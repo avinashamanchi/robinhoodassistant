@@ -66,10 +66,12 @@ class TradingService:
         config: AppConfig,
         clock: MarketClock,
         crypto_clock: Optional[MarketClock] = None,
+        external_source=None,
     ) -> None:
         self.broker = broker
         self.session_factory = session_factory
         self.config = config
+        self.external_source = external_source  # read-only; may be None
         # Equity attributes kept for backward compatibility with existing callers.
         self.clock = clock
         self.risk = RiskEngine(config.risk)
@@ -130,7 +132,17 @@ class TradingService:
             quotes=quotes,
             buying_power=account.buying_power,
             realized_pnl_today=self._realized_pnl_today(session, asset_class),
+            external_positions=self._external_positions_map(),
         )
+
+    def _external_positions_map(self) -> dict:
+        """Read-only external holdings keyed by ticker (empty if no source/down)."""
+        if self.external_source is None:
+            return {}
+        try:
+            return {p.ticker.upper(): p for p in self.external_source.get_positions()}
+        except Exception:  # graceful degradation — never break the trading path
+            return {}
 
     # ── read-only tools ────────────────────────────────────────
     def get_market_data(self, ticker: str) -> dict[str, Any]:
@@ -244,6 +256,10 @@ class TradingService:
                         reason=result.reason_text(),
                     )
                 )
+            # Non-blocking warnings (e.g. cross-broker concentration) are logged
+            # but never change the outcome.
+            for warning in result.warnings:
+                s.add(RiskEvent(order_id=order.id, event_type="warning", reason=warning))
 
             s.commit()
             return {
@@ -251,6 +267,7 @@ class TradingService:
                 "status": order.status,
                 "approved_by_risk": result.approved,
                 "risk_reasons": result.reasons,
+                "risk_warnings": result.warnings,
                 "executed": False,  # invariant: proposing never executes
             }
 
@@ -584,6 +601,94 @@ class TradingService:
                 .all()
             ]
             return {"risk_events": risk_events, "llm_decisions": decisions}
+
+    # ── external (read-only) accounts ──────────────────────────
+    def _external_available(self) -> bool:
+        return self.external_source is not None
+
+    def get_external_positions(self) -> dict[str, Any]:
+        if not self._external_available():
+            return {"available": False, "positions": []}
+        positions = self._external_positions_map()
+        return {
+            "available": True,
+            "stale": getattr(self.external_source, "stale", False),
+            "positions": [
+                {
+                    "ticker": p.ticker,
+                    "quantity": str(p.quantity),
+                    "avg_cost": str(p.avg_cost),
+                    "current_value": str(p.current_value),
+                    "unrealized_pnl": str(p.unrealized_pnl),
+                    "source": p.source,
+                }
+                for p in positions.values()
+            ],
+        }
+
+    def get_external_account_summary(self) -> dict[str, Any]:
+        if not self._external_available():
+            return {"available": False}
+        try:
+            summary = self.external_source.get_account_summary()
+        except Exception:
+            return {"available": True, "stale": True}
+        if summary is None:
+            return {"available": True, "stale": True}
+        return {
+            "available": True,
+            "total_equity": str(summary.total_equity),
+            "cash": str(summary.cash),
+            "buying_power": str(summary.buying_power),
+            "source": summary.source,
+            "stale": summary.stale,
+        }
+
+    def get_external_order_history(self, days: int = 30) -> dict[str, Any]:
+        if not self._external_available():
+            return {"available": False, "orders": []}
+        try:
+            return {"available": True, "orders": self.external_source.get_order_history(days)}
+        except Exception:
+            return {"available": True, "orders": [], "stale": True}
+
+    def get_external_dividends(self, days: int = 90) -> dict[str, Any]:
+        if not self._external_available():
+            return {"available": False, "dividends": []}
+        try:
+            return {"available": True, "dividends": self.external_source.get_dividends(days)}
+        except Exception:
+            return {"available": True, "dividends": [], "stale": True}
+
+    def get_combined_holdings(self) -> dict[str, Any]:
+        """Alpaca + external positions in one view, labeled by source, with
+        per-ticker combined totals. External rows are marked read-only."""
+        alpaca = [
+            {**p, "source": "alpaca", "read_only": False} for p in self.get_positions()
+        ]
+        ext = self.get_external_positions()
+        external = [
+            {
+                "ticker": p["ticker"],
+                "qty": p["quantity"],
+                "current_value": p["current_value"],
+                "source": p["source"],
+                "read_only": True,
+            }
+            for p in ext.get("positions", [])
+        ]
+        combined: dict[str, float] = {}
+        for row in alpaca:
+            combined[row["ticker"]] = combined.get(row["ticker"], 0.0) + float(row["market_value"])
+        for row in external:
+            combined[row["ticker"]] = combined.get(row["ticker"], 0.0) + float(row["current_value"])
+        return {
+            "alpaca": alpaca,
+            "external": external,
+            "combined_by_ticker": {k: round(v, 2) for k, v in combined.items()},
+            "external_available": ext.get("available", False),
+            "external_stale": ext.get("stale", False),
+        }
 
     # ── conditional rules ──────────────────────────────────────
     def create_conditional_rule(

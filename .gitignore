@@ -23,6 +23,10 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
+# Secrets / session tokens
+.rh_token.pickle
+*.pickle
+
 # OS / editor
 .DS_Store
 .idea/

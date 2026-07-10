@@ -35,15 +35,21 @@ class BacktestRunIn(BaseModel):
 
 def build_default_stack() -> tuple[TradingService, Agent]:
     from ..broker.factory import build_broker, build_clock
+    from ..external_accounts.factory import build_external_source
+    from ..logging import register_all_secrets
 
     config = load_config()
     secrets = Secrets()
+    register_all_secrets(secrets)
     engine = create_db_engine(secrets.database_url)
     create_all(engine)
     session_factory = make_session_factory(engine)
     broker = build_broker(config, secrets)
     clock = build_clock(config, secrets)
-    service = TradingService(broker, session_factory, config, clock)
+    service = TradingService(
+        broker, session_factory, config, clock,
+        external_source=build_external_source(config, secrets),
+    )
     backend = AnthropicBackend(
         secrets.anthropic_api_key, config.llm.model, config.llm.max_tokens
     )
@@ -125,6 +131,20 @@ def create_app(
 
         with service.session_factory() as s:
             return promotion_status(s)
+
+    # ── external (read-only) accounts ──────────────────────────
+    @app.get("/holdings")
+    def holdings():
+        """Combined Alpaca + external holdings, labeled by source (read-only external)."""
+        return service.get_combined_holdings()
+
+    @app.get("/external/positions")
+    def external_positions():
+        return service.get_external_positions()
+
+    @app.get("/external/summary")
+    def external_summary():
+        return service.get_external_account_summary()
 
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")

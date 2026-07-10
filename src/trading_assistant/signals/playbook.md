@@ -76,6 +76,12 @@ Multiple positions in highly correlated names (e.g. several mega-cap tech longs)
 effectively ONE bet, not several. When your view adds to existing correlated
 exposure, flag it — it concentrates risk even though it looks diversified.
 
+**This applies ACROSS brokers.** ``external_holdings`` lists read-only positions
+held elsewhere (e.g. Robinhood). If you already hold the same ticker — or a highly
+correlated one — externally, proposing more of it on Alpaca concentrates a single
+bet even though the two accounts look separate. You MUST factor external holdings
+into your concentration assessment and say so explicitly in the report.
+
 ## Uncertainty & citation
 
 Every thesis must (1) cite the concepts above that drove it, (2) state the regime,

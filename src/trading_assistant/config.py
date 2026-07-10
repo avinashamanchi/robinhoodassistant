@@ -55,6 +55,9 @@ class RiskConfig(_Strict):
     price_sanity_pct: float = Field(gt=0)
     reject_when_market_closed: bool = True
     proposal_ttl_minutes: int = Field(gt=0)
+    # Non-blocking WARNING when combined (Alpaca + external) exposure in a ticker
+    # would exceed max_position_per_ticker. Never blocks — external isn't ours.
+    warn_on_cross_broker_concentration: bool = True
 
     @field_validator("ticker_allowlist")
     @classmethod
@@ -96,6 +99,16 @@ class BacktestConfig(_Strict):
     holdout_months: int = Field(default=12, gt=0)
 
 
+class RobinhoodConfig(_Strict):
+    enabled: bool = False              # OFF by default, like everything dangerous
+    cache_ttl_seconds: float = Field(default=300.0, gt=0)
+    token_path: str = "./.rh_token.pickle"
+
+
+class ExternalAccountsConfig(_Strict):
+    robinhood: RobinhoodConfig = Field(default_factory=RobinhoodConfig)
+
+
 class AppConfig(_Strict):
     trading: TradingConfig
     risk: RiskConfig
@@ -105,6 +118,8 @@ class AppConfig(_Strict):
     # Phase 7 additions (optional so pre-Phase-7 configs still load).
     crypto_risk: Optional[RiskConfig] = None
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    # Read-only external account sources (optional).
+    external_accounts: Optional[ExternalAccountsConfig] = None
 
 
 class Secrets(BaseSettings):
@@ -124,6 +139,11 @@ class Secrets(BaseSettings):
     telegram_chat_id: str = ""
     app_host: str = "127.0.0.1"
     app_port: int = 8000
+    # Robinhood (read-only external source). Never logged (see logging.py).
+    rh_username: str = ""
+    rh_password: str = ""
+    rh_totp_secret: str = ""
+    rh_token_path: str = "./.rh_token.pickle"
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:

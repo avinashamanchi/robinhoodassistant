@@ -18,8 +18,12 @@ from .monitor import Monitor
 
 
 def build_monitor() -> Monitor:
+    from ..external_accounts.factory import build_external_source
+    from ..logging import register_all_secrets
+
     config = load_config()
     secrets = Secrets()
+    register_all_secrets(secrets)
     engine = create_db_engine(secrets.database_url)
     create_all(engine)
     session_factory = make_session_factory(engine)
@@ -28,6 +32,7 @@ def build_monitor() -> Monitor:
         session_factory,
         config,
         build_clock(config, secrets),
+        external_source=build_external_source(config, secrets),
     )
     return Monitor(
         service,

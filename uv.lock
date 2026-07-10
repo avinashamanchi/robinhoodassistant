@@ -1222,6 +1222,15 @@ crypto = [
 ]
 
 [[package]]
+name = "pyotp"
+version = "2.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/c6/c5d96a86fd0bf6fa1bbb5c5c341ff3208638b692727a683c8289068d9a11/pyotp-2.10.0.tar.gz", hash = "sha256:d01e9703443616b03c57c700b5cbffd56a1f929c1b0f8f03131bc78c1fca9d3f", size = 18625, upload-time = "2026-06-14T03:48:49.221Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/33/7b83bde70eddaaaaef487751a9c3a5cc0c0be54620ded0e120ebdc401ff9/pyotp-2.10.0-py3-none-any.whl", hash = "sha256:1df2f6a1bcc3bb0716172a5215ddc2f8c7c7fd26a13df9927d52e1746934836c", size = 13768, upload-time = "2026-06-14T03:48:47.831Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1407,6 +1416,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ac/c3/e2a2b89f2d3e2179abd6d00ebd70bff6273f37fb3e0cc209f48b39d00cbf/requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed", size = 142856, upload-time = "2026-05-14T19:25:27.735Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0", size = 73075, upload-time = "2026-05-14T19:25:26.443Z" },
+]
+
+[[package]]
+name = "robin-stocks"
+version = "3.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyotp" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/fc/0ffa7e1a455b3ba43db946da561f22f7742a8569775c74391cdbd36afc5b/robin_stocks-3.4.0.tar.gz", hash = "sha256:70dbbe393239ec85bf02d49077997b87e6e4b4e427e9a9f5babf90c350d6c991", size = 67959, upload-time = "2025-05-18T06:20:35.155Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2e/2b/aae889dd876edab0872d89c296ebc4cee4d958f399c8719c1a483c79ed62/robin_stocks-3.4.0-py3-none-any.whl", hash = "sha256:3b473658d290cc673881c9122aa89e9b897d5a847e136e4061e38e147bb41eed", size = 134132, upload-time = "2025-05-18T06:20:33.504Z" },
 ]
 
 [[package]]
@@ -1713,6 +1737,10 @@ app = [
 broker = [
     { name = "alpaca-py" },
 ]
+external = [
+    { name = "pyotp" },
+    { name = "robin-stocks" },
+]
 mcp = [
     { name = "mcp" },
 ]
@@ -1737,13 +1765,15 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'analysis'", specifier = ">=15.0" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pydantic-settings", specifier = ">=2.2" },
+    { name = "pyotp", marker = "extra == 'external'", specifier = ">=2.9,<3" },
     { name = "python-telegram-bot", marker = "extra == 'notify'", specifier = ">=21" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "robin-stocks", marker = "extra == 'external'", specifier = ">=3.4,<4" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", marker = "extra == 'app'", specifier = ">=0.29" },
 ]
-provides-extras = ["broker", "mcp", "app", "notify", "analysis"]
+provides-extras = ["broker", "mcp", "app", "notify", "analysis", "external"]
 
 [package.metadata.requires-dev]
 dev = [

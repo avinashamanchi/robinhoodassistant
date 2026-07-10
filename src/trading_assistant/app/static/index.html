@@ -71,6 +71,11 @@
     </section>
 
     <section class="panel full">
+      <h2>Combined holdings <span id="ext-stale" class="mode" style="display:none">external data stale</span></h2>
+      <div id="holdings"></div>
+    </section>
+
+    <section class="panel full">
       <h2>Execution &amp; risk log</h2>
       <div id="log-box"></div>
     </section>
@@ -139,6 +144,22 @@
             <td>${x.avg_entry_price}</td><td>${x.current_price}</td><td>${x.market_value}</td></tr>`).join('') +
           `</table>`
         : '<div class="empty">No open positions</div>';
+
+      const h = await api('/holdings');
+      $('ext-stale').style.display = h.external_stale ? 'inline' : 'none';
+      const rows = [...(h.alpaca||[]), ...(h.external||[])];
+      const totals = h.combined_by_ticker || {};
+      $('holdings').innerHTML = rows.length
+        ? `<table><tr><th>Ticker</th><th>Source</th><th>Qty</th><th>Value</th><th>Combined</th></tr>` +
+          rows.map(x => {
+            const val = x.market_value !== undefined ? x.market_value : x.current_value;
+            const ro = x.read_only ? ' <span class="pill" style="background:#2a2f1c;color:var(--amber)">read-only</span>' : '';
+            return `<tr><td>${x.ticker}</td><td>${x.source}${ro}</td><td>${x.qty}</td>
+              <td>${val}</td><td>${totals[x.ticker] ?? ''}</td></tr>`;
+          }).join('') + `</table>`
+        : (h.external_available === false
+            ? '<div class="empty">Alpaca only — no external source enabled</div>'
+            : '<div class="empty">No holdings</div>');
 
       const log = await api('/log');
       const evts = (log.risk_events||[]);

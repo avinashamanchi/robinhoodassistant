@@ -19,6 +19,8 @@ from . import rules
 class RiskResult:
     approved: bool
     reasons: list[str] = field(default_factory=list)
+    # Non-blocking advisories (e.g. cross-broker concentration). Never affect approval.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def rejected(self) -> bool:
@@ -26,6 +28,9 @@ class RiskResult:
 
     def reason_text(self) -> str:
         return "; ".join(self.reasons)
+
+    def warning_text(self) -> str:
+        return "; ".join(self.warnings)
 
 
 class RiskEngine:
@@ -56,4 +61,11 @@ class RiskEngine:
         ]
         reasons.extend(r for r in checks if r is not None)
 
-        return RiskResult(approved=not reasons, reasons=reasons)
+        # Non-blocking advisories (do NOT affect approval).
+        warnings: list[str] = []
+        if self.config.warn_on_cross_broker_concentration:
+            warning = rules.check_cross_broker_concentration(order, snapshot, self.config)
+            if warning is not None:
+                warnings.append(warning)
+
+        return RiskResult(approved=not reasons, reasons=reasons, warnings=warnings)

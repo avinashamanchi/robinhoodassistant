@@ -115,3 +115,29 @@ def check_market_hours(
     if not market_open and config.reject_when_market_closed:
         return "market is closed; order rejected (queueing not requested)"
     return None
+
+
+def check_cross_broker_concentration(
+    order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
+) -> Optional[str]:
+    """WARNING (never a rejection): combined Alpaca + external exposure in this
+    ticker would exceed max_position_per_ticker. External holdings aren't ours to
+    manage, so this only informs — the human may intend the concentration."""
+    price = _reference_price(order, snapshot)
+    if price is None:
+        return None
+    qty = _order_qty_shares(order, price)
+    signed = qty if order.side is OrderSide.BUY else -qty
+    current = snapshot.positions.get(order.ticker.upper())
+    current_qty = current.qty if current else Decimal(0)
+    projected_alpaca = abs(current_qty + signed) * price
+    external = snapshot.external_position_value(order.ticker.upper())
+    combined = projected_alpaca + external
+    limit = Decimal(str(config.max_position_per_ticker))
+    if external > 0 and combined > limit:
+        return (
+            f"cross-broker concentration: combined {order.ticker.upper()} exposure "
+            f"${combined:.2f} (Alpaca ${projected_alpaca:.2f} + external ${external:.2f}) "
+            f"exceeds ${limit:.2f} — not blocked, external holdings are read-only"
+        )
+    return None

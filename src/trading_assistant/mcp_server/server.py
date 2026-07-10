@@ -30,14 +30,21 @@ def configure(service: TradingService) -> None:
 
 
 def build_default_service() -> TradingService:
+    from ..external_accounts.factory import build_external_source
+    from ..logging import register_all_secrets
+
     config = load_config()
     secrets = Secrets()
+    register_all_secrets(secrets)
     engine = create_db_engine(secrets.database_url)
     create_all(engine)
     session_factory = make_session_factory(engine)
     broker = build_broker(config, secrets)
     clock = build_clock(config, secrets)
-    return TradingService(broker, session_factory, config, clock)
+    return TradingService(
+        broker, session_factory, config, clock,
+        external_source=build_external_source(config, secrets),
+    )
 
 
 def _svc() -> TradingService:
@@ -119,6 +126,32 @@ def list_rules() -> list[dict[str, Any]]:
 def cancel_rule(rule_id: int) -> dict[str, Any]:
     """Cancel a standing conditional rule by id."""
     return _svc().cancel_rule(rule_id)
+
+
+# ── external (read-only) account tools ──────────────────────────
+@mcp.tool()
+def get_external_positions() -> dict[str, Any]:
+    """READ-ONLY holdings at external brokers (e.g. Robinhood): ticker, quantity,
+    avg cost, current value, unrealized P&L, source. Informational only."""
+    return _svc().get_external_positions()
+
+
+@mcp.tool()
+def get_external_account_summary() -> dict[str, Any]:
+    """READ-ONLY external account: total equity, cash, buying power. Informational."""
+    return _svc().get_external_account_summary()
+
+
+@mcp.tool()
+def get_external_order_history(days: int = 30) -> dict[str, Any]:
+    """READ-ONLY external order history over the last N days."""
+    return _svc().get_external_order_history(days)
+
+
+@mcp.tool()
+def get_external_dividends(days: int = 90) -> dict[str, Any]:
+    """READ-ONLY external dividends over the last N days."""
+    return _svc().get_external_dividends(days)
 
 
 def main() -> None:

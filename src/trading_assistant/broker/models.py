@@ -139,6 +139,11 @@ class PortfolioSnapshot:
     The risk engine performs NO I/O; it reads this immutable snapshot. Quotes
     map ticker -> latest Quote; positions map ticker -> Position.
     ``realized_pnl_today`` is computed by risk.pnl from the fills table (A2).
+
+    ``external_positions`` holds READ-ONLY holdings at other brokers (e.g.
+    Robinhood), keyed by ticker. Hard risk limits apply only to our Alpaca
+    positions; external holdings only inform a non-blocking cross-broker warning.
+    Typed loosely to avoid coupling broker/ to external_accounts/.
     """
 
     positions: dict[str, Position]
@@ -146,10 +151,15 @@ class PortfolioSnapshot:
     buying_power: Decimal
     realized_pnl_today: Decimal
     as_of: datetime = field(default_factory=_utcnow)
+    external_positions: dict[str, "object"] = field(default_factory=dict)
 
     def position_value(self, ticker: str) -> Decimal:
         pos = self.positions.get(ticker)
         return abs(pos.market_value) if pos else Decimal(0)
+
+    def external_position_value(self, ticker: str) -> Decimal:
+        ext = self.external_positions.get(ticker.upper())
+        return abs(ext.current_value) if ext is not None else Decimal(0)
 
     def gross_exposure(self) -> Decimal:
         """Total absolute market value across all positions (USD)."""

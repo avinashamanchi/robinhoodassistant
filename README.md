@@ -98,6 +98,25 @@ duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 positions to local truth and logs drift, and the daily-loss kill switch trips
 per asset class (`enforce_daily_loss_limits`).
 
+## Robinhood (read-only external source)
+
+`external_accounts/` lets the system SEE holdings at other brokers (Robinhood) so
+cross-broker exposure/correlation is visible — it is **never a broker**. It has no
+order/transfer/write method anywhere (enforced by a test), never enters the
+execution path, and is OFF by default.
+
+```bash
+uv pip install -e '.[external]'    # robin_stocks (pinned >=3.4,<4) + pyotp
+# .env: RH_USERNAME / RH_PASSWORD / RH_TOTP_SECRET (authenticator setup key) / RH_TOKEN_PATH
+# config.yaml: external_accounts.robinhood.enabled: true
+```
+
+When enabled, external positions appear in `/holdings` (labeled read-only), feed the
+analyst's cross-broker correlation check, and trigger a **non-blocking** warning if
+combined Alpaca+external exposure in one ticker exceeds `max_position_per_ticker`.
+All three RH secrets are redacted from logs; the session token is chmod 0600 and
+gitignored. Fetch failures degrade gracefully (cached, marked "stale").
+
 ## Safety model
 
 1. Live trading requires BOTH `config.yaml` `trading.mode: live` AND

@@ -126,3 +126,7 @@ class MarketFeatures(_Model):
     days_to_next_earnings: Optional[int] = None       # None for crypto
     market_context: MarketContext = MarketContext()
     relative_strength_vs_spy: RelativeStrength = RelativeStrength()
+
+    # Read-only cross-broker holdings (e.g. Robinhood) for correlation awareness.
+    # Each item: {"ticker": str, "value": str, "source": str}.
+    external_holdings: list[dict] = []

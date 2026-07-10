@@ -15,6 +15,7 @@ risk:
   price_sanity_pct: 5.0              # reject limit orders >5% from last trade
   reject_when_market_closed: true    # unless order explicitly queued
   proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
+  warn_on_cross_broker_concentration: true  # non-blocking WARNING only
 
 # Crypto risk limits — independent allowlist + kill switch (Phase 7).
 # 24/7 market: never rejected for "closed"; daily P&L boundary is UTC midnight.
@@ -41,6 +42,13 @@ backtest:
     equity: 0                           # Alpaca equities commission-free
     crypto: 25                          # Alpaca crypto worst taker tier
   holdout_months: 12
+
+# Read-only external account sources (never a broker; never places orders).
+external_accounts:
+  robinhood:
+    enabled: false            # OFF by default
+    cache_ttl_seconds: 300    # cache reads; don't hammer their endpoints
+    token_path: ./.rh_token.pickle
 
 features:
   auto_execute_preapproved_rules: false   # daemon auto-exec (Phase 4)

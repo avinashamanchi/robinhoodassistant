@@ -27,6 +27,24 @@ def register_secret(value: str) -> None:
         _REGISTERED.add(value)
 
 
+# Secret-bearing attribute names on the Secrets object (Robinhood + others).
+_SECRET_ATTRS = (
+    "anthropic_api_key",
+    "alpaca_api_key",
+    "alpaca_secret_key",
+    "telegram_bot_token",
+    "rh_username",
+    "rh_password",
+    "rh_totp_secret",
+)
+
+
+def register_all_secrets(secrets) -> None:
+    """Register every known secret value (e.g. RH_PASSWORD, RH_TOTP_SECRET) for masking."""
+    for attr in _SECRET_ATTRS:
+        register_secret(str(getattr(secrets, attr, "") or ""))
+
+
 def redact(message: str) -> str:
     for secret in _REGISTERED:
         message = message.replace(secret, _MASK)
