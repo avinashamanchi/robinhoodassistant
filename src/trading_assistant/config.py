@@ -77,12 +77,34 @@ class DaemonConfig(_Strict):
     use_websocket: bool = True
 
 
+class FillConfig(_Strict):
+    market: str = "next_bar_open"
+    limit: str = "bar_range_cross"
+    max_participation_pct: float = Field(default=10.0, gt=0, le=100)
+
+
+class BacktestConfig(_Strict):
+    """Simulation cost model. Fees and slippage are deliberately separate (Phase 7)."""
+
+    fills: FillConfig = Field(default_factory=FillConfig)
+    slippage_bps: dict[str, float] = Field(
+        default_factory=lambda: {"equity": 5.0, "crypto": 20.0}
+    )
+    fees_bps: dict[str, float] = Field(
+        default_factory=lambda: {"equity": 0.0, "crypto": 25.0}
+    )
+    holdout_months: int = Field(default=12, gt=0)
+
+
 class AppConfig(_Strict):
     trading: TradingConfig
     risk: RiskConfig
     features: FeaturesConfig
     llm: LLMConfig
     daemon: DaemonConfig
+    # Phase 7 additions (optional so pre-Phase-7 configs still load).
+    crypto_risk: Optional[RiskConfig] = None
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
 
 class Secrets(BaseSettings):

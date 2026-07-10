@@ -18,6 +18,20 @@ class MarketClock(Protocol):
     def next_close(self, at: datetime | None = None) -> datetime: ...
 
 
+class CryptoClock:
+    """Crypto trades 24/7 — always open. Satisfies the MarketClock protocol (Phase 7)."""
+
+    def is_open(self, at: datetime | None = None) -> bool:
+        return True
+
+    def next_open(self, at: datetime | None = None) -> datetime:
+        return at or datetime.now(timezone.utc)
+
+    def next_close(self, at: datetime | None = None) -> datetime:
+        # No close; report far future so "time until close" logic never fires.
+        return datetime(9999, 1, 1, tzinfo=timezone.utc)
+
+
 class FakeClock:
     """Controllable clock for tests. Toggle ``open`` and set the next boundaries."""
 

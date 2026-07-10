@@ -30,6 +30,7 @@ from .broker.models import (
     OrderType,
     PortfolioSnapshot,
 )
+from .assets import AssetClass
 from .config import AppConfig
 from .db.models import (
     ApprovalConflict,
@@ -43,7 +44,7 @@ from .db.models import (
     approve_proposed,
     utcnow,
 )
-from .risk.clock import MarketClock
+from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.killswitch import KillSwitch
 from .risk.pnl import FillLike, realized_pnl_today
@@ -64,22 +65,58 @@ class TradingService:
         session_factory: sessionmaker[Session],
         config: AppConfig,
         clock: MarketClock,
+        crypto_clock: Optional[MarketClock] = None,
     ) -> None:
         self.broker = broker
         self.session_factory = session_factory
         self.config = config
+        # Equity attributes kept for backward compatibility with existing callers.
         self.clock = clock
         self.risk = RiskEngine(config.risk)
+        # Per-asset-class routing (Phase 7). Crypto falls back to equity limits if
+        # no crypto_risk section is configured.
+        crypto_cfg = config.crypto_risk or config.risk
+        self._clocks: dict[AssetClass, MarketClock] = {
+            AssetClass.EQUITY: clock,
+            AssetClass.CRYPTO: crypto_clock or CryptoClock(),
+        }
+        self._risk: dict[AssetClass, RiskEngine] = {
+            AssetClass.EQUITY: self.risk,
+            AssetClass.CRYPTO: RiskEngine(crypto_cfg),
+        }
+
+    # ── asset-class routing helpers ────────────────────────────
+    @staticmethod
+    def _asset_class(symbol: str) -> AssetClass:
+        return AssetClass.for_symbol(symbol)
+
+    def _clock_for(self, ac: AssetClass) -> MarketClock:
+        return self._clocks[ac]
+
+    def _risk_for(self, ac: AssetClass) -> RiskEngine:
+        return self._risk[ac]
+
+    def _loss_limit_for(self, ac: AssetClass) -> Decimal:
+        cfg = self.config.crypto_risk if ac is AssetClass.CRYPTO else self.config.risk
+        cfg = cfg or self.config.risk
+        return Decimal(str(cfg.daily_realized_loss_limit))
 
     # ── snapshot assembly (A1) ─────────────────────────────────
-    def _realized_pnl_today(self, session: Session) -> Decimal:
+    def _realized_pnl_today(
+        self, session: Session, asset_class: AssetClass = AssetClass.EQUITY
+    ) -> Decimal:
         rows = session.execute(select(Fill)).scalars().all()
         fills = [
             FillLike(r.ticker, r.side, r.qty, r.price, r.filled_at) for r in rows
         ]
-        return realized_pnl_today(fills)
+        return realized_pnl_today(fills, asset_class=asset_class)
 
-    def assemble_snapshot(self, session: Session, tickers: list[str]) -> PortfolioSnapshot:
+    def assemble_snapshot(
+        self,
+        session: Session,
+        tickers: list[str],
+        asset_class: AssetClass = AssetClass.EQUITY,
+    ) -> PortfolioSnapshot:
         positions = self.broker.get_positions()
         pos_map = {p.ticker.upper(): p for p in positions}
         want = {t.upper() for t in tickers} | set(pos_map)
@@ -89,7 +126,7 @@ class TradingService:
             positions=pos_map,
             quotes=quotes,
             buying_power=account.buying_power,
-            realized_pnl_today=self._realized_pnl_today(session),
+            realized_pnl_today=self._realized_pnl_today(session, asset_class),
         )
 
     # ── read-only tools ────────────────────────────────────────
@@ -163,15 +200,14 @@ class TradingService:
             limit_price=Decimal(limit_price) if limit_price is not None else None,
         )
 
+        ac = self._asset_class(order_req.ticker)
         with self.session_factory() as s:
-            snapshot = self.assemble_snapshot(s, [order_req.ticker])
-            tripped = KillSwitch.is_tripped(s)
-            market_open = self.clock.is_open()
-            result = self.risk.check(
+            snapshot = self.assemble_snapshot(s, [order_req.ticker], ac)
+            result = self._risk_for(ac).check(
                 order_req,
                 snapshot,
-                killswitch_tripped=tripped,
-                market_open=market_open,
+                killswitch_tripped=KillSwitch.is_tripped(s, ac),
+                market_open=self._clock_for(ac).is_open(),
             )
 
             order = Order(
@@ -186,7 +222,8 @@ class TradingService:
             )
             s.add(order)
             s.flush()
-            ttl = self.config.risk.proposal_ttl_minutes
+            risk_cfg = self.config.crypto_risk if ac is AssetClass.CRYPTO else self.config.risk
+            ttl = (risk_cfg or self.config.risk).proposal_ttl_minutes
             s.add(
                 Proposal(
                     order_id=order.id,
@@ -269,14 +306,15 @@ class TradingService:
                 }
             s.refresh(order)  # pick up status = APPROVED from the CAS UPDATE
 
-            # Execution-time risk re-check against a fresh snapshot.
+            # Execution-time risk re-check against a fresh snapshot, routed by class.
+            ac = self._asset_class(order.ticker)
             order_req = self._order_request_from(order)
-            snapshot = self.assemble_snapshot(s, [order.ticker])
-            result = self.risk.check(
+            snapshot = self.assemble_snapshot(s, [order.ticker], ac)
+            result = self._risk_for(ac).check(
                 order_req,
                 snapshot,
-                killswitch_tripped=KillSwitch.is_tripped(s),
-                market_open=self.clock.is_open(),
+                killswitch_tripped=KillSwitch.is_tripped(s, ac),
+                market_open=self._clock_for(ac).is_open(),
             )
             if result.rejected:
                 OrderStateMachine.transition(order, OrderStatus.REJECTED)
@@ -327,11 +365,14 @@ class TradingService:
             s.commit()
             return {"order_id": order_id, "status": order.status}
 
-    def reset_killswitch(self) -> dict[str, Any]:
+    def reset_killswitch(
+        self, asset_class: AssetClass | str = AssetClass.EQUITY
+    ) -> dict[str, Any]:
+        ac = asset_class if isinstance(asset_class, AssetClass) else AssetClass(asset_class)
         with self.session_factory() as s:
-            KillSwitch.reset(s)
+            KillSwitch.reset(s, asset_class=ac)
             s.commit()
-            return {"killswitch": "reset", "tripped": False}
+            return {"killswitch": "reset", "asset_class": ac.value, "tripped": False}
 
     def get_pending(self) -> list[dict[str, Any]]:
         with self.session_factory() as s:

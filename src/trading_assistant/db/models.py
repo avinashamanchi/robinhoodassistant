@@ -233,11 +233,17 @@ class Fill(Base):
 
 
 class KillSwitchState(Base):
-    """Singleton row (id=1). Persisting here means a restart returns tripped (A3)."""
+    """One row per asset class. Persisting here means a restart returns tripped (A3).
+
+    Keyed by ``asset_class`` (Phase 7) so equity and crypto trip independently.
+    """
 
     __tablename__ = "killswitch_state"
 
-    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_class: Mapped[str] = mapped_column(
+        String(16), unique=True, index=True, default="equity"
+    )
     tripped: Mapped[bool] = mapped_column(Boolean, default=False)
     tripped_at: Mapped[Optional[datetime]] = mapped_column(
         UTCDateTime(), nullable=True

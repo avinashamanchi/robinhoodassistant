@@ -16,6 +16,32 @@ risk:
   reject_when_market_closed: true    # unless order explicitly queued
   proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
 
+# Crypto risk limits — independent allowlist + kill switch (Phase 7).
+# 24/7 market: never rejected for "closed"; daily P&L boundary is UTC midnight.
+crypto_risk:
+  ticker_allowlist: ["BTC/USD", "ETH/USD"]
+  max_notional_per_order: 500
+  max_position_per_ticker: 2000
+  max_portfolio_exposure: 10000
+  daily_realized_loss_limit: 500
+  price_sanity_pct: 8.0                 # crypto is more volatile than equities
+  reject_when_market_closed: false      # crypto trades 24/7
+  proposal_ttl_minutes: 15
+
+# Backtest cost model (Phase 7). Fees and slippage are separate.
+backtest:
+  fills:
+    market: next_bar_open
+    limit: bar_range_cross
+    max_participation_pct: 10
+  slippage_bps:
+    equity: 5
+    crypto: 20
+  fees_bps:
+    equity: 0                           # Alpaca equities commission-free
+    crypto: 25                          # Alpaca crypto worst taker tier
+  holdout_months: 12
+
 features:
   auto_execute_preapproved_rules: false   # daemon auto-exec (Phase 4)
   telegram_notifications: false           # (Phase 4)

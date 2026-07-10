@@ -18,6 +18,8 @@ from decimal import Decimal
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
+from ..assets import AssetClass
+
 NY = ZoneInfo("America/New_York")
 _REGULAR_OPEN = time(9, 30)
 
@@ -105,7 +107,28 @@ def realized_pnl(fills: Iterable[FillLike], since: datetime | None = None) -> De
     return total
 
 
-def realized_pnl_today(fills: Iterable[FillLike], now: datetime | None = None) -> Decimal:
-    """Realized P&L since the most recent regular open (America/New_York)."""
+def most_recent_utc_midnight(now: datetime) -> datetime:
+    """Most recent 00:00 UTC at or before ``now`` — the crypto daily boundary (24/7)."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def most_recent_daily_boundary(
+    now: datetime, asset_class: AssetClass = AssetClass.EQUITY
+) -> datetime:
+    """Daily P&L reset boundary. Equity = NY regular open; crypto = UTC midnight."""
+    if asset_class is AssetClass.CRYPTO:
+        return most_recent_utc_midnight(now)
+    return most_recent_regular_open(now)
+
+
+def realized_pnl_today(
+    fills: Iterable[FillLike],
+    now: datetime | None = None,
+    asset_class: AssetClass = AssetClass.EQUITY,
+) -> Decimal:
+    """Realized P&L since the most recent daily boundary for the asset class."""
     now = now or datetime.now(timezone.utc)
-    return realized_pnl(fills, since=most_recent_regular_open(now))
+    return realized_pnl(fills, since=most_recent_daily_boundary(now, asset_class))
