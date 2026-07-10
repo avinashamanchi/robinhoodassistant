@@ -119,6 +119,13 @@ def create_app(
     def reconcile():
         return service.reconcile_positions()
 
+    @app.get("/analyst/scorecard")
+    def analyst_scorecard():
+        from ..analyst.store import promotion_status
+
+        with service.session_factory() as s:
+            return promotion_status(s)
+
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")
     def list_backtests():

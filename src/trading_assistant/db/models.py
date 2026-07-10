@@ -261,6 +261,34 @@ class BacktestMetricRow(Base):
     run: Mapped["BacktestRun"] = relationship(back_populates="rows")
 
 
+class AnalysisReportRow(Base):
+    __tablename__ = "analysis_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    as_of: Mapped[datetime] = mapped_column(UTCDateTime())
+    action: Mapped[str] = mapped_column(String(8))
+    confidence: Mapped[float] = mapped_column(Numeric(6, 4))
+    report_json: Mapped[str] = mapped_column(Text)      # full AnalysisReport
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+    grade: Mapped[Optional["GradedCallRow"]] = relationship(
+        back_populates="report", uselist=False
+    )
+
+
+class GradedCallRow(Base):
+    __tablename__ = "graded_calls"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("analysis_reports.id"), unique=True)
+    correct: Mapped[bool] = mapped_column(Boolean)
+    forward_return_pct: Mapped[float] = mapped_column(Numeric(12, 4))
+    graded_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+    report: Mapped["AnalysisReportRow"] = relationship(back_populates="grade")
+
+
 class HoldoutAccessLog(Base):
     """Audit trail: every holdout access, especially blocked sweep attempts (#1)."""
 

@@ -20,6 +20,10 @@ Built in phases (see `docs/superpowers/specs/`):
 - **Phase 4 ✅** — monitoring daemon (conditional rules, one-shot, crash-safe) + Telegram.
 - **Phase 5 ✅** — hardening: partial fills, fill idempotency, cancel/replace,
   startup reconciliation, kill-switch drill.
+- **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
+  cited + regime-conditioned, earnings-aware), scorecard grading vs realized
+  forward returns, and a 50-graded-calls promotion gate (advice only — never
+  auto-enables; the live double-lock still applies).
 - **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
   backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
   synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop
