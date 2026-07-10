@@ -16,6 +16,10 @@ venv/
 .coverage
 htmlcov/
 
+# Data cache (downloaded bars)
+.cache/
+*.parquet
+
 # Databases
 *.db
 *.db-wal
