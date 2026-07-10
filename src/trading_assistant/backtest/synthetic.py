@@ -24,9 +24,12 @@ def ohlcv_from_closes(
     start_ts: datetime | None = None,
     freq: str = "D",
     wick_frac: float = 0.004,
-    volume: float = 1_000_000.0,
+    volume=1_000_000.0,
 ) -> pd.DataFrame:
-    """Build an OHLCV frame from a close series (open = prior close)."""
+    """Build an OHLCV frame from a close series (open = prior close).
+
+    ``volume`` may be a scalar or a per-bar array.
+    """
     closes = np.asarray(closes, dtype=float)
     n = len(closes)
     start_ts = start_ts or datetime(2015, 1, 1, tzinfo=timezone.utc)
@@ -35,9 +38,9 @@ def ohlcv_from_closes(
     opens[1:] = closes[:-1]
     highs = np.maximum(opens, closes) * (1 + wick_frac)
     lows = np.minimum(opens, closes) * (1 - wick_frac)
+    vol = np.full(n, volume) if np.isscalar(volume) else np.asarray(volume, dtype=float)
     df = pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes,
-         "volume": np.full(n, volume)},
+        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vol},
         index=_index(n, start_ts, freq),
     )
     df.index.name = "ts"
@@ -58,7 +61,10 @@ def make_bars(
     rng = np.random.default_rng(seed)
     shocks = rng.normal(drift, vol, n)
     closes = start * np.exp(np.cumsum(shocks))
-    return ohlcv_from_closes(closes, start_ts, freq, volume=volume)
+    # Volume spikes on large moves (so breakouts get realistic volume confirmation).
+    abs_move = np.abs(shocks) / (vol if vol > 0 else 1.0)
+    volumes = volume * (0.6 + 1.1 * abs_move) * rng.lognormal(0.0, 0.25, n)
+    return ohlcv_from_closes(closes, start_ts, freq, volume=volumes)
 
 
 def make_trend(n_base: int, n_move: int, start: float, end: float, **kw) -> pd.DataFrame:

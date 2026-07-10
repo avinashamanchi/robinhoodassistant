@@ -232,6 +232,42 @@ class Fill(Base):
     order: Mapped[Optional["Order"]] = relationship(back_populates="fills")
 
 
+class BacktestRun(Base):
+    __tablename__ = "backtest_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(120), default="")
+    holdout_start: Mapped[Optional[datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+    rows: Mapped[list["BacktestMetricRow"]] = relationship(back_populates="run")
+
+
+class BacktestMetricRow(Base):
+    __tablename__ = "backtest_metric_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("backtest_runs.id"))
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    strategy: Mapped[str] = mapped_column(String(40), index=True)
+    window: Mapped[str] = mapped_column(String(16))  # development | holdout | full
+    metrics_json: Mapped[str] = mapped_column(Text)
+
+    run: Mapped["BacktestRun"] = relationship(back_populates="rows")
+
+
+class HoldoutAccessLog(Base):
+    """Audit trail: every holdout access, especially blocked sweep attempts (#1)."""
+
+    __tablename__ = "holdout_access_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    context: Mapped[str] = mapped_column(Text)
+    blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class KillSwitchState(Base):
     """One row per asset class. Persisting here means a restart returns tripped (A3).
 

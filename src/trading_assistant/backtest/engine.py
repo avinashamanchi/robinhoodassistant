@@ -54,6 +54,9 @@ class BacktestResult:
     equity_curve: list[tuple[datetime, float]] = field(default_factory=list)
     fills: list[SimFill] = field(default_factory=list)
     starting_equity: float = 0.0
+    # Parallel per-bar series (same length/order as equity_curve).
+    regimes: list = field(default_factory=list)      # Optional[Regime] per bar
+    invested: list = field(default_factory=list)     # bool per bar (position held?)
 
     @property
     def ending_equity(self) -> float:
@@ -80,7 +83,12 @@ def run_backtest(
     spy_symbol: Optional[str] = None,
     starting_cash: float = 100_000.0,
     warmup: int = 2,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> BacktestResult:
+    """Replay ``symbol``. If ``start``/``end`` are given, only bars in that window
+    are traded and scored, but feature views still see all prior history (so a
+    sub-period run gets fair warmup — no cold-start bias)."""
     symbol = symbol.upper()
     ac = AssetClass.for_symbol(symbol)
     risk_config = risk_config or permissive_risk_config([symbol])
@@ -91,6 +99,8 @@ def run_backtest(
     result = BacktestResult(symbol=symbol, strategy=strategy.name, starting_equity=starting_cash)
 
     for t in source.timeline([symbol]):
+        if (start is not None and t < start) or (end is not None and t > end):
+            continue
         # 1. Fill orders submitted at the previous bar, using THIS bar.
         if t in full.index:
             broker.process_bar(t, {symbol: full.loc[t]})
@@ -99,13 +109,17 @@ def run_backtest(
         hist = view.history(symbol)
 
         # 2. Decide on a fresh, bounded feature view (only data <= t).
+        regime = None
         if len(hist) >= warmup:
             spy_hist = view.history(spy_symbol) if spy_symbol else None
             features = build_features(symbol, ac, hist, spy_df=spy_hist, as_of=t)
+            regime = features.regime
             signal = strategy.on_bar(features)
             _act(engine_risk, broker, symbol, ac, signal.action, signal.size_hint)
 
         result.equity_curve.append((t, broker.equity()))
+        result.regimes.append(regime)
+        result.invested.append(_current_qty(broker, symbol) > 0)
 
     result.fills = broker.fills
     return result

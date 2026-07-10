@@ -95,6 +95,12 @@ def _realized_events(fills: Iterable[FillLike]) -> list[tuple[datetime, Decimal]
     return events
 
 
+def realized_events(fills: Iterable[FillLike]) -> list[tuple[datetime, Decimal]]:
+    """Public view of the FIFO realized-P&L chunks (closing time, pnl) — used by
+    backtest metrics for per-trade win/loss statistics."""
+    return _realized_events(fills)
+
+
 def realized_pnl(fills: Iterable[FillLike], since: datetime | None = None) -> Decimal:
     """Total realized P&L. If ``since`` is given, only chunks closed at/after it."""
     events = _realized_events(fills)
