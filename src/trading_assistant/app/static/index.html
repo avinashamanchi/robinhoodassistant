@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading Assistant</title>
+  <style>
+    :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
+            --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+           background:var(--bg); color:var(--fg); }
+    header { display:flex; align-items:center; justify-content:space-between;
+             padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
+    header h1 { font-size:16px; margin:0; font-weight:600; }
+    header .mode { color:var(--amber); font-size:12px; margin-left:10px; }
+    button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg);
+             border-radius:6px; padding:6px 12px; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.approve { border-color:var(--green); color:var(--green); }
+    button.reject { border-color:var(--red); color:var(--red); }
+    button.danger { border-color:var(--red); color:var(--red); }
+    main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px; max-width:1100px; margin:0 auto; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+                margin:0 0 10px; }
+    .full { grid-column:1 / -1; }
+    #log-box, #chat-box { height:220px; overflow-y:auto; background:#11151a; border:1px solid var(--line);
+                          border-radius:8px; padding:10px; }
+    .msg { margin-bottom:8px; }
+    .msg .who { color:var(--muted); font-size:11px; }
+    .msg.user .who { color:var(--accent); }
+    .row { display:flex; gap:8px; margin-top:10px; }
+    .row input { flex:1; padding:8px 10px; background:#11151a; border:1px solid var(--line);
+                 border-radius:6px; color:var(--fg); }
+    table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; }
+    th { color:var(--muted); font-weight:500; }
+    .pill { padding:2px 7px; border-radius:20px; font-size:11px; }
+    .pill.proposed { background:#2a2f1c; color:var(--amber); }
+    .empty { color:var(--muted); font-style:italic; padding:8px 0; }
+    .tool { color:var(--muted); font-size:12px; }
+    .evt-reason { color:var(--red); }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Trading Assistant <span class="mode" id="mode">paper</span></h1></div>
+    <button class="danger" onclick="resetKill()">Reset kill switch</button>
+  </header>
+
+  <main>
+    <section class="panel full">
+      <h2>Assistant</h2>
+      <div id="chat-box"></div>
+      <div class="row">
+        <input id="chat-input" placeholder="e.g. Buy $50 of AAPL if it drops below 175"
+               onkeydown="if(event.key==='Enter')send()" />
+        <button onclick="send()">Send</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Pending approvals</h2>
+      <div id="pending"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Positions</h2>
+      <div id="positions"></div>
+    </section>
+
+    <section class="panel full">
+      <h2>Execution &amp; risk log</h2>
+      <div id="log-box"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function api(path, opts) {
+      const r = await fetch(path, opts);
+      return r.json();
+    }
+    function chatLine(who, text, cls='') {
+      const d = document.createElement('div');
+      d.className = 'msg ' + cls;
+      d.innerHTML = `<div class="who">${who}</div><div>${text}</div>`;
+      $('chat-box').appendChild(d);
+      $('chat-box').scrollTop = $('chat-box').scrollHeight;
+    }
+    async function send() {
+      const input = $('chat-input');
+      const msg = input.value.trim();
+      if (!msg) return;
+      input.value = '';
+      chatLine('you', escapeHtml(msg), 'user');
+      const res = await api('/chat', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({message: msg})
+      });
+      if (res.detail) { chatLine('system', 'Error: ' + JSON.stringify(res.detail)); }
+      else {
+        (res.tool_calls||[]).forEach(t =>
+          chatLine('tool', `<span class="tool">→ ${t.name}(${escapeHtml(JSON.stringify(t.input))})</span>`));
+        chatLine('assistant', escapeHtml(res.reply || '(no reply)'));
+      }
+      refresh();
+    }
+    async function approve(id) { await api('/approve/'+id, {method:'POST'}); refresh(); }
+    async function reject(id)  { await api('/reject/'+id, {method:'POST'}); refresh(); }
+    async function resetKill() { await api('/killswitch/reset', {method:'POST'}); refresh(); }
+
+    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    async function refresh() {
+      const p = await api('/pending');
+      $('pending').innerHTML = (p.pending && p.pending.length)
+        ? p.pending.map(o => `
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <div>
+              <strong>${o.ticker}</strong> ${o.side} ${o.order_type}
+              ${o.notional ? '$'+o.notional : o.qty+' sh'}
+              ${o.limit_price ? '@ '+o.limit_price : ''}
+              <span class="pill proposed">proposed</span>
+            </div>
+            <div>
+              <button class="approve" onclick="approve(${o.order_id})">Approve</button>
+              <button class="reject" onclick="reject(${o.order_id})">Reject</button>
+            </div>
+          </div>`).join('')
+        : '<div class="empty">No pending proposals</div>';
+
+      const pos = await api('/positions');
+      $('positions').innerHTML = (pos.positions && pos.positions.length)
+        ? `<table><tr><th>Ticker</th><th>Qty</th><th>Avg</th><th>Last</th><th>Value</th></tr>` +
+          pos.positions.map(x => `<tr><td>${x.ticker}</td><td>${x.qty}</td>
+            <td>${x.avg_entry_price}</td><td>${x.current_price}</td><td>${x.market_value}</td></tr>`).join('') +
+          `</table>`
+        : '<div class="empty">No open positions</div>';
+
+      const log = await api('/log');
+      const evts = (log.risk_events||[]);
+      $('log-box').innerHTML = evts.length
+        ? evts.map(e => `<div class="msg"><span class="who">${e.at} · ${e.type}</span>
+            <div class="evt-reason">${escapeHtml(e.reason)}</div></div>`).join('')
+        : '<div class="empty">No risk events yet</div>';
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

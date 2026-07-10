@@ -32,12 +32,15 @@ from .broker.models import (
 )
 from .config import AppConfig
 from .db.models import (
+    ApprovalConflict,
     Fill,
+    LLMDecision,
     Order,
     OrderStateMachine,
     Proposal,
     RiskEvent,
     Rule,
+    approve_proposed,
     utcnow,
 )
 from .risk.clock import MarketClock
@@ -210,6 +213,187 @@ class TradingService:
                 "risk_reasons": result.reasons,
                 "executed": False,  # invariant: proposing never executes
             }
+
+    # ── execution (human-gated) ────────────────────────────────
+    def _order_request_from(self, order: Order) -> OrderRequest:
+        return OrderRequest(
+            ticker=order.ticker,
+            side=OrderSide(order.side),
+            order_type=OrderType(order.order_type),
+            idempotency_key=order.idempotency_key,
+            qty=order.qty,
+            notional=order.notional,
+            limit_price=order.limit_price,
+        )
+
+    def approve_order(self, order_id: int) -> dict[str, Any]:
+        """Approve a PROPOSED order, re-run risk at execution moment, then submit.
+
+        This is the ONLY path that trades. It: (1) refuses expired proposals (A6),
+        (2) atomically compare-and-sets PROPOSED->APPROVED (A5) — a second approver
+        conflicts, (3) re-runs the full risk engine against a FRESH snapshot
+        (prices move between proposal and approval), rejecting if anything now
+        fails, and only then (4) submits to the broker.
+        """
+        with self.session_factory() as s:
+            order = s.get(Order, order_id)
+            if order is None:
+                return {"order_id": order_id, "error": "not found", "executed": False}
+
+            # A6: expired proposals cannot be approved.
+            if (
+                order.status == OrderStatus.PROPOSED.value
+                and order.proposal is not None
+                and order.proposal.is_expired()
+            ):
+                OrderStateMachine.transition(order, OrderStatus.EXPIRED)
+                s.commit()
+                return {
+                    "order_id": order_id,
+                    "status": OrderStatus.EXPIRED.value,
+                    "executed": False,
+                    "error": "proposal expired",
+                }
+
+            # A5: atomic exactly-once approval.
+            try:
+                approve_proposed(s, order_id)
+            except ApprovalConflict:
+                s.rollback()
+                current = s.get(Order, order_id)
+                return {
+                    "order_id": order_id,
+                    "status": current.status if current else None,
+                    "executed": False,
+                    "error": "order not in PROPOSED state (already decided?)",
+                }
+            s.refresh(order)  # pick up status = APPROVED from the CAS UPDATE
+
+            # Execution-time risk re-check against a fresh snapshot.
+            order_req = self._order_request_from(order)
+            snapshot = self.assemble_snapshot(s, [order.ticker])
+            result = self.risk.check(
+                order_req,
+                snapshot,
+                killswitch_tripped=KillSwitch.is_tripped(s),
+                market_open=self.clock.is_open(),
+            )
+            if result.rejected:
+                OrderStateMachine.transition(order, OrderStatus.REJECTED)
+                s.add(
+                    RiskEvent(
+                        order_id=order.id,
+                        event_type="rejection",
+                        reason="execution-time: " + result.reason_text(),
+                    )
+                )
+                s.commit()
+                return {
+                    "order_id": order_id,
+                    "status": OrderStatus.REJECTED.value,
+                    "executed": False,
+                    "risk_reasons": result.reasons,
+                }
+
+            # Passed final risk check -> submit to broker.
+            broker_result = self.broker.submit_order(order_req)
+            order.broker_order_id = broker_result.broker_order_id
+            OrderStateMachine.transition(order, OrderStatus.SUBMITTED)
+            s.commit()
+            return {
+                "order_id": order_id,
+                "status": order.status,
+                "executed": True,
+                "broker_order_id": order.broker_order_id,
+            }
+
+    def reject_order(self, order_id: int) -> dict[str, Any]:
+        with self.session_factory() as s:
+            order = s.get(Order, order_id)
+            if order is None:
+                return {"order_id": order_id, "error": "not found"}
+            if order.status != OrderStatus.PROPOSED.value:
+                return {
+                    "order_id": order_id,
+                    "status": order.status,
+                    "error": "only PROPOSED orders can be rejected",
+                }
+            OrderStateMachine.transition(order, OrderStatus.REJECTED)
+            s.add(
+                RiskEvent(
+                    order_id=order.id, event_type="rejection", reason="rejected by human"
+                )
+            )
+            s.commit()
+            return {"order_id": order_id, "status": order.status}
+
+    def reset_killswitch(self) -> dict[str, Any]:
+        with self.session_factory() as s:
+            KillSwitch.reset(s)
+            s.commit()
+            return {"killswitch": "reset", "tripped": False}
+
+    def get_pending(self) -> list[dict[str, Any]]:
+        with self.session_factory() as s:
+            rows = (
+                s.execute(
+                    select(Order).where(Order.status == OrderStatus.PROPOSED.value)
+                )
+                .scalars()
+                .all()
+            )
+            out = []
+            for o in rows:
+                d = self._order_dict(o)
+                if o.proposal is not None:
+                    d["expires_at"] = o.proposal.expires_at.isoformat()
+                    d["expired"] = o.proposal.is_expired()
+                out.append(d)
+            return out
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "ticker": p.ticker,
+                "qty": str(p.qty),
+                "avg_entry_price": str(p.avg_entry_price),
+                "current_price": str(p.current_price),
+                "market_value": str(p.market_value),
+            }
+            for p in self.broker.get_positions()
+        ]
+
+    def get_log(self, limit: int = 100) -> dict[str, Any]:
+        with self.session_factory() as s:
+            risk_events = [
+                {
+                    "id": e.id,
+                    "order_id": e.order_id,
+                    "type": e.event_type,
+                    "reason": e.reason,
+                    "at": e.created_at.isoformat(),
+                }
+                for e in s.execute(
+                    select(RiskEvent).order_by(RiskEvent.id.desc()).limit(limit)
+                )
+                .scalars()
+                .all()
+            ]
+            decisions = [
+                {
+                    "id": d.id,
+                    "prompt": d.prompt,
+                    "reasoning_summary": d.reasoning_summary,
+                    "model": d.model,
+                    "at": d.created_at.isoformat(),
+                }
+                for d in s.execute(
+                    select(LLMDecision).order_by(LLMDecision.id.desc()).limit(limit)
+                )
+                .scalars()
+                .all()
+            ]
+            return {"risk_events": risk_events, "llm_decisions": decisions}
 
     # ── conditional rules ──────────────────────────────────────
     def create_conditional_rule(

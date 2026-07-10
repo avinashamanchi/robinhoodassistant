@@ -14,8 +14,9 @@ Built in phases (see `docs/superpowers/specs/`):
 - **Phase 1 ✅** — scaffold, config, DB models + order state machine, `BrokerClient`
   ABC + `MockBroker`, risk engine (pure) with FIFO P&L + persistent kill switch +
   injectable market clock. Full pytest coverage of every limit.
-- **Phase 2** — `AlpacaBroker` (paper) + MCP server.
-- **Phase 3** — FastAPI host + agentic loop + approval UI.
+- **Phase 2 ✅** — `AlpacaBroker` (paper) + `AlpacaClock` + MCP server + `TradingService`.
+- **Phase 3 ✅** — FastAPI host, agentic loop (Claude tool use), human approval gate
+  with execution-time risk re-check, rate limiting, single-page UI.
 - **Phase 4** — monitoring daemon + conditional rules + Telegram.
 - **Phase 5** — hardening.
 

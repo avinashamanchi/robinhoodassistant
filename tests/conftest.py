@@ -60,6 +60,34 @@ def mock_broker() -> MockBroker:
     return MockBroker()
 
 
+class SpyBroker(MockBroker):
+    """MockBroker that records how many orders were actually sent to the broker."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.submit_calls = 0
+
+    def submit_order(self, order):
+        self.submit_calls += 1
+        return super().submit_order(order)
+
+
+@pytest.fixture
+def make_service(app_config, session_factory):
+    """Factory building a TradingService with a SpyBroker (AAPL priced at $100)."""
+    from trading_assistant.risk.clock import FakeClock
+    from trading_assistant.service import TradingService
+
+    def _make(broker=None, market_open=True):
+        broker = broker if broker is not None else SpyBroker()
+        broker.set_price("AAPL", Decimal("100"))
+        return TradingService(
+            broker, session_factory, app_config, FakeClock(is_open=market_open)
+        )
+
+    return _make
+
+
 @pytest.fixture
 def make_snapshot():
     def _make(
