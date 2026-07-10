@@ -30,6 +30,10 @@ from .data import DataSource
 from .sim_broker import SimBroker, SimFill
 
 TARGET_PCT = 0.95  # fraction of equity a full-size long deploys
+# Feature indicators are causal and need at most ~252 bars (52-week window); a
+# bounded lookback yields identical values while keeping the run O(n·window),
+# not O(n^2). Still strictly <= t, so the no-lookahead guarantee is untouched.
+FEATURE_LOOKBACK = 320
 
 
 def permissive_risk_config(symbols: list[str], capital: float = 1e9) -> RiskConfig:
@@ -106,12 +110,14 @@ def run_backtest(
             broker.process_bar(t, {symbol: full.loc[t]})
 
         view = source.view(t)
-        hist = view.history(symbol)
+        hist = view.history(symbol, lookback=FEATURE_LOOKBACK)
 
         # 2. Decide on a fresh, bounded feature view (only data <= t).
         regime = None
         if len(hist) >= warmup:
-            spy_hist = view.history(spy_symbol) if spy_symbol else None
+            spy_hist = (
+                view.history(spy_symbol, lookback=FEATURE_LOOKBACK) if spy_symbol else None
+            )
             features = build_features(symbol, ac, hist, spy_df=spy_hist, as_of=t)
             regime = features.regime
             signal = strategy.on_bar(features)

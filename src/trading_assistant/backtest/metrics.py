@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
+from typing import Optional
 
 import numpy as np
 
@@ -26,7 +27,7 @@ class Metrics:
     sortino: float = 0.0
     max_drawdown_pct: float = 0.0
     win_rate_pct: float = 0.0
-    profit_factor: float = 0.0
+    profit_factor: Optional[float] = None
     avg_win: float = 0.0
     avg_loss: float = 0.0
     exposure_pct: float = 0.0
@@ -81,7 +82,8 @@ def _trade_stats(result: BacktestResult) -> tuple[float, float, float, float, in
     win_rate = len(wins) / len(pnls) * 100
     gross_win = sum(wins)
     gross_loss = abs(sum(losses))
-    profit_factor = (gross_win / gross_loss) if gross_loss else float("inf")
+    # None (not inf) when there are no losses — keeps the result JSON-serializable.
+    profit_factor = (gross_win / gross_loss) if gross_loss else None
     avg_win = gross_win / len(wins) if wins else 0.0
     avg_loss = sum(losses) / len(losses) if losses else 0.0
     return win_rate, profit_factor, avg_win, avg_loss, len(pnls)
@@ -130,7 +132,7 @@ def compute_metrics(result: BacktestResult) -> Metrics:
         sortino=round(_sortino(rets), 2),
         max_drawdown_pct=round(_max_drawdown(equity), 2),
         win_rate_pct=round(win_rate, 2),
-        profit_factor=round(profit_factor, 2) if profit_factor != float("inf") else profit_factor,
+        profit_factor=round(profit_factor, 2) if profit_factor is not None else None,
         avg_win=round(avg_win, 2),
         avg_loss=round(avg_loss, 2),
         exposure_pct=round(exposure, 2),

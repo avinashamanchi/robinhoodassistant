@@ -29,6 +29,10 @@ class ChatIn(BaseModel):
     message: str
 
 
+class BacktestRunIn(BaseModel):
+    symbols: list[str] = []
+
+
 def build_default_stack() -> tuple[TradingService, Agent]:
     from ..broker.factory import build_broker, build_clock
 
@@ -107,4 +111,72 @@ def create_app(
     def killswitch_reset():
         return service.reset_killswitch()
 
+    # ── backtests (Phase 7) ────────────────────────────────────
+    @app.get("/backtests")
+    def list_backtests():
+        return {"backtests": _list_backtests(service.session_factory)}
+
+    @app.post("/backtests/run")
+    def run_backtest_endpoint(body: BacktestRunIn):
+        from ..backtest.runner import run_synthetic_backtest
+
+        run_id, report = run_synthetic_backtest(
+            service.session_factory, symbols=body.symbols or None
+        )
+        return {"run_id": run_id, "report": report.to_dict()}
+
+    @app.get("/backtests/{run_id}/report")
+    def backtest_report(run_id: int):
+        report = _load_backtest_report(service.session_factory, run_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return report
+
+    @app.get("/backtests/ui", response_class=HTMLResponse)
+    def backtests_ui() -> str:
+        return (_STATIC / "backtests.html").read_text(encoding="utf-8")
+
     return app
+
+
+# ── backtest DB helpers ────────────────────────────────────────
+def _list_backtests(session_factory) -> list[dict]:
+    from sqlalchemy import select
+
+    from ..db.models import BacktestRun
+
+    with session_factory() as s:
+        runs = s.execute(select(BacktestRun).order_by(BacktestRun.id.desc())).scalars().all()
+        return [
+            {
+                "run_id": r.id,
+                "label": r.label,
+                "created_at": r.created_at.isoformat(),
+                "holdout_start": r.holdout_start.isoformat() if r.holdout_start else None,
+            }
+            for r in runs
+        ]
+
+
+def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
+    import json
+
+    from sqlalchemy import select
+
+    from ..backtest.report import SIMULATED_LABEL
+    from ..db.models import BacktestMetricRow, BacktestRun
+
+    with session_factory() as s:
+        run = s.get(BacktestRun, run_id)
+        if run is None:
+            return None
+        rows = s.execute(
+            select(BacktestMetricRow).where(BacktestMetricRow.run_id == run_id)
+        ).scalars().all()
+        return {
+            "run_id": run.id,
+            "label": run.label,
+            "holdout_start": run.holdout_start.isoformat() if run.holdout_start else None,
+            "disclaimer": SIMULATED_LABEL,
+            "rows": [json.loads(r.metrics_json) for r in rows],
+        }

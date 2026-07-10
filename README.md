@@ -19,6 +19,46 @@ Built in phases (see `docs/superpowers/specs/`):
   with execution-time risk re-check, rate limiting, single-page UI.
 - **Phase 4** — monitoring daemon + conditional rules + Telegram.
 - **Phase 5** — hardening.
+- **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
+  backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
+  synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop
+  backtesting is deferred until the Phase 6 analyst exists.
+
+## Backtesting (Phase 7)
+
+Deterministic indicators are computed in code (`signals/`); the LLM only ever
+*interprets* a `MarketFeatures` bundle. Baseline strategies (`strategies/`) and the
+harness (`backtest/`) benchmark everything against buy-and-hold.
+
+```bash
+# Run a synthetic walk-forward (no credentials needed) and open the report UI:
+uv run uvicorn trading_assistant.app.main:create_app --factory --reload
+# visit http://127.0.0.1:8000/backtests/ui  → "Run new backtest"
+
+# Real data (equities + crypto), cached to parquet, adjusted for corp actions:
+#   backtest.data.download_alpaca_bars(symbol, ALPACA_API_KEY, ALPACA_SECRET_KEY)
+```
+
+**Reading the report.** Each strategy is shown side-by-side with buy-and-hold on
+the same symbol and window, with return, Sharpe, Sortino, max drawdown, win rate,
+profit factor, exposure, turnover, and **P&L attributed by regime**. The number
+that matters most is a strategy's holdout result vs buy-and-hold.
+
+**Walk-forward & holdout.** History splits into a *development* window (where any
+tuning would happen) and a **sacred holdout** — the most recent 12 months, which
+`HoldoutGuard` refuses to run parameter sweeps against and logs every access to.
+The holdout is evaluated once, never tuned on; if performance collapses there
+versus development, the strategy overfit.
+
+**Guarantees.** No-lookahead is structural — a `DataView` physically cannot return
+rows after the simulated time `t` (SPY market context flows through the same view).
+Every simulated result carries the label *"Simulated — past performance does not
+predict future results."* Backtest results never auto-enable anything.
+
+The `tests/stress/` suite regression-tests **safety** (not profit) against flash
+crashes, gap-through-stop fills, whipsaw position limits, stale-data halts,
+independent crypto/equity kill switches, stale-approval rejection, and duplicate-
+fill idempotency.
 
 ## Quickstart (Phase 1)
 
