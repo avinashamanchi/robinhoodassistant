@@ -51,6 +51,89 @@ SUBMIT_TOOL: dict[str, Any] = {
 }
 
 
+PLAN_PREAMBLE = SYSTEM_PREAMBLE + (
+    "\n\n=== TRADE PLAN RULES ===\n"
+    "Produce a full trade plan via submit_plan. Build the BEAR case with equal "
+    "effort to the bull case. State the invalidation level (where the thesis is "
+    "WRONG) BEFORE the entry logic. Entry tranches must not chase: for a long, "
+    "every tranche price is at or below the current price and ordered high→low; for "
+    "a short, at or above and low→high. The stop must be at least as tight as the "
+    "invalidation. Recommending NO_TRADE (do nothing) is a valid, often correct "
+    "output — e.g. conflicting signals in an unclear regime: return action "
+    "'no_trade' with a single nominal tranche and a thesis explaining why you are "
+    "standing aside. Never output position sizes — sizing is computed downstream."
+)
+
+_NUM = {"type": "number"}
+SUBMIT_PLAN_TOOL: dict[str, Any] = {
+    "name": "submit_plan",
+    "description": "Submit your full trade plan.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["buy", "sell", "hold", "no_trade"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "thesis": {"type": "string"},
+            "cited_concepts": {"type": "array", "items": {"type": "string"}},
+            "regime_note": {"type": "string"},
+            "earnings_note": {"type": ["string", "null"]},
+            "correlation_note": {"type": ["string", "null"]},
+            "scenarios": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "enum": ["bear", "base", "bull"]},
+                        "price_target": _NUM, "horizon_days": {"type": "integer"},
+                        "probability": _NUM,
+                    },
+                    "required": ["name", "price_target", "horizon_days", "probability"],
+                },
+            },
+            "invalidation": {
+                "type": "object",
+                "properties": {"price_level": _NUM, "rationale": {"type": "string"}},
+                "required": ["price_level", "rationale"],
+            },
+            "entry_plan": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["single", "ladder"]},
+                    "tranches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"price_level": _NUM, "fraction": _NUM},
+                            "required": ["price_level", "fraction"],
+                        },
+                    },
+                },
+                "required": ["type", "tranches"],
+            },
+            "exit_plan": {
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"price_level": _NUM, "fraction_to_sell": _NUM},
+                            "required": ["price_level", "fraction_to_sell"],
+                        },
+                    },
+                    "stop": _NUM,
+                    "trailing_stop_pct": {"type": ["number", "null"]},
+                    "time_stop_days": {"type": ["integer", "null"]},
+                },
+                "required": ["targets", "stop"],
+            },
+        },
+        "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note",
+                     "scenarios", "invalidation", "entry_plan", "exit_plan"],
+    },
+}
+
+
 class LLMBackend(Protocol):
     def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> Any: ...
 
@@ -92,6 +175,41 @@ class Analyst:
                 data["as_of"] = features.as_of
                 return AnalysisReport(**data)
         raise ValueError("analyst did not submit an analysis")
+
+    def analyze_plan(
+        self,
+        features: MarketFeatures,
+        held_symbols: Optional[list[str]] = None,
+        news: Optional[list[str]] = None,
+    ):
+        """Produce a full TradePlan (scenarios, invalidation, entry ladder, exits)."""
+        from decimal import Decimal
+
+        from .models import TradePlan
+
+        system = PLAN_PREAMBLE
+        user = self._prompt(features, held_symbols or [])
+        if news:
+            from .news import NEWS_GUARD, format_news_context
+
+            system = NEWS_GUARD + "\n\n" + PLAN_PREAMBLE
+            user = user + "\n\n" + format_news_context(news)
+
+        resp = self.backend.create(
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            tools=[SUBMIT_PLAN_TOOL],
+        )
+        for block in getattr(resp, "content", []):
+            if getattr(block, "type", None) == "tool_use" and block.name == "submit_plan":
+                data = dict(block.input)
+                data["symbol"] = features.symbol
+                data["as_of"] = features.as_of
+                data["reference_price"] = Decimal(str(features.last_close or 0))
+                plan = TradePlan(**data)
+                self._enforce_quality(plan, features)
+                return plan
+        raise ValueError("analyst did not submit a plan")
 
     @staticmethod
     def _enforce_quality(report: AnalysisReport, features: MarketFeatures) -> None:

@@ -115,6 +115,15 @@ class ExternalAccountsConfig(_Strict):
     robinhood: RobinhoodConfig = Field(default_factory=RobinhoodConfig)
 
 
+class ScreenerConfig(_Strict):
+    universe: list[str] = Field(default_factory=list)  # empty -> use risk allowlist
+    top_n: int = Field(default=10, gt=0)
+
+
+class AnalystExtrasConfig(_Strict):
+    news_enabled: bool = False
+
+
 class AppConfig(_Strict):
     trading: TradingConfig
     risk: RiskConfig
@@ -126,6 +135,8 @@ class AppConfig(_Strict):
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     # Read-only external account sources (optional).
     external_accounts: Optional[ExternalAccountsConfig] = None
+    screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
+    analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
 
 
 class Secrets(BaseSettings):

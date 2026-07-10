@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trade Plans — Trading Assistant</title>
+  <style>
+    :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
+            --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
+    *{box-sizing:border-box;} body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);}
+    header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel);}
+    header h1{font-size:16px;margin:0;font-weight:600;}
+    button{font:inherit;border:1px solid var(--line);background:#222a33;color:var(--fg);border-radius:6px;padding:6px 12px;cursor:pointer;}
+    button:hover{border-color:var(--accent);} button.approve{border-color:var(--green);color:var(--green);}
+    button.cancel{border-color:var(--red);color:var(--red);}
+    input{padding:7px 10px;background:#11151a;border:1px solid var(--line);border-radius:6px;color:var(--fg);}
+    main{max-width:1150px;margin:0 auto;padding:16px;display:grid;grid-template-columns:260px 1fr;gap:16px;}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;}
+    h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:0 0 10px;}
+    .full{grid-column:1/-1;} table{width:100%;border-collapse:collapse;} th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line);font-size:13px;}
+    th:first-child,td:first-child{text-align:left;} th{color:var(--muted);font-weight:500;}
+    .row{padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;}
+    .row:hover{border-color:var(--accent);}
+    .banner{background:#2a2417;color:var(--amber);padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;}
+    .pill{padding:2px 7px;border-radius:20px;font-size:11px;}
+    .bear{color:var(--red);} .bull{color:var(--green);} .base{color:var(--accent);}
+    .muted{color:var(--muted);font-size:12px;} .empty{color:var(--muted);font-style:italic;}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Trade Plans &amp; Screener</h1>
+    <div><a href="/" style="color:var(--accent);margin-right:12px">← Assistant</a>
+    <input id="sym" placeholder="AAPL" size="6"/>
+    <button onclick="analyze()">Analyze</button>
+    <button onclick="runScreen()">Screen</button></div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Plans</h2>
+      <div id="plans"><div class="empty">none</div></div>
+      <h2 style="margin-top:14px">Screener</h2>
+      <div id="screen"><div class="empty">click Screen</div></div>
+    </section>
+    <section class="panel">
+      <h2 id="detail-title">Plan detail</h2>
+      <div id="detail"><div class="empty">Analyze a symbol or pick a plan.</div></div>
+    </section>
+  </main>
+  <script>
+    const $=(id)=>document.getElementById(id);
+    const api=(p,o)=>fetch(p,o).then(r=>r.json());
+    const esc=(s)=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    async function refresh(){
+      const d=await api('/plans');
+      $('plans').innerHTML=(d.plans&&d.plans.length)
+        ? d.plans.map(p=>`<div class="row" onclick="showPlan(${p.plan_id})">#${p.plan_id} ${esc(p.symbol)} · ${esc(p.action)} · <span class="muted">${esc(p.status)}</span></div>`).join('')
+        : '<div class="empty">none</div>';
+    }
+    async function analyze(){
+      const sym=$('sym').value.trim().toUpperCase(); if(!sym)return;
+      $('detail').innerHTML='<div class="empty">Analyzing '+esc(sym)+'…</div>';
+      const res=await api('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
+      if(res.detail){$('detail').innerHTML='<div class="banner">'+esc(JSON.stringify(res.detail))+'</div>';return;}
+      await refresh(); showPlan(res.plan_id);
+    }
+    async function runScreen(){
+      $('screen').innerHTML='<div class="empty">screening…</div>';
+      const res=await api('/screen',{method:'POST'});
+      if(res.detail){$('screen').innerHTML='<div class="empty">'+esc(JSON.stringify(res.detail))+'</div>';return;}
+      $('screen').innerHTML=(res.candidates||[]).map(c=>
+        `<div class="row" onclick="$('sym').value='${esc(c.symbol)}';analyze()">${esc(c.symbol)} <span class="muted">${c.score>=0?'+':''}${c.score} · ${esc(c.regime||'')}</span></div>`).join('')||'<div class="empty">no candidates</div>';
+    }
+    async function showPlan(id){
+      const p=await api('/plans/'+id);
+      $('detail-title').textContent=`Plan #${p.plan_id} — ${p.symbol} (${p.status})`;
+      const pl=p.plan, sz=p.sized;
+      let h='';
+      if(p.paper_only) h+='<div class="banner">UNPROVEN — analyst under the 50-graded-calls gate: PAPER mode only.</div>';
+      h+=`<p><strong>${esc(pl.action)}</strong> · confidence ${pl.confidence} · regime note: ${esc(pl.regime_note)}</p>`;
+      h+=`<p>${esc(pl.thesis)}</p>`;
+      h+='<h2>Scenarios</h2><table><tr><th>Case</th><th>Target</th><th>Days</th><th>Prob</th></tr>'+
+         pl.scenarios.map(s=>`<tr><td class="${s.name}">${s.name}</td><td>${s.price_target}</td><td>${s.horizon_days}</td><td>${(s.probability*100).toFixed(0)}%</td></tr>`).join('')+'</table>';
+      h+=`<p class="muted">Invalidation @ ${pl.invalidation.price_level} — ${esc(pl.invalidation.rationale)}</p>`;
+      h+='<h2>Entry ladder (sized)</h2><table><tr><th>Level</th><th>Fraction</th><th>Shares</th><th>Notional</th></tr>'+
+         (sz.tranches||[]).map(t=>`<tr><td>${t.price_level}</td><td>${(t.fraction*100).toFixed(0)}%</td><td>${t.shares}</td><td>$${t.notional}</td></tr>`).join('')+
+         `</table><p class="muted">Total ${sz.total_shares} sh · risk budget $${sz.risk_budget}${sz.zero_reason?' · '+esc(sz.zero_reason):''}</p>`;
+      h+='<h2>Exits</h2><table><tr><th>Target</th><th>Sell</th></tr>'+
+         pl.exit_plan.targets.map(t=>`<tr><td>${t.price_level}</td><td>${(t.fraction_to_sell*100).toFixed(0)}%</td></tr>`).join('')+
+         `</table><p class="muted">Stop ${pl.exit_plan.stop}${pl.exit_plan.trailing_stop_pct?' · trailing '+pl.exit_plan.trailing_stop_pct+'%':''}${pl.exit_plan.time_stop_days?' · time stop '+pl.exit_plan.time_stop_days+'d':''}</p>`;
+      if(p.status==='proposed') h+=`<div class="row" style="border:none"><button class="approve" onclick="approve(${p.plan_id})">Approve → arm rules</button> <button class="cancel" onclick="cancelPlan(${p.plan_id})">Cancel</button></div>`;
+      $('detail').innerHTML=h;
+    }
+    async function approve(id){const r=await api('/plans/'+id+'/approve',{method:'POST'});if(r.detail)alert(JSON.stringify(r.detail));await refresh();showPlan(id);}
+    async function cancelPlan(id){await api('/plans/'+id+'/cancel',{method:'POST'});await refresh();showPlan(id);}
+    refresh();
+  </script>
+</body>
+</html>

@@ -286,6 +286,19 @@ class AnalysisReportRow(Base):
     )
 
 
+class TradePlanRow(Base):
+    __tablename__ = "trade_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    action: Mapped[str] = mapped_column(String(10))
+    status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed|approved|canceled
+    paper_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    plan_json: Mapped[str] = mapped_column(Text)      # full TradePlan
+    sized_json: Mapped[str] = mapped_column(Text)     # SizedTradePlan
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
 class GradedCallRow(Base):
     __tablename__ = "graded_calls"
 

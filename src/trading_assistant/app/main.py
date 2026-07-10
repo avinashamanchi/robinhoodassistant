@@ -33,6 +33,10 @@ class BacktestRunIn(BaseModel):
     symbols: list[str] = []
 
 
+class AnalyzeIn(BaseModel):
+    symbol: str
+
+
 def build_default_stack() -> tuple[TradingService, Agent]:
     from ..broker.factory import build_broker, build_clock
     from ..external_accounts.factory import build_external_source
@@ -62,11 +66,34 @@ def create_app(
     service: Optional[TradingService] = None,
     agent: Optional[Agent] = None,
     *,
+    planning=None,
+    screen_source=None,
     chat_rate: RateLimiter | None = None,
     approve_rate: RateLimiter | None = None,
 ) -> FastAPI:
     if service is None or agent is None:
         service, agent = build_default_stack()
+
+    _secrets_holder: dict = {}
+    if planning is None:
+        try:
+            from ..analyst.analyst import Analyst
+            from ..analyst.live_features import build_live_feature_provider
+            from ..analyst.planning import PlanningService
+            from ..config import Secrets
+            from ..llm.factory import build_llm_backend
+
+            sec = Secrets()
+            _secrets_holder["s"] = sec
+            analyst = Analyst(
+                build_llm_backend(service.config, sec),
+                max_tokens=service.config.llm.max_tokens,
+            )
+            planning = PlanningService(
+                service, analyst, build_live_feature_provider(service.config, sec), sec
+            )
+        except Exception:  # keep the app up; plan endpoints return 503
+            planning = None
 
     chat_rate = chat_rate or RateLimiter(max_requests=20, window_seconds=60)
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
@@ -130,6 +157,61 @@ def create_app(
 
         with service.session_factory() as s:
             return promotion_status(s)
+
+    # ── plans + screener (Phase 8) ─────────────────────────────
+    def _require_planning():
+        if planning is None:
+            raise HTTPException(status_code=503, detail="analyst/planning not configured (needs LLM + market data)")
+        return planning
+
+    @app.post("/analyze")
+    def analyze(body: AnalyzeIn):
+        return _require_planning().analyze(body.symbol)
+
+    @app.get("/plans")
+    def list_plans():
+        return {"plans": _require_planning().get_plans()}
+
+    @app.get("/plans/ui", response_class=HTMLResponse)
+    def plans_ui() -> str:
+        return (_STATIC / "plans.html").read_text(encoding="utf-8")
+
+    @app.get("/plans/{plan_id}")
+    def get_plan(plan_id: int):
+        plan = _require_planning().get_plan(plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="plan not found")
+        return plan
+
+    @app.post("/plans/{plan_id}/approve")
+    def approve_plan(plan_id: int):
+        result = _require_planning().approve_plan(plan_id)
+        if "error" in result and "promotion gate" in result["error"]:
+            raise HTTPException(status_code=409, detail=result)
+        return result
+
+    @app.post("/plans/{plan_id}/cancel")
+    def cancel_plan(plan_id: int):
+        return _require_planning().cancel_plan(plan_id)
+
+    @app.post("/screen")
+    def screen():
+        nonlocal screen_source
+        from ..analyst import screener
+
+        universe = service.config.screener.universe or service.config.risk.ticker_allowlist
+        if screen_source is None:  # lazily build the live source on first call
+            sec = _secrets_holder.get("s")
+            if sec is None:
+                raise HTTPException(status_code=503, detail="screener source not configured")
+            from ..analyst.live_features import build_screen_source
+
+            screen_source = build_screen_source([s.upper() for s in universe], sec)
+        rows = screener.screen_source(
+            screen_source, [s.upper() for s in universe],
+            spy_symbol="SPY", top_n=service.config.screener.top_n,
+        )
+        return {"candidates": rows}
 
     # ── external (read-only) accounts ──────────────────────────
     @app.get("/holdings")

@@ -20,6 +20,10 @@ Built in phases (see `docs/superpowers/specs/`):
 - **Phase 4 ✅** — monitoring daemon (conditional rules, one-shot, crash-safe) + Telegram.
 - **Phase 5 ✅** — hardening: partial fills, fill idempotency, cancel/replace,
   startup reconciliation, kill-switch drill.
+- **Phase 8 ✅** — the decision layer: full `TradePlan` (bear/base/bull scenarios,
+  invalidation, entry ladder, exits), deterministic sizing, exit rule types
+  (trailing/time stops, OCO), approved-plan → pre-approved-rules autonomy path,
+  deterministic screener, `/analyze` + plans/screener UI, optional Alpaca news.
 - **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
   cited + regime-conditioned, earnings-aware), scorecard grading vs realized
   forward returns, and a 50-graded-calls promotion gate (advice only — never
