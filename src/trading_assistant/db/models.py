@@ -311,6 +311,16 @@ class GradedCallRow(Base):
     report: Mapped["AnalysisReportRow"] = relationship(back_populates="grade")
 
 
+class Heartbeat(Base):
+    """Daemon liveness marker — written each loop; read by GET /health (D3)."""
+
+    __tablename__ = "heartbeats"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(24), default="daemon")
+    at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, index=True)
+
+
 class HoldoutAccessLog(Base):
     """Audit trail: every holdout access, especially blocked sweep attempts (#1)."""
 

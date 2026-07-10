@@ -144,6 +144,10 @@ def create_app(
             raise HTTPException(status_code=429, detail="rate limit exceeded")
         return agent.chat(body.message)
 
+    @app.get("/health")
+    def health():  # no auth — for watchdogs/uptime checks
+        return service.health()
+
     @app.get("/pending")
     def pending():
         return {"pending": service.get_pending()}

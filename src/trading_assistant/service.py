@@ -385,6 +385,36 @@ class TradingService:
             s.commit()
             return {"order_id": order_id, "status": order.status}
 
+    def write_heartbeat(self, source: str = "daemon") -> None:
+        from .db.models import Heartbeat
+
+        with self.session_factory() as s:
+            s.add(Heartbeat(source=source))
+            s.commit()
+
+    def health(self) -> dict[str, Any]:
+        """Liveness for GET /health (no auth): heartbeat age, DB ok, kill switches."""
+        from sqlalchemy import select as _select
+
+        from .db.models import Heartbeat
+
+        try:
+            with self.session_factory() as s:
+                last = s.execute(
+                    _select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
+                ).scalar_one_or_none()
+                age = (utcnow() - last.at).total_seconds() if last else None
+                eq_tripped = KillSwitch.is_tripped(s, AssetClass.EQUITY)
+                cr_tripped = KillSwitch.is_tripped(s, AssetClass.CRYPTO)
+            return {
+                "db_ok": True,
+                "heartbeat_age_seconds": round(age, 1) if age is not None else None,
+                "daemon_alive": age is not None and age < 120,
+                "killswitch": {"equity": eq_tripped, "crypto": cr_tripped},
+            }
+        except Exception as exc:
+            return {"db_ok": False, "error": type(exc).__name__}
+
     def panic(self) -> dict[str, Any]:
         """PANIC: cancel open orders, disable all rules, trip all kill switches.
 

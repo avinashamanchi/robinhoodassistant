@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for the secret scan
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install (with all extras)
+        run: uv pip install --system -e '.[broker,mcp,app,analysis,external,llm,marketdata]' pytest pytest-cov pyyaml httpx
+
+      - name: Full test suite + stress
+        run: pytest -p no:cacheprovider --cov=trading_assistant --cov-report=term-missing --cov-report=xml
+
+      - name: Coverage gate — risk/ >= 85%
+        run: coverage report --include='*/risk/*' --fail-under=85
+
+      - name: Coverage gate — approval path (service) >= 85%
+        run: coverage report --include='*/service.py' --fail-under=85
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

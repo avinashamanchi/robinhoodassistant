@@ -172,6 +172,7 @@ class Monitor:
         while not (stop_event and stop_event.is_set()):
             try:
                 self.tick()
+                self.service.write_heartbeat("daemon")  # liveness for /health (D3)
                 if attempt:  # recovered — feed is healthy again
                     log.info("monitor recovered after %d failed attempt(s)", attempt)
                 attempt = 0
