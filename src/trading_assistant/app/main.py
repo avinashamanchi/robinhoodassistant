@@ -8,10 +8,12 @@ inside TradingService.approve_order.
 
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -62,17 +64,37 @@ def build_default_stack() -> tuple[TradingService, Agent]:
     return service, agent
 
 
+def _auth_dependency(token: str):
+    """Require X-API-Key on mutating endpoints (constant-time). If no token is
+    configured, auth is disabled (dev/test) — preflight flags that as a FAIL."""
+
+    def dep(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
+        if not token:
+            return
+        if x_api_key is None or not hmac.compare_digest(str(x_api_key), token):
+            raise HTTPException(status_code=401, detail="missing or invalid API key")
+
+    return dep
+
+
 def create_app(
     service: Optional[TradingService] = None,
     agent: Optional[Agent] = None,
     *,
     planning=None,
     screen_source=None,
+    api_token: Optional[str] = None,
     chat_rate: RateLimiter | None = None,
     approve_rate: RateLimiter | None = None,
 ) -> FastAPI:
     if service is None or agent is None:
         service, agent = build_default_stack()
+    if api_token is None:
+        api_token = Secrets().app_api_token
+    from ..logging import register_secret
+
+    register_secret(api_token)
+    auth = Depends(_auth_dependency(api_token))
 
     _secrets_holder: dict = {}
     if planning is None:
@@ -99,6 +121,15 @@ def create_app(
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
 
     app = FastAPI(title="Trading Assistant")
+    # Same-origin only. Cross-origin requests carrying the custom X-API-Key header
+    # must CORS-preflight; disallowed origins fail preflight -> CSRF vector closed.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
 
     def _client(request: Request) -> str:
         return request.client.host if request.client else "unknown"
@@ -107,7 +138,7 @@ def create_app(
     def index() -> str:
         return (_STATIC / "index.html").read_text(encoding="utf-8")
 
-    @app.post("/chat")
+    @app.post("/chat", dependencies=[auth])
     def chat(body: ChatIn, request: Request):
         if not chat_rate.allow(_client(request)):
             raise HTTPException(status_code=429, detail="rate limit exceeded")
@@ -117,7 +148,7 @@ def create_app(
     def pending():
         return {"pending": service.get_pending()}
 
-    @app.post("/approve/{order_id}")
+    @app.post("/approve/{order_id}", dependencies=[auth])
     def approve(order_id: int, request: Request):
         if not approve_rate.allow(_client(request)):
             raise HTTPException(status_code=429, detail="rate limit exceeded")
@@ -127,7 +158,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=result)
         return result
 
-    @app.post("/reject/{order_id}")
+    @app.post("/reject/{order_id}", dependencies=[auth])
     def reject(order_id: int):
         return service.reject_order(order_id)
 
@@ -139,17 +170,21 @@ def create_app(
     def log():
         return service.get_log()
 
-    @app.post("/killswitch/reset")
+    @app.post("/killswitch/reset", dependencies=[auth])
     def killswitch_reset():
         return service.reset_killswitch()
 
-    @app.post("/orders/{order_id}/cancel")
+    @app.post("/orders/{order_id}/cancel", dependencies=[auth])
     def cancel_order(order_id: int):
         return service.cancel_live_order(order_id)
 
-    @app.post("/reconcile")
+    @app.post("/reconcile", dependencies=[auth])
     def reconcile():
         return service.reconcile_positions()
+
+    @app.post("/panic", dependencies=[auth])
+    def panic():
+        return service.panic()
 
     @app.get("/analyst/scorecard")
     def analyst_scorecard():
@@ -164,7 +199,7 @@ def create_app(
             raise HTTPException(status_code=503, detail="analyst/planning not configured (needs LLM + market data)")
         return planning
 
-    @app.post("/analyze")
+    @app.post("/analyze", dependencies=[auth])
     def analyze(body: AnalyzeIn):
         return _require_planning().analyze(body.symbol)
 
@@ -183,18 +218,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="plan not found")
         return plan
 
-    @app.post("/plans/{plan_id}/approve")
+    @app.post("/plans/{plan_id}/approve", dependencies=[auth])
     def approve_plan(plan_id: int):
         result = _require_planning().approve_plan(plan_id)
         if "error" in result and "promotion gate" in result["error"]:
             raise HTTPException(status_code=409, detail=result)
         return result
 
-    @app.post("/plans/{plan_id}/cancel")
+    @app.post("/plans/{plan_id}/cancel", dependencies=[auth])
     def cancel_plan(plan_id: int):
         return _require_planning().cancel_plan(plan_id)
 
-    @app.post("/screen")
+    @app.post("/screen", dependencies=[auth])
     def screen():
         nonlocal screen_source
         from ..analyst import screener
@@ -232,7 +267,7 @@ def create_app(
     def list_backtests():
         return {"backtests": _list_backtests(service.session_factory)}
 
-    @app.post("/backtests/run")
+    @app.post("/backtests/run", dependencies=[auth])
     def run_backtest_endpoint(body: BacktestRunIn):
         from ..backtest.runner import run_synthetic_backtest
 

@@ -9,20 +9,18 @@
             --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
     *{box-sizing:border-box;} body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);}
     header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel);}
-    header h1{font-size:16px;margin:0;font-weight:600;}
+    header h1{font-size:16px;margin:0;font-weight:600;} a{color:var(--accent);}
     button{font:inherit;border:1px solid var(--line);background:#222a33;color:var(--fg);border-radius:6px;padding:6px 12px;cursor:pointer;}
-    button:hover{border-color:var(--accent);} button.approve{border-color:var(--green);color:var(--green);}
-    button.cancel{border-color:var(--red);color:var(--red);}
+    button:hover{border-color:var(--accent);} button.approve{border-color:var(--green);color:var(--green);} button.cancel{border-color:var(--red);color:var(--red);}
     input{padding:7px 10px;background:#11151a;border:1px solid var(--line);border-radius:6px;color:var(--fg);}
     main{max-width:1150px;margin:0 auto;padding:16px;display:grid;grid-template-columns:260px 1fr;gap:16px;}
     .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;}
-    h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:0 0 10px;}
-    .full{grid-column:1/-1;} table{width:100%;border-collapse:collapse;} th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line);font-size:13px;}
+    h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:14px 0 8px;}
+    table{width:100%;border-collapse:collapse;} th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line);font-size:13px;}
     th:first-child,td:first-child{text-align:left;} th{color:var(--muted);font-weight:500;}
-    .row{padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;}
-    .row:hover{border-color:var(--accent);}
+    .item{padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;}
+    .item:hover{border-color:var(--accent);}
     .banner{background:#2a2417;color:var(--amber);padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;}
-    .pill{padding:2px 7px;border-radius:20px;font-size:11px;}
     .bear{color:var(--red);} .bull{color:var(--green);} .base{color:var(--accent);}
     .muted{color:var(--muted);font-size:12px;} .empty{color:var(--muted);font-style:italic;}
   </style>
@@ -30,70 +28,94 @@
 <body>
   <header>
     <h1>Trade Plans &amp; Screener</h1>
-    <div><a href="/" style="color:var(--accent);margin-right:12px">← Assistant</a>
+    <div><a href="/" style="margin-right:12px">← Assistant</a>
     <input id="sym" placeholder="AAPL" size="6"/>
     <button onclick="analyze()">Analyze</button>
     <button onclick="runScreen()">Screen</button></div>
   </header>
   <main>
     <section class="panel">
-      <h2>Plans</h2>
-      <div id="plans"><div class="empty">none</div></div>
-      <h2 style="margin-top:14px">Screener</h2>
-      <div id="screen"><div class="empty">click Screen</div></div>
+      <h2 style="margin-top:0">Plans</h2><div id="plans"><div class="empty">none</div></div>
+      <h2>Screener</h2><div id="screen"><div class="empty">click Screen</div></div>
     </section>
     <section class="panel">
-      <h2 id="detail-title">Plan detail</h2>
+      <h2 id="detail-title" style="margin-top:0">Plan detail</h2>
       <div id="detail"><div class="empty">Analyze a symbol or pick a plan.</div></div>
     </section>
   </main>
   <script>
-    const $=(id)=>document.getElementById(id);
-    const api=(p,o)=>fetch(p,o).then(r=>r.json());
-    const esc=(s)=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const $ = (id) => document.getElementById(id);
+    function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
+    function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+    function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
+    async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
+    const jsonPost = (b) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 
-    async function refresh(){
-      const d=await api('/plans');
-      $('plans').innerHTML=(d.plans&&d.plans.length)
-        ? d.plans.map(p=>`<div class="row" onclick="showPlan(${p.plan_id})">#${p.plan_id} ${esc(p.symbol)} · ${esc(p.action)} · <span class="muted">${esc(p.status)}</span></div>`).join('')
-        : '<div class="empty">none</div>';
+    async function refresh() {
+      const d = await api("/plans"); const box = $("plans"); clear(box);
+      if (!(d.plans && d.plans.length)) { box.appendChild(el("div", "none", "empty")); return; }
+      d.plans.forEach((p) => {
+        const it = el("div", null, "item");
+        it.appendChild(document.createTextNode("#" + p.plan_id + " " + p.symbol + " · " + p.action + " · "));
+        it.appendChild(el("span", p.status, "muted"));
+        it.addEventListener("click", () => showPlan(p.plan_id));
+        box.appendChild(it);
+      });
     }
-    async function analyze(){
-      const sym=$('sym').value.trim().toUpperCase(); if(!sym)return;
-      $('detail').innerHTML='<div class="empty">Analyzing '+esc(sym)+'…</div>';
-      const res=await api('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
-      if(res.detail){$('detail').innerHTML='<div class="banner">'+esc(JSON.stringify(res.detail))+'</div>';return;}
+    async function analyze() {
+      const sym = $("sym").value.trim().toUpperCase(); if (!sym) return;
+      const box = $("detail"); clear(box); box.appendChild(el("div", "Analyzing " + sym + "…", "empty"));
+      const res = await api("/analyze", jsonPost({ symbol: sym }));
+      if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
       await refresh(); showPlan(res.plan_id);
     }
-    async function runScreen(){
-      $('screen').innerHTML='<div class="empty">screening…</div>';
-      const res=await api('/screen',{method:'POST'});
-      if(res.detail){$('screen').innerHTML='<div class="empty">'+esc(JSON.stringify(res.detail))+'</div>';return;}
-      $('screen').innerHTML=(res.candidates||[]).map(c=>
-        `<div class="row" onclick="$('sym').value='${esc(c.symbol)}';analyze()">${esc(c.symbol)} <span class="muted">${c.score>=0?'+':''}${c.score} · ${esc(c.regime||'')}</span></div>`).join('')||'<div class="empty">no candidates</div>';
+    async function runScreen() {
+      const box = $("screen"); clear(box); box.appendChild(el("div", "screening…", "empty"));
+      const res = await api("/screen", { method: "POST" });
+      clear(box);
+      if (res.detail) { box.appendChild(el("div", JSON.stringify(res.detail), "empty")); return; }
+      (res.candidates || []).forEach((c) => {
+        const it = el("div", null, "item");
+        it.appendChild(document.createTextNode(c.symbol + " "));
+        it.appendChild(el("span", (c.score >= 0 ? "+" : "") + c.score + " · " + (c.regime || ""), "muted"));
+        it.addEventListener("click", () => { $("sym").value = c.symbol; analyze(); });
+        box.appendChild(it);
+      });
+      if (!(res.candidates || []).length) box.appendChild(el("div", "no candidates", "empty"));
     }
-    async function showPlan(id){
-      const p=await api('/plans/'+id);
-      $('detail-title').textContent=`Plan #${p.plan_id} — ${p.symbol} (${p.status})`;
-      const pl=p.plan, sz=p.sized;
-      let h='';
-      if(p.paper_only) h+='<div class="banner">UNPROVEN — analyst under the 50-graded-calls gate: PAPER mode only.</div>';
-      h+=`<p><strong>${esc(pl.action)}</strong> · confidence ${pl.confidence} · regime note: ${esc(pl.regime_note)}</p>`;
-      h+=`<p>${esc(pl.thesis)}</p>`;
-      h+='<h2>Scenarios</h2><table><tr><th>Case</th><th>Target</th><th>Days</th><th>Prob</th></tr>'+
-         pl.scenarios.map(s=>`<tr><td class="${s.name}">${s.name}</td><td>${s.price_target}</td><td>${s.horizon_days}</td><td>${(s.probability*100).toFixed(0)}%</td></tr>`).join('')+'</table>';
-      h+=`<p class="muted">Invalidation @ ${pl.invalidation.price_level} — ${esc(pl.invalidation.rationale)}</p>`;
-      h+='<h2>Entry ladder (sized)</h2><table><tr><th>Level</th><th>Fraction</th><th>Shares</th><th>Notional</th></tr>'+
-         (sz.tranches||[]).map(t=>`<tr><td>${t.price_level}</td><td>${(t.fraction*100).toFixed(0)}%</td><td>${t.shares}</td><td>$${t.notional}</td></tr>`).join('')+
-         `</table><p class="muted">Total ${sz.total_shares} sh · risk budget $${sz.risk_budget}${sz.zero_reason?' · '+esc(sz.zero_reason):''}</p>`;
-      h+='<h2>Exits</h2><table><tr><th>Target</th><th>Sell</th></tr>'+
-         pl.exit_plan.targets.map(t=>`<tr><td>${t.price_level}</td><td>${(t.fraction_to_sell*100).toFixed(0)}%</td></tr>`).join('')+
-         `</table><p class="muted">Stop ${pl.exit_plan.stop}${pl.exit_plan.trailing_stop_pct?' · trailing '+pl.exit_plan.trailing_stop_pct+'%':''}${pl.exit_plan.time_stop_days?' · time stop '+pl.exit_plan.time_stop_days+'d':''}</p>`;
-      if(p.status==='proposed') h+=`<div class="row" style="border:none"><button class="approve" onclick="approve(${p.plan_id})">Approve → arm rules</button> <button class="cancel" onclick="cancelPlan(${p.plan_id})">Cancel</button></div>`;
-      $('detail').innerHTML=h;
+    function metricTable(headers, rows) {
+      const t = el("table"); const hr = el("tr"); headers.forEach((h) => hr.appendChild(el("th", h))); t.appendChild(hr);
+      rows.forEach((cells) => { const tr = el("tr"); cells.forEach((c, i) => tr.appendChild(el("td", c[0], c[1]))); t.appendChild(tr); });
+      return t;
     }
-    async function approve(id){const r=await api('/plans/'+id+'/approve',{method:'POST'});if(r.detail)alert(JSON.stringify(r.detail));await refresh();showPlan(id);}
-    async function cancelPlan(id){await api('/plans/'+id+'/cancel',{method:'POST'});await refresh();showPlan(id);}
+    async function showPlan(id) {
+      const p = await api("/plans/" + id);
+      $("detail-title").textContent = "Plan #" + p.plan_id + " — " + p.symbol + " (" + p.status + ")";
+      const box = $("detail"); clear(box);
+      const pl = p.plan, sz = p.sized;
+      if (p.paper_only) box.appendChild(el("div", "UNPROVEN — analyst under the 50-graded-calls gate: PAPER mode only.", "banner"));
+      box.appendChild(el("p", pl.action.toUpperCase() + " · confidence " + pl.confidence + " · regime: " + pl.regime_note));
+      box.appendChild(el("p", pl.thesis));
+      box.appendChild(el("h2", "Scenarios"));
+      box.appendChild(metricTable(["Case", "Target", "Days", "Prob"],
+        pl.scenarios.map((s) => [[s.name, s.name], [s.price_target], [s.horizon_days], [(s.probability * 100).toFixed(0) + "%"]])));
+      box.appendChild(el("p", "Invalidation @ " + pl.invalidation.price_level + " — " + pl.invalidation.rationale, "muted"));
+      box.appendChild(el("h2", "Entry ladder (sized)"));
+      box.appendChild(metricTable(["Level", "Fraction", "Shares", "Notional"],
+        (sz.tranches || []).map((t) => [[t.price_level], [(t.fraction * 100).toFixed(0) + "%"], [t.shares], ["$" + t.notional]])));
+      box.appendChild(el("p", "Total " + sz.total_shares + " sh · risk budget $" + sz.risk_budget + (sz.zero_reason ? " · " + sz.zero_reason : ""), "muted"));
+      box.appendChild(el("h2", "Exits"));
+      box.appendChild(metricTable(["Target", "Sell"], pl.exit_plan.targets.map((t) => [[t.price_level], [(t.fraction_to_sell * 100).toFixed(0) + "%"]])));
+      box.appendChild(el("p", "Stop " + pl.exit_plan.stop + (pl.exit_plan.trailing_stop_pct ? " · trailing " + pl.exit_plan.trailing_stop_pct + "%" : "") + (pl.exit_plan.time_stop_days ? " · time stop " + pl.exit_plan.time_stop_days + "d" : ""), "muted"));
+      if (p.status === "proposed") {
+        const bar = el("div"); bar.style.marginTop = "10px";
+        const a = el("button", "Approve → arm rules", "approve"); a.addEventListener("click", () => approve(p.plan_id));
+        const c = el("button", "Cancel", "cancel"); c.style.marginLeft = "8px"; c.addEventListener("click", () => cancelPlan(p.plan_id));
+        bar.append(a, c); box.appendChild(bar);
+      }
+    }
+    async function approve(id) { const r = await api("/plans/" + id + "/approve", { method: "POST" }); if (r.detail) window.alert(JSON.stringify(r.detail)); await refresh(); showPlan(id); }
+    async function cancelPlan(id) { await api("/plans/" + id + "/cancel", { method: "POST" }); await refresh(); showPlan(id); }
     refresh();
   </script>
 </body>

@@ -11,6 +11,7 @@
     body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
     header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
     header h1 { font-size:16px; margin:0; font-weight:600; }
+    a { color:var(--accent); }
     .disclaimer { background:#2a2417; color:var(--amber); text-align:center; padding:8px; font-size:13px; border-bottom:1px solid var(--line); }
     button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg); border-radius:6px; padding:6px 12px; cursor:pointer; }
     button:hover { border-color:var(--accent); }
@@ -32,70 +33,66 @@
 <body>
   <header>
     <h1>Backtests</h1>
-    <div><a href="/" style="color:var(--accent);margin-right:12px">← Assistant</a>
+    <div><a href="/" style="margin-right:12px">← Assistant</a>
     <button onclick="run()">Run new backtest</button></div>
   </header>
-  <div class="disclaimer" id="disclaimer">Simulated — past performance does not predict future results.</div>
+  <div class="disclaimer">Simulated — past performance does not predict future results.</div>
 
   <main>
-    <section class="panel">
-      <h2>Runs</h2>
-      <div id="runs"><div class="empty">none yet</div></div>
-    </section>
-    <section class="panel">
-      <h2 id="report-title">Report</h2>
-      <div id="report"><div class="empty">Run a backtest or pick one on the left.</div></div>
-    </section>
+    <section class="panel"><h2>Runs</h2><div id="runs"><div class="empty">none yet</div></div></section>
+    <section class="panel"><h2 id="report-title">Report</h2>
+      <div id="report"><div class="empty">Run a backtest or pick one on the left.</div></div></section>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const api = (p, o) => fetch(p, o).then(r => r.json());
-    const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
+    function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+    function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
+    async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
 
     async function refreshRuns() {
-      const data = await api('/backtests');
+      const data = await api("/backtests");
+      const box = $("runs"); clear(box);
       const runs = data.backtests || [];
-      $('runs').innerHTML = runs.length
-        ? runs.map(r => `<div class="run" onclick="showReport(${r.run_id})">#${r.run_id} · ${esc(r.label)}<br><span class="regime">${r.created_at.slice(0,16).replace('T',' ')}</span></div>`).join('')
-        : '<div class="empty">none yet</div>';
+      if (!runs.length) { box.appendChild(el("div", "none yet", "empty")); return; }
+      runs.forEach((r) => {
+        const d = el("div", null, "run");
+        d.appendChild(el("div", "#" + r.run_id + " · " + r.label));
+        d.appendChild(el("span", r.created_at.slice(0, 16).replace("T", " "), "regime"));
+        d.addEventListener("click", () => showReport(r.run_id));
+        box.appendChild(d);
+      });
     }
-
     async function run() {
-      $('report').innerHTML = '<div class="empty">Running walk-forward…</div>';
-      const res = await api('/backtests/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+      const box = $("report"); clear(box); box.appendChild(el("div", "Running walk-forward…", "empty"));
+      const res = await api("/backtests/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       await refreshRuns();
-      showReport(res.run_id);
+      if (res.run_id) showReport(res.run_id);
+      else { clear(box); box.appendChild(el("div", JSON.stringify(res.detail || res), "empty")); }
     }
-
-    function metricCells(m) {
-      return `<td>${m.total_return_pct.toFixed(2)}</td><td>${m.sharpe.toFixed(2)}</td>
-              <td>${m.max_drawdown_pct.toFixed(2)}</td><td>${m.num_trades}</td><td>${m.exposure_pct.toFixed(0)}%</td>`;
-    }
-
     async function showReport(id) {
-      const rep = await api(`/backtests/${id}/report`);
-      $('report-title').textContent = `Report #${rep.run_id} — ${rep.label}`;
-      const rows = rep.rows || [];
-      let html = `<table><tr><th>symbol</th><th>strategy</th><th>window</th>
-        <th>ret%</th><th>B&H%</th><th>sharpe</th><th>maxDD%</th><th>trades</th><th>expo</th><th>beat</th></tr>`;
-      for (const r of rows) {
-        const m = r.metrics, b = r.benchmark_buy_and_hold;
-        const beat = r.beat_buy_and_hold;
-        const holdoutClass = r.window === 'holdout' ? 'win-holdout' : '';
-        html += `<tr class="${holdoutClass}"><td>${esc(r.symbol)}</td><td>${esc(r.strategy)}</td><td>${esc(r.window)}</td>
-          <td>${m.total_return_pct.toFixed(2)}</td><td>${b.total_return_pct.toFixed(2)}</td>
-          <td>${m.sharpe.toFixed(2)}</td><td>${m.max_drawdown_pct.toFixed(2)}</td>
-          <td>${m.num_trades}</td><td>${m.exposure_pct.toFixed(0)}%</td>
-          <td class="${beat?'beat-yes':'beat-no'}">${beat?'yes':'no'}</td></tr>`;
+      const rep = await api("/backtests/" + id + "/report");
+      $("report-title").textContent = "Report #" + rep.run_id + " — " + rep.label;
+      const box = $("report"); clear(box);
+      const t = el("table");
+      const hr = el("tr");
+      ["symbol","strategy","window","ret%","B&H%","sharpe","maxDD%","trades","expo","beat"].forEach((h) => hr.appendChild(el("th", h)));
+      t.appendChild(hr);
+      (rep.rows || []).forEach((r) => {
+        const m = r.metrics, b = r.benchmark_buy_and_hold, beat = r.beat_buy_and_hold;
+        const tr = el("tr", null, r.window === "holdout" ? "win-holdout" : "");
+        [r.symbol, r.strategy, r.window, m.total_return_pct.toFixed(2), b.total_return_pct.toFixed(2),
+         m.sharpe.toFixed(2), m.max_drawdown_pct.toFixed(2), m.num_trades, m.exposure_pct.toFixed(0) + "%"]
+          .forEach((v) => tr.appendChild(el("td", v)));
+        tr.appendChild(el("td", beat ? "yes" : "no", beat ? "beat-yes" : "beat-no"));
+        t.appendChild(tr);
         const reg = m.pnl_by_regime || {};
-        const regStr = Object.entries(reg).map(([k,v]) => `${k}: ${v.toFixed(0)}`).join(' · ');
-        if (regStr) html += `<tr><td></td><td colspan="9" class="regime">P&L by regime — ${esc(regStr)}</td></tr>`;
-      }
-      html += '</table>';
-      $('report').innerHTML = html;
+        const regStr = Object.entries(reg).map(([k, v]) => k + ": " + v.toFixed(0)).join(" · ");
+        if (regStr) { const rr = el("tr"); rr.appendChild(el("td", "")); const c = el("td", "P&L by regime — " + regStr, "regime"); c.colSpan = 9; rr.appendChild(c); t.appendChild(rr); }
+      });
+      box.appendChild(t);
     }
-
     refreshRuns();
   </script>
 </body>

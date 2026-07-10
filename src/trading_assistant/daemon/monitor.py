@@ -21,8 +21,10 @@ from sqlalchemy import select
 
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
+from ..risk.staleness import is_stale
 from ..service import TradingService
 from . import rules_engine
+from .backoff import next_delay
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +37,13 @@ class Monitor:
         *,
         auto_execute: bool = False,
         poll_interval_seconds: float = 15.0,
+        max_quote_age_seconds: float = 60.0,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
         self.auto_execute = auto_execute
         self.poll_interval = poll_interval_seconds
+        self.max_quote_age_seconds = max_quote_age_seconds
 
     # ── one evaluation pass (synchronous, testable) ────────────
     def _active_rules(self) -> list[dict[str, Any]]:
@@ -91,6 +95,10 @@ class Monitor:
             return len(sibs)
 
     def _fires(self, rule: dict, quote) -> bool:
+        # Staleness gate (A4): never fire on a quote older than the threshold.
+        if is_stale(quote.as_of, max_age_seconds=self.max_quote_age_seconds):
+            log.warning("rule %s skipped: quote stale (> %ss)", rule["id"], self.max_quote_age_seconds)
+            return False
         kind = rule["kind"]
         if kind == "trailing":
             pct = rule["condition"].get("trailing_stop_pct")
@@ -157,12 +165,22 @@ class Monitor:
         log.info("daemon reconcile: %s", summary)
         return summary
 
-    # ── async loop ─────────────────────────────────────────────
+    # ── async loop with exponential backoff (A4) ───────────────
     async def run(self, stop_event: Optional[asyncio.Event] = None) -> None:
         self.reconcile()
+        attempt = 0
         while not (stop_event and stop_event.is_set()):
             try:
                 self.tick()
+                if attempt:  # recovered — feed is healthy again
+                    log.info("monitor recovered after %d failed attempt(s)", attempt)
+                attempt = 0
+                await asyncio.sleep(self.poll_interval)
             except Exception:  # a bad tick must not kill the daemon
-                log.exception("monitor tick failed")
-            await asyncio.sleep(self.poll_interval)
+                attempt += 1
+                delay = next_delay(attempt)
+                log.exception(
+                    "monitor tick failed; reconnecting with backoff %.1fs (attempt %d)",
+                    delay, attempt,
+                )
+                await asyncio.sleep(delay)

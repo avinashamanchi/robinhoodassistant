@@ -39,6 +39,7 @@ def build_monitor() -> Monitor:
         build_notifier(config, secrets),
         auto_execute=config.features.auto_execute_preapproved_rules,
         poll_interval_seconds=config.daemon.poll_interval_seconds,
+        max_quote_age_seconds=config.daemon.max_quote_age_seconds,
     )
 
 

@@ -84,6 +84,7 @@ class LLMConfig(_Strict):
 class DaemonConfig(_Strict):
     poll_interval_seconds: int = Field(gt=0)
     use_websocket: bool = True
+    max_quote_age_seconds: float = Field(default=60.0, gt=0)  # staleness gate (A4)
 
 
 class FillConfig(_Strict):
@@ -149,7 +150,9 @@ class Secrets(BaseSettings):
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
     groq_api_key: str = ""
+    openrouter_api_key: str = ""
     marketstack_api_key: str = ""
+    app_api_token: str = ""       # X-API-Key required on mutating endpoints (A1)
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"

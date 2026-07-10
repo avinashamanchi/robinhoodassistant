@@ -8,36 +8,32 @@
     :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
             --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
     * { box-sizing:border-box; }
-    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
-           background:var(--bg); color:var(--fg); }
-    header { display:flex; align-items:center; justify-content:space-between;
-             padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
+    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+    header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
     header h1 { font-size:16px; margin:0; font-weight:600; }
     header .mode { color:var(--amber); font-size:12px; margin-left:10px; }
-    button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg);
-             border-radius:6px; padding:6px 12px; cursor:pointer; }
+    a { color:var(--accent); }
+    button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg); border-radius:6px; padding:6px 12px; cursor:pointer; }
     button:hover { border-color:var(--accent); }
     button.approve { border-color:var(--green); color:var(--green); }
     button.reject { border-color:var(--red); color:var(--red); }
     button.danger { border-color:var(--red); color:var(--red); }
     main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px; max-width:1100px; margin:0 auto; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-    .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
-                margin:0 0 10px; }
+    .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin:0 0 10px; }
     .full { grid-column:1 / -1; }
-    #log-box, #chat-box { height:220px; overflow-y:auto; background:#11151a; border:1px solid var(--line);
-                          border-radius:8px; padding:10px; }
+    #log-box, #chat-box { height:220px; overflow-y:auto; background:#11151a; border:1px solid var(--line); border-radius:8px; padding:10px; }
     .msg { margin-bottom:8px; }
     .msg .who { color:var(--muted); font-size:11px; }
     .msg.user .who { color:var(--accent); }
     .row { display:flex; gap:8px; margin-top:10px; }
-    .row input { flex:1; padding:8px 10px; background:#11151a; border:1px solid var(--line);
-                 border-radius:6px; color:var(--fg); }
+    .row input { flex:1; padding:8px 10px; background:#11151a; border:1px solid var(--line); border-radius:6px; color:var(--fg); }
     table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; }
     th { color:var(--muted); font-weight:500; }
     .pill { padding:2px 7px; border-radius:20px; font-size:11px; }
     .pill.proposed { background:#2a2f1c; color:var(--amber); }
+    .pill.ro { background:#2a2f1c; color:var(--amber); margin-left:6px; }
     .empty { color:var(--muted); font-style:italic; padding:8px 0; }
     .tool { color:var(--muted); font-size:12px; }
     .evt-reason { color:var(--red); }
@@ -47,8 +43,9 @@
   <header>
     <div><h1>Trading Assistant <span class="mode" id="mode">paper</span></h1></div>
     <div>
-      <a href="/plans/ui" style="color:var(--accent);margin-right:12px">Plans &amp; Screener</a>
-      <a href="/backtests/ui" style="color:var(--accent);margin-right:12px">Backtests</a>
+      <a href="/plans/ui" style="margin-right:12px">Plans &amp; Screener</a>
+      <a href="/backtests/ui" style="margin-right:12px">Backtests</a>
+      <button class="danger" onclick="panic()">Panic</button>
       <button class="danger" onclick="resetKill()">Reset kill switch</button>
     </div>
   </header>
@@ -58,119 +55,153 @@
       <h2>Assistant</h2>
       <div id="chat-box"></div>
       <div class="row">
-        <input id="chat-input" placeholder="e.g. Buy $50 of AAPL if it drops below 175"
-               onkeydown="if(event.key==='Enter')send()" />
+        <input id="chat-input" placeholder="e.g. Buy $50 of AAPL if it drops below 175" />
         <button onclick="send()">Send</button>
       </div>
     </section>
 
-    <section class="panel">
-      <h2>Pending approvals</h2>
-      <div id="pending"></div>
-    </section>
-
-    <section class="panel">
-      <h2>Positions</h2>
-      <div id="positions"></div>
-    </section>
-
+    <section class="panel"><h2>Pending approvals</h2><div id="pending"></div></section>
+    <section class="panel"><h2>Positions</h2><div id="positions"></div></section>
     <section class="panel full">
-      <h2>Combined holdings <span id="ext-stale" class="mode" style="display:none">external data stale</span></h2>
+      <h2>Combined holdings <span class="mode" id="ext-stale" style="display:none">external data stale</span></h2>
       <div id="holdings"></div>
     </section>
-
-    <section class="panel full">
-      <h2>Execution &amp; risk log</h2>
-      <div id="log-box"></div>
-    </section>
+    <section class="panel full"><h2>Execution &amp; risk log</h2><div id="log-box"></div></section>
   </main>
 
   <script>
+    // ── DOM-safe helpers: all dynamic values go through textContent, never HTML ──
     const $ = (id) => document.getElementById(id);
-    async function api(path, opts) {
+    function el(tag, text, cls) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text !== undefined && text !== null) n.textContent = String(text);
+      return n;
+    }
+    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+    function cell(text) { return el("td", text); }
+    function tableFrom(headers, rows) {
+      const t = el("table");
+      const hr = el("tr");
+      headers.forEach((h) => hr.appendChild(el("th", h)));
+      t.appendChild(hr);
+      rows.forEach((r) => t.appendChild(r));
+      return t;
+    }
+
+    // ── API token (A1): prompt once, send X-API-Key on every request ──
+    function apiKey() {
+      let t = localStorage.getItem("api_key");
+      if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); }
+      return t;
+    }
+    async function api(path, opts = {}) {
+      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
       const r = await fetch(path, opts);
       return r.json();
     }
-    function chatLine(who, text, cls='') {
-      const d = document.createElement('div');
-      d.className = 'msg ' + cls;
-      d.innerHTML = `<div class="who">${who}</div><div>${text}</div>`;
-      $('chat-box').appendChild(d);
-      $('chat-box').scrollTop = $('chat-box').scrollHeight;
+    const jsonPost = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+    function chatLine(who, text, cls) {
+      const d = el("div", null, "msg " + (cls || ""));
+      d.appendChild(el("div", who, "who"));
+      d.appendChild(el("div", text));   // textContent — literal, never parsed as HTML
+      $("chat-box").appendChild(d);
+      $("chat-box").scrollTop = $("chat-box").scrollHeight;
     }
+
     async function send() {
-      const input = $('chat-input');
+      const input = $("chat-input");
       const msg = input.value.trim();
       if (!msg) return;
-      input.value = '';
-      chatLine('you', escapeHtml(msg), 'user');
-      const res = await api('/chat', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({message: msg})
-      });
-      if (res.detail) { chatLine('system', 'Error: ' + JSON.stringify(res.detail)); }
+      input.value = "";
+      chatLine("you", msg, "user");
+      const res = await api("/chat", jsonPost({ message: msg }));
+      if (res.detail) { chatLine("system", "Error: " + JSON.stringify(res.detail)); }
       else {
-        (res.tool_calls||[]).forEach(t =>
-          chatLine('tool', `<span class="tool">→ ${t.name}(${escapeHtml(JSON.stringify(t.input))})</span>`));
-        chatLine('assistant', escapeHtml(res.reply || '(no reply)'));
+        (res.tool_calls || []).forEach((t) =>
+          chatLine("tool", "→ " + t.name + "(" + JSON.stringify(t.input) + ")"));
+        chatLine("assistant", res.reply || "(no reply)");
       }
       refresh();
     }
-    async function approve(id) { await api('/approve/'+id, {method:'POST'}); refresh(); }
-    async function reject(id)  { await api('/reject/'+id, {method:'POST'}); refresh(); }
-    async function resetKill() { await api('/killswitch/reset', {method:'POST'}); refresh(); }
+    $("chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 
-    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c =>
-      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    async function approve(id) { await api("/approve/" + id, { method: "POST" }); refresh(); }
+    async function reject(id) { await api("/reject/" + id, { method: "POST" }); refresh(); }
+    async function resetKill() { await api("/killswitch/reset", { method: "POST" }); refresh(); }
+    async function panic() {
+      if (!window.confirm("PANIC: cancel all orders, disable all rules, trip all kill switches?")) return;
+      await api("/panic", { method: "POST" }); refresh();
+    }
 
     async function refresh() {
-      const p = await api('/pending');
-      $('pending').innerHTML = (p.pending && p.pending.length)
-        ? p.pending.map(o => `
-          <div class="row" style="justify-content:space-between;align-items:center">
-            <div>
-              <strong>${o.ticker}</strong> ${o.side} ${o.order_type}
-              ${o.notional ? '$'+o.notional : o.qty+' sh'}
-              ${o.limit_price ? '@ '+o.limit_price : ''}
-              <span class="pill proposed">proposed</span>
-            </div>
-            <div>
-              <button class="approve" onclick="approve(${o.order_id})">Approve</button>
-              <button class="reject" onclick="reject(${o.order_id})">Reject</button>
-            </div>
-          </div>`).join('')
-        : '<div class="empty">No pending proposals</div>';
+      const p = await api("/pending");
+      const pend = $("pending"); clear(pend);
+      if (p.pending && p.pending.length) {
+        p.pending.forEach((o) => {
+          const row = el("div", null, "row");
+          row.style.justifyContent = "space-between";
+          row.style.alignItems = "center";
+          const left = el("div");
+          left.appendChild(el("strong", o.ticker));
+          left.appendChild(document.createTextNode(
+            " " + o.side + " " + o.order_type + " " + (o.notional ? "$" + o.notional : o.qty + " sh") +
+            (o.limit_price ? " @ " + o.limit_price : "") + " "));
+          left.appendChild(el("span", "proposed", "pill proposed"));
+          const btns = el("div");
+          const a = el("button", "Approve", "approve"); a.addEventListener("click", () => approve(o.order_id));
+          const rj = el("button", "Reject", "reject"); rj.addEventListener("click", () => reject(o.order_id));
+          btns.append(a, rj);
+          row.append(left, btns);
+          pend.appendChild(row);
+        });
+      } else { pend.appendChild(el("div", "No pending proposals", "empty")); }
 
-      const pos = await api('/positions');
-      $('positions').innerHTML = (pos.positions && pos.positions.length)
-        ? `<table><tr><th>Ticker</th><th>Qty</th><th>Avg</th><th>Last</th><th>Value</th></tr>` +
-          pos.positions.map(x => `<tr><td>${x.ticker}</td><td>${x.qty}</td>
-            <td>${x.avg_entry_price}</td><td>${x.current_price}</td><td>${x.market_value}</td></tr>`).join('') +
-          `</table>`
-        : '<div class="empty">No open positions</div>';
+      const pos = await api("/positions");
+      const posBox = $("positions"); clear(posBox);
+      if (pos.positions && pos.positions.length) {
+        const rows = pos.positions.map((x) => {
+          const tr = el("tr");
+          [x.ticker, x.qty, x.avg_entry_price, x.current_price, x.market_value].forEach((v) => tr.appendChild(cell(v)));
+          return tr;
+        });
+        posBox.appendChild(tableFrom(["Ticker", "Qty", "Avg", "Last", "Value"], rows));
+      } else { posBox.appendChild(el("div", "No open positions", "empty")); }
 
-      const h = await api('/holdings');
-      $('ext-stale').style.display = h.external_stale ? 'inline' : 'none';
-      const rows = [...(h.alpaca||[]), ...(h.external||[])];
+      const h = await api("/holdings");
+      $("ext-stale").style.display = h.external_stale ? "inline" : "none";
+      const holdBox = $("holdings"); clear(holdBox);
+      const all = [...(h.alpaca || []), ...(h.external || [])];
       const totals = h.combined_by_ticker || {};
-      $('holdings').innerHTML = rows.length
-        ? `<table><tr><th>Ticker</th><th>Source</th><th>Qty</th><th>Value</th><th>Combined</th></tr>` +
-          rows.map(x => {
-            const val = x.market_value !== undefined ? x.market_value : x.current_value;
-            const ro = x.read_only ? ' <span class="pill" style="background:#2a2f1c;color:var(--amber)">read-only</span>' : '';
-            return `<tr><td>${x.ticker}</td><td>${x.source}${ro}</td><td>${x.qty}</td>
-              <td>${val}</td><td>${totals[x.ticker] ?? ''}</td></tr>`;
-          }).join('') + `</table>`
-        : (h.external_available === false
-            ? '<div class="empty">Alpaca only — no external source enabled</div>'
-            : '<div class="empty">No holdings</div>');
+      if (all.length) {
+        const rows = all.map((x) => {
+          const tr = el("tr");
+          tr.appendChild(cell(x.ticker));
+          const src = el("td", x.source);
+          if (x.read_only) src.appendChild(el("span", "read-only", "pill ro"));
+          tr.appendChild(src);
+          tr.appendChild(cell(x.qty));
+          tr.appendChild(cell(x.market_value !== undefined ? x.market_value : x.current_value));
+          tr.appendChild(cell(totals[x.ticker] !== undefined ? totals[x.ticker] : ""));
+          return tr;
+        });
+        holdBox.appendChild(tableFrom(["Ticker", "Source", "Qty", "Value", "Combined"], rows));
+      } else {
+        holdBox.appendChild(el("div", h.external_available === false ? "Alpaca only — no external source enabled" : "No holdings", "empty"));
+      }
 
-      const log = await api('/log');
-      const evts = (log.risk_events||[]);
-      $('log-box').innerHTML = evts.length
-        ? evts.map(e => `<div class="msg"><span class="who">${e.at} · ${e.type}</span>
-            <div class="evt-reason">${escapeHtml(e.reason)}</div></div>`).join('')
-        : '<div class="empty">No risk events yet</div>';
+      const logData = await api("/log");
+      const logBox = $("log-box"); clear(logBox);
+      const evts = logData.risk_events || [];
+      if (evts.length) {
+        evts.forEach((e) => {
+          const d = el("div", null, "msg");
+          d.appendChild(el("span", e.at + " · " + e.type, "who"));
+          d.appendChild(el("div", e.reason, "evt-reason"));
+          logBox.appendChild(d);
+        });
+      } else { logBox.appendChild(el("div", "No risk events yet", "empty")); }
     }
 
     refresh();

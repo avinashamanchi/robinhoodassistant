@@ -17,7 +17,7 @@ class StubAgent:
 @pytest.fixture
 def client(make_service):
     svc = make_service()
-    return TestClient(create_app(service=svc, agent=StubAgent())), svc
+    return TestClient(create_app(service=svc, agent=StubAgent(), api_token="")), svc
 
 
 def _seed(svc, bars=420):

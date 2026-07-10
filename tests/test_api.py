@@ -27,6 +27,7 @@ def client(make_service):
     app = create_app(
         service=svc,
         agent=agent,
+        api_token="",  # auth tested separately in test_security.py
         chat_rate=RateLimiter(max_requests=2, window_seconds=60),
         approve_rate=RateLimiter(max_requests=100, window_seconds=60),
     )

@@ -385,6 +385,46 @@ class TradingService:
             s.commit()
             return {"order_id": order_id, "status": order.status}
 
+    def panic(self) -> dict[str, Any]:
+        """PANIC: cancel open orders, disable all rules, trip all kill switches.
+
+        Idempotent — a second call is a no-op on already-flat state.
+        """
+        from .db.models import Rule
+
+        with self.session_factory() as s:
+            open_orders = (
+                s.execute(
+                    select(Order).where(
+                        Order.status.in_(
+                            (OrderStatus.SUBMITTED.value, OrderStatus.PARTIALLY_FILLED.value)
+                        )
+                    )
+                ).scalars().all()
+            )
+            for o in open_orders:
+                if o.broker_order_id:
+                    try:
+                        self.broker.cancel_order(o.broker_order_id)
+                    except Exception:
+                        pass
+                OrderStateMachine.transition(o, OrderStatus.CANCELED)
+
+            rules = s.execute(select(Rule).where(Rule.state == "active")).scalars().all()
+            for r in rules:
+                r.state = "canceled"
+
+            KillSwitch.trip(s, "panic button", AssetClass.EQUITY)
+            KillSwitch.trip(s, "panic button", AssetClass.CRYPTO)
+            s.add(RiskEvent(event_type="panic", reason="panic button engaged"))
+            s.commit()
+            return {
+                "panic": True,
+                "orders_canceled": len(open_orders),
+                "rules_disabled": len(rules),
+                "killswitches_tripped": ["equity", "crypto"],
+            }
+
     def reset_killswitch(
         self, asset_class: AssetClass | str = AssetClass.EQUITY
     ) -> dict[str, Any]:

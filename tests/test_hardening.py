@@ -95,3 +95,30 @@ def test_killswitch_drill(make_service):
     svc.reset_killswitch(AssetClass.EQUITY)
     ok = svc.propose_order("AAPL", "buy", "market", notional="100")
     assert ok["status"] == "proposed"
+
+
+# ── panic button (D5) ───────────────────────────────────────────
+def test_panic_flattens_everything(make_service):
+    import json as _json
+
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.db.models import Rule
+    from trading_assistant.risk.killswitch import KillSwitch
+
+    svc = make_service()
+    oid = _submitted(svc)  # a live SUBMITTED order
+    with svc.session_factory() as s:
+        s.add(Rule(ticker="AAPL", kind="price", state="active",
+                   condition_json=_json.dumps({"price_below": 999}),
+                   action_json=_json.dumps({"side": "sell", "qty": "1"})))
+        s.commit()
+
+    res = svc.panic()
+    assert res["orders_canceled"] == 1 and res["rules_disabled"] == 1
+    with svc.session_factory() as s:
+        assert KillSwitch.is_tripped(s, AssetClass.EQUITY) is True
+        assert KillSwitch.is_tripped(s, AssetClass.CRYPTO) is True
+
+    # Idempotent: a second panic is a no-op on already-flat state.
+    res2 = svc.panic()
+    assert res2["orders_canceled"] == 0 and res2["rules_disabled"] == 0

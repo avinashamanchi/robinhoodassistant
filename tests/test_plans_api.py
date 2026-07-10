@@ -55,7 +55,7 @@ def client(make_service):
     planning = PlanningService(svc, _StubAnalyst(), provider, Secrets())
     source = DataSource({s: make_bars(300, seed=i)
                          for i, s in enumerate(["AAPL", "MSFT", "SPY"])})
-    app = create_app(service=svc, agent=_StubAgent(), planning=planning, screen_source=source)
+    app = create_app(service=svc, agent=_StubAgent(), planning=planning, screen_source=source, api_token="")
     return TestClient(app), svc
 
 
