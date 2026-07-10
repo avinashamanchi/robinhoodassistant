@@ -225,6 +225,10 @@ class Fill(Base):
     side: Mapped[str] = mapped_column(String(8))
     qty: Mapped[Decimal] = mapped_column(Numeric(20, 6))
     price: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    # Broker's fill event id — unique so a duplicated fill webhook is idempotent.
+    broker_fill_id: Mapped[Optional[str]] = mapped_column(
+        String(64), unique=True, nullable=True, index=True
+    )
     filled_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=utcnow, index=True
     )

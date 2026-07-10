@@ -17,8 +17,9 @@ Built in phases (see `docs/superpowers/specs/`):
 - **Phase 2 ✅** — `AlpacaBroker` (paper) + `AlpacaClock` + MCP server + `TradingService`.
 - **Phase 3 ✅** — FastAPI host, agentic loop (Claude tool use), human approval gate
   with execution-time risk re-check, rate limiting, single-page UI.
-- **Phase 4** — monitoring daemon + conditional rules + Telegram.
-- **Phase 5** — hardening.
+- **Phase 4 ✅** — monitoring daemon (conditional rules, one-shot, crash-safe) + Telegram.
+- **Phase 5 ✅** — hardening: partial fills, fill idempotency, cancel/replace,
+  startup reconciliation, kill-switch drill.
 - **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
   backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
   synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop
@@ -68,6 +69,22 @@ uv pip install -e '.' pytest pytest-cov pyyaml
 cp .env.example .env      # fill in when you reach Phase 2
 uv run pytest             # run the suite
 ```
+
+## Running
+
+```bash
+# API + UI (chat, approvals, positions, backtests):
+uv run uvicorn trading_assistant.app.main:create_app --factory --reload
+
+# Monitoring daemon (evaluates conditional rules against live quotes):
+uv run python -m trading_assistant.daemon.main
+```
+
+Order lifecycle is hardened: partial fills advance PARTIALLY_FILLED → FILLED,
+duplicate broker fill events are idempotent (`broker_fill_id`), `POST
+/orders/{id}/cancel` cancels live orders, `POST /reconcile` compares broker
+positions to local truth and logs drift, and the daily-loss kill switch trips
+per asset class (`enforce_daily_loss_limits`).
 
 ## Safety model
 

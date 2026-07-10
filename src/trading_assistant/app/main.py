@@ -111,6 +111,14 @@ def create_app(
     def killswitch_reset():
         return service.reset_killswitch()
 
+    @app.post("/orders/{order_id}/cancel")
+    def cancel_order(order_id: int):
+        return service.cancel_live_order(order_id)
+
+    @app.post("/reconcile")
+    def reconcile():
+        return service.reconcile_positions()
+
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")
     def list_backtests():

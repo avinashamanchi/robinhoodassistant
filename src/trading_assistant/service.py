@@ -106,8 +106,11 @@ class TradingService:
         self, session: Session, asset_class: AssetClass = AssetClass.EQUITY
     ) -> Decimal:
         rows = session.execute(select(Fill)).scalars().all()
+        # Only this asset class's fills count toward its daily boundary/limit.
         fills = [
-            FillLike(r.ticker, r.side, r.qty, r.price, r.filled_at) for r in rows
+            FillLike(r.ticker, r.side, r.qty, r.price, r.filled_at)
+            for r in rows
+            if AssetClass.for_symbol(r.ticker) is asset_class
         ]
         return realized_pnl_today(fills, asset_class=asset_class)
 
@@ -373,6 +376,152 @@ class TradingService:
             KillSwitch.reset(s, asset_class=ac)
             s.commit()
             return {"killswitch": "reset", "asset_class": ac.value, "tripped": False}
+
+    # ── hardening: fills, cancel/replace, reconcile, drills (P5) ─
+    def record_fill(
+        self,
+        order_id: int,
+        qty: str,
+        price: str,
+        broker_fill_id: Optional[str] = None,
+        ts=None,
+    ) -> dict[str, Any]:
+        """Ingest a (possibly partial) fill and advance the order lifecycle.
+
+        Idempotent on ``broker_fill_id`` — a duplicated fill event is ignored,
+        so a phantom position can't be created (Phase 7 stress scenario #7).
+        """
+        from sqlalchemy import func
+
+        with self.session_factory() as s:
+            order = s.get(Order, order_id)
+            if order is None:
+                return {"error": "not found"}
+            if broker_fill_id is not None:
+                from sqlalchemy import func as _func
+
+                dup = s.execute(
+                    select(Fill).where(Fill.broker_fill_id == broker_fill_id)
+                ).scalar_one_or_none()
+                if dup is not None:
+                    filled = s.execute(
+                        select(_func.coalesce(_func.sum(Fill.qty), 0)).where(
+                            Fill.order_id == order.id
+                        )
+                    ).scalar_one()
+                    return {
+                        "order_id": order_id,
+                        "status": order.status,
+                        "filled_qty": str(Decimal(str(filled))),
+                        "duplicate": True,
+                    }
+            if OrderStatus(order.status) not in (
+                OrderStatus.SUBMITTED,
+                OrderStatus.PARTIALLY_FILLED,
+            ):
+                return {"order_id": order_id, "status": order.status,
+                        "error": "order not open for fills"}
+
+            s.add(
+                Fill(
+                    order_id=order.id,
+                    ticker=order.ticker,
+                    side=order.side,
+                    qty=Decimal(qty),
+                    price=Decimal(price),
+                    broker_fill_id=broker_fill_id,
+                    filled_at=ts or utcnow(),
+                )
+            )
+            s.flush()
+
+            filled = s.execute(
+                select(func.coalesce(func.sum(Fill.qty), 0)).where(
+                    Fill.order_id == order.id
+                )
+            ).scalar_one()
+            filled = Decimal(str(filled))
+            target = order.qty
+            if target is None and order.notional is not None:
+                target = order.notional / Decimal(price)
+
+            if target is not None and filled >= target - Decimal("0.000001"):
+                OrderStateMachine.transition(order, OrderStatus.FILLED)
+            elif order.status == OrderStatus.SUBMITTED.value:
+                OrderStateMachine.transition(order, OrderStatus.PARTIALLY_FILLED)
+            s.commit()
+            return {
+                "order_id": order_id,
+                "status": order.status,
+                "filled_qty": str(filled),
+                "duplicate": False,
+            }
+
+    def cancel_live_order(self, order_id: int) -> dict[str, Any]:
+        """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
+        with self.session_factory() as s:
+            order = s.get(Order, order_id)
+            if order is None:
+                return {"error": "not found"}
+            if OrderStatus(order.status) not in (
+                OrderStatus.SUBMITTED,
+                OrderStatus.PARTIALLY_FILLED,
+            ):
+                return {"order_id": order_id, "status": order.status,
+                        "error": "order not cancelable in this state"}
+            if order.broker_order_id:
+                try:
+                    self.broker.cancel_order(order.broker_order_id)
+                except Exception:  # broker may have already terminated it
+                    pass
+            OrderStateMachine.transition(order, OrderStatus.CANCELED)
+            s.commit()
+            return {"order_id": order_id, "status": order.status}
+
+    def replace_order(self, order_id: int, **new_order) -> dict[str, Any]:
+        """Cancel/replace: cancel the live order, then propose a replacement."""
+        cancel = self.cancel_live_order(order_id)
+        if "error" in cancel:
+            return {"canceled": cancel, "replacement": None}
+        replacement = self.propose_order(**new_order)
+        return {"canceled": cancel, "replacement": replacement}
+
+    def reconcile_positions(self) -> dict[str, Any]:
+        """Compare broker truth to locally-derived positions; log any drift (§6)."""
+        broker_pos = {p.ticker.upper(): p.qty for p in self.broker.get_positions()}
+        local: dict[str, Decimal] = {}
+        with self.session_factory() as s:
+            for f in s.execute(select(Fill)).scalars().all():
+                delta = f.qty if f.side == "buy" else -f.qty
+                local[f.ticker.upper()] = local.get(f.ticker.upper(), Decimal(0)) + delta
+            drift = {}
+            for ticker in set(broker_pos) | set(local):
+                b = Decimal(str(broker_pos.get(ticker, 0)))
+                l = local.get(ticker, Decimal(0))
+                if b != l:
+                    drift[ticker] = {"broker": str(b), "local": str(l)}
+            if drift:
+                s.add(
+                    RiskEvent(
+                        event_type="reconciliation",
+                        reason=json.dumps(drift),
+                    )
+                )
+                s.commit()
+        return {"reconciled": not drift, "drift": drift}
+
+    def enforce_daily_loss_limits(self) -> dict[str, bool]:
+        """Trip each asset class's kill switch if its realized daily loss breached."""
+        result: dict[str, bool] = {}
+        with self.session_factory() as s:
+            for ac in (AssetClass.EQUITY, AssetClass.CRYPTO):
+                pnl = self._realized_pnl_today(s, ac)
+                tripped = KillSwitch.evaluate_daily_loss(
+                    s, pnl, self._loss_limit_for(ac), ac
+                )
+                result[ac.value] = tripped
+            s.commit()
+        return result
 
     def get_pending(self) -> list[dict[str, Any]]:
         with self.session_factory() as s:
