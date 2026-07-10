@@ -42,13 +42,24 @@ def test_no_trigger_when_condition_unmet(make_service):
     assert Monitor(svc, NullNotifier()).tick() == []
 
 
-def test_auto_execute_flag_executes(make_service):
+def test_auto_execute_requires_preapproved(make_service):
+    from trading_assistant.db.models import Rule
+
     svc = make_service()
-    _rule(svc, {"price_below": 175})
-    mon = Monitor(svc, NullNotifier(), auto_execute=True)
-    acted = mon.tick()
+    created = _rule(svc, {"price_below": 175})
+    # Ad-hoc rule (not pre-approved): flag on, but it must NOT auto-execute.
+    assert Monitor(svc, NullNotifier(), auto_execute=True).tick()[0]["executed"] is None
+    assert svc.broker.submit_calls == 0
+
+    # Mark it pre-approved (as plan approval would) -> now it auto-executes.
+    svc2 = make_service()
+    rid = _rule(svc2, {"price_below": 175})["rule_id"]
+    with svc2.session_factory() as s:
+        s.get(Rule, rid).pre_approved = True
+        s.commit()
+    acted = Monitor(svc2, NullNotifier(), auto_execute=True).tick()
     assert acted[0]["executed"]["executed"] is True
-    assert svc.broker.submit_calls == 1           # pre-approved rule executed
+    assert svc2.broker.submit_calls == 1
 
 
 def test_crash_safe_rules_persist(make_service):

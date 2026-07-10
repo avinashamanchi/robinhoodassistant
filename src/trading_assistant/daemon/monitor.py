@@ -42,11 +42,17 @@ class Monitor:
         self.poll_interval = poll_interval_seconds
 
     # ── one evaluation pass (synchronous, testable) ────────────
-    def _active_rules(self) -> list[tuple[int, str, dict, dict]]:
+    def _active_rules(self) -> list[dict[str, Any]]:
         with self.service.session_factory() as s:
             rules = s.execute(select(Rule).where(Rule.state == "active")).scalars().all()
             return [
-                (r.id, r.ticker, json.loads(r.condition_json), json.loads(r.action_json))
+                {
+                    "id": r.id, "ticker": r.ticker, "kind": r.kind,
+                    "condition": json.loads(r.condition_json),
+                    "action": json.loads(r.action_json),
+                    "hwm": r.hwm, "deadline": r.deadline,
+                    "pre_approved": r.pre_approved, "plan_id": r.plan_id,
+                }
                 for r in rules
             ]
 
@@ -60,11 +66,47 @@ class Monitor:
             s.commit()
             return True
 
+    def _persist_hwm(self, rule_id: int, hwm) -> None:
+        with self.service.session_factory() as s:
+            rule = s.get(Rule, rule_id)
+            if rule is not None:
+                rule.hwm = hwm
+                s.commit()
+
+    def _cancel_siblings(self, plan_id: int, except_id: int) -> int:
+        """OCO: atomically cancel all other active rules in the plan group."""
+        if plan_id is None:
+            return 0
+        with self.service.session_factory() as s:
+            sibs = s.execute(
+                select(Rule).where(
+                    Rule.plan_id == plan_id,
+                    Rule.state == "active",
+                    Rule.id != except_id,
+                )
+            ).scalars().all()
+            for r in sibs:
+                r.state = "canceled"
+            s.commit()
+            return len(sibs)
+
+    def _fires(self, rule: dict, quote) -> bool:
+        kind = rule["kind"]
+        if kind == "trailing":
+            pct = rule["condition"].get("trailing_stop_pct")
+            fires, new_hwm = rules_engine.update_trailing_stop(rule["hwm"], quote.last, pct)
+            self._persist_hwm(rule["id"], new_hwm)  # persist HWM every tick
+            return fires
+        if kind == "time":
+            return rules_engine.time_stop_fires(rule["deadline"])
+        return rules_engine.evaluate(rule["condition"], quote)
+
     def tick(self) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
-        for rule_id, ticker, condition, action in self._active_rules():
+        for rule in self._active_rules():
+            rule_id, ticker, action = rule["id"], rule["ticker"], rule["action"]
             quote = self.service.broker.get_quote(ticker)
-            if not rules_engine.evaluate(condition, quote):
+            if not self._fires(rule, quote):
                 continue
             # Claim the rule first so a concurrent tick can't double-fire it.
             if not self._mark_triggered(rule_id):
@@ -79,18 +121,25 @@ class Monitor:
                 limit_price=action.get("limit_price"),
             )
             self.notifier.send(
-                f"Rule {rule_id} triggered on {ticker} "
-                f"({rules_engine.describe(condition)}): proposal #{proposal['order_id']} "
-                f"[{proposal['status']}]"
+                f"Rule {rule_id} ({rule['kind']}) triggered on {ticker}: "
+                f"proposal #{proposal['order_id']} [{proposal['status']}]"
             )
 
             executed = None
-            if self.auto_execute and proposal["status"] == "proposed":
-                # Pre-approved auto-exec still passes execution-time risk checks.
+            # Only PRE-APPROVED plan rules auto-exec, and only when the flag is on;
+            # ad-hoc rules always await human approval. Execution still passes the
+            # full risk engine.
+            if self.auto_execute and rule["pre_approved"] and proposal["status"] == "proposed":
                 executed = self.service.approve_order(proposal["order_id"])
 
+            # OCO: a full-exit rule (stop/trailing/time) cancels the plan's siblings.
+            canceled = 0
+            if rule["kind"] in ("stop", "trailing", "time") and rule["plan_id"] is not None:
+                canceled = self._cancel_siblings(rule["plan_id"], rule_id)
+
             actions.append(
-                {"rule_id": rule_id, "proposal": proposal, "executed": executed}
+                {"rule_id": rule_id, "proposal": proposal, "executed": executed,
+                 "oco_canceled": canceled}
             )
         return actions
 

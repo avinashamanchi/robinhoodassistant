@@ -187,6 +187,15 @@ class Rule(Base):
     action_json: Mapped[str] = mapped_column(Text)
     state: Mapped[str] = mapped_column(String(16), default="active")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    # Phase 8: trade-plan rule groups + exit-rule state.
+    plan_id: Mapped[Optional[int]] = mapped_column(index=True, nullable=True)
+    kind: Mapped[str] = mapped_column(String(16), default="price")  # price|entry|target|stop|trailing|time
+    fraction: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    # Trailing-stop high-water mark — PERSISTED so it survives a daemon restart
+    # (an in-memory HWM would reset and silently widen the stop).
+    hwm: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    deadline: Mapped[Optional[datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    pre_approved: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class LLMDecision(Base):

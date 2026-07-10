@@ -45,7 +45,6 @@ SUBMIT_TOOL: dict[str, Any] = {
             "regime_note": {"type": "string"},
             "earnings_note": {"type": ["string", "null"]},
             "correlation_note": {"type": ["string", "null"]},
-            "size_hint": {"type": ["number", "null"]},
         },
         "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note"],
     },

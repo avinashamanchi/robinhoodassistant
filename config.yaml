@@ -16,6 +16,7 @@ risk:
   reject_when_market_closed: true    # unless order explicitly queued
   proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
   warn_on_cross_broker_concentration: true  # non-blocking WARNING only
+  per_trade_risk_pct: 0.5             # % of equity risked per trade (sizing)
 
 # Crypto risk limits — independent allowlist + kill switch (Phase 7).
 # 24/7 market: never rejected for "closed"; daily P&L boundary is UTC midnight.

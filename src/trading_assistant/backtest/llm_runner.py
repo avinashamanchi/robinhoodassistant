@@ -142,8 +142,8 @@ class AnalystStrategy(Strategy):
             AnalystAction.SELL: SignalAction.SELL,
             AnalystAction.HOLD: SignalAction.HOLD,
         }[report.action]
-        size = report.size_hint if report.size_hint is not None else report.confidence
-        return Signal(action, size_hint=size, reason=report.thesis[:80])
+        # Sizing is deterministic elsewhere; here confidence just scales the signal.
+        return Signal(action, size_hint=report.confidence, reason=report.thesis[:80])
 
 
 @dataclass

@@ -58,6 +58,8 @@ class RiskConfig(_Strict):
     # Non-blocking WARNING when combined (Alpaca + external) exposure in a ticker
     # would exceed max_position_per_ticker. Never blocks — external isn't ours.
     warn_on_cross_broker_concentration: bool = True
+    # Percent of portfolio equity risked per trade (deterministic sizing, Phase 8).
+    per_trade_risk_pct: float = Field(default=0.5, gt=0, le=100)
 
     @field_validator("ticker_allowlist")
     @classmethod
