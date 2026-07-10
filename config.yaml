@@ -1,0 +1,29 @@
+# Trading Assistant configuration (committed, non-secret).
+# The risk section is the law: it is enforced on EVERY order, server-side,
+# regardless of what the LLM requested. Unknown keys here FAIL to load (A8).
+
+trading:
+  mode: paper              # paper | live  (live ALSO requires env confirmation)
+  broker: mock             # mock | alpaca  (Phase 1 ships mock only)
+
+risk:
+  ticker_allowlist: [AAPL, MSFT, GOOGL, AMZN, NVDA]
+  max_notional_per_order: 500        # USD per single order
+  max_position_per_ticker: 2000      # USD notional held in one name
+  max_portfolio_exposure: 10000      # USD total across positions
+  daily_realized_loss_limit: 500     # USD; breach trips the kill switch
+  price_sanity_pct: 5.0              # reject limit orders >5% from last trade
+  reject_when_market_closed: true    # unless order explicitly queued
+  proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
+
+features:
+  auto_execute_preapproved_rules: false   # daemon auto-exec (Phase 4)
+  telegram_notifications: false           # (Phase 4)
+
+llm:
+  model: claude-sonnet-4-6
+  max_tokens: 4096
+
+daemon:
+  poll_interval_seconds: 15
+  use_websocket: true
