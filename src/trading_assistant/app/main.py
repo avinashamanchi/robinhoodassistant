@@ -19,7 +19,7 @@ from ..config import Secrets, load_config
 from ..db.models import create_all
 from ..db.session import create_db_engine, make_session_factory
 from ..service import TradingService
-from .agent import Agent, AnthropicBackend
+from .agent import Agent
 from .ratelimit import RateLimiter
 
 _STATIC = Path(__file__).parent / "static"
@@ -50,12 +50,11 @@ def build_default_stack() -> tuple[TradingService, Agent]:
         broker, session_factory, config, clock,
         external_source=build_external_source(config, secrets),
     )
-    backend = AnthropicBackend(
-        secrets.anthropic_api_key, config.llm.model, config.llm.max_tokens
-    )
-    agent = Agent(
-        backend, service, session_factory, config.llm.model, config.llm.max_tokens
-    )
+    from ..llm.factory import build_llm_backend
+
+    backend = build_llm_backend(config, secrets)
+    model_label = getattr(config.llm, f"{config.llm.provider}_model", config.llm.model)
+    agent = Agent(backend, service, session_factory, model_label, config.llm.max_tokens)
     return service, agent
 
 

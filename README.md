@@ -98,6 +98,19 @@ duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 positions to local truth and logs drift, and the daily-loss kill switch trips
 per asset class (`enforce_daily_loss_limits`).
 
+## LLM providers & market data
+
+The agent/analyst run on a pluggable backend (`llm/`): set `llm.provider` to
+`anthropic`, `gemini`, or `groq`, with an optional `llm.fallback_provider` that is
+tried automatically if the primary errors at call time (e.g. Gemini quota → Groq).
+Install with `uv pip install -e '.[llm]'` (google-genai + groq). Keys:
+`GEMINI_API_KEY` / `GROQ_API_KEY` / `ANTHROPIC_API_KEY` in `.env`.
+
+Historical bars come from Alpaca, **MarketStack** (equities EOD/splits/dividends —
+`MARKETSTACK_API_KEY`, cached to parquet since the free tier is ~100 req/month), or
+**CoinGecko** (crypto OHLCV, **no key required** — the recommended crypto source).
+`uv pip install -e '.[marketdata]'`.
+
 ## Robinhood (read-only external source)
 
 `external_accounts/` lets the system SEE holdings at other brokers (Robinhood) so

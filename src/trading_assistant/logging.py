@@ -30,6 +30,9 @@ def register_secret(value: str) -> None:
 # Secret-bearing attribute names on the Secrets object (Robinhood + others).
 _SECRET_ATTRS = (
     "anthropic_api_key",
+    "gemini_api_key",
+    "groq_api_key",
+    "marketstack_api_key",
     "alpaca_api_key",
     "alpaca_secret_key",
     "telegram_bot_token",

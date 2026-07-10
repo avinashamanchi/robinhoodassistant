@@ -55,7 +55,11 @@ features:
   telegram_notifications: false           # (Phase 4)
 
 llm:
-  model: claude-sonnet-4-6
+  provider: gemini            # anthropic | gemini | groq
+  fallback_provider: groq     # tried if the primary errors at call time
+  model: claude-sonnet-4-6    # used only when provider=anthropic
+  gemini_model: gemini-flash-latest
+  groq_model: llama-3.3-70b-versatile
   max_tokens: 4096
 
 daemon:

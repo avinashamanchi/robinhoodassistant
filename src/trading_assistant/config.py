@@ -71,8 +71,12 @@ class FeaturesConfig(_Strict):
 
 
 class LLMConfig(_Strict):
-    model: str
+    model: str                                   # anthropic model
     max_tokens: int = Field(gt=0)
+    provider: str = "anthropic"                  # anthropic | gemini | groq
+    fallback_provider: Optional[str] = None      # tried if primary errors at call time
+    gemini_model: str = "gemini-flash-latest"
+    groq_model: str = "llama-3.3-70b-versatile"
 
 
 class DaemonConfig(_Strict):
@@ -130,6 +134,9 @@ class Secrets(BaseSettings):
     )
 
     anthropic_api_key: str = ""
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    marketstack_api_key: str = ""
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
