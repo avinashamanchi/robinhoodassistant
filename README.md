@@ -44,6 +44,14 @@ uv run uvicorn trading_assistant.app.main:create_app --factory --reload
 #   backtest.data.download_alpaca_bars(symbol, ALPACA_API_KEY, ALPACA_SECRET_KEY)
 ```
 
+**LLM-in-the-loop.** `backtest/llm_runner.py` runs the Phase-6 analyst inside the
+harness with cost controls: **trigger-mode** (the analyst only fires on signal
+events, not every bar), a response **cache** keyed on (symbol, date, features
+hash), a hard **`max_llm_calls` budget** that aborts the run, a printed pre-run
+cost estimate, and an optional cheap-model **spot-check** against the full model.
+The analyst's calls are graded against realized forward returns and feed the
+scorecard — so you can finally compare *analyst vs buy-and-hold on the holdout*.
+
 **Reading the report.** Each strategy is shown side-by-side with buy-and-hold on
 the same symbol and window, with return, Sharpe, Sortino, max drawdown, win rate,
 profit factor, exposure, turnover, and **P&L attributed by regime**. The number
