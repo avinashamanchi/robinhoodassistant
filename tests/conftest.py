@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
-from trading_assistant.config import RiskConfig
+from trading_assistant.config import AppConfig, RiskConfig, load_config
 from trading_assistant.db.models import create_all
 from trading_assistant.db.session import create_db_engine, make_session_factory
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
@@ -26,6 +29,12 @@ def risk_config() -> RiskConfig:
         reject_when_market_closed=True,
         proposal_ttl_minutes=15,
     )
+
+
+@pytest.fixture
+def app_config() -> AppConfig:
+    """The real committed config.yaml (mock broker, default risk limits)."""
+    return load_config(REPO_ROOT / "config.yaml")
 
 
 @pytest.fixture
