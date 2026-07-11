@@ -12,7 +12,7 @@ from typing import Optional
 
 from ..config import BacktestConfig
 from ..backtest.engine import run_backtest
-from ..backtest.llm_runner import AnalystStrategy, LLMRunConfig
+from ..backtest.llm_runner import AnalystStrategy, BudgetExceeded, LLMRunConfig
 from ..backtest.metrics import compute_metrics
 from ..strategies.buy_and_hold import BuyAndHold
 from .scorecard import grade
@@ -27,8 +27,12 @@ def analyst_accuracy(
     calls = 0
     for sym in symbols:
         strat = AnalystStrategy(analyst, run_config)
-        res = run_backtest(strat, source, sym, backtest_config=BacktestConfig(),
-                           spy_symbol=spy_symbol, start=start, end=end)
+        try:
+            res = run_backtest(strat, source, sym, backtest_config=BacktestConfig(),
+                               spy_symbol=spy_symbol, start=start, end=end)
+            analyst_ret.append(compute_metrics(res).total_return_pct)
+        except BudgetExceeded:
+            pass  # cap reached — grade what we collected; skip the return metric
         calls += strat.calls
         full = source.full(sym)
         pos = {ts.to_pydatetime(): i for i, ts in enumerate(full.index)}
@@ -41,7 +45,6 @@ def analyst_accuracy(
             g = grade(report, float(fwd))
             regime = features.regime.value if features.regime else "n/a"
             graded.append((report.confidence, g.correct, regime, report.action.value))
-        analyst_ret.append(compute_metrics(res).total_return_pct)
         bnh = compute_metrics(run_backtest(BuyAndHold(), source, sym,
                               backtest_config=BacktestConfig(), start=start, end=end))
         bnh_ret.append(bnh.total_return_pct)
