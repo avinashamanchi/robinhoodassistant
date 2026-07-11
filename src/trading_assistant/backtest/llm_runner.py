@@ -116,7 +116,10 @@ class AnalystStrategy(Strategy):
             raise BudgetExceeded(
                 f"exceeded max_llm_calls={self.config.max_llm_calls}"
             )
-        report = self.analyst.analyze(features)
+        try:
+            report = self.analyst.analyze(features)
+        except Exception:  # a malformed LLM response must not abort the whole run
+            return hold("analyst error; skipped")
         self.calls += 1
         self.cache.put(features, report)
         self.reports.append((features, report))

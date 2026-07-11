@@ -54,7 +54,7 @@ external_accounts:
 features:
   auto_execute_preapproved_rules: false   # daemon auto-exec (Phase 4)
   telegram_notifications: false           # (Phase 4)
-  shadow_mode: false                      # screen+analyze+grade live, zero orders (D1)
+  shadow_mode: true                       # screen+analyze+grade live, zero orders (D1)
 
 execution:
   prefer_bracket_orders: true             # server-side OCO for single-target plans (D4)
