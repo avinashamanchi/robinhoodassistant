@@ -102,7 +102,6 @@ def create_app(
             from ..analyst.analyst import Analyst
             from ..analyst.live_features import build_live_feature_provider
             from ..analyst.planning import PlanningService
-            from ..config import Secrets
             from ..llm.factory import build_llm_backend
 
             sec = Secrets()
