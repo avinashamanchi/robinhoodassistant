@@ -38,12 +38,17 @@ class Monitor:
         auto_execute: bool = False,
         poll_interval_seconds: float = 15.0,
         max_quote_age_seconds: float = 60.0,
+        shadow=None,
+        digest_source=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
         self.auto_execute = auto_execute
         self.poll_interval = poll_interval_seconds
         self.max_quote_age_seconds = max_quote_age_seconds
+        self.shadow = shadow                 # ShadowRunner or None (D1)
+        self.digest_source = digest_source   # screen source for the digest (D2)
+        self._last_daily = None              # date of last daily-tasks run
 
     # ── one evaluation pass (synchronous, testable) ────────────
     def _active_rules(self) -> list[dict[str, Any]]:
@@ -151,6 +156,32 @@ class Monitor:
             )
         return actions
 
+    def run_daily_tasks(self, today=None) -> dict[str, Any]:
+        """Once per day: grade matured shadow calls, run a fresh shadow batch, and
+        send the morning digest. Idempotent within a day (guarded by _last_daily)."""
+        from datetime import datetime, timezone
+
+        today = today or datetime.now(timezone.utc).date()
+        if self._last_daily == today:
+            return {"ran": False}
+        self._last_daily = today
+        result: dict[str, Any] = {"ran": True}
+        if self.shadow is not None:
+            try:
+                result["shadow_graded"] = self.shadow.grade_due()
+                result["shadow_new"] = len(self.shadow.run_once())
+            except Exception:
+                log.exception("shadow tasks failed")
+        try:
+            from ..analyst.digest import compose_digest
+
+            self.notifier.send(compose_digest(self.service, shadow=self.shadow,
+                                              screen_source=self.digest_source))
+            result["digest_sent"] = True
+        except Exception:
+            log.exception("digest failed")
+        return result
+
     # ── reconciliation on restart ──────────────────────────────
     def reconcile(self) -> dict[str, int]:
         """Rules persist in the DB; report the resumable state on startup."""
@@ -172,6 +203,7 @@ class Monitor:
         while not (stop_event and stop_event.is_set()):
             try:
                 self.tick()
+                self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
                 self.service.write_heartbeat("daemon")  # liveness for /health (D3)
                 if attempt:  # recovered — feed is healthy again
                     log.info("monitor recovered after %d failed attempt(s)", attempt)

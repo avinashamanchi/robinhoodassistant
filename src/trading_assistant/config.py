@@ -70,6 +70,11 @@ class RiskConfig(_Strict):
 class FeaturesConfig(_Strict):
     auto_execute_preapproved_rules: bool = False
     telegram_notifications: bool = False
+    shadow_mode: bool = False        # D1: screen+analyze+grade live, zero orders
+
+
+class ExecutionConfig(_Strict):
+    prefer_bracket_orders: bool = True  # D4: server-side OCO for single-target plans
 
 
 class LLMConfig(_Strict):
@@ -138,6 +143,7 @@ class AppConfig(_Strict):
     external_accounts: Optional[ExternalAccountsConfig] = None
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
 
 class Secrets(BaseSettings):

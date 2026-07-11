@@ -12,6 +12,7 @@ for that class may be approved in PAPER mode only.
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Optional
@@ -19,6 +20,7 @@ from typing import Any, Callable, Optional
 from sqlalchemy import select
 
 from ..assets import AssetClass
+from ..broker.models import OrderRequest, OrderSide, OrderType
 from ..config import live_trading_enabled
 from ..db.models import Rule, TradePlanRow, utcnow
 from ..signals.models import MarketFeatures
@@ -104,16 +106,44 @@ class PlanningService:
                     "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
                 }
 
-            rules = self._decompose(plan, sized, plan_id)
+            # D4: single-tranche + single-target plans go out as a server-side
+            # bracket (survives our downtime); the ladder/trailing/time cases stay
+            # daemon-managed rules.
+            bracket = None
+            eligible = (
+                self.service.config.execution.prefer_bracket_orders
+                and len(plan.entry_plan.tranches) == 1
+                and len(plan.exit_plan.targets) == 1
+                and hasattr(self.service.broker, "submit_bracket")
+                and sized["tranches"] and Decimal(sized["tranches"][0]["shares"]) > 0
+            )
+            if eligible:
+                tr = sized["tranches"][0]
+                is_long = plan.action is PlanAction.BUY
+                order_req = OrderRequest(
+                    ticker=plan.symbol,
+                    side=OrderSide.BUY if is_long else OrderSide.SELL,
+                    order_type=OrderType.LIMIT, idempotency_key=uuid.uuid4().hex,
+                    qty=Decimal(tr["shares"]), limit_price=Decimal(str(tr["price_level"])),
+                )
+                bracket = self.service.submit_bracket_order(
+                    order_req, plan.exit_plan.targets[0].price_level, plan.exit_plan.stop
+                )
+                rules = self._decompose(plan, sized, plan_id, exits_only=True)
+            else:
+                rules = self._decompose(plan, sized, plan_id)
             for r in rules:
                 s.add(r)
             row.status = "approved"
             row.paper_only = not (live and promotable)
             s.commit()
             return {"plan_id": plan_id, "status": "approved",
-                    "rules_created": len(rules), "paper_only": row.paper_only}
+                    "rules_created": len(rules), "paper_only": row.paper_only,
+                    "bracket": bracket}
 
-    def _decompose(self, plan: TradePlan, sized: dict, plan_id: int) -> list[Rule]:
+    def _decompose(
+        self, plan: TradePlan, sized: dict, plan_id: int, exits_only: bool = False
+    ) -> list[Rule]:
         symbol = plan.symbol
         is_long = plan.action is PlanAction.BUY
         entry_side = "buy" if is_long else "sell"
@@ -121,7 +151,8 @@ class PlanningService:
         total = Decimal(sized["total_shares"])
         rules: list[Rule] = []
 
-        for t in sized["tranches"]:
+        # When a bracket handles entry+target+stop, only trailing/time remain.
+        for t in ([] if exits_only else sized["tranches"]):
             shares = Decimal(t["shares"])
             if shares <= 0:
                 continue
@@ -134,25 +165,26 @@ class PlanningService:
                 action_json=json.dumps({"side": entry_side, "qty": str(shares)}),
             ))
 
-        for tgt in plan.exit_plan.targets:
-            qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
-            if qty <= 0:
-                continue
-            cond = ({"price_above": float(tgt.price_level)} if is_long
-                    else {"price_below": float(tgt.price_level)})
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="target", pre_approved=True,
-                condition_json=json.dumps(cond),
-                action_json=json.dumps({"side": exit_side, "qty": str(qty)}),
-            ))
+        if not exits_only:
+            for tgt in plan.exit_plan.targets:
+                qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
+                if qty <= 0:
+                    continue
+                cond = ({"price_above": float(tgt.price_level)} if is_long
+                        else {"price_below": float(tgt.price_level)})
+                rules.append(Rule(
+                    ticker=symbol, plan_id=plan_id, kind="target", pre_approved=True,
+                    condition_json=json.dumps(cond),
+                    action_json=json.dumps({"side": exit_side, "qty": str(qty)}),
+                ))
 
-        stop_cond = ({"price_below": float(plan.exit_plan.stop)} if is_long
-                     else {"price_above": float(plan.exit_plan.stop)})
-        rules.append(Rule(
-            ticker=symbol, plan_id=plan_id, kind="stop", pre_approved=True,
-            condition_json=json.dumps(stop_cond),
-            action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-        ))
+            stop_cond = ({"price_below": float(plan.exit_plan.stop)} if is_long
+                         else {"price_above": float(plan.exit_plan.stop)})
+            rules.append(Rule(
+                ticker=symbol, plan_id=plan_id, kind="stop", pre_approved=True,
+                condition_json=json.dumps(stop_cond),
+                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
+            ))
 
         if plan.exit_plan.trailing_stop_pct:
             rules.append(Rule(

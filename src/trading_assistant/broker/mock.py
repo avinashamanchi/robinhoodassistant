@@ -42,6 +42,7 @@ class MockBroker(BrokerClient):
         self._orders_by_key: dict[str, OrderResult] = {}
         self._orders_by_id: dict[str, OrderResult] = {}
         self._id_counter = itertools.count(1)
+        self.brackets: list[dict] = []
 
     # ── market data ────────────────────────────────────────────
     def price_of(self, ticker: str) -> Decimal:
@@ -88,6 +89,13 @@ class MockBroker(BrokerClient):
         )
         self._orders_by_key[order.idempotency_key] = result
         self._orders_by_id[broker_id] = result
+        return result
+
+    def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
+        result = self.submit_order(order)
+        self.brackets.append(
+            {"order": order, "take_profit": take_profit, "stop_loss": stop_loss}
+        )
         return result
 
     def get_order_status(self, order_id: str) -> OrderResult:

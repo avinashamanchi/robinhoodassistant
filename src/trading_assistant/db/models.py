@@ -294,8 +294,23 @@ class TradePlanRow(Base):
     action: Mapped[str] = mapped_column(String(10))
     status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed|approved|canceled
     paper_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    shadow: Mapped[bool] = mapped_column(Boolean, default=False)  # D1 shadow-mode plan
     plan_json: Mapped[str] = mapped_column(Text)      # full TradePlan
     sized_json: Mapped[str] = mapped_column(Text)     # SizedTradePlan
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
+class ShadowCall(Base):
+    """A shadow-mode call awaiting horizon grading (D1). No order is ever placed."""
+
+    __tablename__ = "shadow_calls"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("analysis_reports.id"))
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    reference_price: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    grade_after: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    graded: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 

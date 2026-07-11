@@ -365,6 +365,37 @@ class TradingService:
                 "broker_order_id": order.broker_order_id,
             }
 
+    def submit_bracket_order(
+        self, order_req: OrderRequest, take_profit, stop_loss
+    ) -> dict[str, Any]:
+        """Risk-check then submit a server-side bracket (D4). The entry still passes
+        the risk engine; the broker holds the OCO exit so it survives our downtime."""
+        if not hasattr(self.broker, "submit_bracket"):
+            return {"error": "broker does not support bracket orders", "executed": False}
+        ac = self._asset_class(order_req.ticker)
+        with self.session_factory() as s:
+            snapshot = self.assemble_snapshot(s, [order_req.ticker], ac)
+            result = self._risk_for(ac).check(
+                order_req, snapshot,
+                killswitch_tripped=KillSwitch.is_tripped(s, ac),
+                market_open=self._clock_for(ac).is_open(),
+            )
+            if result.rejected:
+                return {"executed": False, "status": "rejected", "risk_reasons": result.reasons}
+            broker_result = self.broker.submit_bracket(order_req, take_profit, stop_loss)
+            order = Order(
+                idempotency_key=order_req.idempotency_key,
+                ticker=order_req.ticker, side=order_req.side.value,
+                order_type=order_req.order_type.value, qty=order_req.qty,
+                notional=order_req.notional, limit_price=order_req.limit_price,
+                status=OrderStatus.SUBMITTED.value,
+                broker_order_id=broker_result.broker_order_id,
+            )
+            s.add(order)
+            s.commit()
+            return {"executed": True, "bracket": True, "order_id": order.id,
+                    "broker_order_id": order.broker_order_id}
+
     def reject_order(self, order_id: int) -> dict[str, Any]:
         with self.session_factory() as s:
             order = s.get(Order, order_id)

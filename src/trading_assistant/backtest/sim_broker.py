@@ -120,6 +120,15 @@ class SimBroker(BrokerClient):
         self._orders[result.broker_order_id] = result
         return result
 
+    def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
+        """Record a server-side bracket (entry + OCO take-profit/stop). Test double."""
+        result = self.submit_order(order)
+        self.brackets.append(
+            {"order": order, "take_profit": take_profit, "stop_loss": stop_loss,
+             "broker_order_id": result.broker_order_id}
+        )
+        return result
+
     def get_order_status(self, order_id: str) -> OrderResult:
         return self._orders[order_id]
 

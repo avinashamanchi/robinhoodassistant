@@ -201,12 +201,13 @@ def estimate_llm_calls(
 
 
 # ── grading the run's calls ─────────────────────────────────────
-def _grade_reports(
+def grade_pairs(
     source: DataSource,
     symbol: str,
     reports: list[tuple[MarketFeatures, AnalysisReport]],
     horizon_bars: int,
-) -> Scorecard:
+) -> list:
+    """Return (report, grade) pairs — used for scorecard + calibration."""
     full = source.full(symbol)
     pos = {ts.to_pydatetime(): i for i, ts in enumerate(full.index)}
     closes = full["close"].to_numpy()
@@ -214,10 +215,14 @@ def _grade_reports(
     for features, report in reports:
         i = pos.get(features.as_of)
         if i is None or i + horizon_bars >= len(closes) or closes[i] == 0:
-            continue  # not enough forward data to grade yet
+            continue
         fwd = (closes[i + horizon_bars] / closes[i] - 1) * 100
         pairs.append((report, grade(report, float(fwd))))
-    return build_scorecard(pairs)
+    return pairs
+
+
+def _grade_reports(source, symbol, reports, horizon_bars) -> Scorecard:
+    return build_scorecard(grade_pairs(source, symbol, reports, horizon_bars))
 
 
 def run_llm_backtest(

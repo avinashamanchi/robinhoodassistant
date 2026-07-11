@@ -34,12 +34,38 @@ def build_monitor() -> Monitor:
         build_clock(config, secrets),
         external_source=build_external_source(config, secrets),
     )
+    shadow = None
+    screen_source = None
+    if config.features.shadow_mode:
+        from decimal import Decimal
+
+        from ..analyst.analyst import Analyst
+        from ..analyst.live_features import build_live_feature_provider, build_screen_source
+        from ..analyst.planning import PlanningService
+        from ..analyst.shadow import ShadowRunner
+        from ..llm.factory import build_llm_backend
+
+        analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens)
+        planning = PlanningService(service, analyst, build_live_feature_provider(config, secrets), secrets)
+        universe = config.screener.universe or config.risk.ticker_allowlist
+        screen_source = build_screen_source([s.upper() for s in universe], secrets)
+
+        def _price(sym: str):
+            try:
+                return Decimal(str(service.broker.get_quote(sym).last))
+            except Exception:
+                return None
+
+        shadow = ShadowRunner(service, planning, screen_source, _price, top_n=3)
+
     return Monitor(
         service,
         build_notifier(config, secrets),
         auto_execute=config.features.auto_execute_preapproved_rules,
         poll_interval_seconds=config.daemon.poll_interval_seconds,
         max_quote_age_seconds=config.daemon.max_quote_age_seconds,
+        shadow=shadow,
+        digest_source=screen_source,
     )
 
 

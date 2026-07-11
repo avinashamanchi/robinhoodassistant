@@ -146,6 +146,32 @@ class AlpacaBroker(BrokerClient):
         placed = self._trading.submit_order(order_data=request)
         return self._to_result(placed)
 
+    def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
+        """Server-side OCO bracket: entry + take-profit + stop-loss in one order."""
+        existing = self._find_by_client_id(order.idempotency_key)
+        if existing is not None:
+            return self._to_result(existing)
+        from alpaca.trading.enums import OrderClass
+        from alpaca.trading.requests import (
+            LimitOrderRequest,
+            StopLossRequest,
+            TakeProfitRequest,
+        )
+
+        side = AlpacaOrderSide.BUY if order.side is OrderSide.BUY else AlpacaOrderSide.SELL
+        req = LimitOrderRequest(
+            symbol=order.ticker.upper(),
+            qty=float(order.qty),
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=order.idempotency_key,
+            limit_price=float(order.limit_price),
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=float(take_profit)),
+            stop_loss=StopLossRequest(stop_price=float(stop_loss)),
+        )
+        return self._to_result(self._trading.submit_order(order_data=req))
+
     def get_order_status(self, order_id: str) -> OrderResult:
         return self._to_result(self._trading.get_order_by_id(order_id))
 
