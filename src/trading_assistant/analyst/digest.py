@@ -52,7 +52,7 @@ def compose_digest(service, *, shadow=None, screen_source=None) -> str:
 
     from ..analyst.store import promotion_status
     with service.session_factory() as s:
-        status = promotion_status(s)
+        status = promotion_status(s, version=service.config.analyst.version)
     sc = status["scorecard"]
     lines.append(f"Scorecard: {sc['n_calls']} graded, {sc['accuracy']:.0%} accuracy — {status['reason']}")
 

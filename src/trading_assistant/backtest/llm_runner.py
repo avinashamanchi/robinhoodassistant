@@ -148,7 +148,9 @@ class AnalystStrategy(Strategy):
             AnalystAction.HOLD: SignalAction.HOLD,
         }[report.action]
         # Sizing is deterministic elsewhere; here confidence just scales the signal.
-        return Signal(action, size_hint=report.confidence, reason=report.thesis[:80])
+        # v2: confidence is NEUTRALIZED — emitted and graded, but it never sizes or
+        # weights anything until calibration proves out. Fixed size.
+        return Signal(action, size_hint=1.0, reason=report.thesis[:80])
 
 
 @dataclass

@@ -61,15 +61,38 @@ Required in `.env`: `APP_API_TOKEN` (≥32 hex), one LLM key (`GEMINI_API_KEY` /
 - `launchd` plist (macOS) / `systemd` unit for app + daemon auto-restart.
 - Nightly backup cron: `sqlite3 trading_assistant.db ".backup ..."`, 14-day retention.
 
-## Promotion to live — MY decision, never automated
+## Analyst version + scorecard reset
 
-The system will NEVER enable live trading. Promoting the analyst toward live is a
-manual config change I make only when ALL of these hold, and I decide they hold:
+The analyst is versioned (`analyst.version`, currently **v2**). The scorecard grades
+only the current version — v1's grades never transfer to a changed analyst. To
+reset after any change to the analyst's logic or prompt, **bump `analyst.version`**
+(e.g. v2 → v3); shadow mode then grades the new version from zero.
 
-- **≥ 50 graded calls** for the asset class (the code gate), AND
-- analyst **beats buy-and-hold on the holdout** (not just dev), AND
-- **calibration** within tolerance (0.8-confidence calls win ≈ 80%), AND
-- a stretch of **shadow-mode** grades on live data agrees with the backtest.
+**v2 changes (from the first accuracy report — 51% hit, overconfident):**
+- **Suppress RANGING** — the analyst returns NO_TRADE in ranging regimes
+  (`analyst.suppress_ranging: true`). Don't take directional trades in directionless
+  markets.
+- **Confidence neutralized** — the confidence field is still emitted and graded, but
+  it sizes/weights/filters NOTHING until calibration proves out.
+
+## Promotion to live — MY pre-registered decision, never automated
+
+Decided **before** seeing v2's results (anti-goalpost-moving). Promotion is a manual
+config change I make only when ALL hold and I decide they hold:
+
+- **≥ 60 graded calls** for the asset class (code gate is ≥50; my bar is 60), AND
+- hit rate whose **confidence interval clears 50%** (not just point estimate), AND
+- **Brier < 0.25** (calibration beats no-skill), AND
+- **does not lose to buy-and-hold** over the same window.
+
+Discipline while grading: **ration holdout runs to once per major version** (iterating
+the prompt against the holdout overfits it through my own eyes); do NOT add indicators/
+data sources/second-LLM voting to chase accuracy (more parameters = more overfit — the
+fix is sample size, not inputs); do NOT read the trending-up hit rate as edge (being
+long in an uptrend is what buy-and-hold does for free).
 
 Even then, live requires BOTH `trading.mode: live` AND
-`LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`. Paper for months first.
+`LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`. Paper for months first. If v2's live
+sample looks like v1's, the honest conclusion stands: the assistant is a superb
+execution/monitoring system, the "what to buy" layer stays advisory, and an index fund
+keeps the crown.

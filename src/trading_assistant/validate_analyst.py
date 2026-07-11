@@ -56,7 +56,8 @@ def run(argv=None) -> int:
         print(f"Estimate exceeds ${COST_CONFIRM_USD}. Re-run with --yes to proceed.")
         return 2
 
-    analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens)
+    analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
+                       suppress_ranging=config.analyst.suppress_ranging)
     print("Running analyst over the holdout (this makes real LLM calls)...")
     report = analyst_accuracy(source, symbols, analyst, run_cfg, start=start, end=end)
     print(json.dumps(report, indent=2))

@@ -109,6 +109,7 @@ def create_app(
             analyst = Analyst(
                 build_llm_backend(service.config, sec),
                 max_tokens=service.config.llm.max_tokens,
+                suppress_ranging=service.config.analyst.suppress_ranging,
             )
             planning = PlanningService(
                 service, analyst, build_live_feature_provider(service.config, sec), sec
@@ -194,7 +195,7 @@ def create_app(
         from ..analyst.store import promotion_status
 
         with service.session_factory() as s:
-            return promotion_status(s)
+            return promotion_status(s, version=service.config.analyst.version)
 
     # ── plans + screener (Phase 8) ─────────────────────────────
     def _require_planning():

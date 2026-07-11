@@ -45,7 +45,8 @@ def build_monitor() -> Monitor:
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
 
-        analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens)
+        analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
+                       suppress_ranging=config.analyst.suppress_ranging)
         planning = PlanningService(service, analyst, build_live_feature_provider(config, secrets), secrets)
         universe = config.screener.universe or config.risk.ticker_allowlist
         screen_source = build_screen_source([s.upper() for s in universe], secrets)

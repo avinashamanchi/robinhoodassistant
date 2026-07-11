@@ -73,7 +73,9 @@ class ShadowRunner:
                 row = s.get(TradePlanRow, plan_id)
                 row.shadow = True
                 plan = TradePlan.model_validate_json(row.plan_json)
-                report_id = save_report(s, _base_report(plan))  # base report for the scorecard
+                report_id = save_report(
+                    s, _base_report(plan), version=self.service.config.analyst.version
+                )
                 s.add(ShadowCall(
                     report_id=report_id, symbol=plan.symbol,
                     reference_price=plan.reference_price,

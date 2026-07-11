@@ -128,6 +128,8 @@ class ScreenerConfig(_Strict):
 
 class AnalystExtrasConfig(_Strict):
     news_enabled: bool = False
+    version: str = "v2"              # tags graded calls; bump to reset the scorecard
+    suppress_ranging: bool = True    # v2: force NO_TRADE in RANGING regimes
 
 
 class AppConfig(_Strict):

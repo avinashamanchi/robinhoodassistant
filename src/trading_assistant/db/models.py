@@ -278,6 +278,7 @@ class AnalysisReportRow(Base):
     as_of: Mapped[datetime] = mapped_column(UTCDateTime())
     action: Mapped[str] = mapped_column(String(8))
     confidence: Mapped[float] = mapped_column(Numeric(6, 4))
+    analyst_version: Mapped[str] = mapped_column(String(16), default="v1", index=True)
     report_json: Mapped[str] = mapped_column(Text)      # full AnalysisReport
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 

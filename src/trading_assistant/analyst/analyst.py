@@ -139,10 +139,17 @@ class LLMBackend(Protocol):
 
 
 class Analyst:
-    def __init__(self, backend: LLMBackend, model: str = "", max_tokens: int = 1024) -> None:
+    def __init__(
+        self, backend: LLMBackend, model: str = "", max_tokens: int = 1024,
+        suppress_ranging: bool = False,
+    ) -> None:
         self.backend = backend
         self.model = model
         self.max_tokens = max_tokens
+        # v2: the accuracy report showed 16.7% hits in RANGING — don't take
+        # directional trades in directionless markets. Deterministic, not a number
+        # we curve-fit: HOLD/NO_TRADE when the regime is RANGING.
+        self.suppress_ranging = suppress_ranging
 
     def _prompt(self, features: MarketFeatures, held_symbols: list[str]) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
@@ -164,7 +171,7 @@ class Analyst:
         )
         report = self._parse(resp, features)
         self._enforce_quality(report, features)
-        return report
+        return self._apply_regime_filter(report, features)
 
     @staticmethod
     def _parse(resp: Any, features: MarketFeatures) -> AnalysisReport:
@@ -208,8 +215,19 @@ class Analyst:
                 data["reference_price"] = Decimal(str(features.last_close or 0))
                 plan = TradePlan(**data)
                 self._enforce_quality(plan, features)
-                return plan
+                return self._apply_regime_filter(plan, features)
         raise ValueError("analyst did not submit a plan")
+
+    def _apply_regime_filter(self, report, features: MarketFeatures):
+        """v2: force HOLD/NO_TRADE in RANGING regimes (deterministic post-filter)."""
+        from ..signals.models import Regime
+        from .models import AnalystAction, PlanAction, TradePlan
+
+        if self.suppress_ranging and features.regime is Regime.RANGING:
+            report.action = (
+                PlanAction.NO_TRADE if isinstance(report, TradePlan) else AnalystAction.HOLD
+            )
+        return report
 
     @staticmethod
     def _enforce_quality(report: AnalysisReport, features: MarketFeatures) -> None:

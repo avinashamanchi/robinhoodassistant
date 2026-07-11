@@ -17,12 +17,13 @@ from .promotion import can_promote
 from .scorecard import Scorecard, build_scorecard, grade
 
 
-def save_report(session: Session, report: AnalysisReport) -> int:
+def save_report(session: Session, report: AnalysisReport, version: str = "v1") -> int:
     row = AnalysisReportRow(
         symbol=report.symbol,
         as_of=report.as_of,
         action=report.action.value,
         confidence=Decimal(str(report.confidence)),
+        analyst_version=version,
         report_json=report.model_dump_json(),
     )
     session.add(row)
@@ -49,12 +50,13 @@ def grade_report(session: Session, report_id: int, forward_return_pct: float) ->
     return g
 
 
-def build_scorecard_from_db(session: Session) -> Scorecard:
-    rows = session.execute(
-        select(AnalysisReportRow, GradedCallRow).join(
-            GradedCallRow, GradedCallRow.report_id == AnalysisReportRow.id
-        )
-    ).all()
+def build_scorecard_from_db(session: Session, version: str | None = None) -> Scorecard:
+    q = select(AnalysisReportRow, GradedCallRow).join(
+        GradedCallRow, GradedCallRow.report_id == AnalysisReportRow.id
+    )
+    if version is not None:  # grade only the current analyst version (v1 != v2)
+        q = q.where(AnalysisReportRow.analyst_version == version)
+    rows = session.execute(q).all()
     pairs = [
         (
             AnalysisReport.model_validate_json(r.report_json),
@@ -69,7 +71,8 @@ def build_scorecard_from_db(session: Session) -> Scorecard:
     return build_scorecard(pairs)
 
 
-def promotion_status(session: Session) -> dict:
-    sc = build_scorecard_from_db(session)
+def promotion_status(session: Session, version: str | None = None) -> dict:
+    sc = build_scorecard_from_db(session, version=version)
     eligible, reason = can_promote(sc)
-    return {"eligible": eligible, "reason": reason, "scorecard": sc.to_dict()}
+    return {"eligible": eligible, "reason": reason, "version": version,
+            "scorecard": sc.to_dict()}
