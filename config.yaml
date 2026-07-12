@@ -4,7 +4,7 @@
 
 trading:
   mode: paper              # paper | live  (live ALSO requires env confirmation)
-  broker: mock             # mock | alpaca  (Phase 1 ships mock only)
+  broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
 
 risk:
   ticker_allowlist: [AAPL, MSFT, GOOGL, AMZN, NVDA]
@@ -13,7 +13,7 @@ risk:
   max_portfolio_exposure: 10000      # USD total across positions
   daily_realized_loss_limit: 500     # USD; breach trips the kill switch
   price_sanity_pct: 5.0              # reject limit orders >5% from last trade
-  reject_when_market_closed: true    # unless order explicitly queued
+  reject_when_market_closed: false   # false = let orders queue on Alpaca until open
   proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
   warn_on_cross_broker_concentration: true  # non-blocking WARNING only
   per_trade_risk_pct: 0.5             # % of equity risked per trade (sizing)
