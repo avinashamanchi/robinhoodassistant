@@ -205,8 +205,10 @@ class Monitor:
                 self.service.sync_open_orders()         # reconcile fills from broker
                 self.service.enforce_daily_loss_limits()  # trip kill switch on breach
                 self.tick()
-                self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
+                # Heartbeat BEFORE the slow once-a-day shadow run so liveness is
+                # immediate and a watchdog never false-alarms during the daily batch.
                 self.service.write_heartbeat("daemon")  # liveness for /health (D3)
+                self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
                 if attempt:  # recovered — feed is healthy again
                     log.info("monitor recovered after %d failed attempt(s)", attempt)
                 attempt = 0
