@@ -95,3 +95,15 @@ def test_plans_ui_served(client):
     c, _ = client
     r = c.get("/plans/ui")
     assert r.status_code == 200 and "Trade Plans" in r.text
+
+
+def test_propose_generates_plans(client):
+    c, _ = client
+    res = c.post("/propose", json={"n": 3}).json()
+    assert "proposed" in res and "UNPROVEN" in res["note"]
+    made = [p for p in res["proposed"] if "plan_id" in p]
+    assert made  # at least one plan created from the top screener candidates
+    # Those plans are now in the queue to approve.
+    plan_ids = {p["plan_id"] for p in made}
+    listed = {p["plan_id"] for p in c.get("/plans").json()["plans"]}
+    assert plan_ids <= listed

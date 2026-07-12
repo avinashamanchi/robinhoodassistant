@@ -39,6 +39,10 @@ class AnalyzeIn(BaseModel):
     symbol: str
 
 
+class ProposeIn(BaseModel):
+    n: int = 3
+
+
 def build_default_stack() -> tuple[TradingService, Agent]:
     from ..broker.factory import build_broker, build_clock
     from ..external_accounts.factory import build_external_source
@@ -233,8 +237,7 @@ def create_app(
     def cancel_plan(plan_id: int):
         return _require_planning().cancel_plan(plan_id)
 
-    @app.post("/screen", dependencies=[auth])
-    def screen():
+    def _screen_candidates(top_n: int):
         nonlocal screen_source
         from ..analyst import screener
 
@@ -246,11 +249,33 @@ def create_app(
             from ..analyst.live_features import build_screen_source
 
             screen_source = build_screen_source([s.upper() for s in universe], sec)
-        rows = screener.screen_source(
-            screen_source, [s.upper() for s in universe],
-            spy_symbol="SPY", top_n=service.config.screener.top_n,
+        return screener.screen_source(
+            screen_source, [s.upper() for s in universe], spy_symbol="SPY", top_n=top_n,
         )
-        return {"candidates": rows}
+
+    @app.post("/screen", dependencies=[auth])
+    def screen():
+        return {"candidates": _screen_candidates(service.config.screener.top_n)}
+
+    @app.post("/propose", dependencies=[auth])
+    def propose(body: ProposeIn):
+        """Screen the market and run the analyst on the top N candidates, creating
+        sized plans you can approve. The analyst is UNPROVEN — these are suggestions
+        the risk engine still gates; you approve each one."""
+        planning = _require_planning()
+        candidates = _screen_candidates(max(body.n, service.config.screener.top_n))
+        created = []
+        for c in candidates[: body.n]:
+            try:
+                out = planning.analyze(c["symbol"])
+                created.append({
+                    "plan_id": out["plan_id"], "symbol": c["symbol"],
+                    "action": out["plan"]["action"], "score": c["score"],
+                    "sized_shares": out["sized"]["total_shares"],
+                })
+            except Exception as exc:  # skip a bad candidate, keep going
+                created.append({"symbol": c["symbol"], "error": type(exc).__name__})
+        return {"proposed": created, "note": "analyst v2 is UNPROVEN — review before approving"}
 
     # ── external (read-only) accounts ──────────────────────────
     @app.get("/holdings")

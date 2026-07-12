@@ -31,7 +31,8 @@
     <div><a href="/" style="margin-right:12px">← Assistant</a>
     <input id="sym" placeholder="AAPL" size="6"/>
     <button onclick="analyze()">Analyze</button>
-    <button onclick="runScreen()">Screen</button></div>
+    <button onclick="runScreen()">Screen</button>
+    <button onclick="propose()" title="Screen the market + analyze the top names into plans you can approve">Generate proposals</button></div>
   </header>
   <main>
     <section class="panel">
@@ -68,6 +69,20 @@
       const res = await api("/analyze", jsonPost({ symbol: sym }));
       if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
       await refresh(); showPlan(res.plan_id);
+    }
+    async function propose() {
+      const box = $("detail"); clear(box);
+      box.appendChild(el("div", "Screening + analyzing top names (analyst v2 is UNPROVEN — review each)…", "empty"));
+      const res = await api("/propose", jsonPost({ n: 3 }));
+      if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
+      await refresh();
+      clear(box);
+      box.appendChild(el("div", "Proposals generated — pick one on the left to review and approve.", "empty"));
+      (res.proposed || []).forEach((p) => {
+        const line = p.error ? (p.symbol + " — skipped (" + p.error + ")")
+          : ("#" + p.plan_id + " " + p.symbol + " · " + p.action + " · " + p.sized_shares + " sh");
+        box.appendChild(el("div", line, "muted"));
+      });
     }
     async function runScreen() {
       const box = $("screen"); clear(box); box.appendChild(el("div", "screening…", "empty"));
