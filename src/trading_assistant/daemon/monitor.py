@@ -202,6 +202,8 @@ class Monitor:
         attempt = 0
         while not (stop_event and stop_event.is_set()):
             try:
+                self.service.sync_open_orders()         # reconcile fills from broker
+                self.service.enforce_daily_loss_limits()  # trip kill switch on breach
                 self.tick()
                 self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
                 self.service.write_heartbeat("daemon")  # liveness for /health (D3)

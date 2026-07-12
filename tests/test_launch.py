@@ -66,3 +66,36 @@ def test_order_lifecycle_propose_approve_fill(make_service):
         assert s.get(Order, oid).status == "filled"
     # The execution shows up in the log feed the UI reads.
     assert "risk_events" in svc.get_log()
+
+
+# ── fill/status sync from broker (Alpaca reconciliation) ────────
+def test_sync_ingests_fills_and_advances_status(make_service):
+    from decimal import Decimal
+
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import OrderResult, OrderStatus
+    from trading_assistant.db.models import Fill, Order
+
+    class FillableBroker(MockBroker):
+        fill = None
+        def get_order_status(self, oid):
+            r = super().get_order_status(oid)
+            if self.fill:
+                return OrderResult(r.idempotency_key, oid, OrderStatus.FILLED,
+                                   filled_qty=self.fill[0], avg_fill_price=self.fill[1])
+            return r
+
+    broker = FillableBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
+    svc.approve_order(oid)                      # -> SUBMITTED with broker_order_id
+
+    broker.fill = (Decimal("4"), Decimal("100"))
+    r = svc.sync_open_orders()
+    assert r["newly_filled"] == 1
+    with svc.session_factory() as s:
+        assert s.get(Order, oid).status == "filled"
+        assert s.execute(select(func.count()).select_from(Fill)).scalar_one() == 1
+    # Idempotent — nothing left open to sync, no duplicate fill.
+    assert svc.sync_open_orders()["synced"] == 0

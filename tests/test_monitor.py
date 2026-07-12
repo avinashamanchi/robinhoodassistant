@@ -70,3 +70,15 @@ def test_crash_safe_rules_persist(make_service):
     mon2 = Monitor(svc2, NullNotifier())
     assert mon2.reconcile()["active"] == 1        # rule survived the "restart"
     assert len(mon2.tick()) == 1
+
+
+def test_daemon_loop_body_runs_clean(make_service):
+    # One full loop body: fill sync + daily-loss enforcement + rule tick + daily tasks.
+    svc = make_service()
+    mon = Monitor(svc, NullNotifier())
+    svc.sync_open_orders()
+    svc.enforce_daily_loss_limits()
+    mon.tick()
+    mon.run_daily_tasks()
+    svc.write_heartbeat("daemon")
+    assert svc.health()["db_ok"] is True and svc.health()["daemon_alive"] is True

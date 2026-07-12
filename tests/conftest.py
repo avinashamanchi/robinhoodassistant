@@ -9,7 +9,7 @@ import pytest
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
-from trading_assistant.config import AppConfig, RiskConfig, load_config
+from trading_assistant.config import AppConfig, BrokerKind, RiskConfig, load_config
 from trading_assistant.db.models import create_all
 from trading_assistant.db.session import create_db_engine, make_session_factory
 
@@ -33,8 +33,14 @@ def risk_config() -> RiskConfig:
 
 @pytest.fixture
 def app_config() -> AppConfig:
-    """The real committed config.yaml (mock broker, default risk limits)."""
-    return load_config(REPO_ROOT / "config.yaml")
+    """The committed config.yaml, NORMALIZED to stable test defaults (mock broker,
+    reject-when-closed on) so operational config edits (e.g. switching to live
+    Alpaca paper) can never break the test baseline."""
+    cfg = load_config(REPO_ROOT / "config.yaml")
+    return cfg.model_copy(update={
+        "trading": cfg.trading.model_copy(update={"broker": BrokerKind.MOCK}),
+        "risk": cfg.risk.model_copy(update={"reject_when_market_closed": True}),
+    })
 
 
 @pytest.fixture

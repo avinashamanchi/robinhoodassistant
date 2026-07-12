@@ -190,6 +190,10 @@ def create_app(
     def reconcile():
         return service.reconcile_positions()
 
+    @app.post("/sync", dependencies=[auth])
+    def sync():  # pull fills/status from the broker (also runs each daemon loop)
+        return service.sync_open_orders()
+
     @app.post("/panic", dependencies=[auth])
     def panic():
         return service.panic()

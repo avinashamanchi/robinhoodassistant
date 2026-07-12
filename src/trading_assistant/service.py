@@ -575,6 +575,59 @@ class TradingService:
                 "duplicate": False,
             }
 
+    def sync_open_orders(self) -> dict[str, Any]:
+        """Poll the broker for each live order and reconcile status + fills locally.
+
+        Closes the gap between Alpaca truth and our DB: records new fills (idempotent
+        on broker_order_id:cumulative_qty) and advances the lifecycle so realized
+        P&L, the daily-loss kill switch, and /reconcile all reflect real fills.
+        """
+        from sqlalchemy import func as _func
+
+        _STATUS_MAP = {
+            OrderStatus.FILLED: OrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED: OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.CANCELED: OrderStatus.CANCELED,
+            OrderStatus.REJECTED: OrderStatus.REJECTED,
+            OrderStatus.EXPIRED: OrderStatus.EXPIRED,
+        }
+        synced = filled = 0
+        with self.session_factory() as s:
+            open_orders = s.execute(
+                select(Order).where(
+                    Order.status.in_(
+                        (OrderStatus.SUBMITTED.value, OrderStatus.PARTIALLY_FILLED.value)
+                    ),
+                    Order.broker_order_id.isnot(None),
+                )
+            ).scalars().all()
+            for o in open_orders:
+                try:
+                    res = self.broker.get_order_status(o.broker_order_id)
+                except Exception:
+                    continue
+                synced += 1
+                recorded = Decimal(str(
+                    s.execute(
+                        select(_func.coalesce(_func.sum(Fill.qty), 0)).where(Fill.order_id == o.id)
+                    ).scalar_one()
+                ))
+                new_qty = res.filled_qty - recorded
+                if new_qty > 0 and res.avg_fill_price is not None:
+                    s.add(Fill(
+                        order_id=o.id, ticker=o.ticker, side=o.side,
+                        qty=new_qty, price=res.avg_fill_price,
+                        broker_fill_id=f"{o.broker_order_id}:{res.filled_qty}",
+                    ))
+                target = _STATUS_MAP.get(res.status)
+                if target is not None and target.value != o.status:
+                    if OrderStateMachine.can_transition(OrderStatus(o.status), target):
+                        OrderStateMachine.transition(o, target)
+                        if target is OrderStatus.FILLED:
+                            filled += 1
+            s.commit()
+        return {"synced": synced, "newly_filled": filled}
+
     def cancel_live_order(self, order_id: int) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
         with self.session_factory() as s:
