@@ -69,7 +69,9 @@ class Invalidation(_Model):
 
 class EntryPlan(_Model):
     type: Literal["single", "ladder"]
-    tranches: list[Tranche] = Field(min_length=1, max_length=4)
+    # May be empty for a HOLD/NO_TRADE plan (no entry is placed). Actionable
+    # BUY/SELL plans must have tranches — enforced in TradePlan._check.
+    tranches: list[Tranche] = Field(default_factory=list, max_length=4)
 
 
 class ExitTarget(_Model):
@@ -78,10 +80,22 @@ class ExitTarget(_Model):
 
 
 class ExitPlan(_Model):
-    targets: list[ExitTarget] = Field(min_length=1)
+    # Empty targets are allowed for non-actionable plans (see TradePlan._check).
+    targets: list[ExitTarget] = Field(default_factory=list)
     stop: Decimal
     trailing_stop_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
     time_stop_days: Optional[int] = Field(default=None, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_zero_stops(cls, data):
+        # LLMs commonly emit 0 to mean "no trailing/time stop"; treat 0 as unset
+        # so it doesn't trip the gt=0 field constraint.
+        if isinstance(data, dict):
+            for k in ("trailing_stop_pct", "time_stop_days"):
+                if data.get(k) == 0:
+                    data[k] = None
+        return data
 
 
 class TradePlan(AnalysisReport):
@@ -105,26 +119,35 @@ class TradePlan(AnalysisReport):
         if abs(sum(s.probability for s in self.scenarios) - 1.0) > 1e-3:
             raise ValueError("scenario probabilities must sum to 1.0")
 
-        entry = self.entry_plan
-        if entry.type == "ladder" and not (2 <= len(entry.tranches) <= 4):
-            raise ValueError("ladder entry requires 2-4 tranches")
-        if entry.type == "single" and len(entry.tranches) != 1:
-            raise ValueError("single entry requires exactly 1 tranche")
-        if abs(sum(t.fraction for t in entry.tranches) - 1.0) > _EPS:
-            raise ValueError("entry tranche fractions must sum to 1.0")
+        # Entry constraints only bind on ACTIONABLE plans. A HOLD/NO_TRADE never
+        # places an entry (sizing short-circuits it to 0 shares), and the LLM
+        # routinely returns a degenerate placeholder entry for those — validating
+        # it would crash the analyst on a perfectly valid "do nothing" call.
+        if self.action in (PlanAction.BUY, PlanAction.SELL):
+            entry = self.entry_plan
+            if not entry.tranches:
+                raise ValueError("actionable plan requires at least one entry tranche")
+            if not self.exit_plan.targets:
+                raise ValueError("actionable plan requires at least one exit target")
+            if entry.type == "ladder" and not (2 <= len(entry.tranches) <= 4):
+                raise ValueError("ladder entry requires 2-4 tranches")
+            if entry.type == "single" and len(entry.tranches) != 1:
+                raise ValueError("single entry requires exactly 1 tranche")
+            if abs(sum(t.fraction for t in entry.tranches) - 1.0) > _EPS:
+                raise ValueError("entry tranche fractions must sum to 1.0")
 
-        # No chasing + ordering, direction-aware.
-        levels = [t.price_level for t in entry.tranches]
-        if self.action is PlanAction.BUY:
-            if any(l > self.reference_price for l in levels):
-                raise ValueError("BUY tranches must be at or below current price")
-            if levels != sorted(levels, reverse=True):
-                raise ValueError("BUY tranches must be ordered descending")
-        elif self.action is PlanAction.SELL:
-            if any(l < self.reference_price for l in levels):
-                raise ValueError("short SELL tranches must be at or above current price")
-            if levels != sorted(levels):
-                raise ValueError("short SELL tranches must be ordered ascending")
+            # No chasing + ordering, direction-aware.
+            levels = [t.price_level for t in entry.tranches]
+            if self.action is PlanAction.BUY:
+                if any(l > self.reference_price for l in levels):
+                    raise ValueError("BUY tranches must be at or below current price")
+                if levels != sorted(levels, reverse=True):
+                    raise ValueError("BUY tranches must be ordered descending")
+            else:  # SELL
+                if any(l < self.reference_price for l in levels):
+                    raise ValueError("short SELL tranches must be at or above current price")
+                if levels != sorted(levels):
+                    raise ValueError("short SELL tranches must be ordered ascending")
 
         # Exit targets total <= 1.0.
         if sum(t.fraction_to_sell for t in self.exit_plan.targets) > 1.0 + _EPS:

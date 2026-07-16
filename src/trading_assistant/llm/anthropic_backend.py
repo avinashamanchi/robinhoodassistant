@@ -4,7 +4,7 @@ normalized shape the agent/analyst consume (content blocks + stop_reason + usage
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 
 class AnthropicBackend:
@@ -15,11 +15,17 @@ class AnthropicBackend:
         self._model = model
         self._max_tokens = max_tokens
 
-    def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> Any:
-        return self._client.messages.create(
+    def create(
+        self, *, system: str, messages: list[dict], tools: list[dict],
+        tool_choice: Optional[str] = None,
+    ) -> Any:
+        kwargs: dict[str, Any] = dict(
             model=self._model,
             max_tokens=self._max_tokens,
             system=system,
             messages=messages,
             tools=tools,
         )
+        if tools and tool_choice == "any":
+            kwargs["tool_choice"] = {"type": "any"}
+        return self._client.messages.create(**kwargs)

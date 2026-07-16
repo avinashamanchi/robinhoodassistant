@@ -21,14 +21,33 @@ class FallbackBackend:
         self._primary = primary
         self._fallback = fallback
 
-    def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> Any:
+    def create(
+        self, *, system: str, messages: list[dict], tools: list[dict],
+        tool_choice: Optional[str] = None,
+    ) -> Any:
         try:
-            return self._primary.create(system=system, messages=messages, tools=tools)
+            resp = self._primary.create(
+                system=system, messages=messages, tools=tools, tool_choice=tool_choice
+            )
+            # A tool was REQUIRED but the primary answered in prose anyway (Gemini
+            # does this on a 200) — that is a soft failure, so switch providers.
+            if tool_choice == "any" and not _has_tool_use(resp):
+                log.warning("primary returned no tool call though one was required; falling back")
+                return self._fallback.create(
+                    system=system, messages=messages, tools=tools, tool_choice=tool_choice
+                )
+            return resp
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "primary LLM backend failed (%s); falling back", type(exc).__name__
             )
-            return self._fallback.create(system=system, messages=messages, tools=tools)
+            return self._fallback.create(
+                system=system, messages=messages, tools=tools, tool_choice=tool_choice
+            )
+
+
+def _has_tool_use(resp: Any) -> bool:
+    return any(getattr(b, "type", None) == "tool_use" for b in getattr(resp, "content", []))
 
 
 def _make_backend(provider: str, config: AppConfig, secrets: Secrets):

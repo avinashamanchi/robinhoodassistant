@@ -37,6 +37,10 @@
     .empty { color:var(--muted); font-style:italic; padding:8px 0; }
     .tool { color:var(--muted); font-size:12px; }
     .evt-reason { color:var(--red); }
+    #toast { position:fixed; right:16px; bottom:16px; max-width:380px; z-index:50; display:flex; flex-direction:column; gap:8px; }
+    .toast { padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); box-shadow:0 4px 16px rgba(0,0,0,.4); font-size:13px; }
+    .toast.ok { border-color:var(--green); }
+    .toast.err { border-color:var(--red); color:#ffd7d7; }
   </style>
 </head>
 <body>
@@ -68,6 +72,7 @@
     </section>
     <section class="panel full"><h2>Execution &amp; risk log</h2><div id="log-box"></div></section>
   </main>
+  <div id="toast"></div>
 
   <script>
     // ── DOM-safe helpers: all dynamic values go through textContent, never HTML ──
@@ -102,6 +107,33 @@
     }
     const jsonPost = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
+    // Toast feedback so actions are never silent (this is the fix for
+    // "I press approve and nothing happens").
+    function notify(msg, kind) {
+      const box = $("toast");
+      const t = el("div", msg, "toast " + (kind || ""));
+      box.appendChild(t);
+      setTimeout(() => t.remove(), kind === "err" ? 9000 : 5000);
+    }
+    // Mutating call that surfaces HTTP errors instead of swallowing them.
+    async function action(path, opts = {}) {
+      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
+      let r, data;
+      try { r = await fetch(path, opts); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
+      try { data = await r.json(); } catch (e) { data = {}; }
+      if (r.status === 401) {
+        notify("Rejected: bad/missing API token. Click to re-enter.", "err");
+        localStorage.removeItem("api_key");
+        return { ok: false, status: 401, data };
+      }
+      if (!r.ok) {
+        const d = data && data.detail !== undefined ? data.detail : data;
+        notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err");
+        return { ok: false, status: r.status, data };
+      }
+      return { ok: true, status: r.status, data };
+    }
+
     function chatLine(who, text, cls) {
       const d = el("div", null, "msg " + (cls || ""));
       d.appendChild(el("div", who, "who"));
@@ -127,12 +159,21 @@
     }
     $("chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 
-    async function approve(id) { await api("/approve/" + id, { method: "POST" }); refresh(); }
-    async function reject(id) { await api("/reject/" + id, { method: "POST" }); refresh(); }
-    async function resetKill() { await api("/killswitch/reset", { method: "POST" }); refresh(); }
+    async function approve(id) {
+      const r = await action("/approve/" + id, { method: "POST" });
+      if (r.ok) {
+        const d = r.data || {};
+        if (d.status === "rejected") notify("Order " + id + " REJECTED by risk: " + ((d.risk_reasons || []).join("; ") || "see log"), "err");
+        else if (d.executed) notify("Approved ✓ order " + id + " → " + d.status + (d.broker_order_id ? " (Alpaca " + d.broker_order_id.slice(0, 8) + ")" : ""), "ok");
+        else notify("Order " + id + ": " + (d.status || "processed"), "ok");
+      }
+      refresh();
+    }
+    async function reject(id) { const r = await action("/reject/" + id, { method: "POST" }); if (r.ok) notify("Rejected order " + id, "ok"); refresh(); }
+    async function resetKill() { const r = await action("/killswitch/reset", { method: "POST" }); if (r.ok) notify("Kill switch reset", "ok"); refresh(); }
     async function panic() {
       if (!window.confirm("PANIC: cancel all orders, disable all rules, trip all kill switches?")) return;
-      await api("/panic", { method: "POST" }); refresh();
+      const r = await action("/panic", { method: "POST" }); if (r.ok) notify("PANIC executed — everything halted", "ok"); refresh();
     }
 
     async function refresh() {

@@ -36,7 +36,7 @@ class ScriptedBackend:
         self._responses = list(responses)
         self.calls = 0
 
-    def create(self, *, system, messages, tools):
+    def create(self, *, system, messages, tools, tool_choice=None):
         self.calls += 1
         return self._responses.pop(0)
 

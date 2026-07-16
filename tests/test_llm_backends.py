@@ -138,3 +138,25 @@ def test_fallback_used_on_primary_error():
 
     fb = FallbackBackend(Boom(), OK())
     assert fb.create(system="", messages=[], tools=[]) == "fallback-result"
+
+
+def test_fallback_when_primary_returns_no_tool_call_but_one_required():
+    """Gemini can answer a 200 in prose even with tools; if a tool was REQUIRED,
+    the fallback provider must take over (this was 'analyst did not submit a plan')."""
+    from trading_assistant.llm.base import LLMResponse, TextBlock, ToolUseBlock
+
+    class ProseOnly:  # primary: no tool_use block
+        def create(self, **kw):
+            return LLMResponse(content=[TextBlock(text="here is my prose answer")])
+
+    class ToolOK:  # fallback: emits the required tool call
+        def create(self, **kw):
+            return LLMResponse(content=[ToolUseBlock(id="x", name="submit_plan", input={"a": 1})])
+
+    fb = FallbackBackend(ProseOnly(), ToolOK())
+    # No forcing -> prose is fine, primary result kept.
+    r_auto = fb.create(system="", messages=[], tools=[{"name": "t"}])
+    assert r_auto.content[0].type == "text"
+    # Forced -> primary's prose is unacceptable, fall back to the tool-calling provider.
+    r_forced = fb.create(system="", messages=[], tools=[{"name": "t"}], tool_choice="any")
+    assert r_forced.content[0].type == "tool_use"

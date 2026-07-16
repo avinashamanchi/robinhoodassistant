@@ -35,7 +35,7 @@ def _analyst(action="buy") -> Analyst:
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools):
+        def create(self, *, system, messages, tools, tool_choice=None):
             return SimpleNamespace(content=[block])
 
     return Analyst(B())

@@ -36,7 +36,7 @@ def _backend(tool, inp):
     block = SimpleNamespace(type="tool_use", name=tool, id="t", input=dict(inp))
 
     class B:
-        def create(self, *, system, messages, tools):
+        def create(self, *, system, messages, tools, tool_choice=None):
             return SimpleNamespace(content=[block])
 
     return B()

@@ -75,7 +75,10 @@ class GeminiBackend:
             self._client = genai.Client(api_key=self._api_key)
         return self._client
 
-    def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
+    def create(
+        self, *, system: str, messages: list[dict], tools: list[dict],
+        tool_choice: Optional[str] = None,
+    ) -> LLMResponse:
         from google.genai import types
 
         gem_contents = [
@@ -92,11 +95,18 @@ class GeminiBackend:
             )
             for t in tools
         ]
-        config = types.GenerateContentConfig(
+        cfg_kwargs: dict[str, Any] = dict(
             system_instruction=system,
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
         )
+        # "any" forces a function call so a 200 always carries structured output
+        # (Gemini otherwise sometimes replies in prose -> "did not submit a plan").
+        if decls and tool_choice == "any":
+            cfg_kwargs["tool_config"] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            )
+        config = types.GenerateContentConfig(**cfg_kwargs)
         resp = self._get_client().models.generate_content(
             model=self.model, contents=gem_contents, config=config
         )

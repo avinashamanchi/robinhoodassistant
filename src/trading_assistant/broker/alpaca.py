@@ -11,8 +11,13 @@ that order's status rather than creating a duplicate.
 
 from __future__ import annotations
 
+import logging
+import time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
+
+from requests.exceptions import ConnectionError as ReqConnectionError
+from requests.exceptions import Timeout as ReqTimeout
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -50,6 +55,32 @@ _STATUS_MAP: dict[str, OrderStatus] = {
 }
 
 
+log = logging.getLogger(__name__)
+
+# A long-running process keeps HTTP keep-alive sockets to Alpaca in a pool. When
+# the load balancer closes an idle socket, the NEXT request on it raises before a
+# response is read ("Remote end closed connection without response"). Retrying
+# grabs/opens a fresh socket. Only these connection-level errors are transient;
+# HTTP status errors (4xx/5xx APIError) are surfaced, not retried.
+_TRANSIENT = (ReqConnectionError, ReqTimeout)
+_T = TypeVar("_T")
+
+
+def _retry(fn: Callable[..., _T], *args: Any, attempts: int = 3, base_delay: float = 0.3, **kwargs: Any) -> _T:
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except _TRANSIENT as exc:  # stale socket / transient network blip
+            last = exc
+            log.warning("alpaca transient error on %s (attempt %d/%d): %s",
+                        getattr(fn, "__name__", fn), i + 1, attempts, exc)
+            if i + 1 < attempts:
+                time.sleep(base_delay * (i + 1))
+    assert last is not None
+    raise last
+
+
 def _d(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
@@ -79,8 +110,9 @@ class AlpacaBroker(BrokerClient):
     # ── market data ────────────────────────────────────────────
     def get_quote(self, ticker: str) -> Quote:
         symbol = ticker.upper()
-        snap = self._data.get_stock_snapshot(
-            StockSnapshotRequest(symbol_or_symbols=symbol)
+        snap = _retry(
+            self._data.get_stock_snapshot,
+            StockSnapshotRequest(symbol_or_symbols=symbol),
         )[symbol]
         last = _d(snap.latest_trade.price) if snap.latest_trade else None
         bid = _d(snap.latest_quote.bid_price) if snap.latest_quote else None
@@ -98,7 +130,7 @@ class AlpacaBroker(BrokerClient):
 
     # ── account / positions ────────────────────────────────────
     def get_account(self) -> Account:
-        acct = self._trading.get_account()
+        acct = _retry(self._trading.get_account)
         return Account(
             buying_power=_d(acct.buying_power) or Decimal(0),
             equity=_d(acct.equity) or Decimal(0),
@@ -107,7 +139,7 @@ class AlpacaBroker(BrokerClient):
 
     def get_positions(self) -> list[Position]:
         out: list[Position] = []
-        for p in self._trading.get_all_positions():
+        for p in _retry(self._trading.get_all_positions):
             out.append(
                 Position(
                     ticker=p.symbol.upper(),
@@ -120,6 +152,12 @@ class AlpacaBroker(BrokerClient):
 
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:
+        # Retry the WHOLE attempt: on a dropped connection the retry re-runs the
+        # idempotency lookup first, so a submit that actually landed is returned
+        # (via client_order_id) instead of double-placed.
+        return _retry(self._submit_once, order)
+
+    def _submit_once(self, order: OrderRequest) -> OrderResult:
         existing = self._find_by_client_id(order.idempotency_key)
         if existing is not None:
             return self._to_result(existing)
@@ -148,6 +186,9 @@ class AlpacaBroker(BrokerClient):
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Server-side OCO bracket: entry + take-profit + stop-loss in one order."""
+        return _retry(self._submit_bracket_once, order, take_profit, stop_loss)
+
+    def _submit_bracket_once(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         existing = self._find_by_client_id(order.idempotency_key)
         if existing is not None:
             return self._to_result(existing)
@@ -173,18 +214,22 @@ class AlpacaBroker(BrokerClient):
         return self._to_result(self._trading.submit_order(order_data=req))
 
     def get_order_status(self, order_id: str) -> OrderResult:
-        return self._to_result(self._trading.get_order_by_id(order_id))
+        return self._to_result(_retry(self._trading.get_order_by_id, order_id))
 
     def cancel_order(self, order_id: str) -> OrderResult:
-        self._trading.cancel_order_by_id(order_id)
-        return self._to_result(self._trading.get_order_by_id(order_id))
+        _retry(self._trading.cancel_order_by_id, order_id)
+        return self._to_result(_retry(self._trading.get_order_by_id, order_id))
 
     # ── helpers ────────────────────────────────────────────────
     def _find_by_client_id(self, client_order_id: str):
         try:
-            return self._trading.get_order_by_client_order_id(client_order_id)
+            return _retry(self._trading.get_order_by_client_order_id, client_order_id)
+        except _TRANSIENT:
+            # A transient network error must NOT be read as "no such order" — that
+            # would risk a duplicate submit. Propagate so the caller's retry re-tries.
+            raise
         except Exception:
-            # SDK raises when no such order exists; treat as "not submitted yet".
+            # SDK raises a real error when no such order exists: not submitted yet.
             return None
 
     def _to_result(self, o: Any) -> OrderResult:
@@ -210,10 +255,10 @@ class AlpacaClock:
         return cls(TradingClient(api_key, secret_key, paper=paper))
 
     def is_open(self, at=None) -> bool:
-        return bool(self._trading.get_clock().is_open)
+        return bool(_retry(self._trading.get_clock).is_open)
 
     def next_open(self, at=None):
-        return self._trading.get_clock().next_open
+        return _retry(self._trading.get_clock).next_open
 
     def next_close(self, at=None):
-        return self._trading.get_clock().next_close
+        return _retry(self._trading.get_clock).next_close

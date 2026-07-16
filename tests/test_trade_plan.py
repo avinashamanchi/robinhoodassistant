@@ -106,6 +106,49 @@ def test_no_trade_is_valid():
     assert p.action is PlanAction.NO_TRADE
 
 
+def test_hold_plan_ignores_entry_tranche_constraints():
+    """The LLM often returns a HOLD/NO_TRADE plan with a degenerate entry (fractions
+    that don't sum to 1, or a nominal level above price). Since no entry is ever
+    placed for a non-actionable plan, those constraints must NOT reject it — the
+    old behaviour crashed the analyst/shadow runner with a ValidationError."""
+    for act in (PlanAction.HOLD, PlanAction.NO_TRADE):
+        p = _plan(action=act, entry_plan=EntryPlan(type="ladder", tranches=[
+            Tranche(price_level=Decimal("140"), fraction=0.3),   # above ref, sums to 0.6
+            Tranche(price_level=Decimal("150"), fraction=0.3),   # ascending too
+        ]))
+        assert p.action is act
+
+
+def test_no_trade_plan_with_empty_structure_is_valid():
+    """The real LLM output for a NO_TRADE: empty entry/exit and 0 stops. Must be
+    accepted (this crashed the live shadow runner with 4 validation errors)."""
+    from trading_assistant.analyst.models import EntryPlan, ExitPlan
+    p = _plan(
+        action=PlanAction.NO_TRADE,
+        entry_plan=EntryPlan(type="single", tranches=[]),
+        exit_plan=ExitPlan(targets=[], stop=Decimal("0"), trailing_stop_pct=0, time_stop_days=0),
+    )
+    assert p.action is PlanAction.NO_TRADE
+    assert p.exit_plan.trailing_stop_pct is None   # 0 coerced to unset
+
+
+def test_actionable_plan_rejects_empty_entry_or_exit():
+    from trading_assistant.analyst.models import EntryPlan, ExitPlan
+    with pytest.raises(ValidationError):
+        _plan(action=PlanAction.BUY, entry_plan=EntryPlan(type="single", tranches=[]))
+    with pytest.raises(ValidationError):
+        _plan(action=PlanAction.BUY, exit_plan=ExitPlan(targets=[], stop=Decimal("92")))
+
+
+def test_buy_still_enforces_entry_constraints():
+    # Guard against over-relaxing: actionable plans keep their invariants.
+    with pytest.raises(ValidationError):
+        _plan(action=PlanAction.BUY, entry_plan=EntryPlan(type="ladder", tranches=[
+            Tranche(price_level=Decimal("99"), fraction=0.3),
+            Tranche(price_level=Decimal("96"), fraction=0.3),    # sums to 0.6
+        ]))
+
+
 def test_short_plan_valid():
     p = _plan(
         action=PlanAction.SELL,

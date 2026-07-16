@@ -149,6 +149,66 @@ def test_status_mapping(raw, expected):
     assert _map_status(SimpleNamespace(value=raw)) is expected
 
 
+def test_get_quote_retries_on_transient_connection_error():
+    """A stale keep-alive socket raises ConnectionError on first use; the broker
+    must retry (fresh socket) instead of crashing the caller. This is the exact
+    failure that made 'approve' 500 in the long-running app."""
+    from requests.exceptions import ConnectionError as ReqConnErr
+
+    class FlakyData:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_snapshot(self, request):
+            self.calls += 1
+            if self.calls == 1:  # first call: stale connection
+                raise ReqConnErr("Remote end closed connection without response")
+            return {request.symbol_or_symbols: _snap("101", "100.9", "101.1", "99")}
+
+    data = FlakyData()
+    broker = AlpacaBroker(FakeTrading(), data)
+    q = broker.get_quote("AAPL")
+    assert data.calls == 2               # retried once
+    assert q.last == Decimal("101")
+
+
+def test_submit_order_retries_on_transient_and_stays_idempotent():
+    from requests.exceptions import ConnectionError as ReqConnErr
+
+    class FlakyTrading(FakeTrading):
+        def __init__(self):
+            super().__init__()
+            self._first = True
+
+        def submit_order(self, order_data):
+            if self._first:  # first POST: connection dropped mid-flight
+                self._first = False
+                raise ReqConnErr("Remote end closed connection without response")
+            return super().submit_order(order_data)
+
+    trading = FlakyTrading()
+    broker = AlpacaBroker(trading, FakeData({}))
+    result = broker.submit_order(_order())
+    assert result.broker_order_id == "brk-1"
+    assert trading.submit_calls == 1     # exactly one real submit landed
+
+
+def test_non_transient_error_is_not_retried():
+    class ExplodingData:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_snapshot(self, request):
+            self.calls += 1
+            raise ValueError("bad symbol")
+
+    data = ExplodingData()
+    broker = AlpacaBroker(FakeTrading(), data)
+    with pytest.raises(ValueError):
+        broker.get_quote("AAPL")
+    assert data.calls == 1               # not retried — only transient errors retry
+
+
 def test_alpaca_clock_maps():
     clock = AlpacaClock(
         SimpleNamespace(

@@ -32,7 +32,7 @@ class RecordingBackend:
     def __init__(self):
         self.last = None
 
-    def create(self, *, system, messages, tools):
+    def create(self, *, system, messages, tools, tool_choice=None):
         self.last = {"system": system, "messages": messages}
         block = SimpleNamespace(type="tool_use", name="submit_plan", id="t", input=dict(PLAN_INPUT))
         return SimpleNamespace(content=[block])

@@ -26,7 +26,7 @@ def _backend(inp):
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t1", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools):
+        def create(self, *, system, messages, tools, tool_choice=None):
             return SimpleNamespace(content=[block])
 
     return B()
@@ -69,7 +69,7 @@ def test_earnings_addressed_passes():
 
 def test_no_tool_call_raises():
     class B:
-        def create(self, *, system, messages, tools):
+        def create(self, *, system, messages, tools, tool_choice=None):
             return SimpleNamespace(content=[SimpleNamespace(type="text", text="no")])
 
     with pytest.raises(ValueError):

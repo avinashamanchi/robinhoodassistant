@@ -135,7 +135,10 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
 
 
 class LLMBackend(Protocol):
-    def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> Any: ...
+    def create(
+        self, *, system: str, messages: list[dict], tools: list[dict],
+        tool_choice: Optional[str] = None,
+    ) -> Any: ...
 
 
 class Analyst:
@@ -168,6 +171,7 @@ class Analyst:
             system=SYSTEM_PREAMBLE,
             messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
             tools=[SUBMIT_TOOL],
+            tool_choice="any",   # structured output is mandatory for the analyst
         )
         report = self._parse(resp, features)
         self._enforce_quality(report, features)
@@ -206,6 +210,7 @@ class Analyst:
             system=system,
             messages=[{"role": "user", "content": user}],
             tools=[SUBMIT_PLAN_TOOL],
+            tool_choice="any",   # the plan tool call is mandatory
         )
         for block in getattr(resp, "content", []):
             if getattr(block, "type", None) == "tool_use" and block.name == "submit_plan":
