@@ -33,13 +33,19 @@ def risk_config() -> RiskConfig:
 
 @pytest.fixture
 def app_config() -> AppConfig:
-    """The committed config.yaml, NORMALIZED to stable test defaults (mock broker,
-    reject-when-closed on) so operational config edits (e.g. switching to live
-    Alpaca paper) can never break the test baseline."""
+    """The committed config.yaml, NORMALIZED to stable test defaults so operational
+    config edits (switching to live Alpaca paper, widening the allowlist, raising
+    risk caps) can never break the test baseline. Risk caps + allowlist are pinned
+    to the same values as the ``risk_config`` fixture."""
     cfg = load_config(REPO_ROOT / "config.yaml")
     return cfg.model_copy(update={
         "trading": cfg.trading.model_copy(update={"broker": BrokerKind.MOCK}),
-        "risk": cfg.risk.model_copy(update={"reject_when_market_closed": True}),
+        "risk": cfg.risk.model_copy(update={
+            "reject_when_market_closed": True,
+            "ticker_allowlist": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"],
+            "max_notional_per_order": 500,
+            "max_position_per_ticker": 2000,
+        }),
     })
 
 

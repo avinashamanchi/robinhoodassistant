@@ -7,9 +7,9 @@ trading:
   broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
 
 risk:
-  ticker_allowlist: [AAPL, MSFT, GOOGL, AMZN, NVDA]
-  max_notional_per_order: 500        # USD per single order
-  max_position_per_ticker: 2000      # USD notional held in one name
+  ticker_allowlist: [AAPL, MSFT, GOOGL, GOOG, AMZN, NVDA, META, TSLA]
+  max_notional_per_order: 2000       # USD per single order
+  max_position_per_ticker: 5000      # USD notional held in one name
   max_portfolio_exposure: 10000      # USD total across positions
   daily_realized_loss_limit: 500     # USD; breach trips the kill switch
   price_sanity_pct: 5.0              # reject limit orders >5% from last trade

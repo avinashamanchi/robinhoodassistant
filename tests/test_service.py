@@ -72,6 +72,22 @@ def test_disallowed_ticker_rejected(app_config, session_factory):
     assert svc.broker.submit_calls == 0
 
 
+def test_unknown_ticker_rejects_cleanly_not_crash(app_config, session_factory):
+    """A ticker the broker can't quote (e.g. a typo Alpaca doesn't recognize) must
+    reject cleanly via the risk engine, not crash propose_order with a KeyError."""
+    class NoQuoteBroker(SpyBroker):
+        def get_quote(self, ticker):
+            if ticker.upper() == "FOObar".upper():
+                raise KeyError(ticker.upper())   # mirrors Alpaca's missing-symbol KeyError
+            return super().get_quote(ticker)
+
+    svc = _service(app_config, session_factory, broker=NoQuoteBroker())
+    res = svc.propose_order("FOOBAR", "buy", "market", notional="100")  # off-allowlist + unquotable
+    assert res["status"] == "rejected"
+    assert any("allowlist" in r for r in res["risk_reasons"])
+    assert svc.broker.submit_calls == 0
+
+
 def test_market_closed_rejects(app_config, session_factory):
     svc = _service(app_config, session_factory, market_open=False)
     res = svc.propose_order("AAPL", "buy", "market", notional="100")

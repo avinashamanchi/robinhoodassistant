@@ -14,6 +14,7 @@ Every public method returns plain dicts so it maps cleanly onto MCP tool results
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -56,6 +57,8 @@ _OPEN_STATUSES = (
     OrderStatus.SUBMITTED.value,
     OrderStatus.PARTIALLY_FILLED.value,
 )
+
+log = logging.getLogger(__name__)
 
 
 class TradingService:
@@ -125,7 +128,15 @@ class TradingService:
         positions = self.broker.get_positions()
         pos_map = {p.ticker.upper(): p for p in positions}
         want = {t.upper() for t in tickers} | set(pos_map)
-        quotes = {sym: self.broker.get_quote(sym) for sym in want}
+        # A symbol the broker can't quote (typo / unknown ticker) must not crash
+        # the snapshot — omit it. The risk engine then rejects cleanly ("not on
+        # allowlist" and/or "no quote available"), which is fail-closed.
+        quotes = {}
+        for sym in want:
+            try:
+                quotes[sym] = self.broker.get_quote(sym)
+            except Exception:  # noqa: BLE001 — unquotable symbol -> no price, safe rejection
+                log.warning("no quote for %s; omitting from snapshot", sym)
         account = self.broker.get_account()
         return PortfolioSnapshot(
             positions=pos_map,
