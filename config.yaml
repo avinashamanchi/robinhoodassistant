@@ -52,7 +52,7 @@ external_accounts:
     token_path: ./.rh_token.pickle
 
 features:
-  auto_execute_preapproved_rules: false   # daemon auto-exec (Phase 4)
+  auto_execute_preapproved_rules: true    # daemon auto-exec pre-approved rules (still passes full risk engine on every fire)
   telegram_notifications: false           # (Phase 4)
   shadow_mode: true                       # screen+analyze+grade live, zero orders (D1)
 
