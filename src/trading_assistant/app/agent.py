@@ -12,12 +12,15 @@ scripted backend with no API key.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Protocol
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..db.models import LLMDecision
 from ..service import TradingService
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a trading assistant. You can look up market data and account info, "
@@ -180,9 +183,18 @@ class Agent:
         last_resp = None
 
         for _ in range(self.max_turns):
-            resp = self.backend.create(
-                system=SYSTEM_PROMPT, messages=messages, tools=TOOL_SPECS
-            )
+            try:
+                resp = self.backend.create(
+                    system=SYSTEM_PROMPT, messages=messages, tools=TOOL_SPECS
+                )
+            except Exception:  # noqa: BLE001 — never 500 the chat endpoint on an LLM error
+                log.exception("chat backend failed")
+                final_text = (
+                    "Sorry — I couldn't complete that request (the assistant model "
+                    "returned an error). Please try rephrasing, or use the Plans page "
+                    "to generate proposals directly."
+                )
+                break
             last_resp = resp
             messages.append(
                 {"role": "assistant", "content": [_block_to_dict(b) for b in resp.content]}

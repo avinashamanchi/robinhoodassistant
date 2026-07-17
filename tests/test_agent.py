@@ -97,6 +97,22 @@ def test_agent_records_decision(make_service):
         assert s.execute(select(func.count()).select_from(LLMDecision)).scalar_one() == 1
 
 
+def test_agent_chat_survives_backend_error(make_service):
+    """An LLM/provider error must not 500 the chat endpoint — return a graceful reply."""
+    class BoomBackend:
+        def create(self, *, system, messages, tools, tool_choice=None):
+            raise RuntimeError("provider exploded")
+
+    svc = make_service()
+    agent = Agent(BoomBackend(), svc, svc.session_factory, model="mock", max_tokens=100)
+    out = agent.chat("hi")
+    assert out["tool_calls"] == []
+    assert "couldn't complete" in out["reply"].lower()
+    # Still records the (failed) decision — no crash on the None response.
+    with svc.session_factory() as s:
+        assert s.execute(select(func.count()).select_from(LLMDecision)).scalar_one() == 1
+
+
 def test_agent_stops_at_max_turns(make_service):
     # Backend always asks for a tool -> loop must terminate at max_turns, not hang.
     responses = [

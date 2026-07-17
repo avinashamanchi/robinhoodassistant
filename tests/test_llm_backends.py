@@ -69,6 +69,45 @@ def test_groq_tool_call_normalized():
     assert out.usage.input_tokens == 10
 
 
+class _RaisingCompletions:
+    """Simulates Groq raising BadRequestError(tool_use_failed) — the model tried to
+    call a tool but emitted malformed <function=...> syntax the SDK rejects."""
+    def __init__(self, err):
+        self.err = err
+
+    def create(self, **kw):
+        raise self.err
+
+
+def _groq_raising(err):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_RaisingCompletions(err)))
+    return GroqBackend("k", "llama", client=client)
+
+
+class _FakeBadRequest(Exception):
+    def __init__(self, body):
+        super().__init__(str(body))
+        self.body = body
+
+
+def test_groq_recovers_malformed_tool_call():
+    # Shape mirrors groq.BadRequestError: .body carries error.failed_generation.
+    err = _FakeBadRequest({"error": {
+        "code": "tool_use_failed",
+        "failed_generation": '<function=propose_order [{"order_type": "market", "qty": "1", "side": "buy", "ticker": "AAPL"}] </function>',
+    }})
+    out = _groq_raising(err).create(system="s", messages=[{"role": "user", "content": "buy aapl"}], tools=TOOLS)
+    assert out.stop_reason == "tool_use"
+    assert out.content[0].name == "propose_order"
+    assert out.content[0].input == {"order_type": "market", "qty": "1", "side": "buy", "ticker": "AAPL"}
+
+
+def test_groq_unrecoverable_error_propagates():
+    err = RuntimeError("network down")
+    with pytest.raises(RuntimeError):
+        _groq_raising(err).create(system="s", messages=[{"role": "user", "content": "hi"}], tools=TOOLS)
+
+
 def test_groq_text_normalized():
     resp = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="hello", tool_calls=None))],
