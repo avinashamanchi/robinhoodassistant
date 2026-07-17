@@ -23,6 +23,9 @@
     .banner{background:#2a2417;color:var(--amber);padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;}
     .bear{color:var(--red);} .bull{color:var(--green);} .base{color:var(--accent);}
     .muted{color:var(--muted);font-size:12px;} .empty{color:var(--muted);font-style:italic;}
+    #toast{position:fixed;right:16px;bottom:16px;max-width:400px;z-index:50;display:flex;flex-direction:column;gap:8px;}
+    .toast{padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:var(--panel);box-shadow:0 4px 16px rgba(0,0,0,.4);font-size:13px;}
+    .toast.ok{border-color:var(--green);} .toast.err{border-color:var(--red);color:#ffd7d7;}
   </style>
 </head>
 <body>
@@ -44,6 +47,7 @@
       <div id="detail"><div class="empty">Analyze a symbol or pick a plan.</div></div>
     </section>
   </main>
+  <div id="toast"></div>
   <script>
     const $ = (id) => document.getElementById(id);
     function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
@@ -51,6 +55,24 @@
     function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
     async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
     const jsonPost = (b) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+
+    function notify(msg, kind) {
+      const t = el("div", msg, "toast " + (kind || ""));
+      $("toast").appendChild(t);
+      setTimeout(() => t.remove(), kind === "err" ? 9000 : 5000);
+    }
+    // Mutating call that surfaces HTTP status AND a body-level {error:...}
+    // (the plan endpoints return 200 with an "error" field for soft failures).
+    async function action(path, opts = {}) {
+      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
+      let r, data;
+      try { r = await fetch(path, opts); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
+      try { data = await r.json(); } catch (e) { data = {}; }
+      if (r.status === 401) { notify("Rejected: bad/missing API token — re-enter it.", "err"); localStorage.removeItem("api_key"); return { ok: false, data }; }
+      if (!r.ok) { const d = data.detail !== undefined ? data.detail : data; notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err"); return { ok: false, data }; }
+      if (data && data.error) { notify(data.error, "err"); return { ok: false, data }; }
+      return { ok: true, data };
+    }
 
     async function refresh() {
       const d = await api("/plans"); const box = $("plans"); clear(box);
@@ -124,13 +146,35 @@
       box.appendChild(el("p", "Stop " + pl.exit_plan.stop + (pl.exit_plan.trailing_stop_pct ? " · trailing " + pl.exit_plan.trailing_stop_pct + "%" : "") + (pl.exit_plan.time_stop_days ? " · time stop " + pl.exit_plan.time_stop_days + "d" : ""), "muted"));
       if (p.status === "proposed") {
         const bar = el("div"); bar.style.marginTop = "10px";
-        const a = el("button", "Approve → arm rules", "approve"); a.addEventListener("click", () => approve(p.plan_id));
-        const c = el("button", "Cancel", "cancel"); c.style.marginLeft = "8px"; c.addEventListener("click", () => cancelPlan(p.plan_id));
-        bar.append(a, c); box.appendChild(bar);
+        const actionable = sz && Number(sz.total_shares) > 0;
+        if (actionable) {
+          const a = el("button", "Approve → arm rules", "approve"); a.addEventListener("click", () => approve(p.plan_id));
+          bar.appendChild(a);
+        } else {
+          // NO_TRADE / HOLD / zero-sized: nothing to arm — say so instead of a dead button.
+          bar.appendChild(el("div",
+            "Advisory only — this " + pl.action.toUpperCase() + " plan has no sized entry, so there are no orders/rules to arm."
+            + (sz && sz.zero_reason ? " (" + sz.zero_reason + ")" : ""), "banner"));
+        }
+        const c = el("button", "Cancel / dismiss", "cancel"); c.style.marginLeft = "8px"; c.addEventListener("click", () => cancelPlan(p.plan_id));
+        bar.appendChild(c); box.appendChild(bar);
       }
     }
-    async function approve(id) { const r = await api("/plans/" + id + "/approve", { method: "POST" }); if (r.detail) window.alert(JSON.stringify(r.detail)); await refresh(); showPlan(id); }
-    async function cancelPlan(id) { await api("/plans/" + id + "/cancel", { method: "POST" }); await refresh(); showPlan(id); }
+    async function approve(id) {
+      const r = await action("/plans/" + id + "/approve", { method: "POST" });
+      if (r.ok) {
+        const d = r.data || {};
+        if (d.bracket) notify("Approved ✓ plan " + id + " — bracket order placed on Alpaca", "ok");
+        else notify("Approved ✓ plan " + id + " — armed " + (d.rules_created || 0) + " rule(s)"
+                    + (d.paper_only ? " (PAPER — analyst unproven)" : ""), "ok");
+      }
+      await refresh(); showPlan(id);
+    }
+    async function cancelPlan(id) {
+      const r = await action("/plans/" + id + "/cancel", { method: "POST" });
+      if (r.ok) notify("Plan " + id + " canceled", "ok");
+      await refresh(); showPlan(id);
+    }
     refresh();
   </script>
 </body>
