@@ -438,7 +438,6 @@ class RuleRepository:
             rules_canceled = session.execute(
                 update(Rule)
                 .where(
-                    Rule.plan_id == plan_id,
                     Rule.group_id == group.id,
                     Rule.state.in_(
                         (RuleState.ACTIVE.value, RuleState.PROCESSING.value)

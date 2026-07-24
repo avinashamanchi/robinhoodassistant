@@ -106,6 +106,57 @@ def test_cancel_plan_cancels_rules(make_service):
                    for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars())
 
 
+def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = planning.analyze("AAPL")["plan_id"]
+    planning.approve_plan(
+        plan_id,
+        actor="operator:test",
+        reason="reviewed plan",
+    )
+    with svc.session_factory() as session:
+        plan_rule = session.scalar(
+            select(Rule).where(Rule.plan_id == plan_id).limit(1)
+        )
+        group_id = plan_rule.group_id
+        session.add(
+            Rule(
+                group_id=group_id,
+                payload_version=1,
+                ticker="MSFT",
+                condition_json=(
+                    '{"direction":"above","price":"500","type":"price"}'
+                ),
+                action_json=(
+                    '{"notional":"100","order_type":"market","side":"buy"}'
+                ),
+                state="processing",
+                plan_id=None,
+                kind="price",
+                pre_approved=False,
+            )
+        )
+        session.commit()
+        expected_count = session.scalar(
+            select(func.count())
+            .select_from(Rule)
+            .where(Rule.group_id == group_id)
+        )
+
+    result = planning.cancel_plan(plan_id)
+
+    assert result["status"] == "canceled"
+    assert result["rules_canceled"] == expected_count
+    with svc.session_factory() as session:
+        group = session.get(RuleGroup, group_id)
+        states = session.scalars(
+            select(Rule.state).where(Rule.group_id == group_id)
+        ).all()
+    assert group.state == "canceled"
+    assert states and set(states) == {"canceled"}
+
+
 def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_service):
     svc = make_service()
     planning = _planning(svc)

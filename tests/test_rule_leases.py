@@ -117,6 +117,25 @@ def test_expired_lease_can_be_recovered_with_a_new_owner(
     assert recovered.version > lease.version
 
 
+def test_group_reuse_requires_homogeneous_plan_ownership(make_service):
+    svc = make_service()
+    command = _command(group_key="plan-owned-group")
+
+    svc.rule_application.create_rule(command, plan_id=7)
+    svc.rule_application.create_rule(command, plan_id=7)
+
+    with pytest.raises(ValueError, match="plan ownership"):
+        svc.rule_application.create_rule(command, plan_id=8)
+
+    with svc.session_factory() as session:
+        rules = session.scalars(
+            select(Rule).order_by(Rule.id)
+        ).all()
+    assert len(rules) == 2
+    assert {rule.plan_id for rule in rules} == {7}
+    assert len({rule.group_id for rule in rules}) == 1
+
+
 def test_claim_terminal_is_owner_version_guarded_and_cancels_siblings(
     session_factory, seeded_oco_group
 ):

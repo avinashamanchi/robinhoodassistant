@@ -103,6 +103,17 @@ class RuleApplicationService:
                     raise ValueError(
                         f"rule group {group_key!r} is not active"
                     )
+                existing_plan_ids = set(
+                    session.scalars(
+                        select(Rule.plan_id)
+                        .where(Rule.group_id == group.id)
+                        .distinct()
+                    ).all()
+                )
+                if existing_plan_ids and existing_plan_ids != {plan_id}:
+                    raise ValueError(
+                        f"rule group {group_key!r} has different plan ownership"
+                    )
                 groups[group_key] = group
 
             payload = command.model_dump(mode="json")
