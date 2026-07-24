@@ -29,6 +29,7 @@ from trading_assistant.db.models import (
 )
 from trading_assistant.risk.breakers import BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
+from trading_assistant.risk.staleness import is_stale
 
 
 _PENDING_STATUSES = (
@@ -285,13 +286,20 @@ class PortfolioSnapshotService:
     def _quote_is_fresh(
         self, quote: Quote, captured_at: datetime, asset_class: AssetClass
     ) -> bool:
-        as_of = quote.as_of
-        if as_of.tzinfo is None:
-            as_of = as_of.replace(tzinfo=timezone.utc)
-        else:
-            as_of = as_of.astimezone(timezone.utc)
-        age_seconds = Decimal(str((captured_at - as_of).total_seconds()))
-        return age_seconds <= self._max_quote_age(asset_class)
+        if not quote.is_valid:
+            return False
+        max_age_seconds = float(self._max_quote_age(asset_class))
+        return all(
+            not is_stale(
+                component_time,
+                now=captured_at,
+                max_age_seconds=max_age_seconds,
+            )
+            for component_time in (
+                quote.book_as_of,
+                quote.trade_as_of,
+            )
+        )
 
     def _assemble_local(
         self,

@@ -390,7 +390,8 @@ def test_crash_immediately_before_or_after_transaction_creates_at_most_one_propo
 def test_two_thread_sibling_trigger_records_one_proposal_and_one_terminal_rule(
     make_service,
 ):
-    svc = make_service()
+    svc = make_service(quote_now=lambda: NOW)
+    svc.snapshot_service.now = lambda: NOW
     command_a = _command(price="175")
     command_b = _command(direction="above", price="50")
     group_id, _ = _seed_group(svc.session_factory, command_a, command_b)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from trading_assistant.broker.models import Quote
@@ -10,7 +11,16 @@ from trading_assistant.daemon import rules_engine
 
 def _q(last: str) -> Quote:
     p = Decimal(last)
-    return Quote("AAPL", bid=p, ask=p, last=p)
+    source_time = datetime.now(timezone.utc)
+    return Quote(
+        "AAPL",
+        bid=p,
+        ask=p,
+        last=p,
+        as_of=source_time,
+        book_as_of=source_time,
+        trade_as_of=source_time,
+    )
 
 
 def test_price_below():

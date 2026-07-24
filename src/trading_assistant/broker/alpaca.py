@@ -122,6 +122,14 @@ def _finite_d(value: Any) -> Optional[Decimal]:
     return parsed
 
 
+def _utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _map_status(raw: Any) -> OrderStatus:
     key = getattr(raw, "value", raw)
     return _STATUS_MAP.get(str(key), OrderStatus.SUBMITTED)
@@ -172,35 +180,37 @@ class AlpacaBroker(BrokerClient):
                 self._data.get_stock_snapshot,
                 StockSnapshotRequest(symbol_or_symbols=symbol),
             )[symbol]
-        last = _d(snap.latest_trade.price) if snap.latest_trade else None
-        bid = _d(snap.latest_quote.bid_price) if snap.latest_quote else None
-        ask = _d(snap.latest_quote.ask_price) if snap.latest_quote else None
+        latest_trade = getattr(snap, "latest_trade", None)
+        latest_quote = getattr(snap, "latest_quote", None)
+        last = _d(getattr(latest_trade, "price", None))
+        bid = _d(getattr(latest_quote, "bid_price", None))
+        ask = _d(getattr(latest_quote, "ask_price", None))
         prev_close = _d(snap.previous_daily_bar.close) if snap.previous_daily_bar else None
-        source_time = (
-            getattr(snap.latest_quote, "timestamp", None)
-            if snap.latest_quote
-            else None
-        ) or (
-            getattr(snap.latest_trade, "timestamp", None)
-            if snap.latest_trade
-            else None
-        )
-        if source_time is None:
-            source_time = datetime.now(timezone.utc)
-        elif source_time.tzinfo is None:
-            source_time = source_time.replace(tzinfo=timezone.utc)
-        else:
-            source_time = source_time.astimezone(timezone.utc)
-        # Fall back sensibly if a field is momentarily missing.
-        last = last or bid or ask or Decimal(0)
-        return Quote(
+        if last is None or bid is None or ask is None:
+            raise ValueError(
+                f"invalid Alpaca quote for {symbol}: missing price component"
+            )
+        book_as_of = _utc_timestamp(getattr(latest_quote, "timestamp", None))
+        trade_as_of = _utc_timestamp(getattr(latest_trade, "timestamp", None))
+        if book_as_of is None or trade_as_of is None:
+            raise ValueError(
+                f"invalid Alpaca quote for {symbol}: missing component timestamp"
+            )
+        quote = Quote(
             ticker=symbol,
-            bid=bid or last,
-            ask=ask or last,
+            bid=bid,
+            ask=ask,
             last=last,
             prev_close=prev_close,
-            as_of=source_time,
+            as_of=min(book_as_of, trade_as_of),
+            book_as_of=book_as_of,
+            trade_as_of=trade_as_of,
         )
+        if not quote.is_valid:
+            raise ValueError(
+                f"invalid Alpaca quote for {symbol}: invalid price component"
+            )
+        return quote
 
     # ── account / positions ────────────────────────────────────
     def get_account(self) -> Account:

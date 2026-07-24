@@ -21,11 +21,33 @@ from trading_assistant.broker.models import (
 )
 
 
-def _snap(last, bid, ask, prev_close, *, timestamp=None):
+def _snap(
+    last,
+    bid,
+    ask,
+    prev_close,
+    *,
+    timestamp=None,
+    trade_timestamp=None,
+    book_timestamp=None,
+):
     return SimpleNamespace(
-        latest_trade=SimpleNamespace(price=last, timestamp=timestamp),
+        latest_trade=SimpleNamespace(
+            price=last,
+            timestamp=(
+                trade_timestamp
+                if trade_timestamp is not None
+                else timestamp
+            ),
+        ),
         latest_quote=SimpleNamespace(
-            bid_price=bid, ask_price=ask, timestamp=timestamp
+            bid_price=bid,
+            ask_price=ask,
+            timestamp=(
+                book_timestamp
+                if book_timestamp is not None
+                else timestamp
+            ),
         ),
         previous_daily_bar=SimpleNamespace(close=prev_close),
     )
@@ -152,6 +174,117 @@ def test_get_quote_maps_snapshot():
     assert q.ask == Decimal("101.1")
     assert q.prev_close == Decimal("99")
     assert q.as_of == exchange_time
+    assert q.book_as_of == exchange_time
+    assert q.trade_as_of == exchange_time
+
+
+@pytest.mark.parametrize(
+    ("last", "bid", "ask"),
+    [
+        (None, "100.9", "101.1"),
+        ("0", "100.9", "101.1"),
+        ("101", None, "101.1"),
+        ("101", "0", "101.1"),
+        ("101", "100.9", None),
+        ("101", "100.9", "0"),
+    ],
+)
+def test_get_quote_rejects_missing_or_zero_price_components(last, bid, ask):
+    exchange_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
+    broker = AlpacaBroker(
+        FakeTrading(),
+        FakeData(
+            {
+                "AAPL": _snap(
+                    last,
+                    bid,
+                    ask,
+                    "99",
+                    timestamp=exchange_time,
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid Alpaca quote"):
+        broker.get_quote("AAPL")
+
+
+@pytest.mark.parametrize("missing", ["trade", "book"])
+def test_get_quote_rejects_missing_trade_or_book_payload(missing):
+    exchange_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
+    snapshot = _snap(
+        "101",
+        "100.9",
+        "101.1",
+        "99",
+        timestamp=exchange_time,
+    )
+    if missing == "trade":
+        snapshot.latest_trade = None
+    else:
+        snapshot.latest_quote = None
+    broker = AlpacaBroker(FakeTrading(), FakeData({"AAPL": snapshot}))
+
+    with pytest.raises(ValueError, match="invalid Alpaca quote"):
+        broker.get_quote("AAPL")
+
+
+def test_get_quote_preserves_book_and_trade_timestamps_separately():
+    trade_time = datetime(2026, 7, 23, 15, 3, 40, tzinfo=timezone.utc)
+    book_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
+    broker = AlpacaBroker(
+        FakeTrading(),
+        FakeData(
+            {
+                "AAPL": _snap(
+                    "101",
+                    "100.9",
+                    "101.1",
+                    "99",
+                    trade_timestamp=trade_time,
+                    book_timestamp=book_time,
+                )
+            }
+        ),
+    )
+
+    quote = broker.get_quote("AAPL")
+
+    assert quote.book_as_of == book_time
+    assert quote.trade_as_of == trade_time
+    assert quote.as_of == trade_time
+
+
+@pytest.mark.parametrize("missing_timestamp", ["trade", "book"])
+def test_get_quote_rejects_missing_component_timestamp(missing_timestamp):
+    exchange_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
+    broker = AlpacaBroker(
+        FakeTrading(),
+        FakeData(
+            {
+                "AAPL": _snap(
+                    "101",
+                    "100.9",
+                    "101.1",
+                    "99",
+                    trade_timestamp=(
+                        None
+                        if missing_timestamp == "trade"
+                        else exchange_time
+                    ),
+                    book_timestamp=(
+                        None
+                        if missing_timestamp == "book"
+                        else exchange_time
+                    ),
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="timestamp"):
+        broker.get_quote("AAPL")
 
 
 def test_get_crypto_quote_routes_to_crypto_client_and_preserves_timestamp():
@@ -170,6 +303,8 @@ def test_get_crypto_quote_routes_to_crypto_client_and_preserves_timestamp():
     assert quote.ticker == "BTC/USD"
     assert quote.last == Decimal("68000")
     assert quote.as_of == exchange_time
+    assert quote.book_as_of == exchange_time
+    assert quote.trade_as_of == exchange_time
 
 
 def test_get_account_and_positions_map():
@@ -378,7 +513,18 @@ def test_get_quote_retries_on_transient_connection_error():
             self.calls += 1
             if self.calls == 1:  # first call: stale connection
                 raise ReqConnErr("Remote end closed connection without response")
-            return {request.symbol_or_symbols: _snap("101", "100.9", "101.1", "99")}
+            exchange_time = datetime(
+                2026, 7, 23, 15, 4, tzinfo=timezone.utc
+            )
+            return {
+                request.symbol_or_symbols: _snap(
+                    "101",
+                    "100.9",
+                    "101.1",
+                    "99",
+                    timestamp=exchange_time,
+                )
+            }
 
     data = FlakyData()
     broker = AlpacaBroker(FakeTrading(), data)

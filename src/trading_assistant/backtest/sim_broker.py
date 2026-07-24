@@ -90,7 +90,16 @@ class SimBroker(BrokerClient):
     # ── BrokerClient interface ─────────────────────────────────
     def get_quote(self, ticker: str) -> Quote:
         last = Decimal(str(self._last.get(ticker.upper(), 0.0)))
-        return Quote(ticker=ticker.upper(), bid=last, ask=last, last=last, prev_close=last)
+        return Quote(
+            ticker=ticker.upper(),
+            bid=last,
+            ask=last,
+            last=last,
+            prev_close=last,
+            as_of=None,
+            book_as_of=None,
+            trade_as_of=None,
+        )
 
     def get_account(self) -> Account:
         equity = Decimal(str(self.equity()))

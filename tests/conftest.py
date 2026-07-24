@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -90,8 +91,16 @@ def make_service(app_config, session_factory):
     from trading_assistant.risk.clock import FakeClock
     from trading_assistant.service import TradingService
 
-    def _make(broker=None, market_open=True):
-        broker = broker if broker is not None else SpyBroker()
+    def _make(broker=None, market_open=True, quote_now=None):
+        broker = (
+            broker
+            if broker is not None
+            else (
+                SpyBroker(now=quote_now)
+                if quote_now is not None
+                else SpyBroker()
+            )
+        )
         broker.set_price("AAPL", Decimal("100"))
         return TradingService(
             broker, session_factory, app_config, FakeClock(is_open=market_open)
@@ -122,8 +131,18 @@ def make_snapshot():
         active_breakers: frozenset[str] = frozenset(),
     ) -> PortfolioSnapshot:
         prices = prices or {}
+        quote_time = datetime.now(timezone.utc)
         quotes = {
-            t.upper(): Quote(ticker=t.upper(), bid=p, ask=p, last=p, prev_close=p)
+            t.upper(): Quote(
+                ticker=t.upper(),
+                bid=p,
+                ask=p,
+                last=p,
+                prev_close=p,
+                as_of=quote_time,
+                book_as_of=quote_time,
+                trade_as_of=quote_time,
+            )
             for t, p in prices.items()
         }
         pos = {p.ticker.upper(): p for p in (positions or [])}

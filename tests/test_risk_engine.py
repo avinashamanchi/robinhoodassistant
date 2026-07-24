@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 import inspect
 
@@ -16,6 +17,9 @@ from trading_assistant.broker.models import (
     Quote,
 )
 from trading_assistant.risk.engine import RiskEngine
+
+
+QUOTE_TIME = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 
 
 def _order(
@@ -93,6 +97,9 @@ def test_quantity_market_max_notional_uses_ask_at_limit_boundary(
                 bid=Decimal("100"),
                 ask=Decimal("101"),
                 last=Decimal("100"),
+                as_of=QUOTE_TIME,
+                book_as_of=QUOTE_TIME,
+                trade_as_of=QUOTE_TIME,
             )
         },
     )
@@ -200,6 +207,9 @@ def test_quantity_market_portfolio_exposure_uses_ask_at_boundary(
                 bid=Decimal("100"),
                 ask=Decimal("101"),
                 last=Decimal("100"),
+                as_of=QUOTE_TIME,
+                book_as_of=QUOTE_TIME,
+                trade_as_of=QUOTE_TIME,
             )
         },
     )
@@ -271,6 +281,9 @@ def test_quantity_buy_rejects_non_positive_or_non_finite_last_before_arithmetic(
                 bid=Decimal("99"),
                 ask=Decimal("101"),
                 last=last,
+                as_of=QUOTE_TIME,
+                book_as_of=QUOTE_TIME,
+                trade_as_of=QUOTE_TIME,
             )
         },
     )
@@ -298,6 +311,9 @@ def test_notional_sell_rejects_zero_last_instead_of_dividing_by_zero(
                 bid=Decimal("0"),
                 ask=Decimal("0"),
                 last=Decimal("0"),
+                as_of=QUOTE_TIME,
+                book_as_of=QUOTE_TIME,
+                trade_as_of=QUOTE_TIME,
             )
         },
     )
@@ -336,6 +352,9 @@ def test_rejects_invalid_bid_ask_or_impossible_quote_shape_before_arithmetic(
                 bid=bid,
                 ask=ask,
                 last=Decimal("100"),
+                as_of=QUOTE_TIME,
+                book_as_of=QUOTE_TIME,
+                trade_as_of=QUOTE_TIME,
             )
         },
     )

@@ -8,7 +8,9 @@ key twice returns the first order rather than creating a second.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -37,6 +39,8 @@ class MockBroker(BrokerClient):
         prices: Optional[dict[str, Decimal]] = None,
         positions: Optional[list[Position]] = None,
         buying_power: Decimal = Decimal(100_000),
+        *,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._prices = {k.upper(): v for k, v in (prices or {}).items()}
         self._positions = {p.ticker.upper(): p for p in (positions or [])}
@@ -44,6 +48,7 @@ class MockBroker(BrokerClient):
             p.ticker.upper(): p.current_price for p in (positions or [])
         }
         self._buying_power = buying_power
+        self._now = now
         # idempotency_key -> OrderResult (the authoritative record)
         self._orders_by_key: dict[str, OrderResult] = {}
         self._orders_by_id: dict[str, OrderResult] = {}
@@ -63,12 +68,20 @@ class MockBroker(BrokerClient):
     def get_quote(self, ticker: str) -> Quote:
         last = self.price_of(ticker)
         spread = (last * Decimal("0.001")).quantize(Decimal("0.01"))
+        source_time = self._now()
+        if source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=timezone.utc)
+        else:
+            source_time = source_time.astimezone(timezone.utc)
         return Quote(
             ticker=ticker.upper(),
             bid=last - spread,
             ask=last + spread,
             last=last,
             prev_close=last,  # flat prev close keeps day_change deterministic (0%)
+            as_of=source_time,
+            book_as_of=source_time,
+            trade_as_of=source_time,
         )
 
     # ── account / positions ────────────────────────────────────

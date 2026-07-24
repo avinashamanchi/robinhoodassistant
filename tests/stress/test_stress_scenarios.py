@@ -98,6 +98,23 @@ def test_stale_quote_blocked():
     fresh = NOW
     assert is_stale(fresh - timedelta(seconds=120), now=fresh, max_age_seconds=60) is True
     assert is_stale(fresh - timedelta(seconds=5), now=fresh, max_age_seconds=60) is False
+    assert (
+        is_stale(
+            fresh + timedelta(seconds=6),
+            now=fresh,
+            max_age_seconds=60,
+        )
+        is True
+    )
+    assert (
+        is_stale(
+            fresh + timedelta(seconds=5),
+            now=fresh,
+            max_age_seconds=60,
+        )
+        is False
+    )
+    assert is_stale(None, now=fresh, max_age_seconds=60) is True
 
 
 # ── 5. Crypto weekend dump: crypto trips, equity untouched ──────

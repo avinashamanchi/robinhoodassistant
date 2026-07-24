@@ -51,6 +51,25 @@ def order(
     )
 
 
+def _quote_with_component_times(
+    *,
+    bid: Decimal = Decimal("99.90"),
+    ask: Decimal = Decimal("100.10"),
+    last: Decimal = Decimal("100"),
+    book_as_of: datetime | None = NOW,
+    trade_as_of: datetime | None = NOW,
+) -> Quote:
+    return Quote(
+        "AAPL",
+        bid,
+        ask,
+        last,
+        as_of=NOW,
+        book_as_of=book_as_of,
+        trade_as_of=trade_as_of,
+    )
+
+
 def _pending(
     session_factory,
     *,
@@ -113,6 +132,9 @@ def test_quantity_market_buy_uses_higher_ask_for_buying_power(
                 bid=Decimal("100"),
                 ask=Decimal("101"),
                 last=Decimal("100"),
+                as_of=NOW,
+                book_as_of=NOW,
+                trade_as_of=NOW,
             )
         },
     )
@@ -394,12 +416,106 @@ def test_snapshot_marks_stale_quote(make_service):
         Decimal("100.10"),
         Decimal("100"),
         as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
+        book_as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
+        trade_as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
     )
     service.broker.get_quote = lambda _ticker: stale
 
     snapshot = service.snapshot_service.assemble_for_execution("AAPL")
 
     assert snapshot.quote_fresh is False
+
+
+@pytest.mark.parametrize("missing_component", ["book", "trade"])
+def test_snapshot_rejects_missing_component_timestamp(
+    make_service,
+    risk_config,
+    missing_component,
+):
+    service = make_service()
+    service.snapshot_service.now = lambda: NOW
+    quote = _quote_with_component_times(
+        book_as_of=None if missing_component == "book" else NOW,
+        trade_as_of=None if missing_component == "trade" else NOW,
+    )
+    service.broker.get_quote = lambda _ticker: quote
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert snapshot.quote_fresh is False
+    assert "quote is stale" in result.reasons
+
+
+@pytest.mark.parametrize("stale_component", ["book", "trade"])
+def test_snapshot_rejects_stale_component_when_other_component_is_fresh(
+    make_service,
+    risk_config,
+    stale_component,
+):
+    service = make_service()
+    service.snapshot_service.now = lambda: NOW
+    stale = NOW - timedelta(seconds=61)
+    quote = _quote_with_component_times(
+        book_as_of=stale if stale_component == "book" else NOW,
+        trade_as_of=stale if stale_component == "trade" else NOW,
+    )
+    service.broker.get_quote = lambda _ticker: quote
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert snapshot.quote_fresh is False
+    assert "quote is stale" in result.reasons
+
+
+@pytest.mark.parametrize("future_component", ["book", "trade"])
+def test_snapshot_rejects_unreasonably_future_component_timestamp(
+    make_service,
+    risk_config,
+    future_component,
+):
+    service = make_service()
+    service.snapshot_service.now = lambda: NOW
+    future = NOW + timedelta(seconds=30)
+    quote = _quote_with_component_times(
+        book_as_of=future if future_component == "book" else NOW,
+        trade_as_of=future if future_component == "trade" else NOW,
+    )
+    service.broker.get_quote = lambda _ticker: quote
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert snapshot.quote_fresh is False
+    assert "quote is stale" in result.reasons
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "last"),
+    [
+        (Decimal("0"), Decimal("100.10"), Decimal("100")),
+        (Decimal("99.90"), Decimal("0"), Decimal("100")),
+        (Decimal("99.90"), Decimal("100.10"), Decimal("0")),
+    ],
+)
+def test_snapshot_rejects_zero_price_component(
+    make_service,
+    risk_config,
+    bid,
+    ask,
+    last,
+):
+    service = make_service()
+    service.snapshot_service.now = lambda: NOW
+    quote = _quote_with_component_times(bid=bid, ask=ask, last=last)
+    service.broker.get_quote = lambda _ticker: quote
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert snapshot.quote_fresh is False
+    assert result.rejected
 
 
 def test_unrelated_stale_quote_override_does_not_stale_target_snapshot(
@@ -413,6 +529,8 @@ def test_unrelated_stale_quote_override_does_not_stale_target_snapshot(
         Decimal("100.10"),
         Decimal("100"),
         as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
+        book_as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
+        trade_as_of=datetime.now(timezone.utc) - timedelta(seconds=61),
     )
 
     with service.session_factory() as session:

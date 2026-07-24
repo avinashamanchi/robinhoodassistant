@@ -145,7 +145,16 @@ class _StaleBroker(MockBroker):
     def get_quote(self, ticker: str) -> Quote:
         q = super().get_quote(ticker)
         old = datetime.now(timezone.utc) - timedelta(seconds=600)
-        return Quote(q.ticker, q.bid, q.ask, q.last, q.prev_close, as_of=old)
+        return Quote(
+            q.ticker,
+            q.bid,
+            q.ask,
+            q.last,
+            q.prev_close,
+            as_of=old,
+            book_as_of=old,
+            trade_as_of=old,
+        )
 
 
 def test_stale_quote_does_not_fire(make_service):

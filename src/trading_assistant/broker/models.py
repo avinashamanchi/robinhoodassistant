@@ -113,16 +113,23 @@ class Quote:
     ask: Decimal
     last: Decimal
     prev_close: Optional[Decimal] = None
-    as_of: datetime = field(default_factory=_utcnow)
+    # ``as_of`` remains the conservative aggregate timestamp for callers that
+    # consume one time. Execution validates both source-component timestamps.
+    as_of: datetime | None = None
+    book_as_of: datetime | None = None
+    trade_as_of: datetime | None = None
 
     @property
     def is_valid(self) -> bool:
         """Whether sizing and spread arithmetic are safe for this quote."""
         return (
-            self.last.is_finite()
+            isinstance(self.last, Decimal)
+            and self.last.is_finite()
             and self.last > 0
+            and isinstance(self.bid, Decimal)
             and self.bid.is_finite()
-            and self.bid >= 0
+            and self.bid > 0
+            and isinstance(self.ask, Decimal)
             and self.ask.is_finite()
             and self.ask > 0
             and self.bid <= self.ask
