@@ -183,8 +183,10 @@ class Monitor:
         return result
 
     # ── reconciliation on restart ──────────────────────────────
-    def reconcile(self) -> dict[str, int]:
-        """Rules persist in the DB; report the resumable state on startup."""
+    def reconcile(self) -> dict[str, Any]:
+        """Synchronize broker truth before resuming persisted rules on startup."""
+        order_sync = self.service.sync_open_orders()
+        position_reconciliation = self.service.reconcile_positions()
         with self.service.session_factory() as s:
             active = s.execute(
                 select(Rule).where(Rule.state == "active")
@@ -192,7 +194,12 @@ class Monitor:
             triggered = s.execute(
                 select(Rule).where(Rule.state == "triggered")
             ).scalars().all()
-        summary = {"active": len(active), "triggered": len(triggered)}
+        summary = {
+            "active": len(active),
+            "triggered": len(triggered),
+            "order_sync": order_sync,
+            "position_reconciliation": position_reconciliation,
+        }
         log.info("daemon reconcile: %s", summary)
         return summary
 

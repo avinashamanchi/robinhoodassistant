@@ -72,6 +72,45 @@ def test_crash_safe_rules_persist(make_service):
     assert len(mon2.tick()) == 1
 
 
+def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import OrderResult, OrderStatus, Position
+    from trading_assistant.db.models import Order
+
+    broker = MockBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order("AAPL", "buy", "market", qty="4")["order_id"]
+    svc.approve_order(oid)
+
+    with svc.session_factory() as s:
+        local = s.get(Order, oid)
+        broker_id = local.broker_order_id
+        client_id = local.idempotency_key
+        assert local.status == "submitted"
+
+    # Simulate Alpaca having filled while the daemon was offline.
+    filled = OrderResult(
+        client_id,
+        broker_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("4"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_id] = filled
+    broker._orders_by_key[client_id] = filled
+    broker._positions["AAPL"] = Position(
+        "AAPL", Decimal("4"), Decimal("100"), Decimal("100")
+    )
+
+    summary = Monitor(svc, NullNotifier()).reconcile()
+
+    assert summary["order_sync"]["newly_filled"] == 1
+    assert summary["position_reconciliation"]["reconciled"] is True
+    with svc.session_factory() as s:
+        assert s.get(Order, oid).status == "filled"
+
+
 def test_daemon_loop_body_runs_clean(make_service):
     # One full loop body: fill sync + daily-loss enforcement + rule tick + daily tasks.
     svc = make_service()

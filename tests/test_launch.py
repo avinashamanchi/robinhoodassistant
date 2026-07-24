@@ -99,3 +99,66 @@ def test_sync_ingests_fills_and_advances_status(make_service):
         assert s.execute(select(func.count()).select_from(Fill)).scalar_one() == 1
     # Idempotent — nothing left open to sync, no duplicate fill.
     assert svc.sync_open_orders()["synced"] == 0
+
+
+def test_sync_derives_incremental_prices_from_cumulative_average(make_service):
+    """Alpaca reports cumulative quantity and average price, not the latest fill.
+
+    A second cumulative average must be converted back into the incremental
+    fill price or FIFO P&L will be wrong.
+    """
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import OrderResult, OrderStatus
+    from trading_assistant.db.models import Fill, utcnow
+
+    class CumulativeBroker(MockBroker):
+        cumulative = (OrderStatus.SUBMITTED, Decimal("0"), None)
+
+        def get_order_status(self, oid):
+            original = super().get_order_status(oid)
+            status, qty, avg = self.cumulative
+            return OrderResult(
+                original.idempotency_key,
+                oid,
+                status,
+                filled_qty=qty,
+                avg_fill_price=avg,
+            )
+
+    broker = CumulativeBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order("AAPL", "buy", "market", qty="3")["order_id"]
+    svc.approve_order(oid)
+
+    broker.cumulative = (
+        OrderStatus.PARTIALLY_FILLED,
+        Decimal("1"),
+        Decimal("100"),
+    )
+    svc.sync_open_orders()
+    broker.cumulative = (OrderStatus.FILLED, Decimal("3"), Decimal("110"))
+    svc.sync_open_orders()
+
+    with svc.session_factory() as s:
+        buys = (
+            s.execute(select(Fill).where(Fill.order_id == oid).order_by(Fill.id))
+            .scalars()
+            .all()
+        )
+        assert [(row.qty, row.price) for row in buys] == [
+            (Decimal("1.000000"), Decimal("100.000000")),
+            (Decimal("2.000000"), Decimal("115.000000")),
+        ]
+        # Selling all three at 120 realizes 20 + 10 = 30 using the exact FIFO lots.
+        s.add(
+            Fill(
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("3"),
+                price=Decimal("120"),
+                filled_at=utcnow(),
+            )
+        )
+        s.commit()
+        assert svc._realized_pnl_today(s) == Decimal("30.000000")

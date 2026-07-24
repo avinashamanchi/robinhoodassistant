@@ -625,9 +625,27 @@ class TradingService:
                 ))
                 new_qty = res.filled_qty - recorded
                 if new_qty > 0 and res.avg_fill_price is not None:
+                    prior_fills = s.execute(
+                        select(Fill).where(Fill.order_id == o.id)
+                    ).scalars().all()
+                    recorded_notional = sum(
+                        (fill.qty * fill.price for fill in prior_fills), Decimal(0)
+                    )
+                    cumulative_notional = res.filled_qty * res.avg_fill_price
+                    incremental_notional = cumulative_notional - recorded_notional
+                    if incremental_notional <= 0:
+                        log.error(
+                            "broker cumulative fill moved behind local ledger for order %s: "
+                            "broker_notional=%s local_notional=%s",
+                            o.id,
+                            cumulative_notional,
+                            recorded_notional,
+                        )
+                        continue
+                    incremental_price = incremental_notional / new_qty
                     s.add(Fill(
                         order_id=o.id, ticker=o.ticker, side=o.side,
-                        qty=new_qty, price=res.avg_fill_price,
+                        qty=new_qty, price=incremental_price,
                         broker_fill_id=f"{o.broker_order_id}:{res.filled_qty}",
                     ))
                 target = _STATUS_MAP.get(res.status)
