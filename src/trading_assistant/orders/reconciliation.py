@@ -54,6 +54,12 @@ _FILL_STATUSES = {
 }
 
 
+def _normalized_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class ReconciliationReport:
     resolved_unknown: int
@@ -615,6 +621,12 @@ class ReconciliationService:
             return "broker fill identity replay changed quantity"
         if duplicate.price != activity.price:
             return "broker fill identity replay changed price"
+        if (
+            fill_has_trusted_identity(duplicate)
+            and _normalized_utc(duplicate.filled_at)
+            != _normalized_utc(activity.filled_at)
+        ):
+            return "broker fill identity replay changed timestamp"
         return None
 
     @staticmethod

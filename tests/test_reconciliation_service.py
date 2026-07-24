@@ -1077,6 +1077,96 @@ def test_mutated_duplicate_fill_replay_is_rejected_without_corrupting_ledger(
         assert fill.price == Decimal("100.000000")
 
 
+def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+
+    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
+    original = BrokerFill(
+        broker_fill_id="timestamp-immutable-fill",
+        broker_order_id=broker_order_id,
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=filled_at,
+    )
+    broker.activities = [original]
+    filled = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = filled
+    broker._orders_by_key[client_order_id] = filled
+    assert service.reconciliation.reconcile().inserted_fills == 1
+
+    equivalent_offset_time = datetime(
+        2026,
+        7,
+        24,
+        10,
+        0,
+        tzinfo=timezone(timedelta(hours=-7)),
+    )
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=original.broker_fill_id,
+            broker_order_id=original.broker_order_id,
+            ticker=original.ticker,
+            side=original.side,
+            qty=original.qty,
+            price=original.price,
+            filled_at=equivalent_offset_time,
+        )
+    ]
+    equivalent = service.reconciliation.reconcile()
+    assert equivalent.inserted_fills == 0
+    assert equivalent.broker_drift == ()
+
+    changed_time = filled_at + timedelta(minutes=1)
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=original.broker_fill_id,
+            broker_order_id=original.broker_order_id,
+            ticker=original.ticker,
+            side=original.side,
+            qty=original.qty,
+            price=original.price,
+            filled_at=changed_time,
+        )
+    ]
+    restarted = make_service(broker=broker)
+    mismatch = restarted.reconciliation.reconcile()
+    replayed = make_service(broker=broker).reconciliation.reconcile()
+
+    assert mismatch.inserted_fills == 0
+    assert replayed.inserted_fills == 0
+    assert any("changed timestamp" in item for item in mismatch.broker_drift)
+    assert any("changed timestamp" in item for item in replayed.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        fill = session.scalar(
+            select(Fill).where(
+                Fill.broker_fill_id == original.broker_fill_id
+            )
+        )
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "invalid_fill_activity"
+        assert fill.filled_at == filled_at
+        assert fill.reconciliation_state == "trusted"
+
+
 @pytest.mark.parametrize(
     ("remote_status", "filled_qty"),
     [

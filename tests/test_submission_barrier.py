@@ -272,6 +272,7 @@ class _RecoveredCancelLossBroker(MockBroker):
             filled_qty=Decimal("1"),
             avg_fill_price=Decimal("1"),
         )
+        self.filled_at = utcnow()
 
     def get_fill_activities(self, after=None):
         return [
@@ -282,7 +283,7 @@ class _RecoveredCancelLossBroker(MockBroker):
                 side="sell",
                 qty=Decimal("1"),
                 price=Decimal("1"),
-                filled_at=utcnow(),
+                filled_at=self.filled_at,
             )
         ]
 

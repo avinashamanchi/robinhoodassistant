@@ -792,3 +792,89 @@ def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
         ) == 1
         assert cursor.last_activity_id == "cursor-replay-fill"
         assert cursor.last_activity_at == exact_time
+
+
+@pytest.mark.parametrize(
+    ("case_name", "fill_rows"),
+    [
+        (
+            "recovered",
+            [
+                {
+                    "broker_fill_id": "recovered-exact",
+                    "reconciliation_state": "trusted",
+                },
+                {
+                    "broker_fill_id": "recovered-legacy",
+                    "reconciliation_state": "superseded",
+                },
+            ],
+        ),
+        (
+            "unresolved",
+            [
+                {
+                    "broker_fill_id": None,
+                    "reconciliation_state": "quarantined",
+                }
+            ],
+        ),
+    ],
+)
+def test_breaker_downgrade_refuses_nonempty_fill_trust_ledger(
+    tmp_path,
+    case_name,
+    fill_rows,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / f"{case_name}-fill-ledger.db",
+        "20260724_0005",
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO fills "
+                "(order_id,ticker,side,qty,price,broker_fill_id,filled_at,"
+                "reconciliation_state) VALUES "
+                "(NULL,'AAPL','sell',1,90,:broker_fill_id,"
+                "'2026-07-24 17:00:00',:reconciliation_state)"
+            ),
+            fill_rows,
+        )
+
+    with pytest.raises(RuntimeError, match="verified pre-upgrade backup"):
+        command.downgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0005"
+        assert conn.execute(
+            text(
+                "SELECT broker_fill_id,reconciliation_state "
+                "FROM fills ORDER BY id"
+            )
+        ).mappings().all() == fill_rows
+        tables = set(inspect(engine).get_table_names())
+        assert "circuit_breaker_state" in tables
+        assert "killswitch_state" not in tables
+
+
+def test_breaker_downgrade_allows_empty_fill_ledger(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "empty-fill-ledger.db",
+        "20260724_0005",
+    )
+
+    command.downgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0004"
+        assert "reconciliation_state" not in {
+            column["name"] for column in inspect(engine).get_columns("fills")
+        }
+        tables = set(inspect(engine).get_table_names())
+        assert "killswitch_state" in tables
+        assert "circuit_breaker_state" not in tables

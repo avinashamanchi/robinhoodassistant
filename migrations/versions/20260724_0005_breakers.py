@@ -144,6 +144,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    fill_count = bind.scalar(sa.text("SELECT count(*) FROM fills"))
+    if fill_count:
+        raise RuntimeError(
+            "cannot safely downgrade migration 0005 with a non-empty fill "
+            "trust ledger; restore the verified pre-upgrade backup instead"
+        )
+
     op.create_table(
         "killswitch_state",
         sa.Column("id", sa.Integer(), nullable=False),
