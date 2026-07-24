@@ -455,13 +455,7 @@ class ReconciliationService:
                         advance_cursor = False
                         continue
                     if duplicate is not None:
-                        if fill_has_trusted_identity(duplicate):
-                            self._supersede_matching_quarantined_fill(
-                                session,
-                                order,
-                                activity,
-                            )
-                        else:
+                        if not fill_has_trusted_identity(duplicate):
                             self._replace_with_authoritative_activity(
                                 duplicate,
                                 order,
@@ -775,6 +769,11 @@ class ReconciliationService:
                     for fill in all_prior_fills
                     if fill_has_trusted_identity(fill)
                 ]
+                unmatched_legacy_fills = [
+                    fill
+                    for fill in all_prior_fills
+                    if fill_requires_reconciliation(fill)
+                ]
                 recorded = sum(
                     (fill.qty for fill in prior_fills), Decimal(0)
                 )
@@ -836,6 +835,18 @@ class ReconciliationService:
                     == FILL_RECONCILIATION_REQUIRED
                 )
                 if fill_reconciliation_required:
+                    if unmatched_legacy_fills:
+                        self._latch_order_in_session(
+                            order,
+                            "legacy_unidentified_fill",
+                        )
+                        drift.append(
+                            f"broker order {order.id} still has "
+                            f"{len(unmatched_legacy_fills)} quarantined "
+                            "legacy fill(s)"
+                        )
+                        session.commit()
+                        continue
                     terminal_zero_fill_resolved = (
                         order.last_error_code == "indeterminate_cancel"
                         and target

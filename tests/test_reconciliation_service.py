@@ -1591,6 +1591,98 @@ def test_pre_0005_supplied_fill_id_requires_exact_activity_then_replays_once(
         ) == 1
 
 
+def test_trusted_duplicate_replay_never_supersedes_additional_legacy_rows(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="single-exact-multiple-legacy-client",
+            ticker="AAPL",
+            side="sell",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.CANCELED.value,
+            broker_order_id="single-exact-multiple-legacy-order",
+            acceptance_state="fill_reconcile_required",
+            last_error_code="legacy_unverified_fill",
+        )
+        session.add(order)
+        session.flush()
+        for index in range(3):
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("1"),
+                    price=Decimal("90"),
+                    broker_fill_id=f"matching-legacy-{index}",
+                    reconciliation_state="quarantined",
+                    filled_at=utcnow() - timedelta(minutes=index + 1),
+                )
+            )
+        session.commit()
+        order_id = order.id
+
+    remote = OrderResult(
+        "single-exact-multiple-legacy-client",
+        "single-exact-multiple-legacy-order",
+        OrderStatus.CANCELED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("90"),
+    )
+    broker._orders_by_id["single-exact-multiple-legacy-order"] = remote
+    broker._orders_by_key["single-exact-multiple-legacy-client"] = remote
+    exact = BrokerFill(
+        broker_fill_id="one-authoritative-activity",
+        broker_order_id="single-exact-multiple-legacy-order",
+        ticker="AAPL",
+        side="sell",
+        qty=Decimal("1"),
+        price=Decimal("90"),
+        filled_at=utcnow(),
+    )
+    broker.activities = [exact]
+
+    first = service.reconciliation.reconcile()
+    first_replay = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    second_replay = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 1
+    assert first_replay.inserted_fills == 0
+    assert second_replay.inserted_fills == 0
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        rows = session.scalars(
+            select(Fill).where(Fill.order_id == order_id).order_by(Fill.id)
+        ).all()
+        exact_row = next(
+            row
+            for row in rows
+            if row.broker_fill_id == "one-authoritative-activity"
+        )
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "legacy_unidentified_fill"
+        assert exact_row.reconciliation_state == "trusted"
+        assert exact_row.ticker == exact.ticker
+        assert exact_row.side == exact.side
+        assert exact_row.qty == exact.qty
+        assert exact_row.price == exact.price
+        assert exact_row.filled_at == exact.filled_at
+        assert [
+            row.reconciliation_state
+            for row in rows
+            if row.broker_fill_id.startswith("matching-legacy-")
+        ] == ["superseded", "quarantined", "quarantined"]
+
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+
+
 @pytest.mark.parametrize(
     ("synchronous_status", "filled_qty", "expected_loss"),
     [

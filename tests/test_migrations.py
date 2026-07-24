@@ -1,15 +1,28 @@
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, select, text
 
+from trading_assistant.broker.mock import MockBroker
+from trading_assistant.broker.models import (
+    BrokerFill,
+    OrderResult,
+    OrderStatus,
+)
+from trading_assistant.db.models import Fill, Order, ReconciliationCursor
 from trading_assistant.db.migrate import adopt_existing, upgrade
 from trading_assistant.db.schema import SchemaOutOfDate, require_current_schema
-from trading_assistant.db.session import create_db_engine
+from trading_assistant.db.session import (
+    create_db_engine,
+    make_session_factory,
+)
+from trading_assistant.orders.reconciliation import ReconciliationService
+from trading_assistant.orders.repository import OrderRepository
 
 
 def _url(path: Path) -> str:
@@ -657,3 +670,125 @@ def test_breaker_upgrade_quarantines_every_preexisting_fill_and_trips_drift(
     assert "legacy fill" in drift["reason"]
     assert drift["actor"] == "migration:0005"
     assert drift["generation"] == 1
+
+
+def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "legacy-advanced-fill-cursor.db",
+        "20260724_0004",
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO orders "
+                "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                "broker_order_id,created_at,updated_at,approval_reason,"
+                "submission_kind,submission_payload_json,submission_attempt,"
+                "acceptance_state,last_error_code,version) VALUES "
+                "(1,'cursor-replay-client','AAPL','sell','market',1,'canceled',"
+                "'cursor-replay-order',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'',"
+                "'simple','{}',0,'accepted','',0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO fills "
+                "(order_id,ticker,side,qty,price,broker_fill_id,filled_at) "
+                "VALUES "
+                "(1,'AAPL','sell',1,90,'cursor-replay-fill',"
+                "'2026-07-20 17:00:00')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO reconciliation_cursors "
+                "(broker,stream,last_activity_id,last_activity_at,version) "
+                "VALUES "
+                "('migration-replay','fills','cursor-ahead',"
+                "'2026-07-25 17:00:00',9)"
+            )
+        )
+
+    command.upgrade(cfg, "20260724_0005")
+
+    with engine.connect() as conn:
+        assert conn.scalar(
+            text(
+                "SELECT count(*) FROM reconciliation_cursors "
+                "WHERE stream='fills'"
+            )
+        ) == 0
+
+    exact_time = datetime(2026, 7, 20, 17, 0, tzinfo=timezone.utc)
+    exact = BrokerFill(
+        broker_fill_id="cursor-replay-fill",
+        broker_order_id="cursor-replay-order",
+        ticker="AAPL",
+        side="sell",
+        qty=Decimal("1"),
+        price=Decimal("90"),
+        filled_at=exact_time,
+    )
+    remote = OrderResult(
+        "cursor-replay-client",
+        "cursor-replay-order",
+        OrderStatus.CANCELED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("90"),
+    )
+
+    class CursorAwareReplayBroker(MockBroker):
+        reconciliation_key = "migration-replay"
+
+        def __init__(self):
+            super().__init__()
+            self.after_calls = []
+            self._orders_by_id["cursor-replay-order"] = remote
+            self._orders_by_key["cursor-replay-client"] = remote
+
+        def get_fill_activities(self, after=None):
+            self.after_calls.append(after)
+            return [exact] if after is None else []
+
+    broker = CursorAwareReplayBroker()
+    factory = make_session_factory(engine)
+    reconciliation = ReconciliationService(
+        factory,
+        broker,
+        OrderRepository(factory),
+    )
+
+    first = reconciliation.reconcile()
+    replay = ReconciliationService(
+        factory,
+        broker,
+        OrderRepository(factory),
+    ).reconcile()
+
+    assert first.inserted_fills == 0
+    assert replay.inserted_fills == 0
+    assert broker.after_calls == [None, exact_time]
+    with factory() as session:
+        order = session.get(Order, 1)
+        recovered = session.scalar(
+            select(Fill).where(
+                Fill.broker_fill_id == "cursor-replay-fill"
+            )
+        )
+        cursor = session.get(
+            ReconciliationCursor,
+            ("migration-replay", "fills"),
+        )
+        assert order is not None
+        assert recovered is not None
+        assert cursor is not None
+        assert order.acceptance_state == "accepted"
+        assert recovered.reconciliation_state == "trusted"
+        assert recovered.filled_at == exact_time
+        assert session.scalar(
+            select(func.count()).select_from(Fill)
+        ) == 1
+        assert cursor.last_activity_id == "cursor-replay-fill"
+        assert cursor.last_activity_at == exact_time

@@ -31,6 +31,18 @@ def upgrade() -> None:
         SET reconciliation_state = 'quarantined'
         """
     )
+    op.execute(
+        """
+        DELETE FROM reconciliation_cursors
+        WHERE
+            stream = 'fills'
+            AND EXISTS (
+                SELECT 1
+                FROM fills
+                WHERE reconciliation_state = 'quarantined'
+            )
+        """
+    )
     op.create_table(
         "circuit_breaker_state",
         sa.Column("scope_key", sa.String(length=64), nullable=False),
