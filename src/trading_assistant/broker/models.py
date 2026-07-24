@@ -106,6 +106,19 @@ def fill_quantity_relation(
     return FillQuantityRelation.EXACT
 
 
+def exact_fill_exceeds_order_quantity(
+    requested_qty: object | None,
+    aggregate_exact_qty: object,
+) -> bool:
+    """Whether trusted exact fills exceed a quantity order by any quantum."""
+    if requested_qty is None:
+        return False
+    return (
+        fill_quantity_relation(aggregate_exact_qty, requested_qty)
+        is FillQuantityRelation.AHEAD
+    )
+
+
 def normalize_fill_economic(value: object) -> Decimal | None:
     """Return the exact persisted fill value, or fail closed if unrepresentable."""
     if (

@@ -16,6 +16,7 @@ from trading_assistant.broker.models import (
     FillQuantityRelation,
     OrderResult,
     OrderStatus,
+    exact_fill_exceeds_order_quantity,
     fill_quantity_relation,
     normalize_fill_economic,
     order_result_identity_error,
@@ -37,7 +38,11 @@ from trading_assistant.db.models import (
     fill_has_trusted_identity,
     fill_requires_reconciliation,
 )
-from trading_assistant.risk.breakers import BreakerScope, BreakerService
+from trading_assistant.risk.breakers import (
+    BreakerScope,
+    BreakerService,
+    trip_in_session,
+)
 from trading_assistant.risk.staleness import (
     DEFAULT_MAX_FUTURE_SKEW_SECONDS,
 )
@@ -180,6 +185,8 @@ class ReconciliationService:
             ):
                 resolved += 1
                 resolved_results.append((order_id, remote))
+            else:
+                unresolved.append(order_id)
         return (
             resolved,
             tuple(sorted(unresolved)),
@@ -390,6 +397,63 @@ class ReconciliationService:
                 cursor.version,
             )
 
+    @staticmethod
+    def _trusted_exact_fill_qty(session: Session, order: Order) -> Decimal:
+        synthetic_prefix = f"{order.broker_order_id}:"
+        fills = session.scalars(
+            select(Fill).where(Fill.order_id == order.id)
+        ).all()
+        return sum(
+            (
+                fill.qty
+                for fill in fills
+                if fill_has_trusted_identity(fill)
+                and not fill.broker_fill_id.startswith(synthetic_prefix)
+            ),
+            Decimal(0),
+        )
+
+    @staticmethod
+    def _quantity_overfill_detail(
+        order: Order,
+        aggregate_exact_qty: Decimal,
+    ) -> str | None:
+        if not exact_fill_exceeds_order_quantity(
+            order.qty,
+            aggregate_exact_qty,
+        ):
+            return None
+        return (
+            f"authoritative fill quantity {aggregate_exact_qty} for order "
+            f"{order.id} exceeds requested quantity {order.qty}"
+        )
+
+    def _latch_quantity_overfill_in_session(
+        self,
+        session: Session,
+        order: Order,
+        aggregate_exact_qty: Decimal,
+        drift: list[str],
+    ) -> bool:
+        detail = self._quantity_overfill_detail(
+            order,
+            aggregate_exact_qty,
+        )
+        if detail is None:
+            return False
+        drift.append(detail)
+        self._latch_order_in_session(
+            order,
+            "fill_quantity_exceeds_order",
+        )
+        trip_in_session(
+            session,
+            BreakerScope.broker_drift(),
+            detail,
+            "daemon:reconciliation",
+        )
+        return True
+
     def _reconcile_fill_activities(
         self,
         drift: list[str],
@@ -505,12 +569,33 @@ class ReconciliationService:
                                 activity,
                             )
                             inserted_activities.append(activity)
+                        aggregate_exact_qty = (
+                            self._trusted_exact_fill_qty(session, order)
+                        )
+                        if self._latch_quantity_overfill_in_session(
+                            session,
+                            order,
+                            aggregate_exact_qty,
+                            drift,
+                        ):
+                            blocked_order_ids.add(order.id)
                         continue
                     self._remove_synthetic_fills(session, order)
                     self._supersede_matching_quarantined_fill(
                         session,
                         order,
                         activity,
+                    )
+                    projected_exact_qty = (
+                        self._trusted_exact_fill_qty(session, order)
+                        + activity.qty
+                    )
+                    exact_fill_overflow = (
+                        self._quantity_overfill_detail(
+                            order,
+                            projected_exact_qty,
+                        )
+                        is not None
                     )
                     session.add(
                         Fill(
@@ -525,6 +610,15 @@ class ReconciliationService:
                     )
                     inserted += 1
                     inserted_activities.append(activity)
+                    if exact_fill_overflow and (
+                        self._latch_quantity_overfill_in_session(
+                            session,
+                            order,
+                            projected_exact_qty,
+                            drift,
+                        )
+                    ):
+                        blocked_order_ids.add(order.id)
 
                 if advance_cursor:
                     cursor_candidate = None
@@ -863,6 +957,14 @@ class ReconciliationService:
                     (fill.qty for fill in authoritative_fills),
                     Decimal(0),
                 )
+                if self._latch_quantity_overfill_in_session(
+                    session,
+                    order,
+                    authoritative_qty,
+                    drift,
+                ):
+                    session.commit()
+                    continue
                 authoritative_relation = fill_quantity_relation(
                     remote.filled_qty,
                     authoritative_qty,
@@ -1427,6 +1529,13 @@ class ReconciliationService:
                         (fill.qty for fill in authoritative_fills),
                         Decimal(0),
                     )
+                    if self._latch_quantity_overfill_in_session(
+                        session,
+                        order,
+                        authoritative_qty,
+                        faults,
+                    ):
+                        continue
                     fill_truth_complete = (
                         not any(
                             fill_requires_reconciliation(fill)

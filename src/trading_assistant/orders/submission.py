@@ -10,7 +10,10 @@ from typing import Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_assistant.broker.base import BrokerSubmissionRejected
+from trading_assistant.broker.base import (
+    BrokerDataIntegrityError,
+    BrokerSubmissionRejected,
+)
 from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
@@ -196,6 +199,19 @@ class OrderSubmissionService:
                         )
                         return SubmissionResult(
                             order_id, OrderStatus.REJECTED
+                        )
+                    except BrokerDataIntegrityError as exc:
+                        self.repository.record_invalid_broker_data(
+                            order_id,
+                            str(exc),
+                            self.now(),
+                            broker_order_id=exc.broker_order_id,
+                            error_code="invalid_broker_data",
+                        )
+                        return SubmissionResult(
+                            order_id,
+                            OrderStatus.ACCEPTANCE_UNKNOWN,
+                            exc.broker_order_id,
                         )
                     except Exception as exc:
                         self.repository.record_submission_result(

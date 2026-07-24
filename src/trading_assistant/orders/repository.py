@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from trading_assistant.broker.models import (
     FillQuantityRelation,
     OrderStatus,
+    exact_fill_exceeds_order_quantity,
     fill_quantity_relation,
 )
 from trading_assistant.db.models import (
@@ -184,10 +185,17 @@ class OrderRepository:
         }:
             raise ValueError(f"invalid submission result {status.value}")
         with self.session_factory() as session:
+            requested_qty = session.scalar(
+                select(Order.qty).where(Order.id == order_id)
+            )
             authoritative_qty = self._authoritative_fill_qty(
                 session,
                 order_id,
                 broker_order_id,
+            )
+            exact_fill_overflow = exact_fill_exceeds_order_quantity(
+                requested_qty,
+                authoritative_qty,
             )
             (
                 requires_fill_reconciliation,
@@ -202,21 +210,29 @@ class OrderRepository:
             )
             acceptance_state = (
                 FILL_RECONCILIATION_REQUIRED
-                if requires_fill_reconciliation
+                if requires_fill_reconciliation or exact_fill_overflow
                 else status.value
             )
             persisted_error_code = (
-                "invalid_cumulative_fill"
-                if invalid_cumulative
+                "fill_quantity_exceeds_order"
+                if exact_fill_overflow
                 else (
-                    "cumulative_fill_contradiction"
-                    if cumulative_contradiction
-                    else error_code
+                    "invalid_cumulative_fill"
+                    if invalid_cumulative
+                    else (
+                        "cumulative_fill_contradiction"
+                        if cumulative_contradiction
+                        else error_code
+                    )
                 )
             )
             persisted_status = (
                 OrderStatus.ACCEPTANCE_UNKNOWN
-                if cumulative_contradiction
+                if (
+                    invalid_cumulative
+                    or cumulative_contradiction
+                    or exact_fill_overflow
+                )
                 else status
             )
             result = session.execute(
@@ -236,15 +252,32 @@ class OrderRepository:
             )
             if result.rowcount != 1:
                 raise RuntimeError(f"order {order_id} lost submission claim")
-            if cumulative_contradiction:
-                trip_in_session(
-                    session,
-                    BreakerScope.broker_drift(),
-                    (
+            if (
+                invalid_cumulative
+                or cumulative_contradiction
+                or exact_fill_overflow
+            ):
+                if exact_fill_overflow:
+                    drift_reason = (
+                        f"authoritative fill quantity {authoritative_qty} for "
+                        f"order {order_id} exceeds requested quantity "
+                        f"{requested_qty}"
+                    )
+                elif invalid_cumulative:
+                    drift_reason = (
+                        f"broker cumulative fill {filled_qty} for order "
+                        f"{order_id} is invalid"
+                    )
+                else:
+                    drift_reason = (
                         f"broker cumulative fill {filled_qty} for order "
                         f"{order_id} is below authoritative local quantity "
                         f"{authoritative_qty}"
-                    ),
+                    )
+                trip_in_session(
+                    session,
+                    BreakerScope.broker_drift(),
+                    drift_reason,
                     "service:submission",
                     now=now,
                 )
@@ -273,9 +306,38 @@ class OrderRepository:
         now: datetime,
     ) -> None:
         """Atomically latch an indeterminate post-send identity and drift."""
+        self.record_invalid_broker_data(
+            order_id,
+            reason,
+            now,
+            broker_order_id=None,
+            error_code="invalid_broker_identity",
+        )
+
+    def record_invalid_broker_data(
+        self,
+        order_id: int,
+        reason: str,
+        now: datetime,
+        *,
+        broker_order_id: str | None,
+        error_code: str,
+    ) -> None:
+        """Atomically latch malformed synchronous broker truth and drift."""
         reason = reason.strip()
         if not reason:
-            raise ValueError("invalid broker identity reason must be non-empty")
+            raise ValueError("invalid broker data reason must be non-empty")
+        if error_code not in {
+            "invalid_broker_data",
+            "invalid_broker_identity",
+            "invalid_cumulative_fill",
+        }:
+            raise ValueError("unsupported broker data integrity error code")
+        trusted_broker_order_id = (
+            broker_order_id.strip()
+            if isinstance(broker_order_id, str) and broker_order_id.strip()
+            else None
+        )
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -285,9 +347,9 @@ class OrderRepository:
                 )
                 .values(
                     status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                    broker_order_id=None,
+                    broker_order_id=trusted_broker_order_id,
                     acceptance_state=FILL_RECONCILIATION_REQUIRED,
-                    last_error_code="invalid_broker_identity",
+                    last_error_code=error_code,
                     updated_at=now,
                     version=Order.version + 1,
                 )
@@ -311,7 +373,7 @@ class OrderRepository:
             trip_in_session(
                 session,
                 BreakerScope.broker_drift(),
-                f"invalid broker submission identity for order {order_id}: {reason}",
+                f"invalid broker submission data for order {order_id}: {reason}",
                 "service:submission",
                 now=now,
             )
@@ -380,10 +442,17 @@ class OrderRepository:
         if broker_order_id is None:
             return False
         with self.session_factory() as session:
+            requested_qty = session.scalar(
+                select(Order.qty).where(Order.id == order_id)
+            )
             authoritative_qty = self._authoritative_fill_qty(
                 session,
                 order_id,
                 broker_order_id,
+            )
+            exact_fill_overflow = exact_fill_exceeds_order_quantity(
+                requested_qty,
+                authoritative_qty,
             )
             (
                 requires_fill_reconciliation,
@@ -398,7 +467,7 @@ class OrderRepository:
             )
             acceptance_state = (
                 FILL_RECONCILIATION_REQUIRED
-                if requires_fill_reconciliation
+                if requires_fill_reconciliation or exact_fill_overflow
                 else "accepted"
             )
             values: dict[str, object] = {
@@ -406,18 +475,22 @@ class OrderRepository:
                 "acceptance_state": acceptance_state,
                 "last_reconciled_at": now,
                 "last_error_code": (
-                    "invalid_cumulative_fill"
-                    if invalid_cumulative
+                    "fill_quantity_exceeds_order"
+                    if exact_fill_overflow
                     else (
-                        "cumulative_fill_contradiction"
-                        if cumulative_contradiction
-                        else ""
+                        "invalid_cumulative_fill"
+                        if invalid_cumulative
+                        else (
+                            "cumulative_fill_contradiction"
+                            if cumulative_contradiction
+                            else ""
+                        )
                     )
                 ),
                 "updated_at": now,
                 "version": Order.version + 1,
             }
-            if not cumulative_contradiction:
+            if not cumulative_contradiction and not exact_fill_overflow:
                 values["status"] = status.value
             result = session.execute(
                 update(Order)
@@ -435,20 +508,29 @@ class OrderRepository:
             if result.rowcount != 1:
                 session.rollback()
                 return False
-            if cumulative_contradiction:
-                trip_in_session(
-                    session,
-                    BreakerScope.broker_drift(),
+            if cumulative_contradiction or exact_fill_overflow:
+                drift_reason = (
                     (
+                        f"authoritative fill quantity {authoritative_qty} for "
+                        f"order {order_id} exceeds requested quantity "
+                        f"{requested_qty}"
+                    )
+                    if exact_fill_overflow
+                    else (
                         f"broker cumulative fill {filled_qty} for order "
                         f"{order_id} is below authoritative local quantity "
                         f"{authoritative_qty}"
-                    ),
+                    )
+                )
+                trip_in_session(
+                    session,
+                    BreakerScope.broker_drift(),
+                    drift_reason,
                     "service:reconciliation",
                     now=now,
                 )
             session.commit()
-            return True
+            return not exact_fill_overflow
 
     def record_pre_submission_rejection(
         self, order_id: int, reasons: tuple[str, ...], now: datetime

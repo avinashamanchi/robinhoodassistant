@@ -1120,6 +1120,238 @@ class ActivityBroker(MockBroker):
         return list(self.activities)
 
 
+@pytest.mark.parametrize(
+    "excess_qty",
+    [FILL_ECONOMIC_QUANTUM, Decimal("1")],
+    ids=["one-quantum-overfill", "one-share-order-two-shares-filled"],
+)
+def test_quantity_order_exact_overfill_is_preserved_latched_and_replay_safe(
+    make_service,
+    excess_qty,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        qty="1",
+        idempotency_key=f"quantity-overfill-{excess_qty}",
+    )["order_id"]
+    service.approve_order(
+        order_id,
+        actor="operator:avi",
+        reason="reviewed quantity order",
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+        filled_at = order.submission_started_at + timedelta(seconds=1)
+    aggregate_qty = Decimal("1") + excess_qty
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=f"quantity-overfill-base-{excess_qty}",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            filled_at=filled_at,
+        ),
+        BrokerFill(
+            broker_fill_id=f"quantity-overfill-excess-{excess_qty}",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=excess_qty,
+            price=Decimal("100"),
+            filled_at=filled_at + timedelta(milliseconds=1),
+        ),
+    ]
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=aggregate_qty,
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 2
+    assert replay.inserted_fills == 0
+    assert any("exceeds requested quantity 1" in item for item in first.broker_drift)
+    assert any("exceeds requested quantity 1" in item for item in replay.broker_drift)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        fills = session.scalars(
+            select(Fill).where(Fill.order_id == order_id)
+        ).all()
+        assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert order.last_error_code == "fill_quantity_exceeds_order"
+        assert len(fills) == 2
+        assert sum((fill.qty for fill in fills), Decimal(0)) == aggregate_qty
+
+
+def test_acceptance_recovery_never_clears_exact_quantity_overfill(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    submitted_at = utcnow() - timedelta(seconds=1)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="acceptance-quantity-overfill",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+            acceptance_state=FILL_RECONCILIATION_REQUIRED,
+            last_error_code="waiting_for_exact_fill",
+            submission_started_at=submitted_at,
+        )
+        session.add(order)
+        session.flush()
+        order_id = order.id
+        session.add_all(
+            [
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="acceptance-overfill-1",
+                    filled_at=submitted_at + timedelta(milliseconds=1),
+                ),
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="acceptance-overfill-2",
+                    filled_at=submitted_at + timedelta(milliseconds=2),
+                ),
+            ]
+        )
+        session.commit()
+    remote = OrderResult(
+        "acceptance-quantity-overfill",
+        "acceptance-quantity-overfill-broker",
+        OrderStatus.FILLED,
+        filled_qty=Decimal("2"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_key[remote.idempotency_key] = remote
+    broker._orders_by_id[remote.broker_order_id] = remote
+
+    first = service.reconciliation.reconcile_unknown()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile_unknown()
+
+    assert first == (0, (order_id,))
+    assert replay == (0, (order_id,))
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert order.broker_order_id == remote.broker_order_id
+        assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert order.last_error_code == "fill_quantity_exceeds_order"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(Fill.order_id == order_id)
+        ) == 2
+
+
+def test_panic_never_clears_exact_quantity_overfill(make_service):
+    class OverfillCancelBroker(MockBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            canceled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.CANCELED,
+                filled_qty=Decimal("2"),
+                avg_fill_price=Decimal("100"),
+            )
+            self._orders_by_id[order_id] = canceled
+            self._orders_by_key[current.idempotency_key] = canceled
+            return canceled
+
+    broker = OverfillCancelBroker()
+    service = make_service(broker=broker)
+    submitted_at = utcnow() - timedelta(seconds=1)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="panic-quantity-overfill",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id="panic-quantity-overfill-broker",
+            acceptance_state=FILL_RECONCILIATION_REQUIRED,
+            last_error_code="waiting_for_exact_fill",
+            submission_started_at=submitted_at,
+        )
+        session.add(order)
+        session.flush()
+        order_id = order.id
+        session.add_all(
+            [
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="panic-overfill-1",
+                    filled_at=submitted_at + timedelta(milliseconds=1),
+                ),
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="panic-overfill-2",
+                    filled_at=submitted_at + timedelta(milliseconds=2),
+                ),
+            ]
+        )
+        session.commit()
+    remote = OrderResult(
+        "panic-quantity-overfill",
+        "panic-quantity-overfill-broker",
+        OrderStatus.SUBMITTED,
+        filled_qty=Decimal("2"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[remote.broker_order_id] = remote
+    broker._orders_by_key[remote.idempotency_key] = remote
+
+    report = service.reconciliation.panic(
+        "operator:avi",
+        "quantity overfill verification",
+    )
+
+    assert report.safe is False
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert order.last_error_code == "fill_quantity_exceeds_order"
+
+
 def _crypto_order_with_remote_fill(
     service,
     broker,

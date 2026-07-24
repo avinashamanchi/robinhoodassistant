@@ -7,7 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from trading_assistant.broker.base import BrokerSubmissionRejected
+from trading_assistant.broker.base import (
+    BrokerDataIntegrityError,
+    BrokerSubmissionRejected,
+)
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     FILL_ECONOMIC_QUANTUM,
@@ -59,6 +62,39 @@ def test_accept_then_disconnect_becomes_unknown_without_duplicate(make_service):
     result2 = svc.order_submission.submit(order_id)
     assert result2.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert len(broker._orders_by_key) == 1
+    assert svc.breakers.is_tripped(BreakerScope.broker_drift()) is False
+    with svc.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert order.last_error_code == "ConnectionError"
+
+
+def test_synchronous_broker_data_integrity_latches_and_trips_drift(
+    make_service,
+):
+    class MalformedSynchronousBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            raise BrokerDataIntegrityError(
+                "malformed synchronous order payload",
+                broker_order_id=accepted.broker_order_id,
+            )
+
+    broker = MalformedSynchronousBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    order_id = _approved_order(service)
+
+    result = service.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert order.broker_order_id is not None
+        assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert order.last_error_code == "invalid_broker_data"
 
 
 def test_broker_call_occurs_after_claim_transaction_commits(make_service):
@@ -299,10 +335,11 @@ def test_synchronous_invalid_cumulative_fill_latches_before_return(
 
     result = svc.order_submission.submit(order_id)
 
-    assert result.status is OrderStatus.SUBMITTED
+    assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert svc.breakers.is_tripped(BreakerScope.broker_drift()) is True
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
-        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
         assert order.acceptance_state == "fill_reconcile_required"
         assert order.last_error_code == "invalid_cumulative_fill"
 

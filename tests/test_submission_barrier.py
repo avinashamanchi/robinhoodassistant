@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from trading_assistant.assets import AssetClass
+from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     BrokerFill,
@@ -92,6 +93,16 @@ class _InvalidIdentityProcessBroker:
             idempotency_key=f"wrong-{order.idempotency_key}",
             broker_order_id="untrusted-process-broker-order",
             status=OrderStatus.SUBMITTED,
+        )
+
+
+class _InvalidDataProcessBroker:
+    reconciliation_key = "invalid-data-process-test"
+
+    def submit_order(self, order):
+        raise BrokerDataIntegrityError(
+            "malformed synchronous process payload",
+            broker_order_id="malformed-process-broker-order",
         )
 
 
@@ -591,19 +602,25 @@ def _immediate_submission_process(
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
-def _invalid_identity_submission_process(
+def _invalid_submission_process(
     db_url,
     order_id,
+    fault_kind,
     before_barrier_release,
     release_barrier,
     finished,
     outcome,
 ):
     factory = make_session_factory(create_db_engine(db_url))
+    broker = (
+        _InvalidIdentityProcessBroker()
+        if fault_kind == "identity"
+        else _InvalidDataProcessBroker()
+    )
     service = OrderSubmissionService(
         OrderRepository(factory),
         factory,
-        _InvalidIdentityProcessBroker(),
+        broker,
         _StaticSnapshotService(),
         lambda _symbol: _AlwaysApproves(),
         utcnow,
@@ -1525,9 +1542,23 @@ def test_acceptance_contradiction_is_atomic_before_writer_interval_release(
     assert broker_entered.is_set() is False
 
 
-def test_invalid_submission_identity_is_durable_before_barrier_release(
+@pytest.mark.parametrize(
+    ("fault_kind", "expected_broker_order_id", "expected_error"),
+    [
+        ("identity", None, "invalid_broker_identity"),
+        (
+            "data",
+            "malformed-process-broker-order",
+            "invalid_broker_data",
+        ),
+    ],
+)
+def test_invalid_submission_fault_is_durable_before_barrier_release(
     make_service,
     db_url,
+    fault_kind,
+    expected_broker_order_id,
+    expected_error,
 ):
     context: SpawnContext = __import__("multiprocessing").get_context("spawn")
     service = make_service()
@@ -1539,10 +1570,11 @@ def test_invalid_submission_identity_is_durable_before_barrier_release(
     invalid_finished = context.Event()
     invalid_outcome = context.Queue()
     invalid_submission = context.Process(
-        target=_invalid_identity_submission_process,
+        target=_invalid_submission_process,
         args=(
             db_url,
             invalid_order_id,
+            fault_kind,
             before_barrier_release,
             release_barrier,
             invalid_finished,
@@ -1555,12 +1587,12 @@ def test_invalid_submission_identity_is_durable_before_barrier_release(
     with service.session_factory() as session:
         invalid_order = session.get(Order, invalid_order_id)
         assert invalid_order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
-        assert invalid_order.broker_order_id is None
+        assert invalid_order.broker_order_id == expected_broker_order_id
         assert (
             invalid_order.acceptance_state
             == FILL_RECONCILIATION_REQUIRED
         )
-        assert invalid_order.last_error_code == "invalid_broker_identity"
+        assert invalid_order.last_error_code == expected_error
     assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
 
     follower_broker_entered = context.Event()
@@ -1586,7 +1618,7 @@ def test_invalid_submission_identity_is_durable_before_barrier_release(
     assert invalid_outcome.get(timeout=2) == (
         "ok",
         OrderStatus.ACCEPTANCE_UNKNOWN.value,
-        None,
+        expected_broker_order_id,
     )
     assert follower_outcome.get(timeout=2) == (
         "ok",
