@@ -41,3 +41,4 @@ logs/
 
 # Local brainstorming mockups and browser-session state
 .superpowers/
+.worktrees/
