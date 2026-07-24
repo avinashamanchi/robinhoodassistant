@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from trading_assistant.broker.base import BrokerClient
 from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
 from trading_assistant.db.models import (
-    AuditEvent,
     Fill,
     Order,
     OrderStateMachine,
@@ -21,11 +20,10 @@ from trading_assistant.db.models import (
     RuleGroup,
     Proposal,
 )
-from trading_assistant.risk.killswitch import KillSwitch
+from trading_assistant.risk.breakers import BreakerScope, BreakerService
 
 from .repository import OrderRepository
 
-OPERATOR_GLOBAL = "operator_global"
 _LOCAL_LIVE_STATUSES = (
     OrderStatus.SUBMITTING.value,
     OrderStatus.ACCEPTANCE_UNKNOWN.value,
@@ -62,10 +60,12 @@ class ReconciliationService:
         session_factory: sessionmaker[Session],
         broker: BrokerClient,
         repository: OrderRepository,
+        breakers: BreakerService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.broker = broker
         self.repository = repository
+        self.breakers = breakers or BreakerService(session_factory)
         self.broker_key = broker.reconciliation_key
 
     def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
@@ -464,25 +464,12 @@ class ReconciliationService:
             raise ValueError("panic actor and reason must be non-empty")
 
         # The durable global latch is the first side effect. No broker call occurs
-        # until this transaction is closed.
-        with self.session_factory() as session:
-            KillSwitch.trip(
-                session,
-                reason=f"panic by {actor}: {reason}",
-                asset_class=OPERATOR_GLOBAL,
-            )
-            session.add(
-                AuditEvent(
-                    actor=actor,
-                    action="operator.panic",
-                    target_type="system",
-                    target_id=OPERATOR_GLOBAL,
-                    request_id="",
-                    reason=reason,
-                    result_code="latched",
-                )
-            )
-            session.commit()
+        # until its transaction is closed.
+        self.breakers.trip(
+            BreakerScope.operator_global(),
+            reason=f"panic by {actor}: {reason}",
+            actor=actor,
+        )
 
         with self.session_factory() as session:
             session.execute(

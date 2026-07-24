@@ -1,16 +1,11 @@
-"""The risk engine — deterministic, pure, the final authority on every order (A1, A3).
-
-It performs NO I/O. The caller assembles a :class:`PortfolioSnapshot`, resolves
-whether the kill switch is tripped (DB) and whether the market is open (clock),
-and passes those in. Every order — LLM-proposed or execution-time re-check —
-goes through :meth:`RiskEngine.check`.
-"""
+"""The pure, deterministic final authority on every order."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 
-from ..broker.models import OrderRequest, PortfolioSnapshot
+from ..broker.models import OrderRequest, OrderSide, PortfolioSnapshot
 from ..config import RiskConfig
 from . import rules
 
@@ -38,35 +33,71 @@ class RiskEngine:
         self.config = config
 
     def check(
-        self,
-        order: OrderRequest,
-        snapshot: PortfolioSnapshot,
-        *,
-        killswitch_tripped: bool,
-        market_open: bool,
+        self, order: OrderRequest, snapshot: PortfolioSnapshot
     ) -> RiskResult:
+        symbol = order.ticker.upper()
+        quote = snapshot.quotes.get(symbol)
         reasons: list[str] = []
-
-        # Kill switch blocks everything, first and unconditionally.
-        if killswitch_tripped:
-            reasons.append("kill switch is tripped; all new orders are blocked")
-
-        checks = [
+        base_checks = [
             rules.check_allowlist(order, self.config),
             rules.check_pending_exposure_known(snapshot),
-            rules.check_market_hours(order, self.config, market_open),
+            rules.check_market_hours(order, self.config, snapshot.market_open),
             rules.check_max_notional(order, snapshot, self.config),
             rules.check_max_position(order, snapshot, self.config),
             rules.check_portfolio_exposure(order, snapshot, self.config),
             rules.check_price_sanity(order, snapshot, self.config),
         ]
-        reasons.extend(r for r in checks if r is not None)
+        reasons.extend(reason for reason in base_checks if reason is not None)
 
-        # Non-blocking advisories (do NOT affect approval).
+        if not snapshot.quote_fresh:
+            reasons.append("quote is stale")
+        if snapshot.active_breakers:
+            scopes = ",".join(sorted(snapshot.active_breakers))
+            reasons.append(f"active circuit breaker: {scopes}")
+        if self.config.require_broker_reconciled and not snapshot.broker_reconciled:
+            reasons.append("broker reconciliation is not current")
+        if not snapshot.daily_pnl_complete:
+            reasons.append("daily P&L snapshot is incomplete")
+
+        if quote is not None:
+            estimated = order.estimated_notional(quote.last)
+            if order.side is OrderSide.BUY and estimated > snapshot.buying_power:
+                reasons.append("insufficient buying power")
+            if order.side is OrderSide.SELL:
+                position = snapshot.positions.get(symbol)
+                held = max(position.qty, Decimal(0)) if position else Decimal(0)
+                reserved = snapshot.reserved_sell_qty_by_ticker.get(
+                    symbol, Decimal(0)
+                )
+                requested = (
+                    order.qty
+                    if order.qty is not None
+                    else order.notional / quote.last
+                )
+                if requested > held - reserved:
+                    reasons.append("sell quantity exceeds unreserved position")
+
+        daily_total = snapshot.realized_pnl_today + snapshot.unrealized_pnl_today
+        if daily_total <= -Decimal(str(self.config.max_daily_total_loss)):
+            reasons.append("daily total-loss limit reached")
+        if snapshot.account_high_water_mark > 0:
+            drawdown = (
+                snapshot.account_high_water_mark - snapshot.account_equity
+            ) / snapshot.account_high_water_mark * Decimal(100)
+            if drawdown >= Decimal(str(self.config.max_account_drawdown_pct)):
+                reasons.append("account drawdown limit reached")
+        spread = snapshot.spread_pct_by_ticker.get(symbol)
+        if (
+            spread is not None
+            and spread > Decimal(str(self.config.max_spread_pct))
+        ):
+            reasons.append("spread exceeds configured maximum")
+
         warnings: list[str] = []
         if self.config.warn_on_cross_broker_concentration:
-            warning = rules.check_cross_broker_concentration(order, snapshot, self.config)
+            warning = rules.check_cross_broker_concentration(
+                order, snapshot, self.config
+            )
             if warning is not None:
                 warnings.append(warning)
-
         return RiskResult(approved=not reasons, reasons=reasons, warnings=warnings)

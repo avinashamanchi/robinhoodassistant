@@ -1,11 +1,4 @@
-"""Kill switch — DB-backed so a restart returns tripped (A3).
-
-Phase 7: keyed by asset class. Equity and crypto trip independently. Every method
-defaults ``asset_class=EQUITY`` so all pre-Phase-7 call sites and tests are
-unchanged. When the daily realized loss for a class breaches its limit, that
-class's switch trips and blocks its new orders until a human resets it. Both trip
-and reset write an audit row to ``risk_events``.
-"""
+"""Compatibility facade mapping legacy kill switches to scoped breakers."""
 
 from __future__ import annotations
 
@@ -15,37 +8,36 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..assets import AssetClass
-from ..db.models import KillSwitchState, RiskEvent, utcnow
+from ..db.models import CircuitBreakerState, RiskEvent
+from .breakers import (
+    BreakerScope,
+    reset_in_session,
+    trip_in_session,
+)
 
 
-def _ac(asset_class: AssetClass | str) -> str:
-    return asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class)
-
-
-def _get_or_create_state(session: Session, asset_class: str) -> KillSwitchState:
-    state = session.execute(
-        select(KillSwitchState).where(KillSwitchState.asset_class == asset_class)
-    ).scalar_one_or_none()
-    if state is None:
-        state = KillSwitchState(asset_class=asset_class, tripped=False, reason="")
-        session.add(state)
-        session.flush()
-    return state
+def _scope(asset_class: AssetClass | str) -> BreakerScope:
+    if isinstance(asset_class, AssetClass):
+        return BreakerScope.loss(asset_class)
+    if str(asset_class) == "operator_global":
+        return BreakerScope.operator_global()
+    return BreakerScope.loss(AssetClass(str(asset_class)))
 
 
 class KillSwitch:
-    """All methods read/write the ``killswitch_state`` row for one asset class."""
+    """Legacy session-oriented API over loss and operator-global scopes."""
 
     @staticmethod
     def is_tripped(
         session: Session, asset_class: AssetClass | str = AssetClass.EQUITY
     ) -> bool:
-        state = session.execute(
-            select(KillSwitchState).where(
-                KillSwitchState.asset_class == _ac(asset_class)
+        return bool(
+            session.scalar(
+                select(CircuitBreakerState.tripped).where(
+                    CircuitBreakerState.scope_key == _scope(asset_class).key
+                )
             )
-        ).scalar_one_or_none()
-        return bool(state and state.tripped)
+        )
 
     @staticmethod
     def trip(
@@ -53,15 +45,20 @@ class KillSwitch:
         reason: str,
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
-        ac = _ac(asset_class)
-        state = _get_or_create_state(session, ac)
-        if state.tripped:
-            return  # already tripped; keep the original reason/time
-        state.tripped = True
-        state.tripped_at = utcnow()
-        state.reason = reason
-        state.updated_at = utcnow()
-        session.add(RiskEvent(event_type="killswitch_trip", reason=f"[{ac}] {reason}"))
+        scope = _scope(asset_class)
+        _state, changed = trip_in_session(
+            session,
+            scope,
+            reason,
+            "compat:killswitch",
+        )
+        if changed:
+            session.add(
+                RiskEvent(
+                    event_type="killswitch_trip",
+                    reason=f"[{scope.key}] {reason}",
+                )
+            )
 
     @staticmethod
     def reset(
@@ -69,13 +66,20 @@ class KillSwitch:
         note: str = "manual reset",
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
-        ac = _ac(asset_class)
-        state = _get_or_create_state(session, ac)
-        state.tripped = False
-        state.tripped_at = None
-        state.reason = ""
-        state.updated_at = utcnow()
-        session.add(RiskEvent(event_type="killswitch_reset", reason=f"[{ac}] {note}"))
+        scope = _scope(asset_class)
+        reset_in_session(
+            session,
+            scope,
+            "compat:killswitch",
+            note,
+            {"compatibility_facade": True},
+        )
+        session.add(
+            RiskEvent(
+                event_type="killswitch_reset",
+                reason=f"[{scope.key}] {note}",
+            )
+        )
 
     @staticmethod
     def evaluate_daily_loss(
@@ -84,7 +88,6 @@ class KillSwitch:
         loss_limit: Decimal,
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> bool:
-        """Trip this class's switch if its realized loss meets/exceeds the limit."""
         if realized_pnl_today <= -abs(loss_limit):
             KillSwitch.trip(
                 session,

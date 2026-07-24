@@ -112,6 +112,7 @@ class Position:
     qty: Decimal          # signed; negative = short
     avg_entry_price: Decimal
     current_price: Decimal
+    unrealized_intraday_pnl: Decimal | None = None
 
     @property
     def market_value(self) -> Decimal:
@@ -168,6 +169,18 @@ class PortfolioSnapshot:
     quotes: dict[str, Quote]
     buying_power: Decimal
     realized_pnl_today: Decimal
+    cash: Decimal = Decimal(0)
+    unrealized_pnl_today: Decimal = Decimal(0)
+    daily_pnl_complete: bool = True
+    account_high_water_mark: Decimal = Decimal(0)
+    account_equity: Decimal = Decimal(0)
+    quote_fresh: bool = True
+    market_open: bool = True
+    spread_pct_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    pending_buy_notional_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    reserved_sell_qty_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    broker_reconciled: bool = True
+    active_breakers: frozenset[str] = frozenset()
     as_of: datetime = field(default_factory=_utcnow)
     external_positions: dict[str, "object"] = field(default_factory=dict)
     # Signed USD exposure from locally tracked outstanding orders that has not

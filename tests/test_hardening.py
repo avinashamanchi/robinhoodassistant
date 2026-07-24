@@ -117,12 +117,14 @@ def test_killswitch_drill(make_service):
     # New equity orders are now blocked...
     blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
     assert blocked["status"] == "rejected"
-    assert any("kill switch" in r for r in blocked["risk_reasons"])
+    assert any("circuit breaker" in r for r in blocked["risk_reasons"])
 
-    # ...until a human resets the equity switch.
+    # Resetting the persisted breaker does not erase the complete loss snapshot.
+    # Risk remains blocked until the account is genuinely back within limits.
     svc.reset_killswitch(AssetClass.EQUITY)
-    ok = svc.propose_order("AAPL", "buy", "market", notional="100")
-    assert ok["status"] == "proposed"
+    still_blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
+    assert still_blocked["status"] == "rejected"
+    assert "daily total-loss limit reached" in still_blocked["risk_reasons"]
 
 
 # ── panic button (D5) ───────────────────────────────────────────

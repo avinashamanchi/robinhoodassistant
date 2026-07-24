@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -57,6 +58,21 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     assert cfg.daemon.cycle_timeout_seconds == 90.0
     assert cfg.daemon.daily_task_timeout_seconds == 120.0
     assert cfg.daemon.heartbeat_stale_seconds == 180.0
+    assert cfg.risk.max_quote_age_seconds == 60.0
+    assert cfg.risk.max_spread_pct == 1.0
+    assert cfg.risk.max_daily_total_loss == 500.0
+    assert cfg.risk.max_account_drawdown_pct == 10.0
+    assert cfg.risk.require_broker_reconciled is True
+    assert cfg.features.auto_execute_preapproved_rules is False
+    assert cfg.execution.prefer_bracket_orders is False
+
+
+def test_deployed_config_keeps_automatic_execution_disabled():
+    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    cfg = load_config(config_path)
+
+    assert cfg.features.auto_execute_preapproved_rules is False
+    assert cfg.execution.prefer_bracket_orders is False
 
 
 def test_typo_in_risk_key_fails_to_load(tmp_path):

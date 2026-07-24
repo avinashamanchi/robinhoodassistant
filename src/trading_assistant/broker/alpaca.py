@@ -213,6 +213,9 @@ class AlpacaBroker(BrokerClient):
                     qty=_d(p.qty) or Decimal(0),
                     avg_entry_price=_d(p.avg_entry_price) or Decimal(0),
                     current_price=_d(p.current_price) or Decimal(0),
+                    unrealized_intraday_pnl=_d(
+                        getattr(p, "unrealized_intraday_pl", None)
+                    ),
                 )
             )
         return out

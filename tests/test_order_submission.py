@@ -9,10 +9,11 @@ from threading import Event, Thread
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import OrderResult, OrderStatus
+from trading_assistant.assets import AssetClass
 from trading_assistant.db.models import Order, Proposal, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.submission import OrderSubmissionService
-from trading_assistant.risk.killswitch import KillSwitch
+from trading_assistant.risk.breakers import BreakerScope
 
 
 def _approved_order(svc) -> int:
@@ -98,7 +99,7 @@ def test_panic_latch_atomically_prevents_a_later_broker_submit(make_service):
     assert svc.broker.submit_calls == 0
 
 
-def test_asset_latch_atomically_prevents_a_later_broker_submit(make_service):
+def test_scoped_data_breaker_atomically_prevents_a_later_broker_submit(make_service):
     svc = make_service()
     order_id = _approved_order(svc)
     claim_reached = Event()
@@ -122,9 +123,11 @@ def test_asset_latch_atomically_prevents_a_later_broker_submit(make_service):
     thread = Thread(target=submit)
     thread.start()
     assert claim_reached.wait(timeout=5)
-    with svc.session_factory() as session:
-        KillSwitch.trip(session, "asset race", "equity")
-        session.commit()
+    svc.breakers.trip(
+        BreakerScope.data(AssetClass.EQUITY),
+        "asset race",
+        "daemon",
+    )
     release_claim.set()
     thread.join(timeout=5)
 

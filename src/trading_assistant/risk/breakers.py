@@ -1,0 +1,297 @@
+"""Typed, durable circuit breakers with independently resettable scopes."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.orm import Session, sessionmaker
+
+from ..assets import AssetClass
+from ..db.models import AuditEvent, CircuitBreakerState
+
+
+class BreakerKind(str, Enum):
+    LOSS = "loss"
+    DRAWDOWN = "drawdown"
+    DATA = "data"
+    LIQUIDITY = "liquidity"
+    BROKER_DRIFT = "broker_drift"
+    OPERATOR_GLOBAL = "operator_global"
+
+
+@dataclass(frozen=True)
+class BreakerScope:
+    kind: BreakerKind
+    target: str = ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind.value}:{self.target}" if self.target else self.kind.value
+
+    @classmethod
+    def data(cls, asset_class: AssetClass) -> "BreakerScope":
+        return cls(BreakerKind.DATA, asset_class.value)
+
+    @classmethod
+    def loss(cls, asset_class: AssetClass) -> "BreakerScope":
+        return cls(BreakerKind.LOSS, asset_class.value)
+
+    @classmethod
+    def drawdown(cls, asset_class: AssetClass) -> "BreakerScope":
+        return cls(BreakerKind.DRAWDOWN, asset_class.value)
+
+    @classmethod
+    def liquidity(cls, target: str) -> "BreakerScope":
+        return cls(BreakerKind.LIQUIDITY, target.upper())
+
+    @classmethod
+    def broker_drift(cls) -> "BreakerScope":
+        return cls(BreakerKind.BROKER_DRIFT)
+
+    @classmethod
+    def operator_global(cls) -> "BreakerScope":
+        return cls(BreakerKind.OPERATOR_GLOBAL)
+
+
+@dataclass(frozen=True)
+class BreakerState:
+    scope: BreakerScope
+    tripped: bool
+    reason: str
+    actor: str
+    updated_at: datetime
+
+
+def relevant_scopes_for_symbol(symbol: str) -> tuple[BreakerScope, ...]:
+    asset_class = AssetClass.for_symbol(symbol)
+    return (
+        BreakerScope.operator_global(),
+        BreakerScope.broker_drift(),
+        BreakerScope.data(asset_class),
+        BreakerScope.loss(asset_class),
+        BreakerScope.drawdown(asset_class),
+        BreakerScope.liquidity(symbol),
+    )
+
+
+def _now(value: datetime | None) -> datetime:
+    value = value or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _state(row: CircuitBreakerState) -> BreakerState:
+    return BreakerState(
+        scope=BreakerScope(BreakerKind(row.kind), row.target),
+        tripped=row.tripped,
+        reason=row.reason,
+        actor=row.actor,
+        updated_at=row.updated_at,
+    )
+
+
+def _audit(
+    session: Session,
+    *,
+    scope: BreakerScope,
+    actor: str,
+    action: str,
+    reason: str,
+    result_code: str,
+    detail: Mapping[str, object] | None = None,
+    now: datetime,
+) -> None:
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type="circuit_breaker",
+            target_id=scope.key,
+            request_id="",
+            reason=reason,
+            result_code=result_code,
+            detail_json=json.dumps(
+                dict(detail or {}), sort_keys=True, default=str
+            ),
+            created_at=now,
+        )
+    )
+
+
+def trip_in_session(
+    session: Session,
+    scope: BreakerScope,
+    reason: str,
+    actor: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[BreakerState, bool]:
+    reason = reason.strip()
+    actor = actor.strip()
+    if not reason or not actor:
+        raise ValueError("breaker trip actor and reason must be non-empty")
+    timestamp = _now(now)
+    statement = insert(CircuitBreakerState).values(
+        scope_key=scope.key,
+        kind=scope.kind.value,
+        target=scope.target,
+        tripped=True,
+        reason=reason,
+        actor=actor,
+        updated_at=timestamp,
+    )
+    result = session.execute(
+        statement.on_conflict_do_update(
+            index_elements=[CircuitBreakerState.scope_key],
+            set_={
+                "kind": scope.kind.value,
+                "target": scope.target,
+                "tripped": True,
+                "reason": reason,
+                "actor": actor,
+                "updated_at": timestamp,
+            },
+            where=CircuitBreakerState.tripped.is_(False),
+        )
+    )
+    changed = result.rowcount == 1
+    row = session.get(CircuitBreakerState, scope.key)
+    assert row is not None
+    _audit(
+        session,
+        scope=scope,
+        actor=actor,
+        action="circuit_breaker.trip",
+        reason=reason,
+        result_code="tripped" if changed else "already_tripped",
+        now=timestamp,
+    )
+    return _state(row), changed
+
+
+def reset_in_session(
+    session: Session,
+    scope: BreakerScope,
+    actor: str,
+    reason: str,
+    prior_health: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> BreakerState:
+    actor = actor.strip()
+    reason = reason.strip()
+    if not actor:
+        raise ValueError("breaker reset actor must be non-empty")
+    if not reason:
+        raise ValueError("breaker reset reason must be non-empty")
+    if not prior_health:
+        raise ValueError("breaker reset prior health must be non-empty")
+    timestamp = _now(now)
+    statement = insert(CircuitBreakerState).values(
+        scope_key=scope.key,
+        kind=scope.kind.value,
+        target=scope.target,
+        tripped=False,
+        reason=reason,
+        actor=actor,
+        updated_at=timestamp,
+    )
+    session.execute(
+        statement.on_conflict_do_update(
+            index_elements=[CircuitBreakerState.scope_key],
+            set_={
+                "kind": scope.kind.value,
+                "target": scope.target,
+                "tripped": False,
+                "reason": reason,
+                "actor": actor,
+                "updated_at": timestamp,
+            },
+        )
+    )
+    row = session.get(CircuitBreakerState, scope.key)
+    assert row is not None
+    _audit(
+        session,
+        scope=scope,
+        actor=actor,
+        action="circuit_breaker.reset",
+        reason=reason,
+        result_code="reset",
+        detail={"prior_health": dict(prior_health)},
+        now=timestamp,
+    )
+    return _state(row)
+
+
+class BreakerService:
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self.session_factory = session_factory
+
+    def trip(
+        self,
+        scope: BreakerScope,
+        reason: str,
+        actor: str,
+        *,
+        now: datetime | None = None,
+    ) -> BreakerState:
+        with self.session_factory() as session:
+            state, _changed = trip_in_session(
+                session, scope, reason, actor, now=now
+            )
+            session.commit()
+            return state
+
+    def is_tripped(self, scope: BreakerScope) -> bool:
+        with self.session_factory() as session:
+            return bool(
+                session.scalar(
+                    select(CircuitBreakerState.tripped).where(
+                        CircuitBreakerState.scope_key == scope.key
+                    )
+                )
+            )
+
+    def active_for_symbol(self, symbol: str) -> tuple[BreakerState, ...]:
+        scope_keys = tuple(
+            scope.key for scope in relevant_scopes_for_symbol(symbol)
+        )
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(CircuitBreakerState)
+                .where(
+                    CircuitBreakerState.scope_key.in_(scope_keys),
+                    CircuitBreakerState.tripped.is_(True),
+                )
+                .order_by(CircuitBreakerState.scope_key)
+            ).all()
+            return tuple(_state(row) for row in rows)
+
+    def reset(
+        self,
+        scope: BreakerScope,
+        actor: str,
+        reason: str,
+        prior_health: Mapping[str, object],
+        *,
+        now: datetime | None = None,
+    ) -> BreakerState:
+        with self.session_factory() as session:
+            state = reset_in_session(
+                session,
+                scope,
+                actor,
+                reason,
+                prior_health,
+                now=now,
+            )
+            session.commit()
+            return state

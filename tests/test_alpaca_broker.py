@@ -118,7 +118,11 @@ class FakeTrading:
     def get_all_positions(self):
         return [
             SimpleNamespace(
-                symbol="AAPL", qty="10", avg_entry_price="90", current_price="100"
+                symbol="AAPL",
+                qty="10",
+                avg_entry_price="90",
+                current_price="100",
+                unrealized_intraday_pl="25.50",
             )
         ]
 
@@ -174,6 +178,7 @@ def test_get_account_and_positions_map():
     assert acct.buying_power == Decimal("10000")
     pos = broker.get_positions()
     assert pos[0].ticker == "AAPL" and pos[0].qty == Decimal("10")
+    assert pos[0].unrealized_intraday_pnl == Decimal("25.50")
 
 
 def test_fill_activities_preserve_broker_ids_prices_and_timestamps():

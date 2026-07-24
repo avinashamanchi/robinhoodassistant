@@ -1,0 +1,113 @@
+"""replace legacy kill switches with scoped circuit breakers
+
+Revision ID: 20260724_0005
+Revises: 20260724_0004
+Create Date: 2026-07-24
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "20260724_0005"
+down_revision = "20260724_0004"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "circuit_breaker_state",
+        sa.Column("scope_key", sa.String(length=64), nullable=False),
+        sa.Column("kind", sa.String(length=32), nullable=False),
+        sa.Column("target", sa.String(length=32), nullable=False),
+        sa.Column("tripped", sa.Boolean(), nullable=False),
+        sa.Column("reason", sa.Text(), nullable=False),
+        sa.Column("actor", sa.String(length=128), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.PrimaryKeyConstraint("scope_key"),
+    )
+    op.create_index(
+        "ix_circuit_breaker_state_kind",
+        "circuit_breaker_state",
+        ["kind"],
+    )
+    op.execute(
+        """
+        INSERT INTO circuit_breaker_state
+            (scope_key, kind, target, tripped, reason, actor, updated_at)
+        SELECT
+            CASE
+                WHEN asset_class = 'operator_global' THEN 'operator_global'
+                ELSE 'loss:' || asset_class
+            END,
+            CASE
+                WHEN asset_class = 'operator_global' THEN 'operator_global'
+                ELSE 'loss'
+            END,
+            CASE
+                WHEN asset_class = 'operator_global' THEN ''
+                ELSE asset_class
+            END,
+            tripped,
+            reason,
+            'migration:0005',
+            updated_at
+        FROM killswitch_state
+        """
+    )
+    op.drop_index(
+        op.f("ix_killswitch_state_asset_class"),
+        table_name="killswitch_state",
+    )
+    op.drop_table("killswitch_state")
+    op.create_table(
+        "account_risk_state",
+        sa.Column("asset_class", sa.String(length=16), nullable=False),
+        sa.Column("high_water_mark", sa.Numeric(precision=20, scale=6), nullable=False),
+        sa.Column("last_equity", sa.Numeric(precision=20, scale=6), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.PrimaryKeyConstraint("asset_class"),
+    )
+
+
+def downgrade() -> None:
+    op.create_table(
+        "killswitch_state",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("asset_class", sa.String(length=16), nullable=False),
+        sa.Column("tripped", sa.Boolean(), nullable=False),
+        sa.Column("tripped_at", sa.DateTime(), nullable=True),
+        sa.Column("reason", sa.Text(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_killswitch_state_asset_class"),
+        "killswitch_state",
+        ["asset_class"],
+        unique=True,
+    )
+    op.execute(
+        """
+        INSERT INTO killswitch_state
+            (asset_class, tripped, tripped_at, reason, updated_at)
+        SELECT
+            CASE
+                WHEN kind = 'operator_global' THEN 'operator_global'
+                ELSE target
+            END,
+            tripped,
+            CASE WHEN tripped THEN updated_at ELSE NULL END,
+            reason,
+            updated_at
+        FROM circuit_breaker_state
+        WHERE kind IN ('loss', 'operator_global')
+        """
+    )
+    op.drop_table("account_risk_state")
+    op.drop_index(
+        "ix_circuit_breaker_state_kind",
+        table_name="circuit_breaker_state",
+    )
+    op.drop_table("circuit_breaker_state")

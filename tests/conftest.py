@@ -108,6 +108,18 @@ def make_snapshot():
         buying_power: Decimal = Decimal("100000"),
         realized_pnl_today: Decimal = Decimal("0"),
         pending_signed_notional: dict[str, Decimal] | None = None,
+        cash: Decimal = Decimal("100000"),
+        unrealized_pnl_today: Decimal = Decimal("0"),
+        daily_pnl_complete: bool = True,
+        account_high_water_mark: Decimal = Decimal("100000"),
+        account_equity: Decimal = Decimal("100000"),
+        quote_fresh: bool = True,
+        market_open: bool = True,
+        spread_pct_by_ticker: dict[str, Decimal] | None = None,
+        pending_buy_notional_by_ticker: dict[str, Decimal] | None = None,
+        reserved_sell_qty_by_ticker: dict[str, Decimal] | None = None,
+        broker_reconciled: bool = True,
+        active_breakers: frozenset[str] = frozenset(),
     ) -> PortfolioSnapshot:
         prices = prices or {}
         quotes = {
@@ -120,6 +132,18 @@ def make_snapshot():
             quotes=quotes,
             buying_power=buying_power,
             realized_pnl_today=realized_pnl_today,
+            cash=cash,
+            unrealized_pnl_today=unrealized_pnl_today,
+            daily_pnl_complete=daily_pnl_complete,
+            account_high_water_mark=account_high_water_mark,
+            account_equity=account_equity,
+            quote_fresh=quote_fresh,
+            market_open=market_open,
+            spread_pct_by_ticker=spread_pct_by_ticker or {},
+            pending_buy_notional_by_ticker=pending_buy_notional_by_ticker or {},
+            reserved_sell_qty_by_ticker=reserved_sell_qty_by_ticker or {},
+            broker_reconciled=broker_reconciled,
+            active_breakers=active_breakers,
             pending_signed_notional=pending_signed_notional or {},
         )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import inspect
 
 from trading_assistant.broker.models import (
     OrderRequest,
@@ -32,8 +33,16 @@ def _order(
     )
 
 
-def _check(engine, order, snapshot, *, tripped=False, open_=True):
-    return engine.check(order, snapshot, killswitch_tripped=tripped, market_open=open_)
+def _check(engine, order, snapshot):
+    return engine.check(order, snapshot)
+
+
+def test_check_has_exact_pure_two_argument_interface():
+    assert list(inspect.signature(RiskEngine.check).parameters) == [
+        "self",
+        "order",
+        "snapshot",
+    ]
 
 
 # ── happy path ──────────────────────────────────────────────────
@@ -130,7 +139,8 @@ def test_price_sanity_on_limit_orders(risk_config, make_snapshot):
 def test_market_closed_rejected(risk_config, make_snapshot):
     engine = RiskEngine(risk_config)
     snap = make_snapshot(prices={"AAPL": Decimal("100")})
-    result = _check(engine, _order(notional="100"), snap, open_=False)
+    snap = snap.__class__(**{**snap.__dict__, "market_open": False})
+    result = _check(engine, _order(notional="100"), snap)
     assert result.rejected
     assert any("market is closed" in r for r in result.reasons)
 
@@ -138,9 +148,12 @@ def test_market_closed_rejected(risk_config, make_snapshot):
 def test_killswitch_blocks_everything(risk_config, make_snapshot):
     engine = RiskEngine(risk_config)
     snap = make_snapshot(prices={"AAPL": Decimal("100")})
-    result = _check(engine, _order(notional="100"), snap, tripped=True)
+    snap = snap.__class__(
+        **{**snap.__dict__, "active_breakers": frozenset({"loss:equity"})}
+    )
+    result = _check(engine, _order(notional="100"), snap)
     assert result.rejected
-    assert any("kill switch" in r for r in result.reasons)
+    assert any("circuit breaker" in r for r in result.reasons)
 
 
 def test_missing_quote_fails_closed(risk_config, make_snapshot):
@@ -156,6 +169,7 @@ def test_reasons_accumulate(risk_config, make_snapshot):
     engine = RiskEngine(risk_config)
     snap = make_snapshot(prices={"TSLA": Decimal("100")})
     # Not on allowlist AND market closed -> at least two independent reasons.
-    result = _check(engine, _order(ticker="TSLA", notional="100"), snap, open_=False)
+    snap = snap.__class__(**{**snap.__dict__, "market_open": False})
+    result = _check(engine, _order(ticker="TSLA", notional="100"), snap)
     assert result.rejected
     assert len(result.reasons) >= 2

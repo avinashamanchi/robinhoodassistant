@@ -10,10 +10,11 @@ from typing import Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_assistant.assets import AssetClass
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.models import OrderRequest, OrderSide, OrderStatus, OrderType
 from trading_assistant.db.models import Order
+from trading_assistant.risk.breakers import relevant_scopes_for_symbol
+from trading_assistant.risk.engine import RiskResult
 
 from .repository import OrderRepository
 
@@ -62,8 +63,6 @@ class OrderSubmissionService:
         broker,
         snapshot_service,
         risk_for_symbol: Callable[[str], object],
-        clock_for_symbol: Callable[[str], object],
-        killswitch_for_symbol: Callable[[str], bool],
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.repository = repository
@@ -71,9 +70,17 @@ class OrderSubmissionService:
         self.broker = broker
         self.snapshot_service = snapshot_service
         self.risk_for_symbol = risk_for_symbol
-        self.clock_for_symbol = clock_for_symbol
-        self.killswitch_for_symbol = killswitch_for_symbol
         self.now = now
+
+    def _risk_check(
+        self, request: OrderRequest, order_id: int
+    ) -> RiskResult:
+        snapshot = self.snapshot_service.assemble_for_execution(
+            request.ticker, exclude_order_id=order_id
+        )
+        return self.risk_for_symbol(request.ticker).check(
+            request, snapshot
+        )
 
     def submit(self, order_id: int) -> SubmissionResult:
         now = self.now()
@@ -100,24 +107,15 @@ class OrderSubmissionService:
 
         # All provider reads and deterministic risk checks precede the durable
         # claim. Their failures leave APPROVAL_RECORDED and are safely retryable.
-        snapshot = self.snapshot_service.assemble_for_execution(
-            request.ticker, exclude_order_id=order_id
-        )
-        risk = self.risk_for_symbol(request.ticker).check(
-            request,
-            snapshot,
-            killswitch_tripped=self.killswitch_for_symbol(request.ticker),
-            market_open=self.clock_for_symbol(request.ticker).is_open(),
-        )
+        risk = self._risk_check(request, order_id)
         if risk.rejected:
             reasons = tuple(risk.reasons)
             self.repository.record_pre_submission_rejection(order_id, reasons, now)
             return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
 
         claim_now = self.now()
-        breaker_scope_keys = (
-            "operator_global",
-            AssetClass.for_symbol(request.ticker).value,
+        breaker_scope_keys = tuple(
+            scope.key for scope in relevant_scopes_for_symbol(request.ticker)
         )
         if not self.repository.claim_submission(
             order_id, claim_now, breaker_scope_keys

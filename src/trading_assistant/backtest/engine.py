@@ -167,7 +167,7 @@ def _act(
         return  # HOLD, or intent already satisfied
 
     snapshot = _snapshot(broker, symbol)
-    result = engine_risk.check(order, snapshot, killswitch_tripped=False, market_open=True)
+    result = engine_risk.check(order, snapshot)
     if result.approved:
         broker.submit_order(order)
 

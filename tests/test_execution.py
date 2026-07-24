@@ -56,7 +56,7 @@ def test_killswitch_blocks_execution(make_service):
     result = _approve(svc, order_id)
     assert result["executed"] is False
     assert result["status"] == "rejected"
-    assert any("kill switch" in r for r in result["risk_reasons"])
+    assert any("circuit breaker" in r for r in result["risk_reasons"])
     assert svc.broker.submit_calls == 0
 
 
@@ -153,7 +153,10 @@ def test_accept_then_disconnect_records_unknown_without_resubmission(make_servic
     assert replay["executed"] is False
     blocked = _propose(svc)
     assert blocked["status"] == "rejected"
-    assert any("outstanding order exposure" in reason for reason in blocked["risk_reasons"])
+    assert any(
+        "broker reconciliation is not current" in reason
+        for reason in blocked["risk_reasons"]
+    )
     assert broker.submit_calls == 1
 
 

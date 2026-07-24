@@ -9,6 +9,7 @@ from trading_assistant.broker.models import (
     OrderSide,
     OrderStatus,
     OrderType,
+    Position,
 )
 
 
@@ -66,3 +67,20 @@ def test_get_open_orders_only_returns_live_broker_orders(mock_broker):
     mock_broker.cancel_order(second.broker_order_id)
 
     assert mock_broker.get_open_orders() == [first]
+
+
+def test_positions_compute_intraday_pnl_from_controlled_session_open():
+    from trading_assistant.broker.mock import MockBroker
+
+    broker = MockBroker(
+        positions=[
+            Position("AAPL", Decimal("2"), Decimal("90"), Decimal("100"))
+        ]
+    )
+    broker.set_session_open_price("AAPL", Decimal("95"))
+    broker.set_price("AAPL", Decimal("105"))
+
+    (position,) = broker.get_positions()
+
+    assert position.current_price == Decimal("105")
+    assert position.unrealized_intraday_pnl == Decimal("20")

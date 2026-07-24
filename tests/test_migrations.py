@@ -521,3 +521,60 @@ def test_rule_lease_upgrade_aborts_plan_with_multiple_terminal_winners(tmp_path)
             "20260724_0003"
         )
         assert "rule_groups" not in inspect(engine).get_table_names()
+
+
+def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_state(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "legacy-breakers.db", "20260724_0004"
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO killswitch_state "
+                "(asset_class,tripped,tripped_at,reason,updated_at) VALUES "
+                "('equity',1,'2026-07-24 10:00:00','equity loss',"
+                "'2026-07-24 10:00:00'),"
+                "('crypto',0,NULL,'','2026-07-24 10:01:00'),"
+                "('operator_global',1,'2026-07-24 10:02:00','panic',"
+                "'2026-07-24 10:02:00')"
+            )
+        )
+
+    command.upgrade(cfg, "20260724_0005")
+
+    with engine.connect() as conn:
+        tables = set(inspect(engine).get_table_names())
+        rows = conn.execute(
+            text(
+                "SELECT scope_key,kind,target,tripped,reason "
+                "FROM circuit_breaker_state ORDER BY scope_key"
+            )
+        ).mappings().all()
+
+    assert "killswitch_state" not in tables
+    assert "account_risk_state" in tables
+    assert rows == [
+        {
+            "scope_key": "loss:crypto",
+            "kind": "loss",
+            "target": "crypto",
+            "tripped": 0,
+            "reason": "",
+        },
+        {
+            "scope_key": "loss:equity",
+            "kind": "loss",
+            "target": "equity",
+            "tripped": 1,
+            "reason": "equity loss",
+        },
+        {
+            "scope_key": "operator_global",
+            "kind": "operator_global",
+            "target": "",
+            "tripped": 1,
+            "reason": "panic",
+        },
+    ]

@@ -321,6 +321,14 @@ def test_unknown_acceptance_marks_group_until_reconciliation_resolves_client_id(
     outcome = RuleApplicationService(svc, repo).propose_from_lease(
         lease, rule_id, command, now=NOW
     )
+    with svc.session_factory() as session:
+        proposal = session.scalar(
+            select(Proposal).where(
+                Proposal.order_id == outcome.proposal["order_id"]
+            )
+        )
+        proposal.expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+        session.commit()
 
     submitted = svc.approve_order(
         outcome.proposal["order_id"],

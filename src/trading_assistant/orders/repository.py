@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import (
     AuditEvent,
-    KillSwitchState,
+    CircuitBreakerState,
     Order,
     Proposal,
     RiskEvent,
@@ -86,8 +86,8 @@ class OrderRepository:
                         Order.proposal.has(Proposal.expires_at > now),
                     ),
                     ~exists().where(
-                        KillSwitchState.asset_class.in_(scope_keys),
-                        KillSwitchState.tripped.is_(True),
+                        CircuitBreakerState.scope_key.in_(scope_keys),
+                        CircuitBreakerState.tripped.is_(True),
                     ),
                 )
                 .values(

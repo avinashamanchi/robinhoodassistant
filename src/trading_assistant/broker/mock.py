@@ -8,6 +8,7 @@ key twice returns the first order rather than creating a second.
 from __future__ import annotations
 
 import itertools
+from dataclasses import replace
 from decimal import Decimal
 from typing import Optional
 
@@ -39,6 +40,9 @@ class MockBroker(BrokerClient):
     ) -> None:
         self._prices = {k.upper(): v for k, v in (prices or {}).items()}
         self._positions = {p.ticker.upper(): p for p in (positions or [])}
+        self._session_open_prices = {
+            p.ticker.upper(): p.current_price for p in (positions or [])
+        }
         self._buying_power = buying_power
         # idempotency_key -> OrderResult (the authoritative record)
         self._orders_by_key: dict[str, OrderResult] = {}
@@ -52,6 +56,9 @@ class MockBroker(BrokerClient):
 
     def set_price(self, ticker: str, price: Decimal) -> None:
         self._prices[ticker.upper()] = price
+
+    def set_session_open_price(self, ticker: str, price: Decimal) -> None:
+        self._session_open_prices[ticker.upper()] = price
 
     def get_quote(self, ticker: str) -> Quote:
         last = self.price_of(ticker)
@@ -67,14 +74,33 @@ class MockBroker(BrokerClient):
     # ── account / positions ────────────────────────────────────
     def get_account(self) -> Account:
         equity = self._buying_power + sum(
-            (p.market_value for p in self._positions.values()), Decimal(0)
+            (
+                position.qty * self.price_of(symbol)
+                for symbol, position in self._positions.items()
+            ),
+            Decimal(0),
         )
         return Account(
             buying_power=self._buying_power, equity=equity, cash=self._buying_power
         )
 
     def get_positions(self) -> list[Position]:
-        return list(self._positions.values())
+        return [
+            replace(
+                position,
+                current_price=self.price_of(symbol),
+                unrealized_intraday_pnl=(
+                    position.qty
+                    * (
+                        self.price_of(symbol)
+                        - self._session_open_prices.get(
+                            symbol, position.current_price
+                        )
+                    )
+                ),
+            )
+            for symbol, position in self._positions.items()
+        ]
 
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:

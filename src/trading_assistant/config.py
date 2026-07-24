@@ -61,6 +61,11 @@ class RiskConfig(_Strict):
     warn_on_cross_broker_concentration: bool = True
     # Percent of portfolio equity risked per trade (deterministic sizing, Phase 8).
     per_trade_risk_pct: float = Field(default=0.5, gt=0, le=100)
+    max_quote_age_seconds: float = Field(default=60.0, gt=0)
+    max_spread_pct: float = Field(default=1.0, gt=0)
+    max_daily_total_loss: float = Field(default=500.0, gt=0)
+    max_account_drawdown_pct: float = Field(default=10.0, gt=0, le=100)
+    require_broker_reconciled: bool = True
 
     @field_validator("ticker_allowlist")
     @classmethod

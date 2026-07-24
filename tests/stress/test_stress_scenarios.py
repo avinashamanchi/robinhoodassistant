@@ -84,7 +84,7 @@ def test_whipsaw_ladder_respects_position_limit(risk_config, make_snapshot):
             positions=[Position("AAPL", held, Decimal("100"), Decimal("100"))],
         )
         order = OrderRequest("AAPL", OrderSide.BUY, OrderType.MARKET, f"k{_}", notional=Decimal("500"))
-        result = engine.check(order, snap, killswitch_tripped=False, market_open=True)
+        result = engine.check(order, snap)
         if result.approved:
             held += Decimal("5")  # 5 shares filled
             approvals += 1
@@ -112,7 +112,7 @@ def test_crypto_dump_isolates_equity(make_service):
 
     crypto = svc.propose_order("BTC/USD", "buy", "market", notional="100")
     assert crypto["status"] == "rejected"
-    assert any("kill switch" in r for r in crypto["risk_reasons"])
+    assert any("circuit breaker" in r for r in crypto["risk_reasons"])
 
 
 # ── 6. Stale-approval replay: price moves before execution ──────

@@ -86,9 +86,12 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
         # Kill-switch state
         from sqlalchemy.orm import Session
 
-        from .db.models import KillSwitchState
+        from .db.models import CircuitBreakerState
         with Session(engine) as s:
-            tripped = [r.asset_class for r in s.query(KillSwitchState).filter_by(tripped=True).all()]
+            tripped = [
+                row.scope_key
+                for row in s.query(CircuitBreakerState).filter_by(tripped=True).all()
+            ]
         ks = Result("kill switches", PASS if not tripped else FAIL,
                     "all clear" if not tripped else f"TRIPPED: {tripped} (reset before trading)")
         return wal, ks

@@ -207,10 +207,6 @@ class RuleApplicationService:
             risk = self.service._risk_for(asset_class).check(
                 request,
                 snapshot,
-                killswitch_tripped=self.service._risk_is_blocked(
-                    read_session, asset_class
-                ),
-                market_open=self.service._clock_for(asset_class).is_open(),
             )
 
         if self.crash_hook is not None:

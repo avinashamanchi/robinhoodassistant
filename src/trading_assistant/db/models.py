@@ -430,23 +430,28 @@ class HoldoutAccessLog(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class KillSwitchState(Base):
-    """One row per asset class. Persisting here means a restart returns tripped (A3).
+class CircuitBreakerState(Base):
+    """One durable row per typed breaker scope."""
 
-    Keyed by ``asset_class`` (Phase 7) so equity and crypto trip independently.
-    """
+    __tablename__ = "circuit_breaker_state"
 
-    __tablename__ = "killswitch_state"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    asset_class: Mapped[str] = mapped_column(
-        String(16), unique=True, index=True, default="equity"
-    )
+    scope_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    target: Mapped[str] = mapped_column(String(32), default="")
     tripped: Mapped[bool] = mapped_column(Boolean, default=False)
-    tripped_at: Mapped[Optional[datetime]] = mapped_column(
-        UTCDateTime(), nullable=True
-    )
     reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(String(128), default="")
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
+class AccountRiskState(Base):
+    """Durable account high-water mark for one asset class."""
+
+    __tablename__ = "account_risk_state"
+
+    asset_class: Mapped[str] = mapped_column(String(16), primary_key=True)
+    high_water_mark: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    last_equity: Mapped[Decimal] = mapped_column(Numeric(20, 6))
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 

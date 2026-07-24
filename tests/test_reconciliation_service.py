@@ -19,7 +19,7 @@ from trading_assistant.broker.models import (
     OrderType,
 )
 from trading_assistant.db import models as db_models
-from trading_assistant.db.models import Fill, KillSwitchState, Order, utcnow
+from trading_assistant.db.models import CircuitBreakerState, Fill, Order, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 
 
@@ -132,8 +132,8 @@ def test_panic_requires_actor_and_reason_before_latching(make_service):
 
     with service.session_factory() as session:
         assert session.scalar(
-            select(KillSwitchState).where(
-                KillSwitchState.asset_class == "operator_global"
+            select(CircuitBreakerState).where(
+                CircuitBreakerState.scope_key == "operator_global"
             )
         ) is None
 
@@ -171,15 +171,15 @@ def test_panic_latches_global_breaker_before_broker_enumeration_failure(make_ser
     assert report.safe is False
     with service.session_factory() as session:
         state = session.scalar(
-            select(KillSwitchState).where(
-                KillSwitchState.asset_class == "operator_global"
+            select(CircuitBreakerState).where(
+                CircuitBreakerState.scope_key == "operator_global"
             )
         )
         assert state is not None and state.tripped is True
 
     blocked = service.propose_order("AAPL", "buy", "market", notional="100")
     assert blocked["status"] == "rejected"
-    assert any("kill switch" in reason for reason in blocked["risk_reasons"])
+    assert any("circuit breaker" in reason for reason in blocked["risk_reasons"])
 
 
 def test_panic_preserves_unverified_remote_only_id_as_potentially_open(make_service):

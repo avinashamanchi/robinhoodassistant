@@ -52,6 +52,7 @@ from .orders.application import (
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.reconciliation import ReconciliationService
 from .orders.submission import OrderSubmissionService
+from .risk.breakers import BreakerService
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.killswitch import KillSwitch
@@ -107,11 +108,18 @@ class TradingService:
             AssetClass.EQUITY: self.risk,
             AssetClass.CRYPTO: RiskEngine(crypto_cfg),
         }
+        self.breakers = BreakerService(session_factory)
         self.snapshot_service = PortfolioSnapshotService(
             session_factory,
             broker,
             self._clock_for,
             self._external_positions_map,
+            lambda asset_class: (
+                (self.config.crypto_risk or self.config.risk)
+                if asset_class is AssetClass.CRYPTO
+                else self.config.risk
+            ),
+            self.breakers,
         )
         self.order_application = OrderApplicationService(session_factory)
         self.order_submission = OrderSubmissionService(
@@ -120,14 +128,13 @@ class TradingService:
             broker,
             self.snapshot_service,
             lambda symbol: self._risk_for(self._asset_class(symbol)),
-            lambda symbol: self._clock_for(self._asset_class(symbol)),
-            self._killswitch_for_symbol,
             utcnow,
         )
         self.reconciliation = ReconciliationService(
             session_factory,
             broker,
             self.order_application.repository,
+            self.breakers,
         )
         from .rules.application import RuleApplicationService
         from .rules.repository import RuleRepository
@@ -306,15 +313,13 @@ class TradingService:
         )
 
         ac = self._asset_class(order_req.ticker)
-        with self.session_factory() as s:
-            snapshot = self.assemble_snapshot(s, [order_req.ticker], ac)
-            result = self._risk_for(ac).check(
-                order_req,
-                snapshot,
-                killswitch_tripped=self._risk_is_blocked(s, ac),
-                market_open=self._clock_for(ac).is_open(),
+        with self.session_factory() as read_session:
+            snapshot = self.assemble_snapshot(
+                read_session, [order_req.ticker], ac
             )
+            result = self._risk_for(ac).check(order_req, snapshot)
 
+        with self.session_factory() as s:
             order = Order(
                 idempotency_key=order_req.idempotency_key,
                 ticker=order_req.ticker,
