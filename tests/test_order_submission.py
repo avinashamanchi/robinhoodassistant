@@ -179,6 +179,8 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
                 accepted.idempotency_key,
                 accepted.broker_order_id,
                 OrderStatus.FILLED,
+                filled_qty=Decimal("1"),
+                avg_fill_price=Decimal("100"),
             )
             self._orders_by_key[order.idempotency_key] = result
             self._orders_by_id[accepted.broker_order_id] = result
@@ -193,7 +195,19 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
 
     assert result.status is OrderStatus.FILLED
     with svc.session_factory() as session:
-        assert session.get(Order, order_id).status == OrderStatus.FILLED.value
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.FILLED.value
+        assert order.acceptance_state == "fill_reconcile_required"
+    report = svc.reconciliation.reconcile()
+    snapshot = svc.snapshot_service.assemble_for_execution("AAPL")
+
+    assert report.inserted_fills == 0
+    assert any(
+        "requires authoritative fill activities" in item
+        for item in report.broker_drift
+    )
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
 
 
 def test_submission_service_is_public_contract():

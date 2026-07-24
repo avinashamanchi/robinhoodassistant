@@ -23,6 +23,7 @@ from trading_assistant.broker.models import (
 from trading_assistant.config import RiskConfig
 from trading_assistant.db.models import (
     AccountRiskState,
+    FILL_RECONCILIATION_REQUIRED,
     Fill,
     Order,
     RuleGroup,
@@ -368,6 +369,17 @@ class PortfolioSnapshotService:
                 )
             pending_orders = session.scalars(pending_query).all()
             fills = session.scalars(select(Fill)).all()
+            fill_reconciliation_required = (
+                session.scalar(
+                    select(Order.id)
+                    .where(
+                        Order.acceptance_state
+                        == FILL_RECONCILIATION_REQUIRED
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
             broker_reconciled = (
                 session.scalar(
                     select(Order.id)
@@ -375,6 +387,7 @@ class PortfolioSnapshotService:
                     .limit(1)
                 )
                 is None
+                and not fill_reconciliation_required
                 and session.scalar(
                     select(RuleGroup.id)
                     .where(RuleGroup.reconciliation_required.is_(True))
@@ -454,6 +467,8 @@ class PortfolioSnapshotService:
             if not realized.is_finite():
                 daily_pnl_complete = False
                 realized = Decimal(0)
+            if fill_reconciliation_required:
+                daily_pnl_complete = False
         except Exception:
             session.rollback()
             pending_buy_notional = {}

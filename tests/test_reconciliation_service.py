@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-
-from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import event, func, select
@@ -17,6 +16,7 @@ from trading_assistant.broker.models import (
     OrderSide,
     OrderStatus,
     OrderType,
+    Position,
 )
 from trading_assistant.db import models as db_models
 from trading_assistant.db.models import CircuitBreakerState, Fill, Order, utcnow
@@ -299,8 +299,8 @@ def test_reconcile_reports_remote_open_order_without_broker_id(make_service):
 
 
 class ActivityBroker(MockBroker):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.activities: list[BrokerFill] = []
         self.activity_calls: list[datetime | None] = []
         self.fail_activities = False
@@ -310,6 +310,140 @@ class ActivityBroker(MockBroker):
         if self.fail_activities:
             raise ConnectionError("activity stream unavailable")
         return list(self.activities)
+
+
+@pytest.mark.parametrize(
+    ("synchronous_status", "filled_qty", "expected_loss"),
+    [
+        (OrderStatus.PARTIALLY_FILLED, Decimal("0.5"), Decimal("-5")),
+        (OrderStatus.FILLED, Decimal("1"), Decimal("-10")),
+    ],
+)
+def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
+    make_service,
+    synchronous_status,
+    filled_qty,
+    expected_loss,
+):
+    class SynchronousLossBroker(ActivityBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            result = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                synchronous_status,
+                filled_qty=filled_qty,
+                avg_fill_price=Decimal("90"),
+            )
+            self._orders_by_key[order.idempotency_key] = result
+            self._orders_by_id[accepted.broker_order_id] = result
+            return result
+
+    broker = SynchronousLossBroker(
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("1"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ]
+    )
+    service = make_service(broker=broker)
+    opened_at = utcnow() - timedelta(minutes=1)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="opening-lot",
+                filled_at=opened_at,
+            )
+        )
+        session.commit()
+
+    order_id = service.propose_order(
+        "AAPL", "sell", "market", qty="1"
+    )["order_id"]
+    service.order_application.approve(
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed synchronous loss",
+            utcnow(),
+        )
+    )
+    submission = service.order_submission.submit(order_id)
+
+    assert submission.status is synchronous_status
+    incomplete = service.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.realized_pnl_today == Decimal("0")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+    blocked = service.propose_order(
+        "AAPL", "buy", "market", notional="100"
+    )
+    assert blocked["status"] == OrderStatus.REJECTED.value
+    assert {
+        "broker reconciliation is not current",
+        "daily P&L snapshot is incomplete",
+    }.issubset(blocked["risk_reasons"])
+
+    unresolved = service.reconciliation.reconcile()
+    still_incomplete = service.snapshot_service.assemble_for_execution("AAPL")
+    assert unresolved.inserted_fills == 0
+    assert any(
+        "exact activities contain 0" in item
+        for item in unresolved.broker_drift
+    )
+    assert still_incomplete.broker_reconciled is False
+    assert still_incomplete.daily_pnl_complete is False
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        assert order.acceptance_state == "fill_reconcile_required"
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=f"exact-{synchronous_status.value}",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="sell",
+            qty=filled_qty,
+            price=Decimal("90"),
+            filled_at=utcnow(),
+        )
+    ]
+
+    first = service.reconciliation.reconcile()
+    reconciled = service.snapshot_service.assemble_for_execution("AAPL")
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.count()).select_from(Fill)
+        ) == 2
+
+    assert first.inserted_fills == 1
+    assert reconciled.realized_pnl_today == expected_loss
+    assert reconciled.broker_reconciled is True
+    assert reconciled.daily_pnl_complete is True
+
+    duplicate = service.reconciliation.reconcile()
+    after_duplicate = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert duplicate.inserted_fills == 0
+    assert after_duplicate.realized_pnl_today == expected_loss
+    assert after_duplicate.broker_reconciled is True
+    assert after_duplicate.daily_pnl_complete is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.count()).select_from(Fill)
+        ) == 2
 
 
 def test_fill_reconciliation_is_incremental_and_restart_idempotent(make_service):

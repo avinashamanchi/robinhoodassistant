@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.base import BrokerClient
 from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
 from trading_assistant.db.models import (
+    FILL_RECONCILIATION_REQUIRED,
     Fill,
     Order,
     OrderStateMachine,
@@ -116,13 +117,13 @@ class ReconciliationService:
 
     def reconcile(self) -> ReconciliationReport:
         resolved, unresolved, resolved_results = self._resolve_unknown()
-        self._clear_reconciled_rule_groups()
         drift: list[str] = []
         inserted_fills = self._reconcile_fill_activities(drift)
         synced, synthetic_fills = self._reconcile_statuses(
             drift, prefetched_results=resolved_results
         )
         inserted_fills += synthetic_fills
+        self._clear_reconciled_rule_groups()
         self._detect_open_order_drift(drift)
         return ReconciliationReport(
             resolved_unknown=resolved,
@@ -150,11 +151,15 @@ class ReconciliationService:
                     .join(Proposal, Proposal.order_id == Order.id)
                     .where(
                         Proposal.source_rule_group_id == group_id,
-                        Order.status.in_(
-                            (
-                                OrderStatus.SUBMITTING.value,
-                                OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                            )
+                        or_(
+                            Order.status.in_(
+                                (
+                                    OrderStatus.SUBMITTING.value,
+                                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                                )
+                            ),
+                            Order.acceptance_state
+                            == FILL_RECONCILIATION_REQUIRED,
                         ),
                     )
                     .limit(1)
@@ -319,26 +324,25 @@ class ReconciliationService:
         *,
         prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
     ) -> tuple[int, int]:
+        needs_status_reconciliation = or_(
+            Order.status.in_(
+                (
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                )
+            ),
+            Order.acceptance_state == FILL_RECONCILIATION_REQUIRED,
+        )
         with self.session_factory() as session:
             missing_ids = session.scalars(
                 select(Order.id).where(
-                    Order.status.in_(
-                        (
-                            OrderStatus.SUBMITTED.value,
-                            OrderStatus.PARTIALLY_FILLED.value,
-                        )
-                    ),
+                    needs_status_reconciliation,
                     Order.broker_order_id.is_(None),
                 )
             ).all()
             rows = session.execute(
                 select(Order.id, Order.broker_order_id).where(
-                    Order.status.in_(
-                        (
-                            OrderStatus.SUBMITTED.value,
-                            OrderStatus.PARTIALLY_FILLED.value,
-                        )
-                    ),
+                    needs_status_reconciliation,
                     Order.broker_order_id.is_not(None),
                 )
             ).all()
@@ -370,15 +374,53 @@ class ReconciliationService:
                 order = session.get(Order, order_id)
                 if order is None:
                     continue
-                recorded = Decimal(
-                    str(
-                        session.scalar(
-                            select(func.coalesce(func.sum(Fill.qty), 0)).where(
-                                Fill.order_id == order.id
+                prior_fills = session.scalars(
+                    select(Fill).where(Fill.order_id == order.id)
+                ).all()
+                recorded = sum(
+                    (fill.qty for fill in prior_fills), Decimal(0)
+                )
+                fill_reconciliation_required = (
+                    order.acceptance_state
+                    == FILL_RECONCILIATION_REQUIRED
+                )
+                if fill_reconciliation_required:
+                    synthetic_prefix = f"{order.broker_order_id}:"
+                    authoritative_fills = [
+                        fill
+                        for fill in prior_fills
+                        if (
+                            fill.broker_fill_id is not None
+                            and not fill.broker_fill_id.startswith(
+                                synthetic_prefix
                             )
                         )
+                    ]
+                    authoritative_qty = sum(
+                        (fill.qty for fill in authoritative_fills),
+                        Decimal(0),
                     )
-                )
+                    if not exact_reader:
+                        drift.append(
+                            f"broker order {order.id} requires authoritative "
+                            "fill activities"
+                        )
+                        continue
+                    if (
+                        not remote.filled_qty.is_finite()
+                        or remote.filled_qty <= Decimal("0.000001")
+                        or len(authoritative_fills) != len(prior_fills)
+                        or abs(
+                            authoritative_qty - remote.filled_qty
+                        )
+                        > Decimal("0.000001")
+                    ):
+                        drift.append(
+                            f"broker order {order.id} fill reconciliation "
+                            f"requires {remote.filled_qty} authoritative quantity "
+                            f"but exact activities contain {authoritative_qty}"
+                        )
+                        continue
                 new_qty = remote.filled_qty - recorded
                 if exact_reader and new_qty > Decimal("0.000001"):
                     drift.append(
@@ -391,9 +433,6 @@ class ReconciliationService:
                     and new_qty > Decimal("0.000001")
                     and remote.avg_fill_price is not None
                 ):
-                    prior_fills = session.scalars(
-                        select(Fill).where(Fill.order_id == order.id)
-                    ).all()
                     recorded_notional = sum(
                         (fill.qty * fill.price for fill in prior_fills), Decimal(0)
                     )
@@ -419,6 +458,8 @@ class ReconciliationService:
                     )
                     inserted += 1
 
+                if fill_reconciliation_required:
+                    order.acceptance_state = "accepted"
                 target = remote.status
                 current = OrderStatus(order.status)
                 if (

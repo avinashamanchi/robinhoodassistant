@@ -12,6 +12,7 @@ from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
+    FILL_RECONCILIATION_REQUIRED,
     Order,
     Proposal,
     RiskEvent,
@@ -168,6 +169,15 @@ class OrderRepository:
             OrderStatus.REJECTED,
         }:
             raise ValueError(f"invalid submission result {status.value}")
+        acceptance_state = (
+            FILL_RECONCILIATION_REQUIRED
+            if status
+            in {
+                OrderStatus.PARTIALLY_FILLED,
+                OrderStatus.FILLED,
+            }
+            else status.value
+        )
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -178,7 +188,7 @@ class OrderRepository:
                 .values(
                     status=status.value,
                     broker_order_id=broker_order_id,
-                    acceptance_state=status.value,
+                    acceptance_state=acceptance_state,
                     last_error_code=error_code,
                     updated_at=now,
                     version=Order.version + 1,

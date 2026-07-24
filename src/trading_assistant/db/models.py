@@ -200,6 +200,9 @@ class Order(Base):
     fills: Mapped[list["Fill"]] = relationship(back_populates="order")
 
 
+FILL_RECONCILIATION_REQUIRED = "fill_reconcile_required"
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 
