@@ -94,8 +94,9 @@ def test_rule_does_not_retry_unknown_broker_acceptance(make_service):
     first = monitor.tick()
     second = monitor.tick()
 
-    assert first[0]["error"] == "ConnectionError"
-    assert second[0]["executed"] is None
+    assert first[0]["executed"]["status"] == "acceptance_unknown"
+    assert first[0]["executed"]["executed"] is False
+    assert second == []
     assert len(broker._orders_by_key) == 1
     with svc.session_factory() as session:
         orders = session.execute(select(Order)).scalars().all()
