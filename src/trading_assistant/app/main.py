@@ -258,9 +258,9 @@ def create_app(
     def cancel_order(order_id: int):
         return service.cancel_live_order(order_id)
 
-    @app.post("/reconcile", dependencies=[auth])
-    def reconcile():
-        return service.reconcile_positions()
+    @app.post("/reconcile")
+    def reconcile(principal: str = auth):
+        return service.reconcile_positions(actor=principal)
 
     @app.post("/sync", dependencies=[auth])
     def sync():  # pull fills/status from the broker (also runs each daemon loop)

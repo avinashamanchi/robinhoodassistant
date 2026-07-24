@@ -837,29 +837,50 @@ class TradingService:
         replacement = self.propose_order(**new_order)
         return {"canceled": cancel, "replacement": replacement}
 
-    def reconcile_positions(self) -> dict[str, Any]:
-        """Compare broker truth to locally-derived positions; log any drift (§6)."""
-        broker_pos = {p.ticker.upper(): p.qty for p in self.broker.get_positions()}
-        local: dict[str, Decimal] = {}
-        with self.session_factory() as s:
-            for f in s.execute(select(Fill)).scalars().all():
-                delta = f.qty if f.side == "buy" else -f.qty
-                local[f.ticker.upper()] = local.get(f.ticker.upper(), Decimal(0)) + delta
-            drift = {}
-            for ticker in set(broker_pos) | set(local):
-                b = Decimal(str(broker_pos.get(ticker, 0)))
-                l = local.get(ticker, Decimal(0))
-                if b != l:
-                    drift[ticker] = {"broker": str(b), "local": str(l)}
-            if drift:
-                s.add(
-                    RiskEvent(
-                        event_type="reconciliation",
-                        reason=json.dumps(drift),
+    def reconcile_positions(
+        self,
+        *,
+        actor: str = "system:position-reconciliation",
+    ) -> dict[str, Any]:
+        """Compare positions and durably trip drift in one writer interval."""
+        with self.submission_barrier.hold_writer():
+            # Broker I/O is ordered by the process barrier but occurs before
+            # any SQLite transaction is opened.
+            broker_pos = {
+                p.ticker.upper(): p.qty
+                for p in self.broker.get_positions()
+            }
+            local: dict[str, Decimal] = {}
+            with self.session_factory() as session:
+                for fill in session.execute(select(Fill)).scalars().all():
+                    delta = fill.qty if fill.side == "buy" else -fill.qty
+                    ticker = fill.ticker.upper()
+                    local[ticker] = local.get(ticker, Decimal(0)) + delta
+                drift = {}
+                for ticker in set(broker_pos) | set(local):
+                    broker_qty = Decimal(str(broker_pos.get(ticker, 0)))
+                    local_qty = local.get(ticker, Decimal(0))
+                    if broker_qty != local_qty:
+                        drift[ticker] = {
+                            "broker": str(broker_qty),
+                            "local": str(local_qty),
+                        }
+                if drift:
+                    reason = json.dumps(drift, sort_keys=True)
+                    session.add(
+                        RiskEvent(
+                            event_type="reconciliation",
+                            reason=reason,
+                        )
                     )
-                )
-                s.commit()
-        return {"reconciled": not drift, "drift": drift}
+                    trip_in_session(
+                        session,
+                        BreakerScope.broker_drift(),
+                        f"position reconciliation drift: {reason}",
+                        actor,
+                    )
+                    session.commit()
+            return {"reconciled": not drift, "drift": drift}
 
     def enforce_daily_loss_limits(self) -> dict[str, bool]:
         """Trip each asset class's kill switch if its realized daily loss breached."""

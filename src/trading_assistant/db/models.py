@@ -95,7 +95,9 @@ _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.FILLED,
             OrderStatus.ACCEPTANCE_UNKNOWN,
+            OrderStatus.CANCELED,
             OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
         }
     ),
     OrderStatus.ACCEPTANCE_UNKNOWN: frozenset(

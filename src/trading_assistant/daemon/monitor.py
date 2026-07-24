@@ -97,7 +97,9 @@ class Monitor:
         """Synchronize broker truth before resuming persisted rules on startup."""
         report = self.service.reconciliation.reconcile()
         order_sync = self.service.serialize_reconciliation_report(report)
-        position_reconciliation = self.service.reconcile_positions()
+        position_reconciliation = self.service.reconcile_positions(
+            actor="daemon:startup"
+        )
         with self.service.session_factory() as s:
             active = s.execute(
                 select(Rule).where(Rule.state == "active")

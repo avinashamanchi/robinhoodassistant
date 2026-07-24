@@ -20,6 +20,18 @@ from trading_assistant.risk.submission_barrier import SubmissionBarrier
 from .repository import OrderRepository
 
 
+_DEFINITIVE_BROKER_STATUSES = frozenset(
+    {
+        OrderStatus.SUBMITTED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    }
+)
+
+
 @dataclass(frozen=True)
 class SubmissionResult:
     order_id: int
@@ -190,22 +202,18 @@ class OrderSubmissionService:
                         return SubmissionResult(
                             order_id, OrderStatus.ACCEPTANCE_UNKNOWN
                         )
-                    status = (
-                        broker_result.status
-                        if broker_result.status
-                        in {
-                            OrderStatus.SUBMITTED,
-                            OrderStatus.PARTIALLY_FILLED,
-                            OrderStatus.FILLED,
-                        }
-                        else OrderStatus.SUBMITTED
-                    )
+                    status = broker_result.status
+                    error_code = ""
+                    if status not in _DEFINITIVE_BROKER_STATUSES:
+                        status = OrderStatus.ACCEPTANCE_UNKNOWN
+                        error_code = "invalid_broker_submission_status"
                     self.repository.record_submission_result(
                         order_id,
                         status,
                         broker_result.broker_order_id,
-                        "",
+                        error_code,
                         self.now(),
+                        broker_result.filled_qty,
                     )
                     return SubmissionResult(
                         order_id, status, broker_result.broker_order_id

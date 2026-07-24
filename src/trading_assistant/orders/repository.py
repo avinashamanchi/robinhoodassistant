@@ -164,6 +164,7 @@ class OrderRepository:
         broker_order_id: str | None,
         error_code: str,
         now: datetime,
+        filled_qty: Decimal = Decimal(0),
     ) -> None:
         """Record the single definitive or indeterminate post-send outcome."""
         if status not in {
@@ -171,19 +172,34 @@ class OrderRepository:
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.FILLED,
             OrderStatus.ACCEPTANCE_UNKNOWN,
+            OrderStatus.CANCELED,
             OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
         }:
             raise ValueError(f"invalid submission result {status.value}")
-        acceptance_state = (
-            FILL_RECONCILIATION_REQUIRED
-            if status
-            in {
-                OrderStatus.PARTIALLY_FILLED,
-                OrderStatus.FILLED,
-            }
-            else status.value
-        )
         with self.session_factory() as session:
+            authoritative_qty = self._authoritative_fill_qty(
+                session,
+                order_id,
+                broker_order_id,
+            )
+            requires_fill_reconciliation, invalid_cumulative = (
+                self._requires_fill_reconciliation(
+                    status,
+                    filled_qty,
+                    authoritative_qty,
+                )
+            )
+            acceptance_state = (
+                FILL_RECONCILIATION_REQUIRED
+                if requires_fill_reconciliation
+                else status.value
+            )
+            persisted_error_code = (
+                "invalid_cumulative_fill"
+                if invalid_cumulative
+                else error_code
+            )
             result = session.execute(
                 update(Order)
                 .where(
@@ -194,7 +210,7 @@ class OrderRepository:
                     status=status.value,
                     broker_order_id=broker_order_id,
                     acceptance_state=acceptance_state,
-                    last_error_code=error_code,
+                    last_error_code=persisted_error_code,
                     updated_at=now,
                     version=Order.version + 1,
                 )
@@ -218,6 +234,56 @@ class OrderRepository:
                     )
             session.commit()
 
+    @staticmethod
+    def _authoritative_fill_qty(
+        session: Session,
+        order_id: int,
+        broker_order_id: str | None,
+    ) -> Decimal:
+        local_fills = session.execute(
+            select(Fill.broker_fill_id, Fill.qty).where(
+                Fill.order_id == order_id
+            )
+        ).all()
+        synthetic_prefix = (
+            f"{broker_order_id}:" if broker_order_id is not None else None
+        )
+        return sum(
+            (
+                qty
+                for broker_fill_id, qty in local_fills
+                if broker_fill_id is not None
+                and (
+                    synthetic_prefix is None
+                    or not broker_fill_id.startswith(synthetic_prefix)
+                )
+            ),
+            Decimal(0),
+        )
+
+    @staticmethod
+    def _requires_fill_reconciliation(
+        status: OrderStatus,
+        filled_qty: Decimal,
+        authoritative_qty: Decimal,
+    ) -> tuple[bool, bool]:
+        invalid_cumulative = not valid_cumulative_filled_qty(filled_qty)
+        remote_fill_ahead = (
+            not invalid_cumulative
+            and filled_qty
+            > authoritative_qty + Decimal("0.000001")
+        )
+        return (
+            status
+            in {
+                OrderStatus.PARTIALLY_FILLED,
+                OrderStatus.FILLED,
+            }
+            or invalid_cumulative
+            or remote_fill_ahead,
+            invalid_cumulative,
+        )
+
     def resolve_acceptance(
         self,
         order_id: int,
@@ -230,38 +296,21 @@ class OrderRepository:
         if broker_order_id is None:
             return False
         with self.session_factory() as session:
-            local_fills = session.execute(
-                select(Fill.broker_fill_id, Fill.qty).where(
-                    Fill.order_id == order_id
-                )
-            ).all()
-            synthetic_prefix = f"{broker_order_id}:"
-            authoritative_qty = sum(
-                (
-                    qty
-                    for broker_fill_id, qty in local_fills
-                    if broker_fill_id is not None
-                    and not broker_fill_id.startswith(synthetic_prefix)
-                ),
-                Decimal(0),
+            authoritative_qty = self._authoritative_fill_qty(
+                session,
+                order_id,
+                broker_order_id,
             )
-            remote_fill_invalid = not valid_cumulative_filled_qty(filled_qty)
-            remote_fill_ahead = (
-                not remote_fill_invalid
-                and filled_qty
-                > authoritative_qty + Decimal("0.000001")
+            requires_fill_reconciliation, _invalid_cumulative = (
+                self._requires_fill_reconciliation(
+                    status,
+                    filled_qty,
+                    authoritative_qty,
+                )
             )
             acceptance_state = (
                 FILL_RECONCILIATION_REQUIRED
-                if (
-                    status
-                    in {
-                        OrderStatus.PARTIALLY_FILLED,
-                        OrderStatus.FILLED,
-                    }
-                    or remote_fill_invalid
-                    or remote_fill_ahead
-                )
+                if requires_fill_reconciliation
                 else "accepted"
             )
             result = session.execute(

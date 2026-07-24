@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
+import pytest
+
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import OrderResult, OrderStatus
@@ -208,6 +210,80 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
     )
     assert snapshot.broker_reconciled is False
     assert snapshot.daily_pnl_complete is False
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+        OrderStatus.REJECTED,
+    ],
+)
+def test_synchronous_terminal_partial_fill_preserves_status_and_latches(
+    make_service,
+    terminal_status,
+):
+    class TerminalPartialBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            result = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                terminal_status,
+                filled_qty=Decimal("0.5"),
+                avg_fill_price=Decimal("99"),
+            )
+            self._orders_by_key[order.idempotency_key] = result
+            self._orders_by_id[accepted.broker_order_id] = result
+            return result
+
+    broker = TerminalPartialBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    order_id = _approved_order(svc)
+
+    result = svc.order_submission.submit(order_id)
+
+    assert result.status is terminal_status
+    with svc.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == terminal_status.value
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.broker_order_id is not None
+
+
+@pytest.mark.parametrize("filled_qty", [Decimal("NaN"), Decimal("-1")])
+def test_synchronous_invalid_cumulative_fill_latches_before_return(
+    make_service,
+    filled_qty,
+):
+    class InvalidCumulativeBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            result = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                OrderStatus.SUBMITTED,
+                filled_qty=filled_qty,
+            )
+            self._orders_by_key[order.idempotency_key] = result
+            self._orders_by_id[accepted.broker_order_id] = result
+            return result
+
+    broker = InvalidCumulativeBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    order_id = _approved_order(svc)
+
+    result = svc.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.SUBMITTED
+    with svc.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "invalid_cumulative_fill"
 
 
 def test_submission_service_is_public_contract():

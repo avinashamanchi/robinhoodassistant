@@ -14,7 +14,12 @@ from sqlalchemy import text
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
+from trading_assistant.broker.models import (
+    BrokerFill,
+    OrderResult,
+    OrderStatus,
+    Position,
+)
 from trading_assistant.config import RiskConfig
 from trading_assistant.db.models import Fill, Order, utcnow
 from trading_assistant.db.session import create_db_engine, make_session_factory
@@ -131,6 +136,45 @@ class _DriftRaceBroker(MockBroker):
                 status=OrderStatus.SUBMITTED,
             )
         ]
+
+
+class _ObservedPositionQty:
+    def __init__(self, drift_observed, release_drift) -> None:
+        self.drift_observed = drift_observed
+        self.release_drift = release_drift
+
+    def __str__(self) -> str:
+        self.drift_observed.set()
+        if not self.release_drift.wait(timeout=10):
+            raise TimeoutError("test did not release position drift comparison")
+        return "10"
+
+
+class _PositionDriftRaceBroker(MockBroker):
+    reconciliation_key = "position-drift-risk-writer"
+
+    def __init__(self, drift_observed, release_drift) -> None:
+        super().__init__(prices={"AAPL": Decimal("100")})
+        self.drift_observed = drift_observed
+        self.release_drift = release_drift
+
+    def get_positions(self):
+        return [
+            Position(
+                "AAPL",
+                _ObservedPositionQty(
+                    self.drift_observed,
+                    self.release_drift,
+                ),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ]
+
+
+class _ProcessStubAgent:
+    def chat(self, message):
+        return {"reply": message, "tool_calls": []}
 
 
 def _process_risk_config() -> RiskConfig:
@@ -319,6 +363,74 @@ def _daily_loss_enforcement_process(
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
         finished.set()
+
+
+def _position_reconciliation_process(
+    db_url,
+    app_config,
+    entrypoint,
+    drift_observed,
+    release_drift,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    service = TradingService(
+        _PositionDriftRaceBroker(drift_observed, release_drift),
+        factory,
+        app_config,
+        FakeClock(),
+    )
+    try:
+        if entrypoint == "http":
+            from fastapi.testclient import TestClient
+
+            from trading_assistant.app.main import create_app
+
+            response = TestClient(
+                create_app(
+                    service=service,
+                    agent=_ProcessStubAgent(),
+                    planning=object(),
+                    api_token="",
+                )
+            ).post("/reconcile")
+            response.raise_for_status()
+            result = response.json()
+        else:
+            from trading_assistant.daemon.monitor import Monitor
+            from trading_assistant.notifications.base import NullNotifier
+
+            result = Monitor(service, NullNotifier()).reconcile()[
+                "position_reconciliation"
+            ]
+        outcome.put(("ok", result))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _immediate_submission_process(
+    db_url,
+    order_id,
+    broker_entered,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    service = OrderSubmissionService(
+        OrderRepository(factory),
+        factory,
+        _ImmediateProcessBroker(broker_entered),
+        _StaticSnapshotService(),
+        lambda _symbol: _AlwaysApproves(),
+        utcnow,
+    )
+    try:
+        result = service.submit(order_id)
+        outcome.put(("ok", result.status.value))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
 def _writer_intent_path(db_url):
@@ -1104,6 +1216,77 @@ def test_daily_loss_observation_and_trip_are_one_writer_interval(
         OrderStatus.APPROVAL_RECORDED.value,
     )
     assert broker_entered.is_set() is False
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "expected_actor"),
+    [
+        ("http", "operator:api-token"),
+        ("startup", "daemon:startup"),
+    ],
+)
+def test_position_drift_entrypoint_blocks_submission_until_durable_trip(
+    make_service,
+    db_url,
+    app_config,
+    entrypoint,
+    expected_actor,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+
+    drift_observed = context.Event()
+    release_drift = context.Event()
+    reconciliation_finished = context.Event()
+    reconciliation_outcome = context.Queue()
+    reconciliation = context.Process(
+        target=_position_reconciliation_process,
+        args=(
+            db_url,
+            app_config,
+            entrypoint,
+            drift_observed,
+            release_drift,
+            reconciliation_finished,
+            reconciliation_outcome,
+        ),
+    )
+    reconciliation.start()
+    assert drift_observed.wait(timeout=10)
+
+    broker_entered = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_immediate_submission_process,
+        args=(
+            db_url,
+            order_id,
+            broker_entered,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    try:
+        assert broker_entered.wait(timeout=0.75) is False
+        assert reconciliation_finished.is_set() is False
+    finally:
+        release_drift.set()
+        _join(reconciliation, release_drift)
+        _join(submission)
+
+    outcome_kind, result = reconciliation_outcome.get(timeout=2)
+    assert outcome_kind == "ok"
+    assert result["reconciled"] is False
+    assert result["drift"]["AAPL"] == {"broker": "10", "local": "0"}
+    assert submission_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.APPROVAL_RECORDED.value,
+    )
+    assert broker_entered.is_set() is False
+    state = service.breakers.get(BreakerScope.broker_drift())
+    assert state is not None and state.tripped is True
+    assert state.actor == expected_actor
 
 
 def test_loss_fill_writer_queued_after_snapshot_prevents_broker_send(
