@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from decimal import Decimal
+from threading import Event
 
 import pytest
 from sqlalchemy import select
@@ -384,10 +384,18 @@ def test_daemon_loop_body_runs_clean(make_service):
 
 
 def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
+    daily_started = Event()
+    daily_release = Event()
+    daily_finished = Event()
+
     class SlowShadow:
         def grade_due(self):
-            time.sleep(0.12)
-            return 0
+            daily_started.set()
+            try:
+                daily_release.wait()
+                return 0
+            finally:
+                daily_finished.set()
 
         def run_once(self):
             return []
@@ -412,11 +420,40 @@ def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
     )
 
     async def scenario():
+        async def wait_until(condition, description):
+            async def poll():
+                while not condition():
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(poll(), timeout=5)
+            except TimeoutError:
+                pytest.fail(f"timed out waiting for {description}")
+
         stop = asyncio.Event()
         task = asyncio.create_task(monitor.run(stop))
-        await asyncio.sleep(0.09)
-        stop.set()
-        await asyncio.wait_for(task, timeout=0.5)
+        try:
+            await wait_until(daily_started.is_set, "daily analysis to start")
+            blocked_heartbeat_count = heartbeat_count
+            await wait_until(
+                lambda: heartbeat_count >= blocked_heartbeat_count + 3,
+                "three heartbeats during daily analysis",
+            )
+            assert daily_release.is_set() is False
+            assert daily_finished.is_set() is False
+        finally:
+            daily_release.set()
+            try:
+                if daily_started.is_set():
+                    await wait_until(
+                        daily_finished.is_set,
+                        "daily analysis to finish",
+                    )
+            finally:
+                stop.set()
+                await asyncio.wait_for(task, timeout=5)
+                if monitor._daily_task is not None:
+                    await asyncio.wait_for(monitor._daily_task, timeout=5)
 
     asyncio.run(scenario())
 
