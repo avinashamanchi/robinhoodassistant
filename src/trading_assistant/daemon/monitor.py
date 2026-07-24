@@ -153,6 +153,11 @@ class Monitor:
         quotes: dict[str, Any] = {}
         for rule in self._active_rules():
             rule_id, ticker, action = rule["id"], rule["ticker"], rule["action"]
+            # Equity price rules cannot execute while the equity clock is closed.
+            # Avoid burning market-data quota on the same stale snapshot all night.
+            # Crypto uses its independent always-open clock and continues normally.
+            if not self.service.market_is_open(ticker):
+                continue
             if ticker not in quotes:
                 quotes[ticker] = self.service.broker.get_quote(ticker)
             quote = quotes[ticker]

@@ -131,6 +131,53 @@ def test_tick_fetches_one_quote_per_ticker_even_with_many_rules(make_service):
     assert broker.quote_calls == 1
 
 
+def test_tick_does_not_poll_equity_quotes_while_market_is_closed(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker, market_open=False)
+    _rule(svc, {"price_below": 175})
+    broker.quote_calls = 0
+
+    assert Monitor(svc, NullNotifier()).tick() == []
+    assert broker.quote_calls == 0
+
+
+def test_closed_equity_clock_does_not_stop_crypto_monitoring(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("BTC/USD", Decimal("50000"))
+    svc = make_service(broker=broker, market_open=False)
+    svc.create_conditional_rule(
+        "BTC/USD",
+        {"price_below": 60000},
+        {"side": "buy", "notional": "100"},
+    )
+    broker.quote_calls = 0
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert broker.quote_calls > 0
+
+
 def test_auto_execute_requires_preapproved(make_service):
     from trading_assistant.db.models import Rule
 

@@ -107,6 +107,11 @@ class TradingService:
         cfg = cfg or self.config.risk
         return Decimal(str(cfg.daily_realized_loss_limit))
 
+    def market_is_open(self, ticker: str) -> bool:
+        """Return the configured broker clock state for a symbol's asset class."""
+        ac = self._asset_class(ticker)
+        return self._clock_for(ac).is_open()
+
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
         self, session: Session, asset_class: AssetClass = AssetClass.EQUITY
