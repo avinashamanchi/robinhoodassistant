@@ -84,6 +84,17 @@ class _ImmediateProcessBroker:
         )
 
 
+class _InvalidIdentityProcessBroker:
+    reconciliation_key = "invalid-identity-process-test"
+
+    def submit_order(self, order):
+        return OrderResult(
+            idempotency_key=f"wrong-{order.idempotency_key}",
+            broker_order_id="untrusted-process-broker-order",
+            status=OrderStatus.SUBMITTED,
+        )
+
+
 class _QueuedSnapshotBroker(MockBroker):
     reconciliation_key = "queued-snapshot-process-test"
 
@@ -529,6 +540,45 @@ def _immediate_submission_process(
         outcome.put(("ok", result.status.value))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _invalid_identity_submission_process(
+    db_url,
+    order_id,
+    before_barrier_release,
+    release_barrier,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    service = OrderSubmissionService(
+        OrderRepository(factory),
+        factory,
+        _InvalidIdentityProcessBroker(),
+        _StaticSnapshotService(),
+        lambda _symbol: _AlwaysApproves(),
+        utcnow,
+    )
+    original_hold_submission = service.submission_barrier.hold_submission
+
+    @contextmanager
+    def observed_hold_submission():
+        with original_hold_submission() as guard:
+            yield guard
+            before_barrier_release.set()
+            if not release_barrier.wait(timeout=10):
+                raise TimeoutError(
+                    "test did not release invalid-identity submission barrier"
+                )
+
+    service.submission_barrier.hold_submission = observed_hold_submission
+    try:
+        result = service.submit(order_id)
+        outcome.put(("ok", result.status.value, result.broker_order_id))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
 
 
 def _cancel_loss_process(
@@ -1339,6 +1389,76 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
         OrderStatus.APPROVAL_RECORDED.value,
     )
     assert broker_entered.is_set() is False
+
+
+def test_invalid_submission_identity_is_durable_before_barrier_release(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    invalid_order_id = _approved_order(service)
+    follower_id = _approved_order(service)
+
+    before_barrier_release = context.Event()
+    release_barrier = context.Event()
+    invalid_finished = context.Event()
+    invalid_outcome = context.Queue()
+    invalid_submission = context.Process(
+        target=_invalid_identity_submission_process,
+        args=(
+            db_url,
+            invalid_order_id,
+            before_barrier_release,
+            release_barrier,
+            invalid_finished,
+            invalid_outcome,
+        ),
+    )
+    invalid_submission.start()
+    assert before_barrier_release.wait(timeout=10)
+
+    with service.session_factory() as session:
+        invalid_order = session.get(Order, invalid_order_id)
+        assert invalid_order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert invalid_order.broker_order_id is None
+        assert (
+            invalid_order.acceptance_state
+            == FILL_RECONCILIATION_REQUIRED
+        )
+        assert invalid_order.last_error_code == "invalid_broker_identity"
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+
+    follower_broker_entered = context.Event()
+    follower_outcome = context.Queue()
+    follower = context.Process(
+        target=_immediate_submission_process,
+        args=(
+            db_url,
+            follower_id,
+            follower_broker_entered,
+            follower_outcome,
+        ),
+    )
+    follower.start()
+    try:
+        assert follower_broker_entered.wait(timeout=0.75) is False
+        assert invalid_finished.is_set() is False
+    finally:
+        release_barrier.set()
+        _join(invalid_submission, release_barrier)
+        _join(follower)
+
+    assert invalid_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.ACCEPTANCE_UNKNOWN.value,
+        None,
+    )
+    assert follower_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.APPROVAL_RECORDED.value,
+    )
+    assert follower_broker_entered.is_set() is False
 
 
 def test_daily_loss_observation_and_trip_are_one_writer_interval(

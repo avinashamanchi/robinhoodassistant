@@ -11,10 +11,13 @@ from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import OrderResult, OrderStatus
 from trading_assistant.assets import AssetClass
-from trading_assistant.db.models import Order, Proposal, utcnow
+from trading_assistant.db.models import Fill, Order, Proposal, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.submission import OrderSubmissionService
-from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.breakers import (
+    BreakerScope,
+    relevant_scopes_for_symbol,
+)
 
 
 def _approved_order(svc) -> int:
@@ -284,6 +287,126 @@ def test_synchronous_invalid_cumulative_fill_latches_before_return(
         assert order.status == OrderStatus.SUBMITTED.value
         assert order.acceptance_state == "fill_reconcile_required"
         assert order.last_error_code == "invalid_cumulative_fill"
+
+
+def test_post_send_cumulative_below_exact_local_fill_never_adopts_terminal_status(
+    make_service,
+):
+    service = make_service()
+    order_id = _approved_order(service)
+    assert service.order_submission.repository.claim_submission(
+        order_id,
+        utcnow(),
+        tuple(
+            scope.key
+            for scope in relevant_scopes_for_symbol("AAPL")
+        ),
+    )
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="post-send-exact-fill",
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+
+    persisted_status = (
+        service.order_submission.repository.record_submission_result(
+            order_id,
+            OrderStatus.CANCELED,
+            "post-send-broker-order",
+            "",
+            utcnow(),
+            Decimal("0"),
+        )
+    )
+
+    assert persisted_status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "cumulative_fill_contradiction"
+
+
+@pytest.mark.parametrize(
+    ("broker_order_id", "returned_client_id"),
+    [
+        (None, "expected-client-id"),
+        ("", "expected-client-id"),
+        ("   ", "expected-client-id"),
+        ("broker-id", ""),
+        ("broker-id", "different-client-id"),
+    ],
+)
+def test_invalid_submission_identity_is_unknown_latched_and_trips_drift(
+    make_service,
+    broker_order_id,
+    returned_client_id,
+):
+    class InvalidIdentityBroker(MockBroker):
+        def submit_order(self, order):
+            return OrderResult(
+                returned_client_id,
+                broker_order_id,
+                OrderStatus.SUBMITTED,
+            )
+
+    broker = InvalidIdentityBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        idempotency_key="expected-client-id",
+    )["order_id"]
+    service.order_application.approve(
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed identity",
+            utcnow(),
+        )
+    )
+
+    result = service.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert result.broker_order_id is None
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert order.broker_order_id is None
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "invalid_broker_identity"
+
+
+def test_malformed_position_payload_fails_before_submission_claim(make_service):
+    service = make_service()
+    order_id = _approved_order(service)
+    service.broker.get_positions = lambda: (_ for _ in ()).throw(
+        ValueError("invalid Alpaca position quantity")
+    )
+
+    with pytest.raises(ValueError, match="invalid Alpaca position"):
+        service.order_submission.submit(order_id)
+
+    assert service.broker.submit_calls == 0
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.APPROVAL_RECORDED.value
+        )
 
 
 def test_submission_service_is_public_contract():

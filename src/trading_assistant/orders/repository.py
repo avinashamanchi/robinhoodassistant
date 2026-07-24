@@ -22,6 +22,11 @@ from trading_assistant.db.models import (
     Proposal,
     RiskEvent,
     RuleGroup,
+    fill_has_trusted_identity,
+)
+from trading_assistant.risk.breakers import (
+    BreakerScope,
+    trip_in_session,
 )
 
 
@@ -165,7 +170,7 @@ class OrderRepository:
         error_code: str,
         now: datetime,
         filled_qty: Decimal = Decimal(0),
-    ) -> None:
+    ) -> OrderStatus:
         """Record the single definitive or indeterminate post-send outcome."""
         if status not in {
             OrderStatus.SUBMITTED,
@@ -183,7 +188,11 @@ class OrderRepository:
                 order_id,
                 broker_order_id,
             )
-            requires_fill_reconciliation, invalid_cumulative = (
+            (
+                requires_fill_reconciliation,
+                invalid_cumulative,
+                cumulative_contradiction,
+            ) = (
                 self._requires_fill_reconciliation(
                     status,
                     filled_qty,
@@ -198,7 +207,16 @@ class OrderRepository:
             persisted_error_code = (
                 "invalid_cumulative_fill"
                 if invalid_cumulative
-                else error_code
+                else (
+                    "cumulative_fill_contradiction"
+                    if cumulative_contradiction
+                    else error_code
+                )
+            )
+            persisted_status = (
+                OrderStatus.ACCEPTANCE_UNKNOWN
+                if cumulative_contradiction
+                else status
             )
             result = session.execute(
                 update(Order)
@@ -207,7 +225,7 @@ class OrderRepository:
                     Order.status == OrderStatus.SUBMITTING.value,
                 )
                 .values(
-                    status=status.value,
+                    status=persisted_status.value,
                     broker_order_id=broker_order_id,
                     acceptance_state=acceptance_state,
                     last_error_code=persisted_error_code,
@@ -217,7 +235,19 @@ class OrderRepository:
             )
             if result.rowcount != 1:
                 raise RuntimeError(f"order {order_id} lost submission claim")
-            if status is OrderStatus.ACCEPTANCE_UNKNOWN:
+            if cumulative_contradiction:
+                trip_in_session(
+                    session,
+                    BreakerScope.broker_drift(),
+                    (
+                        f"broker cumulative fill {filled_qty} for order "
+                        f"{order_id} is below authoritative local quantity "
+                        f"{authoritative_qty}"
+                    ),
+                    "service:submission",
+                    now=now,
+                )
+            if persisted_status is OrderStatus.ACCEPTANCE_UNKNOWN:
                 source_rule_group_id = session.scalar(
                     select(Proposal.source_rule_group_id).where(
                         Proposal.order_id == order_id
@@ -233,6 +263,58 @@ class OrderRepository:
                         )
                     )
             session.commit()
+            return persisted_status
+
+    def record_invalid_broker_identity(
+        self,
+        order_id: int,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """Atomically latch an indeterminate post-send identity and drift."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("invalid broker identity reason must be non-empty")
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status == OrderStatus.SUBMITTING.value,
+                )
+                .values(
+                    status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                    broker_order_id=None,
+                    acceptance_state=FILL_RECONCILIATION_REQUIRED,
+                    last_error_code="invalid_broker_identity",
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(f"order {order_id} lost submission claim")
+            source_rule_group_id = session.scalar(
+                select(Proposal.source_rule_group_id).where(
+                    Proposal.order_id == order_id
+                )
+            )
+            if source_rule_group_id is not None:
+                session.execute(
+                    update(RuleGroup)
+                    .where(RuleGroup.id == source_rule_group_id)
+                    .values(
+                        reconciliation_required=True,
+                        updated_at=now,
+                    )
+                )
+            trip_in_session(
+                session,
+                BreakerScope.broker_drift(),
+                f"invalid broker submission identity for order {order_id}: {reason}",
+                "service:submission",
+                now=now,
+            )
+            session.commit()
 
     @staticmethod
     def _authoritative_fill_qty(
@@ -240,22 +322,20 @@ class OrderRepository:
         order_id: int,
         broker_order_id: str | None,
     ) -> Decimal:
-        local_fills = session.execute(
-            select(Fill.broker_fill_id, Fill.qty).where(
-                Fill.order_id == order_id
-            )
+        local_fills = session.scalars(
+            select(Fill).where(Fill.order_id == order_id)
         ).all()
         synthetic_prefix = (
             f"{broker_order_id}:" if broker_order_id is not None else None
         )
         return sum(
             (
-                qty
-                for broker_fill_id, qty in local_fills
-                if broker_fill_id is not None
+                fill.qty
+                for fill in local_fills
+                if fill_has_trusted_identity(fill)
                 and (
                     synthetic_prefix is None
-                    or not broker_fill_id.startswith(synthetic_prefix)
+                    or not fill.broker_fill_id.startswith(synthetic_prefix)
                 )
             ),
             Decimal(0),
@@ -266,12 +346,16 @@ class OrderRepository:
         status: OrderStatus,
         filled_qty: Decimal,
         authoritative_qty: Decimal,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         invalid_cumulative = not valid_cumulative_filled_qty(filled_qty)
         remote_fill_ahead = (
             not invalid_cumulative
             and filled_qty
             > authoritative_qty + Decimal("0.000001")
+        )
+        cumulative_contradiction = (
+            not invalid_cumulative
+            and filled_qty + Decimal("0.000001") < authoritative_qty
         )
         return (
             status
@@ -280,8 +364,13 @@ class OrderRepository:
                 OrderStatus.FILLED,
             }
             or invalid_cumulative
-            or remote_fill_ahead,
+            or remote_fill_ahead
+            or cumulative_contradiction,
+            # Contradictory cumulative truth also requires reconciliation.
+            # It is returned separately so callers can preserve the local
+            # status and persist a durable drift reason.
             invalid_cumulative,
+            cumulative_contradiction,
         )
 
     def resolve_acceptance(
@@ -301,7 +390,11 @@ class OrderRepository:
                 order_id,
                 broker_order_id,
             )
-            requires_fill_reconciliation, _invalid_cumulative = (
+            (
+                requires_fill_reconciliation,
+                invalid_cumulative,
+                cumulative_contradiction,
+            ) = (
                 self._requires_fill_reconciliation(
                     status,
                     filled_qty,
@@ -313,6 +406,24 @@ class OrderRepository:
                 if requires_fill_reconciliation
                 else "accepted"
             )
+            values: dict[str, object] = {
+                "broker_order_id": broker_order_id,
+                "acceptance_state": acceptance_state,
+                "last_reconciled_at": now,
+                "last_error_code": (
+                    "invalid_cumulative_fill"
+                    if invalid_cumulative
+                    else (
+                        "cumulative_fill_contradiction"
+                        if cumulative_contradiction
+                        else ""
+                    )
+                ),
+                "updated_at": now,
+                "version": Order.version + 1,
+            }
+            if not cumulative_contradiction:
+                values["status"] = status.value
             result = session.execute(
                 update(Order)
                 .where(
@@ -324,15 +435,7 @@ class OrderRepository:
                         )
                     ),
                 )
-                .values(
-                    status=status.value,
-                    broker_order_id=broker_order_id,
-                    acceptance_state=acceptance_state,
-                    last_reconciled_at=now,
-                    last_error_code="",
-                    updated_at=now,
-                    version=Order.version + 1,
-                )
+                .values(**values)
             )
             if result.rowcount != 1:
                 session.rollback()

@@ -44,6 +44,7 @@ from .db.models import (
     RiskEvent,
     Rule,
     RuleGroup,
+    fill_has_trusted_identity,
     utcnow,
 )
 from .orders.application import (
@@ -179,7 +180,10 @@ class TradingService:
         fills = [
             FillLike(r.ticker, r.side, r.qty, r.price, r.filled_at)
             for r in rows
-            if AssetClass.for_symbol(r.ticker) is asset_class
+            if (
+                AssetClass.for_symbol(r.ticker) is asset_class
+                and fill_has_trusted_identity(r)
+            )
         ]
         boundary = self._clock_for(asset_class).most_recent_open()
         return realized_pnl_today(
@@ -789,6 +793,8 @@ class TradingService:
             local: dict[str, Decimal] = {}
             with self.session_factory() as session:
                 for fill in session.execute(select(Fill)).scalars().all():
+                    if not fill_has_trusted_identity(fill):
+                        continue
                     delta = fill.qty if fill.side == "buy" else -fill.qty
                     ticker = fill.ticker.upper()
                     local[ticker] = local.get(ticker, Decimal(0)) + delta

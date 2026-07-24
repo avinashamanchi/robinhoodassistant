@@ -19,7 +19,7 @@ from trading_assistant.broker.models import (
     Position,
     Quote,
 )
-from trading_assistant.db.models import AccountRiskState, Order, utcnow
+from trading_assistant.db.models import AccountRiskState, Fill, Order, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import RiskEngine
@@ -630,6 +630,41 @@ def test_pending_buys_and_sells_do_not_net_reservations(make_service):
     assert snapshot.pending_signed_notional["AAPL"] == Decimal("500.000000")
 
 
+def test_null_identity_fill_never_reduces_pending_exposure_reservation(
+    make_service,
+):
+    service = make_service()
+    order_id = _pending(
+        service.session_factory,
+        key="pending-buy-with-legacy-fill",
+        side=OrderSide.BUY,
+        status=OrderStatus.SUBMITTED,
+        qty="2",
+    )
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id=None,
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.pending_buy_notional_by_ticker == {
+        "AAPL": Decimal("200.20000000")
+    }
+    assert snapshot.pending_exposure_complete is False
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+
+
 def test_snapshot_marks_daily_pnl_incomplete_when_position_value_is_missing(
     make_service
 ):
@@ -652,6 +687,52 @@ def test_snapshot_marks_daily_pnl_incomplete_when_position_value_is_missing(
     )
 
     assert snapshot.daily_pnl_complete is False
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        Position(
+            "AAPL",
+            Decimal("NaN"),
+            Decimal("90"),
+            Decimal("100"),
+        ),
+        Position(
+            "AAPL",
+            Decimal("2"),
+            Decimal("Infinity"),
+            Decimal("100"),
+        ),
+        Position(
+            "AAPL",
+            Decimal("2"),
+            Decimal("90"),
+            Decimal("0"),
+        ),
+        Position(
+            " ",
+            Decimal("2"),
+            Decimal("90"),
+            Decimal("100"),
+        ),
+    ],
+)
+def test_snapshot_rejects_malformed_position_values(
+    make_service,
+    position,
+):
+    class MalformedPositionBroker(MockBroker):
+        def get_positions(self):
+            return [position]
+
+    broker = MalformedPositionBroker()
+    broker.set_price("AAPL", Decimal("100"))
+
+    with pytest.raises(ValueError, match="invalid broker position"):
+        make_service(broker=broker).snapshot_service.assemble_for_execution(
+            "AAPL"
+        )
 
 
 def test_snapshot_marks_non_finite_unrealized_pnl_incomplete(make_service):

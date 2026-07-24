@@ -376,13 +376,14 @@ def test_sync_preserves_exact_incremental_activity_prices(make_service):
         ]
         # Selling all three at 120 realizes 20 + 10 = 30 using the exact FIFO lots.
         s.add(
-            Fill(
-                ticker="AAPL",
-                side="sell",
-                qty=Decimal("3"),
-                price=Decimal("120"),
-                filled_at=utcnow(),
-            )
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("3"),
+                    price=Decimal("120"),
+                    broker_fill_id="incremental-fill-closing-sale",
+                    filled_at=utcnow(),
+                )
         )
         s.commit()
         assert svc._realized_pnl_today(s) == Decimal("30.000000")

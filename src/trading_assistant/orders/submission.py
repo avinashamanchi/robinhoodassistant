@@ -11,7 +11,13 @@ from typing import Callable
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.base import BrokerSubmissionRejected
-from trading_assistant.broker.models import OrderRequest, OrderSide, OrderStatus, OrderType
+from trading_assistant.broker.models import (
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    order_result_identity_error,
+)
 from trading_assistant.db.models import Order
 from trading_assistant.risk.breakers import relevant_scopes_for_symbol
 from trading_assistant.risk.engine import RiskResult
@@ -202,12 +208,26 @@ class OrderSubmissionService:
                         return SubmissionResult(
                             order_id, OrderStatus.ACCEPTANCE_UNKNOWN
                         )
+                    identity_error = order_result_identity_error(
+                        broker_result,
+                        request.idempotency_key,
+                    )
+                    if identity_error is not None:
+                        self.repository.record_invalid_broker_identity(
+                            order_id,
+                            identity_error,
+                            self.now(),
+                        )
+                        return SubmissionResult(
+                            order_id,
+                            OrderStatus.ACCEPTANCE_UNKNOWN,
+                        )
                     status = broker_result.status
                     error_code = ""
                     if status not in _DEFINITIVE_BROKER_STATUSES:
                         status = OrderStatus.ACCEPTANCE_UNKNOWN
                         error_code = "invalid_broker_submission_status"
-                    self.repository.record_submission_result(
+                    persisted_status = self.repository.record_submission_result(
                         order_id,
                         status,
                         broker_result.broker_order_id,
@@ -216,5 +236,7 @@ class OrderSubmissionService:
                         broker_result.filled_qty,
                     )
                     return SubmissionResult(
-                        order_id, status, broker_result.broker_order_id
+                        order_id,
+                        persisted_status,
+                        broker_result.broker_order_id,
                     )

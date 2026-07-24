@@ -200,8 +200,26 @@ def test_killswitch_drill(make_service):
     now = datetime.now(timezone.utc)
     # Insert a realized -$5,000 round trip for today, directly as fills.
     with svc.session_factory() as s:
-        s.add(Fill(ticker="AAPL", side="buy", qty=Decimal("100"), price=Decimal("100"), filled_at=now))
-        s.add(Fill(ticker="AAPL", side="sell", qty=Decimal("100"), price=Decimal("50"), filled_at=now))
+        s.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("100"),
+                price=Decimal("100"),
+                broker_fill_id="killswitch-drill-open",
+                filled_at=now,
+            )
+        )
+        s.add(
+            Fill(
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("100"),
+                price=Decimal("50"),
+                broker_fill_id="killswitch-drill-close",
+                filled_at=now,
+            )
+        )
         s.commit()
 
     tripped = svc.enforce_daily_loss_limits()

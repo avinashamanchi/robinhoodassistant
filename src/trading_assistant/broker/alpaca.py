@@ -129,6 +129,31 @@ def _finite_d(value: Any) -> Optional[Decimal]:
     return parsed
 
 
+def _required_position_decimal(
+    value: Any,
+    *,
+    symbol: str,
+    field: str,
+    positive: bool,
+) -> Decimal:
+    try:
+        parsed = _d(value)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise BrokerDataIntegrityError(
+            f"invalid Alpaca position {field} for {symbol}"
+        ) from exc
+    if (
+        parsed is None
+        or not parsed.is_finite()
+        or (positive and parsed <= 0)
+        or (not positive and parsed == 0)
+    ):
+        raise BrokerDataIntegrityError(
+            f"invalid Alpaca position {field} for {symbol}"
+        )
+    return parsed
+
+
 def _utc_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -231,12 +256,36 @@ class AlpacaBroker(BrokerClient):
     def get_positions(self) -> list[Position]:
         out: list[Position] = []
         for p in _retry(self._trading.get_all_positions):
+            raw_symbol = getattr(p, "symbol", None)
+            if (
+                not isinstance(raw_symbol, str)
+                or not raw_symbol.strip()
+            ):
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca position symbol"
+                )
+            symbol = raw_symbol.strip().upper()
             out.append(
                 Position(
-                    ticker=p.symbol.upper(),
-                    qty=_d(p.qty) or Decimal(0),
-                    avg_entry_price=_d(p.avg_entry_price) or Decimal(0),
-                    current_price=_d(p.current_price) or Decimal(0),
+                    ticker=symbol,
+                    qty=_required_position_decimal(
+                        getattr(p, "qty", None),
+                        symbol=symbol,
+                        field="quantity",
+                        positive=False,
+                    ),
+                    avg_entry_price=_required_position_decimal(
+                        getattr(p, "avg_entry_price", None),
+                        symbol=symbol,
+                        field="average entry price",
+                        positive=True,
+                    ),
+                    current_price=_required_position_decimal(
+                        getattr(p, "current_price", None),
+                        symbol=symbol,
+                        field="current price",
+                        positive=True,
+                    ),
                     unrealized_intraday_pnl=_finite_d(
                         getattr(p, "unrealized_intraday_pl", None)
                     ),
@@ -269,7 +318,16 @@ class AlpacaBroker(BrokerClient):
                 params,
             )
             for raw in page:
-                broker_order_id = str(raw["order_id"])
+                raw_order_id = raw.get("order_id")
+                broker_order_id = (
+                    str(raw_order_id)
+                    if raw_order_id is not None
+                    else None
+                )
+                if not broker_order_id or not broker_order_id.strip():
+                    raise BrokerDataIntegrityError(
+                        "invalid Alpaca fill broker order identity"
+                    )
                 timestamp = datetime.fromisoformat(
                     str(raw["transaction_time"]).replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
@@ -434,7 +492,12 @@ class AlpacaBroker(BrokerClient):
         return BrokerAcceptanceUnknown(str(exc))
 
     def _to_result(self, o: Any) -> OrderResult:
-        broker_order_id = str(o.id)
+        raw_broker_order_id = getattr(o, "id", None)
+        broker_order_id = (
+            str(raw_broker_order_id)
+            if raw_broker_order_id is not None
+            else None
+        )
         try:
             filled_qty = _d(getattr(o, "filled_qty", 0))
         except (ArithmeticError, TypeError, ValueError) as exc:

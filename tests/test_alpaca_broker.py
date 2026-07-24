@@ -320,6 +320,58 @@ def test_get_account_and_positions_map():
 @pytest.mark.parametrize(
     ("field", "raw_value"),
     [
+        ("qty", None),
+        ("qty", "NaN"),
+        ("qty", "Infinity"),
+        ("avg_entry_price", None),
+        ("avg_entry_price", "NaN"),
+        ("avg_entry_price", "Infinity"),
+        ("avg_entry_price", "0"),
+        ("current_price", None),
+        ("current_price", "NaN"),
+        ("current_price", "-Infinity"),
+        ("current_price", "0"),
+    ],
+)
+def test_get_positions_rejects_missing_or_invalid_risk_fields(
+    field,
+    raw_value,
+):
+    trading = FakeTrading()
+    values = {
+        "symbol": "AAPL",
+        "qty": "10",
+        "avg_entry_price": "90",
+        "current_price": "100",
+        "unrealized_intraday_pl": "25.50",
+    }
+    values[field] = raw_value
+    trading.get_all_positions = lambda: [SimpleNamespace(**values)]
+
+    with pytest.raises(ValueError, match="invalid Alpaca position"):
+        AlpacaBroker(trading, FakeData({})).get_positions()
+
+
+@pytest.mark.parametrize("symbol", [None, "", "   "])
+def test_get_positions_rejects_missing_symbol(symbol):
+    trading = FakeTrading()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(
+            symbol=symbol,
+            qty="10",
+            avg_entry_price="90",
+            current_price="100",
+            unrealized_intraday_pl="25.50",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="invalid Alpaca position"):
+        AlpacaBroker(trading, FakeData({})).get_positions()
+
+
+@pytest.mark.parametrize(
+    ("field", "raw_value"),
+    [
         ("buying_power", None),
         ("equity", None),
         ("cash", None),
@@ -435,6 +487,20 @@ def test_order_mapping_rejects_invalid_cumulative_filled_qty(filled_qty):
 
     with pytest.raises(ValueError, match="filled_qty"):
         broker.get_order_by_client_id("k1")
+
+
+def test_order_mapping_does_not_stringify_missing_broker_identity():
+    prior = FakeOrder(
+        None,
+        "k1",
+        "new",
+    )
+    broker = AlpacaBroker(FakeTrading(existing=prior), FakeData({}))
+
+    mapped = broker.get_order_by_client_id("k1")
+
+    assert mapped is not None
+    assert mapped.broker_order_id is None
 
 
 def test_submit_market_order_builds_request_and_maps_result():

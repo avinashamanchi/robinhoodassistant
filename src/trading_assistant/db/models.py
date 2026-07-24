@@ -117,6 +117,7 @@ _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.FILLED,
             OrderStatus.CANCELED,
             OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
         }
     ),
     OrderStatus.PARTIALLY_FILLED: frozenset(
@@ -203,6 +204,9 @@ class Order(Base):
 
 
 FILL_RECONCILIATION_REQUIRED = "fill_reconcile_required"
+FILL_RECONCILIATION_TRUSTED = "trusted"
+FILL_RECONCILIATION_QUARANTINED = "quarantined"
+FILL_RECONCILIATION_SUPERSEDED = "superseded"
 
 
 class AuditEvent(Base):
@@ -325,11 +329,36 @@ class Fill(Base):
     broker_fill_id: Mapped[Optional[str]] = mapped_column(
         String(64), unique=True, nullable=True, index=True
     )
+    reconciliation_state: Mapped[str] = mapped_column(
+        String(24),
+        default=FILL_RECONCILIATION_TRUSTED,
+        server_default=FILL_RECONCILIATION_TRUSTED,
+    )
     filled_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=utcnow, index=True
     )
 
     order: Mapped[Optional["Order"]] = relationship(back_populates="fills")
+
+
+def fill_has_trusted_identity(fill: Fill) -> bool:
+    """Whether a ledger row is eligible for execution-risk arithmetic."""
+    return (
+        fill.reconciliation_state == FILL_RECONCILIATION_TRUSTED
+        and isinstance(fill.broker_fill_id, str)
+        and bool(fill.broker_fill_id.strip())
+    )
+
+
+def fill_requires_reconciliation(fill: Fill) -> bool:
+    """Whether a legacy unidentified row still needs authoritative matching."""
+    if fill.reconciliation_state == FILL_RECONCILIATION_SUPERSEDED:
+        return False
+    return (
+        fill.reconciliation_state == FILL_RECONCILIATION_QUARANTINED
+        or not isinstance(fill.broker_fill_id, str)
+        or not fill.broker_fill_id.strip()
+    )
 
 
 class BacktestRun(Base):

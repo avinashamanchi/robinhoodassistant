@@ -185,6 +185,22 @@ class Position:
     def market_value(self) -> Decimal:
         return self.qty * self.current_price
 
+    @property
+    def risk_values_valid(self) -> bool:
+        return (
+            isinstance(self.ticker, str)
+            and bool(self.ticker.strip())
+            and isinstance(self.qty, Decimal)
+            and self.qty.is_finite()
+            and self.qty != 0
+            and isinstance(self.avg_entry_price, Decimal)
+            and self.avg_entry_price.is_finite()
+            and self.avg_entry_price > 0
+            and isinstance(self.current_price, Decimal)
+            and self.current_price.is_finite()
+            and self.current_price > 0
+        )
+
 
 @dataclass(frozen=True)
 class Account:
@@ -213,6 +229,26 @@ class OrderResult:
     filled_qty: Decimal = Decimal(0)
     avg_fill_price: Optional[Decimal] = None
     submitted_at: datetime = field(default_factory=_utcnow)
+
+
+def order_result_identity_error(
+    result: OrderResult,
+    expected_client_id: str,
+) -> str | None:
+    """Return why a broker order result cannot identify the requested order."""
+    if (
+        not isinstance(result.broker_order_id, str)
+        or not result.broker_order_id.strip()
+    ):
+        return "missing broker order identity"
+    if (
+        not isinstance(result.idempotency_key, str)
+        or result.idempotency_key != expected_client_id
+    ):
+        return (
+            "broker client identity does not match local idempotency key"
+        )
+    return None
 
 
 @dataclass(frozen=True)

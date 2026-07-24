@@ -27,6 +27,8 @@ from trading_assistant.db.models import (
     Fill,
     Order,
     RuleGroup,
+    fill_has_trusted_identity,
+    fill_requires_reconciliation,
 )
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
@@ -188,6 +190,8 @@ class PortfolioSnapshotService:
     ]:
         account = self.broker.get_account()
         positions = self.broker.get_positions()
+        if any(not position.risk_values_valid for position in positions):
+            raise ValueError("invalid broker position payload")
         external = self.external_positions()
         clock = self.clock_for_asset(asset_class)
         market_open = clock.is_open()
@@ -392,7 +396,16 @@ class PortfolioSnapshotService:
                     Order.id != exclude_order_id
                 )
             pending_orders = session.scalars(pending_query).all()
-            fills = session.scalars(select(Fill)).all()
+            all_fills = session.scalars(select(Fill)).all()
+            fills = [
+                fill
+                for fill in all_fills
+                if fill_has_trusted_identity(fill)
+            ]
+            legacy_fill_reconciliation_required = any(
+                fill_requires_reconciliation(fill)
+                for fill in all_fills
+            )
             fill_reconciliation_required = (
                 session.scalar(
                     select(Order.id)
@@ -403,6 +416,7 @@ class PortfolioSnapshotService:
                     .limit(1)
                 )
                 is not None
+                or legacy_fill_reconciliation_required
             )
             broker_reconciled = (
                 session.scalar(
@@ -422,7 +436,10 @@ class PortfolioSnapshotService:
             )
             pending_buy_notional: dict[str, Decimal] = {}
             reserved_sell_qty: dict[str, Decimal] = {}
-            pending_exposure_complete = discovery_complete
+            pending_exposure_complete = (
+                discovery_complete
+                and not legacy_fill_reconciliation_required
+            )
             fills_by_order: dict[int, list[Fill]] = {}
             for fill in fills:
                 if fill.order_id is not None:

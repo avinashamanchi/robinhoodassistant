@@ -16,6 +16,22 @@ depends_on = None
 
 
 def upgrade() -> None:
+    op.add_column(
+        "fills",
+        sa.Column(
+            "reconciliation_state",
+            sa.String(length=24),
+            server_default=sa.text("'trusted'"),
+            nullable=False,
+        ),
+    )
+    op.execute(
+        """
+        UPDATE fills
+        SET reconciliation_state = 'quarantined'
+        WHERE broker_fill_id IS NULL OR trim(broker_fill_id) = ''
+        """
+    )
     op.create_table(
         "circuit_breaker_state",
         sa.Column("scope_key", sa.String(length=64), nullable=False),
@@ -59,6 +75,46 @@ def upgrade() -> None:
             1,
             updated_at
         FROM killswitch_state
+        """
+    )
+    op.execute(
+        """
+        INSERT INTO circuit_breaker_state
+            (
+                scope_key, kind, target, tripped, reason, actor, generation,
+                updated_at
+            )
+        SELECT
+            'broker_drift',
+            'broker_drift',
+            '',
+            1,
+            'legacy fill without authoritative broker identity requires reconciliation',
+            'migration:0005',
+            1,
+            CURRENT_TIMESTAMP
+        WHERE EXISTS (
+            SELECT 1
+            FROM fills
+            WHERE reconciliation_state = 'quarantined'
+        )
+        """
+    )
+    op.execute(
+        """
+        UPDATE orders
+        SET
+            acceptance_state = 'fill_reconcile_required',
+            last_error_code = 'legacy_unidentified_fill',
+            updated_at = CURRENT_TIMESTAMP,
+            version = version + 1
+        WHERE id IN (
+            SELECT order_id
+            FROM fills
+            WHERE
+                reconciliation_state = 'quarantined'
+                AND order_id IS NOT NULL
+        )
         """
     )
     op.drop_index(
@@ -116,3 +172,5 @@ def downgrade() -> None:
         table_name="circuit_breaker_state",
     )
     op.drop_table("circuit_breaker_state")
+    with op.batch_alter_table("fills") as batch_op:
+        batch_op.drop_column("reconciliation_state")

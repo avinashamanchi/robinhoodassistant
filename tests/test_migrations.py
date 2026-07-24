@@ -581,3 +581,67 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
             "generation": 1,
         },
     ]
+
+
+def test_breaker_upgrade_quarantines_null_id_fills_and_trips_drift(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "legacy-null-fill.db",
+        "20260724_0004",
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO orders "
+                "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                "broker_order_id,created_at,updated_at,approval_reason,"
+                "submission_kind,submission_payload_json,submission_attempt,"
+                "acceptance_state,last_error_code,version) VALUES "
+                "(1,'legacy-null-client','AAPL','sell','market',1,'canceled',"
+                "'legacy-null-order',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'',"
+                "'simple','{}',0,'accepted','',0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO fills "
+                "(order_id,ticker,side,qty,price,broker_fill_id,filled_at) "
+                "VALUES "
+                "(1,'AAPL','sell',1,1,NULL,CURRENT_TIMESTAMP)"
+            )
+        )
+
+    command.upgrade(cfg, "20260724_0005")
+
+    with engine.connect() as conn:
+        fill = conn.execute(
+            text(
+                "SELECT broker_fill_id,reconciliation_state "
+                "FROM fills WHERE order_id=1"
+            )
+        ).mappings().one()
+        order = conn.execute(
+            text(
+                "SELECT acceptance_state,last_error_code "
+                "FROM orders WHERE id=1"
+            )
+        ).mappings().one()
+        drift = conn.execute(
+            text(
+                "SELECT tripped,reason,actor,generation "
+                "FROM circuit_breaker_state "
+                "WHERE scope_key='broker_drift'"
+            )
+        ).mappings().one()
+
+    assert fill == {
+        "broker_fill_id": None,
+        "reconciliation_state": "quarantined",
+    }
+    assert order == {
+        "acceptance_state": "fill_reconcile_required",
+        "last_error_code": "legacy_unidentified_fill",
+    }
+    assert drift["tripped"] == 1
+    assert "legacy fill" in drift["reason"]
+    assert drift["actor"] == "migration:0005"
+    assert drift["generation"] == 1
