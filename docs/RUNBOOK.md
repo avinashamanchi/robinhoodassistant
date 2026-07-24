@@ -20,7 +20,9 @@ Required in `.env`: `APP_API_TOKEN` (≥32 hex), one LLM key (`GEMINI_API_KEY` /
    uv run python -m trading_assistant.preflight
    ```
    Exit 0 / `=> READY` means go. Any `FAIL` blocks the day; `NEEDS-ME` means a key
-   is missing. If kill switches show TRIPPED, investigate `risk_events` before reset.
+   is missing. Preflight also synchronizes broker order statuses and requires local
+   positions to match Alpaca. If kill switches show TRIPPED, investigate
+   `risk_events` before reset.
 2. **Start the app** (UI + API):
    ```bash
    uv run uvicorn trading_assistant.app.main:create_app --factory --host 127.0.0.1 --port 8000
@@ -31,6 +33,19 @@ Required in `.env`: `APP_API_TOKEN` (≥32 hex), one LLM key (`GEMINI_API_KEY` /
    ```
 4. Open http://127.0.0.1:8000 — the UI prompts once for your `APP_API_TOKEN`.
 5. Check `GET /health` shows `daemon_alive: true`.
+
+## One-time paper order drill
+
+Run this after credentials or broker code changes:
+
+```bash
+uv run python -m trading_assistant.ops.paper_drill
+```
+
+It refuses non-paper configuration, sends one roughly $1.25 AAPL limit order about
+4% below the latest price through the normal proposal, approval, and risk path,
+then cancels it and requires both Alpaca and the local DB to report `canceled`.
+Treat any failure as a trading block and verify Alpaca has no open order.
 
 ## Daily routine
 
@@ -56,10 +71,22 @@ Required in `.env`: `APP_API_TOKEN` (≥32 hex), one LLM key (`GEMINI_API_KEY` /
 - Drawdown + `risk_events` for the week.
 - Backtest holdout report — has anything changed?
 
-## Keeping it running (see `docs/ops/`)
+## Keeping it running
 
-- `launchd` plist (macOS) / `systemd` unit for app + daemon auto-restart.
-- Nightly backup cron: `sqlite3 trading_assistant.db ".backup ..."`, 14-day retention.
+```bash
+./scripts/launchd/install.sh
+```
+
+This installs four launch agents: the API, daemon, a once-per-minute heartbeat
+watchdog, and a 02:00 online SQLite backup with 14-day retention. Backups use
+SQLite's online backup API and run an integrity check:
+
+```bash
+uv run python -m trading_assistant.ops.backup --destination backups
+```
+
+The watchdog restarts a stale daemon; it does not alter kill switches or live-mode
+configuration. Logs are in `logs/`, backups in `backups/`.
 
 ## Analyst version + scorecard reset
 

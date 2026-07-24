@@ -4,7 +4,7 @@
 set -euo pipefail
 LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
-for label in com.trading.app com.trading.daemon com.trading.watchdog; do
+for label in com.trading.app com.trading.daemon com.trading.watchdog com.trading.backup; do
   launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
   rm -f "$LA/$label.plist"
   echo "removed $label"

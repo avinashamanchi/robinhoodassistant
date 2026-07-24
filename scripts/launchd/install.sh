@@ -12,7 +12,7 @@ LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
-mkdir -p "$LA" "$PROJ/logs"
+mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
 
 emit () {  # $1=label  $2...=program args
   local label="$1"; shift
@@ -62,9 +62,38 @@ emit_periodic () {  # $1=label $2=interval_seconds $3...=program args
   echo "loaded $label"
 }
 
+emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
+  local label="$1"; shift
+  local hour="$1"; shift
+  local minute="$1"; shift
+  local plist="$LA/$label.plist"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$label"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>ProgramArguments</key>\n  <array>\n'
+    for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+    printf '  </array>\n'
+    printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>StartCalendarInterval</key><dict>\n'
+    printf '    <key>Hour</key><integer>%s</integer>\n' "$hour"
+    printf '    <key>Minute</key><integer>%s</integer>\n' "$minute"
+    printf '  </dict>\n'
+    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
+    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
+    printf '</dict></plist>\n'
+  } > "$plist"
+  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_" "$plist"
+  echo "loaded $label"
+}
+
 emit com.trading.app "$PY" -m uvicorn trading_assistant.app.main:create_app --factory --host 127.0.0.1 --port 8000
 emit com.trading.daemon "$PY" -m trading_assistant.daemon.main
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
+emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/backups" --retention-days 14
 
 sleep 6
 echo "=== status ==="

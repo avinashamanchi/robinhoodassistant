@@ -94,6 +94,12 @@ uv run uvicorn trading_assistant.app.main:create_app --factory --reload
 
 # Monitoring daemon (evaluates conditional rules against live quotes):
 uv run python -m trading_assistant.daemon.main
+
+# Verify Alpaca's full paper order path with one tiny submit/cancel:
+uv run python -m trading_assistant.ops.paper_drill
+
+# Install API + daemon + watchdog + nightly online backup on macOS:
+./scripts/launchd/install.sh
 ```
 
 Order lifecycle is hardened: partial fills advance PARTIALLY_FILLED → FILLED,
@@ -101,6 +107,10 @@ duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 /orders/{id}/cancel` cancels live orders, `POST /reconcile` compares broker
 positions to local truth and logs drift, and the daily-loss kill switch trips
 per asset class (`enforce_daily_loss_limits`).
+
+Operational details and daily checks are in
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md). Paper trading is a simulation and does not
+establish that a strategy will be profitable in live markets.
 
 ## LLM providers & market data
 

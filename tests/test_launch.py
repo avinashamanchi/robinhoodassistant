@@ -49,6 +49,22 @@ def test_preflight_env_flags_missing_token():
     assert r.status == "FAIL" and "APP_API_TOKEN" in r.detail
 
 
+def test_preflight_reconciliation_reports_position_drift(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+    from trading_assistant import preflight
+
+    broker = MockBroker(
+        positions=[
+            Position("AAPL", Decimal("2"), Decimal("100"), Decimal("100"))
+        ]
+    )
+    result = preflight._reconciliation(make_service(broker=broker))
+
+    assert result.status == "FAIL"
+    assert "AAPL" in result.detail
+
+
 # ── B2 full order lifecycle ─────────────────────────────────────
 def test_order_lifecycle_propose_approve_fill(make_service):
     svc = make_service()  # AAPL @ 100

@@ -97,6 +97,44 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
         return Result("DB WAL mode", FAIL, err), Result("kill switches", FAIL, err)
 
 
+def _reconciliation(service) -> Result:
+    """Repair stale order statuses, then require local positions to match Alpaca."""
+    try:
+        order_sync = service.sync_open_orders()
+        positions = service.reconcile_positions()
+        if not positions["reconciled"]:
+            return Result(
+                "broker/local reconciliation",
+                FAIL,
+                f"drift={positions['drift']} order_sync={order_sync}",
+            )
+        return Result(
+            "broker/local reconciliation",
+            PASS,
+            f"positions match; order_sync={order_sync}",
+        )
+    except Exception as e:
+        return Result(
+            "broker/local reconciliation", FAIL, f"{type(e).__name__}: {e}"
+        )
+
+
+def _build_service(config, secrets: Secrets):
+    from .broker.factory import build_broker, build_clock
+    from .db.models import create_all
+    from .db.session import create_db_engine, make_session_factory
+    from .service import TradingService
+
+    engine = create_db_engine(secrets.database_url)
+    create_all(engine)
+    return TradingService(
+        build_broker(config, secrets),
+        make_session_factory(engine),
+        config,
+        build_clock(config, secrets),
+    )
+
+
 def _llm(config, secrets: Secrets) -> Result:
     if not (secrets.gemini_api_key or secrets.groq_api_key or secrets.anthropic_api_key):
         return Result("LLM provider ping", NEEDS, "set an LLM key, then re-run")
@@ -140,6 +178,16 @@ def run() -> int:
     results = [_config_parses(), _env_present(secrets), _live_off(config, secrets)]
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))
+    if secrets.alpaca_api_key and secrets.alpaca_secret_key:
+        results.append(_reconciliation(_build_service(config, secrets)))
+    else:
+        results.append(
+            Result(
+                "broker/local reconciliation",
+                NEEDS,
+                "set ALPACA keys, then re-run",
+            )
+        )
     results.append(_llm(config, secrets))
     results.append(_robinhood(config, secrets))
     results.append(_telegram(config, secrets))
