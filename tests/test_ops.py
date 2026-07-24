@@ -17,6 +17,7 @@ from trading_assistant.ops.paper_drill import PaperDrillError, run_paper_drill
 def test_online_backup_is_valid_and_rotates_only_matching_old_files(tmp_path):
     source = tmp_path / "live.sqlite3"
     with sqlite3.connect(source) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("CREATE TABLE sample (value TEXT)")
         connection.execute("INSERT INTO sample VALUES ('preserved')")
         connection.commit()
@@ -39,6 +40,7 @@ def test_online_backup_is_valid_and_rotates_only_matching_old_files(tmp_path):
         )
     assert not old_match.exists()
     assert unrelated.exists()
+    assert list(destination.glob("*.tmp*")) == []
 
 
 def test_paper_drill_refuses_live_configuration(app_config):

@@ -79,7 +79,7 @@ class FakeTrading:
         self.last_request = None
         self._by_id = {}
 
-    def get_order_by_client_order_id(self, cid):
+    def get_order_by_client_id(self, cid):
         if self._lookup_error is not None:
             raise self._lookup_error
         if self._existing is not None:

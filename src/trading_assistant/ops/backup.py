@@ -46,6 +46,8 @@ def backup_database(
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+        temporary.with_name(f"{temporary.name}-wal").unlink(missing_ok=True)
+        temporary.with_name(f"{temporary.name}-shm").unlink(missing_ok=True)
 
     cutoff = time.time() - retention_days * 86400
     pattern = f"{_BACKUP_PREFIX}*{_BACKUP_SUFFIX}"

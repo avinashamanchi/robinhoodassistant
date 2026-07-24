@@ -287,7 +287,7 @@ class AlpacaBroker(BrokerClient):
     # ── helpers ────────────────────────────────────────────────
     def _find_by_client_id(self, client_order_id: str):
         try:
-            return _retry(self._trading.get_order_by_client_order_id, client_order_id)
+            return _retry(self._trading.get_order_by_client_id, client_order_id)
         except _TRANSIENT:
             # A transient network error must NOT be read as "no such order" — that
             # would risk a duplicate submit. Propagate so the caller's retry re-tries.
