@@ -166,6 +166,69 @@ def test_full_exit_is_capped_to_unreserved_live_position(make_service):
     assert proposal.qty == Decimal("5")
 
 
+def test_computed_rule_qty_is_normalized_before_risk_and_persistence(make_service):
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("1"), Decimal("3"), Decimal("3"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        action_json=json.dumps({"side": "sell", "notional": "1"}),
+        condition_json=json.dumps({"price_below": 4}),
+    )
+    broker.set_price("AAPL", Decimal("3"))
+    checked_qty = []
+    risk = svc._risk_for(AssetClass.EQUITY)
+    original_check = risk.check
+
+    def record_check(order, *args, **kwargs):
+        checked_qty.append(order.qty)
+        return original_check(order, *args, **kwargs)
+
+    risk.check = record_check
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert checked_qty == [Decimal("0.333333")]
+    with svc.session_factory() as session:
+        assert session.execute(select(Order)).scalar_one().qty == Decimal(
+            "0.333333"
+        )
+
+
+def test_computed_rule_qty_underflow_does_not_persist_zero_order(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[
+            Position("AAPL", Decimal("1"), Decimal("100"), Decimal("100"))
+        ]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        action_json=json.dumps({"side": "sell", "notional": "0.000001"}),
+        condition_json=json.dumps({"price_below": 101}),
+    )
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0].proposal is None
+    assert acted[0].error == "no unreserved position to exit"
+    with svc.session_factory() as session:
+        assert session.execute(select(Order)).scalars().all() == []
+        assert session.execute(select(Rule)).scalar_one().state == "active"
+
+
 @pytest.mark.parametrize(
     ("status", "reserved_qty", "expected_proposal_qty"),
     [

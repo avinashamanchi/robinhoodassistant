@@ -6,7 +6,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Callable, Iterable, Mapping, TYPE_CHECKING
+from typing import Callable, Iterable, Mapping, MutableMapping, TYPE_CHECKING
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -25,7 +25,14 @@ from trading_assistant.db.models import (
     RuleGroup,
 )
 
-from .models import RuleAction, RuleCommand, RuleKind, RuleOutcome, RuleState
+from .models import (
+    normalize_computed_order_decimal,
+    RuleAction,
+    RuleCommand,
+    RuleKind,
+    RuleOutcome,
+    RuleState,
+)
 from .repository import RuleGroupLease, RuleRepository
 
 if TYPE_CHECKING:
@@ -136,6 +143,7 @@ class RuleApplicationService:
         reference_price: Decimal | None = None,
         reference_quote=None,
         quote_overrides: Mapping[str, object] | None = None,
+        quote_cache: MutableMapping[str, object] | None = None,
         high_water_mark: Decimal | None = None,
     ) -> RuleOutcome:
         now = now or datetime.now(timezone.utc)
@@ -170,6 +178,9 @@ class RuleApplicationService:
         )
         asset_class = self.service._asset_class(request.ticker)
         snapshot_quote_overrides = dict(quote_overrides or {})
+        if quote_cache is not None:
+            for symbol, quote in quote_cache.items():
+                snapshot_quote_overrides.setdefault(symbol, quote)
         if reference_quote is not None:
             snapshot_quote_overrides.setdefault(request.ticker, reference_quote)
         with self.service.session_factory() as read_session:
@@ -179,6 +190,9 @@ class RuleApplicationService:
                 asset_class,
                 quote_overrides=snapshot_quote_overrides or None,
             )
+            if quote_cache is not None:
+                for symbol, quote in snapshot.quotes.items():
+                    quote_cache.setdefault(symbol.upper(), quote)
             risk = self.service._risk_for(asset_class).check(
                 request,
                 snapshot,
@@ -306,7 +320,12 @@ class RuleApplicationService:
         if available <= 0:
             return None
         if action.qty is not None:
-            return action.model_copy(update={"qty": min(action.qty, available)})
+            qty = normalize_computed_order_decimal(min(action.qty, available))
+            if qty is None:
+                return None
+            return RuleAction.model_validate(
+                {**action.model_dump(mode="python"), "qty": qty}
+            )
 
         price = reference_price
         if price is None:
@@ -314,9 +333,15 @@ class RuleApplicationService:
         if price <= 0:
             raise ValueError("reference price must be positive")
         assert action.notional is not None
-        return action.model_copy(
-            update={
-                "qty": min(action.notional / price, available),
+        qty = normalize_computed_order_decimal(
+            min(action.notional / price, available)
+        )
+        if qty is None:
+            return None
+        return RuleAction.model_validate(
+            {
+                **action.model_dump(mode="python"),
+                "qty": qty,
                 "notional": None,
             }
         )

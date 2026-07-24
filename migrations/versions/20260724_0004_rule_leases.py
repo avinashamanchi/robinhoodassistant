@@ -143,18 +143,18 @@ def _action(row) -> dict:
     notional = source.get("notional")
     if (qty is None) == (notional is None):
         raise ValueError("action requires exactly one quantity shape")
-    if qty is not None and not _positive(qty):
-        raise ValueError("qty must be positive")
-    if notional is not None and not _positive(notional):
-        raise ValueError("notional must be positive")
+    if qty is not None:
+        _optional_positive_decimal(qty, precision=20, scale=6)
+    if notional is not None:
+        _optional_positive_decimal(notional, precision=20, scale=6)
     order_type = source.get("order_type", "market")
     if order_type not in {"market", "limit"}:
         raise ValueError("unknown order type")
     limit_price = source.get("limit_price")
     if (order_type == "limit") != (limit_price is not None):
         raise ValueError("invalid limit-price shape")
-    if limit_price is not None and not _positive(limit_price):
-        raise ValueError("limit_price must be positive")
+    if limit_price is not None:
+        _optional_positive_decimal(limit_price, precision=20, scale=6)
     return {**source, "order_type": order_type}
 
 

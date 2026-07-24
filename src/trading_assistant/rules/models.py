@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, localcontext
 from enum import Enum
 from typing import Annotated, Any, Literal
 
@@ -65,7 +65,13 @@ PersistedHighWaterMark = Annotated[
     Decimal,
     Field(gt=0, max_digits=20, decimal_places=6),
 ]
+PersistedOrderDecimal = Annotated[
+    Decimal,
+    Field(gt=0, max_digits=20, decimal_places=6),
+]
 _HIGH_WATER_MARK_ADAPTER = TypeAdapter(PersistedHighWaterMark)
+_ORDER_DECIMAL_ADAPTER = TypeAdapter(PersistedOrderDecimal)
+_ORDER_DECIMAL_QUANTUM = Decimal("0.000001")
 
 
 def validate_persisted_high_water_mark(value: object) -> Decimal:
@@ -74,14 +80,38 @@ def validate_persisted_high_water_mark(value: object) -> Decimal:
     return _HIGH_WATER_MARK_ADAPTER.validate_python(value)
 
 
+def normalize_computed_order_decimal(value: Decimal) -> Decimal | None:
+    """Round a positive computed order value down to the persisted scale."""
+
+    if not value.is_finite() or value <= 0:
+        raise ValueError("computed order value must be finite and positive")
+    _, digits, exponent = value.normalize().as_tuple()
+    whole_digits = (
+        len(digits) + exponent
+        if exponent >= 0
+        else max(len(digits) + exponent, 0)
+    )
+    if whole_digits > 14:
+        raise ValueError("computed order value exceeds persisted precision")
+    with localcontext() as context:
+        context.prec = max(20, len(digits) + max(exponent, 0) + 6)
+        normalized = value.quantize(
+            _ORDER_DECIMAL_QUANTUM,
+            rounding=ROUND_DOWN,
+        )
+    if normalized == 0:
+        return None
+    return _ORDER_DECIMAL_ADAPTER.validate_python(normalized)
+
+
 class RuleAction(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     side: Literal["buy", "sell"]
     order_type: Literal["market", "limit"]
-    qty: Decimal | None = Field(default=None, gt=0)
-    notional: Decimal | None = Field(default=None, gt=0)
-    limit_price: Decimal | None = Field(default=None, gt=0)
+    qty: PersistedOrderDecimal | None = None
+    notional: PersistedOrderDecimal | None = None
+    limit_price: PersistedOrderDecimal | None = None
 
     @model_validator(mode="after")
     def validate_shape(self) -> "RuleAction":

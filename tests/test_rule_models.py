@@ -81,6 +81,31 @@ def test_rule_action_enforces_limit_price_shape(payload):
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("qty", "0.0000001"),
+        ("qty", "100000000000000"),
+        ("notional", "0.0000001"),
+        ("notional", "100000000000000"),
+        ("limit_price", "0.0000001"),
+        ("limit_price", "100000000000000"),
+    ],
+)
+def test_rule_action_rejects_values_order_columns_cannot_preserve(field, value):
+    payload = {
+        "side": "buy",
+        "order_type": "limit" if field == "limit_price" else "market",
+        "qty": "1" if field == "limit_price" else None,
+        field: value,
+    }
+    if field == "notional":
+        payload.pop("qty")
+
+    with pytest.raises(ValidationError):
+        RuleAction.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     ("model", "payload"),
     [
         (

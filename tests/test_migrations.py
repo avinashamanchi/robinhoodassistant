@@ -43,6 +43,7 @@ def _insert_legacy_rule(
     ticker: str = "AAPL",
     fraction=None,
     hwm=None,
+    action: dict | None = None,
 ) -> None:
     conn.execute(
         text(
@@ -56,7 +57,11 @@ def _insert_legacy_rule(
             "id": rule_id,
             "ticker": ticker,
             "condition": json.dumps({"price_below": 100 + rule_id}),
-            "action": json.dumps({"side": "buy", "notional": "50"}),
+            "action": json.dumps(
+                action
+                if action is not None
+                else {"side": "buy", "notional": "50"}
+            ),
             "state": state,
             "plan_id": plan_id,
             "pre_approved": pre_approved,
@@ -401,6 +406,59 @@ def test_rule_lease_upgrade_aborts_invalid_resumable_scalar_before_ddl(
             plan_id=None,
             state=state,
             **values,
+        )
+
+    with pytest.raises(RuntimeError, match="unknown active rule"):
+        command.upgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "20260724_0003"
+        )
+        assert "rule_groups" not in inspect(engine).get_table_names()
+
+
+@pytest.mark.parametrize(
+    ("state", "field", "value"),
+    [
+        ("active", "qty", "0.0000001"),
+        ("processing", "qty", "0.0000001"),
+        ("active", "qty", "100000000000000"),
+        ("processing", "qty", "100000000000000"),
+        ("active", "notional", "0.0000001"),
+        ("processing", "notional", "0.0000001"),
+        ("active", "notional", "100000000000000"),
+        ("processing", "notional", "100000000000000"),
+        ("active", "limit_price", "0.0000001"),
+        ("processing", "limit_price", "0.0000001"),
+        ("active", "limit_price", "100000000000000"),
+        ("processing", "limit_price", "100000000000000"),
+    ],
+)
+def test_rule_lease_upgrade_aborts_unpersistable_action_before_ddl(
+    tmp_path, state, field, value
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "invalid-action-rule.db", "20260724_0003"
+    )
+    action = {
+        "side": "buy",
+        "order_type": "limit" if field == "limit_price" else "market",
+        "qty": "1" if field == "limit_price" else value,
+    }
+    if field == "notional":
+        action.pop("qty")
+        action["notional"] = value
+    elif field == "limit_price":
+        action["limit_price"] = value
+
+    with engine.begin() as conn:
+        _insert_legacy_rule(
+            conn,
+            rule_id=1,
+            plan_id=None,
+            state=state,
+            action=action,
         )
 
     with pytest.raises(RuntimeError, match="unknown active rule"):
