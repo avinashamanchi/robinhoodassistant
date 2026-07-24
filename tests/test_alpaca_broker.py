@@ -370,6 +370,37 @@ def test_get_positions_canonicalizes_only_metadata_identified_crypto(
     assert position.ticker == expected_symbol
 
 
+@pytest.mark.parametrize("second_qty", ["2", "3"], ids=["identical", "conflicting"])
+def test_get_positions_rejects_duplicate_canonical_crypto_symbols(
+    second_qty,
+):
+    trading = FakeTrading()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(
+            symbol="BTCUSD",
+            asset_class=SimpleNamespace(value="crypto"),
+            qty="2",
+            avg_entry_price="60000",
+            current_price="68000",
+            unrealized_intraday_pl="1000",
+        ),
+        SimpleNamespace(
+            symbol="BTC/USD",
+            asset_class=SimpleNamespace(value="crypto"),
+            qty=second_qty,
+            avg_entry_price="60000",
+            current_price="68000",
+            unrealized_intraday_pl="1000",
+        ),
+    ]
+
+    with pytest.raises(
+        BrokerDataIntegrityError,
+        match="duplicate Alpaca position.*BTC/USD",
+    ):
+        AlpacaBroker(trading, FakeData({})).get_positions()
+
+
 def test_compact_crypto_position_is_single_canonical_snapshot_exposure(
     session_factory,
     app_config,

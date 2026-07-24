@@ -28,6 +28,8 @@ from trading_assistant.risk.breakers import (
     BreakerScope,
     relevant_scopes_for_symbol,
 )
+from trading_assistant.risk.clock import FakeClock
+from trading_assistant.service import TradingService
 
 
 def _approved_order(svc) -> int:
@@ -557,6 +559,61 @@ def test_crypto_submission_identity_accepts_equivalent_symbol_only(
         assert (
             order.acceptance_state == FILL_RECONCILIATION_REQUIRED
         ) is expected_drift
+
+
+def test_submission_never_treats_local_equity_as_broker_slash_crypto(
+    app_config,
+    session_factory,
+):
+    class ReversedIdentityBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            return OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                OrderStatus.SUBMITTED,
+                ticker="ACME/USD",
+            )
+
+    config = app_config.model_copy(
+        update={
+            "risk": app_config.risk.model_copy(
+                update={"ticker_allowlist": ["ACMEUSD"]}
+            )
+        }
+    )
+    broker = ReversedIdentityBroker()
+    broker.set_price("ACMEUSD", Decimal("100"))
+    service = TradingService(
+        broker,
+        session_factory,
+        config,
+        FakeClock(is_open=True),
+    )
+    order_id = service.propose_order(
+        "ACMEUSD",
+        "buy",
+        "market",
+        notional="100",
+        idempotency_key="equity-direction-submission",
+    )["order_id"]
+    service.order_application.approve(
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed directional identity",
+            utcnow(),
+        )
+    )
+
+    result = service.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order_row = session.get(Order, order_id)
+        assert order_row.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert order_row.last_error_code == "invalid_broker_identity"
 
 
 def test_malformed_position_payload_fails_before_submission_claim(make_service):

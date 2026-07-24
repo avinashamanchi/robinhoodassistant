@@ -164,6 +164,43 @@ def test_acceptance_unknown_rejects_invalid_remote_identity_durably(
         assert order.last_error_code == "invalid_broker_identity"
 
 
+def test_acceptance_recovery_keeps_broker_symbol_first_in_identity_check(
+    make_service,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="equity-direction-recovery",
+            ticker="ACMEUSD",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+    broker._orders_by_key[order.idempotency_key] = OrderResult(
+        order.idempotency_key,
+        "equity-direction-recovery-broker",
+        OrderStatus.SUBMITTED,
+        ticker="ACME/USD",
+    )
+
+    resolved, unresolved = service.reconciliation.reconcile_unknown()
+
+    assert resolved == 0
+    assert unresolved == (order_id,)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        assert persisted.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert persisted.broker_order_id is None
+        assert persisted.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert persisted.last_error_code == "invalid_broker_identity"
+
+
 @pytest.mark.parametrize(
     ("remote_status", "filled_qty"),
     [
@@ -810,6 +847,60 @@ def test_panic_requires_actor_and_reason_before_latching(make_service):
         ) is None
 
 
+def test_panic_keeps_broker_symbol_first_in_identity_check(make_service):
+    class ReversedIdentityCancelBroker(MockBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            canceled = OrderResult(
+                current.idempotency_key,
+                current.broker_order_id,
+                OrderStatus.CANCELED,
+                ticker="ACME/USD",
+            )
+            self._orders_by_id[order_id] = canceled
+            self._orders_by_key[current.idempotency_key] = canceled
+            return canceled
+
+    broker = ReversedIdentityCancelBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="equity-direction-panic",
+            ticker="ACMEUSD",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id="equity-direction-panic-broker",
+            acceptance_state="accepted",
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+    remote = OrderResult(
+        order.idempotency_key,
+        order.broker_order_id,
+        OrderStatus.SUBMITTED,
+        ticker="ACME/USD",
+    )
+    broker._orders_by_id[order.broker_order_id] = remote
+    broker._orders_by_key[order.idempotency_key] = remote
+
+    report = service.reconciliation.panic(
+        "operator:avi",
+        "directional broker identity",
+    )
+
+    assert report.safe is False
+    assert report.unconfirmed_order_ids == (order_id,)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        assert persisted.status == OrderStatus.SUBMITTED.value
+        assert persisted.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert persisted.last_error_code == "invalid_broker_identity"
+
+
 def test_panic_cancels_remote_only_open_order_by_explicit_id(make_service):
     broker = MockBroker()
     remote = broker.submit_order(
@@ -958,6 +1049,45 @@ def test_reconcile_syncs_terminal_broker_status(make_service):
     assert report.synced_orders == 1
     with service.session_factory() as session:
         assert session.get(Order, order_id).status == OrderStatus.CANCELED.value
+
+
+def test_ordinary_reconciliation_keeps_broker_symbol_first_in_identity_check(
+    make_service,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="equity-direction-reconcile",
+            ticker="ACMEUSD",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id="equity-direction-reconcile-broker",
+            acceptance_state="accepted",
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+    remote = OrderResult(
+        order.idempotency_key,
+        order.broker_order_id,
+        OrderStatus.CANCELED,
+        ticker="ACME/USD",
+    )
+    broker._orders_by_id[order.broker_order_id] = remote
+    broker._orders_by_key[order.idempotency_key] = remote
+
+    report = service.reconciliation.reconcile()
+
+    assert any("invalid broker identity" in item for item in report.broker_drift)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        assert persisted.status == OrderStatus.SUBMITTED.value
+        assert persisted.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert persisted.last_error_code == "invalid_broker_identity"
 
 
 def test_reconcile_reports_remote_open_order_without_broker_id(make_service):

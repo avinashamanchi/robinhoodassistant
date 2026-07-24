@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from trading_assistant.assets import AssetClass
+from trading_assistant.assets import AssetClass, broker_symbol_matches_local
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.clock import CryptoClock, FakeClock
 from trading_assistant.risk.killswitch import KillSwitch
@@ -28,6 +28,13 @@ def test_for_symbol_classifies():
     assert AssetClass.for_symbol("BTC/USD") is CR
     assert AssetClass.for_symbol("ETH/USD") is CR
     assert AssetClass.for_symbol("AAPL") is EQ
+
+
+def test_broker_symbol_equivalence_is_directional_from_local_canonical_form():
+    assert broker_symbol_matches_local("BTCUSD", "BTC/USD") is True
+    assert broker_symbol_matches_local("BTC/USD", "BTC/USD") is True
+    assert broker_symbol_matches_local("BTC/USD", "BTCUSD") is False
+    assert broker_symbol_matches_local("ACME/USD", "ACMEUSD") is False
 
 
 # ── kill switch independence ────────────────────────────────────

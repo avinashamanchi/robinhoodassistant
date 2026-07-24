@@ -735,6 +735,77 @@ def test_snapshot_rejects_malformed_position_values(
         )
 
 
+@pytest.mark.parametrize(
+    ("target", "first_symbol", "second_symbol", "second_qty"),
+    [
+        ("BTC/USD", "BTCUSD", "BTC/USD", "1"),
+        ("BTC/USD", "BTCUSD", "BTC/USD", "2"),
+        ("AAPL", "AAPL", "aapl", "1"),
+        ("AAPL", "AAPL", "AAPL", "2"),
+    ],
+    ids=[
+        "crypto-alias-identical",
+        "crypto-alias-conflicting",
+        "equity-case-identical",
+        "equity-exact-conflicting",
+    ],
+)
+def test_snapshot_blocks_canonical_duplicate_positions_without_overwrite(
+    make_service,
+    app_config,
+    target,
+    first_symbol,
+    second_symbol,
+    second_qty,
+):
+    positions = [
+        Position(
+            first_symbol,
+            Decimal("1"),
+            Decimal("90"),
+            Decimal("100"),
+            unrealized_intraday_pnl=Decimal("0"),
+        ),
+        Position(
+            second_symbol,
+            Decimal(second_qty),
+            Decimal("90"),
+            Decimal("100"),
+            unrealized_intraday_pnl=Decimal("0"),
+        ),
+    ]
+
+    class DuplicatePositionBroker(MockBroker):
+        def get_positions(self):
+            return positions
+
+    broker = DuplicatePositionBroker()
+    broker.set_price(target, Decimal("100"))
+    service = make_service(broker=broker)
+
+    snapshot = service.snapshot_service.assemble_for_execution(target)
+    config = (
+        app_config.crypto_risk
+        if AssetClass.for_symbol(target) is AssetClass.CRYPTO
+        else app_config.risk
+    )
+    assert config is not None
+    result = RiskEngine(config).check(
+        order(ticker=target, notional="100"),
+        snapshot,
+    )
+
+    assert set(snapshot.positions) == {target}
+    assert snapshot.positions[target].qty == Decimal("1")
+    assert snapshot.pending_exposure_complete is False
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    assert (
+        "outstanding order exposure is unknown; new orders are blocked"
+        in result.reasons
+    )
+
+
 def test_snapshot_marks_non_finite_unrealized_pnl_incomplete(make_service):
     class NonFinitePnlBroker(MockBroker):
         def get_positions(self):

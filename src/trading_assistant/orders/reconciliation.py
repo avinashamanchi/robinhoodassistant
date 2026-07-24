@@ -449,7 +449,7 @@ class ReconciliationService:
                         activity,
                         ticker=canonicalize_broker_symbol(
                             activity.ticker,
-                            reference_symbol=order.ticker,
+                            local_symbol=order.ticker,
                         ),
                         filled_at=_normalized_utc(activity.filled_at),
                     )

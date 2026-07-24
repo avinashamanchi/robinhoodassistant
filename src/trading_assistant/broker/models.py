@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from trading_assistant.assets import broker_symbols_equivalent
+from trading_assistant.assets import broker_symbol_matches_local
 
 
 FILL_NUMERIC_PRECISION = 24
@@ -313,7 +313,7 @@ def order_result_identity_error(
         )
     if result.ticker is not None and expected_ticker is not None:
         try:
-            ticker_matches = broker_symbols_equivalent(
+            ticker_matches = broker_symbol_matches_local(
                 result.ticker,
                 expected_ticker,
             )

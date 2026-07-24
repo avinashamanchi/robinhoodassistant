@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -10,7 +11,11 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_assistant.assets import AssetClass
+from trading_assistant.assets import (
+    AssetClass,
+    broker_symbol_matches_local,
+    canonicalize_broker_symbol,
+)
 from trading_assistant.broker.models import (
     Account,
     OrderSide,
@@ -78,6 +83,7 @@ class PortfolioSnapshotService:
         (
             account,
             positions,
+            position_exposure_complete,
             external,
             quotes,
             wanted,
@@ -108,6 +114,7 @@ class PortfolioSnapshotService:
                 exclude_order_id=exclude_order_id,
                 account=account,
                 positions=positions,
+                position_exposure_complete=position_exposure_complete,
                 external=external,
                 quotes=quotes,
                 wanted=wanted,
@@ -131,6 +138,7 @@ class PortfolioSnapshotService:
         (
             account,
             positions,
+            position_exposure_complete,
             external,
             quotes,
             wanted,
@@ -162,6 +170,7 @@ class PortfolioSnapshotService:
             exclude_order_id=exclude_order_id,
             account=account,
             positions=positions,
+            position_exposure_complete=position_exposure_complete,
             external=external,
             quotes=quotes,
             wanted=wanted,
@@ -182,6 +191,7 @@ class PortfolioSnapshotService:
     ) -> tuple[
         Account,
         list[Position],
+        bool,
         dict,
         dict[str, Quote],
         set[str],
@@ -192,6 +202,10 @@ class PortfolioSnapshotService:
         positions = self.broker.get_positions()
         if any(not position.risk_values_valid for position in positions):
             raise ValueError("invalid broker position payload")
+        positions, position_exposure_complete = self._canonical_positions(
+            positions,
+            tickers,
+        )
         external = self.external_positions()
         clock = self.clock_for_asset(asset_class)
         market_open = clock.is_open()
@@ -208,12 +222,64 @@ class PortfolioSnapshotService:
         return (
             account,
             positions,
+            position_exposure_complete,
             external,
             quotes,
             wanted,
             market_open,
             boundary,
         )
+
+    @staticmethod
+    def _canonical_positions(
+        positions: list[Position],
+        local_symbols: list[str],
+    ) -> tuple[list[Position], bool]:
+        normalized = [
+            canonicalize_broker_symbol(position.ticker)
+            for position in positions
+        ]
+        local_crypto_symbols = {
+            canonicalize_broker_symbol(symbol)
+            for symbol in (
+                list(local_symbols)
+                + [
+                    symbol
+                    for symbol in normalized
+                    if "/" in symbol
+                ]
+            )
+            if "/" in symbol
+        }
+        canonical_positions: list[Position] = []
+        seen: set[str] = set()
+        complete = True
+        for position, broker_symbol in zip(
+            positions,
+            normalized,
+            strict=True,
+        ):
+            matching_local = [
+                local_symbol
+                for local_symbol in local_crypto_symbols
+                if broker_symbol_matches_local(
+                    broker_symbol,
+                    local_symbol,
+                )
+            ]
+            canonical_symbol = (
+                matching_local[0]
+                if len(matching_local) == 1
+                else broker_symbol
+            )
+            if len(matching_local) > 1 or canonical_symbol in seen:
+                complete = False
+                continue
+            seen.add(canonical_symbol)
+            canonical_positions.append(
+                replace(position, ticker=canonical_symbol)
+            )
+        return canonical_positions, complete
 
     def _fetch_missing_quotes(
         self, quotes: dict[str, Quote], wanted: set[str]
@@ -329,6 +395,7 @@ class PortfolioSnapshotService:
         exclude_order_id: int | None,
         account: Account,
         positions: list[Position],
+        position_exposure_complete: bool,
         external: dict,
         quotes: dict[str, Quote],
         wanted: set[str],
@@ -373,7 +440,8 @@ class PortfolioSnapshotService:
             )
         ]
         daily_pnl_complete = (
-            len(finite_unrealized) == len(relevant_positions)
+            position_exposure_complete
+            and len(finite_unrealized) == len(relevant_positions)
             and not broker_drift_active
         )
         unrealized_pnl_today = sum(
@@ -419,7 +487,8 @@ class PortfolioSnapshotService:
                 or legacy_fill_reconciliation_required
             )
             broker_reconciled = (
-                session.scalar(
+                position_exposure_complete
+                and session.scalar(
                     select(Order.id)
                     .where(Order.status.in_(_UNRECONCILED_STATUSES))
                     .limit(1)
@@ -438,6 +507,7 @@ class PortfolioSnapshotService:
             reserved_sell_qty: dict[str, Decimal] = {}
             pending_exposure_complete = (
                 discovery_complete
+                and position_exposure_complete
                 and not legacy_fill_reconciliation_required
             )
             fills_by_order: dict[int, list[Fill]] = {}

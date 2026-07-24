@@ -255,6 +255,7 @@ class AlpacaBroker(BrokerClient):
 
     def get_positions(self) -> list[Position]:
         out: list[Position] = []
+        seen_symbols: set[str] = set()
         for p in _retry(self._trading.get_all_positions):
             raw_symbol = getattr(p, "symbol", None)
             if (
@@ -273,6 +274,11 @@ class AlpacaBroker(BrokerClient):
                 raise BrokerDataIntegrityError(
                     "invalid Alpaca position symbol"
                 ) from exc
+            if symbol in seen_symbols:
+                raise BrokerDataIntegrityError(
+                    f"duplicate Alpaca position symbol {symbol}"
+                )
+            seen_symbols.add(symbol)
             out.append(
                 Position(
                     ticker=symbol,
