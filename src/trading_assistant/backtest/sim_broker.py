@@ -120,6 +120,16 @@ class SimBroker(BrokerClient):
         self._orders[result.broker_order_id] = result
         return result
 
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
+        return next(
+            (
+                result
+                for result in self._orders.values()
+                if result.idempotency_key == client_order_id
+            ),
+            None,
+        )
+
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Record a server-side bracket (entry + OCO take-profit/stop). Test double."""
         result = self.submit_order(order)

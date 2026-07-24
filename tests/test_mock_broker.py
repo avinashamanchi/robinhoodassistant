@@ -44,6 +44,14 @@ def test_idempotent_submit_does_not_double_order(mock_broker):
     assert third.broker_order_id != first.broker_order_id
 
 
+def test_get_order_by_client_id_returns_none_or_prior_order_without_submitting(mock_broker):
+    assert mock_broker.get_order_by_client_id("missing") is None
+
+    submitted = mock_broker.submit_order(_order("key-lookup"))
+
+    assert mock_broker.get_order_by_client_id("key-lookup") == submitted
+
+
 def test_status_and_cancel(mock_broker):
     result = mock_broker.submit_order(_order("key-x"))
     fetched = mock_broker.get_order_status(result.broker_order_id)

@@ -12,6 +12,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import TimeInForce
 
 from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
+from trading_assistant.broker.base import BrokerAcceptanceUnknown, BrokerSubmissionRejected
 from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
@@ -255,6 +256,40 @@ def test_idempotent_submit_does_not_resubmit():
     assert result.status is OrderStatus.FILLED
 
 
+def test_get_order_by_client_id_returns_none_or_prior_order_without_submitting():
+    prior = FakeOrder("brk-existing", "k1", "filled", filled_qty="1", avg="100")
+    missing = AlpacaBroker(FakeTrading(), FakeData({}))
+    existing = AlpacaBroker(FakeTrading(existing=prior), FakeData({}))
+
+    assert missing.get_order_by_client_id("not-found") is None
+    found = existing.get_order_by_client_id("k1")
+    assert found is not None
+    assert found.broker_order_id == "brk-existing"
+    assert existing._trading.submit_calls == 0
+
+
+def test_alpaca_definitive_validation_rejection_is_typed():
+    class RejectingTrading(FakeTrading):
+        def submit_order(self, order_data):
+            raise _api_error(422)
+
+    broker = AlpacaBroker(RejectingTrading(), FakeData({}))
+
+    with pytest.raises(BrokerSubmissionRejected):
+        broker.submit_order(_order())
+
+
+def test_alpaca_post_send_connection_loss_is_acceptance_unknown():
+    class DisconnectingTrading(FakeTrading):
+        def submit_order(self, order_data):
+            raise ConnectionError("response lost")
+
+    broker = AlpacaBroker(DisconnectingTrading(), FakeData({}))
+
+    with pytest.raises(BrokerAcceptanceUnknown):
+        broker.submit_order(_order())
+
+
 def test_idempotency_lookup_failure_is_fail_closed():
     trading = FakeTrading(lookup_error=_api_error(500))
     broker = AlpacaBroker(trading, FakeData({}))
@@ -306,7 +341,7 @@ def test_get_quote_retries_on_transient_connection_error():
     assert q.last == Decimal("101")
 
 
-def test_submit_order_retries_on_transient_and_stays_idempotent():
+def test_submit_order_does_not_retry_post_send_connection_loss():
     from requests.exceptions import ConnectionError as ReqConnErr
 
     class FlakyTrading(FakeTrading):
@@ -322,9 +357,9 @@ def test_submit_order_retries_on_transient_and_stays_idempotent():
 
     trading = FlakyTrading()
     broker = AlpacaBroker(trading, FakeData({}))
-    result = broker.submit_order(_order())
-    assert result.broker_order_id == "brk-1"
-    assert trading.submit_calls == 1     # exactly one real submit landed
+    with pytest.raises(BrokerAcceptanceUnknown):
+        broker.submit_order(_order())
+    assert trading.submit_calls == 0  # no second POST after an uncertain send
 
 
 def test_non_transient_error_is_not_retried():

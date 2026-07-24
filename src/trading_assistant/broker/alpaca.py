@@ -32,7 +32,7 @@ from alpaca.trading.requests import GetCalendarRequest, LimitOrderRequest, Marke
 from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass
-from .base import BrokerClient
+from .base import BrokerAcceptanceUnknown, BrokerClient, BrokerSubmissionRejected
 from .models import (
     Account,
     BrokerFill,
@@ -256,16 +256,19 @@ class AlpacaBroker(BrokerClient):
 
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:
-        # Retry the WHOLE attempt: on a dropped connection the retry re-runs the
-        # idempotency lookup first, so a submit that actually landed is returned
-        # (via client_order_id) instead of double-placed.
-        return _retry(self._submit_once, order)
+        existing = self.get_order_by_client_id(order.idempotency_key)
+        if existing is not None:
+            return existing
+        try:
+            return self._submit_once(order)
+        except APIError as exc:
+            raise self._submission_exception(exc) from exc
+        except Exception as exc:
+            # The POST was attempted. A timeout, malformed response, or connection
+            # reset cannot prove that Alpaca did not accept the client id.
+            raise BrokerAcceptanceUnknown(str(exc)) from exc
 
     def _submit_once(self, order: OrderRequest) -> OrderResult:
-        existing = self._find_by_client_id(order.idempotency_key)
-        if existing is not None:
-            return self._to_result(existing)
-
         side = (
             AlpacaOrderSide.BUY if order.side is OrderSide.BUY else AlpacaOrderSide.SELL
         )
@@ -296,12 +299,17 @@ class AlpacaBroker(BrokerClient):
         """Server-side OCO bracket: entry + take-profit + stop-loss in one order."""
         if AssetClass.for_symbol(order.ticker) is AssetClass.CRYPTO:
             raise ValueError("crypto bracket orders are not supported by Alpaca")
-        return _retry(self._submit_bracket_once, order, take_profit, stop_loss)
+        existing = self.get_order_by_client_id(order.idempotency_key)
+        if existing is not None:
+            return existing
+        try:
+            return self._submit_bracket_once(order, take_profit, stop_loss)
+        except APIError as exc:
+            raise self._submission_exception(exc) from exc
+        except Exception as exc:
+            raise BrokerAcceptanceUnknown(str(exc)) from exc
 
     def _submit_bracket_once(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
-        existing = self._find_by_client_id(order.idempotency_key)
-        if existing is not None:
-            return self._to_result(existing)
         from alpaca.trading.enums import OrderClass
         from alpaca.trading.requests import (
             LimitOrderRequest,
@@ -326,6 +334,10 @@ class AlpacaBroker(BrokerClient):
     def get_order_status(self, order_id: str) -> OrderResult:
         return self._to_result(_retry(self._trading.get_order_by_id, order_id))
 
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
+        found = self._find_by_client_id(client_order_id)
+        return self._to_result(found) if found is not None else None
+
     def cancel_order(self, order_id: str) -> OrderResult:
         _retry(self._trading.cancel_order_by_id, order_id)
         return self._to_result(_retry(self._trading.get_order_by_id, order_id))
@@ -345,6 +357,16 @@ class AlpacaBroker(BrokerClient):
             if exc.status_code == 404:
                 return None
             raise
+
+    @staticmethod
+    def _submission_exception(exc: APIError) -> RuntimeError:
+        status_code = getattr(exc, "status_code", None)
+        # Alpaca documents 400/422 as validation failures, which prove no order
+        # was accepted. Other 4xx responses can be transport/auth/rate-limit
+        # edge cases, so preserve the safer indeterminate outcome.
+        if status_code in {400, 422}:
+            return BrokerSubmissionRejected(f"alpaca_http_{status_code}", str(exc))
+        return BrokerAcceptanceUnknown(str(exc))
 
     def _to_result(self, o: Any) -> OrderResult:
         return OrderResult(

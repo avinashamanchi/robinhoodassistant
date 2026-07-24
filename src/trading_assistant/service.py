@@ -21,7 +21,6 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .broker.base import BrokerClient
@@ -35,7 +34,6 @@ from .broker.models import (
 from .assets import AssetClass
 from .config import AppConfig
 from .db.models import (
-    ApprovalConflict,
     Fill,
     LLMDecision,
     Order,
@@ -43,10 +41,15 @@ from .db.models import (
     Proposal,
     RiskEvent,
     Rule,
-    approve_proposed,
     utcnow,
 )
-from .orders.repository import OrderRepository
+from .orders.application import (
+    ApprovalCommand,
+    ApprovalConflict as ApprovalApplicationConflict,
+    OrderApplicationService,
+)
+from .orders.snapshot import PortfolioSnapshotService
+from .orders.submission import OrderSubmissionService
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.killswitch import KillSwitch
@@ -91,6 +94,23 @@ class TradingService:
             AssetClass.EQUITY: self.risk,
             AssetClass.CRYPTO: RiskEngine(crypto_cfg),
         }
+        self.snapshot_service = PortfolioSnapshotService(
+            session_factory,
+            broker,
+            self._clock_for,
+            self._external_positions_map,
+        )
+        self.order_application = OrderApplicationService(session_factory)
+        self.order_submission = OrderSubmissionService(
+            self.order_application.repository,
+            session_factory,
+            broker,
+            self.snapshot_service,
+            lambda symbol: self._risk_for(self._asset_class(symbol)),
+            lambda symbol: self._clock_for(self._asset_class(symbol)),
+            self._killswitch_for_symbol,
+            utcnow,
+        )
 
     # ── asset-class routing helpers ────────────────────────────
     @staticmethod
@@ -112,6 +132,11 @@ class TradingService:
         """Return the configured broker clock state for a symbol's asset class."""
         ac = self._asset_class(ticker)
         return self._clock_for(ac).is_open()
+
+    def _killswitch_for_symbol(self, ticker: str) -> bool:
+        """Read the durable breaker in a closed session before broker I/O."""
+        with self.session_factory() as session:
+            return KillSwitch.is_tripped(session, self._asset_class(ticker))
 
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
@@ -138,86 +163,11 @@ class TradingService:
         asset_class: AssetClass = AssetClass.EQUITY,
         exclude_order_id: int | None = None,
     ) -> PortfolioSnapshot:
-        positions = self.broker.get_positions()
-        pos_map = {p.ticker.upper(): p for p in positions}
-        pending_query = select(Order).where(
-            Order.status.in_(
-                (
-                    OrderStatus.APPROVED.value,
-                    OrderStatus.APPROVAL_RECORDED.value,
-                    OrderStatus.SUBMITTING.value,
-                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                    OrderStatus.SUBMITTED.value,
-                    OrderStatus.PARTIALLY_FILLED.value,
-                )
-            )
-        )
-        if exclude_order_id is not None:
-            pending_query = pending_query.where(Order.id != exclude_order_id)
-        pending_orders = session.execute(pending_query).scalars().all()
-        want = (
-            {t.upper() for t in tickers}
-            | set(pos_map)
-            | {order.ticker.upper() for order in pending_orders}
-        )
-        # A symbol the broker can't quote (typo / unknown ticker) must not crash
-        # the snapshot — omit it. The risk engine then rejects cleanly ("not on
-        # allowlist" and/or "no quote available"), which is fail-closed.
-        quotes = {}
-        for sym in want:
-            try:
-                quotes[sym] = self.broker.get_quote(sym)
-            except Exception:  # noqa: BLE001 — unquotable symbol -> no price, safe rejection
-                log.warning("no quote for %s; omitting from snapshot", sym)
-        account = self.broker.get_account()
-        pending_signed_notional: dict[str, Decimal] = {}
-        pending_exposure_complete = True
-        for pending_order in pending_orders:
-            if pending_order.status in (
-                OrderStatus.SUBMITTING.value,
-                OrderStatus.ACCEPTANCE_UNKNOWN.value,
-            ):
-                # Submission may already have reached the broker, but local
-                # acceptance is unresolved. Reserve any calculable amount and
-                # fail closed until reconciliation establishes the outcome.
-                pending_exposure_complete = False
-            symbol = pending_order.ticker.upper()
-            quote = quotes.get(symbol)
-            if quote is None:
-                pending_exposure_complete = False
-                continue
-            recorded_qty = sum(
-                (fill.qty for fill in pending_order.fills), Decimal(0)
-            )
-            recorded_notional = sum(
-                (fill.qty * fill.price for fill in pending_order.fills), Decimal(0)
-            )
-            if pending_order.qty is not None:
-                remaining_qty = max(
-                    pending_order.qty - recorded_qty, Decimal(0)
-                )
-                remaining_notional = remaining_qty * quote.last
-            else:
-                remaining_notional = max(
-                    (pending_order.notional or Decimal(0)) - recorded_notional,
-                    Decimal(0),
-                )
-            signed_notional = (
-                remaining_notional
-                if pending_order.side == OrderSide.BUY.value
-                else -remaining_notional
-            )
-            pending_signed_notional[symbol] = (
-                pending_signed_notional.get(symbol, Decimal(0)) + signed_notional
-            )
-        return PortfolioSnapshot(
-            positions=pos_map,
-            quotes=quotes,
-            buying_power=account.buying_power,
-            realized_pnl_today=self._realized_pnl_today(session, asset_class),
-            external_positions=self._external_positions_map(),
-            pending_signed_notional=pending_signed_notional,
-            pending_exposure_complete=pending_exposure_complete,
+        return self.snapshot_service.assemble(
+            session,
+            tickers,
+            asset_class,
+            exclude_order_id=exclude_order_id,
         )
 
     def _external_positions_map(self) -> dict:
@@ -396,142 +346,61 @@ class TradingService:
         reason: str,
         request_id: str = "",
     ) -> dict[str, Any]:
-        """Approve, claim, and submit an order without broker I/O in a write transaction."""
+        """Record an identified approval, then send through the durable outbox."""
         if not actor.strip() or not reason.strip():
             raise ValueError("approval actor and reason must be non-empty")
-        repository = OrderRepository(self.session_factory)
-
-        # Inspect expiry before the CAS. The repository owns the state-changing
-        # expiry write so a concurrent submission claim cannot be overwritten.
-        with self.session_factory() as s:
-            order = s.get(Order, order_id)
-            if order is None:
-                return {"order_id": order_id, "error": "not found", "executed": False}
-            is_expired = (
-                order.status
-                in (OrderStatus.PROPOSED.value, OrderStatus.APPROVAL_RECORDED.value)
-                and order.proposal is not None
-                and order.proposal.is_expired()
-            )
-
-        if is_expired:
-            status = repository.expire_if_eligible(order_id, utcnow())
-            if status is OrderStatus.EXPIRED:
-                return {
-                    "order_id": order_id,
-                    "status": OrderStatus.EXPIRED.value,
-                    "executed": False,
-                    "error": "proposal expired",
-                }
-            return {
-                "order_id": order_id,
-                "status": status.value if status is not None else None,
-                "executed": False,
-                "error": "order not in PROPOSED state (already decided?)",
-            }
-
-        # Commit the human approval and audit record before any broker read.
-        with self.session_factory() as s:
-            try:
-                approve_proposed(
-                    s,
+        try:
+            approval = self.order_application.approve(
+                ApprovalCommand(
                     order_id,
-                    actor=actor,
-                    reason=reason,
-                    request_id=request_id or uuid.uuid4().hex,
+                    actor,
+                    reason,
+                    utcnow(),
+                    request_id or uuid.uuid4().hex,
                 )
-            except ApprovalConflict:
-                s.rollback()
-                current = s.get(Order, order_id)
+            )
+        except KeyError:
+            return {"order_id": order_id, "error": "not found", "executed": False}
+        except ApprovalApplicationConflict:
+            with self.session_factory() as session:
+                current = session.get(Order, order_id)
                 return {
                     "order_id": order_id,
                     "status": current.status if current else None,
                     "executed": False,
                     "error": "order not in PROPOSED state (already decided?)",
                 }
-            s.commit()
+        if approval.status is OrderStatus.EXPIRED:
+            return {
+                "order_id": order_id,
+                "status": OrderStatus.EXPIRED.value,
+                "executed": False,
+                "error": "proposal expired",
+            }
 
-        # Fresh risk evaluation uses only a read-only database session. Broker
-        # reads therefore cannot happen while a SQLite write is uncommitted.
-        with self.session_factory() as s:
-            order = s.get(Order, order_id)
-            assert order is not None
-            ac = self._asset_class(order.ticker)
-            order_req = self._order_request_from(order)
-            snapshot = self.assemble_snapshot(
-                s, [order.ticker], ac, exclude_order_id=order.id
-            )
-            result = self._risk_for(ac).check(
-                order_req,
-                snapshot,
-                killswitch_tripped=KillSwitch.is_tripped(s, ac),
-                market_open=self._clock_for(ac).is_open(),
-            )
-
-        if result.rejected:
-            # Persist a fresh risk rejection in its own write transaction.
-            with self.session_factory() as s:
-                order = s.get(Order, order_id)
-                assert order is not None
-                if order.status != OrderStatus.APPROVAL_RECORDED.value:
-                    return {
-                        "order_id": order_id,
-                        "status": order.status,
-                        "executed": False,
-                        "error": "order not in PROPOSED state (already decided?)",
-                    }
-                OrderStateMachine.transition(order, OrderStatus.REJECTED)
-                s.add(
-                    RiskEvent(
-                        order_id=order.id,
-                        event_type="rejection",
-                        reason="execution-time: " + result.reason_text(),
-                    )
-                )
-                s.commit()
-                return {
-                    "order_id": order_id,
-                    "status": OrderStatus.REJECTED.value,
-                    "executed": False,
-                    "risk_reasons": result.reasons,
-                }
-
-        # Claim submission durably before broker I/O. A retry cannot claim this
-        # order again, and any subsequent error is persisted as indeterminate.
-        if not repository.claim_submission(order_id, utcnow()):
-            with self.session_factory() as s:
-                current = s.get(Order, order_id)
-                return {
-                    "order_id": order_id,
-                    "status": current.status if current is not None else None,
-                    "executed": False,
-                    "error": "order not in PROPOSED state (already decided?)",
-                }
-
-        try:
-            broker_result = self.broker.submit_order(order_req)
-            if not repository.record_submission(
-                order_id, broker_result.broker_order_id, utcnow()
-            ):
-                raise RuntimeError("could not persist broker acceptance")
-        except Exception as exc:
-            repository.mark_acceptance_unknown(order_id, type(exc).__name__, utcnow())
-            raise
+        result = self.order_submission.submit(order_id)
         return {
             "order_id": order_id,
-            "status": OrderStatus.SUBMITTED.value,
-            "executed": True,
-            "broker_order_id": broker_result.broker_order_id,
+            "status": result.status.value,
+            "executed": result.status
+            in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
+            "broker_order_id": result.broker_order_id,
+            "risk_reasons": list(result.risk_reasons),
         }
 
     def submit_bracket_order(
         self, order_req: OrderRequest, take_profit, stop_loss
     ) -> dict[str, Any]:
-        """Risk-check then submit a server-side bracket (D4). The entry still passes
-        the risk engine; the broker holds the OCO exit so it survives our downtime."""
+        """Persist, approve, and submit a bracket through the same durable outbox."""
         if not hasattr(self.broker, "submit_bracket"):
             return {"error": "broker does not support bracket orders", "executed": False}
-        ac = self._asset_class(order_req.ticker)
+        try:
+            take_profit = Decimal(str(take_profit))
+            stop_loss = Decimal(str(stop_loss))
+        except Exception as exc:
+            raise ValueError("bracket prices must be valid decimals") from exc
+        if take_profit <= 0 or stop_loss <= 0:
+            raise ValueError("bracket prices must be positive")
         with self.session_factory() as s:
             existing = s.execute(
                 select(Order).where(
@@ -539,30 +408,8 @@ class TradingService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                if existing.broker_order_id:
-                    return {
-                        "executed": True,
-                        "bracket": True,
-                        "order_id": existing.id,
-                        "broker_order_id": existing.broker_order_id,
-                    }
                 order_id = existing.id
             else:
-                snapshot = self.assemble_snapshot(s, [order_req.ticker], ac)
-                result = self._risk_for(ac).check(
-                    order_req, snapshot,
-                    killswitch_tripped=KillSwitch.is_tripped(s, ac),
-                    market_open=self._clock_for(ac).is_open(),
-                )
-                if result.rejected:
-                    return {
-                        "executed": False,
-                        "status": "rejected",
-                        "risk_reasons": result.reasons,
-                    }
-                # Durable outbox: persist the stable idempotency key BEFORE broker
-                # I/O. SUBMITTED with no broker id means acceptance is unknown and
-                # retrying this same request is required.
                 order = Order(
                     idempotency_key=order_req.idempotency_key,
                     ticker=order_req.ticker,
@@ -571,43 +418,51 @@ class TradingService:
                     qty=order_req.qty,
                     notional=order_req.notional,
                     limit_price=order_req.limit_price,
-                    status=OrderStatus.SUBMITTED.value,
+                    status=OrderStatus.PROPOSED.value,
+                    submission_kind="bracket",
+                    submission_payload_json=json.dumps(
+                        {"take_profit": str(take_profit), "stop_loss": str(stop_loss)}
+                    ),
                 )
                 s.add(order)
-                try:
-                    s.commit()
-                    order_id = order.id
-                except IntegrityError:
-                    s.rollback()
-                    concurrent = s.execute(
-                        select(Order).where(
-                            Order.idempotency_key == order_req.idempotency_key
-                        )
-                    ).scalar_one()
-                    if concurrent.broker_order_id:
-                        return {
-                            "executed": True,
-                            "bracket": True,
-                            "order_id": concurrent.id,
-                            "broker_order_id": concurrent.broker_order_id,
-                        }
-                    order_id = concurrent.id
+                risk_cfg = self.config.crypto_risk if self._asset_class(order_req.ticker) is AssetClass.CRYPTO else self.config.risk
+                ttl = (risk_cfg or self.config.risk).proposal_ttl_minutes
+                s.flush()
+                s.add(
+                    Proposal(
+                        order_id=order.id,
+                        ttl_minutes=ttl,
+                        expires_at=utcnow() + timedelta(minutes=ttl),
+                    )
+                )
+                s.commit()
+                order_id = order.id
 
-        broker_result = self.broker.submit_bracket(
-            order_req, take_profit, stop_loss
-        )
-        with self.session_factory() as s:
-            order = s.get(Order, order_id)
-            if order is None:
-                raise RuntimeError("durable bracket outbox row disappeared")
-            order.broker_order_id = broker_result.broker_order_id
-            s.commit()
-            return {
-                "executed": True,
-                "bracket": True,
-                "order_id": order.id,
-                "broker_order_id": order.broker_order_id,
-            }
+        with self.session_factory() as session:
+            current = session.get(Order, order_id)
+            assert current is not None
+            current_status = OrderStatus(current.status)
+        if current_status is OrderStatus.PROPOSED:
+            approval = self.order_application.approve(
+                ApprovalCommand(
+                    order_id,
+                    "operator:plan",
+                    "approved bracket plan",
+                    utcnow(),
+                    f"bracket-{order_req.idempotency_key}",
+                )
+            )
+            current_status = approval.status
+        result = self.order_submission.submit(order_id)
+        return {
+            "executed": result.status
+            in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
+            "bracket": True,
+            "order_id": order_id,
+            "status": result.status.value,
+            "broker_order_id": result.broker_order_id,
+            "risk_reasons": list(result.risk_reasons),
+        }
 
     def reject_order(self, order_id: int) -> dict[str, Any]:
         with self.session_factory() as s:

@@ -1,0 +1,154 @@
+"""Durable, one-way submission orchestration for approved order outbox rows."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Callable
+
+from sqlalchemy.orm import Session, sessionmaker
+
+from trading_assistant.broker.base import BrokerSubmissionRejected
+from trading_assistant.broker.models import OrderRequest, OrderSide, OrderStatus, OrderType
+from trading_assistant.db.models import Order
+
+from .repository import OrderRepository
+
+
+@dataclass(frozen=True)
+class SubmissionResult:
+    order_id: int
+    status: OrderStatus
+    broker_order_id: str | None = None
+    risk_reasons: tuple[str, ...] = ()
+
+
+def order_to_request(order: Order) -> OrderRequest:
+    """Construct the broker request solely from validated persisted columns."""
+    return OrderRequest(
+        ticker=order.ticker,
+        side=OrderSide(order.side),
+        order_type=OrderType(order.order_type),
+        idempotency_key=order.idempotency_key,
+        qty=order.qty,
+        notional=order.notional,
+        limit_price=order.limit_price,
+    )
+
+
+def bracket_prices(order: Order) -> tuple[Decimal, Decimal]:
+    """Parse the small, validated bracket payload; never execute stored data."""
+    try:
+        payload = json.loads(order.submission_payload_json)
+        if not isinstance(payload, dict) or set(payload) != {"take_profit", "stop_loss"}:
+            raise ValueError("invalid bracket submission payload")
+        take_profit = Decimal(str(payload["take_profit"]))
+        stop_loss = Decimal(str(payload["stop_loss"]))
+    except (json.JSONDecodeError, InvalidOperation, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid bracket submission payload") from exc
+    if take_profit <= 0 or stop_loss <= 0:
+        raise ValueError("bracket prices must be positive")
+    return take_profit, stop_loss
+
+
+class OrderSubmissionService:
+    def __init__(
+        self,
+        repository: OrderRepository,
+        session_factory: sessionmaker[Session],
+        broker,
+        snapshot_service,
+        risk_for_symbol: Callable[[str], object],
+        clock_for_symbol: Callable[[str], object],
+        killswitch_for_symbol: Callable[[str], bool],
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self.repository = repository
+        self.session_factory = session_factory
+        self.broker = broker
+        self.snapshot_service = snapshot_service
+        self.risk_for_symbol = risk_for_symbol
+        self.clock_for_symbol = clock_for_symbol
+        self.killswitch_for_symbol = killswitch_for_symbol
+        self.now = now
+
+    def submit(self, order_id: int) -> SubmissionResult:
+        now = self.now()
+        with self.session_factory() as session:
+            order = session.get(Order, order_id)
+            if order is None:
+                raise KeyError(f"order {order_id} not found")
+            current = OrderStatus(order.status)
+            if current is OrderStatus.ACCEPTANCE_UNKNOWN:
+                return SubmissionResult(order_id, current, order.broker_order_id)
+            if current is not OrderStatus.APPROVAL_RECORDED:
+                return SubmissionResult(order_id, current, order.broker_order_id)
+            expired = order.proposal is not None and order.proposal.is_expired(now)
+            request = order_to_request(order)
+            submission_kind = order.submission_kind
+            payload_order = order
+            session.expunge(payload_order)
+        if expired:
+            self.repository.expire_approved(order_id, now)
+            return SubmissionResult(order_id, OrderStatus.EXPIRED)
+        bracket_payload = (
+            bracket_prices(payload_order) if submission_kind == "bracket" else None
+        )
+
+        # All provider reads and deterministic risk checks precede the durable
+        # claim. Their failures leave APPROVAL_RECORDED and are safely retryable.
+        snapshot = self.snapshot_service.assemble_for_execution(
+            request.ticker, exclude_order_id=order_id
+        )
+        risk = self.risk_for_symbol(request.ticker).check(
+            request,
+            snapshot,
+            killswitch_tripped=self.killswitch_for_symbol(request.ticker),
+            market_open=self.clock_for_symbol(request.ticker).is_open(),
+        )
+        if risk.rejected:
+            reasons = tuple(risk.reasons)
+            self.repository.record_pre_submission_rejection(order_id, reasons, now)
+            return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
+
+        if not self.repository.claim_submission(order_id, self.now()):
+            with self.session_factory() as session:
+                changed = session.get(Order, order_id)
+                if changed is None:
+                    raise KeyError(f"order {order_id} not found")
+                return SubmissionResult(
+                    order_id, OrderStatus(changed.status), changed.broker_order_id
+                )
+        try:
+            if submission_kind == "bracket":
+                assert bracket_payload is not None
+                take_profit, stop_loss = bracket_payload
+                broker_result = self.broker.submit_bracket(request, take_profit, stop_loss)
+            else:
+                broker_result = self.broker.submit_order(request)
+        except BrokerSubmissionRejected as exc:
+            self.repository.record_submission_result(
+                order_id, OrderStatus.REJECTED, None, exc.stable_code, self.now()
+            )
+            return SubmissionResult(order_id, OrderStatus.REJECTED)
+        except Exception as exc:
+            self.repository.record_submission_result(
+                order_id,
+                OrderStatus.ACCEPTANCE_UNKNOWN,
+                None,
+                type(exc).__name__,
+                self.now(),
+            )
+            return SubmissionResult(order_id, OrderStatus.ACCEPTANCE_UNKNOWN)
+        status = (
+            broker_result.status
+            if broker_result.status
+            in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
+            else OrderStatus.SUBMITTED
+        )
+        self.repository.record_submission_result(
+            order_id, status, broker_result.broker_order_id, "", self.now()
+        )
+        return SubmissionResult(order_id, status, broker_result.broker_order_id)

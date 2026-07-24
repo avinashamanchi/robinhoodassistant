@@ -8,6 +8,18 @@ from typing import Optional
 from .models import Account, OrderRequest, OrderResult, Position, Quote
 
 
+class BrokerSubmissionRejected(RuntimeError):
+    """Broker definitively rejected a request without accepting an order."""
+
+    def __init__(self, stable_code: str, message: str = "") -> None:
+        super().__init__(message or stable_code)
+        self.stable_code = stable_code
+
+
+class BrokerAcceptanceUnknown(RuntimeError):
+    """A request may have been sent, but broker acceptance is unproven."""
+
+
 class BrokerClient(abc.ABC):
     """The single seam the rest of the system talks to for market/account/order I/O.
 
@@ -27,6 +39,9 @@ class BrokerClient(abc.ABC):
 
     @abc.abstractmethod
     def submit_order(self, order: OrderRequest) -> OrderResult: ...
+
+    @abc.abstractmethod
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None: ...
 
     @abc.abstractmethod
     def get_order_status(self, order_id: str) -> OrderResult: ...

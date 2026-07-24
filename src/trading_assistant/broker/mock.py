@@ -91,6 +91,9 @@ class MockBroker(BrokerClient):
         self._orders_by_id[broker_id] = result
         return result
 
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
+        return self._orders_by_key.get(client_order_id)
+
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         result = self.submit_order(order)
         self.brackets.append(

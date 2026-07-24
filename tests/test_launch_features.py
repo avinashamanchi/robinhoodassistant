@@ -191,18 +191,20 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         limit_price=Decimal("100"),
     )
 
-    with pytest.raises(ConnectionError):
-        svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+    first = svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+    assert first["executed"] is False
+    assert first["status"] == "acceptance_unknown"
     with svc.session_factory() as session:
         stored = session.execute(
             select(Order).where(Order.idempotency_key == "stable-plan-bracket")
         ).scalar_one()
-        assert stored.status == "submitted"
+        assert stored.status == "acceptance_unknown"
         assert stored.broker_order_id is None
 
     result = svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
 
-    assert result["executed"] is True
+    assert result["executed"] is False
+    assert result["status"] == "acceptance_unknown"
     assert len(broker._orders_by_key) == 1
 
 

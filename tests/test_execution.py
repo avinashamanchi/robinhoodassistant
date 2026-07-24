@@ -140,13 +140,14 @@ def test_accept_then_disconnect_records_unknown_without_resubmission(make_servic
     svc = make_service(broker=broker)
     order_id = _propose(svc)["order_id"]
 
-    with pytest.raises(ConnectionError, match="response lost"):
-        _approve(svc, order_id, "acceptance-loss drill")
+    first = _approve(svc, order_id, "acceptance-loss drill")
+    assert first["executed"] is False
+    assert first["status"] == OrderStatus.ACCEPTANCE_UNKNOWN.value
 
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
-        assert order.acceptance_state == "unknown"
+        assert order.acceptance_state == OrderStatus.ACCEPTANCE_UNKNOWN.value
         assert order.submission_attempt == 1
     replay = _approve(svc, order_id, "must not resubmit unknown acceptance")
     assert replay["executed"] is False

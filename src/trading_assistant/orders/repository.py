@@ -9,7 +9,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import AuditEvent, Order
+from trading_assistant.db.models import AuditEvent, Order, RiskEvent
 
 
 class OrderRepository:
@@ -71,6 +71,7 @@ class OrderRepository:
                     status=OrderStatus.SUBMITTING.value,
                     submission_attempt=Order.submission_attempt + 1,
                     submission_started_at=now,
+                    acceptance_state="pending",
                     updated_at=now,
                     version=Order.version + 1,
                 )
@@ -113,10 +114,23 @@ class OrderRepository:
             current = session.get(Order, order_id)
             return OrderStatus(current.status) if current is not None else None
 
-    def record_submission(
-        self, order_id: int, broker_order_id: str | None, now: datetime
-    ) -> bool:
-        """Persist a definitive broker acceptance after the submission claim."""
+    def record_submission_result(
+        self,
+        order_id: int,
+        status: OrderStatus,
+        broker_order_id: str | None,
+        error_code: str,
+        now: datetime,
+    ) -> None:
+        """Record the single definitive or indeterminate post-send outcome."""
+        if status not in {
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.ACCEPTANCE_UNKNOWN,
+            OrderStatus.REJECTED,
+        }:
+            raise ValueError(f"invalid submission result {status.value}")
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -125,40 +139,62 @@ class OrderRepository:
                     Order.status == OrderStatus.SUBMITTING.value,
                 )
                 .values(
-                    status=OrderStatus.SUBMITTED.value,
+                    status=status.value,
                     broker_order_id=broker_order_id,
-                    acceptance_state="accepted",
-                    updated_at=now,
-                    version=Order.version + 1,
-                )
-            )
-            if result.rowcount != 1:
-                session.rollback()
-                return False
-            session.commit()
-            return True
-
-    def mark_acceptance_unknown(
-        self, order_id: int, error_code: str, now: datetime
-    ) -> bool:
-        """Persist an indeterminate broker result without ever retrying it."""
-        with self.session_factory() as session:
-            result = session.execute(
-                update(Order)
-                .where(
-                    Order.id == order_id,
-                    Order.status == OrderStatus.SUBMITTING.value,
-                )
-                .values(
-                    status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                    acceptance_state="unknown",
+                    acceptance_state=status.value,
                     last_error_code=error_code,
                     updated_at=now,
                     version=Order.version + 1,
                 )
             )
             if result.rowcount != 1:
-                session.rollback()
-                return False
+                raise RuntimeError(f"order {order_id} lost submission claim")
             session.commit()
-            return True
+
+    def record_pre_submission_rejection(
+        self, order_id: int, reasons: tuple[str, ...], now: datetime
+    ) -> None:
+        """Persist a fresh deterministic risk rejection before a broker send."""
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status == OrderStatus.APPROVAL_RECORDED.value,
+                )
+                .values(
+                    status=OrderStatus.REJECTED.value,
+                    last_error_code="risk_rejected",
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(f"order {order_id} changed during risk rejection")
+            session.add(
+                RiskEvent(
+                    order_id=order_id,
+                    event_type="rejection",
+                    reason="execution-time: " + "; ".join(reasons),
+                )
+            )
+            session.commit()
+
+    def expire_approved(self, order_id: int, now: datetime) -> None:
+        """Expire a still-unclaimed approval before it can reach the broker."""
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status == OrderStatus.APPROVAL_RECORDED.value,
+                )
+                .values(
+                    status=OrderStatus.EXPIRED.value,
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(f"order {order_id} changed during expiry")
+            session.commit()
