@@ -376,11 +376,18 @@ class TradingService:
             limit_price=order.limit_price,
         )
 
-    def approve_order(self, order_id: int) -> dict[str, Any]:
+    def approve_order(
+        self,
+        order_id: int,
+        *,
+        actor: str = "operator:legacy-service",
+        reason: str = "legacy service approval",
+        request_id: str = "",
+    ) -> dict[str, Any]:
         """Approve a PROPOSED order, re-run risk at execution moment, then submit.
 
         This is the ONLY path that trades. It: (1) refuses expired proposals (A6),
-        (2) atomically compare-and-sets PROPOSED->APPROVED (A5) — a second approver
+        (2) atomically compare-and-sets PROPOSED->APPROVAL_RECORDED (A5) — a second approver
         conflicts, (3) re-runs the full risk engine against a FRESH snapshot
         (prices move between proposal and approval), rejecting if anything now
         fails, and only then (4) submits to the broker.
@@ -407,7 +414,13 @@ class TradingService:
 
             # A5: atomic exactly-once approval.
             try:
-                approve_proposed(s, order_id)
+                approve_proposed(
+                    s,
+                    order_id,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id or uuid.uuid4().hex,
+                )
             except ApprovalConflict:
                 s.rollback()
                 current = s.get(Order, order_id)
@@ -417,7 +430,7 @@ class TradingService:
                     "executed": False,
                     "error": "order not in PROPOSED state (already decided?)",
                 }
-            s.refresh(order)  # pick up status = APPROVED from the CAS UPDATE
+            s.refresh(order)  # pick up status = APPROVAL_RECORDED from the CAS UPDATE
 
             # Execution-time risk re-check against a fresh snapshot, routed by class.
             ac = self._asset_class(order.ticker)
@@ -449,6 +462,7 @@ class TradingService:
                 }
 
             # Passed final risk check -> submit to broker.
+            OrderStateMachine.transition(order, OrderStatus.SUBMITTING)
             broker_result = self.broker.submit_order(order_req)
             order.broker_order_id = broker_result.broker_order_id
             OrderStateMachine.transition(order, OrderStatus.SUBMITTED)

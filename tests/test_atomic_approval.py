@@ -9,6 +9,7 @@ import pytest
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import (
     ApprovalConflict,
+    AuditEvent,
     Order,
     OrderStateMachine,
     Proposal,
@@ -40,21 +41,25 @@ def _make_proposed(session_factory) -> int:
 def test_first_approval_succeeds(session_factory):
     oid = _make_proposed(session_factory)
     with session_factory() as s:
-        approve_proposed(s, oid)
+        approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
         s.commit()
     with session_factory() as s:
-        assert s.get(Order, oid).status == OrderStatus.APPROVED.value
+        order = s.get(Order, oid)
+        assert order.status == OrderStatus.APPROVAL_RECORDED.value
+        assert order.approval_actor == "operator:avi"
+        assert order.approval_reason == "reviewed"
+        assert s.query(AuditEvent).filter_by(action="order.approve").count() == 1
 
 
 def test_second_approval_conflicts(session_factory):
     oid = _make_proposed(session_factory)
     with session_factory() as s:
-        approve_proposed(s, oid)
+        approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
         s.commit()
     # A second approver sees the row is no longer PROPOSED -> conflict (would be 409).
     with session_factory() as s:
         with pytest.raises(ApprovalConflict):
-            approve_proposed(s, oid)
+            approve_proposed(s, oid, actor="operator:avi", reason="retry")
 
 
 def test_cannot_approve_rejected_order(session_factory):
@@ -65,4 +70,12 @@ def test_cannot_approve_rejected_order(session_factory):
         s.commit()
     with session_factory() as s:
         with pytest.raises(ApprovalConflict):
-            approve_proposed(s, oid)
+            approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
+
+
+@pytest.mark.parametrize("actor,reason", [("", "reviewed"), ("operator:avi", "")])
+def test_approval_identity_is_required(session_factory, actor, reason):
+    oid = _make_proposed(session_factory)
+    with session_factory() as s:
+        with pytest.raises(ValueError, match="actor and reason"):
+            approve_proposed(s, oid, actor=actor, reason=reason)

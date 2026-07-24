@@ -87,7 +87,7 @@ _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
         }
     ),
     OrderStatus.APPROVAL_RECORDED: frozenset(
-        {OrderStatus.SUBMITTING, OrderStatus.EXPIRED}
+        {OrderStatus.SUBMITTING, OrderStatus.EXPIRED, OrderStatus.REJECTED}
     ),
     OrderStatus.SUBMITTING: frozenset(
         {
@@ -107,11 +107,8 @@ _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.CANCELED,
         }
     ),
-    # Compatibility for orders approved by pre-outbox callers. New approval
-    # code uses APPROVAL_RECORDED and never transitions into APPROVED.
-    OrderStatus.APPROVED: frozenset(
-        {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELED}
-    ),
+    # Legacy deserialization only. No runtime transition may enter or leave it.
+    OrderStatus.APPROVED: frozenset(),
     OrderStatus.SUBMITTED: frozenset(
         {
             OrderStatus.PARTIALLY_FILLED,
@@ -428,23 +425,52 @@ class KillSwitchState(Base):
 
 
 # ── Atomic approval primitive (A5) ──────────────────────────────
-def approve_proposed(session: Session, order_id: int) -> None:
-    """Transition PROPOSED -> APPROVED exactly once via compare-and-set.
+def approve_proposed(
+    session: Session,
+    order_id: int,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str = "",
+) -> None:
+    """Record one identified approval via a compare-and-set.
 
     Emits a single UPDATE guarded on the current status. If it changes zero rows
     the order was not PROPOSED (already approved/rejected/expired or gone), which
     for a concurrent second approver means a conflict -> raises ApprovalConflict.
-    The caller commits.
+    The caller commits the state transition and its audit event together.
     """
-    result = session.execute(
+    if not actor.strip() or not reason.strip():
+        raise ValueError("approval actor and reason must be non-empty")
+    idempotency_key = session.execute(
         update(Order)
         .where(Order.id == order_id, Order.status == OrderStatus.PROPOSED.value)
-        .values(status=OrderStatus.APPROVED.value, updated_at=utcnow())
-    )
-    if result.rowcount != 1:
+        .values(
+            status=OrderStatus.APPROVAL_RECORDED.value,
+            approval_actor=actor,
+            approval_reason=reason,
+            approved_at=utcnow(),
+            updated_at=utcnow(),
+            version=Order.version + 1,
+        )
+        .returning(Order.idempotency_key)
+    ).scalar_one_or_none()
+    if idempotency_key is None:
         raise ApprovalConflict(
             f"order {order_id} was not in PROPOSED state (already decided?)"
         )
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action="order.approve",
+            target_type="order",
+            target_id=str(order_id),
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            result_code=OrderStatus.APPROVAL_RECORDED.value,
+        )
+    )
 
 
 def create_all(engine) -> None:

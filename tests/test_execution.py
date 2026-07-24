@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from trading_assistant.db.models import Order, Proposal, utcnow
+from trading_assistant.db.models import AuditEvent, Order, Proposal, utcnow
 from trading_assistant.risk.killswitch import KillSwitch
 
 
@@ -33,6 +33,11 @@ def test_approve_runs_final_risk_check_then_submits(make_service):
     assert result["status"] == "submitted"
     assert result["broker_order_id"] is not None
     assert svc.broker.submit_calls == 1  # exactly one broker submit
+    with svc.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.approval_actor == "operator:legacy-service"
+        assert order.approval_reason == "legacy service approval"
+        assert session.query(AuditEvent).filter_by(action="order.approve").count() == 1
 
 
 def test_killswitch_blocks_execution(make_service):

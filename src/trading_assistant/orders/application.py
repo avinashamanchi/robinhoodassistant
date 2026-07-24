@@ -48,10 +48,14 @@ class OrderApplicationService:
             if order is None:
                 raise KeyError(f"order {command.order_id} not found")
             if order.proposal is not None and order.proposal.is_expired(command.now):
-                order.status = OrderStatus.EXPIRED.value
-                order.updated_at = command.now
-                session.commit()
-                return ApprovalResult(order.id, OrderStatus.EXPIRED)
+                status = self.repository.expire_if_eligible(order.id, command.now)
+                if status is OrderStatus.EXPIRED:
+                    return ApprovalResult(order.id, status)
+                if status is None:
+                    raise KeyError(f"order {command.order_id} not found")
+                raise ApprovalConflict(
+                    f"order {command.order_id} approval already consumed ({status.value})"
+                )
 
         request_id = command.request_id or uuid4().hex
         if not self.repository.record_approval(

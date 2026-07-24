@@ -31,7 +31,6 @@ LEGAL = [
     (S.ACCEPTANCE_UNKNOWN, S.FILLED),
     (S.ACCEPTANCE_UNKNOWN, S.REJECTED),
     (S.ACCEPTANCE_UNKNOWN, S.CANCELED),
-    (S.APPROVED, S.SUBMITTED),  # legacy compatibility only
     (S.SUBMITTED, S.PARTIALLY_FILLED),
     (S.SUBMITTED, S.FILLED),
     (S.SUBMITTED, S.CANCELED),
@@ -45,6 +44,7 @@ ILLEGAL = [
     (S.PROPOSED, S.SUBMITTED),      # cannot skip approval
     (S.PROPOSED, S.FILLED),
     (S.APPROVAL_RECORDED, S.FILLED),  # must claim submission first
+    (S.APPROVED, S.SUBMITTED),  # legacy status is deserialization-only
     (S.FILLED, S.CANCELED),         # terminal
     (S.EXPIRED, S.APPROVED),        # terminal
     (S.REJECTED, S.APPROVED),       # terminal
@@ -80,3 +80,8 @@ def test_illegal_transitions_raise(current, new):
 def test_terminal_states_have_no_exits(terminal):
     for target in OrderStatus:
         assert not OrderStateMachine.can_transition(terminal, target)
+
+
+def test_legacy_approved_has_no_runtime_transitions():
+    for target in OrderStatus:
+        assert not OrderStateMachine.can_transition(OrderStatus.APPROVED, target)

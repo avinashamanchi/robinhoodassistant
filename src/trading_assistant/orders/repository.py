@@ -80,3 +80,35 @@ class OrderRepository:
                 return False
             session.commit()
             return True
+
+    def expire_if_eligible(self, order_id: int, now: datetime) -> OrderStatus | None:
+        """Expire only a still-pending approval and return the resulting status.
+
+        A failed compare-and-set returns the current status so a retry cannot
+        overwrite a submission claim that won the race.
+        """
+        with self.session_factory() as session:
+            status = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status.in_(
+                        (
+                            OrderStatus.PROPOSED.value,
+                            OrderStatus.APPROVAL_RECORDED.value,
+                        )
+                    ),
+                )
+                .values(
+                    status=OrderStatus.EXPIRED.value,
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+                .returning(Order.status)
+            ).scalar_one_or_none()
+            if status is not None:
+                session.commit()
+                return OrderStatus(status)
+            session.rollback()
+            current = session.get(Order, order_id)
+            return OrderStatus(current.status) if current is not None else None

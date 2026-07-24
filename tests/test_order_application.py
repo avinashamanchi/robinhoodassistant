@@ -112,3 +112,27 @@ def test_submission_claim_succeeds_once_after_approval(make_service):
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.SUBMITTING.value
         assert order.submission_attempt == 1
+
+
+def test_expired_approval_retry_does_not_overwrite_submission_claim(make_service):
+    service, order_id = _proposed_order_id(make_service)
+    app = OrderApplicationService(service.session_factory)
+    approved_at = datetime.now(timezone.utc)
+    command = ApprovalCommand(order_id, "operator:avi", "reviewed", approved_at)
+    app.approve(command)
+    assert app.repository.claim_submission(order_id, approved_at) is True
+
+    with pytest.raises(ApprovalConflict):
+        app.approve(
+            ApprovalCommand(
+                order_id,
+                "operator:avi",
+                "retry after submission claim",
+                approved_at.replace(year=approved_at.year + 1),
+            )
+        )
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.SUBMITTING.value
+        assert order.version == 2
