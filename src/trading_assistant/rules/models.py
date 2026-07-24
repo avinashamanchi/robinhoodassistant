@@ -109,6 +109,15 @@ class RuleCommand(BaseModel):
             raise ValueError("group_key must be non-empty")
         return normalized
 
+    @field_validator("pre_approved")
+    @classmethod
+    def reject_preapproval(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "pre_approved=true is disabled while global auto_execute=false"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_condition_matches_kind(self) -> "RuleCommand":
         expected = {

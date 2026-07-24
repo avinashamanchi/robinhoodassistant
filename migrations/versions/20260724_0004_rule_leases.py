@@ -22,6 +22,7 @@ depends_on = None
 
 _KINDS = {"price", "entry", "target", "stop", "trailing", "time"}
 _NONTERMINAL = {"active", "processing"}
+_WINNING_TERMINAL = {"triggered", "failed"}
 
 
 def _positive(value) -> bool:
@@ -146,6 +147,14 @@ def _converted(row) -> tuple[str, str] | None:
         return None
 
 
+def _group_key(row) -> str:
+    return (
+        f"legacy-plan-{row.plan_id}"
+        if row.plan_id is not None
+        else f"legacy-rule-{row.id}"
+    )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     legacy_rows = bind.execute(
@@ -158,6 +167,18 @@ def upgrade() -> None:
 
     # Validate every resumable row before SQLite's non-transactional DDL begins.
     conversions = {row.id: _converted(row) for row in legacy_rows}
+    grouped: dict[str, list] = {}
+    for row in legacy_rows:
+        grouped.setdefault(_group_key(row), []).append(row)
+
+    terminal_winners = {}
+    for group_key, rows in grouped.items():
+        winners = [row for row in rows if row.state in _WINNING_TERMINAL]
+        if len(winners) > 1:
+            raise RuntimeError(
+                f"rule group {group_key} has multiple terminal winners"
+            )
+        terminal_winners[group_key] = winners[0] if winners else None
 
     op.create_table(
         "rule_groups",
@@ -220,23 +241,12 @@ def upgrade() -> None:
         )
 
     now = datetime.now(timezone.utc)
-    grouped: dict[str, list] = {}
-    for row in legacy_rows:
-        key = (
-            f"legacy-plan-{row.plan_id}"
-            if row.plan_id is not None
-            else f"legacy-rule-{row.id}"
-        )
-        grouped.setdefault(key, []).append(row)
 
     rule_to_group: dict[int, int] = {}
     for group_key, rows in grouped.items():
-        triggered = next((row for row in rows if row.state == "triggered"), None)
-        failed = next((row for row in rows if row.state == "failed"), None)
-        if triggered is not None:
-            state, terminal_rule_id = "triggered", triggered.id
-        elif failed is not None:
-            state, terminal_rule_id = "failed", failed.id
+        winner = terminal_winners[group_key]
+        if winner is not None:
+            state, terminal_rule_id = winner.state, winner.id
         elif any(row.state in _NONTERMINAL for row in rows):
             state, terminal_rule_id = "active", None
         else:
@@ -267,10 +277,22 @@ def upgrade() -> None:
 
     for row in legacy_rows:
         converted = conversions[row.id]
+        winner = terminal_winners[_group_key(row)]
+        state = (
+            "canceled"
+            if winner is not None
+            and row.id != winner.id
+            and row.state in _NONTERMINAL
+            else row.state
+        )
         values = {
             "id": row.id,
             "group_id": rule_to_group[row.id],
             "payload_version": 1 if converted is not None else 0,
+            "state": state,
+            "pre_approved": (
+                False if row.state in _NONTERMINAL else row.pre_approved
+            ),
             "condition_json": (
                 converted[0] if converted is not None else row.condition_json
             ),
@@ -282,6 +304,7 @@ def upgrade() -> None:
             sa.text(
                 "UPDATE rules SET group_id=:group_id, "
                 "payload_version=:payload_version, "
+                "state=:state, pre_approved=:pre_approved, "
                 "condition_json=:condition_json, action_json=:action_json "
                 "WHERE id=:id"
             ),

@@ -144,7 +144,7 @@ def test_digest_has_sections(make_service):
 
 
 # ── D4 bracket orders ───────────────────────────────────────────
-def test_single_target_plan_uses_bracket(make_service):
+def test_explicit_bracket_preference_still_creates_human_gated_rules(make_service):
     svc = make_service()
     svc.config = svc.config.model_copy(
         update={
@@ -159,16 +159,18 @@ def test_single_target_plan_uses_bracket(make_service):
         pid, actor="operator:avi", reason="reviewed single-target plan"
     )
 
-    assert res["bracket"] is not None and res["bracket"]["bracket"] is True
-    assert len(svc.broker.brackets) == 1                    # server-side OCO submitted
+    assert res["status"] == "approved"
+    assert res["bracket"] is None
+    assert svc.broker.brackets == []
+    assert svc.broker.submit_calls == 0
     with svc.session_factory() as s:
-        kinds = {r.kind for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()}
-        bracket_order = s.execute(
+        rules = s.execute(select(Rule).where(Rule.plan_id == pid)).scalars().all()
+        bracket_orders = s.execute(
             select(Order).where(Order.idempotency_key == f"plan-{pid}-bracket-entry")
-        ).scalar_one()
-    assert not ({"entry", "target", "stop"} & kinds)        # handled by the bracket
-    assert bracket_order.approval_actor == "operator:avi"
-    assert bracket_order.approval_reason == "reviewed single-target plan"
+        ).scalars().all()
+    assert {"entry", "target", "stop"} <= {rule.kind for rule in rules}
+    assert all(rule.state == "active" and not rule.pre_approved for rule in rules)
+    assert bracket_orders == []
 
 
 def test_bracket_order_is_persisted_before_broker_response_loss(make_service):

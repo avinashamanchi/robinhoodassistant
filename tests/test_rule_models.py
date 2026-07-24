@@ -162,11 +162,13 @@ def test_condition_kind_mismatch_is_rejected():
         _command(kind="time")
 
 
-def test_preapproval_is_typed_but_rejected_at_application_boundary(make_service):
+def test_preapproval_is_rejected_by_typed_model_and_application_boundary(make_service):
     svc = make_service()
-    command = _command(pre_approved=True)
 
-    assert command.pre_approved is True
+    with pytest.raises(ValidationError, match="pre_approved"):
+        _command(pre_approved=True)
+
+    command = _command().model_copy(update={"pre_approved": True})
     with pytest.raises(ValueError, match="pre_approved"):
         svc.rule_application.create_rule(command)
 

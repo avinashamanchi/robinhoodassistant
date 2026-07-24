@@ -19,7 +19,6 @@ from typing import Any, Callable, Optional
 from sqlalchemy import select, update
 
 from ..assets import AssetClass
-from ..broker.models import OrderRequest, OrderSide, OrderType
 from ..config import live_trading_enabled
 from ..db.models import Rule, RuleGroup, TradePlanRow, utcnow
 from ..rules.models import RuleCommand
@@ -127,48 +126,10 @@ class PlanningService:
             s.refresh(row)
 
             try:
-                # D4: single-tranche + single-target plans go out as a server-side
-                # bracket (survives our downtime); the ladder/trailing/time cases stay
-                # daemon-managed rules.
+                # Automatic brackets remain disabled in this safety phase even
+                # when an older config file explicitly prefers them.
                 bracket = None
-                eligible = (
-                    self.service.config.execution.prefer_bracket_orders
-                    and len(plan.entry_plan.tranches) == 1
-                    and len(plan.exit_plan.targets) == 1
-                    and hasattr(self.service.broker, "submit_bracket")
-                    and sized["tranches"]
-                    and Decimal(sized["tranches"][0]["shares"]) > 0
-                )
-                if eligible:
-                    tr = sized["tranches"][0]
-                    is_long = plan.action is PlanAction.BUY
-                    order_req = OrderRequest(
-                        ticker=plan.symbol,
-                        side=OrderSide.BUY if is_long else OrderSide.SELL,
-                        order_type=OrderType.LIMIT,
-                        idempotency_key=f"plan-{plan_id}-bracket-entry",
-                        qty=Decimal(tr["shares"]),
-                        limit_price=Decimal(str(tr["price_level"])),
-                    )
-                    bracket = self.service.submit_bracket_order(
-                        order_req,
-                        plan.exit_plan.targets[0].price_level,
-                        plan.exit_plan.stop,
-                        actor=actor,
-                        reason=reason,
-                    )
-                    if not bracket.get("executed"):
-                        row.status = "rejected"
-                        s.commit()
-                        return {
-                            "plan_id": plan_id,
-                            "status": "rejected",
-                            "error": "bracket entry rejected",
-                            "bracket": bracket,
-                        }
-                    rules = self._decompose(plan, sized, plan_id, exits_only=True)
-                else:
-                    rules = self._decompose(plan, sized, plan_id)
+                rules = self._decompose(plan, sized, plan_id)
                 self.service.rule_application.persist_commands(
                     s, rules, plan_id=plan_id
                 )
@@ -197,7 +158,7 @@ class PlanningService:
                 raise
 
     def _decompose(
-        self, plan: TradePlan, sized: dict, plan_id: int, exits_only: bool = False
+        self, plan: TradePlan, sized: dict, plan_id: int
     ) -> list[RuleCommand]:
         symbol = plan.symbol
         is_long = plan.action is PlanAction.BUY
@@ -207,8 +168,7 @@ class PlanningService:
         rules: list[RuleCommand] = []
         group_key = f"plan-{plan_id}"
 
-        # When a bracket handles entry+target+stop, only trailing/time remain.
-        for t in ([] if exits_only else sized["tranches"]):
+        for t in sized["tranches"]:
             shares = Decimal(t["shares"])
             if shares <= 0:
                 continue
@@ -233,50 +193,49 @@ class PlanningService:
                 )
             )
 
-        if not exits_only:
-            for tgt in plan.exit_plan.targets:
-                qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
-                if qty <= 0:
-                    continue
-                rules.append(
-                    RuleCommand.model_validate(
-                        {
-                            "ticker": symbol,
-                            "kind": "target",
-                            "condition": {
-                                "type": "price",
-                                "direction": "above" if is_long else "below",
-                                "price": tgt.price_level,
-                            },
-                            "action": {
-                                "side": exit_side,
-                                "order_type": "market",
-                                "qty": qty,
-                            },
-                            "group_key": group_key,
-                        }
-                    )
-                )
-
+        for tgt in plan.exit_plan.targets:
+            qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
+            if qty <= 0:
+                continue
             rules.append(
                 RuleCommand.model_validate(
                     {
                         "ticker": symbol,
-                        "kind": "stop",
+                        "kind": "target",
                         "condition": {
                             "type": "price",
-                            "direction": "below" if is_long else "above",
-                            "price": plan.exit_plan.stop,
+                            "direction": "above" if is_long else "below",
+                            "price": tgt.price_level,
                         },
                         "action": {
                             "side": exit_side,
                             "order_type": "market",
-                            "qty": total,
+                            "qty": qty,
                         },
                         "group_key": group_key,
                     }
                 )
             )
+
+        rules.append(
+            RuleCommand.model_validate(
+                {
+                    "ticker": symbol,
+                    "kind": "stop",
+                    "condition": {
+                        "type": "price",
+                        "direction": "below" if is_long else "above",
+                        "price": plan.exit_plan.stop,
+                    },
+                    "action": {
+                        "side": exit_side,
+                        "order_type": "market",
+                        "qty": total,
+                    },
+                    "group_key": group_key,
+                }
+            )
+        )
 
         if plan.exit_plan.trailing_stop_pct:
             rules.append(

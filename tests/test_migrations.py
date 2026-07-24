@@ -33,6 +33,33 @@ def _engine_at_revision(path: Path, revision: str):
     return create_db_engine(_url(path)), cfg
 
 
+def _insert_legacy_rule(
+    conn,
+    *,
+    rule_id: int,
+    plan_id: int | None,
+    state: str,
+    pre_approved: bool = False,
+) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO rules "
+            "(id,ticker,condition_json,action_json,state,created_at,plan_id,kind,"
+            "fraction,hwm,deadline,pre_approved) "
+            "VALUES (:id,'AAPL',:condition,:action,:state,CURRENT_TIMESTAMP,"
+            ":plan_id,'price',NULL,NULL,NULL,:pre_approved)"
+        ),
+        {
+            "id": rule_id,
+            "condition": json.dumps({"price_below": 100 + rule_id}),
+            "action": json.dumps({"side": "buy", "notional": "50"}),
+            "state": state,
+            "plan_id": plan_id,
+            "pre_approved": pre_approved,
+        },
+    )
+
+
 def test_fresh_database_upgrades_to_head(tmp_path):
     engine = create_db_engine(_url(tmp_path / "fresh.db"))
     upgrade(engine)
@@ -123,13 +150,13 @@ def test_rule_lease_upgrade_from_0003_maps_every_repository_legacy_shape(tmp_pat
             "AAPL",
             {"price_above": 200},
             {"side": "sell", "qty": "2"},
-            "active",
+            "processing",
             7,
             "target",
             "0.5",
             None,
             None,
-            False,
+            True,
         ),
         (
             3,
@@ -299,7 +326,9 @@ def test_rule_lease_upgrade_from_0003_maps_every_repository_legacy_shape(tmp_pat
     assert migrated[0]["plan_id"] == 7
     assert Decimal(str(migrated[1]["fraction"])) == Decimal("0.5")
     assert Decimal(str(migrated[2]["hwm"])) == Decimal("212.50")
-    assert migrated[0]["pre_approved"] == 1
+    assert migrated[0]["pre_approved"] == 0
+    assert migrated[1]["pre_approved"] == 0
+    assert migrated[2]["pre_approved"] == 1
     assert "source_rule_group_id" in proposal_columns
     assert source_rule_group_id == migrated[0]["group_id"]
     assert source_group_reconciliation_required == 1
@@ -325,6 +354,58 @@ def test_rule_lease_upgrade_aborts_on_unknown_active_shape(tmp_path):
         )
 
     with pytest.raises(RuntimeError, match="unknown active rule"):
+        command.upgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "20260724_0003"
+        )
+        assert "rule_groups" not in inspect(engine).get_table_names()
+
+
+def test_rule_lease_upgrade_cancels_resumable_siblings_of_terminal_winner(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "terminal-rule-group.db", "20260724_0003"
+    )
+    with engine.begin() as conn:
+        _insert_legacy_rule(
+            conn, rule_id=1, plan_id=9, state="triggered"
+        )
+        _insert_legacy_rule(conn, rule_id=2, plan_id=9, state="active")
+        _insert_legacy_rule(
+            conn, rule_id=3, plan_id=9, state="processing"
+        )
+
+    command.upgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        group = conn.execute(
+            text(
+                "SELECT state, terminal_rule_id FROM rule_groups "
+                "WHERE group_key='legacy-plan-9'"
+            )
+        ).mappings().one()
+        states = dict(
+            conn.execute(
+                text("SELECT id, state FROM rules ORDER BY id")
+            ).all()
+        )
+
+    assert group == {"state": "triggered", "terminal_rule_id": 1}
+    assert states == {1: "triggered", 2: "canceled", 3: "canceled"}
+
+
+def test_rule_lease_upgrade_aborts_plan_with_multiple_terminal_winners(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "ambiguous-terminal-rule-group.db", "20260724_0003"
+    )
+    with engine.begin() as conn:
+        _insert_legacy_rule(
+            conn, rule_id=1, plan_id=10, state="triggered"
+        )
+        _insert_legacy_rule(conn, rule_id=2, plan_id=10, state="failed")
+
+    with pytest.raises(RuntimeError, match="multiple terminal winners"):
         command.upgrade(cfg, "20260724_0004")
 
     with engine.connect() as conn:

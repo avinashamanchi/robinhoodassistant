@@ -186,7 +186,7 @@ def test_preapproved_database_row_is_rejected_instead_of_autoexecuted(make_servi
     acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
 
     assert acted[0]["proposal"] is None
-    assert acted[0]["error"] == "ValueError"
+    assert acted[0]["error"] == "ValidationError"
     assert svc.broker.submit_calls == 0
 
 
