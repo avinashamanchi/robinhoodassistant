@@ -40,22 +40,28 @@ def _insert_legacy_rule(
     plan_id: int | None,
     state: str,
     pre_approved: bool = False,
+    ticker: str = "AAPL",
+    fraction=None,
+    hwm=None,
 ) -> None:
     conn.execute(
         text(
             "INSERT INTO rules "
             "(id,ticker,condition_json,action_json,state,created_at,plan_id,kind,"
             "fraction,hwm,deadline,pre_approved) "
-            "VALUES (:id,'AAPL',:condition,:action,:state,CURRENT_TIMESTAMP,"
-            ":plan_id,'price',NULL,NULL,NULL,:pre_approved)"
+            "VALUES (:id,:ticker,:condition,:action,:state,CURRENT_TIMESTAMP,"
+            ":plan_id,'price',:fraction,:hwm,NULL,:pre_approved)"
         ),
         {
             "id": rule_id,
+            "ticker": ticker,
             "condition": json.dumps({"price_below": 100 + rule_id}),
             "action": json.dumps({"side": "buy", "notional": "50"}),
             "state": state,
             "plan_id": plan_id,
             "pre_approved": pre_approved,
+            "fraction": fraction,
+            "hwm": hwm,
         },
     )
 
@@ -351,6 +357,46 @@ def test_rule_lease_upgrade_aborts_on_unknown_active_shape(tmp_path):
                 "condition": json.dumps({"mystery": 1}),
                 "action": json.dumps({"side": "buy", "notional": "50"}),
             },
+        )
+
+    with pytest.raises(RuntimeError, match="unknown active rule"):
+        command.upgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "20260724_0003"
+        )
+        assert "rule_groups" not in inspect(engine).get_table_names()
+
+
+@pytest.mark.parametrize(
+    ("state", "field", "value"),
+    [
+        ("active", "ticker", "   "),
+        ("active", "ticker", "ABCDEFGHIJKLMNOPQ"),
+        ("active", "fraction", "0"),
+        ("active", "fraction", "1.01"),
+        ("active", "fraction", "NaN"),
+        ("active", "hwm", "0"),
+        ("active", "hwm", "Infinity"),
+        ("processing", "hwm", "Infinity"),
+    ],
+)
+def test_rule_lease_upgrade_aborts_invalid_resumable_scalar_before_ddl(
+    tmp_path, state, field, value
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / f"invalid-{field}-rule.db", "20260724_0003"
+    )
+    values = {"ticker": "AAPL", "fraction": None, "hwm": None}
+    values[field] = value
+    with engine.begin() as conn:
+        _insert_legacy_rule(
+            conn,
+            rule_id=1,
+            plan_id=None,
+            state=state,
+            **values,
         )
 
     with pytest.raises(RuntimeError, match="unknown active rule"):

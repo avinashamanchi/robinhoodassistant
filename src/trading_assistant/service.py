@@ -65,6 +65,15 @@ _OPEN_STATUSES = (
     OrderStatus.PARTIALLY_FILLED.value,
 )
 
+_EXIT_RESERVATION_STATUSES = (
+    OrderStatus.APPROVED.value,
+    OrderStatus.APPROVAL_RECORDED.value,
+    OrderStatus.SUBMITTING.value,
+    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+    OrderStatus.SUBMITTED.value,
+    OrderStatus.PARTIALLY_FILLED.value,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -839,13 +848,7 @@ class TradingService:
                 select(Order).where(
                     Order.ticker == symbol,
                     Order.side == side,
-                    Order.status.in_(
-                        (
-                            OrderStatus.APPROVED.value,
-                            OrderStatus.SUBMITTED.value,
-                            OrderStatus.PARTIALLY_FILLED.value,
-                        )
-                    ),
+                    Order.status.in_(_EXIT_RESERVATION_STATUSES),
                 )
             ).scalars().all()
             reserved = Decimal(0)

@@ -6,8 +6,10 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
+from trading_assistant.broker.models import OrderStatus
 from trading_assistant.daemon import rules_engine
 from trading_assistant.daemon.monitor import Monitor
 from trading_assistant.db.models import Order, Rule
@@ -134,3 +136,57 @@ def test_full_exit_is_capped_to_unreserved_live_position(make_service):
     with svc.session_factory() as session:
         proposal = session.execute(select(Order)).scalar_one()
     assert proposal.qty == Decimal("5")
+
+
+@pytest.mark.parametrize(
+    ("status", "reserved_qty", "expected_proposal_qty"),
+    [
+        (OrderStatus.APPROVAL_RECORDED.value, Decimal("3"), Decimal("2")),
+        (OrderStatus.SUBMITTING.value, Decimal("5"), None),
+        (OrderStatus.ACCEPTANCE_UNKNOWN.value, Decimal("5"), None),
+    ],
+)
+def test_full_exit_reserves_all_live_pending_same_side_orders(
+    make_service, status, reserved_qty, expected_proposal_qty
+):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=3,
+        action_json=json.dumps({"side": "sell", "qty": "10"}),
+        condition_json=json.dumps({"price_below": 95}),
+    )
+    with svc.session_factory() as session:
+        session.add(
+            Order(
+                idempotency_key=f"reserved-{status}",
+                ticker="AAPL",
+                side="sell",
+                order_type="market",
+                qty=reserved_qty,
+                status=status,
+            )
+        )
+        session.commit()
+    broker.set_price("AAPL", Decimal("90"))
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["executed"] is None
+    assert broker._orders_by_key == {}
+    if expected_proposal_qty is None:
+        assert acted[0]["proposal"] is None
+        assert acted[0]["error"] == "no unreserved position to exit"
+    else:
+        proposal_order_id = acted[0]["proposal"]["order_id"]
+        with svc.session_factory() as session:
+            proposal = session.get(Order, proposal_order_id)
+        assert proposal.qty == expected_proposal_qty

@@ -33,6 +33,29 @@ def _positive(value) -> bool:
         return False
 
 
+def _normalized_ticker(value) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 16:
+        raise ValueError("ticker must be a string between 1 and 16 characters")
+    normalized = value.strip().upper()
+    if not normalized:
+        raise ValueError("ticker must be non-empty")
+    return normalized
+
+
+def _optional_positive_decimal(value, *, maximum=None):
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("invalid decimal scalar") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError("decimal scalar must be finite and positive")
+    if maximum is not None and parsed > maximum:
+        raise ValueError("decimal scalar exceeds maximum")
+    return parsed
+
+
 def _valid_deadline(value) -> bool:
     if isinstance(value, datetime):
         return True
@@ -120,8 +143,13 @@ def _action(row) -> dict:
     return {**source, "order_type": order_type}
 
 
-def _converted(row) -> tuple[str, str] | None:
+def _converted(
+    row,
+) -> tuple[str, str, str, Decimal | None, Decimal | None] | None:
     try:
+        ticker = _normalized_ticker(row.ticker)
+        fraction = _optional_positive_decimal(row.fraction, maximum=Decimal(1))
+        high_water_mark = _optional_positive_decimal(row.hwm)
         if row.kind not in _KINDS:
             raise ValueError("unknown rule kind")
         condition = _condition(row)
@@ -138,6 +166,9 @@ def _converted(row) -> tuple[str, str] | None:
         return (
             json.dumps(condition, separators=(",", ":"), sort_keys=True),
             json.dumps(action, separators=(",", ":"), sort_keys=True),
+            ticker,
+            fraction,
+            high_water_mark,
         )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         if row.state in _NONTERMINAL:
@@ -289,6 +320,17 @@ def upgrade() -> None:
             "id": row.id,
             "group_id": rule_to_group[row.id],
             "payload_version": 1 if converted is not None else 0,
+            "ticker": converted[2] if converted is not None else row.ticker,
+            "fraction": (
+                str(converted[3])
+                if converted is not None and converted[3] is not None
+                else row.fraction
+            ),
+            "hwm": (
+                str(converted[4])
+                if converted is not None and converted[4] is not None
+                else row.hwm
+            ),
             "state": state,
             "pre_approved": (
                 False if row.state in _NONTERMINAL else row.pre_approved
@@ -304,6 +346,7 @@ def upgrade() -> None:
             sa.text(
                 "UPDATE rules SET group_id=:group_id, "
                 "payload_version=:payload_version, "
+                "ticker=:ticker, fraction=:fraction, hwm=:hwm, "
                 "state=:state, pre_approved=:pre_approved, "
                 "condition_json=:condition_json, action_json=:action_json "
                 "WHERE id=:id"
