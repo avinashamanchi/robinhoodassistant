@@ -7,7 +7,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
@@ -71,6 +71,42 @@ def test_reconcile_unknown_finds_remote_acceptance(make_service):
         row = session.get(Order, order_id)
         assert row.status == "submitted"
         assert row.broker_order_id is not None
+
+
+def test_reconcile_unknown_directly_to_filled_records_fill(make_service):
+    class FilledThenDisconnectBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            filled = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                OrderStatus.FILLED,
+                filled_qty=Decimal("1"),
+                avg_fill_price=Decimal("100"),
+            )
+            self._orders_by_key[order.idempotency_key] = filled
+            self._orders_by_id[accepted.broker_order_id] = filled
+            raise ConnectionError("response lost after fill")
+
+    broker = FilledThenDisconnectBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    order_id = _approved_order_id(service)
+    service.order_submission.submit(order_id)
+
+    report = service.reconciliation.reconcile()
+
+    assert report.resolved_unknown == 1
+    assert report.inserted_fills == 1
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        fills = session.scalars(
+            select(Fill).where(Fill.order_id == order_id)
+        ).all()
+        assert order.status == OrderStatus.FILLED.value
+        assert len(fills) == 1
+        assert fills[0].qty == Decimal("1.000000")
+        assert fills[0].price == Decimal("100.000000")
 
 
 def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
@@ -329,6 +365,91 @@ def test_fill_reconciliation_is_incremental_and_restart_idempotent(make_service)
         assert cursor.last_activity_id == "activity-1"
         assert cursor.last_activity_at == filled_at
         assert cursor.version == first_cursor_version
+
+
+def test_late_visible_fill_with_equal_timestamp_is_not_lost(make_service):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        broker_order_id = session.get(Order, order_id).broker_order_id
+
+    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
+    first = BrokerFill(
+        broker_fill_id="z-first",
+        broker_order_id=broker_order_id,
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("0.5"),
+        price=Decimal("100"),
+        filled_at=filled_at,
+    )
+    late = BrokerFill(
+        broker_fill_id="a-late",
+        broker_order_id=broker_order_id,
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("0.5"),
+        price=Decimal("101"),
+        filled_at=filled_at,
+    )
+    broker.activities = [first]
+    assert service.reconciliation.reconcile().inserted_fills == 1
+    broker.activities = [first, late]
+
+    report = service.reconciliation.reconcile()
+
+    assert report.inserted_fills == 1
+    with service.session_factory() as session:
+        fill_ids = set(
+            session.scalars(
+                select(Fill.broker_fill_id).where(Fill.order_id == order_id)
+            ).all()
+        )
+        assert fill_ids == {"z-first", "a-late"}
+
+
+def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        broker_order_id = session.get(Order, order_id).broker_order_id
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="rollback-fill",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            filled_at=datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc),
+        )
+    ]
+    session_type = service.session_factory.class_
+
+    def fail_after_flush(session):
+        if any(
+            isinstance(row, db_models.ReconciliationCursor)
+            for row in session.new
+        ):
+            session.flush()
+            raise RuntimeError("forced commit failure")
+
+    event.listen(session_type, "before_commit", fail_after_flush)
+    try:
+        report = service.reconciliation.reconcile()
+    finally:
+        event.remove(session_type, "before_commit", fail_after_flush)
+
+    assert report.inserted_fills == 0
+    assert any("batch not committed" in drift for drift in report.broker_drift)
+    with service.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Fill)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(db_models.ReconciliationCursor)
+        ) == 0
 
 
 def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):

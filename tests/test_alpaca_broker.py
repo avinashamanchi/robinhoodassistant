@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -193,11 +193,14 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     )
     broker = AlpacaBroker(trading, FakeData({}))
 
-    fills = broker.get_fill_activities(
-        after=datetime(2026, 7, 19, tzinfo=timezone.utc)
-    )
+    boundary = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    fills = broker.get_fill_activities(after=boundary)
 
     assert trading.activity_request[0] == "/account/activities/FILL"
+    requested_after = datetime.fromisoformat(
+        trading.activity_request[1]["after"].replace("Z", "+00:00")
+    )
+    assert requested_after == boundary - timedelta(seconds=1)
     assert fills[0].broker_fill_id == "activity-1"
     assert fills[0].broker_order_id == "order-1"
     assert fills[0].side == "sell"

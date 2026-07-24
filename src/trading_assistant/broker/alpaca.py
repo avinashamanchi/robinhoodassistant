@@ -231,6 +231,7 @@ class AlpacaBroker(BrokerClient):
                 if after.tzinfo is None
                 else after.astimezone(timezone.utc)
             )
+            normalized -= timedelta(seconds=1)
             params["after"] = normalized.isoformat().replace("+00:00", "Z")
 
         fills: list[BrokerFill] = []

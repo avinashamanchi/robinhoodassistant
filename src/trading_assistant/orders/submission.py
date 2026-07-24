@@ -10,6 +10,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from trading_assistant.assets import AssetClass
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.models import OrderRequest, OrderSide, OrderStatus, OrderType
 from trading_assistant.db.models import Order
@@ -114,7 +115,13 @@ class OrderSubmissionService:
             return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
 
         claim_now = self.now()
-        if not self.repository.claim_submission(order_id, claim_now):
+        breaker_scope_keys = (
+            "operator_global",
+            AssetClass.for_symbol(request.ticker).value,
+        )
+        if not self.repository.claim_submission(
+            order_id, claim_now, breaker_scope_keys
+        ):
             if self.repository.expire_approved(order_id, claim_now):
                 return SubmissionResult(order_id, OrderStatus.EXPIRED)
             with self.session_factory() as session:

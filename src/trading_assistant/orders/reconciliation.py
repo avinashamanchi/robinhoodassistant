@@ -67,6 +67,12 @@ class ReconciliationService:
         self.broker_key = broker.reconciliation_key
 
     def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
+        resolved, unresolved, _ = self._resolve_unknown()
+        return resolved, unresolved
+
+    def _resolve_unknown(
+        self,
+    ) -> tuple[int, tuple[int, ...], tuple[tuple[int, OrderResult], ...]]:
         with self.session_factory() as session:
             rows = session.execute(
                 select(Order.id, Order.idempotency_key).where(
@@ -81,6 +87,7 @@ class ReconciliationService:
 
         resolved = 0
         unresolved: list[int] = []
+        resolved_results: list[tuple[int, OrderResult]] = []
         for order_id, client_order_id in rows:
             try:
                 remote = self.broker.get_order_by_client_id(client_order_id)
@@ -97,13 +104,20 @@ class ReconciliationService:
                 datetime.now(timezone.utc),
             ):
                 resolved += 1
-        return resolved, tuple(sorted(unresolved))
+                resolved_results.append((order_id, remote))
+        return (
+            resolved,
+            tuple(sorted(unresolved)),
+            tuple(resolved_results),
+        )
 
     def reconcile(self) -> ReconciliationReport:
-        resolved, unresolved = self.reconcile_unknown()
+        resolved, unresolved, resolved_results = self._resolve_unknown()
         drift: list[str] = []
         inserted_fills = self._reconcile_fill_activities(drift)
-        synced, synthetic_fills = self._reconcile_statuses(drift)
+        synced, synthetic_fills = self._reconcile_statuses(
+            drift, prefetched_results=resolved_results
+        )
         inserted_fills += synthetic_fills
         self._detect_open_order_drift(drift)
         return ReconciliationReport(
@@ -132,30 +146,22 @@ class ReconciliationService:
         if not callable(activity_reader):
             return 0
 
-        last_activity_id, after, expected_version = self._cursor_snapshot()
+        _last_activity_id, after, expected_version = self._cursor_snapshot()
         try:
             activities = list(activity_reader(after=after))
         except Exception as exc:
             drift.append(f"fill activities unavailable: {type(exc).__name__}")
             return 0
 
-        batch = sorted(
-            (
-                activity
-                for activity in activities
-                if after is None
-                or (activity.filled_at, activity.broker_fill_id)
-                > (after, last_activity_id or "")
-            ),
-            key=lambda activity: (
-                activity.filled_at,
-                activity.broker_fill_id,
-            ),
-        )
+        # Activity IDs are opaque, not chronological. The broker query overlaps
+        # the timestamp boundary and the fill table's unique broker ID is the
+        # authority for deduplication, including late-visible equal-time fills.
+        batch = sorted(activities, key=lambda activity: activity.filled_at)
         if not batch:
             return 0
 
         inserted = 0
+        inserted_activities: list[BrokerFill] = []
         advance_cursor = True
         with self.session_factory() as session:
             try:
@@ -193,11 +199,26 @@ class ReconciliationService:
                         )
                     )
                     inserted += 1
+                    inserted_activities.append(activity)
 
                 if advance_cursor:
-                    self._advance_cursor(
-                        session, batch[-1], expected_version=expected_version
-                    )
+                    cursor_candidate = None
+                    if after is None:
+                        cursor_candidate = batch[-1]
+                    else:
+                        at_or_after_cursor = [
+                            activity
+                            for activity in inserted_activities
+                            if activity.filled_at >= after
+                        ]
+                        if at_or_after_cursor:
+                            cursor_candidate = at_or_after_cursor[-1]
+                    if cursor_candidate is not None:
+                        self._advance_cursor(
+                            session,
+                            cursor_candidate,
+                            expected_version=expected_version,
+                        )
                 session.commit()
             except Exception as exc:
                 session.rollback()
@@ -247,7 +268,12 @@ class ReconciliationService:
         cursor.last_activity_at = activity.filled_at
         cursor.version += 1
 
-    def _reconcile_statuses(self, drift: list[str]) -> tuple[int, int]:
+    def _reconcile_statuses(
+        self,
+        drift: list[str],
+        *,
+        prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
+    ) -> tuple[int, int]:
         with self.session_factory() as session:
             missing_ids = session.scalars(
                 select(Order.id).where(
@@ -275,8 +301,13 @@ class ReconciliationService:
         for order_id in missing_ids:
             drift.append(f"local open order {order_id} has no broker order id")
 
-        results: list[tuple[int, OrderResult]] = []
+        results: list[tuple[int, OrderResult]] = list(prefetched_results)
+        prefetched_order_ids = {
+            order_id for order_id, _remote in prefetched_results
+        }
         for order_id, broker_order_id in rows:
+            if order_id in prefetched_order_ids:
+                continue
             try:
                 results.append(
                     (order_id, self.broker.get_order_status(broker_order_id))

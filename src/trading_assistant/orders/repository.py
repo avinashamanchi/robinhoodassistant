@@ -5,11 +5,17 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from sqlalchemy import or_, update
+from sqlalchemy import exists, or_, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import AuditEvent, Order, Proposal, RiskEvent
+from trading_assistant.db.models import (
+    AuditEvent,
+    KillSwitchState,
+    Order,
+    Proposal,
+    RiskEvent,
+)
 
 
 class OrderRepository:
@@ -58,8 +64,16 @@ class OrderRepository:
             session.commit()
             return True
 
-    def claim_submission(self, order_id: int, now: datetime) -> bool:
-        """Claim a recorded approval exactly once before any broker I/O occurs."""
+    def claim_submission(
+        self,
+        order_id: int,
+        now: datetime,
+        breaker_scope_keys: tuple[str, ...],
+    ) -> bool:
+        """Claim once iff every relevant durable breaker is absent or clear."""
+        scope_keys = tuple(dict.fromkeys(breaker_scope_keys))
+        if not scope_keys or any(not key for key in scope_keys):
+            raise ValueError("submission claim requires stable breaker scope keys")
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -69,6 +83,10 @@ class OrderRepository:
                     or_(
                         ~Order.proposal.has(),
                         Order.proposal.has(Proposal.expires_at > now),
+                    ),
+                    ~exists().where(
+                        KillSwitchState.asset_class.in_(scope_keys),
+                        KillSwitchState.tripped.is_(True),
                     ),
                 )
                 .values(
