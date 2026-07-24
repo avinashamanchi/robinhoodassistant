@@ -23,6 +23,9 @@ from trading_assistant.db import models as db_models
 from trading_assistant.db.models import CircuitBreakerState, Fill, Order, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.staleness import (
+    DEFAULT_MAX_FUTURE_SKEW_SECONDS,
+)
 
 
 def _approved_order_id(service) -> int:
@@ -1087,8 +1090,8 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
         order = session.get(Order, order_id)
         broker_order_id = order.broker_order_id
         client_order_id = order.idempotency_key
+        filled_at = order.submission_started_at + timedelta(seconds=1)
 
-    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
     original = BrokerFill(
         broker_fill_id="timestamp-immutable-fill",
         broker_order_id=broker_order_id,
@@ -1110,13 +1113,8 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
     broker._orders_by_key[client_order_id] = filled
     assert service.reconciliation.reconcile().inserted_fills == 1
 
-    equivalent_offset_time = datetime(
-        2026,
-        7,
-        24,
-        10,
-        0,
-        tzinfo=timezone(timedelta(hours=-7)),
+    equivalent_offset_time = filled_at.astimezone(
+        timezone(timedelta(hours=-7))
     )
     broker.activities = [
         BrokerFill(
@@ -1133,7 +1131,7 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
     assert equivalent.inserted_fills == 0
     assert equivalent.broker_drift == ()
 
-    changed_time = filled_at + timedelta(minutes=1)
+    changed_time = filled_at + timedelta(microseconds=1)
     broker.activities = [
         BrokerFill(
             broker_fill_id=original.broker_fill_id,
@@ -1165,6 +1163,107 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
         assert order.last_error_code == "invalid_fill_activity"
         assert fill.filled_at == filled_at
         assert fill.reconciliation_state == "trusted"
+
+
+@pytest.mark.parametrize(
+    ("timestamp_case", "expected_error"),
+    [
+        ("stale-day-boundary", "predates order submission"),
+        ("future", "beyond allowed future skew"),
+    ],
+)
+def test_first_seen_fill_rejects_out_of_bounds_timestamp_across_restart(
+    make_service,
+    timestamp_case,
+    expected_error,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+        submission_boundary = order.submission_started_at
+        order.acceptance_state = "fill_reconcile_required"
+        order.last_error_code = "waiting_for_exact_fill"
+        legacy_fill_id = f"{timestamp_case}-legacy-fill"
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id=legacy_fill_id,
+                reconciliation_state="quarantined",
+                filled_at=submission_boundary,
+            )
+        )
+        session.commit()
+
+    if timestamp_case == "stale-day-boundary":
+        invalid_at_utc = submission_boundary - timedelta(days=1)
+        invalid_at = invalid_at_utc.astimezone(
+            timezone(timedelta(hours=-7))
+        )
+    else:
+        invalid_at = (
+            utcnow()
+            + timedelta(
+                seconds=DEFAULT_MAX_FUTURE_SKEW_SECONDS + 300
+            )
+        ).astimezone(timezone(timedelta(hours=5, minutes=30)))
+
+    exact_fill_id = f"{timestamp_case}-exact-fill"
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=exact_fill_id,
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            filled_at=invalid_at,
+        )
+    ]
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+
+    assert first.inserted_fills == 0
+    assert replay.inserted_fills == 0
+    assert any(expected_error in item for item in first.broker_drift)
+    assert any(expected_error in item for item in replay.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        fills = session.scalars(
+            select(Fill).where(Fill.order_id == order_id)
+        ).all()
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "legacy_unidentified_fill"
+        assert len(fills) == 1
+        assert fills[0].broker_fill_id == legacy_fill_id
+        assert fills[0].reconciliation_state == "quarantined"
+        assert session.scalar(
+            select(func.count())
+            .select_from(db_models.ReconciliationCursor)
+            .where(db_models.ReconciliationCursor.stream == "fills")
+        ) == 0
 
 
 @pytest.mark.parametrize(
@@ -1935,8 +2034,8 @@ def test_fill_reconciliation_is_incremental_and_restart_idempotent(make_service)
         order = session.get(Order, order_id)
         broker_order_id = order.broker_order_id
         client_order_id = order.idempotency_key
+        filled_at = order.submission_started_at + timedelta(seconds=1)
 
-    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
     broker.activities = [
         BrokerFill(
             broker_fill_id="activity-1",
@@ -1985,9 +2084,10 @@ def test_late_visible_fill_with_equal_timestamp_is_not_lost(make_service):
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
     with service.session_factory() as session:
-        broker_order_id = session.get(Order, order_id).broker_order_id
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        filled_at = order.submission_started_at + timedelta(seconds=1)
 
-    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
     first = BrokerFill(
         broker_fill_id="z-first",
         broker_order_id=broker_order_id,
@@ -2027,7 +2127,9 @@ def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
     with service.session_factory() as session:
-        broker_order_id = session.get(Order, order_id).broker_order_id
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        filled_at = order.submission_started_at + timedelta(seconds=1)
 
     broker.activities = [
         BrokerFill(
@@ -2037,7 +2139,7 @@ def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
             side="buy",
             qty=Decimal("1"),
             price=Decimal("100"),
-            filled_at=datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc),
+            filled_at=filled_at,
         )
     ]
     session_type = service.session_factory.class_
@@ -2074,8 +2176,8 @@ def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):
     with service.session_factory() as session:
         order = session.get(Order, order_id)
         broker_order_id = order.broker_order_id
+        filled_at = order.submission_started_at + timedelta(seconds=1)
 
-    filled_at = datetime(2026, 7, 24, 17, 0, tzinfo=timezone.utc)
     broker.activities = [
         BrokerFill(
             broker_fill_id="activity-1",

@@ -232,13 +232,11 @@ def test_sync_reports_submitted_outbox_without_broker_id(make_service):
 
 
 def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
-    from datetime import datetime, timezone
+    from datetime import timedelta
 
     from trading_assistant.broker.mock import MockBroker
     from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
     from trading_assistant.db.models import Fill, Order
-
-    exact_time = datetime(2026, 7, 20, 13, 31, 16, tzinfo=timezone.utc)
 
     class ActivityBroker(MockBroker):
         def get_fill_activities(self, after=None):
@@ -250,7 +248,7 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
                     side="buy",
                     qty=Decimal("2"),
                     price=Decimal("332.03"),
-                    filled_at=exact_time,
+                    filled_at=self.exact_time,
                 )
             ]
 
@@ -262,6 +260,9 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
     with svc.session_factory() as session:
         order = session.get(Order, oid)
         broker.order_id = order.broker_order_id
+        broker.exact_time = (
+            order.submission_started_at + timedelta(seconds=1)
+        )
         synthetic = Fill(
             order_id=oid,
             ticker="AAPL",
@@ -291,7 +292,7 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
         assert len(fills) == 1
         assert fills[0].broker_fill_id == "activity-1"
         assert fills[0].price == Decimal("332.030000")
-        assert fills[0].filled_at == exact_time
+        assert fills[0].filled_at == broker.exact_time
 
 
 def test_sync_preserves_exact_incremental_activity_prices(make_service):

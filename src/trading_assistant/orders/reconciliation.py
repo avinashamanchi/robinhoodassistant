@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, or_, select, update
@@ -34,6 +34,9 @@ from trading_assistant.db.models import (
     fill_requires_reconciliation,
 )
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
+from trading_assistant.risk.staleness import (
+    DEFAULT_MAX_FUTURE_SKEW_SECONDS,
+)
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 from .repository import OrderRepository
@@ -400,10 +403,14 @@ class ReconciliationService:
             drift.append(f"fill activities unavailable: {type(exc).__name__}")
             return 0, frozenset(), False
 
+        observed_at = datetime.now(timezone.utc)
         # Activity IDs are opaque, not chronological. The broker query overlaps
         # the timestamp boundary and the fill table's unique broker ID is the
         # authority for deduplication, including late-visible equal-time fills.
-        batch = sorted(activities, key=lambda activity: activity.filled_at)
+        batch = sorted(
+            activities,
+            key=lambda activity: _normalized_utc(activity.filled_at),
+        )
         if not batch:
             return 0, frozenset(), True
 
@@ -429,9 +436,14 @@ class ReconciliationService:
                         advance_cursor = False
                         continue
                     order = orders[0]
+                    activity = replace(
+                        activity,
+                        filled_at=_normalized_utc(activity.filled_at),
+                    )
                     validation_error = self._fill_activity_validation_error(
                         activity,
                         order,
+                        observed_at,
                     )
                     duplicate = None
                     if validation_error is None:
@@ -565,6 +577,7 @@ class ReconciliationService:
     def _fill_activity_validation_error(
         activity: BrokerFill,
         order: Order,
+        observed_at: datetime,
     ) -> str | None:
         if not isinstance(activity.broker_fill_id, str) or not (
             activity.broker_fill_id.strip()
@@ -597,6 +610,20 @@ class ReconciliationService:
             return f"quantity {activity.qty!r} is not finite and positive"
         if not valid_fill_economic(activity.price):
             return f"price {activity.price!r} is not finite and positive"
+        submission_boundary = (
+            order.submission_started_at or order.created_at
+        )
+        allowed_skew = timedelta(
+            seconds=DEFAULT_MAX_FUTURE_SKEW_SECONDS
+        )
+        if activity.filled_at < (
+            _normalized_utc(submission_boundary) - allowed_skew
+        ):
+            return "fill timestamp predates order submission"
+        if activity.filled_at > (
+            _normalized_utc(observed_at) + allowed_skew
+        ):
+            return "fill timestamp is beyond allowed future skew"
         return None
 
     @staticmethod

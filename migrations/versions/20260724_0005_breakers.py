@@ -145,11 +145,33 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    fill_count = bind.scalar(sa.text("SELECT count(*) FROM fills"))
-    if fill_count:
+    nonrepresentable_state = [
+        label
+        for label, query in (
+            ("fill trust ledger", "SELECT count(*) FROM fills"),
+            (
+                "account risk state",
+                "SELECT count(*) FROM account_risk_state",
+            ),
+            (
+                "fill reconciliation latch",
+                "SELECT count(*) FROM orders "
+                "WHERE acceptance_state = 'fill_reconcile_required'",
+            ),
+            (
+                "non-legacy active breaker",
+                "SELECT count(*) FROM circuit_breaker_state "
+                "WHERE tripped = 1 "
+                "AND kind NOT IN ('loss', 'operator_global')",
+            ),
+        )
+        if bind.scalar(sa.text(query))
+    ]
+    if nonrepresentable_state:
         raise RuntimeError(
-            "cannot safely downgrade migration 0005 with a non-empty fill "
-            "trust ledger; restore the verified pre-upgrade backup instead"
+            "cannot safely downgrade migration 0005 with nonrepresentable "
+            f"safety state ({', '.join(nonrepresentable_state)}); restore "
+            "the verified pre-upgrade backup instead"
         )
 
     op.create_table(

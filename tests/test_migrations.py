@@ -686,10 +686,12 @@ def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
                 "(id,idempotency_key,ticker,side,order_type,qty,status,"
                 "broker_order_id,created_at,updated_at,approval_reason,"
                 "submission_kind,submission_payload_json,submission_attempt,"
-                "acceptance_state,last_error_code,version) VALUES "
+                "submission_started_at,acceptance_state,last_error_code,"
+                "version) VALUES "
                 "(1,'cursor-replay-client','AAPL','sell','market',1,'canceled',"
-                "'cursor-replay-order',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'',"
-                "'simple','{}',0,'accepted','',0)"
+                "'cursor-replay-order','2026-07-20 16:00:00',"
+                "'2026-07-20 18:00:00','','simple','{}',0,"
+                "'2026-07-20 16:59:00','accepted','',0)"
             )
         )
         conn.execute(
@@ -860,11 +862,134 @@ def test_breaker_downgrade_refuses_nonempty_fill_trust_ledger(
         assert "killswitch_state" not in tables
 
 
-def test_breaker_downgrade_allows_empty_fill_ledger(tmp_path):
+@pytest.mark.parametrize(
+    "safety_state",
+    [
+        "account-risk",
+        "fill-latch",
+        "data-breaker",
+        "drawdown-breaker",
+        "liquidity-breaker",
+        "broker-drift-breaker",
+    ],
+)
+def test_breaker_downgrade_refuses_nonrepresentable_safety_state_before_ddl(
+    tmp_path,
+    safety_state,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / f"{safety_state}.db",
+        "20260724_0005",
+    )
+    with engine.begin() as conn:
+        if safety_state == "account-risk":
+            conn.execute(
+                text(
+                    "INSERT INTO account_risk_state "
+                    "(asset_class,high_water_mark,last_equity,updated_at) "
+                    "VALUES ('equity',100000,95000,CURRENT_TIMESTAMP)"
+                )
+            )
+        elif safety_state == "fill-latch":
+            conn.execute(
+                text(
+                    "INSERT INTO orders "
+                    "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                    "created_at,updated_at,approval_reason,submission_kind,"
+                    "submission_payload_json,submission_attempt,"
+                    "acceptance_state,last_error_code,version) VALUES "
+                    "(1,'downgrade-latched-order','AAPL','buy','market',1,"
+                    "'canceled',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'',"
+                    "'simple','{}',0,'fill_reconcile_required',"
+                    "'invalid_fill_activity',0)"
+                )
+            )
+        else:
+            kind, target = {
+                "data-breaker": ("data", "equity"),
+                "drawdown-breaker": ("drawdown", "equity"),
+                "liquidity-breaker": ("liquidity", "AAPL"),
+                "broker-drift-breaker": ("broker_drift", ""),
+            }[safety_state]
+            scope_key = f"{kind}:{target}" if target else kind
+            conn.execute(
+                text(
+                    "INSERT INTO circuit_breaker_state "
+                    "(scope_key,kind,target,tripped,reason,actor,generation,"
+                    "updated_at) VALUES "
+                    "(:scope_key,:kind,:target,1,'active safety state',"
+                    "'test:review19',3,CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "scope_key": scope_key,
+                    "kind": kind,
+                    "target": target,
+                },
+            )
+
+    with pytest.raises(RuntimeError, match="verified pre-upgrade backup"):
+        command.downgrade(cfg, "20260724_0004")
+
+    with engine.connect() as conn:
+        assert conn.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0005"
+        assert conn.scalar(text("SELECT count(*) FROM fills")) == 0
+        tables = set(inspect(engine).get_table_names())
+        assert "account_risk_state" in tables
+        assert "circuit_breaker_state" in tables
+        assert "killswitch_state" not in tables
+        assert "reconciliation_state" in {
+            column["name"] for column in inspect(engine).get_columns("fills")
+        }
+        if safety_state == "account-risk":
+            assert conn.execute(
+                text(
+                    "SELECT high_water_mark,last_equity "
+                    "FROM account_risk_state WHERE asset_class='equity'"
+                )
+            ).one() == (100000, 95000)
+        elif safety_state == "fill-latch":
+            assert conn.execute(
+                text(
+                    "SELECT acceptance_state,last_error_code "
+                    "FROM orders WHERE id=1"
+                )
+            ).one() == (
+                "fill_reconcile_required",
+                "invalid_fill_activity",
+            )
+        else:
+            assert conn.execute(
+                text(
+                    "SELECT tripped,reason,actor,generation "
+                    "FROM circuit_breaker_state"
+                )
+            ).one() == (
+                1,
+                "active safety state",
+                "test:review19",
+                3,
+            )
+
+
+def test_breaker_downgrade_allows_representable_empty_safety_state(tmp_path):
     engine, cfg = _engine_at_revision(
         tmp_path / "empty-fill-ledger.db",
         "20260724_0005",
     )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO circuit_breaker_state "
+                "(scope_key,kind,target,tripped,reason,actor,generation,"
+                "updated_at) VALUES "
+                "('loss:equity','loss','equity',1,'loss limit','test',1,"
+                "CURRENT_TIMESTAMP),"
+                "('operator_global','operator_global','',1,'operator panic',"
+                "'test',2,CURRENT_TIMESTAMP)"
+            )
+        )
 
     command.downgrade(cfg, "20260724_0004")
 
@@ -878,3 +1003,12 @@ def test_breaker_downgrade_allows_empty_fill_ledger(tmp_path):
         tables = set(inspect(engine).get_table_names())
         assert "killswitch_state" in tables
         assert "circuit_breaker_state" not in tables
+        assert conn.execute(
+            text(
+                "SELECT asset_class,tripped,reason "
+                "FROM killswitch_state ORDER BY asset_class"
+            )
+        ).all() == [
+            ("equity", 1, "loss limit"),
+            ("operator_global", 1, "operator panic"),
+        ]
