@@ -75,11 +75,11 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
     try:
         from sqlalchemy import text
 
-        from .db.models import create_all
+        from .db.schema import require_current_schema
         from .db.session import create_db_engine
 
         engine = create_db_engine(secrets.database_url)
-        create_all(engine)
+        require_current_schema(engine)
         with engine.connect() as c:
             mode = c.execute(text("PRAGMA journal_mode")).scalar()
         wal = Result("DB WAL mode", PASS if str(mode).lower() == "wal" else FAIL, f"journal_mode={mode}")
@@ -130,12 +130,12 @@ def _reconciliation(service) -> Result:
 
 def _build_service(config, secrets: Secrets):
     from .broker.factory import build_broker, build_clock
-    from .db.models import create_all
+    from .db.schema import require_current_schema
     from .db.session import create_db_engine, make_session_factory
     from .service import TradingService
 
     engine = create_db_engine(secrets.database_url)
-    create_all(engine)
+    require_current_schema(engine)
     return TradingService(
         build_broker(config, secrets),
         make_session_factory(engine),

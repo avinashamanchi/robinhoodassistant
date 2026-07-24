@@ -19,12 +19,12 @@ class PaperDrillError(RuntimeError):
 
 def build_paper_service(config: AppConfig, secrets: Secrets) -> "TradingService":
     from ..broker.factory import build_broker, build_clock
-    from ..db.models import create_all
+    from ..db.schema import require_current_schema
     from ..db.session import create_db_engine, make_session_factory
     from ..service import TradingService
 
     engine = create_db_engine(secrets.database_url)
-    create_all(engine)
+    require_current_schema(engine)
     return TradingService(
         build_broker(config, secrets),
         make_session_factory(engine),

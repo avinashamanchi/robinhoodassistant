@@ -4,8 +4,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import event
 
+import trading_assistant.orders.snapshot as snapshot_module
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
@@ -16,7 +18,8 @@ from trading_assistant.broker.models import (
     Position,
     Quote,
 )
-from trading_assistant.db.models import Order
+from trading_assistant.db.models import Order, utcnow
+from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import RiskEngine
 
@@ -84,6 +87,51 @@ def test_execution_rejects_insufficient_buying_power(risk_config, make_snapshot)
     assert "insufficient buying power" in result.reasons
 
 
+def test_pending_buys_across_tickers_reserve_buying_power(
+    risk_config, make_snapshot
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        buying_power=Decimal("150"),
+        pending_buy_notional_by_ticker={
+            "AAPL": Decimal("30"),
+            "MSFT": Decimal("60"),
+        },
+    )
+
+    result = RiskEngine(risk_config).check(order(notional="70"), snapshot)
+
+    assert "insufficient buying power" in result.reasons
+
+
+def test_concurrent_approvals_cannot_overcommit_buying_power(make_service):
+    service = make_service()
+    service.broker._buying_power = Decimal("100")
+    first_id = service.propose_order(
+        "AAPL", "buy", "market", notional="60"
+    )["order_id"]
+    second_id = service.propose_order(
+        "AAPL", "buy", "market", notional="60"
+    )["order_id"]
+    for order_id in (first_id, second_id):
+        service.order_application.approve(
+            ApprovalCommand(
+                order_id,
+                "operator:concurrent-test",
+                "independently reviewed",
+                utcnow(),
+            )
+        )
+
+    first = service.order_submission.submit(first_id)
+    second = service.order_submission.submit(second_id)
+
+    assert first.status is OrderStatus.REJECTED
+    assert first.risk_reasons == ("insufficient buying power",)
+    assert second.status is OrderStatus.SUBMITTED
+    assert service.broker.submit_calls == 1
+
+
 def test_execution_rejects_active_breakers_in_sorted_order(
     risk_config, make_snapshot
 ):
@@ -113,6 +161,29 @@ def test_execution_rejects_incomplete_daily_pnl(risk_config, make_snapshot):
     snapshot = replace(
         make_snapshot(prices={"AAPL": Decimal("100")}),
         daily_pnl_complete=False,
+    )
+
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert "daily P&L snapshot is incomplete" in result.reasons
+
+
+@pytest.mark.parametrize(
+    ("realized", "unrealized"),
+    [
+        (Decimal("NaN"), Decimal("0")),
+        (Decimal("0"), Decimal("Infinity")),
+        (Decimal("-Infinity"), Decimal("0")),
+    ],
+)
+def test_execution_rejects_non_finite_daily_pnl_without_raising(
+    risk_config, make_snapshot, realized, unrealized
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        realized_pnl_today=realized,
+        unrealized_pnl_today=unrealized,
+        daily_pnl_complete=True,
     )
 
     result = RiskEngine(risk_config).check(order(), snapshot)
@@ -362,6 +433,45 @@ def test_snapshot_marks_daily_pnl_incomplete_when_position_value_is_missing(
     )
 
     assert snapshot.daily_pnl_complete is False
+
+
+def test_snapshot_marks_non_finite_unrealized_pnl_incomplete(make_service):
+    class NonFinitePnlBroker(MockBroker):
+        def get_positions(self):
+            return [
+                Position(
+                    "AAPL",
+                    Decimal("2"),
+                    Decimal("90"),
+                    Decimal("100"),
+                    unrealized_intraday_pnl=Decimal("NaN"),
+                )
+            ]
+
+    broker = NonFinitePnlBroker()
+    broker.set_price("AAPL", Decimal("100"))
+
+    snapshot = make_service(
+        broker=broker
+    ).snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.daily_pnl_complete is False
+    assert snapshot.unrealized_pnl_today == Decimal(0)
+
+
+def test_snapshot_marks_non_finite_realized_pnl_incomplete(
+    make_service, monkeypatch
+):
+    monkeypatch.setattr(
+        snapshot_module,
+        "realized_pnl_today",
+        lambda *_args, **_kwargs: Decimal("Infinity"),
+    )
+
+    snapshot = make_service().snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.daily_pnl_complete is False
+    assert snapshot.realized_pnl_today == Decimal(0)
 
 
 def test_snapshot_assembles_cash_intraday_pnl_spread_and_market_state(make_service):

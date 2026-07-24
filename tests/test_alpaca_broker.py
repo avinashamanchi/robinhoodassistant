@@ -181,6 +181,24 @@ def test_get_account_and_positions_map():
     assert pos[0].unrealized_intraday_pnl == Decimal("25.50")
 
 
+@pytest.mark.parametrize("raw_pnl", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_position_pnl_maps_to_missing(raw_pnl):
+    trading = FakeTrading()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(
+            symbol="AAPL",
+            qty="10",
+            avg_entry_price="90",
+            current_price="100",
+            unrealized_intraday_pl=raw_pnl,
+        )
+    ]
+
+    position = AlpacaBroker(trading, FakeData({})).get_positions()[0]
+
+    assert position.unrealized_intraday_pnl is None
+
+
 def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     transaction_time = "2026-07-20T13:31:16.178437Z"
     trading = FakeTrading(

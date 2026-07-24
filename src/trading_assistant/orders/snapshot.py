@@ -333,15 +333,19 @@ class PortfolioSnapshotService:
             for position in positions
             if AssetClass.for_symbol(position.ticker) is asset_class
         ]
-        daily_pnl_complete = all(
-            position.unrealized_intraday_pnl is not None
+        finite_unrealized = [
+            position.unrealized_intraday_pnl
             for position in relevant_positions
+            if (
+                position.unrealized_intraday_pnl is not None
+                and position.unrealized_intraday_pnl.is_finite()
+            )
+        ]
+        daily_pnl_complete = (
+            len(finite_unrealized) == len(relevant_positions)
         )
         unrealized_pnl_today = sum(
-            (
-                position.unrealized_intraday_pnl or Decimal(0)
-                for position in relevant_positions
-            ),
+            finite_unrealized,
             Decimal(0),
         )
 
@@ -428,6 +432,9 @@ class PortfolioSnapshotService:
                 asset_class=asset_class,
                 boundary=boundary,
             )
+            if not realized.is_finite():
+                daily_pnl_complete = False
+                realized = Decimal(0)
         except Exception:
             session.rollback()
             pending_buy_notional = {}

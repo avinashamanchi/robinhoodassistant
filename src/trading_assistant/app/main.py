@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..assets import AssetClass
 from ..config import Secrets, load_config
-from ..db.models import create_all
+from ..db.schema import require_current_schema
 from ..db.session import create_db_engine, make_session_factory
 from ..service import TradingService
 from .agent import Agent
@@ -90,7 +90,7 @@ def build_default_stack() -> tuple[TradingService, Agent]:
     secrets = Secrets()
     register_all_secrets(secrets)
     engine = create_db_engine(secrets.database_url)
-    create_all(engine)
+    require_current_schema(engine)
     session_factory = make_session_factory(engine)
     broker = build_broker(config, secrets)
     clock = build_clock(config, secrets)

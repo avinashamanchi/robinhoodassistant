@@ -167,17 +167,6 @@ class TradingService:
         ac = self._asset_class(ticker)
         return self._clock_for(ac).is_open()
 
-    def _killswitch_for_symbol(self, ticker: str) -> bool:
-        """Read the durable breaker in a closed session before broker I/O."""
-        with self.session_factory() as session:
-            return self._risk_is_blocked(session, self._asset_class(ticker))
-
-    @staticmethod
-    def _risk_is_blocked(session: Session, asset_class: AssetClass) -> bool:
-        return KillSwitch.is_tripped(
-            session, asset_class
-        ) or KillSwitch.is_tripped(session, "operator_global")
-
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
         self, session: Session, asset_class: AssetClass = AssetClass.EQUITY

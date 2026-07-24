@@ -423,8 +423,7 @@ def test_core_cycle_can_recover_after_a_transient_failure(make_service):
 
 
 def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service):
-    from trading_assistant.assets import AssetClass
-    from trading_assistant.risk.killswitch import KillSwitch
+    from trading_assistant.risk.breakers import BreakerScope
 
     svc = make_service()
     monitor = Monitor(svc, NullNotifier())
@@ -446,14 +445,13 @@ def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service
         monitor._core_cycle()
 
     assert rules_evaluated is False
-    with svc.session_factory() as session:
-        assert KillSwitch.is_tripped(session, AssetClass.EQUITY)
-        assert KillSwitch.is_tripped(session, AssetClass.CRYPTO)
+    state = svc.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.actor == "daemon:operations"
 
 
 def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
-    from trading_assistant.assets import AssetClass
-    from trading_assistant.risk.killswitch import KillSwitch
+    from trading_assistant.risk.breakers import BreakerScope
 
     svc = make_service()
     monitor = Monitor(svc, NullNotifier(), cycle_timeout_seconds=0.2)
@@ -467,6 +465,6 @@ def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
     with pytest.raises(RuntimeError, match="reconciliation"):
         asyncio.run(monitor.run(asyncio.Event()))
 
-    with svc.session_factory() as session:
-        assert KillSwitch.is_tripped(session, AssetClass.EQUITY)
-        assert KillSwitch.is_tripped(session, AssetClass.CRYPTO)
+    state = svc.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.actor == "daemon:operations"

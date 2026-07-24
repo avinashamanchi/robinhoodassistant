@@ -61,13 +61,31 @@ class RiskEngine:
             reasons.append(f"active circuit breaker: {scopes}")
         if self.config.require_broker_reconciled and not snapshot.broker_reconciled:
             reasons.append("broker reconciliation is not current")
-        if not snapshot.daily_pnl_complete:
+        pnl_is_finite = (
+            snapshot.realized_pnl_today.is_finite()
+            and snapshot.unrealized_pnl_today.is_finite()
+        )
+        if not snapshot.daily_pnl_complete or not pnl_is_finite:
             reasons.append("daily P&L snapshot is incomplete")
 
         if quote is not None:
             estimated = order.estimated_notional(quote.last)
-            if order.side is OrderSide.BUY and estimated > snapshot.buying_power:
-                reasons.append("insufficient buying power")
+            if order.side is OrderSide.BUY:
+                reserved_buying_power = sum(
+                    (
+                        max(notional, Decimal(0))
+                        for notional in (
+                            snapshot.pending_buy_notional_by_ticker.values()
+                        )
+                    ),
+                    Decimal(0),
+                )
+                available_buying_power = max(
+                    snapshot.buying_power - reserved_buying_power,
+                    Decimal(0),
+                )
+                if estimated > available_buying_power:
+                    reasons.append("insufficient buying power")
             if order.side is OrderSide.SELL:
                 position = snapshot.positions.get(symbol)
                 held = max(position.qty, Decimal(0)) if position else Decimal(0)
@@ -82,9 +100,15 @@ class RiskEngine:
                 if requested > held - reserved:
                     reasons.append("sell quantity exceeds unreserved position")
 
-        daily_total = snapshot.realized_pnl_today + snapshot.unrealized_pnl_today
-        if daily_total <= -Decimal(str(self.config.max_daily_total_loss)):
-            reasons.append("daily total-loss limit reached")
+        if pnl_is_finite:
+            daily_total = (
+                snapshot.realized_pnl_today
+                + snapshot.unrealized_pnl_today
+            )
+            if daily_total <= -Decimal(
+                str(self.config.max_daily_total_loss)
+            ):
+                reasons.append("daily total-loss limit reached")
         if snapshot.account_high_water_mark > 0:
             drawdown = (
                 snapshot.account_high_water_mark - snapshot.account_equity

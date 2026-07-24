@@ -14,6 +14,7 @@ from .breakers import (
     reset_in_session,
     trip_in_session,
 )
+from .submission_barrier import SubmissionBarrier
 
 
 def _scope(asset_class: AssetClass | str) -> BreakerScope:
@@ -25,7 +26,11 @@ def _scope(asset_class: AssetClass | str) -> BreakerScope:
 
 
 class KillSwitch:
-    """Legacy session-oriented API over loss and operator-global scopes."""
+    """Legacy API over loss and operator-global scopes.
+
+    Compatibility writes own their commit so the process barrier remains held
+    until the new breaker state is durable.
+    """
 
     @staticmethod
     def is_tripped(
@@ -46,19 +51,25 @@ class KillSwitch:
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
         scope = _scope(asset_class)
-        _state, changed = trip_in_session(
-            session,
-            scope,
-            reason,
-            "compat:killswitch",
-        )
-        if changed:
-            session.add(
-                RiskEvent(
-                    event_type="killswitch_trip",
-                    reason=f"[{scope.key}] {reason}",
+        with SubmissionBarrier(session).hold():
+            try:
+                _state, changed = trip_in_session(
+                    session,
+                    scope,
+                    reason,
+                    "compat:killswitch",
                 )
-            )
+                if changed:
+                    session.add(
+                        RiskEvent(
+                            event_type="killswitch_trip",
+                            reason=f"[{scope.key}] {reason}",
+                        )
+                    )
+                session.commit()
+            except BaseException:
+                session.rollback()
+                raise
 
     @staticmethod
     def reset(
@@ -67,23 +78,31 @@ class KillSwitch:
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
         scope = _scope(asset_class)
-        row = session.get(CircuitBreakerState, scope.key)
-        if row is None:
-            raise ValueError("cannot reset a breaker that has not been tripped")
-        reset_in_session(
-            session,
-            scope,
-            "compat:killswitch",
-            note,
-            {"compatibility_facade": True},
-            expected_generation=row.generation,
-        )
-        session.add(
-            RiskEvent(
-                event_type="killswitch_reset",
-                reason=f"[{scope.key}] {note}",
-            )
-        )
+        with SubmissionBarrier(session).hold():
+            try:
+                row = session.get(CircuitBreakerState, scope.key)
+                if row is None:
+                    raise ValueError(
+                        "cannot reset a breaker that has not been tripped"
+                    )
+                reset_in_session(
+                    session,
+                    scope,
+                    "compat:killswitch",
+                    note,
+                    {"compatibility_facade": True},
+                    expected_generation=row.generation,
+                )
+                session.add(
+                    RiskEvent(
+                        event_type="killswitch_reset",
+                        reason=f"[{scope.key}] {note}",
+                    )
+                )
+                session.commit()
+            except BaseException:
+                session.rollback()
+                raise
 
     @staticmethod
     def evaluate_daily_loss(

@@ -18,6 +18,7 @@ from trading_assistant.orders.submission import OrderSubmissionService
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.risk.engine import RiskResult
+from trading_assistant.risk.killswitch import KillSwitch
 
 
 class _StaticSnapshotService:
@@ -99,7 +100,7 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
                 "cross-process feed fault",
                 "daemon:process-test",
             )
-        else:
+        elif writer_kind == "panic":
             from trading_assistant.broker.mock import MockBroker
 
             ReconciliationService(
@@ -108,6 +109,13 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
                 repository,
                 breakers,
             ).panic("operator:process-test", "cross-process panic")
+        else:
+            with factory() as session:
+                KillSwitch.trip(
+                    session,
+                    "cross-process compatibility trip",
+                    AssetClass.EQUITY,
+                )
         outcome.put(("ok", writer_kind))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -146,6 +154,7 @@ def _join(process, *release_events) -> None:
     [
         ("breaker", BreakerScope.data(AssetClass.EQUITY)),
         ("panic", BreakerScope.operator_global()),
+        ("compatibility", BreakerScope.loss(AssetClass.EQUITY)),
     ],
 )
 def test_writer_committed_before_claim_blocks_cross_process_broker_send(
@@ -210,6 +219,7 @@ def test_writer_committed_before_claim_blocks_cross_process_broker_send(
     [
         ("breaker", BreakerScope.data(AssetClass.EQUITY)),
         ("panic", BreakerScope.operator_global()),
+        ("compatibility", BreakerScope.loss(AssetClass.EQUITY)),
     ],
 )
 def test_writer_requested_after_claim_waits_until_cross_process_broker_send_finishes(

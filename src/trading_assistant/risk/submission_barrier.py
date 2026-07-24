@@ -20,8 +20,16 @@ class SubmissionBarrier:
     transaction open. ``flock`` is released automatically if a process exits.
     """
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
-        bind = session_factory.kw.get("bind")
+    def __init__(
+        self,
+        source: sessionmaker[Session] | Session | Engine,
+    ) -> None:
+        if isinstance(source, Session):
+            bind = source.get_bind()
+        elif isinstance(source, Engine):
+            bind = source
+        else:
+            bind = source.kw.get("bind")
         if not isinstance(bind, Engine) or bind.dialect.name != "sqlite":
             raise ValueError("submission barrier requires a bound SQLite engine")
         database = bind.url.database

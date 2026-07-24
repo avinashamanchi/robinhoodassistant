@@ -34,6 +34,11 @@ def _service(app_config, session_factory, broker=None, market_open=True):
     )
 
 
+def test_legacy_killswitch_helpers_are_not_part_of_trading_service():
+    assert not hasattr(TradingService, "_killswitch_for_symbol")
+    assert not hasattr(TradingService, "_risk_is_blocked")
+
+
 def test_propose_creates_pending_and_does_not_execute(app_config, session_factory):
     svc = _service(app_config, session_factory)
     res = svc.propose_order("AAPL", "buy", "market", notional="400")
