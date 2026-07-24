@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import stat
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import Fill, Order, Proposal, utcnow
+from trading_assistant.db.session import create_db_engine
 
 
 def test_order_proposal_fill_roundtrip(session_factory):
@@ -62,3 +64,15 @@ def test_idempotency_key_unique(session_factory):
         except Exception:
             raised = True
         assert raised, "duplicate idempotency_key must violate the unique constraint"
+
+
+def test_sqlite_database_and_sidecars_are_owner_only(tmp_path):
+    path = tmp_path / "private.db"
+    engine = create_db_engine(f"sqlite:///{path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE private_data (id INTEGER)")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(f"{path.name}{suffix}")
+        if sidecar.exists():
+            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600

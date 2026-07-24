@@ -88,6 +88,18 @@ uv run python -m trading_assistant.ops.backup --destination backups
 The watchdog restarts a stale daemon; it does not alter kill switches or live-mode
 configuration. Logs are in `logs/`, backups in `backups/`.
 
+The repository's safe operating profile keeps
+`features.auto_execute_preapproved_rules: false` and
+`execution.prefer_bracket_orders: false`. The daemon still monitors, reconciles,
+grades shadow calls, and creates human-reviewable proposals every day. Turning
+either execution switch on is a separate manual promotion decision after extended
+paper evidence and concurrency drills.
+
+On macOS, keep FileVault enabled. The installer restricts `.env`, the SQLite
+database and sidecars, and backup files to the current user; FileVault provides
+at-rest encryption for those local files. Store any off-device backup only in an
+encrypted destination.
+
 ## Analyst version + scorecard reset
 
 The analyst is versioned (`analyst.version`, currently **v2**). The scorecard grades

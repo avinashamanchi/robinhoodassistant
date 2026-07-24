@@ -44,10 +44,9 @@ class _Lot:
 def most_recent_regular_open(now: datetime) -> datetime:
     """Most recent weekday 09:30 America/New_York at or before ``now``, as UTC.
 
-    Weekends roll back to Friday. This intentionally ignores exchange holidays —
-    the daily-loss reset boundary does not need holiday precision, and keeping it
-    calendar-free keeps it deterministic and dependency-light. Precise
-    open/close checks go through the MarketClock (A7), not this helper.
+    Weekends roll back to Friday. This dependency-light fallback intentionally
+    ignores exchange holidays and is used by isolated calculations/tests. The
+    live service supplies an Alpaca-calendar boundary through MarketClock (A7).
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -134,7 +133,9 @@ def realized_pnl_today(
     fills: Iterable[FillLike],
     now: datetime | None = None,
     asset_class: AssetClass = AssetClass.EQUITY,
+    boundary: datetime | None = None,
 ) -> Decimal:
     """Realized P&L since the most recent daily boundary for the asset class."""
     now = now or datetime.now(timezone.utc)
-    return realized_pnl(fills, since=most_recent_daily_boundary(now, asset_class))
+    since = boundary or most_recent_daily_boundary(now, asset_class)
+    return realized_pnl(fills, since=since)

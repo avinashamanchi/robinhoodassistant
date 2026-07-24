@@ -72,9 +72,11 @@ class FakeOrder:
 
 
 class FakeTrading:
-    def __init__(self, existing=None, lookup_error=None):
+    def __init__(self, existing=None, lookup_error=None, activities=None):
         self._existing = existing  # simulates a prior order for the same client id
         self._lookup_error = lookup_error
+        self.activities = activities or []
+        self.activity_request = None
         self.submit_calls = 0
         self.last_request = None
         self._by_id = {}
@@ -85,6 +87,10 @@ class FakeTrading:
         if self._existing is not None:
             return self._existing
         raise _api_error(404)
+
+    def get(self, path, data=None):
+        self.activity_request = (path, data)
+        return self.activities
 
     def submit_order(self, order_data):
         self.submit_calls += 1
@@ -161,6 +167,37 @@ def test_get_account_and_positions_map():
     assert acct.buying_power == Decimal("10000")
     pos = broker.get_positions()
     assert pos[0].ticker == "AAPL" and pos[0].qty == Decimal("10")
+
+
+def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
+    transaction_time = "2026-07-20T13:31:16.178437Z"
+    trading = FakeTrading(
+        activities=[
+            {
+                "id": "activity-1",
+                "transaction_time": transaction_time,
+                "price": "332.03",
+                "qty": "2",
+                "side": "sell_short",
+                "symbol": "AAPL",
+                "order_id": "order-1",
+            }
+        ]
+    )
+    broker = AlpacaBroker(trading, FakeData({}))
+
+    fills = broker.get_fill_activities(
+        after=datetime(2026, 7, 19, tzinfo=timezone.utc)
+    )
+
+    assert trading.activity_request[0] == "/account/activities/FILL"
+    assert fills[0].broker_fill_id == "activity-1"
+    assert fills[0].broker_order_id == "order-1"
+    assert fills[0].side == "sell"
+    assert fills[0].price == Decimal("332.03")
+    assert fills[0].filled_at == datetime(
+        2026, 7, 20, 13, 31, 16, 178437, tzinfo=timezone.utc
+    )
 
 
 def test_submit_market_order_builds_request_and_maps_result():
@@ -333,3 +370,25 @@ def test_alpaca_clock_maps():
     assert clock.is_open() is True
     assert clock.next_open() == "2026-01-02T09:30"
     assert clock.next_close() == "2026-01-02T16:00"
+
+
+def test_alpaca_clock_uses_exchange_calendar_for_most_recent_open():
+    trading = SimpleNamespace(
+        get_calendar=lambda request: [
+            SimpleNamespace(
+                date=datetime(2026, 7, 2).date(),
+                open=datetime(2026, 7, 2, 9, 30),
+            ),
+            # July 3 is absent: exchange holiday.
+            SimpleNamespace(
+                date=datetime(2026, 7, 6).date(),
+                open=datetime(2026, 7, 6, 9, 30),
+            ),
+        ]
+    )
+    clock = AlpacaClock(trading)
+    before_july_6_open = datetime(2026, 7, 6, 12, tzinfo=timezone.utc)
+
+    assert clock.most_recent_open(before_july_6_open) == datetime(
+        2026, 7, 2, 13, 30, tzinfo=timezone.utc
+    )

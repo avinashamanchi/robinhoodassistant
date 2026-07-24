@@ -106,6 +106,25 @@ def test_snapshot_uses_broker_positions(app_config, session_factory):
     assert any("per ticker" in r for r in res["risk_reasons"])
 
 
+def test_second_order_counts_first_outstanding_order(app_config, session_factory):
+    config = app_config.model_copy(
+        update={
+            "risk": app_config.risk.model_copy(
+                update={"max_notional_per_order": 2000}
+            )
+        }
+    )
+    svc = _service(config, session_factory)
+    first = svc.propose_order("AAPL", "buy", "market", notional="1800")
+    assert first["status"] == "proposed"
+    assert svc.approve_order(first["order_id"])["status"] == "submitted"
+
+    second = svc.propose_order("AAPL", "buy", "market", notional="400")
+
+    assert second["status"] == "rejected"
+    assert any("per ticker" in reason for reason in second["risk_reasons"])
+
+
 def test_conditional_rule_crud(app_config, session_factory):
     svc = _service(app_config, session_factory)
     created = svc.create_conditional_rule(

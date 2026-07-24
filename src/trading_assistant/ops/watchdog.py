@@ -25,9 +25,43 @@ def needs_restart(health: dict[str, Any], stale_seconds: float) -> bool:
         return True
 
 
+def labels_to_restart(
+    *,
+    api_health: dict[str, Any] | None,
+    database_health: dict[str, Any],
+    stale_seconds: float,
+) -> set[str]:
+    labels: set[str] = set()
+    if api_health is None:
+        labels.add("com.trading.app")
+    effective = api_health if api_health is not None else database_health
+    if needs_restart(effective, stale_seconds):
+        labels.add("com.trading.daemon")
+    return labels
+
+
 def fetch_health(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
     with urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310 - local URL
         return json.loads(response.read())
+
+
+def read_database_health() -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from ..config import Secrets
+    from ..db.models import Heartbeat, utcnow
+    from ..db.session import create_db_engine, make_session_factory
+
+    try:
+        factory = make_session_factory(create_db_engine(Secrets().database_url))
+        with factory() as session:
+            last = session.execute(
+                select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
+            ).scalar_one_or_none()
+        age = (utcnow() - last.at).total_seconds() if last is not None else None
+        return {"db_ok": True, "heartbeat_age_seconds": age}
+    except Exception:
+        return {"db_ok": False, "heartbeat_age_seconds": None}
 
 
 def restart_launch_agent(label: str) -> None:
@@ -43,9 +77,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config()
-    health = fetch_health(args.health_url, args.request_timeout)
-    if needs_restart(health, config.daemon.heartbeat_stale_seconds):
-        restart_launch_agent(args.label)
+    try:
+        api_health = fetch_health(args.health_url, args.request_timeout)
+    except Exception:
+        api_health = None
+    labels = labels_to_restart(
+        api_health=api_health,
+        database_health=read_database_health(),
+        stale_seconds=config.daemon.heartbeat_stale_seconds,
+    )
+    for label in sorted(labels):
+        restart_launch_agent(args.label if label == "com.trading.daemon" else label)
+    if labels:
         return 1
     return 0
 

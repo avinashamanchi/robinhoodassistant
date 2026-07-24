@@ -117,6 +117,117 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     assert svc.sync_open_orders()["synced"] == 0
 
 
+def test_sync_reports_broker_status_failures(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class StatusFailureBroker(MockBroker):
+        fail_status = False
+
+        def get_order_status(self, order_id):
+            if self.fail_status:
+                raise ConnectionError("broker unavailable")
+            return super().get_order_status(order_id)
+
+    broker = StatusFailureBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order("AAPL", "buy", "market", qty="1")["order_id"]
+    svc.approve_order(oid)
+    broker.fail_status = True
+
+    result = svc.sync_open_orders()
+
+    assert result["failed"] == 1
+    assert result["synced"] == 0
+
+
+def test_sync_reports_submitted_outbox_without_broker_id(make_service):
+    from trading_assistant.db.models import Order
+
+    svc = make_service()
+    with svc.session_factory() as session:
+        session.add(
+            Order(
+                idempotency_key="unknown-acceptance",
+                ticker="AAPL",
+                side="buy",
+                order_type="limit",
+                qty=Decimal("1"),
+                limit_price=Decimal("95"),
+                status="submitted",
+                broker_order_id=None,
+            )
+        )
+        session.commit()
+
+    result = svc.sync_open_orders()
+
+    assert result["failed"] == 1
+
+
+def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
+    from datetime import datetime, timezone
+
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
+    from trading_assistant.db.models import Fill, Order
+
+    exact_time = datetime(2026, 7, 20, 13, 31, 16, tzinfo=timezone.utc)
+
+    class ActivityBroker(MockBroker):
+        def get_fill_activities(self, after=None):
+            return [
+                BrokerFill(
+                    broker_fill_id="activity-1",
+                    broker_order_id=self.order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("2"),
+                    price=Decimal("332.03"),
+                    filled_at=exact_time,
+                )
+            ]
+
+    broker = ActivityBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order("AAPL", "buy", "market", qty="2")["order_id"]
+    svc.approve_order(oid)
+    with svc.session_factory() as session:
+        order = session.get(Order, oid)
+        broker.order_id = order.broker_order_id
+        synthetic = Fill(
+            order_id=oid,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("2"),
+            price=Decimal("333"),
+            broker_fill_id=f"{order.broker_order_id}:2",
+        )
+        session.add(synthetic)
+        session.commit()
+        client_id = order.idempotency_key
+    filled = OrderResult(
+        client_id,
+        broker.order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("2"),
+        avg_fill_price=Decimal("332.03"),
+    )
+    broker._orders_by_id[broker.order_id] = filled
+    broker._orders_by_key[client_id] = filled
+
+    result = svc.sync_open_orders()
+
+    assert result["newly_filled"] == 1
+    with svc.session_factory() as session:
+        fills = session.execute(select(Fill).where(Fill.order_id == oid)).scalars().all()
+        assert len(fills) == 1
+        assert fills[0].broker_fill_id == "activity-1"
+        assert fills[0].price == Decimal("332.030000")
+        assert fills[0].filled_at == exact_time
+
+
 def test_sync_derives_incremental_prices_from_cumulative_average(make_service):
     """Alpaca reports cumulative quantity and average price, not the latest fill.
 

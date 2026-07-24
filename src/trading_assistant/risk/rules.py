@@ -32,6 +32,12 @@ def check_allowlist(order: OrderRequest, config: RiskConfig) -> Optional[str]:
     return None
 
 
+def check_pending_exposure_known(snapshot: PortfolioSnapshot) -> Optional[str]:
+    if not snapshot.pending_exposure_complete:
+        return "outstanding order exposure is unknown; new orders are blocked"
+    return None
+
+
 def check_max_notional(
     order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
 ) -> Optional[str]:
@@ -55,7 +61,10 @@ def check_max_position(
     signed = qty if order.side is OrderSide.BUY else -qty
     current = snapshot.positions.get(order.ticker.upper())
     current_qty = current.qty if current else Decimal(0)
-    projected_value = abs(current_qty + signed) * price
+    pending = snapshot.pending_signed_notional.get(
+        order.ticker.upper(), Decimal(0)
+    )
+    projected_value = abs(current_qty * price + pending + signed * price)
     limit = Decimal(str(config.max_position_per_ticker))
     if projected_value > limit:
         return (
@@ -75,10 +84,15 @@ def check_portfolio_exposure(
     signed = qty if order.side is OrderSide.BUY else -qty
     current = snapshot.positions.get(order.ticker.upper())
     current_qty = current.qty if current else Decimal(0)
-    current_ticker_value = abs(current_qty) * price
-    projected_ticker_value = abs(current_qty + signed) * price
+    pending = snapshot.pending_signed_notional.get(
+        order.ticker.upper(), Decimal(0)
+    )
+    current_ticker_value = abs(current_qty * price + pending)
+    projected_ticker_value = abs(current_qty * price + pending + signed * price)
     projected_gross = (
-        snapshot.gross_exposure() - current_ticker_value + projected_ticker_value
+        snapshot.gross_exposure_with_pending()
+        - current_ticker_value
+        + projected_ticker_value
     )
     limit = Decimal(str(config.max_portfolio_exposure))
     if projected_gross > limit:
@@ -130,7 +144,10 @@ def check_cross_broker_concentration(
     signed = qty if order.side is OrderSide.BUY else -qty
     current = snapshot.positions.get(order.ticker.upper())
     current_qty = current.qty if current else Decimal(0)
-    projected_alpaca = abs(current_qty + signed) * price
+    pending = snapshot.pending_signed_notional.get(
+        order.ticker.upper(), Decimal(0)
+    )
+    projected_alpaca = abs(current_qty * price + pending + signed * price)
     external = snapshot.external_position_value(order.ticker.upper())
     combined = projected_alpaca + external
     limit = Decimal(str(config.max_position_per_ticker))

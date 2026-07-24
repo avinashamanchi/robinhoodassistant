@@ -73,3 +73,16 @@ def test_before_open_rolls_back_a_day():
     before_open = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)  # 08:00 ET Wed
     open_utc = most_recent_regular_open(before_open)
     assert open_utc.astimezone(NY).date() < before_open.astimezone(NY).date()
+
+
+def test_injected_exchange_boundary_overrides_weekday_approximation():
+    boundary = datetime(2026, 7, 2, 13, 30, tzinfo=timezone.utc)
+    fills = [
+        _f("AAPL", "buy", "1", "100", datetime(2026, 7, 2, 14, tzinfo=timezone.utc)),
+        _f("AAPL", "sell", "1", "90", datetime(2026, 7, 2, 15, tzinfo=timezone.utc)),
+    ]
+    assert realized_pnl_today(
+        fills,
+        now=datetime(2026, 7, 6, 12, tzinfo=timezone.utc),
+        boundary=boundary,
+    ) == Decimal("-10")

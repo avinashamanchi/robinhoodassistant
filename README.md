@@ -112,6 +112,12 @@ Operational details and daily checks are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Paper trading is a simulation and does not
 establish that a strategy will be profitable in live markets.
 
+The checked-in operating profile is intentionally conservative:
+`trading.mode: paper`, autonomous pre-approved-rule execution OFF, broker bracket
+submission OFF, and shadow analysis ON. Do not enable execution features from
+backtest results alone; require the scorecard/paper evidence gates in the runbook
+and a separate manual decision.
+
 ## LLM providers & market data
 
 The agent/analyst run on a pluggable backend (`llm/`): set `llm.provider` to

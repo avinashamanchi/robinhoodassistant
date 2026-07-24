@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
+from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Quote
 
@@ -45,6 +46,28 @@ def test_wrong_token_401(client):
 def test_correct_token_allows(client):
     r = client.post("/killswitch/reset", headers={"X-API-Key": TOKEN})
     assert r.status_code == 200 and r.json()["tripped"] is False
+
+
+def test_paid_analysis_and_backtest_endpoints_are_rate_limited(make_service):
+    class StubPlanning:
+        def analyze(self, symbol):
+            return {"symbol": symbol}
+
+    blocked = RateLimiter(max_requests=0, window_seconds=60)
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=StubPlanning(),
+        analysis_rate=blocked,
+        backtest_rate=blocked,
+    )
+    limited = TestClient(app)
+    headers = {"X-API-Key": TOKEN}
+
+    assert limited.post("/analyze", json={"symbol": "AAPL"}, headers=headers).status_code == 429
+    assert limited.post("/propose", json={"n": 1}, headers=headers).status_code == 429
+    assert limited.post("/backtests/run", json={"symbols": []}, headers=headers).status_code == 429
 
 
 def test_get_endpoints_stay_open(client):

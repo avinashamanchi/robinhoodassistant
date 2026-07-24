@@ -13,6 +13,21 @@ UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
+chmod 700 "$PROJ/backups"
+[ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
+
+reload_plist () {  # launchd can briefly return EIO immediately after bootout
+  local label="$1"
+  local plist="$2"
+  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
+  for attempt in 1 2 3; do
+    if launchctl bootstrap "gui/$UID_" "$plist"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 emit () {  # $1=label  $2...=program args
   local label="$1"; shift
@@ -32,8 +47,7 @@ emit () {  # $1=label  $2...=program args
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
     printf '</dict></plist>\n'
   } > "$plist"
-  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_" "$plist"
+  reload_plist "$label" "$plist"
   echo "loaded $label"
 }
 
@@ -57,8 +71,7 @@ emit_periodic () {  # $1=label $2=interval_seconds $3...=program args
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
     printf '</dict></plist>\n'
   } > "$plist"
-  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_" "$plist"
+  reload_plist "$label" "$plist"
   echo "loaded $label"
 }
 
@@ -85,8 +98,7 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
     printf '</dict></plist>\n'
   } > "$plist"
-  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_" "$plist"
+  reload_plist "$label" "$plist"
   echo "loaded $label"
 }
 

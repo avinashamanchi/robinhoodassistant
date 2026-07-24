@@ -107,6 +107,7 @@ def make_snapshot():
         positions: list[Position] | None = None,
         buying_power: Decimal = Decimal("100000"),
         realized_pnl_today: Decimal = Decimal("0"),
+        pending_signed_notional: dict[str, Decimal] | None = None,
     ) -> PortfolioSnapshot:
         prices = prices or {}
         quotes = {
@@ -119,6 +120,7 @@ def make_snapshot():
             quotes=quotes,
             buying_power=buying_power,
             realized_pnl_today=realized_pnl_today,
+            pending_signed_notional=pending_signed_notional or {},
         )
 
     return _make

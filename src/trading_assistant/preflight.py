@@ -102,6 +102,12 @@ def _reconciliation(service) -> Result:
     try:
         order_sync = service.sync_open_orders()
         positions = service.reconcile_positions()
+        if order_sync.get("failed", 0):
+            return Result(
+                "broker/local reconciliation",
+                FAIL,
+                f"order status sync failures: {order_sync}",
+            )
         if not positions["reconciled"]:
             return Result(
                 "broker/local reconciliation",

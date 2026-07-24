@@ -4,7 +4,11 @@ monitoring daemon both write, and WAL allows concurrent readers with a writer.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -23,7 +27,25 @@ def create_db_engine(url: str = "sqlite:///./trading_assistant.db") -> Engine:
         connect_args = {"check_same_thread": False}
     engine = create_engine(url, connect_args=connect_args, future=True)
     if url.startswith("sqlite"):
-        event.listen(engine, "connect", _enable_sqlite_pragmas)
+        parsed = make_url(url)
+        database_path = (
+            Path(parsed.database).expanduser().resolve()
+            if parsed.database and parsed.database != ":memory:"
+            else None
+        )
+
+        def configure_and_secure(dbapi_conn, record) -> None:
+            _enable_sqlite_pragmas(dbapi_conn, record)
+            if database_path is not None:
+                for candidate in (
+                    database_path,
+                    database_path.with_name(f"{database_path.name}-wal"),
+                    database_path.with_name(f"{database_path.name}-shm"),
+                ):
+                    if candidate.exists():
+                        os.chmod(candidate, 0o600)
+
+        event.listen(engine, "connect", configure_and_secure)
     return engine
 
 

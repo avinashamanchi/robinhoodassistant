@@ -53,6 +53,7 @@ class RiskEngine:
 
         checks = [
             rules.check_allowlist(order, self.config),
+            rules.check_pending_exposure_known(snapshot),
             rules.check_market_hours(order, self.config, market_open),
             rules.check_max_notional(order, snapshot, self.config),
             rules.check_max_position(order, snapshot, self.config),

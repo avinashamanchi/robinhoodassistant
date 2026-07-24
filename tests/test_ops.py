@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import time
 from decimal import Decimal
 
@@ -41,6 +42,10 @@ def test_online_backup_is_valid_and_rotates_only_matching_old_files(tmp_path):
     assert not old_match.exists()
     assert unrelated.exists()
     assert list(destination.glob("*.tmp*")) == []
+    assert not created.with_name(f"{created.name}-wal").exists()
+    assert not created.with_name(f"{created.name}-shm").exists()
+    assert stat.S_IMODE(created.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
 
 
 def test_paper_drill_refuses_live_configuration(app_config):

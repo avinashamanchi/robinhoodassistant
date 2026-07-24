@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Optional, TypeVar
 
@@ -28,12 +28,14 @@ from alpaca.data.requests import CryptoSnapshotRequest, StockSnapshotRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.requests import GetCalendarRequest, LimitOrderRequest, MarketOrderRequest
+from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass
 from .base import BrokerClient
 from .models import (
     Account,
+    BrokerFill,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -208,6 +210,50 @@ class AlpacaBroker(BrokerClient):
             )
         return out
 
+    def get_fill_activities(
+        self, after: datetime | None = None
+    ) -> list[BrokerFill]:
+        """Return exact Alpaca FILL activities, including IDs and exchange times."""
+        params: dict[str, Any] = {
+            "direction": "asc",
+            "page_size": 100,
+        }
+        if after is not None:
+            normalized = (
+                after.replace(tzinfo=timezone.utc)
+                if after.tzinfo is None
+                else after.astimezone(timezone.utc)
+            )
+            params["after"] = normalized.isoformat().replace("+00:00", "Z")
+
+        fills: list[BrokerFill] = []
+        while True:
+            page = _retry(
+                self._trading.get,
+                "/account/activities/FILL",
+                params,
+            )
+            for raw in page:
+                timestamp = datetime.fromisoformat(
+                    str(raw["transaction_time"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                raw_side = str(raw["side"]).lower()
+                fills.append(
+                    BrokerFill(
+                        broker_fill_id=str(raw["id"]),
+                        broker_order_id=str(raw["order_id"]),
+                        ticker=str(raw["symbol"]).upper(),
+                        side="buy" if raw_side.startswith("buy") else "sell",
+                        qty=Decimal(str(raw["qty"])),
+                        price=Decimal(str(raw["price"])),
+                        filled_at=timestamp,
+                    )
+                )
+            if len(page) < 100:
+                break
+            params["page_token"] = page[-1]["id"]
+        return fills
+
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:
         # Retry the WHOLE attempt: on a dropped connection the retry re-runs the
@@ -337,3 +383,29 @@ class AlpacaClock:
 
     def next_close(self, at=None):
         return _retry(self._trading.get_clock).next_close
+
+    def most_recent_open(self, at=None) -> datetime:
+        now = at or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        ny = ZoneInfo("America/New_York")
+        local_date = now.astimezone(ny).date()
+        calendar = _retry(
+            self._trading.get_calendar,
+            GetCalendarRequest(
+                start=local_date - timedelta(days=14),
+                end=local_date,
+            ),
+        )
+        candidates: list[datetime] = []
+        for session in calendar:
+            session_open = session.open
+            if session_open.tzinfo is None:
+                session_open = session_open.replace(tzinfo=ny)
+            session_open = session_open.astimezone(timezone.utc)
+            if session_open <= now:
+                candidates.append(session_open)
+        if not candidates:
+            raise RuntimeError("Alpaca calendar returned no prior market session")
+        return max(candidates)

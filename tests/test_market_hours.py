@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from trading_assistant.broker.models import OrderRequest, OrderSide, OrderType
@@ -22,6 +23,11 @@ def _order() -> OrderRequest:
 
 def test_fake_clock_satisfies_protocol():
     assert isinstance(FakeClock(), MarketClock)
+
+
+def test_fake_clock_exposes_injected_previous_session_open():
+    previous = datetime(2026, 7, 2, 13, 30, tzinfo=timezone.utc)
+    assert FakeClock(most_recent_open=previous).most_recent_open() == previous
 
 
 def test_is_market_open_follows_clock():

@@ -133,6 +133,19 @@ class OrderResult:
 
 
 @dataclass(frozen=True)
+class BrokerFill:
+    """One immutable execution activity from the broker's authoritative ledger."""
+
+    broker_fill_id: str
+    broker_order_id: str
+    ticker: str
+    side: str
+    qty: Decimal
+    price: Decimal
+    filled_at: datetime
+
+
+@dataclass(frozen=True)
 class PortfolioSnapshot:
     """Everything the risk engine needs, assembled by the caller (A1).
 
@@ -152,6 +165,10 @@ class PortfolioSnapshot:
     realized_pnl_today: Decimal
     as_of: datetime = field(default_factory=_utcnow)
     external_positions: dict[str, "object"] = field(default_factory=dict)
+    # Signed USD exposure from locally tracked APPROVED/SUBMITTED orders that
+    # has not filled yet. Buys are positive, sells negative.
+    pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
+    pending_exposure_complete: bool = True
 
     def position_value(self, ticker: str) -> Decimal:
         pos = self.positions.get(ticker)
@@ -164,3 +181,16 @@ class PortfolioSnapshot:
     def gross_exposure(self) -> Decimal:
         """Total absolute market value across all positions (USD)."""
         return sum((abs(p.market_value) for p in self.positions.values()), Decimal(0))
+
+    def effective_signed_value(self, ticker: str) -> Decimal:
+        symbol = ticker.upper()
+        position = self.positions.get(symbol)
+        held = position.market_value if position is not None else Decimal(0)
+        return held + self.pending_signed_notional.get(symbol, Decimal(0))
+
+    def gross_exposure_with_pending(self) -> Decimal:
+        symbols = set(self.positions) | set(self.pending_signed_notional)
+        return sum(
+            (abs(self.effective_signed_value(symbol)) for symbol in symbols),
+            Decimal(0),
+        )

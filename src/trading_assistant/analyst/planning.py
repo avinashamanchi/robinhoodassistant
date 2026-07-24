@@ -12,12 +12,11 @@ for that class may be approved in PAPER mode only.
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..assets import AssetClass
 from ..broker.models import OrderRequest, OrderSide, OrderType
@@ -106,40 +105,90 @@ class PlanningService:
                     "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
                 }
 
-            # D4: single-tranche + single-target plans go out as a server-side
-            # bracket (survives our downtime); the ladder/trailing/time cases stay
-            # daemon-managed rules.
-            bracket = None
-            eligible = (
-                self.service.config.execution.prefer_bracket_orders
-                and len(plan.entry_plan.tranches) == 1
-                and len(plan.exit_plan.targets) == 1
-                and hasattr(self.service.broker, "submit_bracket")
-                and sized["tranches"] and Decimal(sized["tranches"][0]["shares"]) > 0
+            claim = s.execute(
+                update(TradePlanRow)
+                .where(
+                    TradePlanRow.id == plan_id,
+                    TradePlanRow.status == "proposed",
+                )
+                .values(status="approving")
             )
-            if eligible:
-                tr = sized["tranches"][0]
-                is_long = plan.action is PlanAction.BUY
-                order_req = OrderRequest(
-                    ticker=plan.symbol,
-                    side=OrderSide.BUY if is_long else OrderSide.SELL,
-                    order_type=OrderType.LIMIT, idempotency_key=uuid.uuid4().hex,
-                    qty=Decimal(tr["shares"]), limit_price=Decimal(str(tr["price_level"])),
-                )
-                bracket = self.service.submit_bracket_order(
-                    order_req, plan.exit_plan.targets[0].price_level, plan.exit_plan.stop
-                )
-                rules = self._decompose(plan, sized, plan_id, exits_only=True)
-            else:
-                rules = self._decompose(plan, sized, plan_id)
-            for r in rules:
-                s.add(r)
-            row.status = "approved"
-            row.paper_only = not (live and promotable)
             s.commit()
-            return {"plan_id": plan_id, "status": "approved",
-                    "rules_created": len(rules), "paper_only": row.paper_only,
-                    "bracket": bracket}
+            if claim.rowcount != 1:
+                current = s.get(TradePlanRow, plan_id)
+                return {
+                    "plan_id": plan_id,
+                    "status": current.status if current else None,
+                    "error": "plan approval is already in progress or complete",
+                }
+            s.refresh(row)
+
+            try:
+                # D4: single-tranche + single-target plans go out as a server-side
+                # bracket (survives our downtime); the ladder/trailing/time cases stay
+                # daemon-managed rules.
+                bracket = None
+                eligible = (
+                    self.service.config.execution.prefer_bracket_orders
+                    and len(plan.entry_plan.tranches) == 1
+                    and len(plan.exit_plan.targets) == 1
+                    and hasattr(self.service.broker, "submit_bracket")
+                    and sized["tranches"]
+                    and Decimal(sized["tranches"][0]["shares"]) > 0
+                )
+                if eligible:
+                    tr = sized["tranches"][0]
+                    is_long = plan.action is PlanAction.BUY
+                    order_req = OrderRequest(
+                        ticker=plan.symbol,
+                        side=OrderSide.BUY if is_long else OrderSide.SELL,
+                        order_type=OrderType.LIMIT,
+                        idempotency_key=f"plan-{plan_id}-bracket-entry",
+                        qty=Decimal(tr["shares"]),
+                        limit_price=Decimal(str(tr["price_level"])),
+                    )
+                    bracket = self.service.submit_bracket_order(
+                        order_req,
+                        plan.exit_plan.targets[0].price_level,
+                        plan.exit_plan.stop,
+                    )
+                    if not bracket.get("executed"):
+                        row.status = "rejected"
+                        s.commit()
+                        return {
+                            "plan_id": plan_id,
+                            "status": "rejected",
+                            "error": "bracket entry rejected",
+                            "bracket": bracket,
+                        }
+                    rules = self._decompose(plan, sized, plan_id, exits_only=True)
+                else:
+                    rules = self._decompose(plan, sized, plan_id)
+                for rule in rules:
+                    s.add(rule)
+                row.status = "approved"
+                row.paper_only = not (live and promotable)
+                s.commit()
+                return {
+                    "plan_id": plan_id,
+                    "status": "approved",
+                    "rules_created": len(rules),
+                    "paper_only": row.paper_only,
+                    "bracket": bracket,
+                }
+            except Exception:
+                s.rollback()
+                with self.service.session_factory() as recovery:
+                    recovery.execute(
+                        update(TradePlanRow)
+                        .where(
+                            TradePlanRow.id == plan_id,
+                            TradePlanRow.status == "approving",
+                        )
+                        .values(status="proposed")
+                    )
+                    recovery.commit()
+                raise
 
     def _decompose(
         self, plan: TradePlan, sized: dict, plan_id: int, exits_only: bool = False

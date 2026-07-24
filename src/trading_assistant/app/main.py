@@ -90,6 +90,8 @@ def create_app(
     api_token: Optional[str] = None,
     chat_rate: RateLimiter | None = None,
     approve_rate: RateLimiter | None = None,
+    analysis_rate: RateLimiter | None = None,
+    backtest_rate: RateLimiter | None = None,
 ) -> FastAPI:
     if service is None or agent is None:
         service, agent = build_default_stack()
@@ -123,6 +125,8 @@ def create_app(
 
     chat_rate = chat_rate or RateLimiter(max_requests=20, window_seconds=60)
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
+    analysis_rate = analysis_rate or RateLimiter(max_requests=5, window_seconds=60)
+    backtest_rate = backtest_rate or RateLimiter(max_requests=2, window_seconds=3600)
 
     app = FastAPI(title="Trading Assistant")
     # Same-origin only. Cross-origin requests carrying the custom X-API-Key header
@@ -212,7 +216,9 @@ def create_app(
         return planning
 
     @app.post("/analyze", dependencies=[auth])
-    def analyze(body: AnalyzeIn):
+    def analyze(body: AnalyzeIn, request: Request):
+        if not analysis_rate.allow(_client(request)):
+            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
         return _require_planning().analyze(body.symbol)
 
     @app.get("/plans")
@@ -258,14 +264,18 @@ def create_app(
         )
 
     @app.post("/screen", dependencies=[auth])
-    def screen():
+    def screen(request: Request):
+        if not analysis_rate.allow(_client(request)):
+            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
         return {"candidates": _screen_candidates(service.config.screener.top_n)}
 
     @app.post("/propose", dependencies=[auth])
-    def propose(body: ProposeIn):
+    def propose(body: ProposeIn, request: Request):
         """Screen the market and run the analyst on the top N candidates, creating
         sized plans you can approve. The analyst is UNPROVEN — these are suggestions
         the risk engine still gates; you approve each one."""
+        if not analysis_rate.allow(_client(request)):
+            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
         planning = _require_planning()
         candidates = _screen_candidates(max(body.n, service.config.screener.top_n))
         created = []
@@ -301,7 +311,9 @@ def create_app(
         return {"backtests": _list_backtests(service.session_factory)}
 
     @app.post("/backtests/run", dependencies=[auth])
-    def run_backtest_endpoint(body: BacktestRunIn):
+    def run_backtest_endpoint(body: BacktestRunIn, request: Request):
+        if not backtest_rate.allow(_client(request)):
+            raise HTTPException(status_code=429, detail="backtest rate limit exceeded")
         from ..backtest.runner import run_synthetic_backtest
 
         run_id, report = run_synthetic_backtest(

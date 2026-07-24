@@ -47,6 +47,34 @@ def test_cancel_live_order(make_service):
     assert "error" in svc.cancel_live_order(oid)       # cannot cancel twice
 
 
+def test_cancel_race_records_broker_fill_instead_of_claiming_canceled(make_service):
+    from trading_assistant.broker.models import OrderResult, OrderStatus
+
+    class FilledDuringCancel(MockBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            filled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.FILLED,
+                filled_qty=Decimal("4"),
+                avg_fill_price=Decimal("100"),
+            )
+            self._orders_by_id[order_id] = filled
+            self._orders_by_key[current.idempotency_key] = filled
+            return filled
+
+    broker = FilledDuringCancel()
+    svc = make_service(broker=broker)
+    oid = _submitted(svc)
+
+    result = svc.cancel_live_order(oid)
+
+    assert result["status"] == "filled"
+    assert "not canceled" in result["error"]
+    assert svc.get_order_status(oid)["status"] == "filled"
+
+
 def test_replace_order(make_service):
     svc = make_service()
     oid = _submitted(svc)
@@ -122,3 +150,21 @@ def test_panic_flattens_everything(make_service):
     # Idempotent: a second panic is a no-op on already-flat state.
     res2 = svc.panic()
     assert res2["orders_canceled"] == 0 and res2["rules_disabled"] == 0
+
+
+def test_panic_never_claims_an_unconfirmed_broker_cancel(make_service):
+    class CancelFailureBroker(MockBroker):
+        def cancel_order(self, order_id):
+            raise ConnectionError("broker unavailable")
+
+        def get_order_status(self, order_id):
+            raise ConnectionError("broker unavailable")
+
+    svc = make_service(broker=CancelFailureBroker())
+    oid = _submitted(svc)
+
+    result = svc.panic()
+
+    assert result["orders_canceled"] == 0
+    assert result["orders_unconfirmed"] == [oid]
+    assert svc.get_order_status(oid)["status"] == "submitted"

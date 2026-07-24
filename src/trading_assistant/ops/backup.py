@@ -29,7 +29,8 @@ def backup_database(
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     destination = Path(destination_dir).expanduser().resolve()
-    destination.mkdir(parents=True, exist_ok=True)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.chmod(0o700)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     target = destination / f"{_BACKUP_PREFIX}{stamp}{_BACKUP_SUFFIX}"
@@ -43,7 +44,12 @@ def backup_database(
             check = backup_connection.execute("PRAGMA integrity_check").fetchone()
             if check != ("ok",):
                 raise RuntimeError(f"backup integrity check failed: {check}")
+            # A source in WAL mode transfers that journal setting into the copy.
+            # Backups should be standalone files, not require adjacent -wal/-shm
+            # sidecars, so normalize the completed copy before publishing it.
+            backup_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
         os.replace(temporary, target)
+        target.chmod(0o600)
     finally:
         temporary.unlink(missing_ok=True)
         temporary.with_name(f"{temporary.name}-wal").unlink(missing_ok=True)

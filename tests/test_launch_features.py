@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Event, Thread
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import func, select
 
 from trading_assistant.analyst.accuracy import analyst_accuracy
@@ -91,6 +94,13 @@ def test_digest_has_sections(make_service):
 # ── D4 bracket orders ───────────────────────────────────────────
 def test_single_target_plan_uses_bracket(make_service):
     svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "execution": svc.config.execution.model_copy(
+                update={"prefer_bracket_orders": True}
+            )
+        }
+    )
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
     pid = planning.analyze("AAPL")["plan_id"]
     res = planning.approve_plan(pid)
@@ -102,6 +112,48 @@ def test_single_target_plan_uses_bracket(make_service):
     assert not ({"entry", "target", "stop"} & kinds)        # handled by the bracket
 
 
+def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import OrderRequest, OrderSide, OrderType
+    from trading_assistant.db.models import Order
+
+    class ResponseLossBroker(MockBroker):
+        first = True
+
+        def submit_bracket(self, order, take_profit, stop_loss):
+            result = super().submit_bracket(order, take_profit, stop_loss)
+            if self.first:
+                self.first = False
+                raise ConnectionError("response lost after broker acceptance")
+            return result
+
+    broker = ResponseLossBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="stable-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    with pytest.raises(ConnectionError):
+        svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+    with svc.session_factory() as session:
+        stored = session.execute(
+            select(Order).where(Order.idempotency_key == "stable-plan-bracket")
+        ).scalar_one()
+        assert stored.status == "submitted"
+        assert stored.broker_order_id is None
+
+    result = svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+
+    assert result["executed"] is True
+    assert len(broker._orders_by_key) == 1
+
+
 def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
@@ -109,8 +161,56 @@ def test_ladder_plan_still_uses_rules(make_service):
     planning.approve_plan(pid)
     assert len(svc.broker.brackets) == 0                    # ladder -> daemon rules, not bracket
     with svc.session_factory() as s:
-        kinds = {r.kind for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()}
+        kinds = {
+            r.kind
+            for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()
+        }
     assert "entry" in kinds and "stop" in kinds
+
+
+def test_concurrent_plan_approval_claims_exactly_once(make_service):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    plan_id = planning.analyze("AAPL")["plan_id"]
+    with svc.session_factory() as session:
+        stored = session.get(TradePlanRow, plan_id)
+        expected_rule_count = len(
+            planning._decompose(
+                TradePlan.model_validate_json(stored.plan_json),
+                json.loads(stored.sized_json),
+                plan_id,
+            )
+        )
+    entered = Event()
+    release = Event()
+    original = planning._decompose
+
+    def blocking_decompose(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original(*args, **kwargs)
+
+    planning._decompose = blocking_decompose
+    first_result = {}
+
+    def approve_first():
+        first_result.update(planning.approve_plan(plan_id))
+
+    thread = Thread(target=approve_first)
+    thread.start()
+    assert entered.wait(timeout=2)
+    second = planning.approve_plan(plan_id)
+    release.set()
+    thread.join(timeout=2)
+
+    assert first_result["status"] == "approved"
+    assert second["status"] == "approving"
+    assert "error" in second
+    with svc.session_factory() as session:
+        rules = session.execute(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).scalars().all()
+        assert len(rules) == expected_rule_count
 
 
 # ── C4 accuracy report (mock analyst) ───────────────────────────

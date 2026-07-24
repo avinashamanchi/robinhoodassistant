@@ -53,12 +53,12 @@ external_accounts:
     token_path: ./.rh_token.pickle
 
 features:
-  auto_execute_preapproved_rules: true    # daemon auto-exec pre-approved rules (still passes full risk engine on every fire)
+  auto_execute_preapproved_rules: false   # keep OFF until paper evidence and safety review pass
   telegram_notifications: false           # (Phase 4)
   shadow_mode: true                       # screen+analyze+grade live, zero orders (D1)
 
 execution:
-  prefer_bracket_orders: true             # server-side OCO for single-target plans (D4)
+  prefer_bracket_orders: false            # OFF until extended paper concurrency drills pass
 
 llm:
   provider: gemini            # anthropic | gemini | groq
@@ -71,7 +71,7 @@ llm:
 
 daemon:
   poll_interval_seconds: 15
-  use_websocket: true
+  use_websocket: false               # current daemon uses bounded snapshot polling
   max_quote_age_seconds: 60
   cycle_timeout_seconds: 90
   daily_task_timeout_seconds: 120

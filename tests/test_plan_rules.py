@@ -64,16 +64,59 @@ def test_trailing_hwm_persists_across_restart(make_service):
 
 # ── OCO: a stop firing cancels the plan's siblings ──────────────
 def test_oco_cancels_siblings_atomically(make_service):
-    svc = make_service()
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
     _add_rule(svc, kind="entry", plan_id=1, condition_json=json.dumps({"price_below": 80}))
     _add_rule(svc, kind="target", plan_id=1, condition_json=json.dumps({"price_above": 200}))
-    _add_rule(svc, kind="stop", plan_id=1, condition_json=json.dumps({"price_below": 90}))
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=1,
+        pre_approved=True,
+        condition_json=json.dumps({"price_below": 90}),
+    )
 
     svc.broker.set_price("AAPL", Decimal("85"))            # only the stop's condition is true
-    acted = Monitor(svc, NullNotifier()).tick()
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
     assert len(acted) == 1 and acted[0]["oco_canceled"] == 2
 
     with svc.session_factory() as s:
         states = {r.kind: r.state for r in s.execute(select(Rule)).scalars()}
     assert states["stop"] == "triggered"
     assert states["entry"] == "canceled" and states["target"] == "canceled"
+
+
+def test_full_exit_is_capped_to_unreserved_live_position(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    class RecordingBroker(MockBroker):
+        submitted = []
+
+        def submit_order(self, order):
+            self.submitted.append(order)
+            return super().submit_order(order)
+
+    broker = RecordingBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=2,
+        pre_approved=True,
+        action_json=json.dumps({"side": "sell", "qty": "10"}),
+        condition_json=json.dumps({"price_below": 95}),
+    )
+    broker.set_price("AAPL", Decimal("90"))
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert acted[0]["executed"]["executed"] is True
+    assert broker.submitted[0].qty == Decimal("5")

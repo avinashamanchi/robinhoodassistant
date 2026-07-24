@@ -74,6 +74,32 @@ def test_max_position_per_ticker(risk_config, make_snapshot):
     assert any("per ticker" in r for r in result.reasons)
 
 
+def test_max_position_includes_outstanding_order_exposure(
+    risk_config, make_snapshot
+):
+    engine = RiskEngine(risk_config)
+    snap = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        pending_signed_notional={"AAPL": Decimal("1800")},
+    )
+    result = _check(engine, _order(notional="400"), snap)
+    assert result.rejected
+    assert any("per ticker" in reason for reason in result.reasons)
+
+
+def test_unknown_outstanding_order_exposure_fails_closed(
+    risk_config, make_snapshot
+):
+    engine = RiskEngine(risk_config)
+    snapshot = make_snapshot(prices={"AAPL": Decimal("100")})
+    object.__setattr__(snapshot, "pending_exposure_complete", False)
+
+    result = _check(engine, _order(notional="100"), snapshot)
+
+    assert result.rejected
+    assert any("outstanding order exposure" in reason for reason in result.reasons)
+
+
 def test_max_portfolio_exposure(risk_config, make_snapshot):
     cfg = risk_config.model_copy(
         update={"max_notional_per_order": 100000, "max_position_per_ticker": 100000,

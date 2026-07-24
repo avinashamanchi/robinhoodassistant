@@ -15,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
@@ -71,15 +72,42 @@ class Monitor:
                 for r in rules
             ]
 
-    def _mark_triggered(self, rule_id: int) -> bool:
-        """Atomically flip active -> triggered. Returns False if already handled."""
+    def _claim_rule(self, rule_id: int) -> bool:
+        """Atomically claim active -> processing exactly once."""
         with self.service.session_factory() as s:
-            rule = s.get(Rule, rule_id)
-            if rule is None or rule.state != "active":
-                return False
-            rule.state = "triggered"
+            result = s.execute(
+                update(Rule)
+                .where(Rule.id == rule_id, Rule.state == "active")
+                .values(state="processing")
+            )
             s.commit()
-            return True
+            return result.rowcount == 1
+
+    def _finish_claim(self, rule_id: int, state: str) -> None:
+        with self.service.session_factory() as s:
+            s.execute(
+                update(Rule)
+                .where(Rule.id == rule_id, Rule.state == "processing")
+                .values(state=state)
+            )
+            s.commit()
+
+    def _effective_action(self, rule: dict, action: dict) -> dict | None:
+        if rule["kind"] not in ("target", "stop", "trailing", "time"):
+            return dict(action)
+        side = action["side"]
+        available = self.service.available_reduce_qty(rule["ticker"], side)
+        if available <= 0:
+            return None
+        adjusted = dict(action)
+        if adjusted.get("qty") is not None:
+            adjusted["qty"] = str(min(Decimal(str(adjusted["qty"])), available))
+        else:
+            quote = self.service.broker.get_quote(rule["ticker"])
+            requested = Decimal(str(adjusted.get("notional", 0))) / quote.last
+            adjusted.pop("notional", None)
+            adjusted["qty"] = str(min(requested, available))
+        return adjusted
 
     def _persist_hwm(self, rule_id: int, hwm) -> None:
         with self.service.session_factory() as s:
@@ -122,44 +150,102 @@ class Monitor:
 
     def tick(self) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
+        quotes: dict[str, Any] = {}
         for rule in self._active_rules():
             rule_id, ticker, action = rule["id"], rule["ticker"], rule["action"]
-            quote = self.service.broker.get_quote(ticker)
+            if ticker not in quotes:
+                quotes[ticker] = self.service.broker.get_quote(ticker)
+            quote = quotes[ticker]
             if not self._fires(rule, quote):
                 continue
-            # Claim the rule first so a concurrent tick can't double-fire it.
-            if not self._mark_triggered(rule_id):
+            # Compare-and-set claim prevents concurrent monitors from double firing.
+            if not self._claim_rule(rule_id):
                 continue
+            try:
+                effective_action = self._effective_action(rule, action)
+                if effective_action is None:
+                    self._finish_claim(rule_id, "canceled")
+                    actions.append(
+                        {
+                            "rule_id": rule_id,
+                            "proposal": None,
+                            "executed": None,
+                            "oco_canceled": 0,
+                            "error": "no unreserved position to exit",
+                        }
+                    )
+                    continue
 
-            proposal = self.service.propose_order(
-                ticker=ticker,
-                side=action["side"],
-                order_type=action.get("order_type", "market"),
-                qty=action.get("qty"),
-                notional=action.get("notional"),
-                limit_price=action.get("limit_price"),
-            )
-            self.notifier.send(
-                f"Rule {rule_id} ({rule['kind']}) triggered on {ticker}: "
-                f"proposal #{proposal['order_id']} [{proposal['status']}]"
-            )
+                proposal = self.service.propose_order(
+                    ticker=ticker,
+                    side=effective_action["side"],
+                    order_type=effective_action.get("order_type", "market"),
+                    qty=effective_action.get("qty"),
+                    notional=effective_action.get("notional"),
+                    limit_price=effective_action.get("limit_price"),
+                    idempotency_key=f"rule-{rule_id}",
+                )
+                self.notifier.send(
+                    f"Rule {rule_id} ({rule['kind']}) triggered on {ticker}: "
+                    f"proposal #{proposal['order_id']} [{proposal['status']}]"
+                )
+                if proposal["status"] != "proposed":
+                    self._finish_claim(rule_id, "failed")
+                    actions.append(
+                        {
+                            "rule_id": rule_id,
+                            "proposal": proposal,
+                            "executed": None,
+                            "oco_canceled": 0,
+                        }
+                    )
+                    continue
 
-            executed = None
-            # Only PRE-APPROVED plan rules auto-exec, and only when the flag is on;
-            # ad-hoc rules always await human approval. Execution still passes the
-            # full risk engine.
-            if self.auto_execute and rule["pre_approved"] and proposal["status"] == "proposed":
-                executed = self.service.approve_order(proposal["order_id"])
+                executed = None
+                if self.auto_execute and rule["pre_approved"]:
+                    executed = self.service.approve_order(proposal["order_id"])
+                    if not executed.get("executed"):
+                        self._finish_claim(rule_id, "failed")
+                        actions.append(
+                            {
+                                "rule_id": rule_id,
+                                "proposal": proposal,
+                                "executed": executed,
+                                "oco_canceled": 0,
+                            }
+                        )
+                        continue
 
-            # OCO: a full-exit rule (stop/trailing/time) cancels the plan's siblings.
-            canceled = 0
-            if rule["kind"] in ("stop", "trailing", "time") and rule["plan_id"] is not None:
-                canceled = self._cancel_siblings(rule["plan_id"], rule_id)
+                self._finish_claim(rule_id, "triggered")
+                canceled = 0
+                if (
+                    executed is not None
+                    and executed.get("executed")
+                    and rule["kind"] in ("stop", "trailing", "time")
+                    and rule["plan_id"] is not None
+                ):
+                    canceled = self._cancel_siblings(rule["plan_id"], rule_id)
 
-            actions.append(
-                {"rule_id": rule_id, "proposal": proposal, "executed": executed,
-                 "oco_canceled": canceled}
-            )
+                actions.append(
+                    {
+                        "rule_id": rule_id,
+                        "proposal": proposal,
+                        "executed": executed,
+                        "oco_canceled": canceled,
+                    }
+                )
+            except Exception as exc:
+                self._finish_claim(rule_id, "active")
+                log.exception("rule %s execution failed; returned to active", rule_id)
+                actions.append(
+                    {
+                        "rule_id": rule_id,
+                        "proposal": None,
+                        "executed": None,
+                        "oco_canceled": 0,
+                        "error": type(exc).__name__,
+                    }
+                )
         return actions
 
     def run_daily_tasks(self, today=None) -> dict[str, Any]:
@@ -194,6 +280,12 @@ class Monitor:
         order_sync = self.service.sync_open_orders()
         position_reconciliation = self.service.reconcile_positions()
         with self.service.session_factory() as s:
+            recovered = s.execute(
+                update(Rule)
+                .where(Rule.state == "processing")
+                .values(state="active")
+            ).rowcount
+            s.commit()
             active = s.execute(
                 select(Rule).where(Rule.state == "active")
             ).scalars().all()
@@ -203,6 +295,7 @@ class Monitor:
         summary = {
             "active": len(active),
             "triggered": len(triggered),
+            "claims_recovered": recovered,
             "order_sync": order_sync,
             "position_reconciliation": position_reconciliation,
         }
@@ -210,7 +303,14 @@ class Monitor:
         return summary
 
     def _core_cycle(self) -> None:
-        self.service.sync_open_orders()
+        order_sync = self.service.sync_open_orders()
+        if order_sync.get("failed", 0):
+            self.service.trip_all_killswitches(
+                "runtime broker order reconciliation failed"
+            )
+            raise RuntimeError(
+                "runtime broker order reconciliation failed; kill switches tripped"
+            )
         self.service.enforce_daily_loss_limits()
         self.tick()
 
@@ -225,14 +325,20 @@ class Monitor:
         if self._core_task is not None:
             if not self._core_task.done():
                 raise TimeoutError("previous daemon core cycle is still running")
-            self._core_task.result()
+            completed = self._core_task
             self._core_task = None
+            completed.result()
 
         self._core_task = asyncio.create_task(asyncio.to_thread(self._core_cycle))
-        await asyncio.wait_for(
-            asyncio.shield(self._core_task), timeout=self.cycle_timeout
-        )
-        self._core_task.result()
+        current = self._core_task
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(current), timeout=self.cycle_timeout
+            )
+        except BaseException:
+            if current.done():
+                self._core_task = None
+            raise
         self._core_task = None
 
     async def _bounded_daily_tasks(self) -> None:
@@ -258,9 +364,15 @@ class Monitor:
 
     # ── async loop with exponential backoff (A4) ───────────────
     async def run(self, stop_event: Optional[asyncio.Event] = None) -> None:
-        await asyncio.wait_for(
+        startup = await asyncio.wait_for(
             asyncio.to_thread(self.reconcile), timeout=self.cycle_timeout
         )
+        if (
+            startup["order_sync"].get("failed", 0)
+            or not startup["position_reconciliation"].get("reconciled", False)
+        ):
+            self.service.trip_all_killswitches("startup reconciliation failed")
+            raise RuntimeError("startup reconciliation failed; kill switches tripped")
         attempt = 0
         while not (stop_event and stop_event.is_set()):
             try:
