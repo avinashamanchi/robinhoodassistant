@@ -72,3 +72,7 @@ llm:
 daemon:
   poll_interval_seconds: 15
   use_websocket: true
+  max_quote_age_seconds: 60
+  cycle_timeout_seconds: 90
+  daily_task_timeout_seconds: 120
+  heartbeat_stale_seconds: 180

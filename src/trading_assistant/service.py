@@ -451,7 +451,10 @@ class TradingService:
             return {
                 "db_ok": True,
                 "heartbeat_age_seconds": round(age, 1) if age is not None else None,
-                "daemon_alive": age is not None and age < 120,
+                "daemon_alive": (
+                    age is not None
+                    and age < self.config.daemon.heartbeat_stale_seconds
+                ),
                 "killswitch": {"equity": eq_tripped, "crypto": cr_tripped},
             }
         except Exception as exc:

@@ -38,6 +38,8 @@ class Monitor:
         auto_execute: bool = False,
         poll_interval_seconds: float = 15.0,
         max_quote_age_seconds: float = 60.0,
+        cycle_timeout_seconds: float = 90.0,
+        daily_task_timeout_seconds: float = 120.0,
         shadow=None,
         digest_source=None,
     ) -> None:
@@ -46,9 +48,13 @@ class Monitor:
         self.auto_execute = auto_execute
         self.poll_interval = poll_interval_seconds
         self.max_quote_age_seconds = max_quote_age_seconds
+        self.cycle_timeout = cycle_timeout_seconds
+        self.daily_task_timeout = daily_task_timeout_seconds
         self.shadow = shadow                 # ShadowRunner or None (D1)
         self.digest_source = digest_source   # screen source for the digest (D2)
         self._last_daily = None              # date of last daily-tasks run
+        self._core_task: Optional[asyncio.Task[Any]] = None
+        self._daily_task: Optional[asyncio.Task[Any]] = None
 
     # ── one evaluation pass (synchronous, testable) ────────────
     def _active_rules(self) -> list[dict[str, Any]]:
@@ -203,19 +209,66 @@ class Monitor:
         log.info("daemon reconcile: %s", summary)
         return summary
 
+    def _core_cycle(self) -> None:
+        self.service.sync_open_orders()
+        self.service.enforce_daily_loss_limits()
+        self.tick()
+
+    async def _bounded_core_cycle(self) -> None:
+        """Run one safety cycle without ever blocking the asyncio event loop.
+
+        ``wait_for`` cannot kill a Python worker thread, so a timed-out task is
+        retained and no replacement cycle is started until it exits. This avoids
+        accumulating workers or racing multiple rule evaluators while the
+        external launchd watchdog restarts a genuinely wedged process.
+        """
+        if self._core_task is not None:
+            if not self._core_task.done():
+                raise TimeoutError("previous daemon core cycle is still running")
+            self._core_task.result()
+            self._core_task = None
+
+        self._core_task = asyncio.create_task(asyncio.to_thread(self._core_cycle))
+        await asyncio.wait_for(
+            asyncio.shield(self._core_task), timeout=self.cycle_timeout
+        )
+        self._core_task.result()
+        self._core_task = None
+
+    async def _bounded_daily_tasks(self) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self.run_daily_tasks),
+                timeout=self.daily_task_timeout,
+            )
+        except TimeoutError:
+            log.error(
+                "daily analysis exceeded %.1fs; safety heartbeat loop continues",
+                self.daily_task_timeout,
+            )
+        except Exception:
+            log.exception("daily analysis task failed")
+
+    def _schedule_daily_tasks(self) -> None:
+        if self._daily_task is not None and not self._daily_task.done():
+            return
+        if self._daily_task is not None:
+            self._daily_task.result()
+        self._daily_task = asyncio.create_task(self._bounded_daily_tasks())
+
     # ── async loop with exponential backoff (A4) ───────────────
     async def run(self, stop_event: Optional[asyncio.Event] = None) -> None:
-        self.reconcile()
+        await asyncio.wait_for(
+            asyncio.to_thread(self.reconcile), timeout=self.cycle_timeout
+        )
         attempt = 0
         while not (stop_event and stop_event.is_set()):
             try:
-                self.service.sync_open_orders()         # reconcile fills from broker
-                self.service.enforce_daily_loss_limits()  # trip kill switch on breach
-                self.tick()
-                # Heartbeat BEFORE the slow once-a-day shadow run so liveness is
-                # immediate and a watchdog never false-alarms during the daily batch.
+                await self._bounded_core_cycle()
                 self.service.write_heartbeat("daemon")  # liveness for /health (D3)
-                self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
+                # Shadow analysis and the digest run independently. They can time
+                # out or fail without delaying order sync, rules, or heartbeats.
+                self._schedule_daily_tasks()
                 if attempt:  # recovered — feed is healthy again
                     log.info("monitor recovered after %d failed attempt(s)", attempt)
                 attempt = 0

@@ -92,6 +92,9 @@ class DaemonConfig(_Strict):
     poll_interval_seconds: int = Field(gt=0)
     use_websocket: bool = True
     max_quote_age_seconds: float = Field(default=60.0, gt=0)  # staleness gate (A4)
+    cycle_timeout_seconds: float = Field(default=90.0, gt=0)
+    daily_task_timeout_seconds: float = Field(default=120.0, gt=0)
+    heartbeat_stale_seconds: float = Field(default=180.0, gt=0)
 
 
 class FillConfig(_Strict):

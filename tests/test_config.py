@@ -54,6 +54,9 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     # allowlist uppercased
     assert cfg.risk.ticker_allowlist == ["AAPL", "MSFT"]
     assert cfg.risk.proposal_ttl_minutes == 15
+    assert cfg.daemon.cycle_timeout_seconds == 90.0
+    assert cfg.daemon.daily_task_timeout_seconds == 120.0
+    assert cfg.daemon.heartbeat_stale_seconds == 180.0
 
 
 def test_typo_in_risk_key_fails_to_load(tmp_path):
@@ -80,6 +83,10 @@ def test_non_positive_limit_rejected(tmp_path):
     [
         ("broker: mock", "broker: mock\n  request_timeout_seconds: 0"),
         ("max_tokens: 4096", "max_tokens: 4096\n  request_timeout_seconds: 0"),
+        (
+            "poll_interval_seconds: 15",
+            "poll_interval_seconds: 15\n  heartbeat_stale_seconds: 0",
+        ),
     ],
 )
 def test_non_positive_external_timeout_rejected(tmp_path, old, new):

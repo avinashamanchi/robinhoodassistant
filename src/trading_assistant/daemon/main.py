@@ -65,6 +65,8 @@ def build_monitor() -> Monitor:
         auto_execute=config.features.auto_execute_preapproved_rules,
         poll_interval_seconds=config.daemon.poll_interval_seconds,
         max_quote_age_seconds=config.daemon.max_quote_age_seconds,
+        cycle_timeout_seconds=config.daemon.cycle_timeout_seconds,
+        daily_task_timeout_seconds=config.daemon.daily_task_timeout_seconds,
         shadow=shadow,
         digest_source=screen_source,
     )

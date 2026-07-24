@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from decimal import Decimal
 
 from trading_assistant.daemon.monitor import Monitor
@@ -121,3 +123,43 @@ def test_daemon_loop_body_runs_clean(make_service):
     mon.run_daily_tasks()
     svc.write_heartbeat("daemon")
     assert svc.health()["db_ok"] is True and svc.health()["daemon_alive"] is True
+
+
+def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
+    class SlowShadow:
+        def grade_due(self):
+            time.sleep(0.12)
+            return 0
+
+        def run_once(self):
+            return []
+
+    svc = make_service()
+    heartbeat_count = 0
+    original_write = svc.write_heartbeat
+
+    def count_heartbeat(source="daemon"):
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        return original_write(source)
+
+    svc.write_heartbeat = count_heartbeat
+    monitor = Monitor(
+        svc,
+        NullNotifier(),
+        poll_interval_seconds=0.01,
+        cycle_timeout_seconds=0.2,
+        daily_task_timeout_seconds=0.02,
+        shadow=SlowShadow(),
+    )
+
+    async def scenario():
+        stop = asyncio.Event()
+        task = asyncio.create_task(monitor.run(stop))
+        await asyncio.sleep(0.09)
+        stop.set()
+        await asyncio.wait_for(task, timeout=0.5)
+
+    asyncio.run(scenario())
+
+    assert heartbeat_count >= 3
