@@ -31,6 +31,7 @@ from trading_assistant.db.models import (
 from trading_assistant.risk.breakers import BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
 from trading_assistant.risk.staleness import is_stale
+from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 
 _PENDING_STATUSES = (
@@ -66,6 +67,7 @@ class PortfolioSnapshotService:
         self.risk_config_for_asset = risk_config_for_asset
         self.breakers = breakers or BreakerService(session_factory)
         self.now = now
+        self.submission_barrier = SubmissionBarrier(session_factory)
 
     def assemble_for_execution(
         self, ticker: str, *, exclude_order_id: int | None = None
@@ -275,14 +277,15 @@ class PortfolioSnapshotService:
                 "updated_at": statement.excluded.updated_at,
             },
         )
-        with self.session_factory() as session:
-            session.execute(statement)
-            session.flush()
-            state = session.get(AccountRiskState, asset_class.value)
-            assert state is not None
-            high_water_mark = state.high_water_mark
-            session.commit()
-            return high_water_mark
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                session.execute(statement)
+                session.flush()
+                state = session.get(AccountRiskState, asset_class.value)
+                assert state is not None
+                high_water_mark = state.high_water_mark
+                session.commit()
+                return high_water_mark
 
     def _max_quote_age(self, asset_class: AssetClass) -> Decimal:
         if self.risk_config_for_asset is None:

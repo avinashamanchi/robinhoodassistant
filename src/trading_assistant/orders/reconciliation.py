@@ -22,6 +22,7 @@ from trading_assistant.db.models import (
     Proposal,
 )
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
+from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 from .repository import OrderRepository
 
@@ -72,11 +73,13 @@ class ReconciliationService:
         self.repository = repository
         self.breakers = breakers or BreakerService(session_factory)
         self.broker_key = broker.reconciliation_key
+        self.submission_barrier = SubmissionBarrier(session_factory)
 
     def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
-        resolved, unresolved, _ = self._resolve_unknown()
-        self._clear_reconciled_rule_groups()
-        return resolved, unresolved
+        with self.submission_barrier.hold_writer():
+            resolved, unresolved, _ = self._resolve_unknown()
+            self._clear_reconciled_rule_groups()
+            return resolved, unresolved
 
     def _resolve_unknown(
         self,
@@ -120,22 +123,23 @@ class ReconciliationService:
         )
 
     def reconcile(self) -> ReconciliationReport:
-        resolved, unresolved, resolved_results = self._resolve_unknown()
-        drift: list[str] = []
-        inserted_fills = self._reconcile_fill_activities(drift)
-        synced, synthetic_fills = self._reconcile_statuses(
-            drift, prefetched_results=resolved_results
-        )
-        inserted_fills += synthetic_fills
-        self._clear_reconciled_rule_groups()
-        self._detect_open_order_drift(drift)
-        return ReconciliationReport(
-            resolved_unknown=resolved,
-            unresolved_unknown=unresolved,
-            synced_orders=synced,
-            inserted_fills=inserted_fills,
-            broker_drift=tuple(drift),
-        )
+        with self.submission_barrier.hold_writer():
+            resolved, unresolved, resolved_results = self._resolve_unknown()
+            drift: list[str] = []
+            inserted_fills = self._reconcile_fill_activities(drift)
+            synced, synthetic_fills = self._reconcile_statuses(
+                drift, prefetched_results=resolved_results
+            )
+            inserted_fills += synthetic_fills
+            self._clear_reconciled_rule_groups()
+            self._detect_open_order_drift(drift)
+            return ReconciliationReport(
+                resolved_unknown=resolved,
+                unresolved_unknown=unresolved,
+                synced_orders=synced,
+                inserted_fills=inserted_fills,
+                broker_drift=tuple(drift),
+            )
 
     def _clear_reconciled_rule_groups(self) -> None:
         """Clear only groups whose linked outbox has no unresolved acceptance.
@@ -381,7 +385,33 @@ class ReconciliationService:
                 target = remote.status
                 current = OrderStatus(order.status)
                 latch_changed = False
-                if target in _FILL_STATUSES:
+                prior_fills = session.scalars(
+                    select(Fill).where(Fill.order_id == order.id)
+                ).all()
+                recorded = sum(
+                    (fill.qty for fill in prior_fills), Decimal(0)
+                )
+                synthetic_prefix = f"{order.broker_order_id}:"
+                authoritative_fills = [
+                    fill
+                    for fill in prior_fills
+                    if (
+                        fill.broker_fill_id is not None
+                        and not fill.broker_fill_id.startswith(
+                            synthetic_prefix
+                        )
+                    )
+                ]
+                authoritative_qty = sum(
+                    (fill.qty for fill in authoritative_fills),
+                    Decimal(0),
+                )
+                remote_exceeds_authoritative = (
+                    remote.filled_qty.is_finite()
+                    and remote.filled_qty
+                    > authoritative_qty + Decimal("0.000001")
+                )
+                if target in _FILL_STATUSES or remote_exceeds_authoritative:
                     if (
                         target is not current
                         and OrderStateMachine.can_transition(current, target)
@@ -397,32 +427,11 @@ class ReconciliationService:
                         )
                         order.updated_at = datetime.now(timezone.utc)
                         latch_changed = True
-                prior_fills = session.scalars(
-                    select(Fill).where(Fill.order_id == order.id)
-                ).all()
-                recorded = sum(
-                    (fill.qty for fill in prior_fills), Decimal(0)
-                )
                 fill_reconciliation_required = (
                     order.acceptance_state
                     == FILL_RECONCILIATION_REQUIRED
                 )
                 if fill_reconciliation_required:
-                    synthetic_prefix = f"{order.broker_order_id}:"
-                    authoritative_fills = [
-                        fill
-                        for fill in prior_fills
-                        if (
-                            fill.broker_fill_id is not None
-                            and not fill.broker_fill_id.startswith(
-                                synthetic_prefix
-                            )
-                        )
-                    ]
-                    authoritative_qty = sum(
-                        (fill.qty for fill in authoritative_fills),
-                        Decimal(0),
-                    )
                     if not exact_reader:
                         drift.append(
                             f"broker order {order.id} requires authoritative "
@@ -685,14 +694,52 @@ class ReconciliationService:
             "updated_at": now,
             "version": Order.version + 1,
         }
-        if remote.status in _FILL_STATUSES:
-            values["acceptance_state"] = (
-                FILL_RECONCILIATION_REQUIRED
-            )
-        with self.session_factory() as session:
-            session.execute(
-                update(Order)
-                .where(Order.id.in_(local_order_ids))
-                .values(**values)
-            )
-            session.commit()
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                latch_order_ids: list[int] = []
+                orders = session.scalars(
+                    select(Order).where(Order.id.in_(local_order_ids))
+                ).all()
+                for order in orders:
+                    synthetic_prefix = f"{order.broker_order_id}:"
+                    local_fills = session.scalars(
+                        select(Fill).where(Fill.order_id == order.id)
+                    ).all()
+                    authoritative_qty = sum(
+                        (
+                            fill.qty
+                            for fill in local_fills
+                            if (
+                                fill.broker_fill_id is not None
+                                and not fill.broker_fill_id.startswith(
+                                    synthetic_prefix
+                                )
+                            )
+                        ),
+                        Decimal(0),
+                    )
+                    if (
+                        remote.status in _FILL_STATUSES
+                        or (
+                            remote.filled_qty.is_finite()
+                            and remote.filled_qty
+                            > authoritative_qty + Decimal("0.000001")
+                        )
+                    ):
+                        latch_order_ids.append(order.id)
+                session.execute(
+                    update(Order)
+                    .where(Order.id.in_(local_order_ids))
+                    .values(**values)
+                )
+                if latch_order_ids:
+                    session.execute(
+                        update(Order)
+                        .where(Order.id.in_(latch_order_ids))
+                        .values(
+                            acceptance_state=(
+                                FILL_RECONCILIATION_REQUIRED
+                            )
+                        )
+                    )
+                session.commit()

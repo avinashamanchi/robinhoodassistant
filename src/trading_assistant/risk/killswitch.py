@@ -61,7 +61,7 @@ class KillSwitch:
     ) -> None:
         scope = _scope(asset_class)
         _require_barrier_before_transaction(session)
-        with SubmissionBarrier(session).hold():
+        with SubmissionBarrier(session).hold_writer():
             try:
                 _state, changed = trip_in_session(
                     session,
@@ -89,7 +89,7 @@ class KillSwitch:
     ) -> None:
         scope = _scope(asset_class)
         _require_barrier_before_transaction(session)
-        with SubmissionBarrier(session).hold():
+        with SubmissionBarrier(session).hold_writer():
             try:
                 row = session.get(CircuitBreakerState, scope.key)
                 if row is None:

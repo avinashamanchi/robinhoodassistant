@@ -57,6 +57,7 @@ from .risk.breakers import BreakerScope, BreakerService
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.pnl import FillLike, realized_pnl_today
+from .risk.submission_barrier import SubmissionBarrier
 
 # Statuses that count as "still live / open" for listing purposes.
 _OPEN_STATUSES = (
@@ -108,6 +109,7 @@ class TradingService:
             AssetClass.EQUITY: self.risk,
             AssetClass.CRYPTO: RiskEngine(crypto_cfg),
         }
+        self.submission_barrier = SubmissionBarrier(session_factory)
         self.breakers = BreakerService(session_factory)
         self.snapshot_service = PortfolioSnapshotService(
             session_factory,
@@ -662,6 +664,23 @@ class TradingService:
         broker_fill_id: Optional[str] = None,
         ts=None,
     ) -> dict[str, Any]:
+        with self.submission_barrier.hold_writer():
+            return self._record_fill(
+                order_id,
+                qty,
+                price,
+                broker_fill_id=broker_fill_id,
+                ts=ts,
+            )
+
+    def _record_fill(
+        self,
+        order_id: int,
+        qty: str,
+        price: str,
+        broker_fill_id: Optional[str] = None,
+        ts=None,
+    ) -> dict[str, Any]:
         """Ingest a (possibly partial) fill and advance the order lifecycle.
 
         Idempotent on ``broker_fill_id`` — a duplicated fill event is ignored,
@@ -757,7 +776,6 @@ class TradingService:
 
     def cancel_live_order(self, order_id: int) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
-        broker_status: OrderStatus | None = None
         with self.session_factory() as s:
             order = s.get(Order, order_id)
             if order is None:
@@ -768,41 +786,42 @@ class TradingService:
             ):
                 return {"order_id": order_id, "status": order.status,
                         "error": "order not cancelable in this state"}
-            if order.broker_order_id:
-                try:
-                    broker_result = self.broker.cancel_order(order.broker_order_id)
-                except Exception as cancel_error:
-                    # A cancel can race a fill. Query authoritative broker state;
-                    # never claim CANCELED merely because the DELETE failed.
-                    try:
-                        broker_result = self.broker.get_order_status(
-                            order.broker_order_id
-                        )
-                    except Exception:
-                        return {
-                            "order_id": order_id,
-                            "status": order.status,
-                            "error": (
-                                "broker cancellation could not be confirmed: "
-                                f"{type(cancel_error).__name__}"
-                            ),
-                        }
-                broker_status = broker_result.status
-                if broker_status is OrderStatus.CANCELED:
-                    OrderStateMachine.transition(order, OrderStatus.CANCELED)
-                    s.commit()
-                    return {"order_id": order_id, "status": order.status}
-            else:
+            broker_order_id = order.broker_order_id
+            local_status = order.status
+            if not broker_order_id:
                 return {
                     "order_id": order_id,
                     "status": order.status,
                     "error": "live order has no broker order id",
                 }
 
-        # The broker reported a fill or another non-canceled state. Leave the
-        # local row open until the normal reconciliation path ingests broker truth.
+        # Broker I/O is complete before reconciliation opens any write
+        # transaction. Every returned cumulative fill quantity, including a
+        # canceled-after-partial result, then follows the same authoritative
+        # fill-latch path as scheduled reconciliation.
+        try:
+            broker_result = self.broker.cancel_order(broker_order_id)
+        except Exception as cancel_error:
+            try:
+                broker_result = self.broker.get_order_status(broker_order_id)
+            except Exception:
+                return {
+                    "order_id": order_id,
+                    "status": local_status,
+                    "error": (
+                        "broker cancellation could not be confirmed: "
+                        f"{type(cancel_error).__name__}"
+                    ),
+                }
+        broker_status = broker_result.status
         sync = self.sync_open_orders()
         current = self.get_order_status(order_id)
+        if (
+            broker_status is OrderStatus.CANCELED
+            and current is not None
+            and current["status"] == OrderStatus.CANCELED.value
+        ):
+            return {"order_id": order_id, "status": current["status"]}
         return {
             "order_id": order_id,
             "status": current["status"] if current else None,

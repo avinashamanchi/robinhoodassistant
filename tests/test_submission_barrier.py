@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
+import time
 from decimal import Decimal
 from multiprocessing.context import SpawnContext
 
@@ -10,9 +13,9 @@ from sqlalchemy import text
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import OrderResult, OrderStatus
+from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
 from trading_assistant.config import RiskConfig
-from trading_assistant.db.models import Order, utcnow
+from trading_assistant.db.models import Fill, Order, utcnow
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.reconciliation import ReconciliationService
@@ -23,6 +26,7 @@ from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.risk.engine import RiskEngine, RiskResult
 from trading_assistant.risk.killswitch import KillSwitch
+from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 
 class _StaticSnapshotService:
@@ -69,6 +73,36 @@ class _QueuedSnapshotBroker(MockBroker):
         return accepted
 
 
+class _LossFillRaceBroker(MockBroker):
+    reconciliation_key = "loss-fill-risk-writer"
+
+    def get_fill_activities(self, after=None):
+        return [
+            BrokerFill(
+                broker_fill_id="loss-fill-risk-writer-activity",
+                broker_order_id="loss-fill-risk-writer-order",
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("1"),
+                price=Decimal("1"),
+                filled_at=utcnow(),
+            )
+        ]
+
+    def get_order_status(self, order_id):
+        assert order_id == "loss-fill-risk-writer-order"
+        return OrderResult(
+            idempotency_key="loss-fill-risk-writer-client",
+            broker_order_id=order_id,
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("1"),
+            avg_fill_price=Decimal("1"),
+        )
+
+    def get_open_orders(self):
+        return []
+
+
 def _process_risk_config() -> RiskConfig:
     return RiskConfig(
         ticker_allowlist=["AAPL"],
@@ -80,6 +114,139 @@ def _process_risk_config() -> RiskConfig:
         reject_when_market_closed=True,
         proposal_ttl_minutes=15,
     )
+
+
+def _risk_writer_submission_process(
+    db_url,
+    order_id,
+    snapshot_evaluated,
+    release_evaluation,
+    broker_entered,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    repository = OrderRepository(factory)
+    broker = _QueuedSnapshotBroker(
+        broker_entered,
+        disconnect_after_acceptance=False,
+    )
+    config = _process_risk_config().model_copy(
+        update={
+            "max_daily_total_loss": 50,
+            "max_account_drawdown_pct": 10,
+        }
+    )
+    breakers = BreakerService(factory)
+    snapshot_service = PortfolioSnapshotService(
+        factory,
+        broker,
+        lambda _asset_class: FakeClock(),
+        lambda: {},
+        lambda _asset_class: config,
+        breakers,
+        utcnow,
+    )
+
+    class _PauseAfterFirstEvaluation:
+        def __init__(self):
+            self.calls = 0
+            self.engine = RiskEngine(config)
+
+        def check(self, order, snapshot):
+            result = self.engine.check(order, snapshot)
+            self.calls += 1
+            if self.calls == 1:
+                snapshot_evaluated.set()
+                if not release_evaluation.wait(timeout=10):
+                    raise TimeoutError("test did not release risk evaluation")
+            return result
+
+    risk = _PauseAfterFirstEvaluation()
+    service = OrderSubmissionService(
+        repository,
+        factory,
+        broker,
+        snapshot_service,
+        lambda _symbol: risk,
+        utcnow,
+    )
+    try:
+        result = service.submit(order_id)
+        outcome.put(
+            ("ok", result.status.value, tuple(result.risk_reasons))
+        )
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _loss_fill_writer_process(db_url, started, finished, outcome):
+    factory = make_session_factory(create_db_engine(db_url))
+    started.set()
+    try:
+        report = ReconciliationService(
+            factory,
+            _LossFillRaceBroker(),
+            OrderRepository(factory),
+        ).reconcile()
+        outcome.put(("ok", report.inserted_fills))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _higher_hwm_writer_process(db_url, started, finished, outcome):
+    factory = make_session_factory(create_db_engine(db_url))
+    config = _process_risk_config()
+    broker = MockBroker(
+        prices={"AAPL": Decimal("100")},
+        buying_power=Decimal("200000"),
+    )
+    snapshot_service = PortfolioSnapshotService(
+        factory,
+        broker,
+        lambda _asset_class: FakeClock(),
+        lambda: {},
+        lambda _asset_class: config,
+        BreakerService(factory),
+        utcnow,
+    )
+    started.set()
+    try:
+        snapshot = snapshot_service.assemble_for_execution("AAPL")
+        outcome.put(("ok", str(snapshot.account_high_water_mark)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _writer_intent_path(db_url):
+    factory = make_session_factory(create_db_engine(db_url))
+    barrier_path = SubmissionBarrier(factory).path
+    return barrier_path.with_name(f"{barrier_path.name}.intent")
+
+
+def _wait_for_writer_intent(intent_path, writer_finished) -> bool:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        descriptor = os.open(intent_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                return True
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        if writer_finished.is_set():
+            return False
+        time.sleep(0.01)
+    return False
 
 
 def _queued_snapshot_submission_process(
@@ -564,3 +731,143 @@ def test_queued_submission_rechecks_acceptance_unknown_under_process_barrier(
             session.get(Order, follower_id).status
             == OrderStatus.REJECTED.value
         )
+
+
+def test_loss_fill_writer_queued_after_snapshot_prevents_broker_send(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="loss-fill-opening-lot",
+                filled_at=utcnow(),
+            )
+        )
+        session.add(
+            Order(
+                idempotency_key="loss-fill-risk-writer-client",
+                ticker="AAPL",
+                side="sell",
+                order_type="market",
+                qty=Decimal("1"),
+                status=OrderStatus.SUBMITTED.value,
+                broker_order_id="loss-fill-risk-writer-order",
+                acceptance_state="submitted",
+            )
+        )
+        session.commit()
+
+    snapshot_evaluated = context.Event()
+    release_evaluation = context.Event()
+    broker_entered = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_risk_writer_submission_process,
+        args=(
+            db_url,
+            order_id,
+            snapshot_evaluated,
+            release_evaluation,
+            broker_entered,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    assert snapshot_evaluated.wait(timeout=10)
+
+    writer_started = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_loss_fill_writer_process,
+        args=(
+            db_url,
+            writer_started,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert writer_started.wait(timeout=10)
+    intent_observed = _wait_for_writer_intent(
+        _writer_intent_path(db_url),
+        writer_finished,
+    )
+    try:
+        release_evaluation.set()
+    finally:
+        _join(submission, release_evaluation)
+        _join(writer)
+
+    assert intent_observed is True
+    assert writer_outcome.get(timeout=2) == ("ok", 1)
+    result = submission_outcome.get(timeout=2)
+    assert result[0:2] == ("ok", OrderStatus.REJECTED.value)
+    assert "daily total-loss limit reached" in result[2]
+    assert broker_entered.is_set() is False
+
+
+def test_higher_hwm_writer_queued_after_snapshot_prevents_broker_send(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+
+    snapshot_evaluated = context.Event()
+    release_evaluation = context.Event()
+    broker_entered = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_risk_writer_submission_process,
+        args=(
+            db_url,
+            order_id,
+            snapshot_evaluated,
+            release_evaluation,
+            broker_entered,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    assert snapshot_evaluated.wait(timeout=10)
+
+    writer_started = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_higher_hwm_writer_process,
+        args=(
+            db_url,
+            writer_started,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert writer_started.wait(timeout=10)
+    intent_observed = _wait_for_writer_intent(
+        _writer_intent_path(db_url),
+        writer_finished,
+    )
+    try:
+        release_evaluation.set()
+    finally:
+        _join(submission, release_evaluation)
+        _join(writer)
+
+    assert intent_observed is True
+    assert writer_outcome.get(timeout=2) == ("ok", "200000.000000")
+    result = submission_outcome.get(timeout=2)
+    assert result[0:2] == ("ok", OrderStatus.REJECTED.value)
+    assert "account drawdown limit reached" in result[2]
+    assert broker_entered.is_set() is False

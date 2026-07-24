@@ -310,7 +310,7 @@ class BreakerService:
         *,
         now: datetime | None = None,
     ) -> BreakerState:
-        with self.submission_barrier.hold():
+        with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
                 state, _changed = trip_in_session(
                     session, scope, reason, actor, now=now
@@ -358,20 +358,21 @@ class BreakerService:
         expected_generation: int,
         now: datetime | None = None,
     ) -> BreakerState:
-        with self.session_factory() as session:
-            try:
-                state = reset_in_session(
-                    session,
-                    scope,
-                    actor,
-                    reason,
-                    prior_health,
-                    expected_generation=expected_generation,
-                    now=now,
-                )
-            except BreakerResetConflict:
-                session.commit()
-                raise
-            else:
-                session.commit()
-                return state
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                try:
+                    state = reset_in_session(
+                        session,
+                        scope,
+                        actor,
+                        reason,
+                        prior_health,
+                        expected_generation=expected_generation,
+                        now=now,
+                    )
+                except BreakerResetConflict:
+                    session.commit()
+                    raise
+                else:
+                    session.commit()
+                    return state

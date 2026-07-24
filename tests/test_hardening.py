@@ -3,13 +3,16 @@ startup reconciliation, and an end-to-end kill-switch drill."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
+
+from sqlalchemy import event
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Position
-from trading_assistant.db.models import Fill
+from trading_assistant.db.models import Fill, Order
 from trading_assistant.risk.breakers import BreakerScope
 
 
@@ -39,6 +42,44 @@ def test_duplicate_fill_is_idempotent(make_service):
     assert dup["filled_qty"] == first["filled_qty"]   # not double-counted
 
 
+def test_record_fill_acquires_process_barrier_before_sqlite_transaction(
+    make_service,
+    engine,
+):
+    svc = make_service()
+    oid = _submitted(svc)
+
+    class TrackingBarrier:
+        active = False
+
+        @contextmanager
+        def hold_writer(self):
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+
+    barrier = TrackingBarrier()
+    svc.submission_barrier = barrier
+
+    def assert_barrier_precedes_transaction(_connection):
+        assert barrier.active is True
+
+    event.listen(engine, "begin", assert_barrier_precedes_transaction)
+    try:
+        result = svc.record_fill(
+            oid,
+            qty="1",
+            price="100",
+            broker_fill_id="barrier-ordered-fill",
+        )
+    finally:
+        event.remove(engine, "begin", assert_barrier_precedes_transaction)
+
+    assert result["duplicate"] is False
+
+
 # ── cancel / replace ────────────────────────────────────────────
 def test_cancel_live_order(make_service):
     svc = make_service()
@@ -46,6 +87,39 @@ def test_cancel_live_order(make_service):
     result = svc.cancel_live_order(oid)
     assert result["status"] == "canceled"
     assert "error" in svc.cancel_live_order(oid)       # cannot cancel twice
+
+
+def test_cancel_result_with_cumulative_partial_fill_sets_reconciliation_latch(
+    make_service,
+):
+    from trading_assistant.broker.models import OrderResult, OrderStatus
+
+    class CanceledAfterPartial(MockBroker):
+        def get_fill_activities(self, after=None):
+            return []
+
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            canceled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.CANCELED,
+                filled_qty=Decimal("0.5"),
+                avg_fill_price=Decimal("90"),
+            )
+            self._orders_by_id[order_id] = canceled
+            self._orders_by_key[current.idempotency_key] = canceled
+            return canceled
+
+    svc = make_service(broker=CanceledAfterPartial())
+    oid = _submitted(svc)
+
+    result = svc.cancel_live_order(oid)
+
+    assert result["status"] == OrderStatus.CANCELED.value
+    with svc.session_factory() as session:
+        order = session.get(Order, oid)
+        assert order.acceptance_state == "fill_reconcile_required"
 
 
 def test_cancel_race_records_broker_fill_instead_of_claiming_canceled(make_service):

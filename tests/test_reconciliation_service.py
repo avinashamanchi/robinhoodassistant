@@ -206,6 +206,63 @@ def test_panic_fill_discovery_persists_fill_reconciliation_latch(
     assert snapshot.daily_pnl_complete is False
 
 
+def test_panic_canceled_after_partial_fill_stays_latched_until_activity(
+    make_service,
+):
+    class CanceledAfterPartialBroker(ActivityBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            canceled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.CANCELED,
+                filled_qty=Decimal("0.5"),
+                avg_fill_price=Decimal("90"),
+            )
+            self._orders_by_id[order_id] = canceled
+            self._orders_by_key[current.idempotency_key] = canceled
+            return canceled
+
+    broker = CanceledAfterPartialBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+
+    service.reconciliation.panic("operator:avi", "cancel after fill")
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        assert order.status == OrderStatus.CANCELED.value
+        assert order.acceptance_state == "fill_reconcile_required"
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="panic-canceled-after-partial",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("0.5"),
+            price=Decimal("90"),
+            filled_at=utcnow(),
+        )
+    ]
+    restarted = make_service(broker=broker)
+
+    exact = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile()
+
+    assert exact.inserted_fills == 1
+    assert replay.inserted_fills == 0
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.order_id == order_id
+            )
+        ) == 1
+
+
 def test_panic_requires_actor_and_reason_before_latching(make_service):
     service = make_service()
 
@@ -454,6 +511,71 @@ def test_status_discovery_latch_survives_restart_until_exact_activity(
     assert exact.inserted_fills == 1
     with restarted.session_factory() as session:
         order = session.get(Order, order_id)
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.order_id == order_id
+            )
+        ) == 1
+
+
+def test_canceled_after_partial_fill_stays_latched_until_exact_activity(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    canceled_after_fill = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.CANCELED,
+        filled_qty=Decimal("0.5"),
+        avg_fill_price=Decimal("90"),
+    )
+    broker._orders_by_id[broker_order_id] = canceled_after_fill
+    broker._orders_by_key[client_order_id] = canceled_after_fill
+
+    delayed = service.reconciliation.reconcile()
+
+    assert delayed.inserted_fills == 0
+    assert any(
+        "requires 0.5 authoritative quantity" in item
+        for item in delayed.broker_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.CANCELED.value
+        assert order.acceptance_state == "fill_reconcile_required"
+
+    restarted = make_service(broker=broker)
+    incomplete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="canceled-after-partial",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("0.5"),
+            price=Decimal("90"),
+            filled_at=utcnow(),
+        )
+    ]
+
+    exact = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile()
+
+    assert exact.inserted_fills == 1
+    assert replay.inserted_fills == 0
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.CANCELED.value
         assert order.acceptance_state == "accepted"
         assert session.scalar(
             select(func.count()).select_from(Fill).where(
