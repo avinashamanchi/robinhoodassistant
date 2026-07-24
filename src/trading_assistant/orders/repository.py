@@ -10,8 +10,9 @@ from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import (
+    FillQuantityRelation,
     OrderStatus,
-    valid_cumulative_filled_qty,
+    fill_quantity_relation,
 )
 from trading_assistant.db.models import (
     AuditEvent,
@@ -347,16 +348,10 @@ class OrderRepository:
         filled_qty: Decimal,
         authoritative_qty: Decimal,
     ) -> tuple[bool, bool, bool]:
-        invalid_cumulative = not valid_cumulative_filled_qty(filled_qty)
-        remote_fill_ahead = (
-            not invalid_cumulative
-            and filled_qty
-            > authoritative_qty + Decimal("0.000001")
-        )
-        cumulative_contradiction = (
-            not invalid_cumulative
-            and filled_qty + Decimal("0.000001") < authoritative_qty
-        )
+        relation = fill_quantity_relation(filled_qty, authoritative_qty)
+        invalid_cumulative = relation is None
+        remote_fill_ahead = relation is FillQuantityRelation.AHEAD
+        cumulative_contradiction = relation is FillQuantityRelation.BEHIND
         return (
             status
             in {

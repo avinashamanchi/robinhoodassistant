@@ -12,6 +12,7 @@ from trading_assistant.broker.alpaca import AlpacaBroker
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     BrokerFill,
+    FILL_ECONOMIC_QUANTUM,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -20,7 +21,14 @@ from trading_assistant.broker.models import (
     Position,
 )
 from trading_assistant.db import models as db_models
-from trading_assistant.db.models import CircuitBreakerState, Fill, Order, utcnow
+from trading_assistant.db.models import (
+    FILL_RECONCILIATION_QUARANTINED,
+    FILL_RECONCILIATION_REQUIRED,
+    CircuitBreakerState,
+    Fill,
+    Order,
+    utcnow,
+)
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.staleness import (
@@ -330,6 +338,126 @@ def test_reconcile_unknown_atomically_latches_terminal_cumulative_fill(
         ) == Decimal("0.5")
 
 
+@pytest.mark.parametrize(
+    (
+        "local_qty",
+        "remote_qty",
+        "initial_acceptance",
+        "expected_status",
+        "expected_acceptance",
+        "expected_error",
+        "expected_drift",
+    ),
+    [
+        (
+            None,
+            Decimal("0.000000500"),
+            "acceptance_unknown",
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500"),
+            FILL_RECONCILIATION_REQUIRED,
+            OrderStatus.CANCELED,
+            "accepted",
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500") + FILL_ECONOMIC_QUANTUM,
+            "acceptance_unknown",
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500") - FILL_ECONOMIC_QUANTUM,
+            "acceptance_unknown",
+            OrderStatus.ACCEPTANCE_UNKNOWN,
+            FILL_RECONCILIATION_REQUIRED,
+            "cumulative_fill_contradiction",
+            True,
+        ),
+    ],
+    ids=[
+        "sub-micro-terminal",
+        "exact",
+        "one-quantum-ahead",
+        "one-quantum-behind",
+    ],
+)
+def test_acceptance_recovery_uses_canonical_fill_quantum(
+    make_service,
+    local_qty,
+    remote_qty,
+    initial_acceptance,
+    expected_status,
+    expected_acceptance,
+    expected_error,
+    expected_drift,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    submitted_at = utcnow() - timedelta(seconds=1)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key=f"acceptance-quantum-{remote_qty}",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+            acceptance_state=initial_acceptance,
+            submission_started_at=submitted_at,
+        )
+        session.add(order)
+        session.flush()
+        if local_qty is not None:
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=local_qty,
+                    price=Decimal("100"),
+                    broker_fill_id=f"acceptance-quantum-fill-{remote_qty}",
+                    filled_at=utcnow(),
+                )
+            )
+        session.commit()
+        order_id = order.id
+        client_order_id = order.idempotency_key
+
+    remote = OrderResult(
+        client_order_id,
+        f"acceptance-quantum-broker-{remote_qty}",
+        OrderStatus.CANCELED,
+        filled_qty=remote_qty,
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_key[client_order_id] = remote
+    broker._orders_by_id[remote.broker_order_id] = remote
+
+    assert service.reconciliation.reconcile_unknown() == (1, ())
+
+    assert (
+        service.breakers.is_tripped(BreakerScope.broker_drift())
+        is expected_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == expected_status.value
+        assert order.acceptance_state == expected_acceptance
+        assert order.last_error_code == expected_error
+
+
 def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
     broker = CancelFailsBroker()
     broker.set_price("AAPL", Decimal("100"))
@@ -514,6 +642,156 @@ def test_panic_rejects_cumulative_fill_below_exact_local_truth(
         assert session.scalar(
             select(func.sum(Fill.qty)).where(Fill.order_id == order_id)
         ) == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    (
+        "local_qty",
+        "quarantined_qty",
+        "remote_qty",
+        "initial_acceptance",
+        "expected_status",
+        "expected_acceptance",
+        "expected_error",
+        "expected_drift",
+    ),
+    [
+        (
+            None,
+            None,
+            Decimal("0.000000500"),
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            None,
+            Decimal("0.000000500"),
+            FILL_RECONCILIATION_REQUIRED,
+            OrderStatus.CANCELED,
+            "accepted",
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500"),
+            Decimal("0.000000500"),
+            FILL_RECONCILIATION_REQUIRED,
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "waiting_for_exact_fill",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            None,
+            Decimal("0.000000500") + FILL_ECONOMIC_QUANTUM,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            None,
+            Decimal("0.000000500") - FILL_ECONOMIC_QUANTUM,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.SUBMITTED,
+            FILL_RECONCILIATION_REQUIRED,
+            "cumulative_fill_contradiction",
+            True,
+        ),
+    ],
+    ids=[
+        "sub-micro-terminal",
+        "exact",
+        "exact-with-quarantined-fill",
+        "one-quantum-ahead",
+        "one-quantum-behind",
+    ],
+)
+def test_panic_uses_canonical_fill_quantum(
+    make_service,
+    local_qty,
+    quarantined_qty,
+    remote_qty,
+    initial_acceptance,
+    expected_status,
+    expected_acceptance,
+    expected_error,
+    expected_drift,
+):
+    class QuantumCancelBroker(ActivityBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            canceled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.CANCELED,
+                filled_qty=remote_qty,
+                avg_fill_price=Decimal("100"),
+            )
+            self._orders_by_id[order_id] = canceled
+            self._orders_by_key[current.idempotency_key] = canceled
+            return canceled
+
+    broker = QuantumCancelBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        order.acceptance_state = initial_acceptance
+        order.last_error_code = (
+            "waiting_for_exact_fill"
+            if initial_acceptance == FILL_RECONCILIATION_REQUIRED
+            else ""
+        )
+        if local_qty is not None:
+            session.add(
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=local_qty,
+                    price=Decimal("100"),
+                    broker_fill_id=f"panic-quantum-fill-{remote_qty}",
+                    filled_at=utcnow(),
+                )
+            )
+        if quarantined_qty is not None:
+            session.add(
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=quarantined_qty,
+                    price=Decimal("100"),
+                    broker_fill_id=f"panic-quarantined-fill-{remote_qty}",
+                    reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
+                    filled_at=utcnow(),
+                )
+            )
+        session.commit()
+
+    service.reconciliation.panic(
+        "operator:avi",
+        f"quantum comparison {remote_qty}",
+    )
+
+    assert (
+        service.breakers.is_tripped(BreakerScope.broker_drift())
+        is expected_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == expected_status.value
+        assert order.acceptance_state == expected_acceptance
+        assert order.last_error_code == expected_error
 
 
 def test_panic_requires_actor_and_reason_before_latching(make_service):
@@ -710,6 +988,147 @@ class ActivityBroker(MockBroker):
         if self.fail_activities:
             raise ConnectionError("activity stream unavailable")
         return list(self.activities)
+
+
+@pytest.mark.parametrize(
+    (
+        "local_qty",
+        "remote_qty",
+        "initial_acceptance",
+        "expected_status",
+        "expected_acceptance",
+        "expected_error",
+        "expected_drift",
+    ),
+    [
+        (
+            None,
+            Decimal("0.000000500"),
+            "accepted",
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            True,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500"),
+            FILL_RECONCILIATION_REQUIRED,
+            OrderStatus.CANCELED,
+            "accepted",
+            "",
+            False,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500") + FILL_ECONOMIC_QUANTUM,
+            "accepted",
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            True,
+        ),
+        (
+            Decimal("0.000000500"),
+            Decimal("0.000000500") - FILL_ECONOMIC_QUANTUM,
+            "accepted",
+            OrderStatus.SUBMITTED,
+            FILL_RECONCILIATION_REQUIRED,
+            "cumulative_fill_contradiction",
+            True,
+        ),
+    ],
+    ids=[
+        "sub-micro-terminal",
+        "exact-clears-latch",
+        "one-quantum-ahead",
+        "one-quantum-behind",
+    ],
+)
+def test_ordinary_reconciliation_uses_canonical_fill_quantum(
+    make_service,
+    local_qty,
+    remote_qty,
+    initial_acceptance,
+    expected_status,
+    expected_acceptance,
+    expected_error,
+    expected_drift,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    submitted_at = utcnow() - timedelta(seconds=1)
+    filled_at = utcnow()
+    broker_order_id = f"ordinary-quantum-broker-{remote_qty}"
+    client_order_id = f"ordinary-quantum-client-{remote_qty}"
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key=client_order_id,
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id=broker_order_id,
+            acceptance_state=initial_acceptance,
+            last_error_code=(
+                "waiting_for_exact_fill"
+                if initial_acceptance == FILL_RECONCILIATION_REQUIRED
+                else ""
+            ),
+            submission_started_at=submitted_at,
+        )
+        session.add(order)
+        session.flush()
+        order_id = order.id
+        if local_qty is not None:
+            fill_id = f"ordinary-quantum-fill-{remote_qty}"
+            session.add(
+                Fill(
+                    order_id=order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=local_qty,
+                    price=Decimal("100"),
+                    broker_fill_id=fill_id,
+                    filled_at=filled_at,
+                )
+            )
+            broker.activities = [
+                BrokerFill(
+                    broker_fill_id=fill_id,
+                    broker_order_id=broker_order_id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=local_qty,
+                    price=Decimal("100"),
+                    filled_at=filled_at,
+                )
+            ]
+        session.commit()
+
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.CANCELED,
+        filled_qty=remote_qty,
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+
+    report = service.reconciliation.reconcile()
+
+    assert bool(report.broker_drift) is expected_drift
+    assert (
+        service.breakers.is_tripped(BreakerScope.broker_drift())
+        is expected_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == expected_status.value
+        assert order.acceptance_state == expected_acceptance
+        assert order.last_error_code == expected_error
 
 
 def test_missing_alpaca_activity_id_never_inserts_advances_or_clears_latch(

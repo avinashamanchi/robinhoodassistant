@@ -9,9 +9,19 @@ import pytest
 
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import OrderResult, OrderStatus
+from trading_assistant.broker.models import (
+    FILL_ECONOMIC_QUANTUM,
+    OrderResult,
+    OrderStatus,
+)
 from trading_assistant.assets import AssetClass
-from trading_assistant.db.models import Fill, Order, Proposal, utcnow
+from trading_assistant.db.models import (
+    FILL_RECONCILIATION_REQUIRED,
+    Fill,
+    Order,
+    Proposal,
+    utcnow,
+)
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.submission import OrderSubmissionService
 from trading_assistant.risk.breakers import (
@@ -223,9 +233,15 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
         OrderStatus.REJECTED,
     ],
 )
+@pytest.mark.parametrize(
+    "filled_qty",
+    [Decimal("0.5"), Decimal("0.000000500")],
+    ids=["ordinary", "sub-micro"],
+)
 def test_synchronous_terminal_partial_fill_preserves_status_and_latches(
     make_service,
     terminal_status,
+    filled_qty,
 ):
     class TerminalPartialBroker(MockBroker):
         def submit_order(self, order):
@@ -234,7 +250,7 @@ def test_synchronous_terminal_partial_fill_preserves_status_and_latches(
                 accepted.idempotency_key,
                 accepted.broker_order_id,
                 terminal_status,
-                filled_qty=Decimal("0.5"),
+                filled_qty=filled_qty,
                 avg_fill_price=Decimal("99"),
             )
             self._orders_by_key[order.idempotency_key] = result
@@ -334,6 +350,95 @@ def test_post_send_cumulative_below_exact_local_fill_never_adopts_terminal_statu
         assert order.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
         assert order.acceptance_state == "fill_reconcile_required"
         assert order.last_error_code == "cumulative_fill_contradiction"
+
+
+@pytest.mark.parametrize(
+    (
+        "delta",
+        "expected_status",
+        "expected_acceptance",
+        "expected_error",
+        "expected_drift",
+    ),
+    [
+        (
+            Decimal(0),
+            OrderStatus.CANCELED,
+            OrderStatus.CANCELED.value,
+            "",
+            False,
+        ),
+        (
+            FILL_ECONOMIC_QUANTUM,
+            OrderStatus.CANCELED,
+            FILL_RECONCILIATION_REQUIRED,
+            "",
+            False,
+        ),
+        (
+            -FILL_ECONOMIC_QUANTUM,
+            OrderStatus.ACCEPTANCE_UNKNOWN,
+            FILL_RECONCILIATION_REQUIRED,
+            "cumulative_fill_contradiction",
+            True,
+        ),
+    ],
+    ids=["exact", "one-quantum-ahead", "one-quantum-behind"],
+)
+def test_post_send_uses_canonical_fill_quantum(
+    make_service,
+    delta,
+    expected_status,
+    expected_acceptance,
+    expected_error,
+    expected_drift,
+):
+    service = make_service()
+    order_id = _approved_order(service)
+    assert service.order_submission.repository.claim_submission(
+        order_id,
+        utcnow(),
+        tuple(
+            scope.key
+            for scope in relevant_scopes_for_symbol("AAPL")
+        ),
+    )
+    authoritative_qty = Decimal("0.000000500")
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=authoritative_qty,
+                price=Decimal("100"),
+                broker_fill_id="post-send-quantum-fill",
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+
+    persisted_status = (
+        service.order_submission.repository.record_submission_result(
+            order_id,
+            OrderStatus.CANCELED,
+            "post-send-quantum-broker",
+            "",
+            utcnow(),
+            authoritative_qty + delta,
+        )
+    )
+
+    assert persisted_status is expected_status
+    assert (
+        service.breakers.is_tripped(BreakerScope.broker_drift())
+        is expected_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == expected_status.value
+        assert order.acceptance_state == expected_acceptance
+        assert order.last_error_code == expected_error
 
 
 @pytest.mark.parametrize(

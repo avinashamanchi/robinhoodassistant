@@ -536,7 +536,13 @@ def test_fill_activities_reject_unpersistable_economics(field, value):
 
 @pytest.mark.parametrize(
     "filled_qty",
-    ["NaN", "Infinity", "-Infinity", "-0.000001"],
+    [
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "-0.000001",
+        "0.0000000001",
+    ],
 )
 def test_order_mapping_rejects_invalid_cumulative_filled_qty(filled_qty):
     prior = FakeOrder(

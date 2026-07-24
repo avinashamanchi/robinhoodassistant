@@ -56,17 +56,52 @@ class OrderStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class FillQuantityRelation(str, enum.Enum):
+    BEHIND = "behind"
+    EXACT = "exact"
+    AHEAD = "ahead"
+
+
 # Money is handled as Decimal end-to-end to avoid float drift on notionals.
 Money = Decimal
 
 
+def normalize_cumulative_filled_qty(value: object) -> Decimal | None:
+    """Return a nonnegative cumulative quantity at the fill-ledger quantum."""
+    if (
+        not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value < 0
+    ):
+        return None
+    try:
+        normalized = value.quantize(FILL_ECONOMIC_QUANTUM)
+    except InvalidOperation:
+        return None
+    if normalized != value:
+        return None
+    return normalized
+
+
 def valid_cumulative_filled_qty(value: object) -> bool:
-    """Whether broker cumulative execution quantity is safe to reconcile."""
-    return (
-        isinstance(value, Decimal)
-        and value.is_finite()
-        and value >= 0
-    )
+    """Whether broker cumulative execution quantity is canonical and safe."""
+    return normalize_cumulative_filled_qty(value) is not None
+
+
+def fill_quantity_relation(
+    reported: object,
+    authoritative: object,
+) -> FillQuantityRelation | None:
+    """Compare canonical cumulative and ledger quantities without tolerance."""
+    normalized_reported = normalize_cumulative_filled_qty(reported)
+    normalized_authoritative = normalize_cumulative_filled_qty(authoritative)
+    if normalized_reported is None or normalized_authoritative is None:
+        return None
+    if normalized_reported < normalized_authoritative:
+        return FillQuantityRelation.BEHIND
+    if normalized_reported > normalized_authoritative:
+        return FillQuantityRelation.AHEAD
+    return FillQuantityRelation.EXACT
 
 
 def normalize_fill_economic(value: object) -> Decimal | None:

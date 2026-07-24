@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from trading_assistant.broker.base import BrokerClient, BrokerDataIntegrityError
 from trading_assistant.broker.models import (
     BrokerFill,
+    FillQuantityRelation,
     OrderResult,
     OrderStatus,
+    fill_quantity_relation,
     normalize_fill_economic,
     order_result_identity_error,
     valid_cumulative_filled_qty,
@@ -850,15 +852,26 @@ class ReconciliationService:
                     (fill.qty for fill in authoritative_fills),
                     Decimal(0),
                 )
+                authoritative_relation = fill_quantity_relation(
+                    remote.filled_qty,
+                    authoritative_qty,
+                )
+                if authoritative_relation is None:
+                    drift.append(
+                        f"broker order {order.id} has noncanonical cumulative "
+                        "or authoritative fill quantity"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    session.commit()
+                    continue
                 remote_exceeds_authoritative = (
-                    remote.filled_qty.is_finite()
-                    and remote.filled_qty
-                    > authoritative_qty + Decimal("0.000001")
+                    authoritative_relation is FillQuantityRelation.AHEAD
                 )
                 remote_below_authoritative = (
-                    remote.filled_qty
-                    + Decimal("0.000001")
-                    < authoritative_qty
+                    authoritative_relation is FillQuantityRelation.BEHIND
                 )
                 if remote_below_authoritative:
                     drift.append(
@@ -944,14 +957,12 @@ class ReconciliationService:
                     if (
                         not remote.filled_qty.is_finite()
                         or (
-                            remote.filled_qty <= Decimal("0.000001")
+                            remote.filled_qty == Decimal(0)
                             and not terminal_zero_fill_resolved
                         )
                         or len(authoritative_fills) != len(prior_fills)
-                        or abs(
-                            authoritative_qty - remote.filled_qty
-                        )
-                        > Decimal("0.000001")
+                        or authoritative_relation
+                        is not FillQuantityRelation.EXACT
                     ):
                         drift.append(
                             f"broker order {order.id} fill reconciliation "
@@ -963,7 +974,37 @@ class ReconciliationService:
                             session.commit()
                         continue
                 new_qty = remote.filled_qty - recorded
-                if exact_reader and new_qty > Decimal("0.000001"):
+                recorded_relation = fill_quantity_relation(
+                    remote.filled_qty,
+                    recorded,
+                )
+                if recorded_relation is None:
+                    drift.append(
+                        f"broker order {order.id} has noncanonical cumulative "
+                        "or recorded fill quantity"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    session.commit()
+                    continue
+                if recorded_relation is FillQuantityRelation.BEHIND:
+                    drift.append(
+                        f"broker order {order.id} cumulative "
+                        f"{remote.filled_qty} is below recorded local "
+                        f"quantity {recorded}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "cumulative_fill_contradiction",
+                    )
+                    session.commit()
+                    continue
+                if (
+                    exact_reader
+                    and recorded_relation is FillQuantityRelation.AHEAD
+                ):
                     drift.append(
                         f"broker order {order.id} reports {remote.filled_qty} filled "
                         f"but exact activities contain {recorded}"
@@ -974,7 +1015,7 @@ class ReconciliationService:
                     continue
                 if (
                     not exact_reader
-                    and new_qty > Decimal("0.000001")
+                    and recorded_relation is FillQuantityRelation.AHEAD
                 ):
                     if not valid_fill_economic(remote.avg_fill_price):
                         drift.append(
@@ -1358,23 +1399,44 @@ class ReconciliationService:
                     local_fills = session.scalars(
                         select(Fill).where(Fill.order_id == order.id)
                     ).all()
+                    trusted_fills = [
+                        fill
+                        for fill in local_fills
+                        if fill_has_trusted_identity(fill)
+                    ]
+                    authoritative_fills = [
+                        fill
+                        for fill in trusted_fills
+                        if not fill.broker_fill_id.startswith(
+                            synthetic_prefix
+                        )
+                    ]
                     authoritative_qty = sum(
-                        (
-                            fill.qty
-                            for fill in local_fills
-                            if (
-                                fill_has_trusted_identity(fill)
-                                and not fill.broker_fill_id.startswith(
-                                    synthetic_prefix
-                                )
-                            )
-                        ),
+                        (fill.qty for fill in authoritative_fills),
                         Decimal(0),
                     )
-                    if (
-                        remote.filled_qty + Decimal("0.000001")
-                        < authoritative_qty
-                    ):
+                    fill_truth_complete = (
+                        not any(
+                            fill_requires_reconciliation(fill)
+                            for fill in local_fills
+                        )
+                        and len(authoritative_fills) == len(trusted_fills)
+                    )
+                    relation = fill_quantity_relation(
+                        remote.filled_qty,
+                        authoritative_qty,
+                    )
+                    if relation is None:
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
+                        )
+                        faults.append(
+                            f"panic order {order.id} has noncanonical "
+                            "cumulative or authoritative fill quantity"
+                        )
+                        continue
+                    if relation is FillQuantityRelation.BEHIND:
                         self._latch_order_in_session(
                             order,
                             "cumulative_fill_contradiction",
@@ -1390,12 +1452,15 @@ class ReconciliationService:
                     order.updated_at = now
                     order.version += 1
                     if (
+                        relation is FillQuantityRelation.EXACT
+                        and authoritative_qty > Decimal(0)
+                        and fill_truth_complete
+                    ):
+                        order.acceptance_state = "accepted"
+                        order.last_error_code = ""
+                    elif (
                         remote.status in _FILL_STATUSES
-                        or (
-                            remote.filled_qty.is_finite()
-                            and remote.filled_qty
-                            > authoritative_qty + Decimal("0.000001")
-                        )
+                        or relation is FillQuantityRelation.AHEAD
                     ):
                         order.acceptance_state = (
                             FILL_RECONCILIATION_REQUIRED
