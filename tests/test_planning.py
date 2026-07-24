@@ -71,7 +71,7 @@ def test_analyze_stores_sized_plan(make_service):
     assert Decimal(out["sized"]["total_shares"]) > 0
 
 
-def test_approve_decomposes_into_preapproved_rules(make_service):
+def test_approve_decomposes_into_human_gated_typed_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = pln.analyze("AAPL")["plan_id"]
@@ -83,7 +83,9 @@ def test_approve_decomposes_into_preapproved_rules(make_service):
         kinds = sorted(r.kind for r in rules)
         assert "entry" in kinds and "target" in kinds and "stop" in kinds
         assert "trailing" in kinds and "time" in kinds
-        assert all(r.pre_approved for r in rules)          # armed for the daemon
+        assert all(not r.pre_approved for r in rules)
+        assert all(r.payload_version == 1 for r in rules)
+        assert len({r.group_id for r in rules}) == 1
         assert s.get(TradePlanRow, pid).status == "approved"
 
 

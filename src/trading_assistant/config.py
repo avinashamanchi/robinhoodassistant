@@ -75,7 +75,7 @@ class FeaturesConfig(_Strict):
 
 
 class ExecutionConfig(_Strict):
-    prefer_bracket_orders: bool = True  # D4: server-side OCO for single-target plans
+    prefer_bracket_orders: bool = False  # disabled until paper concurrency review
 
 
 class LLMConfig(_Strict):

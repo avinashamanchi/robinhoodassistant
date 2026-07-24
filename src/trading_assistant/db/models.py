@@ -222,6 +222,9 @@ class Proposal(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), unique=True)
+    source_rule_group_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("rule_groups.id"), nullable=True, index=True
+    )
     reasoning: Mapped[str] = mapped_column(Text, default="")
     ttl_minutes: Mapped[int] = mapped_column(default=15)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
@@ -234,10 +237,33 @@ class Proposal(Base):
         return now >= self.expires_at
 
 
+class RuleGroup(Base):
+    __tablename__ = "rule_groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    state: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    terminal_rule_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("rules.id"), nullable=True
+    )
+    version: Mapped[int] = mapped_column(default=0)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
 class Rule(Base):
     __tablename__ = "rules"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("rule_groups.id"), nullable=False, index=True
+    )
+    payload_version: Mapped[int] = mapped_column(default=1)
     ticker: Mapped[str] = mapped_column(String(16), index=True)
     condition_json: Mapped[str] = mapped_column(Text)
     action_json: Mapped[str] = mapped_column(Text)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from sqlalchemy import exists, or_, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
@@ -15,6 +15,7 @@ from trading_assistant.db.models import (
     Order,
     Proposal,
     RiskEvent,
+    RuleGroup,
 )
 
 
@@ -101,6 +102,20 @@ class OrderRepository:
             if result.rowcount != 1:
                 session.rollback()
                 return False
+            source_rule_group_id = session.scalar(
+                select(Proposal.source_rule_group_id).where(
+                    Proposal.order_id == order_id
+                )
+            )
+            if source_rule_group_id is not None:
+                session.execute(
+                    update(RuleGroup)
+                    .where(RuleGroup.id == source_rule_group_id)
+                    .values(
+                        reconciliation_required=True,
+                        updated_at=now,
+                    )
+                )
             session.commit()
             return True
 
@@ -171,6 +186,21 @@ class OrderRepository:
             )
             if result.rowcount != 1:
                 raise RuntimeError(f"order {order_id} lost submission claim")
+            if status is OrderStatus.ACCEPTANCE_UNKNOWN:
+                source_rule_group_id = session.scalar(
+                    select(Proposal.source_rule_group_id).where(
+                        Proposal.order_id == order_id
+                    )
+                )
+                if source_rule_group_id is not None:
+                    session.execute(
+                        update(RuleGroup)
+                        .where(RuleGroup.id == source_rule_group_id)
+                        .values(
+                            reconciliation_required=True,
+                            updated_at=now,
+                        )
+                    )
             session.commit()
 
     def resolve_acceptance(

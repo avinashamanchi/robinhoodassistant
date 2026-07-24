@@ -125,18 +125,15 @@ class _StaleBroker(MockBroker):
 
 
 def test_stale_quote_does_not_fire(make_service):
-    import json
-
     from trading_assistant.daemon.monitor import Monitor
-    from trading_assistant.db.models import Rule
 
     broker = _StaleBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    with svc.session_factory() as s:
-        s.add(Rule(ticker="AAPL", kind="price", state="active",
-                   condition_json=json.dumps({"price_below": 175}),
-                   action_json=json.dumps({"side": "buy", "notional": "100"})))
-        s.commit()
+    svc.create_conditional_rule(
+        "AAPL",
+        {"price_below": 175},
+        {"side": "buy", "notional": "100"},
+    )
     # Price 100 < 175 would fire, but the quote is 600s stale -> skipped.
     assert Monitor(svc, max_quote_age_seconds=60).tick() == []

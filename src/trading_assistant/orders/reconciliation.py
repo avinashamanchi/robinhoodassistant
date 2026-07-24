@@ -18,6 +18,8 @@ from trading_assistant.db.models import (
     OrderStateMachine,
     ReconciliationCursor,
     Rule,
+    RuleGroup,
+    Proposal,
 )
 from trading_assistant.risk.killswitch import KillSwitch
 
@@ -68,6 +70,7 @@ class ReconciliationService:
 
     def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
         resolved, unresolved, _ = self._resolve_unknown()
+        self._clear_reconciled_rule_groups()
         return resolved, unresolved
 
     def _resolve_unknown(
@@ -113,6 +116,7 @@ class ReconciliationService:
 
     def reconcile(self) -> ReconciliationReport:
         resolved, unresolved, resolved_results = self._resolve_unknown()
+        self._clear_reconciled_rule_groups()
         drift: list[str] = []
         inserted_fills = self._reconcile_fill_activities(drift)
         synced, synthetic_fills = self._reconcile_statuses(
@@ -127,6 +131,47 @@ class ReconciliationService:
             inserted_fills=inserted_fills,
             broker_drift=tuple(drift),
         )
+
+    def _clear_reconciled_rule_groups(self) -> None:
+        """Clear only groups whose linked outbox has no unresolved acceptance.
+
+        This method intentionally lives in ReconciliationService: submission and
+        worker code may set the latch, but cannot clear it.
+        """
+        with self.session_factory() as session:
+            group_ids = session.scalars(
+                select(RuleGroup.id).where(
+                    RuleGroup.reconciliation_required.is_(True)
+                )
+            ).all()
+            for group_id in group_ids:
+                unresolved = session.scalar(
+                    select(Order.id)
+                    .join(Proposal, Proposal.order_id == Order.id)
+                    .where(
+                        Proposal.source_rule_group_id == group_id,
+                        Order.status.in_(
+                            (
+                                OrderStatus.SUBMITTING.value,
+                                OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                            )
+                        ),
+                    )
+                    .limit(1)
+                )
+                if unresolved is None:
+                    session.execute(
+                        update(RuleGroup)
+                        .where(
+                            RuleGroup.id == group_id,
+                            RuleGroup.reconciliation_required.is_(True),
+                        )
+                        .values(
+                            reconciliation_required=False,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+            session.commit()
 
     def _cursor_snapshot(self) -> tuple[str | None, datetime | None, int | None]:
         with self.session_factory() as session:
@@ -444,6 +489,17 @@ class ReconciliationService:
                 update(Rule)
                 .where(Rule.state.in_(("active", "processing")))
                 .values(state="canceled")
+            )
+            session.execute(
+                update(RuleGroup)
+                .where(RuleGroup.state == "active")
+                .values(
+                    state="canceled",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    version=RuleGroup.version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
             session.commit()
 

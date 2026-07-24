@@ -127,18 +127,16 @@ def test_killswitch_drill(make_service):
 
 # ── panic button (D5) ───────────────────────────────────────────
 def test_panic_flattens_everything(make_service):
-    import json as _json
-
     from trading_assistant.db.models import Rule
     from trading_assistant.risk.killswitch import KillSwitch
 
     svc = make_service()
     oid = _submitted(svc)  # a live SUBMITTED order
-    with svc.session_factory() as s:
-        s.add(Rule(ticker="AAPL", kind="price", state="active",
-                   condition_json=_json.dumps({"price_below": 999}),
-                   action_json=_json.dumps({"side": "sell", "qty": "1"})))
-        s.commit()
+    svc.create_conditional_rule(
+        "AAPL",
+        {"price_below": 999},
+        {"side": "sell", "qty": "1"},
+    )
 
     res = svc.panic(actor="operator:test", reason="panic drill")
     assert res["safe"] is True

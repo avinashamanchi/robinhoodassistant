@@ -41,6 +41,7 @@ from .db.models import (
     Proposal,
     RiskEvent,
     Rule,
+    RuleGroup,
     utcnow,
 )
 from .orders.application import (
@@ -117,6 +118,15 @@ class TradingService:
             broker,
             self.order_application.repository,
         )
+        from .rules.application import RuleApplicationService
+        from .rules.repository import RuleRepository
+
+        self.rule_repository = RuleRepository(
+            session_factory, owner=f"rule-worker-{uuid.uuid4().hex}"
+        )
+        self.rule_application = RuleApplicationService(
+            self, self.rule_repository
+        )
 
     # ── asset-class routing helpers ────────────────────────────
     @staticmethod
@@ -174,12 +184,14 @@ class TradingService:
         tickers: list[str],
         asset_class: AssetClass = AssetClass.EQUITY,
         exclude_order_id: int | None = None,
+        quote_overrides: dict[str, object] | None = None,
     ) -> PortfolioSnapshot:
         return self.snapshot_service.assemble(
             session,
             tickers,
             asset_class,
             exclude_order_id=exclude_order_id,
+            quote_overrides=quote_overrides,
         )
 
     def _external_positions_map(self) -> dict:
@@ -797,7 +809,13 @@ class TradingService:
             for p in self.broker.get_positions()
         ]
 
-    def available_reduce_qty(self, ticker: str, side: str) -> Decimal:
+    def available_reduce_qty(
+        self,
+        ticker: str,
+        side: str,
+        *,
+        reference_price: Decimal | None = None,
+    ) -> Decimal:
         """Quantity an exit can safely reserve without reversing the position.
 
         Existing same-side live orders reserve quantity first, so a stop and a
@@ -830,21 +848,21 @@ class TradingService:
                     ),
                 )
             ).scalars().all()
-            quote = None
             reserved = Decimal(0)
             for order in live:
                 filled_qty = sum((fill.qty for fill in order.fills), Decimal(0))
                 if order.qty is not None:
                     reserved += max(order.qty - filled_qty, Decimal(0))
                 elif order.notional is not None:
-                    if quote is None:
-                        quote = self.broker.get_quote(symbol)
+                    price = reference_price
+                    if price is None:
+                        price = self.broker.get_quote(symbol).last
                     spent = sum(
                         (fill.qty * fill.price for fill in order.fills), Decimal(0)
                     )
                     remaining = max(order.notional - spent, Decimal(0))
-                    if quote.last > 0:
-                        reserved += remaining / quote.last
+                    if price > 0:
+                        reserved += remaining / price
         return max(reducible - reserved, Decimal(0))
 
     def get_log(self, limit: int = 100) -> dict[str, Any]:
@@ -969,18 +987,78 @@ class TradingService:
 
     # ── conditional rules ──────────────────────────────────────
     def create_conditional_rule(
-        self, ticker: str, condition: dict[str, Any], action: dict[str, Any]
+        self,
+        ticker: str,
+        condition: dict[str, Any],
+        action: dict[str, Any],
+        *,
+        kind: str = "price",
+        group_key: str | None = None,
+        plan_id: int | None = None,
+        pre_approved: bool = False,
+        fraction: str | Decimal | None = None,
+        high_water_mark: str | Decimal | None = None,
+        deadline=None,
     ) -> dict[str, Any]:
+        from .rules.models import RuleCommand
+
+        typed_condition, typed_kind = self._typed_rule_condition(
+            condition, kind=kind, deadline=deadline
+        )
+        typed_action = dict(action)
+        typed_action.setdefault(
+            "order_type",
+            "limit" if typed_action.get("limit_price") is not None else "market",
+        )
+        command = RuleCommand.model_validate(
+            {
+                "ticker": ticker,
+                "kind": typed_kind,
+                "condition": typed_condition,
+                "action": typed_action,
+                "group_key": group_key,
+                "pre_approved": pre_approved,
+                "fraction": fraction,
+                "high_water_mark": high_water_mark,
+            }
+        )
+        rule_id = self.rule_application.create_rule(command, plan_id=plan_id)
         with self.session_factory() as s:
-            rule = Rule(
-                ticker=ticker.upper(),
-                condition_json=json.dumps(condition),
-                action_json=json.dumps(action),
-                state="active",
-            )
-            s.add(rule)
-            s.commit()
+            rule = s.get(Rule, rule_id)
+            assert rule is not None
             return self._rule_dict(rule)
+
+    @staticmethod
+    def _typed_rule_condition(
+        condition: dict[str, Any], *, kind: str, deadline=None
+    ) -> tuple[dict[str, Any], str]:
+        if "type" in condition:
+            return dict(condition), kind
+        if set(condition) == {"price_below"}:
+            return {
+                "type": "price",
+                "direction": "below",
+                "price": condition["price_below"],
+            }, kind
+        if set(condition) == {"price_above"}:
+            return {
+                "type": "price",
+                "direction": "above",
+                "price": condition["price_above"],
+            }, kind
+        if set(condition) == {"trailing_stop_pct"}:
+            return {
+                "type": "trailing",
+                "percent": condition["trailing_stop_pct"],
+            }, ("trailing" if kind == "price" else kind)
+        if kind == "time" and condition == {} and deadline is not None:
+            return {
+                "type": "time",
+                "deadline": deadline,
+            }, kind
+        # Preserve the raw value only long enough for the strict discriminated
+        # RuleCommand parser to reject it. Nothing is persisted before validation.
+        return dict(condition), kind
 
     def list_rules(self) -> list[dict[str, Any]]:
         with self.session_factory() as s:
@@ -993,6 +1071,21 @@ class TradingService:
             if rule is None:
                 return {"rule_id": rule_id, "canceled": False, "error": "not found"}
             rule.state = "canceled"
+            active_sibling = s.scalar(
+                select(Rule.id).where(
+                    Rule.group_id == rule.group_id,
+                    Rule.id != rule.id,
+                    Rule.state == "active",
+                ).limit(1)
+            )
+            if active_sibling is None:
+                group = s.get(RuleGroup, rule.group_id)
+                if group is not None and group.state == "active":
+                    group.state = "canceled"
+                    group.lease_owner = None
+                    group.lease_expires_at = None
+                    group.version += 1
+                    group.updated_at = utcnow()
             s.commit()
             return {"rule_id": rule_id, "canceled": True}
 
@@ -1015,8 +1108,11 @@ class TradingService:
     def _rule_dict(r: Rule) -> dict[str, Any]:
         return {
             "rule_id": r.id,
+            "group_id": r.group_id,
+            "payload_version": r.payload_version,
             "ticker": r.ticker,
             "condition": json.loads(r.condition_json),
             "action": json.loads(r.action_json),
             "state": r.state,
+            "pre_approved": r.pre_approved,
         }

@@ -1,9 +1,9 @@
 """Plan lifecycle: analyze → size → store → approve (decompose into rules) → cancel.
 
-Approving a plan turns its SizedTradePlan into a group of PRE_APPROVED conditional
-rules (entry tranches + targets + stop + trailing + time) tagged with the plan id.
-With ``auto_execute_preapproved_rules`` on, the daemon runs the whole ladder and
-exit sequence hands-free on Alpaca — every firing still passing the risk engine.
+Approving a plan turns its SizedTradePlan into a human-gated group of typed
+conditional rules (entry tranches + targets + stop + trailing + time) tagged
+with the plan id. A firing creates a proposal and still requires a separate,
+identified human approval.
 
 Promotion gate: while the analyst has <50 graded calls for an asset class, plans
 for that class may be approved in PAPER mode only.
@@ -21,7 +21,8 @@ from sqlalchemy import select, update
 from ..assets import AssetClass
 from ..broker.models import OrderRequest, OrderSide, OrderType
 from ..config import live_trading_enabled
-from ..db.models import Rule, TradePlanRow, utcnow
+from ..db.models import Rule, RuleGroup, TradePlanRow, utcnow
+from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
 from .promotion import can_promote
@@ -168,8 +169,9 @@ class PlanningService:
                     rules = self._decompose(plan, sized, plan_id, exits_only=True)
                 else:
                     rules = self._decompose(plan, sized, plan_id)
-                for rule in rules:
-                    s.add(rule)
+                self.service.rule_application.persist_commands(
+                    s, rules, plan_id=plan_id
+                )
                 row.status = "approved"
                 row.paper_only = not (live and promotable)
                 s.commit()
@@ -196,63 +198,126 @@ class PlanningService:
 
     def _decompose(
         self, plan: TradePlan, sized: dict, plan_id: int, exits_only: bool = False
-    ) -> list[Rule]:
+    ) -> list[RuleCommand]:
         symbol = plan.symbol
         is_long = plan.action is PlanAction.BUY
         entry_side = "buy" if is_long else "sell"
         exit_side = "sell" if is_long else "buy"
         total = Decimal(sized["total_shares"])
-        rules: list[Rule] = []
+        rules: list[RuleCommand] = []
+        group_key = f"plan-{plan_id}"
 
         # When a bracket handles entry+target+stop, only trailing/time remain.
         for t in ([] if exits_only else sized["tranches"]):
             shares = Decimal(t["shares"])
             if shares <= 0:
                 continue
-            cond = ({"price_below": float(t["price_level"])} if is_long
-                    else {"price_above": float(t["price_level"])})
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="entry", pre_approved=True,
-                fraction=Decimal(str(t["fraction"])),
-                condition_json=json.dumps(cond),
-                action_json=json.dumps({"side": entry_side, "qty": str(shares)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "entry",
+                        "condition": {
+                            "type": "price",
+                            "direction": "below" if is_long else "above",
+                            "price": t["price_level"],
+                        },
+                        "action": {
+                            "side": entry_side,
+                            "order_type": "market",
+                            "qty": shares,
+                        },
+                        "group_key": group_key,
+                        "fraction": t["fraction"],
+                    }
+                )
+            )
 
         if not exits_only:
             for tgt in plan.exit_plan.targets:
                 qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
                 if qty <= 0:
                     continue
-                cond = ({"price_above": float(tgt.price_level)} if is_long
-                        else {"price_below": float(tgt.price_level)})
-                rules.append(Rule(
-                    ticker=symbol, plan_id=plan_id, kind="target", pre_approved=True,
-                    condition_json=json.dumps(cond),
-                    action_json=json.dumps({"side": exit_side, "qty": str(qty)}),
-                ))
+                rules.append(
+                    RuleCommand.model_validate(
+                        {
+                            "ticker": symbol,
+                            "kind": "target",
+                            "condition": {
+                                "type": "price",
+                                "direction": "above" if is_long else "below",
+                                "price": tgt.price_level,
+                            },
+                            "action": {
+                                "side": exit_side,
+                                "order_type": "market",
+                                "qty": qty,
+                            },
+                            "group_key": group_key,
+                        }
+                    )
+                )
 
-            stop_cond = ({"price_below": float(plan.exit_plan.stop)} if is_long
-                         else {"price_above": float(plan.exit_plan.stop)})
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="stop", pre_approved=True,
-                condition_json=json.dumps(stop_cond),
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "stop",
+                        "condition": {
+                            "type": "price",
+                            "direction": "below" if is_long else "above",
+                            "price": plan.exit_plan.stop,
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": total,
+                        },
+                        "group_key": group_key,
+                    }
+                )
+            )
 
         if plan.exit_plan.trailing_stop_pct:
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="trailing", pre_approved=True,
-                condition_json=json.dumps({"trailing_stop_pct": plan.exit_plan.trailing_stop_pct}),
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "trailing",
+                        "condition": {
+                            "type": "trailing",
+                            "percent": plan.exit_plan.trailing_stop_pct,
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": total,
+                        },
+                        "group_key": group_key,
+                    }
+                )
+            )
 
         if plan.exit_plan.time_stop_days:
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="time", pre_approved=True,
-                deadline=utcnow() + timedelta(days=plan.exit_plan.time_stop_days),
-                condition_json="{}",
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "time",
+                        "condition": {
+                            "type": "time",
+                            "deadline": utcnow()
+                            + timedelta(days=plan.exit_plan.time_stop_days),
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": total,
+                        },
+                        "group_key": group_key,
+                    }
+                )
+            )
         return rules
 
     # ── cancel + queries ───────────────────────────────────────
@@ -262,10 +327,22 @@ class PlanningService:
             if row is None:
                 return {"error": "not found"}
             sibs = s.execute(
-                select(Rule).where(Rule.plan_id == plan_id, Rule.state == "active")
+                select(Rule).where(
+                    Rule.plan_id == plan_id,
+                    Rule.state.in_(("active", "processing")),
+                )
             ).scalars().all()
             for r in sibs:
                 r.state = "canceled"
+            group_ids = {rule.group_id for rule in sibs}
+            for group_id in group_ids:
+                group = s.get(RuleGroup, group_id)
+                if group is not None and group.state == "active":
+                    group.state = "canceled"
+                    group.lease_owner = None
+                    group.lease_expires_at = None
+                    group.version += 1
+                    group.updated_at = utcnow()
             row.status = "canceled"
             s.commit()
             return {"plan_id": plan_id, "status": "canceled", "rules_canceled": len(sibs)}

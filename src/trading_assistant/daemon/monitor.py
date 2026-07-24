@@ -1,10 +1,8 @@
 """Monitoring daemon.
 
-Polls quotes for tickers with active conditional rules; when a rule triggers it
-creates a PENDING proposal (routed through the risk engine like any order) and
-sends a notification. It never bypasses the human gate unless
-``features.auto_execute_preapproved_rules`` is explicitly on — and even then
-execution re-runs the risk engine.
+Delegates conditional-rule evaluation to :class:`RuleWorker`. A firing creates
+a PENDING proposal routed through the risk engine and sends a notification.
+This phase never auto-approves and never submits a broker order.
 
 Crash-safe: rules live in the DB, so a restarted daemon resumes from persisted
 state. Rules are one-shot (active -> triggered) to avoid re-firing every tick.
@@ -13,18 +11,15 @@ state. Rules are one-shot (active -> triggered) to avoid re-firing every tick.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
-from ..risk.staleness import is_stale
+from ..rules.worker import RuleWorker
 from ..service import TradingService
-from . import rules_engine
 from .backoff import next_delay
 
 log = logging.getLogger(__name__)
@@ -43,10 +38,13 @@ class Monitor:
         daily_task_timeout_seconds: float = 120.0,
         shadow=None,
         digest_source=None,
+        rule_worker=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
-        self.auto_execute = auto_execute
+        # Retained as a compatibility argument only. RuleWorker has no approval
+        # or submission dependency, so even a stale true setting cannot trade.
+        self.auto_execute = False
         self.poll_interval = poll_interval_seconds
         self.max_quote_age_seconds = max_quote_age_seconds
         self.cycle_timeout = cycle_timeout_seconds
@@ -56,206 +54,17 @@ class Monitor:
         self._last_daily = None              # date of last daily-tasks run
         self._core_task: Optional[asyncio.Task[Any]] = None
         self._daily_task: Optional[asyncio.Task[Any]] = None
+        self.rule_worker = rule_worker or RuleWorker(
+            service,
+            service.rule_repository,
+            service.rule_application,
+            self.notifier,
+            max_quote_age_seconds=max_quote_age_seconds,
+        )
 
     # ── one evaluation pass (synchronous, testable) ────────────
-    def _active_rules(self) -> list[dict[str, Any]]:
-        with self.service.session_factory() as s:
-            rules = s.execute(select(Rule).where(Rule.state == "active")).scalars().all()
-            return [
-                {
-                    "id": r.id, "ticker": r.ticker, "kind": r.kind,
-                    "condition": json.loads(r.condition_json),
-                    "action": json.loads(r.action_json),
-                    "hwm": r.hwm, "deadline": r.deadline,
-                    "pre_approved": r.pre_approved, "plan_id": r.plan_id,
-                }
-                for r in rules
-            ]
-
-    def _claim_rule(self, rule_id: int) -> bool:
-        """Atomically claim active -> processing exactly once."""
-        with self.service.session_factory() as s:
-            result = s.execute(
-                update(Rule)
-                .where(Rule.id == rule_id, Rule.state == "active")
-                .values(state="processing")
-            )
-            s.commit()
-            return result.rowcount == 1
-
-    def _finish_claim(self, rule_id: int, state: str) -> None:
-        with self.service.session_factory() as s:
-            s.execute(
-                update(Rule)
-                .where(Rule.id == rule_id, Rule.state == "processing")
-                .values(state=state)
-            )
-            s.commit()
-
-    def _effective_action(self, rule: dict, action: dict) -> dict | None:
-        if rule["kind"] not in ("target", "stop", "trailing", "time"):
-            return dict(action)
-        side = action["side"]
-        available = self.service.available_reduce_qty(rule["ticker"], side)
-        if available <= 0:
-            return None
-        adjusted = dict(action)
-        if adjusted.get("qty") is not None:
-            adjusted["qty"] = str(min(Decimal(str(adjusted["qty"])), available))
-        else:
-            quote = self.service.broker.get_quote(rule["ticker"])
-            requested = Decimal(str(adjusted.get("notional", 0))) / quote.last
-            adjusted.pop("notional", None)
-            adjusted["qty"] = str(min(requested, available))
-        return adjusted
-
-    def _persist_hwm(self, rule_id: int, hwm) -> None:
-        with self.service.session_factory() as s:
-            rule = s.get(Rule, rule_id)
-            if rule is not None:
-                rule.hwm = hwm
-                s.commit()
-
-    def _cancel_siblings(self, plan_id: int, except_id: int) -> int:
-        """OCO: atomically cancel all other active rules in the plan group."""
-        if plan_id is None:
-            return 0
-        with self.service.session_factory() as s:
-            sibs = s.execute(
-                select(Rule).where(
-                    Rule.plan_id == plan_id,
-                    Rule.state == "active",
-                    Rule.id != except_id,
-                )
-            ).scalars().all()
-            for r in sibs:
-                r.state = "canceled"
-            s.commit()
-            return len(sibs)
-
-    def _fires(self, rule: dict, quote) -> bool:
-        # Staleness gate (A4): never fire on a quote older than the threshold.
-        if is_stale(quote.as_of, max_age_seconds=self.max_quote_age_seconds):
-            log.warning("rule %s skipped: quote stale (> %ss)", rule["id"], self.max_quote_age_seconds)
-            return False
-        kind = rule["kind"]
-        if kind == "trailing":
-            pct = rule["condition"].get("trailing_stop_pct")
-            fires, new_hwm = rules_engine.update_trailing_stop(rule["hwm"], quote.last, pct)
-            self._persist_hwm(rule["id"], new_hwm)  # persist HWM every tick
-            return fires
-        if kind == "time":
-            return rules_engine.time_stop_fires(rule["deadline"])
-        return rules_engine.evaluate(rule["condition"], quote)
-
-    def tick(self) -> list[dict[str, Any]]:
-        actions: list[dict[str, Any]] = []
-        quotes: dict[str, Any] = {}
-        for rule in self._active_rules():
-            rule_id, ticker, action = rule["id"], rule["ticker"], rule["action"]
-            # Equity price rules cannot execute while the equity clock is closed.
-            # Avoid burning market-data quota on the same stale snapshot all night.
-            # Crypto uses its independent always-open clock and continues normally.
-            if not self.service.market_is_open(ticker):
-                continue
-            if ticker not in quotes:
-                quotes[ticker] = self.service.broker.get_quote(ticker)
-            quote = quotes[ticker]
-            if not self._fires(rule, quote):
-                continue
-            # Compare-and-set claim prevents concurrent monitors from double firing.
-            if not self._claim_rule(rule_id):
-                continue
-            try:
-                effective_action = self._effective_action(rule, action)
-                if effective_action is None:
-                    self._finish_claim(rule_id, "canceled")
-                    actions.append(
-                        {
-                            "rule_id": rule_id,
-                            "proposal": None,
-                            "executed": None,
-                            "oco_canceled": 0,
-                            "error": "no unreserved position to exit",
-                        }
-                    )
-                    continue
-
-                proposal = self.service.propose_order(
-                    ticker=ticker,
-                    side=effective_action["side"],
-                    order_type=effective_action.get("order_type", "market"),
-                    qty=effective_action.get("qty"),
-                    notional=effective_action.get("notional"),
-                    limit_price=effective_action.get("limit_price"),
-                    idempotency_key=f"rule-{rule_id}",
-                )
-                self.notifier.send(
-                    f"Rule {rule_id} ({rule['kind']}) triggered on {ticker}: "
-                    f"proposal #{proposal['order_id']} [{proposal['status']}]"
-                )
-                if proposal["status"] != "proposed":
-                    self._finish_claim(rule_id, "failed")
-                    actions.append(
-                        {
-                            "rule_id": rule_id,
-                            "proposal": proposal,
-                            "executed": None,
-                            "oco_canceled": 0,
-                        }
-                    )
-                    continue
-
-                executed = None
-                if self.auto_execute and rule["pre_approved"]:
-                    executed = self.service.approve_order(
-                        proposal["order_id"],
-                        actor=f"rule:{rule_id}",
-                        reason="pre-approved rule execution",
-                    )
-                    if not executed.get("executed"):
-                        self._finish_claim(rule_id, "failed")
-                        actions.append(
-                            {
-                                "rule_id": rule_id,
-                                "proposal": proposal,
-                                "executed": executed,
-                                "oco_canceled": 0,
-                            }
-                        )
-                        continue
-
-                self._finish_claim(rule_id, "triggered")
-                canceled = 0
-                if (
-                    executed is not None
-                    and executed.get("executed")
-                    and rule["kind"] in ("stop", "trailing", "time")
-                    and rule["plan_id"] is not None
-                ):
-                    canceled = self._cancel_siblings(rule["plan_id"], rule_id)
-
-                actions.append(
-                    {
-                        "rule_id": rule_id,
-                        "proposal": proposal,
-                        "executed": executed,
-                        "oco_canceled": canceled,
-                    }
-                )
-            except Exception as exc:
-                self._finish_claim(rule_id, "active")
-                log.exception("rule %s execution failed; returned to active", rule_id)
-                actions.append(
-                    {
-                        "rule_id": rule_id,
-                        "proposal": None,
-                        "executed": None,
-                        "oco_canceled": 0,
-                        "error": type(exc).__name__,
-                    }
-                )
-        return actions
+    def tick(self):
+        return self.rule_worker.tick()
 
     def run_daily_tasks(self, today=None) -> dict[str, Any]:
         """Once per day: grade matured shadow calls, run a fresh shadow batch, and
@@ -290,12 +99,6 @@ class Monitor:
         order_sync = self.service.serialize_reconciliation_report(report)
         position_reconciliation = self.service.reconcile_positions()
         with self.service.session_factory() as s:
-            recovered = s.execute(
-                update(Rule)
-                .where(Rule.state == "processing")
-                .values(state="active")
-            ).rowcount
-            s.commit()
             active = s.execute(
                 select(Rule).where(Rule.state == "active")
             ).scalars().all()
@@ -305,7 +108,7 @@ class Monitor:
         summary = {
             "active": len(active),
             "triggered": len(triggered),
-            "claims_recovered": recovered,
+            "claims_recovered": 0,
             "order_sync": order_sync,
             "position_reconciliation": position_reconciliation,
         }

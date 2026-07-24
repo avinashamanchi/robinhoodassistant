@@ -133,7 +133,11 @@ def test_conditional_rule_crud(app_config, session_factory):
         "AAPL", {"price_below": 175}, {"side": "buy", "notional": "50"}
     )
     assert created["state"] == "active"
-    assert svc.list_rules()[0]["condition"] == {"price_below": 175}
+    assert svc.list_rules()[0]["condition"] == {
+        "type": "price",
+        "direction": "below",
+        "price": "175",
+    }
 
     canceled = svc.cancel_rule(created["rule_id"])
     assert canceled["canceled"] is True

@@ -41,26 +41,45 @@ def test_rule_is_one_shot(make_service):
     assert mon.tick() == []                       # already triggered; no re-fire
 
 
-def test_rule_claim_is_compare_and_set(make_service):
+def test_monitor_tick_delegates_only_to_rule_worker(make_service):
     svc = make_service()
-    rule_id = _rule(svc, {"price_below": 175})["rule_id"]
-    first = Monitor(svc, NullNotifier())
-    second = Monitor(svc, NullNotifier())
+    sentinel = [{"delegated": True}]
 
-    assert first._claim_rule(rule_id) is True
-    assert second._claim_rule(rule_id) is False
+    class StubWorker:
+        calls = 0
+
+        def tick(self):
+            self.calls += 1
+            return sentinel
+
+    worker = StubWorker()
+    svc.propose_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("monitor must not propose directly")
+    )
+    svc.approve_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("monitor must not approve or submit")
+    )
+
+    monitor = Monitor(
+        svc, NullNotifier(), auto_execute=True, rule_worker=worker
+    )
+
+    assert monitor.tick() is sentinel
+    assert worker.calls == 1
+    assert svc.broker.submit_calls == 0
 
 
-def test_rule_returns_to_active_when_proposal_raises(make_service):
+def test_rule_lease_survives_when_application_crashes_before_transaction(make_service):
     from trading_assistant.db.models import Rule
 
     svc = make_service()
     rule_id = _rule(svc, {"price_below": 175})["rule_id"]
 
-    def fail_proposal(*args, **kwargs):
-        raise ConnectionError("database temporarily unavailable")
+    def fail_before(phase):
+        if phase == "before_transaction":
+            raise ConnectionError("database temporarily unavailable")
 
-    svc.propose_order = fail_proposal
+    svc.rule_application.crash_hook = fail_before
     result = Monitor(svc, NullNotifier()).tick()
 
     assert result[0]["error"] == "ConnectionError"
@@ -68,41 +87,15 @@ def test_rule_returns_to_active_when_proposal_raises(make_service):
         assert session.get(Rule, rule_id).state == "active"
 
 
-def test_rule_does_not_retry_unknown_broker_acceptance(make_service):
-    from trading_assistant.broker.mock import MockBroker
-    from trading_assistant.db.models import Order, Rule
+def test_monitor_never_submits_even_when_auto_execute_argument_is_true(make_service):
+    svc = make_service()
+    _rule(svc, {"price_below": 175})
 
-    class ResponseLossBroker(MockBroker):
-        lose_first_response = True
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
 
-        def submit_order(self, order):
-            result = super().submit_order(order)
-            if self.lose_first_response:
-                self.lose_first_response = False
-                raise ConnectionError("response lost after acceptance")
-            return result
-
-    broker = ResponseLossBroker()
-    broker.set_price("AAPL", Decimal("100"))
-    svc = make_service(broker=broker)
-    rule_id = _rule(svc, {"price_below": 175})["rule_id"]
-    with svc.session_factory() as session:
-        session.get(Rule, rule_id).pre_approved = True
-        session.commit()
-    monitor = Monitor(svc, NullNotifier(), auto_execute=True)
-
-    first = monitor.tick()
-    second = monitor.tick()
-
-    assert first[0]["executed"]["status"] == "acceptance_unknown"
-    assert first[0]["executed"]["executed"] is False
-    assert second == []
-    assert len(broker._orders_by_key) == 1
-    with svc.session_factory() as session:
-        orders = session.execute(select(Order)).scalars().all()
-        assert len(orders) == 1
-        assert orders[0].idempotency_key == f"rule-{rule_id}"
-        assert orders[0].status == "acceptance_unknown"
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert acted[0]["executed"] is None
+    assert svc.broker.submit_calls == 0
 
 
 def test_no_trigger_when_condition_unmet(make_service):
@@ -124,12 +117,13 @@ def test_tick_fetches_one_quote_per_ticker_even_with_many_rules(make_service):
     broker = CountingBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    _rule(svc, {"price_below": 50})
+    _rule(svc, {"price_below": 175})
     _rule(svc, {"price_above": 150})
     broker.quote_calls = 0
 
-    Monitor(svc, NullNotifier()).tick()
+    acted = Monitor(svc, NullNotifier()).tick()
 
+    assert len(acted) == 1
     assert broker.quote_calls == 1
 
 
@@ -180,24 +174,20 @@ def test_closed_equity_clock_does_not_stop_crypto_monitoring(make_service):
     assert broker.quote_calls > 0
 
 
-def test_auto_execute_requires_preapproved(make_service):
+def test_preapproved_database_row_is_rejected_instead_of_autoexecuted(make_service):
     from trading_assistant.db.models import Rule
 
     svc = make_service()
-    created = _rule(svc, {"price_below": 175})
-    # Ad-hoc rule (not pre-approved): flag on, but it must NOT auto-execute.
-    assert Monitor(svc, NullNotifier(), auto_execute=True).tick()[0]["executed"] is None
-    assert svc.broker.submit_calls == 0
-
-    # Mark it pre-approved (as plan approval would) -> now it auto-executes.
-    svc2 = make_service()
-    rid = _rule(svc2, {"price_below": 175})["rule_id"]
-    with svc2.session_factory() as s:
+    rid = _rule(svc, {"price_below": 175})["rule_id"]
+    with svc.session_factory() as s:
         s.get(Rule, rid).pre_approved = True
         s.commit()
-    acted = Monitor(svc2, NullNotifier(), auto_execute=True).tick()
-    assert acted[0]["executed"]["executed"] is True
-    assert svc2.broker.submit_calls == 1
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert acted[0]["proposal"] is None
+    assert acted[0]["error"] == "ValueError"
+    assert svc.broker.submit_calls == 0
 
 
 def test_crash_safe_rules_persist(make_service):
@@ -210,18 +200,13 @@ def test_crash_safe_rules_persist(make_service):
     assert len(mon2.tick()) == 1
 
 
-def test_startup_releases_rule_claim_left_processing_by_crash(make_service):
-    from trading_assistant.db.models import Rule
-
+def test_startup_no_longer_recovers_legacy_per_rule_processing_claims(make_service):
     svc = make_service()
-    rule_id = _rule(svc, {"price_below": 175})["rule_id"]
-    assert Monitor(svc, NullNotifier())._claim_rule(rule_id)
 
     summary = Monitor(svc, NullNotifier()).reconcile()
 
-    assert summary["claims_recovered"] == 1
-    with svc.session_factory() as session:
-        assert session.get(Rule, rule_id).state == "active"
+    assert summary["claims_recovered"] == 0
+    assert not hasattr(Monitor, "_claim_rule")
 
 
 def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_service):

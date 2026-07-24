@@ -10,20 +10,31 @@ from sqlalchemy import select
 
 from trading_assistant.daemon import rules_engine
 from trading_assistant.daemon.monitor import Monitor
-from trading_assistant.db.models import Rule
+from trading_assistant.db.models import Order, Rule
 from trading_assistant.notifications.base import NullNotifier
 
 
 def _add_rule(svc, **kw):
-    kw.setdefault("ticker", "AAPL")
-    kw.setdefault("state", "active")
-    kw.setdefault("action_json", json.dumps({"side": "sell", "qty": "5"}))
-    kw.setdefault("condition_json", "{}")
-    with svc.session_factory() as s:
-        rule = Rule(**kw)
-        s.add(rule)
-        s.commit()
-        return rule.id
+    ticker = kw.pop("ticker", "AAPL")
+    kind = kw.pop("kind", "price")
+    plan_id = kw.pop("plan_id", None)
+    condition = json.loads(kw.pop("condition_json", "{}"))
+    action = json.loads(
+        kw.pop("action_json", json.dumps({"side": "sell", "qty": "5"}))
+    )
+    deadline = kw.pop("deadline", None)
+    assert not kw
+    if kind == "time":
+        condition = {"type": "time", "deadline": deadline.isoformat()}
+    result = svc.create_conditional_rule(
+        ticker,
+        condition,
+        action,
+        kind=kind,
+        group_key=f"plan-{plan_id}" if plan_id is not None else None,
+        plan_id=plan_id,
+    )
+    return result["rule_id"]
 
 
 # ── pure logic ──────────────────────────────────────────────────
@@ -77,13 +88,14 @@ def test_oco_cancels_siblings_atomically(make_service):
         svc,
         kind="stop",
         plan_id=1,
-        pre_approved=True,
         condition_json=json.dumps({"price_below": 90}),
     )
 
     svc.broker.set_price("AAPL", Decimal("85"))            # only the stop's condition is true
     acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
     assert len(acted) == 1 and acted[0]["oco_canceled"] == 2
+    assert acted[0]["executed"] is None
+    assert broker._orders_by_key == {}
 
     with svc.session_factory() as s:
         states = {r.kind: r.state for r in s.execute(select(Rule)).scalars()}
@@ -110,7 +122,6 @@ def test_full_exit_is_capped_to_unreserved_live_position(make_service):
         svc,
         kind="stop",
         plan_id=2,
-        pre_approved=True,
         action_json=json.dumps({"side": "sell", "qty": "10"}),
         condition_json=json.dumps({"price_below": 95}),
     )
@@ -118,5 +129,8 @@ def test_full_exit_is_capped_to_unreserved_live_position(make_service):
 
     acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
 
-    assert acted[0]["executed"]["executed"] is True
-    assert broker.submitted[0].qty == Decimal("5")
+    assert acted[0]["executed"] is None
+    assert broker.submitted == []
+    with svc.session_factory() as session:
+        proposal = session.execute(select(Order)).scalar_one()
+    assert proposal.qty == Decimal("5")

@@ -45,6 +45,7 @@ class PortfolioSnapshotService:
         asset_class: AssetClass = AssetClass.EQUITY,
         *,
         exclude_order_id: int | None = None,
+        quote_overrides: dict[str, object] | None = None,
     ) -> PortfolioSnapshot:
         positions = self.broker.get_positions()
         pos_map = {position.ticker.upper(): position for position in positions}
@@ -68,8 +69,13 @@ class PortfolioSnapshotService:
             | set(pos_map)
             | {order.ticker.upper() for order in pending_orders}
         )
-        quotes = {}
+        quotes = {
+            symbol.upper(): quote
+            for symbol, quote in (quote_overrides or {}).items()
+        }
         for symbol in wanted:
+            if symbol in quotes:
+                continue
             try:
                 quotes[symbol] = self.broker.get_quote(symbol)
             except Exception:
