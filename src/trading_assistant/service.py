@@ -144,6 +144,9 @@ class TradingService:
             Order.status.in_(
                 (
                     OrderStatus.APPROVED.value,
+                    OrderStatus.APPROVAL_RECORDED.value,
+                    OrderStatus.SUBMITTING.value,
+                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
                     OrderStatus.SUBMITTED.value,
                     OrderStatus.PARTIALLY_FILLED.value,
                 )
@@ -170,6 +173,14 @@ class TradingService:
         pending_signed_notional: dict[str, Decimal] = {}
         pending_exposure_complete = True
         for pending_order in pending_orders:
+            if pending_order.status in (
+                OrderStatus.SUBMITTING.value,
+                OrderStatus.ACCEPTANCE_UNKNOWN.value,
+            ):
+                # Submission may already have reached the broker, but local
+                # acceptance is unresolved. Reserve any calculable amount and
+                # fail closed until reconciliation establishes the outcome.
+                pending_exposure_complete = False
             symbol = pending_order.ticker.upper()
             quote = quotes.get(symbol)
             if quote is None:

@@ -150,6 +150,9 @@ def test_accept_then_disconnect_records_unknown_without_resubmission(make_servic
         assert order.submission_attempt == 1
     replay = _approve(svc, order_id, "must not resubmit unknown acceptance")
     assert replay["executed"] is False
+    blocked = _propose(svc)
+    assert blocked["status"] == "rejected"
+    assert any("outstanding order exposure" in reason for reason in blocked["risk_reasons"])
     assert broker.submit_calls == 1
 
 

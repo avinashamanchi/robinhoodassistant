@@ -170,8 +170,8 @@ class PortfolioSnapshot:
     realized_pnl_today: Decimal
     as_of: datetime = field(default_factory=_utcnow)
     external_positions: dict[str, "object"] = field(default_factory=dict)
-    # Signed USD exposure from locally tracked APPROVED/SUBMITTED orders that
-    # has not filled yet. Buys are positive, sells negative.
+    # Signed USD exposure from locally tracked outstanding orders that has not
+    # filled yet. Buys are positive, sells negative.
     pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
     pending_exposure_complete: bool = True
 
