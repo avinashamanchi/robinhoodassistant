@@ -57,6 +57,21 @@ class _ProcessBroker:
         )
 
 
+class _ImmediateProcessBroker:
+    reconciliation_key = "immediate-process-test"
+
+    def __init__(self, entered) -> None:
+        self.entered = entered
+
+    def submit_order(self, order):
+        self.entered.set()
+        return OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=f"process-broker-order-{order.idempotency_key}",
+            status=OrderStatus.SUBMITTED,
+        )
+
+
 class _QueuedSnapshotBroker(MockBroker):
     reconciliation_key = "queued-snapshot-process-test"
 
@@ -247,6 +262,122 @@ def _wait_for_writer_intent(intent_path, writer_finished) -> bool:
             return False
         time.sleep(0.01)
     return False
+
+
+def _observe_barrier_lock(
+    barrier,
+    path,
+    operation,
+    observed,
+    *,
+    after_acquire=False,
+) -> None:
+    """Signal an exact child-process flock call without changing lock ordering."""
+    original_open = barrier._open
+    observed_descriptors: set[int] = set()
+
+    def observed_open(open_path):
+        descriptor = original_open(open_path)
+        if open_path == path:
+            observed_descriptors.add(descriptor)
+        return descriptor
+
+    original_flock = fcntl.flock
+
+    def observed_flock(descriptor, lock_operation):
+        matched = (
+            descriptor in observed_descriptors
+            and lock_operation == operation
+        )
+        if matched and not after_acquire:
+            observed.set()
+        result = original_flock(descriptor, lock_operation)
+        if matched and after_acquire:
+            observed.set()
+        return result
+
+    barrier._open = observed_open
+    fcntl.flock = observed_flock
+
+
+def _counted_submission_process(
+    db_url,
+    order_id,
+    pause_after_first_evaluation,
+    snapshot_evaluated,
+    release_evaluation,
+    main_lock_attempted,
+    broker_entered,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    repository = OrderRepository(factory)
+
+    class _CountingRisk:
+        def __init__(self):
+            self.calls = 0
+
+        def check(self, order, snapshot):
+            self.calls += 1
+            if self.calls == 1:
+                snapshot_evaluated.set()
+                if (
+                    pause_after_first_evaluation
+                    and not release_evaluation.wait(timeout=10)
+                ):
+                    raise TimeoutError("test did not release risk evaluation")
+            return RiskResult(approved=True)
+
+    risk = _CountingRisk()
+    service = OrderSubmissionService(
+        repository,
+        factory,
+        _ImmediateProcessBroker(broker_entered),
+        _StaticSnapshotService(),
+        lambda _symbol: risk,
+        utcnow,
+    )
+    _observe_barrier_lock(
+        service.submission_barrier,
+        service.submission_barrier.path,
+        fcntl.LOCK_EX,
+        main_lock_attempted,
+    )
+    try:
+        result = service.submit(order_id)
+        outcome.put(("ok", result.status.value, risk.calls))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}", risk.calls))
+
+
+def _observed_breaker_writer_process(
+    db_url,
+    started,
+    intent_acquired,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    breakers = BreakerService(factory)
+    _observe_barrier_lock(
+        breakers.submission_barrier,
+        breakers.submission_barrier.intent_path,
+        fcntl.LOCK_SH,
+        intent_acquired,
+        after_acquire=True,
+    )
+    started.set()
+    try:
+        breakers.trip(
+            BreakerScope.data(AssetClass.EQUITY),
+            "writer priority regression",
+            "daemon:writer-priority",
+        )
+        outcome.put(("ok", "breaker"))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
 
 
 def _queued_snapshot_submission_process(
@@ -871,3 +1002,154 @@ def test_higher_hwm_writer_queued_after_snapshot_prevents_broker_send(
     assert result[0:2] == ("ok", OrderStatus.REJECTED.value)
     assert "account drawdown limit reached" in result[2]
     assert broker_entered.is_set() is False
+
+
+@pytest.mark.parametrize("follower_count", [1, 3])
+def test_submission_waiters_make_progress_without_invalidating_active_submission(
+    make_service,
+    db_url,
+    follower_count,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_ids = [
+        _approved_order(service) for _index in range(follower_count + 1)
+    ]
+    release_active = context.Event()
+    processes = []
+    snapshots = []
+    main_attempts = []
+    broker_calls = []
+    outcomes = []
+
+    for index, order_id in enumerate(order_ids):
+        snapshot_evaluated = context.Event()
+        main_lock_attempted = context.Event()
+        broker_entered = context.Event()
+        outcome = context.Queue()
+        process = context.Process(
+            target=_counted_submission_process,
+            args=(
+                db_url,
+                order_id,
+                index == 0,
+                snapshot_evaluated,
+                release_active,
+                main_lock_attempted,
+                broker_entered,
+                outcome,
+            ),
+        )
+        processes.append(process)
+        snapshots.append(snapshot_evaluated)
+        main_attempts.append(main_lock_attempted)
+        broker_calls.append(broker_entered)
+        outcomes.append(outcome)
+
+    processes[0].start()
+    assert snapshots[0].wait(timeout=10)
+    for process in processes[1:]:
+        process.start()
+    followers_reached_main = [
+        event.wait(timeout=2) for event in main_attempts[1:]
+    ]
+    try:
+        release_active.set()
+    finally:
+        for process in processes:
+            _join(process, release_active)
+
+    assert all(followers_reached_main)
+    assert [queue.get(timeout=2) for queue in outcomes] == [
+        ("ok", OrderStatus.SUBMITTED.value, 1)
+        for _order_id in order_ids
+    ]
+    assert all(event.is_set() for event in broker_calls)
+
+
+@pytest.mark.parametrize("follower_count", [1, 3])
+def test_real_writer_has_priority_over_queued_submission_waiters_without_deadlock(
+    make_service,
+    db_url,
+    follower_count,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_ids = [
+        _approved_order(service) for _index in range(follower_count + 1)
+    ]
+    release_active = context.Event()
+    submissions = []
+    snapshots = []
+    main_attempts = []
+    broker_calls = []
+    submission_outcomes = []
+
+    for index, order_id in enumerate(order_ids):
+        snapshot_evaluated = context.Event()
+        main_lock_attempted = context.Event()
+        broker_entered = context.Event()
+        outcome = context.Queue()
+        process = context.Process(
+            target=_counted_submission_process,
+            args=(
+                db_url,
+                order_id,
+                index == 0,
+                snapshot_evaluated,
+                release_active,
+                main_lock_attempted,
+                broker_entered,
+                outcome,
+            ),
+        )
+        submissions.append(process)
+        snapshots.append(snapshot_evaluated)
+        main_attempts.append(main_lock_attempted)
+        broker_calls.append(broker_entered)
+        submission_outcomes.append(outcome)
+
+    submissions[0].start()
+    assert snapshots[0].wait(timeout=10)
+    for submission in submissions[1:]:
+        submission.start()
+    followers_reached_main = [
+        event.wait(timeout=2) for event in main_attempts[1:]
+    ]
+
+    writer_started = context.Event()
+    writer_intent_acquired = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_observed_breaker_writer_process,
+        args=(
+            db_url,
+            writer_started,
+            writer_intent_acquired,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert writer_started.wait(timeout=10)
+    writer_advertised_before_release = writer_intent_acquired.wait(timeout=2)
+    try:
+        release_active.set()
+    finally:
+        for submission in submissions:
+            _join(submission, release_active)
+        _join(writer)
+
+    assert all(followers_reached_main)
+    assert writer_advertised_before_release is True
+    assert writer_outcome.get(timeout=2) == ("ok", "breaker")
+    assert writer_finished.is_set() is True
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    ) is True
+    assert [queue.get(timeout=2)[0:2] for queue in submission_outcomes] == [
+        ("ok", OrderStatus.APPROVAL_RECORDED.value)
+        for _order_id in order_ids
+    ]
+    assert all(event.is_set() is False for event in broker_calls)

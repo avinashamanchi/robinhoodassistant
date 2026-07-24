@@ -160,6 +160,93 @@ def test_reconcile_unknown_fill_latch_survives_restart_until_exact_activity(
         assert fill.price == Decimal("100.000000")
 
 
+@pytest.mark.parametrize(
+    "terminal_status",
+    [OrderStatus.CANCELED, OrderStatus.REJECTED],
+)
+def test_reconcile_unknown_atomically_latches_terminal_cumulative_fill(
+    make_service,
+    terminal_status,
+):
+    class TerminalThenDisconnectBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.activities = []
+
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            terminal = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                terminal_status,
+                filled_qty=Decimal("0.5"),
+                avg_fill_price=Decimal("90"),
+            )
+            self._orders_by_key[order.idempotency_key] = terminal
+            self._orders_by_id[accepted.broker_order_id] = terminal
+            raise ConnectionError("response lost after terminal partial fill")
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
+
+    broker = TerminalThenDisconnectBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    order_id = _approved_order_id(service)
+    service.order_submission.submit(order_id)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("0.25"),
+                price=Decimal("90"),
+                broker_fill_id="already-authoritative-quarter",
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+
+    assert service.reconciliation.reconcile_unknown() == (1, ())
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        assert order.status == terminal_status.value
+        assert order.acceptance_state == "fill_reconcile_required"
+
+    restarted = make_service(broker=broker)
+    incomplete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="delayed-authoritative-quarter",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("0.25"),
+            price=Decimal("90"),
+            filled_at=utcnow(),
+        )
+    ]
+
+    exact = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile()
+
+    assert exact.inserted_fills == 1
+    assert replay.inserted_fills == 0
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == terminal_status.value
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.sum(Fill.qty)).where(Fill.order_id == order_id)
+        ) == Decimal("0.5")
+
+
 def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
     broker = CancelFailsBroker()
     broker.set_price("AAPL", Decimal("100"))

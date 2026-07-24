@@ -112,6 +112,7 @@ class ReconciliationService:
                 order_id,
                 remote.broker_order_id,
                 remote.status,
+                remote.filled_qty,
                 datetime.now(timezone.utc),
             ):
                 resolved += 1

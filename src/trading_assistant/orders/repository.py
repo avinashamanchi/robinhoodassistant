@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -13,6 +14,7 @@ from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
     FILL_RECONCILIATION_REQUIRED,
+    Fill,
     Order,
     Proposal,
     RiskEvent,
@@ -218,21 +220,51 @@ class OrderRepository:
         order_id: int,
         broker_order_id: str | None,
         status: OrderStatus,
+        filled_qty: Decimal,
         now: datetime,
     ) -> bool:
-        """Persist broker truth for one indeterminate submission without resending."""
+        """Atomically persist acceptance and latch unresolved cumulative fills."""
         if broker_order_id is None:
             return False
-        acceptance_state = (
-            FILL_RECONCILIATION_REQUIRED
-            if status
-            in {
-                OrderStatus.PARTIALLY_FILLED,
-                OrderStatus.FILLED,
-            }
-            else "accepted"
-        )
         with self.session_factory() as session:
+            local_fills = session.execute(
+                select(Fill.broker_fill_id, Fill.qty).where(
+                    Fill.order_id == order_id
+                )
+            ).all()
+            synthetic_prefix = f"{broker_order_id}:"
+            authoritative_qty = sum(
+                (
+                    qty
+                    for broker_fill_id, qty in local_fills
+                    if broker_fill_id is not None
+                    and not broker_fill_id.startswith(synthetic_prefix)
+                ),
+                Decimal(0),
+            )
+            remote_fill_invalid = (
+                not isinstance(filled_qty, Decimal)
+                or not filled_qty.is_finite()
+                or filled_qty < 0
+            )
+            remote_fill_ahead = (
+                not remote_fill_invalid
+                and filled_qty
+                > authoritative_qty + Decimal("0.000001")
+            )
+            acceptance_state = (
+                FILL_RECONCILIATION_REQUIRED
+                if (
+                    status
+                    in {
+                        OrderStatus.PARTIALLY_FILLED,
+                        OrderStatus.FILLED,
+                    }
+                    or remote_fill_invalid
+                    or remote_fill_ahead
+                )
+                else "accepted"
+            )
             result = session.execute(
                 update(Order)
                 .where(

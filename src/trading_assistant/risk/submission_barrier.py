@@ -29,6 +29,7 @@ class SubmissionGuard:
 
     def __init__(self, barrier: "SubmissionBarrier") -> None:
         self._barrier = barrier
+        self.writer_pending = False
 
     @contextmanager
     def claim_if_current(self) -> Iterator[bool]:
@@ -42,6 +43,7 @@ class SubmissionGuard:
                     fcntl.LOCK_EX | fcntl.LOCK_NB,
                 )
             except BlockingIOError:
+                self.writer_pending = True
                 yield False
                 return
             acquired = True
@@ -58,10 +60,18 @@ class SubmissionBarrier:
     The sidecar lock is independent of SQLite transactions, so a submission can
     retain ordering ownership across broker I/O without holding a database
     transaction open. Risk writers first take a shared intent lock, then the
-    exclusive main lock. A submission takes both exclusively to begin a fresh
-    snapshot, releases intent during evaluation, and reacquires it
-    non-blockingly before claim. A queued writer therefore invalidates the
-    evaluated snapshot instead of waiting until after a stale broker send.
+    exclusive main lock. Submission waiters queue only on the main lock and
+    never advertise writer intent. Once admitted, a submission probes intent
+    non-blockingly before snapshot assembly and reacquires it non-blockingly
+    before claim. A queued writer therefore invalidates an evaluated snapshot
+    instead of waiting until after a stale broker send.
+
+    A separate writer gate lets an invalidated submission wait until every
+    already-announced writer commits, without relying on advisory-lock waiter
+    fairness. Writers acquire the gate before intent; submissions never hold
+    the main lock while waiting on the gate. This preserves writer priority and
+    a single global lock order while keeping broker I/O outside SQLite write
+    transactions.
 
     ``flock`` releases every lock automatically if a process exits.
     """
@@ -88,6 +98,9 @@ class SubmissionBarrier:
             f"{database_path.name}.submission.lock"
         )
         self.intent_path = self.path.with_name(f"{self.path.name}.intent")
+        self.writer_gate_path = self.path.with_name(
+            f"{self.path.name}.writer-gate"
+        )
 
     @staticmethod
     def _open(path: Path) -> int:
@@ -116,6 +129,32 @@ class SubmissionBarrier:
             else:
                 del paths[key]
 
+    def _intent_is_clear(self) -> bool:
+        descriptor = self._open(self.intent_path)
+        acquired = False
+        try:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                return False
+            acquired = True
+            return True
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _wait_for_announced_writers(self) -> None:
+        descriptor = self._open(self.writer_gate_path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
     @contextmanager
     def hold_writer(self) -> Iterator[None]:
         """Announce and serialize one execution-risk write through commit."""
@@ -123,9 +162,11 @@ class SubmissionBarrier:
             yield
             return
 
+        gate_descriptor = self._open(self.writer_gate_path)
         intent_descriptor = self._open(self.intent_path)
         main_descriptor = self._open(self.path)
         try:
+            fcntl.flock(gate_descriptor, fcntl.LOCK_SH)
             fcntl.flock(intent_descriptor, fcntl.LOCK_SH)
             fcntl.flock(main_descriptor, fcntl.LOCK_EX)
             with self._mark_owned():
@@ -135,6 +176,8 @@ class SubmissionBarrier:
             os.close(main_descriptor)
             fcntl.flock(intent_descriptor, fcntl.LOCK_UN)
             os.close(intent_descriptor)
+            fcntl.flock(gate_descriptor, fcntl.LOCK_UN)
+            os.close(gate_descriptor)
 
     @contextmanager
     def hold_submission(self) -> Iterator[SubmissionGuard]:
@@ -142,23 +185,27 @@ class SubmissionBarrier:
         if self._is_owned_by_current_thread():
             raise RuntimeError("submission barrier cannot be nested")
 
-        intent_descriptor = self._open(self.intent_path)
         main_descriptor = self._open(self.path)
-        intent_locked = False
+        main_locked = False
+        guard: SubmissionGuard | None = None
         try:
-            fcntl.flock(intent_descriptor, fcntl.LOCK_EX)
-            intent_locked = True
-            fcntl.flock(main_descriptor, fcntl.LOCK_EX)
-            fcntl.flock(intent_descriptor, fcntl.LOCK_UN)
-            intent_locked = False
+            while True:
+                fcntl.flock(main_descriptor, fcntl.LOCK_EX)
+                main_locked = True
+                if self._intent_is_clear():
+                    break
+                fcntl.flock(main_descriptor, fcntl.LOCK_UN)
+                main_locked = False
+                self._wait_for_announced_writers()
+            guard = SubmissionGuard(self)
             with self._mark_owned():
-                yield SubmissionGuard(self)
+                yield guard
         finally:
-            if intent_locked:
-                fcntl.flock(intent_descriptor, fcntl.LOCK_UN)
-            os.close(intent_descriptor)
-            fcntl.flock(main_descriptor, fcntl.LOCK_UN)
+            if main_locked:
+                fcntl.flock(main_descriptor, fcntl.LOCK_UN)
             os.close(main_descriptor)
+            if guard is not None and guard.writer_pending:
+                self._wait_for_announced_writers()
 
     @contextmanager
     def hold(self) -> Iterator[None]:
