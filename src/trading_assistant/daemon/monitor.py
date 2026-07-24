@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
+from uuid import uuid4
 
 from sqlalchemy import select
 
@@ -95,10 +96,16 @@ class Monitor:
     # ── reconciliation on restart ──────────────────────────────
     def reconcile(self) -> dict[str, Any]:
         """Synchronize broker truth before resuming persisted rules on startup."""
-        report = self.service.reconciliation.reconcile()
-        order_sync = self.service.serialize_reconciliation_report(report)
+        request_id = uuid4().hex
+        order_sync = self.service.sync_open_orders(
+            actor="daemon:startup",
+            reason="daemon startup broker order reconciliation",
+            request_id=request_id,
+        )
         position_reconciliation = self.service.reconcile_positions(
-            actor="daemon:startup"
+            actor="daemon:startup",
+            reason="daemon startup position reconciliation",
+            request_id=request_id,
         )
         with self.service.session_factory() as s:
             active = s.execute(
@@ -118,7 +125,11 @@ class Monitor:
         return summary
 
     def _core_cycle(self) -> None:
-        order_sync = self.service.sync_open_orders()
+        order_sync = self.service.sync_open_orders(
+            actor="daemon:monitor",
+            reason="daemon runtime broker order reconciliation",
+            request_id=uuid4().hex,
+        )
         if order_sync.get("failed", 0):
             self.service.trip_all_killswitches(
                 "runtime broker order reconciliation failed"

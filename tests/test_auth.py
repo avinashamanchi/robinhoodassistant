@@ -24,7 +24,7 @@ TOKEN = "task-7-operator-secret"
 
 
 class _StubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
 
 
@@ -168,28 +168,35 @@ def test_wrong_csrf_is_rejected(session_auth):
     assert principal.actor == "operator:local"
 
 
-def test_session_endpoint_rotates_csrf_for_in_memory_clients(client):
+def test_session_endpoint_is_non_mutating_and_multi_tab_safe(client):
     login = client.post("/auth/login", json={"secret": TOKEN})
     original_csrf = login.json()["csrf_token"]
+    session_factory = client.app.state.session_auth.session_factory
+    with session_factory() as db:
+        original_hash = db.query(AuthSession).one().csrf_hash
 
-    session = client.get("/auth/session")
-    refreshed_csrf = session.json()["csrf_token"]
+    first_tab = client.get("/auth/session")
+    second_tab = client.get("/auth/session")
+    first_csrf = first_tab.json()["csrf_token"]
+    second_csrf = second_tab.json()["csrf_token"]
 
-    assert refreshed_csrf
-    assert refreshed_csrf != original_csrf
+    assert first_csrf == original_csrf
+    assert second_csrf == original_csrf
+    with session_factory() as db:
+        assert db.query(AuthSession).one().csrf_hash == original_hash
     assert (
         client.post(
             "/chat",
-            json={"message": "old token"},
-            headers={"X-CSRF-Token": original_csrf},
+            json={"message": "first tab"},
+            headers={"X-CSRF-Token": first_csrf},
         ).status_code
-        == 403
+        == 200
     )
     assert (
         client.post(
             "/chat",
-            json={"message": "new token"},
-            headers={"X-CSRF-Token": refreshed_csrf},
+            json={"message": "second tab"},
+            headers={"X-CSRF-Token": second_csrf},
         ).status_code
         == 200
     )

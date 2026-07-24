@@ -141,7 +141,7 @@ def authenticated_client(make_service, operator_token, authenticate_client):
     from trading_assistant.app.main import create_app
 
     class _StubAgent:
-        def chat(self, message):
+        def chat(self, message, **context):
             return {"reply": "ok", "tool_calls": []}
 
     service = make_service()

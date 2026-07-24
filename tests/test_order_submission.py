@@ -36,7 +36,15 @@ from trading_assistant.service import TradingService
 
 
 def _approved_order(svc) -> int:
-    order_id = svc.propose_order("AAPL", "buy", "market", notional="100")["order_id"]
+    order_id = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="order submission proposal",
+        request_id="order-submission-proposal",
+    )["order_id"]
     svc.order_application.approve(
         ApprovalCommand(order_id, "operator:avi", "reviewed", utcnow())
     )
@@ -512,6 +520,9 @@ def test_invalid_submission_identity_is_unknown_latched_and_trips_drift(
         "market",
         notional="100",
         idempotency_key="expected-client-id",
+        actor="operator:test",
+        reason="order identity proposal",
+        request_id="order-identity-proposal",
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(
@@ -573,6 +584,9 @@ def test_crypto_submission_identity_accepts_equivalent_symbol_only(
         "market",
         notional="100",
         idempotency_key=f"symbol-identity-{returned_ticker}",
+        actor="operator:test",
+        reason="symbol identity proposal",
+        request_id="symbol-identity-proposal",
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(
@@ -633,6 +647,9 @@ def test_submission_never_treats_local_equity_as_broker_slash_crypto(
         "market",
         notional="100",
         idempotency_key="equity-direction-submission",
+        actor="operator:test",
+        reason="directional identity proposal",
+        request_id="directional-identity-proposal",
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(

@@ -19,7 +19,7 @@ EXPECTED_CSP = (
 
 
 class _StubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
 
 
@@ -62,7 +62,7 @@ def test_security_headers_cover_success_auth_failure_and_not_found(
 
 def test_provider_exception_text_is_not_returned(make_service):
     class ExplodingAgent:
-        def chat(self, message):
+        def chat(self, message, **context):
             raise RuntimeError("provider-secret-response")
 
     app = create_app(

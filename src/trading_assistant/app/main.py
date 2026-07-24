@@ -42,6 +42,13 @@ _STATIC = Path(__file__).parent / "static"
 class ChatIn(BaseModel):
     message: str
 
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message must be non-empty")
+        return value.strip()
+
 
 class BacktestRunIn(BaseModel):
     symbols: list[str] = []
@@ -210,7 +217,6 @@ def create_app(
         service.session_factory,
         **session_kwargs,
     )
-    install_security(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
@@ -218,6 +224,7 @@ def create_app(
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["X-CSRF-Token", "Content-Type"],
     )
+    install_security(app)
     app.include_router(auth_router)
 
     @app.get("/health/live")
@@ -248,7 +255,12 @@ def create_app(
             raise ApiError(
                 "rate_limit_exceeded", 429, "Chat rate limit exceeded"
             )
-        return agent.chat(body.message)
+        return agent.chat(
+            body.message,
+            actor=principal.actor,
+            reason=body.message,
+            request_id=request.state.request_id,
+        )
 
     @app.get("/health")
     def health(
@@ -279,7 +291,11 @@ def create_app(
             reason=body.reason,
             request_id=request.state.request_id,
         )
-        if result.get("error", "").startswith("order not in PROPOSED"):
+        if (
+            result.get("error", "").startswith("order not in PROPOSED")
+            or result.get("error") == "proposal expired"
+            or result.get("status") == "expired"
+        ):
             raise ApiError(
                 "approval_conflict", 409, "Order approval is no longer current"
             )
@@ -406,11 +422,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
-        return service.panic(
+        receipt = service.panic(
             actor=principal.actor,
             reason=body.reason,
             request_id=request.state.request_id,
         )
+        if receipt.get("safe") is not True:
+            raise ApiError(
+                "panic_incomplete",
+                503,
+                "Panic could not confirm a safe state",
+                receipt=receipt,
+            )
+        return receipt
 
     @app.get("/analyst/scorecard")
     def analyst_scorecard(

@@ -344,7 +344,7 @@ class _RecoveredCancelLossBroker(MockBroker):
 
 
 class _ProcessStubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": message, "tool_calls": []}
 
 
@@ -722,15 +722,25 @@ def _cancel_loss_process(
     )
     original_sync = service.sync_open_orders
 
-    def paused_sync():
+    def paused_sync(**context):
         cancel_observed.set()
         if not release_cancel.wait(timeout=10):
             raise TimeoutError("test did not release cancel reconciliation")
-        return original_sync()
+        return original_sync(**context)
 
     service.sync_open_orders = paused_sync
     try:
-        outcome.put(("ok", service.cancel_live_order(cancel_order_id)))
+        outcome.put(
+            (
+                "ok",
+                service.cancel_live_order(
+                    cancel_order_id,
+                    actor="operator:process-test",
+                    reason="cancel loss race",
+                    request_id="process-cancel-loss-race",
+                ),
+            )
+        )
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -769,7 +779,17 @@ def _indeterminate_cancel_process(
 
     service.submission_barrier.hold_writer = observed_hold_writer
     try:
-        outcome.put(("ok", service.cancel_live_order(cancel_order_id)))
+        outcome.put(
+            (
+                "ok",
+                service.cancel_live_order(
+                    cancel_order_id,
+                    actor="operator:process-test",
+                    reason="indeterminate cancellation race",
+                    request_id="process-indeterminate-cancel",
+                ),
+            )
+        )
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -1130,7 +1150,13 @@ def _active_transaction_compatibility_writer_process(
 
 def _approved_order(service) -> int:
     order_id = service.propose_order(
-        "AAPL", "buy", "market", notional="100"
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:process-test",
+        reason="submission barrier proposal",
+        request_id="submission-barrier-proposal",
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(

@@ -206,6 +206,9 @@ def test_rule_application_rejects_raw_unknown_json_without_persisting(make_servi
             "AAPL",
             {"type": "mystery", "value": 1},
             {"side": "buy", "order_type": "market", "notional": "100"},
+            actor="operator:test",
+            reason="invalid rule model test",
+            request_id="invalid-rule-model",
         )
     assert svc.list_rules() == []
 

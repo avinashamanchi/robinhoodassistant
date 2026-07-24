@@ -35,6 +35,9 @@ def _add_rule(svc, **kw):
         kind=kind,
         group_key=f"plan-{plan_id}" if plan_id is not None else None,
         plan_id=plan_id,
+        actor="operator:test",
+        reason="plan rule test setup",
+        request_id="plan-rule-setup",
     )
     return result["rule_id"]
 

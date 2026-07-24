@@ -78,6 +78,18 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _derive_csrf(token: str, application_secret: str) -> str:
+    key = hashlib.sha256(
+        b"trading-assistant/csrf/v1\x00"
+        + application_secret.encode("utf-8")
+    ).digest()
+    return hmac.new(
+        key,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class SessionAuth:
     def __init__(
         self,
@@ -114,7 +126,7 @@ class SessionAuth:
         ):
             raise InvalidCredentials
         token = secrets.token_urlsafe(32)
-        csrf = secrets.token_urlsafe(32)
+        csrf = _derive_csrf(token, expected_secret)
         now = self.now()
         with self.session_factory() as session:
             row = AuthSession(
@@ -161,15 +173,17 @@ class SessionAuth:
                 raise CsrfRejected
         return principal
 
-    def rotate_csrf(self, token: str) -> str:
+    def csrf_token(self, token: str, application_secret: str) -> str:
         principal = self.authenticate(token)
-        csrf = secrets.token_urlsafe(32)
+        if not application_secret or not application_secret.strip():
+            raise RuntimeError("APP_API_TOKEN is required")
+        csrf = _derive_csrf(token, application_secret)
         with self.session_factory() as session:
             row = session.get(AuthSession, principal.session_id)
             if row is None or row.revoked_at is not None:
                 raise InvalidSession
-            row.csrf_hash = _hash(csrf)
-            session.commit()
+            if not hmac.compare_digest(row.csrf_hash, _hash(csrf)):
+                raise CsrfRejected
         return csrf
 
     def reauthenticate(

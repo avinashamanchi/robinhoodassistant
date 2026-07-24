@@ -14,12 +14,34 @@ from trading_assistant.db.models import Fill, Order
 
 
 class _StubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
 
 
 def _approve(svc, order_id):
-    return svc.approve_order(order_id, actor="operator:test", reason="launch test")
+    return svc.approve_order(
+        order_id,
+        actor="operator:test",
+        reason="launch test",
+        request_id="launch-test-approval",
+    )
+
+
+def _propose(svc, **kwargs):
+    return svc.propose_order(
+        **kwargs,
+        actor="operator:test",
+        reason="launch test proposal",
+        request_id="launch-test-proposal",
+    )
+
+
+def _sync(svc):
+    return svc.sync_open_orders(
+        actor="operator:test",
+        reason="launch test broker reconciliation",
+        request_id="launch-test-sync",
+    )
 
 
 # ── D3 health + heartbeat ───────────────────────────────────────
@@ -89,7 +111,13 @@ def test_order_lifecycle_propose_approve_fill(make_service):
 
     broker = LifecycleBroker()
     svc = make_service(broker=broker)  # AAPL @ 100
-    oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
+    oid = _propose(
+        svc,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        notional="400",
+    )["order_id"]
     assert svc.get_order_status(oid)["status"] == "proposed"
 
     approve = _approve(svc, oid)
@@ -120,7 +148,7 @@ def test_order_lifecycle_propose_approve_fill(make_service):
         )
     ]
 
-    sync = svc.sync_open_orders()
+    sync = _sync(svc)
     assert sync["newly_filled"] == 1
 
     with svc.session_factory() as s:
@@ -159,7 +187,13 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     broker = FillableBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
+    oid = _propose(
+        svc,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        notional="400",
+    )["order_id"]
     _approve(svc, oid)                          # -> SUBMITTED with broker_order_id
 
     broker.fill = (Decimal("4"), Decimal("100"))
@@ -176,13 +210,13 @@ def test_sync_ingests_fills_and_advances_status(make_service):
             filled_at=utcnow(),
         )
     ]
-    r = svc.sync_open_orders()
+    r = _sync(svc)
     assert r["newly_filled"] == 1
     with svc.session_factory() as s:
         assert s.get(Order, oid).status == "filled"
         assert s.execute(select(func.count()).select_from(Fill)).scalar_one() == 1
     # Idempotent — nothing left open to sync, no duplicate fill.
-    assert svc.sync_open_orders()["synced"] == 0
+    assert _sync(svc)["synced"] == 0
 
 
 def test_sync_reports_broker_status_failures(make_service):
@@ -199,11 +233,17 @@ def test_sync_reports_broker_status_failures(make_service):
     broker = StatusFailureBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    oid = svc.propose_order("AAPL", "buy", "market", qty="1")["order_id"]
+    oid = _propose(
+        svc,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        qty="1",
+    )["order_id"]
     _approve(svc, oid)
     broker.fail_status = True
 
-    result = svc.sync_open_orders()
+    result = _sync(svc)
 
     assert result["failed"] == 1
     assert result["synced"] == 0
@@ -228,7 +268,7 @@ def test_sync_reports_submitted_outbox_without_broker_id(make_service):
         )
         session.commit()
 
-    result = svc.sync_open_orders()
+    result = _sync(svc)
 
     assert result["failed"] == 1
 
@@ -257,7 +297,13 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
     broker = ActivityBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    oid = svc.propose_order("AAPL", "buy", "market", qty="2")["order_id"]
+    oid = _propose(
+        svc,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        qty="2",
+    )["order_id"]
     _approve(svc, oid)
     with svc.session_factory() as session:
         order = session.get(Order, oid)
@@ -286,7 +332,7 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
     broker._orders_by_id[broker.order_id] = filled
     broker._orders_by_key[client_id] = filled
 
-    result = svc.sync_open_orders()
+    result = _sync(svc)
 
     assert result["newly_filled"] == 1
     with svc.session_factory() as session:
@@ -330,7 +376,13 @@ def test_sync_preserves_exact_incremental_activity_prices(make_service):
     broker = ExactActivityBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    oid = svc.propose_order("AAPL", "buy", "market", qty="3")["order_id"]
+    oid = _propose(
+        svc,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        qty="3",
+    )["order_id"]
     _approve(svc, oid)
     with svc.session_factory() as session:
         broker_order_id = session.get(Order, oid).broker_order_id
@@ -351,7 +403,7 @@ def test_sync_preserves_exact_incremental_activity_prices(make_service):
         filled_at=first_at,
     )
     broker.activities = [first]
-    svc.sync_open_orders()
+    _sync(svc)
     broker.cumulative = (OrderStatus.FILLED, Decimal("3"), Decimal("110"))
     broker.activities = [
         first,
@@ -365,7 +417,7 @@ def test_sync_preserves_exact_incremental_activity_prices(make_service):
             filled_at=first_at + timedelta(seconds=1),
         ),
     ]
-    svc.sync_open_orders()
+    _sync(svc)
 
     with svc.session_factory() as s:
         buys = (

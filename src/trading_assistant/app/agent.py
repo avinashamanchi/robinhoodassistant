@@ -121,8 +121,21 @@ class ToolRouter:
     def __init__(self, service: TradingService) -> None:
         self.service = service
 
-    def dispatch(self, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    def dispatch(
+        self,
+        name: str,
+        tool_input: dict[str, Any],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
         s = self.service
+        mutation_context = {
+            "actor": actor,
+            "reason": reason,
+            "request_id": request_id,
+        }
         table = {
             "get_market_data": lambda: s.get_market_data(tool_input["ticker"]),
             "get_account_summary": lambda: s.get_account_summary(),
@@ -130,19 +143,29 @@ class ToolRouter:
             "get_order_status": lambda: (
                 s.get_order_status(tool_input["order_id"]) or {"error": "not found"}
             ),
-            "propose_order": lambda: s.propose_order(**tool_input),
+            "propose_order": lambda: s.propose_order(
+                **tool_input,
+                **mutation_context,
+            ),
             "create_conditional_rule": lambda: s.create_conditional_rule(
-                tool_input["ticker"], tool_input["condition"], tool_input["action"]
+                tool_input["ticker"],
+                tool_input["condition"],
+                tool_input["action"],
+                **mutation_context,
             ),
             "list_rules": lambda: {"rules": s.list_rules()},
-            "cancel_rule": lambda: s.cancel_rule(tool_input["rule_id"]),
+            "cancel_rule": lambda: s.cancel_rule(
+                tool_input["rule_id"],
+                **mutation_context,
+            ),
         }
         if name not in table:
             return {"error": f"unknown tool {name}"}
         try:
             return table[name]()
-        except Exception as exc:  # surface tool errors to the model, don't crash
-            return {"error": f"{type(exc).__name__}: {exc}"}
+        except Exception:  # stable failure: never return provider/domain text
+            log.exception("agent tool %s failed", name)
+            return {"error": "tool_failed"}
 
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
@@ -176,7 +199,18 @@ class Agent:
         self.max_tokens = max_tokens
         self.max_turns = max_turns
 
-    def chat(self, user_message: str) -> dict[str, Any]:
+    def chat(
+        self,
+        user_message: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        if not actor.strip() or not reason.strip() or not request_id.strip():
+            raise ValueError(
+                "chat actor, reason, and request_id must be non-empty"
+            )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
         tool_calls: list[dict[str, Any]] = []
         final_text = ""
@@ -204,7 +238,13 @@ class Agent:
                 results = []
                 for block in resp.content:
                     if getattr(block, "type", None) == "tool_use":
-                        output = self.router.dispatch(block.name, dict(block.input))
+                        output = self.router.dispatch(
+                            block.name,
+                            dict(block.input),
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                        )
                         tool_calls.append(
                             {"name": block.name, "input": block.input, "output": output}
                         )

@@ -84,6 +84,21 @@ _RESUMABLE_RULE_STATES = ("active", "processing")
 log = logging.getLogger(__name__)
 
 
+def _require_mutation_context(
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> tuple[str, str, str]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "mutation actor, reason, and request_id must be non-empty"
+        )
+    return actor, reason, request_id
+
+
 class TradingService:
     def __init__(
         self,
@@ -273,6 +288,10 @@ class TradingService:
         notional: Optional[str] = None,
         limit_price: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         """Create a PENDING proposal after a risk pre-check. Does NOT trade.
 
@@ -280,6 +299,11 @@ class TradingService:
         the UI can show why. An accepted order becomes PROPOSED, awaiting human
         approval — which will re-run the risk engine at execution time (A6/Phase 3).
         """
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         key = idempotency_key or uuid.uuid4().hex
         if idempotency_key is not None:
             with self.session_factory() as s:
@@ -352,6 +376,17 @@ class TradingService:
             # but never change the outcome.
             for warning in result.warnings:
                 s.add(RiskEvent(order_id=order.id, event_type="warning", reason=warning))
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="order.propose",
+                    target_type="order",
+                    target_id=str(order.id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=order.status,
+                )
+            )
 
             s.commit()
             return {
@@ -381,11 +416,14 @@ class TradingService:
         *,
         actor: str,
         reason: str,
-        request_id: str = "",
+        request_id: str,
     ) -> dict[str, Any]:
         """Record an identified approval, then send through the durable outbox."""
-        if not actor.strip() or not reason.strip():
-            raise ValueError("approval actor and reason must be non-empty")
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         try:
             approval = self.order_application.approve(
                 ApprovalCommand(
@@ -393,7 +431,7 @@ class TradingService:
                     actor,
                     reason,
                     utcnow(),
-                    request_id or uuid.uuid4().hex,
+                    request_id,
                 )
             )
         except KeyError:
@@ -433,11 +471,14 @@ class TradingService:
         *,
         actor: str,
         reason: str,
-        request_id: str = "",
+        request_id: str,
     ) -> dict[str, Any]:
         """Persist, approve, and submit a bracket through the same durable outbox."""
-        if not actor.strip() or not reason.strip():
-            raise ValueError("approval actor and reason must be non-empty")
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         if not hasattr(self.broker, "submit_bracket"):
             return {"error": "broker does not support bracket orders", "executed": False}
         try:
@@ -495,7 +536,7 @@ class TradingService:
                     actor,
                     reason,
                     utcnow(),
-                    request_id or uuid.uuid4().hex,
+                    request_id,
                 )
             )
             current_status = approval.status
@@ -514,14 +555,15 @@ class TradingService:
         self,
         order_id: int,
         *,
-        actor: str = "system:order-rejection",
-        reason: str = "programmatic order rejection",
-        request_id: str = "",
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
-        actor = actor.strip()
-        reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError("rejection actor and reason must be non-empty")
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         with self.session_factory() as s:
             order = s.get(Order, order_id)
             if order is None:
@@ -607,9 +649,14 @@ class TradingService:
         self,
         actor: str,
         reason: str,
-        request_id: str = "",
+        request_id: str,
     ) -> dict[str, Any]:
         """Latch and execute panic, returning only confirmed broker/local truth."""
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         report = self.reconciliation.panic(
             actor,
             reason,
@@ -638,19 +685,18 @@ class TradingService:
         actor: str,
         reason: str,
         expected_generation: int,
-        request_id: str = "",
+        request_id: str,
     ) -> dict[str, Any]:
         ac = (
             asset_class
             if isinstance(asset_class, AssetClass)
             else AssetClass(asset_class)
         )
-        actor = actor.strip()
-        reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError(
-                "breaker reset actor and reason must be non-empty"
-            )
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         risk_config = (
             self.config.crypto_risk or self.config.risk
             if ac is AssetClass.CRYPTO
@@ -715,17 +761,16 @@ class TradingService:
     def sync_open_orders(
         self,
         *,
-        actor: str = "system:order-reconciliation",
-        reason: str = "scheduled broker order reconciliation",
-        request_id: str = "",
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         """Compatibility facade for callers that still consume dictionary reports."""
-        actor = actor.strip()
-        reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError(
-                "order reconciliation actor and reason must be non-empty"
-            )
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         result = self.serialize_reconciliation_report(
             self.reconciliation.reconcile()
         )
@@ -764,19 +809,23 @@ class TradingService:
         self,
         order_id: int,
         *,
-        actor: str = "system:order-cancel",
-        reason: str = "programmatic live-order cancellation",
-        request_id: str = "",
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
-        actor = actor.strip()
-        reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError(
-                "live-order cancellation actor and reason must be non-empty"
-            )
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         with self.submission_barrier.hold_writer():
-            result = self._cancel_live_order_under_writer(order_id)
+            result = self._cancel_live_order_under_writer(
+                order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             with self.session_factory() as session:
                 session.add(
                     AuditEvent(
@@ -806,6 +855,10 @@ class TradingService:
     def _cancel_live_order_under_writer(
         self,
         order_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         with self.session_factory() as s:
             order = s.get(Order, order_id)
@@ -870,7 +923,11 @@ class TradingService:
                     ),
                 }
         broker_status = broker_result.status
-        sync = self.sync_open_orders()
+        sync = self.sync_open_orders(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         current = self.get_order_status(order_id)
         if (
             broker_status is OrderStatus.CANCELED
@@ -885,28 +942,50 @@ class TradingService:
             "sync": sync,
         }
 
-    def replace_order(self, order_id: int, **new_order) -> dict[str, Any]:
+    def replace_order(
+        self,
+        order_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        **new_order,
+    ) -> dict[str, Any]:
         """Cancel/replace: cancel the live order, then propose a replacement."""
-        cancel = self.cancel_live_order(order_id)
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
+        cancel = self.cancel_live_order(
+            order_id,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         if "error" in cancel:
             return {"canceled": cancel, "replacement": None}
-        replacement = self.propose_order(**new_order)
+        replacement = self.propose_order(
+            **new_order,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         return {"canceled": cancel, "replacement": replacement}
 
     def reconcile_positions(
         self,
         *,
-        actor: str = "system:position-reconciliation",
-        reason: str = "scheduled position reconciliation",
-        request_id: str = "",
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         """Compare positions and durably trip drift in one writer interval."""
-        actor = actor.strip()
-        reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError(
-                "position reconciliation actor and reason must be non-empty"
-            )
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         with self.submission_barrier.hold_writer():
             # Broker I/O is ordered by the process barrier but occurs before
             # any SQLite transaction is opened.
@@ -1213,6 +1292,9 @@ class TradingService:
         condition: dict[str, Any],
         action: dict[str, Any],
         *,
+        actor: str,
+        reason: str,
+        request_id: str,
         kind: str = "price",
         group_key: str | None = None,
         plan_id: int | None = None,
@@ -1223,6 +1305,11 @@ class TradingService:
     ) -> dict[str, Any]:
         from .rules.models import RuleCommand
 
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         typed_condition, typed_kind = self._typed_rule_condition(
             condition, kind=kind, deadline=deadline
         )
@@ -1243,10 +1330,24 @@ class TradingService:
                 "high_water_mark": high_water_mark,
             }
         )
-        rule_id = self.rule_application.create_rule(command, plan_id=plan_id)
         with self.session_factory() as s:
-            rule = s.get(Rule, rule_id)
-            assert rule is not None
+            rule = self.rule_application.persist_commands(
+                s,
+                [command],
+                plan_id=plan_id,
+            )[0]
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="rule.create",
+                    target_type="rule",
+                    target_id=str(rule.id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=rule.state,
+                )
+            )
+            s.commit()
             return self._rule_dict(rule)
 
     @staticmethod
@@ -1286,7 +1387,19 @@ class TradingService:
             rows = s.execute(select(Rule)).scalars().all()
             return [self._rule_dict(r) for r in rows]
 
-    def cancel_rule(self, rule_id: int) -> dict[str, Any]:
+    def cancel_rule(
+        self,
+        rule_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
         with self.session_factory() as s:
             rule = s.get(Rule, rule_id)
             if rule is None:
@@ -1362,6 +1475,17 @@ class TradingService:
                         "canceled": False,
                         "error": "rule group changed during cancellation",
                     }
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="rule.cancel",
+                    target_type="rule",
+                    target_id=str(rule_id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code="canceled",
+                )
+            )
             s.commit()
             return {"rule_id": rule_id, "canceled": True}
 

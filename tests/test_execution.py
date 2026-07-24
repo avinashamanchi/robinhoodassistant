@@ -23,11 +23,19 @@ def _propose(svc, **kw):
     kw.setdefault("side", "buy")
     kw.setdefault("order_type", "market")
     kw.setdefault("notional", "100")
+    kw.setdefault("actor", "operator:test")
+    kw.setdefault("reason", "execution test proposal")
+    kw.setdefault("request_id", "execution-test-proposal")
     return svc.propose_order(**kw)
 
 
 def _approve(svc, order_id, reason="test approval"):
-    return svc.approve_order(order_id, actor="operator:test", reason=reason)
+    return svc.approve_order(
+        order_id,
+        actor="operator:test",
+        reason=reason,
+        request_id="execution-test-approval",
+    )
 
 
 def test_approve_runs_final_risk_check_then_submits(make_service):
@@ -115,7 +123,12 @@ def test_double_approval_conflicts(make_service):
 def test_reject_order(make_service):
     svc = make_service()
     order_id = _propose(svc)["order_id"]
-    result = svc.reject_order(order_id)
+    result = svc.reject_order(
+        order_id,
+        actor="operator:test",
+        reason="execution test rejection",
+        request_id="execution-test-rejection",
+    )
     assert result["status"] == "rejected"
 
     # A rejected order can no longer be approved.

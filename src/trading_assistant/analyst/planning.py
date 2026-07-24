@@ -88,10 +88,16 @@ class PlanningService:
         *,
         actor: str,
         reason: str,
-        request_id: str = "",
+        request_id: str,
     ) -> dict[str, Any]:
-        if not actor.strip() or not reason.strip():
-            raise ValueError("approval actor and reason must be non-empty")
+        if (
+            not actor.strip()
+            or not reason.strip()
+            or not request_id.strip()
+        ):
+            raise ValueError(
+                "approval actor, reason, and request_id must be non-empty"
+            )
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
@@ -302,15 +308,17 @@ class PlanningService:
         self,
         plan_id: int,
         *,
-        actor: str = "system:plan-cancel",
-        reason: str = "programmatic plan cancellation",
-        request_id: str = "",
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
-        if not actor or not reason:
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
             raise ValueError(
-                "plan cancellation actor and reason must be non-empty"
+                "plan cancellation actor, reason, and request_id "
+                "must be non-empty"
             )
         result = self.service.rule_repository.cancel_plan(
             plan_id,

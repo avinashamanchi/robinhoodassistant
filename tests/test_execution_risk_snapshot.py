@@ -181,6 +181,9 @@ def test_concurrent_quantity_limit_approvals_reserve_limit_price(
         "limit",
         qty="3",
         limit_price="105",
+        actor="operator:test",
+        reason="execution snapshot first limit proposal",
+        request_id="execution-snapshot-first-limit",
     )
     second = service.propose_order(
         "AAPL",
@@ -188,6 +191,9 @@ def test_concurrent_quantity_limit_approvals_reserve_limit_price(
         "limit",
         qty="3",
         limit_price="105",
+        actor="operator:test",
+        reason="execution snapshot second limit proposal",
+        request_id="execution-snapshot-second-limit",
     )
     assert first["status"] == OrderStatus.PROPOSED.value
     assert second["status"] == OrderStatus.PROPOSED.value
@@ -231,10 +237,22 @@ def test_concurrent_approvals_cannot_overcommit_buying_power(make_service):
     service = make_service()
     service.broker._buying_power = Decimal("100")
     first_id = service.propose_order(
-        "AAPL", "buy", "market", notional="60"
+        "AAPL",
+        "buy",
+        "market",
+        notional="60",
+        actor="operator:test",
+        reason="execution buying power first proposal",
+        request_id="execution-buying-power-first",
     )["order_id"]
     second_id = service.propose_order(
-        "AAPL", "buy", "market", notional="60"
+        "AAPL",
+        "buy",
+        "market",
+        notional="60",
+        actor="operator:test",
+        reason="execution buying power second proposal",
+        request_id="execution-buying-power-second",
     )["order_id"]
     for order_id in (first_id, second_id):
         service.order_application.approve(

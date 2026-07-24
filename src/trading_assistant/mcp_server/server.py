@@ -9,6 +9,7 @@ logic — it maps tool calls to :class:`TradingService` methods.
 from __future__ import annotations
 
 from typing import Any, Optional
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
@@ -85,6 +86,7 @@ def propose_order(
     ticker: str,
     side: str,
     order_type: str,
+    reason: str,
     qty: Optional[str] = None,
     notional: Optional[str] = None,
     limit_price: Optional[str] = None,
@@ -103,17 +105,30 @@ def propose_order(
         qty=qty,
         notional=notional,
         limit_price=limit_price,
+        actor="assistant:mcp",
+        reason=reason,
+        request_id=uuid4().hex,
     )
 
 
 # ── conditional rules ───────────────────────────────────────────
 @mcp.tool()
 def create_conditional_rule(
-    ticker: str, condition: dict[str, Any], action: dict[str, Any]
+    ticker: str,
+    condition: dict[str, Any],
+    action: dict[str, Any],
+    reason: str,
 ) -> dict[str, Any]:
     """Store a standing rule, e.g. condition {"price_below": 175} action
     {"side": "buy", "notional": "50"}. The daemon (Phase 4) evaluates it."""
-    return _svc().create_conditional_rule(ticker, condition, action)
+    return _svc().create_conditional_rule(
+        ticker,
+        condition,
+        action,
+        actor="assistant:mcp",
+        reason=reason,
+        request_id=uuid4().hex,
+    )
 
 
 @mcp.tool()
@@ -123,9 +138,14 @@ def list_rules() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def cancel_rule(rule_id: int) -> dict[str, Any]:
+def cancel_rule(rule_id: int, reason: str) -> dict[str, Any]:
     """Cancel a standing conditional rule by id."""
-    return _svc().cancel_rule(rule_id)
+    return _svc().cancel_rule(
+        rule_id,
+        actor="assistant:mcp",
+        reason=reason,
+        request_id=uuid4().hex,
+    )
 
 
 # ── external (read-only) account tools ──────────────────────────

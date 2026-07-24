@@ -156,7 +156,10 @@ def test_explicit_bracket_preference_still_creates_human_gated_rules(make_servic
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
     pid = planning.analyze("AAPL")["plan_id"]
     res = planning.approve_plan(
-        pid, actor="operator:avi", reason="reviewed single-target plan"
+        pid,
+        actor="operator:avi",
+        reason="reviewed single-target plan",
+        request_id="launch-feature-plan-approval",
     )
 
     assert res["status"] == "approved"
@@ -206,6 +209,7 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         Decimal("95"),
         actor="operator:test",
         reason="response-loss drill",
+        request_id="launch-feature-bracket-first",
     )
     assert first["executed"] is False
     assert first["status"] == "acceptance_unknown"
@@ -222,6 +226,7 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         Decimal("95"),
         actor="operator:test",
         reason="response-loss drill",
+        request_id="launch-feature-bracket-retry",
     )
 
     assert result["executed"] is False
@@ -233,7 +238,12 @@ def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
     pid = planning.analyze("AAPL")["plan_id"]
-    planning.approve_plan(pid, actor="operator:test", reason="reviewed ladder plan")
+    planning.approve_plan(
+        pid,
+        actor="operator:test",
+        reason="reviewed ladder plan",
+        request_id="launch-feature-ladder-approval",
+    )
     assert len(svc.broker.brackets) == 0                    # ladder -> daemon rules, not bracket
     with svc.session_factory() as s:
         kinds = {
@@ -270,13 +280,23 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
 
     def approve_first():
         first_result.update(
-            planning.approve_plan(plan_id, actor="operator:test", reason="reviewed")
+            planning.approve_plan(
+                plan_id,
+                actor="operator:test",
+                reason="reviewed",
+                request_id="launch-feature-concurrent-first",
+            )
         )
 
     thread = Thread(target=approve_first)
     thread.start()
     assert entered.wait(timeout=2)
-    second = planning.approve_plan(plan_id, actor="operator:second", reason="reviewed")
+    second = planning.approve_plan(
+        plan_id,
+        actor="operator:second",
+        reason="reviewed",
+        request_id="launch-feature-concurrent-second",
+    )
     release.set()
     thread.join(timeout=2)
 

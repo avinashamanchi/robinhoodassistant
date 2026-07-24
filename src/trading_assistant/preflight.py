@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from uuid import uuid4
 
 from .config import Secrets, TradingMode, load_config
 
@@ -103,8 +104,17 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
 def _reconciliation(service) -> Result:
     """Repair stale order statuses, then require local positions to match Alpaca."""
     try:
-        order_sync = service.sync_open_orders()
-        positions = service.reconcile_positions()
+        request_id = uuid4().hex
+        order_sync = service.sync_open_orders(
+            actor="preflight:startup",
+            reason="preflight broker order reconciliation",
+            request_id=request_id,
+        )
+        positions = service.reconcile_positions(
+            actor="preflight:startup",
+            reason="preflight position reconciliation",
+            request_id=request_id,
+        )
         if order_sync.get("failed", 0):
             return Result(
                 "broker/local reconciliation",

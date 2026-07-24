@@ -133,10 +133,26 @@ def test_service_routes_crypto_around_equity_killswitch(make_service):
         s.commit()
 
     # Equity order: blocked by both the equity kill switch and closed market.
-    eq = svc.propose_order("AAPL", "buy", "market", notional="100")
+    eq = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="asset class equity proposal",
+        request_id="asset-class-equity",
+    )
     assert eq["status"] == "rejected"
 
     # Crypto order: crypto switch clean + crypto clock always open -> proposed.
-    cr = svc.propose_order("BTC/USD", "buy", "market", notional="100")
+    cr = svc.propose_order(
+        "BTC/USD",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="asset class crypto proposal",
+        request_id="asset-class-crypto",
+    )
     assert cr["status"] == "proposed"
     assert cr["approved_by_risk"] is True

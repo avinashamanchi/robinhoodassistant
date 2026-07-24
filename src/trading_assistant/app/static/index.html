@@ -94,7 +94,7 @@
       return t;
     }
 
-    // Session cookies are HttpOnly. Keep the rotating CSRF value in memory only.
+    // Session cookies are HttpOnly. Keep the session CSRF value in memory only.
     let csrfToken = "";
     const sessionReady = fetch("/auth/session").then(async (response) => {
       if (response.status === 401) {
@@ -213,7 +213,11 @@
       const reason = (window.prompt("Reason for panic shutdown:") || "").trim();
       if (!reason) { notify("A non-empty panic reason is required.", "err"); return; }
       const r = await action("/panic", jsonPost({ reason }));
-      if (r.ok) notify("PANIC executed — everything halted", "ok");
+      if (r.ok && r.data && r.data.safe === true) {
+        notify("PANIC executed — everything halted", "ok");
+      } else if (r.ok) {
+        notify("PANIC response did not confirm a safe state", "err");
+      }
       refresh();
     }
 

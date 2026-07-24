@@ -127,7 +127,15 @@ def test_crypto_dump_isolates_equity(make_service):
         assert KillSwitch.is_tripped(s, CR) is True
         assert KillSwitch.is_tripped(s, EQ) is False  # equity independent
 
-    crypto = svc.propose_order("BTC/USD", "buy", "market", notional="100")
+    crypto = svc.propose_order(
+        "BTC/USD",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:stress-test",
+        reason="stress crypto proposal",
+        request_id="stress-crypto-proposal",
+    )
     assert crypto["status"] == "rejected"
     assert any("circuit breaker" in r for r in crypto["risk_reasons"])
 
@@ -137,13 +145,24 @@ def test_stale_approval_rejected_on_price_move(make_service):
     svc = make_service()
     svc.broker.set_price("AAPL", Decimal("100"))
     svc.broker._positions["AAPL"] = Position("AAPL", Decimal("15"), Decimal("100"), Decimal("100"))
-    order_id = svc.propose_order("AAPL", "buy", "market", notional="500")["order_id"]
+    order_id = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="500",
+        actor="operator:stress-test",
+        reason="stress stale approval proposal",
+        request_id="stress-stale-proposal",
+    )["order_id"]
     assert svc.get_order_status(order_id)["status"] == "proposed"
 
     # Price jumps 10% between proposal and approval -> execution re-check refuses.
     svc.broker.set_price("AAPL", Decimal("110"))
     result = svc.approve_order(
-        order_id, actor="operator:stress-test", reason="stale approval drill"
+        order_id,
+        actor="operator:stress-test",
+        reason="stale approval drill",
+        request_id="stress-stale-approval",
     )
     assert result["executed"] is False
     assert result["status"] == "rejected"

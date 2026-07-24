@@ -12,7 +12,7 @@ TOKEN = "test-backtests-operator-secret"
 
 
 class StubAgent:
-    def chat(self, message: str):
+    def chat(self, message: str, **context):
         return {"reply": "", "tool_calls": []}
 
 

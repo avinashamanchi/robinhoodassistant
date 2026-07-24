@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 import json
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
-from trading_assistant.db.models import AuditEvent
+from trading_assistant.broker.mock import MockBroker
+from trading_assistant.db.models import AuditEvent, Proposal, utcnow
 from trading_assistant.assets import AssetClass
 from trading_assistant.risk.breakers import BreakerScope
 
@@ -20,9 +22,11 @@ TOKEN = "test-api-operator-secret"
 class StubAgent:
     def __init__(self):
         self.calls = 0
+        self.last_context = None
 
-    def chat(self, message: str):
+    def chat(self, message: str, **context):
         self.calls += 1
+        self.last_context = context
         return {"reply": f"echo: {message}", "tool_calls": []}
 
 
@@ -43,7 +47,15 @@ def client(make_service, authenticate_client):
 
 
 def _propose(svc, notional="100"):
-    return svc.propose_order("AAPL", "buy", "market", notional=notional)["order_id"]
+    return svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional=notional,
+        actor="operator:test-setup",
+        reason="API test proposal setup",
+        request_id="api-test-proposal",
+    )["order_id"]
 
 
 def test_index_served(client):
@@ -90,6 +102,29 @@ def test_double_approve_returns_409(client):
     order_id = _propose(svc)
     assert c.post(f"/approve/{order_id}", json={"reason": "first review"}).status_code == 200
     assert c.post(f"/approve/{order_id}", json={"reason": "duplicate review"}).status_code == 409
+
+
+def test_expired_approval_returns_stable_409(client):
+    c, svc, _ = client
+    order_id = _propose(svc)
+    with svc.session_factory() as session:
+        proposal = session.query(Proposal).filter_by(order_id=order_id).one()
+        proposal.expires_at = utcnow() - timedelta(seconds=1)
+        session.commit()
+
+    response = c.post(
+        f"/approve/{order_id}",
+        json={"reason": "reviewed after proposal expiry"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "approval_conflict",
+            "message": "Order approval is no longer current",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
 
 
 def test_approve_requires_non_empty_reason(client):
@@ -155,6 +190,17 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
     assert audit.actor == "operator:local"
     assert audit.reason == "operator canceled stale intent"
     assert audit.request_id == response.headers["X-Request-ID"]
+    with svc.session_factory() as session:
+        sync_audit = (
+            session.query(AuditEvent)
+            .filter_by(action="orders.sync")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert sync_audit is not None
+    assert sync_audit.actor == audit.actor
+    assert sync_audit.reason == audit.reason
+    assert sync_audit.request_id == audit.request_id
 
 
 @pytest.mark.parametrize(
@@ -283,6 +329,101 @@ def test_panic_endpoint_supplies_actor_and_requires_reason(client):
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
+def test_unsafe_panic_returns_non_2xx_truthful_receipt(
+    make_service, authenticate_client
+):
+    class UnconfirmedCancelBroker(MockBroker):
+        def cancel_order(self, order_id):
+            raise ConnectionError("provider cancellation detail")
+
+        def get_order_status(self, order_id):
+            raise ConnectionError("provider status detail")
+
+    service = make_service(broker=UnconfirmedCancelBroker())
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test-setup",
+        reason="unsafe panic proposal setup",
+        request_id="unsafe-panic-proposal",
+    )["order_id"]
+    approved = service.approve_order(
+        order_id,
+        actor="operator:test-setup",
+        reason="create live order for unsafe panic regression",
+        request_id="unsafe-panic-setup",
+    )
+    broker_order_id = approved["broker_order_id"]
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = c.post(
+        "/panic",
+        json={"reason": "cancel all live orders"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "panic_incomplete"
+    assert (
+        response.json()["error"]["request_id"]
+        == response.headers["X-Request-ID"]
+    )
+    receipt = response.json()["receipt"]
+    assert receipt["safe"] is False
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["unconfirmed_order_ids"] == [order_id]
+    assert receipt["remote_open_order_ids"] == [broker_order_id]
+    assert "provider cancellation detail" not in response.text
+    assert "provider status detail" not in response.text
+
+
+def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
+    make_service, authenticate_client
+):
+    class EnumerationFailureBroker(MockBroker):
+        def get_open_orders(self):
+            raise ConnectionError("raw provider outage")
+
+    service = make_service(broker=EnumerationFailureBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = c.post(
+        "/panic",
+        json={"reason": "dependency failure drill"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "panic_incomplete"
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "message": (
+            "panic incomplete: safety could not be confirmed; "
+            "broker_enumeration=unconfirmed "
+            "unaddressable_remote_open=false "
+            "local_unconfirmed=[] remote_open=[]"
+        ),
+    }
+    assert "raw provider outage" not in response.text
+
+
 def test_reconcile_requires_reason_and_audits_operator_identity(client):
     c, svc, _ = client
 
@@ -331,7 +472,20 @@ def test_sync_requires_reason_and_audits_operator_identity(client):
 
 def test_chat_and_rate_limit(client):
     c, svc, agent = client
-    assert c.post("/chat", json={"message": "hi"}).json()["reply"] == "echo: hi"
+    response = c.post("/chat", json={"message": "hi"})
+    assert response.json()["reply"] == "echo: hi"
+    assert agent.last_context == {
+        "actor": "operator:local",
+        "reason": "hi",
+        "request_id": response.headers["X-Request-ID"],
+    }
     c.post("/chat", json={"message": "again"})       # 2nd allowed (limit=2)
     r = c.post("/chat", json={"message": "third"})   # 3rd blocked
     assert r.status_code == 429
+
+
+def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):
+    c, _, _ = client
+    page = c.get("/").text
+
+    assert "r.data.safe === true" in page

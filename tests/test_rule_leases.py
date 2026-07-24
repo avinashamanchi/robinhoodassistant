@@ -334,6 +334,7 @@ def test_unknown_acceptance_marks_group_until_reconciliation_resolves_client_id(
         outcome.proposal["order_id"],
         actor="operator:test",
         reason="explicit human approval",
+        request_id="rule-lease-human-approval",
     )
 
     assert submitted["status"] == "acceptance_unknown"

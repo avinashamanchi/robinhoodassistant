@@ -80,7 +80,12 @@ def test_approve_decomposes_into_human_gated_typed_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = pln.analyze("AAPL")["plan_id"]
-    res = pln.approve_plan(pid, actor="operator:test", reason="reviewed plan")
+    res = pln.approve_plan(
+        pid,
+        actor="operator:test",
+        reason="reviewed plan",
+        request_id="planning-approve",
+    )
     assert res["status"] == "approved"
 
     with svc.session_factory() as s:
@@ -98,8 +103,18 @@ def test_cancel_plan_cancels_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = pln.analyze("AAPL")["plan_id"]
-    pln.approve_plan(pid, actor="operator:test", reason="reviewed plan")
-    res = pln.cancel_plan(pid)
+    pln.approve_plan(
+        pid,
+        actor="operator:test",
+        reason="reviewed plan",
+        request_id="planning-cancel-approval",
+    )
+    res = pln.cancel_plan(
+        pid,
+        actor="operator:test",
+        reason="cancel reviewed plan",
+        request_id="planning-cancel",
+    )
     assert res["status"] == "canceled" and res["rules_canceled"] >= 1
     with svc.session_factory() as s:
         assert all(r.state == "canceled"
@@ -114,6 +129,7 @@ def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service)
         plan_id,
         actor="operator:test",
         reason="reviewed plan",
+        request_id="planning-mixed-group-approval",
     )
     with svc.session_factory() as session:
         plan_rule = session.scalar(
@@ -144,7 +160,12 @@ def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service)
             .where(Rule.group_id == group_id)
         )
 
-    result = planning.cancel_plan(plan_id)
+    result = planning.cancel_plan(
+        plan_id,
+        actor="operator:test",
+        reason="cancel mixed plan group",
+        request_id="planning-mixed-group-cancel",
+    )
 
     assert result["status"] == "canceled"
     assert result["rules_canceled"] == expected_count
@@ -165,6 +186,7 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
         plan_id,
         actor="operator:test",
         reason="reviewed plan",
+        request_id="planning-race-approval",
     )
     svc.broker.set_price("AAPL", Decimal("80"))
     barrier = Barrier(2)
@@ -182,7 +204,12 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
 
     def cancel_plan():
         barrier.wait(timeout=2)
-        return planning.cancel_plan(plan_id)
+        return planning.cancel_plan(
+            plan_id,
+            actor="operator:test",
+            reason="cancel plan during worker race",
+            request_id="planning-race-cancel",
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         worker_future = pool.submit(run_worker)
@@ -248,6 +275,9 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
 
     pid = pln.analyze("AAPL")["plan_id"]
     res = pln.approve_plan(
-        pid, actor="operator:test", reason="reviewed plan"
+        pid,
+        actor="operator:test",
+        reason="reviewed plan",
+        request_id="planning-promotion-gate",
     )  # 0 graded calls -> gate blocks live approval
     assert "promotion gate" in res["error"]

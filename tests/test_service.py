@@ -34,6 +34,14 @@ def _service(app_config, session_factory, broker=None, market_open=True):
     )
 
 
+def _context(reason):
+    return {
+        "actor": "operator:test",
+        "reason": reason,
+        "request_id": f"service-test-{reason.replace(' ', '-')}",
+    }
+
+
 def test_legacy_killswitch_helpers_are_not_part_of_trading_service():
     assert not hasattr(TradingService, "_killswitch_for_symbol")
     assert not hasattr(TradingService, "_risk_is_blocked")
@@ -41,7 +49,13 @@ def test_legacy_killswitch_helpers_are_not_part_of_trading_service():
 
 def test_propose_creates_pending_and_does_not_execute(app_config, session_factory):
     svc = _service(app_config, session_factory)
-    res = svc.propose_order("AAPL", "buy", "market", notional="400")
+    res = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="400",
+        **_context("pending proposal"),
+    )
 
     assert res["status"] == "proposed"
     assert res["approved_by_risk"] is True
@@ -56,7 +70,13 @@ def test_propose_creates_pending_and_does_not_execute(app_config, session_factor
 
 def test_rejected_order_is_persisted_with_reason(app_config, session_factory):
     svc = _service(app_config, session_factory)
-    res = svc.propose_order("AAPL", "buy", "market", notional="600")  # > $500 limit
+    res = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="600",
+        **_context("rejected proposal"),
+    )  # > $500 limit
 
     assert res["status"] == "rejected"
     assert res["approved_by_risk"] is False
@@ -71,7 +91,13 @@ def test_rejected_order_is_persisted_with_reason(app_config, session_factory):
 def test_disallowed_ticker_rejected(app_config, session_factory):
     svc = _service(app_config, session_factory)
     svc.broker.set_price("TSLA", Decimal("100"))
-    res = svc.propose_order("TSLA", "buy", "market", notional="100")
+    res = svc.propose_order(
+        "TSLA",
+        "buy",
+        "market",
+        notional="100",
+        **_context("disallowed ticker"),
+    )
     assert res["status"] == "rejected"
     assert any("allowlist" in r for r in res["risk_reasons"])
     assert svc.broker.submit_calls == 0
@@ -87,7 +113,13 @@ def test_unknown_ticker_rejects_cleanly_not_crash(app_config, session_factory):
             return super().get_quote(ticker)
 
     svc = _service(app_config, session_factory, broker=NoQuoteBroker())
-    res = svc.propose_order("FOOBAR", "buy", "market", notional="100")  # off-allowlist + unquotable
+    res = svc.propose_order(
+        "FOOBAR",
+        "buy",
+        "market",
+        notional="100",
+        **_context("unknown ticker"),
+    )  # off-allowlist + unquotable
     assert res["status"] == "rejected"
     assert any("allowlist" in r for r in res["risk_reasons"])
     assert svc.broker.submit_calls == 0
@@ -95,7 +127,13 @@ def test_unknown_ticker_rejects_cleanly_not_crash(app_config, session_factory):
 
 def test_market_closed_rejects(app_config, session_factory):
     svc = _service(app_config, session_factory, market_open=False)
-    res = svc.propose_order("AAPL", "buy", "market", notional="100")
+    res = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_context("closed market"),
+    )
     assert res["status"] == "rejected"
     assert any("market is closed" in r for r in res["risk_reasons"])
 
@@ -106,7 +144,13 @@ def test_snapshot_uses_broker_positions(app_config, session_factory):
     )
     svc = _service(app_config, session_factory, broker=broker)
     # Existing $1900 position + $500 order -> $2400 > $2000 per-ticker limit.
-    res = svc.propose_order("AAPL", "buy", "market", notional="500")
+    res = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="500",
+        **_context("position limit"),
+    )
     assert res["status"] == "rejected"
     assert any("per ticker" in r for r in res["risk_reasons"])
 
@@ -120,13 +164,28 @@ def test_second_order_counts_first_outstanding_order(app_config, session_factory
         }
     )
     svc = _service(config, session_factory)
-    first = svc.propose_order("AAPL", "buy", "market", notional="1800")
+    first = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="1800",
+        **_context("first outstanding order"),
+    )
     assert first["status"] == "proposed"
     assert svc.approve_order(
-        first["order_id"], actor="operator:test", reason="service test"
+        first["order_id"],
+        actor="operator:test",
+        reason="service test",
+        request_id="service-test-approval",
     )["status"] == "submitted"
 
-    second = svc.propose_order("AAPL", "buy", "market", notional="400")
+    second = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="400",
+        **_context("second outstanding order"),
+    )
 
     assert second["status"] == "rejected"
     assert any("per ticker" in reason for reason in second["risk_reasons"])
@@ -135,7 +194,10 @@ def test_second_order_counts_first_outstanding_order(app_config, session_factory
 def test_conditional_rule_crud(app_config, session_factory):
     svc = _service(app_config, session_factory)
     created = svc.create_conditional_rule(
-        "AAPL", {"price_below": 175}, {"side": "buy", "notional": "50"}
+        "AAPL",
+        {"price_below": 175},
+        {"side": "buy", "notional": "50"},
+        **_context("conditional rule create"),
     )
     assert created["state"] == "active"
     assert svc.list_rules()[0]["condition"] == {
@@ -144,7 +206,10 @@ def test_conditional_rule_crud(app_config, session_factory):
         "price": "175",
     }
 
-    canceled = svc.cancel_rule(created["rule_id"])
+    canceled = svc.cancel_rule(
+        created["rule_id"],
+        **_context("conditional rule cancel"),
+    )
     assert canceled["canceled"] is True
     assert svc.list_rules()[0]["state"] == "canceled"
 
@@ -158,12 +223,14 @@ def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(
         {"price_below": 90},
         {"side": "buy", "notional": "50"},
         group_key="processing-sibling",
+        **_context("first sibling rule"),
     )
     second = svc.create_conditional_rule(
         "AAPL",
         {"price_above": 110},
         {"side": "buy", "notional": "50"},
         group_key="processing-sibling",
+        **_context("second sibling rule"),
     )
     with session_factory() as session:
         first_rule = session.get(Rule, first["rule_id"])
@@ -173,7 +240,10 @@ def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(
         initial_version = group.version
         session.commit()
 
-    assert svc.cancel_rule(first["rule_id"])["canceled"] is True
+    assert svc.cancel_rule(
+        first["rule_id"],
+        **_context("cancel first sibling"),
+    )["canceled"] is True
 
     with session_factory() as session:
         first_rule = session.get(Rule, first["rule_id"])
@@ -184,7 +254,10 @@ def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(
         assert group.state == "active"
         assert group.version == initial_version
 
-    assert svc.cancel_rule(second["rule_id"])["canceled"] is True
+    assert svc.cancel_rule(
+        second["rule_id"],
+        **_context("cancel second sibling"),
+    )["canceled"] is True
 
     with session_factory() as session:
         second_rule = session.get(Rule, second["rule_id"])
@@ -200,7 +273,10 @@ def test_cancel_rule_terminal_winner_is_explicit_noop(
 ):
     svc = _service(app_config, session_factory)
     created = svc.create_conditional_rule(
-        "AAPL", {"price_below": 90}, {"side": "buy", "notional": "50"}
+        "AAPL",
+        {"price_below": 90},
+        {"side": "buy", "notional": "50"},
+        **_context("terminal rule setup"),
     )
     with session_factory() as session:
         rule = session.get(Rule, created["rule_id"])
@@ -211,7 +287,10 @@ def test_cancel_rule_terminal_winner_is_explicit_noop(
         group.version = 7
         session.commit()
 
-    result = svc.cancel_rule(created["rule_id"])
+    result = svc.cancel_rule(
+        created["rule_id"],
+        **_context("terminal rule cancel"),
+    )
 
     assert result["canceled"] is False
     assert "terminal" in result["error"]

@@ -45,7 +45,7 @@ class _StubAnalyst:
 
 
 class _StubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": "", "tool_calls": []}
 
 

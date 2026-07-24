@@ -41,7 +41,13 @@ def test_get_market_data_tool(configured):
 
 
 def test_propose_order_tool_creates_pending(configured):
-    res = mcp_server.propose_order("AAPL", "buy", "market", notional="400")
+    res = mcp_server.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        "MCP test proposal",
+        notional="400",
+    )
     assert res["status"] == "proposed"
     assert res["executed"] is False
     assert mcp_server.get_open_orders()[0]["status"] == "proposed"

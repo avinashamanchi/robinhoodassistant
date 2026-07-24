@@ -76,15 +76,18 @@ def rate_limit_key(request: Request, principal: SessionPrincipal) -> str:
 
 def _error_response(request: Request, error: ApiError) -> JSONResponse:
     request_id = getattr(request.state, "request_id", uuid4().hex)
+    content = {
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "request_id": request_id,
+        }
+    }
+    if error.receipt is not None:
+        content["receipt"] = error.receipt
     return JSONResponse(
         status_code=error.status_code,
-        content={
-            "error": {
-                "code": error.code,
-                "message": error.message,
-                "request_id": request_id,
-            }
-        },
+        content=content,
     )
 
 
@@ -127,6 +130,20 @@ def install_security(app: FastAPI) -> None:
     async def secure_response(request: Request, call_next):
         request.state.request_id = uuid4().hex
         response = await call_next(request)
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("Origin")
+            and request.headers.get("Access-Control-Request-Method")
+            and response.status_code >= 400
+        ):
+            response = _error_response(
+                request,
+                ApiError(
+                    "cors_rejected",
+                    403,
+                    "CORS preflight was rejected",
+                ),
+            )
         for key, value in SECURITY_HEADERS.items():
             response.headers[key] = value
         response.headers["X-Request-ID"] = request.state.request_id

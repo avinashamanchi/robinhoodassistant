@@ -18,7 +18,15 @@ from trading_assistant.orders.application import (
 
 def _proposed_order_id(make_service) -> tuple[object, int]:
     service = make_service()
-    result = service.propose_order("AAPL", "buy", "market", notional="100")
+    result = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="order application proposal",
+        request_id="order-application-proposal",
+    )
     return service, result["order_id"]
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from decimal import ROUND_UP, Decimal
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ..broker.models import OrderStatus
 from ..config import AppConfig, BrokerKind, Secrets, TradingMode, load_config
@@ -60,6 +61,7 @@ def run_paper_drill(
     qty = (test_notional / limit_price).quantize(
         Decimal("0.000001"), rounding=ROUND_UP
     )
+    request_id = uuid4().hex
 
     proposal = service.propose_order(
         symbol,
@@ -67,6 +69,9 @@ def run_paper_drill(
         "limit",
         qty=str(qty),
         limit_price=str(limit_price),
+        actor="operator:paper-drill",
+        reason="paper drill order proposal",
+        request_id=request_id,
     )
     if proposal["status"] != OrderStatus.PROPOSED.value:
         raise PaperDrillError(
@@ -80,6 +85,7 @@ def run_paper_drill(
             proposal["order_id"],
             actor="operator:paper-drill",
             reason="paper drill execution",
+            request_id=request_id,
         )
         if not approved.get("executed") or not approved.get("broker_order_id"):
             raise PaperDrillError(f"broker did not accept paper drill: {approved}")
@@ -93,7 +99,12 @@ def run_paper_drill(
                 f"unexpected broker acceptance status: {accepted.status.value}"
             )
 
-        canceled = service.cancel_live_order(proposal["order_id"])
+        canceled = service.cancel_live_order(
+            proposal["order_id"],
+            actor="operator:paper-drill",
+            reason="paper drill terminal cancellation",
+            request_id=request_id,
+        )
         broker_terminal = service.broker.get_order_status(broker_order_id)
         if (
             canceled.get("status") != OrderStatus.CANCELED.value
@@ -115,7 +126,12 @@ def run_paper_drill(
     finally:
         if broker_order_id is not None and not terminal:
             try:
-                service.cancel_live_order(proposal["order_id"])
+                service.cancel_live_order(
+                    proposal["order_id"],
+                    actor="operator:paper-drill",
+                    reason="paper drill failure cleanup",
+                    request_id=request_id,
+                )
             except Exception:
                 pass
 

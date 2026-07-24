@@ -17,8 +17,21 @@ from trading_assistant.risk.breakers import BreakerScope
 
 
 def _submitted(svc, notional="400") -> int:
-    order_id = svc.propose_order("AAPL", "buy", "market", notional=notional)["order_id"]
-    svc.approve_order(order_id, actor="operator:test", reason="hardening test")  # -> SUBMITTED
+    order_id = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional=notional,
+        actor="operator:test",
+        reason="hardening test proposal",
+        request_id="hardening-test-proposal",
+    )["order_id"]
+    svc.approve_order(
+        order_id,
+        actor="operator:test",
+        reason="hardening test",
+        request_id="hardening-test-approval",
+    )  # -> SUBMITTED
     return order_id
 
 
@@ -65,9 +78,30 @@ def test_direct_fill_mutation_path_is_not_available(
 def test_cancel_live_order(make_service):
     svc = make_service()
     oid = _submitted(svc)
-    result = svc.cancel_live_order(oid)
+    result = svc.cancel_live_order(
+        oid,
+        actor="operator:test",
+        reason="hardening cancellation",
+        request_id="hardening-test-cancel",
+    )
     assert result["status"] == "canceled"
-    assert "error" in svc.cancel_live_order(oid)       # cannot cancel twice
+    assert "error" in svc.cancel_live_order(
+        oid,
+        actor="operator:test",
+        reason="hardening duplicate cancellation",
+        request_id="hardening-test-cancel-duplicate",
+    )  # cannot cancel twice
+
+
+def test_operator_mutation_services_require_explicit_context(make_service):
+    svc = make_service()
+
+    with pytest.raises(TypeError):
+        svc.sync_open_orders()
+    with pytest.raises(TypeError):
+        svc.reconcile_positions()
+    with pytest.raises(TypeError):
+        svc.cancel_live_order(999)
 
 
 def test_cancel_broker_io_occurs_without_sqlite_transaction(
@@ -97,7 +131,12 @@ def test_cancel_broker_io_occurs_without_sqlite_transaction(
     event.listen(engine, "commit", transaction_ended)
     event.listen(engine, "rollback", transaction_ended)
     try:
-        result = svc.cancel_live_order(oid)
+        result = svc.cancel_live_order(
+            oid,
+            actor="operator:test",
+            reason="transaction boundary cancellation",
+            request_id="hardening-transaction-cancel",
+        )
     finally:
         event.remove(engine, "begin", transaction_began)
         event.remove(engine, "commit", transaction_ended)
@@ -133,7 +172,12 @@ def test_cancel_result_with_cumulative_partial_fill_sets_reconciliation_latch(
     svc = make_service(broker=CanceledAfterPartial())
     oid = _submitted(svc)
 
-    result = svc.cancel_live_order(oid)
+    result = svc.cancel_live_order(
+        oid,
+        actor="operator:test",
+        reason="partial fill cancellation",
+        request_id="hardening-partial-fill-cancel",
+    )
 
     assert result["status"] == OrderStatus.CANCELED.value
     with svc.session_factory() as session:
@@ -162,7 +206,12 @@ def test_cancel_race_records_broker_fill_instead_of_claiming_canceled(make_servi
     svc = make_service(broker=broker)
     oid = _submitted(svc)
 
-    result = svc.cancel_live_order(oid)
+    result = svc.cancel_live_order(
+        oid,
+        actor="operator:test",
+        reason="cancel race reconciliation",
+        request_id="hardening-cancel-race",
+    )
 
     assert result["status"] == "filled"
     assert "not canceled" in result["error"]
@@ -173,7 +222,14 @@ def test_replace_order(make_service):
     svc = make_service()
     oid = _submitted(svc)
     result = svc.replace_order(
-        oid, ticker="AAPL", side="buy", order_type="market", notional="200"
+        oid,
+        ticker="AAPL",
+        side="buy",
+        order_type="market",
+        notional="200",
+        actor="operator:test",
+        reason="hardening replacement",
+        request_id="hardening-replace",
     )
     assert result["canceled"]["status"] == "canceled"
     assert result["replacement"]["status"] == "proposed"
@@ -184,14 +240,22 @@ def test_reconcile_detects_drift(make_service):
     # Broker reports a position that local fills don't account for.
     broker = MockBroker(positions=[Position("AAPL", Decimal("10"), Decimal("100"), Decimal("100"))])
     svc = make_service(broker=broker)
-    result = svc.reconcile_positions()
+    result = svc.reconcile_positions(
+        actor="operator:test",
+        reason="hardening drift reconciliation",
+        request_id="hardening-reconcile-drift",
+    )
     assert result["reconciled"] is False
     assert "AAPL" in result["drift"]
 
 
 def test_reconcile_clean_when_matching(make_service):
     svc = make_service()  # no positions, no fills
-    assert svc.reconcile_positions()["reconciled"] is True
+    assert svc.reconcile_positions(
+        actor="operator:test",
+        reason="hardening clean reconciliation",
+        request_id="hardening-reconcile-clean",
+    )["reconciled"] is True
 
 
 # ── kill-switch drill (end-to-end) ──────────────────────────────
@@ -230,7 +294,15 @@ def test_killswitch_drill(make_service):
     assert loss_state.actor == "daemon:daily-loss"
 
     # New equity orders are now blocked...
-    blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
+    blocked = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="hardening breaker proposal",
+        request_id="hardening-breaker-proposal",
+    )
     assert blocked["status"] == "rejected"
     assert any("circuit breaker" in r for r in blocked["risk_reasons"])
 
@@ -243,8 +315,17 @@ def test_killswitch_drill(make_service):
         actor="operator:test",
         reason="manual drill health reviewed",
         expected_generation=observed.generation,
+        request_id="hardening-breaker-reset",
     )
-    still_blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
+    still_blocked = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="hardening post-reset proposal",
+        request_id="hardening-post-reset-proposal",
+    )
     assert still_blocked["status"] == "rejected"
     assert "daily total-loss limit reached" in still_blocked["risk_reasons"]
 
@@ -270,9 +351,16 @@ def test_panic_flattens_everything(make_service):
         "AAPL",
         {"price_below": 999},
         {"side": "sell", "qty": "1"},
+        actor="operator:test",
+        reason="hardening panic rule setup",
+        request_id="hardening-panic-rule",
     )
 
-    res = svc.panic(actor="operator:test", reason="panic drill")
+    res = svc.panic(
+        actor="operator:test",
+        reason="panic drill",
+        request_id="hardening-panic",
+    )
     assert res["safe"] is True
     assert len(res["confirmed_canceled"]) == 1
     with svc.session_factory() as s:
@@ -280,7 +368,11 @@ def test_panic_flattens_everything(make_service):
         assert s.query(Rule).filter_by(state="active").count() == 0
 
     # Idempotent: a second panic is a no-op on already-flat state.
-    res2 = svc.panic(actor="operator:test", reason="repeat panic drill")
+    res2 = svc.panic(
+        actor="operator:test",
+        reason="repeat panic drill",
+        request_id="hardening-panic-repeat",
+    )
     assert res2["safe"] is True
     assert res2["confirmed_canceled"] == []
 
@@ -296,7 +388,11 @@ def test_panic_never_claims_an_unconfirmed_broker_cancel(make_service):
     svc = make_service(broker=CancelFailureBroker())
     oid = _submitted(svc)
 
-    result = svc.panic(actor="operator:test", reason="cancel failure drill")
+    result = svc.panic(
+        actor="operator:test",
+        reason="cancel failure drill",
+        request_id="hardening-panic-failure",
+    )
 
     assert result["safe"] is False
     assert result["confirmed_canceled"] == []

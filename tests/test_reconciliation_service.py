@@ -36,9 +36,21 @@ from trading_assistant.risk.staleness import (
 )
 
 
+def _mutation(reason):
+    return {
+        "actor": "operator:test",
+        "reason": reason,
+        "request_id": f"reconciliation-{reason.replace(' ', '-')}",
+    }
+
+
 def _approved_order_id(service) -> int:
     order_id = service.propose_order(
-        "AAPL", "buy", "market", notional="100"
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_mutation("approved order proposal"),
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(order_id, "operator:avi", "reviewed", utcnow())
@@ -48,10 +60,17 @@ def _approved_order_id(service) -> int:
 
 def _submitted_order_id(service) -> int:
     order_id = service.propose_order(
-        "AAPL", "buy", "market", notional="100"
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_mutation("submitted order proposal"),
     )["order_id"]
     service.approve_order(
-        order_id, actor="operator:avi", reason="reviewed for submission"
+        order_id,
+        actor="operator:avi",
+        reason="reviewed for submission",
+        request_id="reconciliation-submission-approval",
     )
     return order_id
 
@@ -130,6 +149,7 @@ def test_acceptance_unknown_rejects_invalid_remote_identity_durably(
         "market",
         notional="100",
         idempotency_key="local-client-id",
+        **_mutation("invalid identity proposal"),
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(
@@ -940,7 +960,13 @@ def test_panic_latches_global_breaker_before_broker_enumeration_failure(make_ser
         )
         assert state is not None and state.tripped is True
 
-    blocked = service.propose_order("AAPL", "buy", "market", notional="100")
+    blocked = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_mutation("panic enumeration blocked proposal"),
+    )
     assert blocked["status"] == "rejected"
     assert any("circuit breaker" in reason for reason in blocked["risk_reasons"])
 
@@ -1154,6 +1180,7 @@ def test_remote_open_order_matching_terminal_local_order_trips_drift_on_replay(
         "buy",
         "market",
         notional="100",
+        **_mutation("terminal drift proposal"),
     )
 
     expected = (
@@ -1308,11 +1335,13 @@ def test_quantity_order_exact_overfill_is_preserved_latched_and_replay_safe(
         "market",
         qty="1",
         idempotency_key=f"quantity-overfill-{excess_qty}",
+        **_mutation("quantity overfill proposal"),
     )["order_id"]
     service.approve_order(
         order_id,
         actor="operator:avi",
         reason="reviewed quantity order",
+        request_id="reconciliation-quantity-approval",
     )
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -3234,7 +3263,11 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
         session.commit()
 
     order_id = service.propose_order(
-        "AAPL", "sell", "market", qty="1"
+        "AAPL",
+        "sell",
+        "market",
+        qty="1",
+        **_mutation("synchronous loss sell proposal"),
     )["order_id"]
     service.order_application.approve(
         ApprovalCommand(
@@ -3252,7 +3285,11 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
     assert incomplete.broker_reconciled is False
     assert incomplete.daily_pnl_complete is False
     blocked = service.propose_order(
-        "AAPL", "buy", "market", notional="100"
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_mutation("synchronous loss blocked proposal"),
     )
     assert blocked["status"] == OrderStatus.REJECTED.value
     assert {
@@ -3523,8 +3560,16 @@ def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):
 def test_service_compatibility_methods_serialize_reports(make_service):
     service = make_service()
 
-    sync = service.sync_open_orders()
-    panic = service.panic(actor="operator:avi", reason="serialization drill")
+    sync = service.sync_open_orders(
+        actor="operator:avi",
+        reason="serialization drill sync",
+        request_id="reconciliation-serialization-sync",
+    )
+    panic = service.panic(
+        actor="operator:avi",
+        reason="serialization drill",
+        request_id="reconciliation-serialization-panic",
+    )
 
     assert sync["resolved_unknown"] == 0
     assert sync["unresolved_unknown"] == []

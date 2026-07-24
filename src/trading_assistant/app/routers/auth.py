@@ -65,7 +65,10 @@ def get_session(
         "actor": principal.actor,
         "session_id": principal.session_id,
         "authenticated_at": principal.authenticated_at.isoformat(),
-        "csrf_token": auth.rotate_csrf(_token(request, auth)),
+        "csrf_token": auth.csrf_token(
+            _token(request, auth),
+            request.app.state.operator_secret,
+        ),
     }
 
 

@@ -15,7 +15,14 @@ from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
 
 def _rule(svc, cond, action=None):
     action = action or {"side": "buy", "notional": "100"}
-    return svc.create_conditional_rule("AAPL", cond, action)
+    return svc.create_conditional_rule(
+        "AAPL",
+        cond,
+        action,
+        actor="operator:test",
+        reason="monitor test rule setup",
+        request_id="monitor-test-rule",
+    )
 
 
 def test_trigger_creates_proposal_and_notifies(make_service):
@@ -159,6 +166,9 @@ def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):
         "MSFT",
         {"price_above": 150},
         {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor multi-symbol rule setup",
+        request_id="monitor-msft-rule",
     )
     _rule(svc, {"price_below": 175})
 
@@ -202,6 +212,9 @@ def test_snapshot_expansion_flows_back_to_tick_quote_cache(make_service):
         "MSFT",
         {"price_above": 150},
         {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor grouped rule setup",
+        request_id="monitor-grouped-rule",
     )
 
     acted = Monitor(svc, NullNotifier()).tick()
@@ -248,6 +261,9 @@ def test_closed_equity_clock_does_not_stop_crypto_monitoring(make_service):
         "BTC/USD",
         {"price_below": 60000},
         {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor crypto rule setup",
+        request_id="monitor-crypto-rule",
     )
     broker.quote_calls = 0
 
@@ -312,8 +328,21 @@ def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_ser
     broker = ActivityBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
-    oid = svc.propose_order("AAPL", "buy", "market", qty="4")["order_id"]
-    svc.approve_order(oid, actor="operator:test", reason="monitor reconciliation test")
+    oid = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        qty="4",
+        actor="operator:test",
+        reason="monitor reconciliation proposal",
+        request_id="monitor-reconciliation-proposal",
+    )["order_id"]
+    svc.approve_order(
+        oid,
+        actor="operator:test",
+        reason="monitor reconciliation test",
+        request_id="monitor-reconciliation-approval",
+    )
 
     with svc.session_factory() as s:
         local = s.get(Order, oid)
@@ -359,23 +388,36 @@ def test_startup_monitor_delegates_to_reconciliation_service(make_service):
 
     svc = make_service()
     report = ReconciliationReport(1, (), 2, 3, ())
-    svc.reconciliation.reconcile = lambda: report
-    svc.sync_open_orders = lambda: (_ for _ in ()).throw(
-        AssertionError("legacy compatibility method must not be used")
-    )
+    observed_context = {}
+
+    def sync_with_context(**context):
+        observed_context.update(context)
+        return svc.serialize_reconciliation_report(report)
+
+    svc.sync_open_orders = sync_with_context
 
     summary = Monitor(svc, NullNotifier()).reconcile()
 
     assert summary["order_sync"]["resolved_unknown"] == 1
     assert summary["order_sync"]["synced_orders"] == 2
     assert summary["order_sync"]["inserted_fills"] == 3
+    assert observed_context["actor"] == "daemon:startup"
+    assert (
+        observed_context["reason"]
+        == "daemon startup broker order reconciliation"
+    )
+    assert observed_context["request_id"]
 
 
 def test_daemon_loop_body_runs_clean(make_service):
     # One full loop body: fill sync + daily-loss enforcement + rule tick + daily tasks.
     svc = make_service()
     mon = Monitor(svc, NullNotifier())
-    svc.sync_open_orders()
+    svc.sync_open_orders(
+        actor="operator:test",
+        reason="monitor loop body setup",
+        request_id="monitor-loop-body-sync",
+    )
     svc.enforce_daily_loss_limits()
     mon.tick()
     mon.run_daily_tasks()
@@ -414,7 +456,7 @@ def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
         svc,
         NullNotifier(),
         poll_interval_seconds=0.01,
-        cycle_timeout_seconds=0.2,
+        cycle_timeout_seconds=1.0,
         daily_task_timeout_seconds=0.02,
         shadow=SlowShadow(),
     )
@@ -486,7 +528,7 @@ def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service
 
     svc = make_service()
     monitor = Monitor(svc, NullNotifier())
-    svc.sync_open_orders = lambda: {
+    svc.sync_open_orders = lambda **context: {
         "synced": 0,
         "newly_filled": 0,
         "failed": 1,

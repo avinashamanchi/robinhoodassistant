@@ -21,7 +21,7 @@ _STATIC = pathlib.Path("src/trading_assistant/app/static")
 
 
 class _StubAgent:
-    def chat(self, message):
+    def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
 
 
@@ -109,13 +109,48 @@ def test_financial_get_endpoints_fail_closed(client):
     assert client.get("/log").status_code == 401
 
 
-def test_cors_preflight_blocks_cross_origin(client):
-    hdr = {"Origin": "http://evil.example", "Access-Control-Request-Method": "POST",
-           "Access-Control-Request-Headers": "x-csrf-token"}
-    r = client.options("/approve/1", headers=hdr)
-    assert r.headers.get("access-control-allow-origin") != "http://evil.example"
-    ok = client.options("/approve/1", headers={**hdr, "Origin": "http://127.0.0.1:8000"})
-    assert ok.headers.get("access-control-allow-origin") == "http://127.0.0.1:8000"
+def test_allowed_cors_preflight_has_security_headers_and_request_id(client):
+    response = client.options(
+        "/approve/1",
+        headers={
+            "Origin": "http://127.0.0.1:8000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-csrf-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.headers["access-control-allow-origin"]
+        == "http://127.0.0.1:8000"
+    )
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["X-Request-ID"]
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_rejected_cors_preflight_has_stable_hardened_error(client):
+    response = client.options(
+        "/approve/1",
+        headers={
+            "Origin": "http://evil.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-csrf-token",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.headers.get("access-control-allow-origin") is None
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["X-Request-ID"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
+        "error": {
+            "code": "cors_rejected",
+            "message": "CORS preflight was rejected",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
 
 
 # ── A2: no dynamic innerHTML in the UIs ─────────────────────────
@@ -176,6 +211,9 @@ def test_stale_quote_does_not_fire(make_service):
         "AAPL",
         {"price_below": 175},
         {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="stale quote rule setup",
+        request_id="security-stale-quote-rule",
     )
     # Price 100 < 175 would fire, but the quote is 600s stale -> skipped.
     assert Monitor(svc, max_quote_age_seconds=60).tick() == []
