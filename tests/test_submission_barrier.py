@@ -21,7 +21,12 @@ from trading_assistant.broker.models import (
     Position,
 )
 from trading_assistant.config import RiskConfig
-from trading_assistant.db.models import Fill, Order, utcnow
+from trading_assistant.db.models import (
+    FILL_RECONCILIATION_REQUIRED,
+    Fill,
+    Order,
+    utcnow,
+)
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.reconciliation import ReconciliationService
@@ -195,6 +200,59 @@ class _CancelLossRaceBroker(MockBroker):
         return [
             BrokerFill(
                 broker_fill_id="cancel-loss-closing-fill",
+                broker_order_id=self.broker_order_id,
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("1"),
+                price=Decimal("1"),
+                filled_at=utcnow(),
+            )
+        ]
+
+    def get_order_status(self, order_id):
+        assert order_id == self.broker_order_id
+        return self.canceled
+
+    def get_open_orders(self):
+        return []
+
+
+class _IndeterminateCancelLossBroker(MockBroker):
+    reconciliation_key = "indeterminate-cancel-loss-risk-writer"
+
+    def __init__(self, broker_order_id) -> None:
+        super().__init__(prices={"AAPL": Decimal("100")})
+        self.broker_order_id = broker_order_id
+
+    def cancel_order(self, order_id):
+        assert order_id == self.broker_order_id
+        # The broker accepted the cancellation after a hidden loss fill, but
+        # the response was lost and status confirmation is also unavailable.
+        raise ConnectionError("cancel response lost after broker acceptance")
+
+    def get_order_status(self, order_id):
+        assert order_id == self.broker_order_id
+        raise TimeoutError("broker status lookup unavailable")
+
+
+class _RecoveredCancelLossBroker(MockBroker):
+    reconciliation_key = "recovered-cancel-loss-risk-writer"
+
+    def __init__(self, broker_order_id, client_order_id) -> None:
+        super().__init__(prices={"AAPL": Decimal("100")})
+        self.broker_order_id = broker_order_id
+        self.canceled = OrderResult(
+            client_order_id,
+            broker_order_id,
+            OrderStatus.CANCELED,
+            filled_qty=Decimal("1"),
+            avg_fill_price=Decimal("1"),
+        )
+
+    def get_fill_activities(self, after=None):
+        return [
+            BrokerFill(
+                broker_fill_id="indeterminate-cancel-hidden-loss-fill",
                 broker_order_id=self.broker_order_id,
                 ticker="AAPL",
                 side="sell",
@@ -502,6 +560,45 @@ def _cancel_loss_process(
         return original_sync()
 
     service.sync_open_orders = paused_sync
+    try:
+        outcome.put(("ok", service.cancel_live_order(cancel_order_id)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _indeterminate_cancel_process(
+    db_url,
+    app_config,
+    cancel_order_id,
+    before_writer_release,
+    release_writer,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    with factory() as session:
+        broker_order_id = session.get(Order, cancel_order_id).broker_order_id
+    service = TradingService(
+        _IndeterminateCancelLossBroker(broker_order_id),
+        factory,
+        app_config,
+        FakeClock(),
+    )
+    original_hold_writer = service.submission_barrier.hold_writer
+
+    @contextmanager
+    def observed_hold_writer():
+        with original_hold_writer():
+            yield
+            before_writer_release.set()
+            if not release_writer.wait(timeout=10):
+                raise TimeoutError(
+                    "test did not release indeterminate-cancel writer"
+                )
+
+    service.submission_barrier.hold_writer = observed_hold_writer
     try:
         outcome.put(("ok", service.cancel_live_order(cancel_order_id)))
     except BaseException as exc:
@@ -1426,6 +1523,160 @@ def test_cancel_loss_reconciliation_blocks_concurrent_submission(
                 Fill.broker_fill_id == "cancel-loss-closing-fill"
             )
         ) == 1
+
+
+def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
+    make_service,
+    db_url,
+    app_config,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    follower_id = _approved_order(service)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="indeterminate-cancel-opening-fill",
+                filled_at=utcnow(),
+            )
+        )
+        cancel_order = Order(
+            idempotency_key="indeterminate-cancel-client-order",
+            ticker="AAPL",
+            side="sell",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id="indeterminate-cancel-broker-order",
+            acceptance_state="submitted",
+        )
+        session.add(cancel_order)
+        session.commit()
+        cancel_order_id = cancel_order.id
+
+    before_writer_release = context.Event()
+    release_writer = context.Event()
+    cancel_finished = context.Event()
+    cancel_outcome = context.Queue()
+    cancel = context.Process(
+        target=_indeterminate_cancel_process,
+        args=(
+            db_url,
+            app_config,
+            cancel_order_id,
+            before_writer_release,
+            release_writer,
+            cancel_finished,
+            cancel_outcome,
+        ),
+    )
+    cancel.start()
+    assert before_writer_release.wait(timeout=10)
+
+    with service.session_factory() as session:
+        latched = session.get(Order, cancel_order_id)
+        assert (
+            latched.acceptance_state
+            == FILL_RECONCILIATION_REQUIRED
+        )
+        assert latched.last_error_code == "indeterminate_cancel"
+    drift_state = service.breakers.get(BreakerScope.broker_drift())
+    assert drift_state is not None and drift_state.tripped is True
+    assert drift_state.actor == "service:cancel"
+    assert "ConnectionError" in drift_state.reason
+    assert "TimeoutError" in drift_state.reason
+
+    broker_entered = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_loss_checked_submission_process,
+        args=(
+            db_url,
+            follower_id,
+            broker_entered,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    try:
+        assert broker_entered.wait(timeout=0.75) is False
+        assert cancel_finished.is_set() is False
+    finally:
+        release_writer.set()
+        _join(cancel, release_writer)
+        _join(submission)
+
+    cancel_kind, cancel_result = cancel_outcome.get(timeout=2)
+    assert cancel_kind == "ok"
+    assert "could not be confirmed" in cancel_result["error"]
+    submission_result = submission_outcome.get(timeout=2)
+    assert submission_result[0:2] == (
+        "ok",
+        OrderStatus.REJECTED.value,
+    )
+    assert "active circuit breaker: broker_drift" in submission_result[2]
+    assert broker_entered.is_set() is False
+
+    recovery_broker = _RecoveredCancelLossBroker(
+        "indeterminate-cancel-broker-order",
+        "indeterminate-cancel-client-order",
+    )
+    restarted = make_service(broker=recovery_broker)
+    incomplete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+    assert incomplete.realized_pnl_today == Decimal("0")
+
+    first = restarted.reconciliation.reconcile()
+    after_exact_truth = restarted.snapshot_service.assemble_for_execution(
+        "AAPL"
+    )
+    assert first.inserted_fills == 1
+    assert after_exact_truth.realized_pnl_today == Decimal("-99")
+    assert after_exact_truth.broker_reconciled is False
+    assert after_exact_truth.daily_pnl_complete is False
+    with restarted.session_factory() as session:
+        recovered_order = session.get(Order, cancel_order_id)
+        assert recovered_order.status == OrderStatus.CANCELED.value
+        assert recovered_order.acceptance_state == "accepted"
+        assert recovered_order.last_error_code == ""
+        assert session.scalar(
+            select(func.count())
+            .select_from(Fill)
+            .where(
+                Fill.broker_fill_id
+                == "indeterminate-cancel-hidden-loss-fill"
+            )
+        ) == 1
+
+    drift_state = restarted.breakers.get(BreakerScope.broker_drift())
+    assert drift_state is not None and drift_state.tripped is True
+    restarted.breakers.reset(
+        BreakerScope.broker_drift(),
+        actor="operator:reconciliation",
+        reason="authoritative cancel status and exact fill reviewed",
+        prior_health={
+            "order_id": cancel_order_id,
+            "status": OrderStatus.CANCELED.value,
+            "authoritative_fill_qty": "1",
+        },
+        expected_generation=drift_state.generation,
+    )
+    complete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert complete.broker_reconciled is True
+    assert complete.daily_pnl_complete is True
+    assert complete.realized_pnl_today == Decimal("-99")
+
+    replay = restarted.reconciliation.reconcile()
+    after_replay = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert replay.inserted_fills == 0
+    assert after_replay.realized_pnl_today == Decimal("-99")
+    assert after_replay.broker_reconciled is True
+    assert after_replay.daily_pnl_complete is True
 
 
 @pytest.mark.parametrize(
