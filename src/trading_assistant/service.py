@@ -53,7 +53,7 @@ from .orders.application import (
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.reconciliation import ReconciliationService
 from .orders.submission import OrderSubmissionService
-from .risk.breakers import BreakerScope, BreakerService
+from .risk.breakers import BreakerScope, BreakerService, trip_in_session
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.pnl import FillLike, realized_pnl_today
@@ -863,26 +863,43 @@ class TradingService:
 
     def enforce_daily_loss_limits(self) -> dict[str, bool]:
         """Trip each asset class's kill switch if its realized daily loss breached."""
-        realized: dict[AssetClass, Decimal] = {}
-        with self.session_factory() as s:
-            for ac in (AssetClass.EQUITY, AssetClass.CRYPTO):
-                realized[ac] = self._realized_pnl_today(s, ac)
-        result: dict[str, bool] = {}
-        for ac, pnl in realized.items():
-            limit = abs(self._loss_limit_for(ac))
-            if pnl <= -limit:
-                self.breakers.trip(
-                    BreakerScope.loss(ac),
-                    (
-                        f"daily realized loss {pnl} breached limit "
-                        f"-{limit}"
-                    ),
-                    "daemon:daily-loss",
-                )
-            result[ac.value] = self.breakers.is_tripped(
-                BreakerScope.loss(ac)
-            )
-        return result
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                realized = {
+                    asset_class: self._realized_pnl_today(
+                        session,
+                        asset_class,
+                    )
+                    for asset_class in (
+                        AssetClass.EQUITY,
+                        AssetClass.CRYPTO,
+                    )
+                }
+                result: dict[str, bool] = {}
+                for asset_class, pnl in realized.items():
+                    scope = BreakerScope.loss(asset_class)
+                    limit = abs(self._loss_limit_for(asset_class))
+                    if pnl <= -limit:
+                        trip_in_session(
+                            session,
+                            scope,
+                            (
+                                f"daily realized loss {pnl} breached limit "
+                                f"-{limit}"
+                            ),
+                            "daemon:daily-loss",
+                        )
+                        result[asset_class.value] = True
+                    else:
+                        result[asset_class.value] = bool(
+                            session.scalar(
+                                select(CircuitBreakerState.tripped).where(
+                                    CircuitBreakerState.scope_key == scope.key
+                                )
+                            )
+                        )
+                session.commit()
+                return result
 
     def get_pending(self) -> list[dict[str, Any]]:
         with self.session_factory() as s:

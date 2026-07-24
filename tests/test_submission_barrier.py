@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import time
+from contextlib import contextmanager
 from decimal import Decimal
 from multiprocessing.context import SpawnContext
 
@@ -27,6 +28,7 @@ from trading_assistant.risk.clock import FakeClock
 from trading_assistant.risk.engine import RiskEngine, RiskResult
 from trading_assistant.risk.killswitch import KillSwitch
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
+from trading_assistant.service import TradingService
 
 
 class _StaticSnapshotService:
@@ -116,6 +118,19 @@ class _LossFillRaceBroker(MockBroker):
 
     def get_open_orders(self):
         return []
+
+
+class _DriftRaceBroker(MockBroker):
+    reconciliation_key = "drift-risk-writer"
+
+    def get_open_orders(self):
+        return [
+            OrderResult(
+                idempotency_key="unknown-remote-client",
+                broker_order_id="unknown-remote-order",
+                status=OrderStatus.SUBMITTED,
+            )
+        ]
 
 
 def _process_risk_config() -> RiskConfig:
@@ -230,6 +245,76 @@ def _higher_hwm_writer_process(db_url, started, finished, outcome):
     try:
         snapshot = snapshot_service.assemble_for_execution("AAPL")
         outcome.put(("ok", str(snapshot.account_high_water_mark)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _drift_reconciliation_process(
+    db_url,
+    before_writer_release,
+    release_writer,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    reconciliation = ReconciliationService(
+        factory,
+        _DriftRaceBroker(),
+        OrderRepository(factory),
+    )
+    original_hold_writer = reconciliation.submission_barrier.hold_writer
+
+    @contextmanager
+    def observed_hold_writer():
+        with original_hold_writer():
+            yield
+            before_writer_release.set()
+            if not release_writer.wait(timeout=10):
+                raise TimeoutError("test did not release reconciliation writer")
+
+    reconciliation.submission_barrier.hold_writer = observed_hold_writer
+    try:
+        report = reconciliation.reconcile()
+        outcome.put(("ok", tuple(report.broker_drift)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _daily_loss_enforcement_process(
+    db_url,
+    app_config,
+    loss_observed,
+    release_loss_writer,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    service = TradingService(
+        MockBroker(prices={"AAPL": Decimal("100")}),
+        factory,
+        app_config,
+        FakeClock(),
+    )
+    original_realized = service._realized_pnl_today
+    paused = False
+
+    def observed_realized(session, asset_class=AssetClass.EQUITY):
+        nonlocal paused
+        pnl = original_realized(session, asset_class)
+        if asset_class is AssetClass.EQUITY and not paused:
+            paused = True
+            loss_observed.set()
+            if not release_loss_writer.wait(timeout=10):
+                raise TimeoutError("test did not release daily-loss writer")
+        return pnl
+
+    service._realized_pnl_today = observed_realized
+    try:
+        outcome.put(("ok", service.enforce_daily_loss_limits()))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -862,6 +947,163 @@ def test_queued_submission_rechecks_acceptance_unknown_under_process_barrier(
             session.get(Order, follower_id).status
             == OrderStatus.REJECTED.value
         )
+
+
+def test_reconciliation_drift_is_durable_before_writer_interval_release(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+    before_writer_release = context.Event()
+    release_writer = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_drift_reconciliation_process,
+        args=(
+            db_url,
+            before_writer_release,
+            release_writer,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert before_writer_release.wait(timeout=10)
+    drift_was_durable = service.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    )
+
+    claim_committed = context.Event()
+    unused_release_claim = context.Event()
+    broker_entered = context.Event()
+    release_broker = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_submission_process,
+        args=(
+            db_url,
+            order_id,
+            False,
+            claim_committed,
+            unused_release_claim,
+            broker_entered,
+            release_broker,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    broker_entered_before_release = broker_entered.wait(timeout=1)
+    try:
+        release_writer.set()
+    finally:
+        _join(writer, release_writer)
+        _join(submission, release_broker)
+
+    assert drift_was_durable is True
+    assert broker_entered_before_release is False
+    writer_result = writer_outcome.get(timeout=2)
+    assert writer_result[0] == "ok"
+    assert any("has no local order" in item for item in writer_result[1])
+    assert submission_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.APPROVAL_RECORDED.value,
+    )
+    assert broker_entered.is_set() is False
+
+
+def test_daily_loss_observation_and_trip_are_one_writer_interval(
+    make_service,
+    app_config,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+    now = utcnow()
+    with service.session_factory() as session:
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("10"),
+                    price=Decimal("100"),
+                    broker_fill_id="daily-loss-open",
+                    filled_at=now,
+                ),
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("10"),
+                    price=Decimal("1"),
+                    broker_fill_id="daily-loss-close",
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    loss_observed = context.Event()
+    release_loss_writer = context.Event()
+    loss_writer_finished = context.Event()
+    loss_writer_outcome = context.Queue()
+    loss_writer = context.Process(
+        target=_daily_loss_enforcement_process,
+        args=(
+            db_url,
+            app_config,
+            loss_observed,
+            release_loss_writer,
+            loss_writer_finished,
+            loss_writer_outcome,
+        ),
+    )
+    loss_writer.start()
+    assert loss_observed.wait(timeout=10)
+
+    claim_committed = context.Event()
+    unused_release_claim = context.Event()
+    broker_entered = context.Event()
+    release_broker = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_submission_process,
+        args=(
+            db_url,
+            order_id,
+            False,
+            claim_committed,
+            unused_release_claim,
+            broker_entered,
+            release_broker,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    broker_entered_before_trip = broker_entered.wait(timeout=1)
+    try:
+        release_loss_writer.set()
+    finally:
+        release_broker.set()
+        _join(submission, release_broker)
+        _join(loss_writer, release_loss_writer)
+
+    assert broker_entered_before_trip is False
+    assert loss_writer_outcome.get(timeout=2) == (
+        "ok",
+        {"equity": True, "crypto": False},
+    )
+    assert service.breakers.is_tripped(
+        BreakerScope.loss(AssetClass.EQUITY)
+    ) is True
+    assert submission_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.APPROVAL_RECORDED.value,
+    )
+    assert broker_entered.is_set() is False
 
 
 def test_loss_fill_writer_queued_after_snapshot_prevents_broker_send(

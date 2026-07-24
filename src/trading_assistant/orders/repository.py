@@ -9,7 +9,10 @@ from decimal import Decimal
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_assistant.broker.models import OrderStatus
+from trading_assistant.broker.models import (
+    OrderStatus,
+    valid_cumulative_filled_qty,
+)
 from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
@@ -242,11 +245,7 @@ class OrderRepository:
                 ),
                 Decimal(0),
             )
-            remote_fill_invalid = (
-                not isinstance(filled_qty, Decimal)
-                or not filled_qty.is_finite()
-                or filled_qty < 0
-            )
+            remote_fill_invalid = not valid_cumulative_filled_qty(filled_qty)
             remote_fill_ahead = (
                 not remote_fill_invalid
                 and filled_qty

@@ -28,7 +28,7 @@ from trading_assistant.db.models import (
     Order,
     RuleGroup,
 )
-from trading_assistant.risk.breakers import BreakerService
+from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
 from trading_assistant.risk.staleness import is_stale
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
@@ -357,6 +357,9 @@ class PortfolioSnapshotService:
             for position in positions
             if AssetClass.for_symbol(position.ticker) is asset_class
         ]
+        broker_drift_active = (
+            BreakerScope.broker_drift().key in active_breakers
+        )
         finite_unrealized = [
             position.unrealized_intraday_pnl
             for position in relevant_positions
@@ -367,6 +370,7 @@ class PortfolioSnapshotService:
         ]
         daily_pnl_complete = (
             len(finite_unrealized) == len(relevant_positions)
+            and not broker_drift_active
         )
         unrealized_pnl_today = sum(
             finite_unrealized,
@@ -408,6 +412,7 @@ class PortfolioSnapshotService:
                 )
                 is None
                 and not fill_reconciliation_required
+                and not broker_drift_active
                 and session.scalar(
                     select(RuleGroup.id)
                     .where(RuleGroup.reconciliation_required.is_(True))

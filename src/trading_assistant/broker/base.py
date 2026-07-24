@@ -20,6 +20,19 @@ class BrokerAcceptanceUnknown(RuntimeError):
     """A request may have been sent, but broker acceptance is unproven."""
 
 
+class BrokerDataIntegrityError(ValueError):
+    """Broker payload cannot be trusted as execution or reconciliation truth."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        broker_order_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.broker_order_id = broker_order_id
+
+
 class BrokerClient(abc.ABC):
     """The single seam the rest of the system talks to for market/account/order I/O.
 

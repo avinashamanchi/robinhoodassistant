@@ -50,6 +50,24 @@ class OrderStatus(str, enum.Enum):
 Money = Decimal
 
 
+def valid_cumulative_filled_qty(value: object) -> bool:
+    """Whether broker cumulative execution quantity is safe to reconcile."""
+    return (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and value >= 0
+    )
+
+
+def valid_fill_economic(value: object) -> bool:
+    """Whether an exact fill quantity or price is finite and strictly positive."""
+    return (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and value > 0
+    )
+
+
 @dataclass(frozen=True)
 class OrderRequest:
     """An intent to trade. Carries EITHER qty OR notional, never both.

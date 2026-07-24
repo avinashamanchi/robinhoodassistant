@@ -37,7 +37,12 @@ from alpaca.trading.requests import (
 from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass
-from .base import BrokerAcceptanceUnknown, BrokerClient, BrokerSubmissionRejected
+from .base import (
+    BrokerAcceptanceUnknown,
+    BrokerClient,
+    BrokerDataIntegrityError,
+    BrokerSubmissionRejected,
+)
 from .models import (
     Account,
     BrokerFill,
@@ -48,6 +53,8 @@ from .models import (
     OrderType,
     Position,
     Quote,
+    valid_cumulative_filled_qty,
+    valid_fill_economic,
 )
 
 # Alpaca order-status string -> our lifecycle status.
@@ -262,18 +269,41 @@ class AlpacaBroker(BrokerClient):
                 params,
             )
             for raw in page:
+                broker_order_id = str(raw["order_id"])
                 timestamp = datetime.fromisoformat(
                     str(raw["transaction_time"]).replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
                 raw_side = str(raw["side"]).lower()
+                if raw_side in {"buy", "buy_to_cover"}:
+                    side = "buy"
+                elif raw_side in {"sell", "sell_short"}:
+                    side = "sell"
+                else:
+                    raise BrokerDataIntegrityError(
+                        f"invalid Alpaca fill side: {raw_side}",
+                        broker_order_id=broker_order_id,
+                    )
+                try:
+                    qty = Decimal(str(raw["qty"]))
+                    price = Decimal(str(raw["price"]))
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    raise BrokerDataIntegrityError(
+                        "invalid Alpaca fill quantity or price",
+                        broker_order_id=broker_order_id,
+                    ) from exc
+                if not valid_fill_economic(qty) or not valid_fill_economic(price):
+                    raise BrokerDataIntegrityError(
+                        "invalid Alpaca fill quantity or price",
+                        broker_order_id=broker_order_id,
+                    )
                 fills.append(
                     BrokerFill(
                         broker_fill_id=str(raw["id"]),
-                        broker_order_id=str(raw["order_id"]),
+                        broker_order_id=broker_order_id,
                         ticker=str(raw["symbol"]).upper(),
-                        side="buy" if raw_side.startswith("buy") else "sell",
-                        qty=Decimal(str(raw["qty"])),
-                        price=Decimal(str(raw["price"])),
+                        side=side,
+                        qty=qty,
+                        price=price,
                         filled_at=timestamp,
                     )
                 )
@@ -404,11 +434,24 @@ class AlpacaBroker(BrokerClient):
         return BrokerAcceptanceUnknown(str(exc))
 
     def _to_result(self, o: Any) -> OrderResult:
+        broker_order_id = str(o.id)
+        try:
+            filled_qty = _d(getattr(o, "filled_qty", 0))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca filled_qty",
+                broker_order_id=broker_order_id,
+            ) from exc
+        if not valid_cumulative_filled_qty(filled_qty):
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca filled_qty",
+                broker_order_id=broker_order_id,
+            )
         return OrderResult(
             idempotency_key=getattr(o, "client_order_id", "") or "",
-            broker_order_id=str(o.id),
+            broker_order_id=broker_order_id,
             status=_map_status(o.status),
-            filled_qty=_d(getattr(o, "filled_qty", 0)) or Decimal(0),
+            filled_qty=filled_qty,
             avg_fill_price=_d(getattr(o, "filled_avg_price", None)),
         )
 

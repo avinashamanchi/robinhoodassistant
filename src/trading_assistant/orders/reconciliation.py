@@ -9,8 +9,14 @@ from decimal import Decimal
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_assistant.broker.base import BrokerClient
-from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
+from trading_assistant.broker.base import BrokerClient, BrokerDataIntegrityError
+from trading_assistant.broker.models import (
+    BrokerFill,
+    OrderResult,
+    OrderStatus,
+    valid_cumulative_filled_qty,
+    valid_fill_economic,
+)
 from trading_assistant.db.models import (
     FILL_RECONCILIATION_REQUIRED,
     Fill,
@@ -77,12 +83,15 @@ class ReconciliationService:
 
     def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
         with self.submission_barrier.hold_writer():
-            resolved, unresolved, _ = self._resolve_unknown()
+            drift: list[str] = []
+            resolved, unresolved, _ = self._resolve_unknown(drift)
             self._clear_reconciled_rule_groups()
+            self._trip_reconciliation_faults(drift, unresolved)
             return resolved, unresolved
 
     def _resolve_unknown(
         self,
+        drift: list[str],
     ) -> tuple[int, tuple[int, ...], tuple[tuple[int, OrderResult], ...]]:
         with self.session_factory() as session:
             rows = session.execute(
@@ -102,12 +111,27 @@ class ReconciliationService:
         for order_id, client_order_id in rows:
             try:
                 remote = self.broker.get_order_by_client_id(client_order_id)
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    (order_id,),
+                    "invalid_cumulative_fill",
+                )
+                drift.append(
+                    f"local order {order_id} invalid cumulative filled_qty: {exc}"
+                )
+                unresolved.append(order_id)
+                continue
             except Exception:
                 unresolved.append(order_id)
                 continue
             if remote is None or remote.broker_order_id is None:
                 unresolved.append(order_id)
                 continue
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                drift.append(
+                    f"local order {order_id} invalid cumulative filled_qty "
+                    f"{remote.filled_qty}"
+                )
             if self.repository.resolve_acceptance(
                 order_id,
                 remote.broker_order_id,
@@ -125,15 +149,20 @@ class ReconciliationService:
 
     def reconcile(self) -> ReconciliationReport:
         with self.submission_barrier.hold_writer():
-            resolved, unresolved, resolved_results = self._resolve_unknown()
             drift: list[str] = []
-            inserted_fills = self._reconcile_fill_activities(drift)
+            resolved, unresolved, resolved_results = self._resolve_unknown(drift)
+            inserted_fills, invalid_fill_order_ids = (
+                self._reconcile_fill_activities(drift)
+            )
             synced, synthetic_fills = self._reconcile_statuses(
-                drift, prefetched_results=resolved_results
+                drift,
+                prefetched_results=resolved_results,
+                blocked_fill_order_ids=invalid_fill_order_ids,
             )
             inserted_fills += synthetic_fills
             self._clear_reconciled_rule_groups()
             self._detect_open_order_drift(drift)
+            self._trip_reconciliation_faults(drift, unresolved)
             return ReconciliationReport(
                 resolved_unknown=resolved,
                 unresolved_unknown=unresolved,
@@ -187,6 +216,78 @@ class ReconciliationService:
                     )
             session.commit()
 
+    @staticmethod
+    def _latch_order_in_session(order: Order, error_code: str) -> bool:
+        changed = False
+        if order.acceptance_state != FILL_RECONCILIATION_REQUIRED:
+            order.acceptance_state = FILL_RECONCILIATION_REQUIRED
+            changed = True
+        if order.last_error_code != error_code:
+            order.last_error_code = error_code
+            changed = True
+        if changed:
+            order.updated_at = datetime.now(timezone.utc)
+            order.version += 1
+        return changed
+
+    def _latch_order_ids(
+        self,
+        order_ids: tuple[int, ...] | list[int],
+        error_code: str,
+    ) -> tuple[int, ...]:
+        unique_ids = tuple(sorted(set(order_ids)))
+        if not unique_ids:
+            return ()
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                orders = session.scalars(
+                    select(Order).where(Order.id.in_(unique_ids))
+                ).all()
+                latched = tuple(order.id for order in orders)
+                for order in orders:
+                    self._latch_order_in_session(order, error_code)
+                session.commit()
+                return latched
+
+    def _latch_broker_order_id(
+        self,
+        broker_order_id: str | None,
+        error_code: str,
+    ) -> tuple[int, ...]:
+        if not broker_order_id:
+            return ()
+        with self.session_factory() as session:
+            order_ids = tuple(
+                session.scalars(
+                    select(Order.id).where(
+                        Order.broker_order_id == broker_order_id
+                    )
+                ).all()
+            )
+        return self._latch_order_ids(list(order_ids), error_code)
+
+    def _trip_reconciliation_faults(
+        self,
+        drift: list[str],
+        unresolved_order_ids: tuple[int, ...] = (),
+    ) -> None:
+        faults = list(drift)
+        if unresolved_order_ids:
+            faults.append(
+                "unresolved acceptance orders "
+                f"{list(sorted(unresolved_order_ids))}"
+            )
+        if not faults:
+            return
+        detail = " | ".join(faults[:3])
+        if len(faults) > 3:
+            detail += f" | {len(faults) - 3} additional fault(s)"
+        self.breakers.trip(
+            BreakerScope.broker_drift(),
+            f"broker reconciliation fault: {detail}",
+            "daemon:reconciliation",
+        )
+
     def _cursor_snapshot(self) -> tuple[str | None, datetime | None, int | None]:
         with self.session_factory() as session:
             cursor = session.get(
@@ -200,52 +301,91 @@ class ReconciliationService:
                 cursor.version,
             )
 
-    def _reconcile_fill_activities(self, drift: list[str]) -> int:
+    def _reconcile_fill_activities(
+        self,
+        drift: list[str],
+    ) -> tuple[int, frozenset[int]]:
         activity_reader = getattr(self.broker, "get_fill_activities", None)
         if not callable(activity_reader):
-            return 0
+            return 0, frozenset()
 
         _last_activity_id, after, expected_version = self._cursor_snapshot()
         try:
             activities = list(activity_reader(after=after))
+        except BrokerDataIntegrityError as exc:
+            blocked_order_ids = self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_fill_activity",
+            )
+            drift.append(f"invalid fill activity payload: {exc}")
+            return 0, frozenset(blocked_order_ids)
         except Exception as exc:
             drift.append(f"fill activities unavailable: {type(exc).__name__}")
-            return 0
+            return 0, frozenset()
 
         # Activity IDs are opaque, not chronological. The broker query overlaps
         # the timestamp boundary and the fill table's unique broker ID is the
         # authority for deduplication, including late-visible equal-time fills.
         batch = sorted(activities, key=lambda activity: activity.filled_at)
         if not batch:
-            return 0
+            return 0, frozenset()
 
         inserted = 0
         inserted_activities: list[BrokerFill] = []
+        blocked_order_ids: set[int] = set()
         advance_cursor = True
         with self.session_factory() as session:
             try:
                 for activity in batch:
-                    order = session.scalar(
+                    orders = session.scalars(
                         select(Order).where(
                             Order.broker_order_id == activity.broker_order_id
                         )
-                    )
-                    if order is None:
+                    ).all()
+                    if len(orders) != 1:
                         drift.append(
                             "fill activity "
-                            f"{activity.broker_fill_id} has unknown broker order "
+                            f"{activity.broker_fill_id} has unknown or ambiguous "
+                            "broker order "
                             f"{activity.broker_order_id}"
                         )
                         advance_cursor = False
                         continue
-                    self._remove_synthetic_fills(session, order)
-                    duplicate = session.scalar(
-                        select(Fill.id).where(
-                            Fill.broker_fill_id == activity.broker_fill_id
-                        )
+                    order = orders[0]
+                    validation_error = self._fill_activity_validation_error(
+                        activity,
+                        order,
                     )
+                    duplicate = None
+                    if validation_error is None:
+                        duplicate = session.scalar(
+                            select(Fill).where(
+                                Fill.broker_fill_id == activity.broker_fill_id
+                            )
+                        )
+                    if validation_error is None and duplicate is not None:
+                        validation_error = (
+                            self._duplicate_fill_validation_error(
+                                activity,
+                                order,
+                                duplicate,
+                            )
+                        )
+                    if validation_error is not None:
+                        drift.append(
+                            f"invalid fill activity "
+                            f"{activity.broker_fill_id}: {validation_error}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_fill_activity",
+                        )
+                        blocked_order_ids.add(order.id)
+                        advance_cursor = False
+                        continue
                     if duplicate is not None:
                         continue
+                    self._remove_synthetic_fills(session, order)
                     session.add(
                         Fill(
                             order_id=order.id,
@@ -282,8 +422,64 @@ class ReconciliationService:
             except Exception as exc:
                 session.rollback()
                 drift.append(f"fill activity batch not committed: {type(exc).__name__}")
-                return 0
-        return inserted
+                return 0, frozenset(blocked_order_ids)
+        return inserted, frozenset(blocked_order_ids)
+
+    @staticmethod
+    def _fill_activity_validation_error(
+        activity: BrokerFill,
+        order: Order,
+    ) -> str | None:
+        if not isinstance(activity.broker_fill_id, str) or not (
+            activity.broker_fill_id.strip()
+        ):
+            return "missing broker fill identity"
+        if (
+            not isinstance(activity.broker_order_id, str)
+            or activity.broker_order_id != order.broker_order_id
+        ):
+            return "broker order identity does not match local order"
+        if (
+            not isinstance(activity.side, str)
+            or activity.side not in {"buy", "sell"}
+        ):
+            return f"unknown side {activity.side!r}"
+        if activity.side != order.side:
+            return (
+                f"side {activity.side!r} does not match local side "
+                f"{order.side!r}"
+            )
+        if (
+            not isinstance(activity.ticker, str)
+            or activity.ticker.upper() != order.ticker.upper()
+        ):
+            return (
+                f"ticker {activity.ticker!r} does not match local ticker "
+                f"{order.ticker!r}"
+            )
+        if not valid_fill_economic(activity.qty):
+            return f"quantity {activity.qty!r} is not finite and positive"
+        if not valid_fill_economic(activity.price):
+            return f"price {activity.price!r} is not finite and positive"
+        return None
+
+    @staticmethod
+    def _duplicate_fill_validation_error(
+        activity: BrokerFill,
+        order: Order,
+        duplicate: Fill,
+    ) -> str | None:
+        if duplicate.order_id != order.id:
+            return "broker fill identity belongs to a different local order"
+        if duplicate.ticker.upper() != activity.ticker.upper():
+            return "broker fill identity replay changed ticker"
+        if duplicate.side != activity.side:
+            return "broker fill identity replay changed side"
+        if duplicate.qty != activity.qty:
+            return "broker fill identity replay changed quantity"
+        if duplicate.price != activity.price:
+            return "broker fill identity replay changed price"
+        return None
 
     @staticmethod
     def _remove_synthetic_fills(session: Session, order: Order) -> None:
@@ -332,6 +528,7 @@ class ReconciliationService:
         drift: list[str],
         *,
         prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
+        blocked_fill_order_ids: frozenset[int] = frozenset(),
     ) -> tuple[int, int]:
         needs_status_reconciliation = or_(
             Order.status.in_(
@@ -370,6 +567,14 @@ class ReconciliationService:
                 results.append(
                     (order_id, self.broker.get_order_status(broker_order_id))
                 )
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    (order_id,),
+                    "invalid_cumulative_fill",
+                )
+                drift.append(
+                    f"local order {order_id} invalid cumulative filled_qty: {exc}"
+                )
             except Exception as exc:
                 drift.append(
                     f"status unavailable for local order {order_id}: "
@@ -382,6 +587,17 @@ class ReconciliationService:
             with self.session_factory() as session:
                 order = session.get(Order, order_id)
                 if order is None:
+                    continue
+                if not valid_cumulative_filled_qty(remote.filled_qty):
+                    drift.append(
+                        f"local order {order.id} invalid cumulative filled_qty "
+                        f"{remote.filled_qty}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    session.commit()
                     continue
                 target = remote.status
                 current = OrderStatus(order.status)
@@ -433,6 +649,11 @@ class ReconciliationService:
                     == FILL_RECONCILIATION_REQUIRED
                 )
                 if fill_reconciliation_required:
+                    if order.id in blocked_fill_order_ids:
+                        if latch_changed:
+                            order.version += 1
+                        session.commit()
+                        continue
                     if not exact_reader:
                         drift.append(
                             f"broker order {order.id} requires authoritative "
@@ -473,8 +694,19 @@ class ReconciliationService:
                 if (
                     not exact_reader
                     and new_qty > Decimal("0.000001")
-                    and remote.avg_fill_price is not None
                 ):
+                    if not valid_fill_economic(remote.avg_fill_price):
+                        drift.append(
+                            f"broker order {order.id} has invalid cumulative "
+                            f"average fill price {remote.avg_fill_price}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
+                        )
+                        session.commit()
+                        continue
+                    assert remote.avg_fill_price is not None
                     recorded_notional = sum(
                         (fill.qty * fill.price for fill in prior_fills), Decimal(0)
                     )
@@ -505,6 +737,7 @@ class ReconciliationService:
 
                 if fill_reconciliation_required:
                     order.acceptance_state = "accepted"
+                    order.last_error_code = ""
                 current = OrderStatus(order.status)
                 if (
                     target is not current
@@ -519,9 +752,26 @@ class ReconciliationService:
     def _detect_open_order_drift(self, drift: list[str]) -> None:
         try:
             remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+            )
+            drift.append(f"open order invalid cumulative filled_qty: {exc}")
+            return
         except Exception as exc:
             drift.append(f"open order enumeration unavailable: {type(exc).__name__}")
             return
+        for remote in remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                self._latch_broker_order_id(
+                    remote.broker_order_id,
+                    "invalid_cumulative_fill",
+                )
+                drift.append(
+                    "open order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
         if any(remote.broker_order_id is None for remote in remote_open):
             drift.append("remote open order is missing broker order id")
         remote_ids = {
@@ -589,20 +839,52 @@ class ReconciliationService:
                 local_by_broker_id.setdefault(broker_order_id, []).append(local_id)
 
         enumeration_failed = False
+        panic_drift: list[str] = []
         try:
             remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+            )
+            panic_drift.append(
+                f"panic open-order invalid cumulative filled_qty: {exc}"
+            )
+            remote_open = []
+            enumeration_failed = True
         except Exception:
             remote_open = []
             enumeration_failed = True
+        invalid_remote_ids: set[str] = set()
+        for remote in remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                if remote.broker_order_id is not None:
+                    invalid_remote_ids.add(remote.broker_order_id)
+                    self._latch_broker_order_id(
+                        remote.broker_order_id,
+                        "invalid_cumulative_fill",
+                    )
+                panic_drift.append(
+                    "panic open-order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
         unaddressable_remote_open = any(
             remote.broker_order_id is None for remote in remote_open
-        )
+        ) or bool(invalid_remote_ids)
         remote_by_id = {
             remote.broker_order_id: remote
             for remote in remote_open
             if remote.broker_order_id is not None
+            and remote.broker_order_id not in invalid_remote_ids
         }
-        explicit_ids = sorted(set(local_by_broker_id) | set(remote_by_id))
+        explicit_ids = sorted(
+            set(local_by_broker_id)
+            | {
+                remote.broker_order_id
+                for remote in remote_open
+                if remote.broker_order_id is not None
+            }
+        )
 
         confirmed_canceled: list[str] = []
         verified_terminal: set[str] = set()
@@ -614,7 +896,27 @@ class ReconciliationService:
                 pass
             try:
                 verified = self.broker.get_order_status(broker_order_id)
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    local_by_broker_id.get(broker_order_id, []),
+                    "invalid_cumulative_fill",
+                )
+                panic_drift.append(
+                    f"panic order {broker_order_id} invalid cumulative "
+                    f"filled_qty: {exc}"
+                )
+                continue
             except Exception:
+                continue
+            if not valid_cumulative_filled_qty(verified.filled_qty):
+                self._latch_order_ids(
+                    local_by_broker_id.get(broker_order_id, []),
+                    "invalid_cumulative_fill",
+                )
+                panic_drift.append(
+                    f"panic order {broker_order_id} invalid cumulative "
+                    f"filled_qty {verified.filled_qty}"
+                )
                 continue
             if verified.status not in _REMOTE_OPEN_STATUSES:
                 verified_terminal.add(broker_order_id)
@@ -627,6 +929,21 @@ class ReconciliationService:
 
         try:
             final_remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+            )
+            panic_drift.append(
+                f"panic final open-order invalid cumulative filled_qty: {exc}"
+            )
+            enumeration_failed = True
+            final_remote_open = [
+                remote_by_id[broker_order_id]
+                for broker_order_id in explicit_ids
+                if broker_order_id in remote_by_id
+                and broker_order_id not in verified_terminal
+            ]
         except Exception:
             enumeration_failed = True
             final_remote_open = [
@@ -635,9 +952,21 @@ class ReconciliationService:
                 if broker_order_id in remote_by_id
                 and broker_order_id not in verified_terminal
             ]
+        for remote in final_remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                if remote.broker_order_id is not None:
+                    potentially_open.add(remote.broker_order_id)
+                    self._latch_broker_order_id(
+                        remote.broker_order_id,
+                        "invalid_cumulative_fill",
+                    )
+                panic_drift.append(
+                    "panic final open-order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
         unaddressable_remote_open = unaddressable_remote_open or any(
             remote.broker_order_id is None for remote in final_remote_open
-        )
+        ) or bool(panic_drift)
         remote_open_ids = tuple(
             sorted(
                 {
@@ -665,6 +994,7 @@ class ReconciliationService:
             and not local_unconfirmed
             and not remote_open_ids
         )
+        self._trip_reconciliation_faults(panic_drift)
         if safe:
             message = "panic verified: no local unknown/open or broker open orders remain"
         else:
@@ -687,6 +1017,18 @@ class ReconciliationService:
         self, local_order_ids: tuple[int, ...] | list[int], remote: OrderResult
     ) -> None:
         if not local_order_ids:
+            return
+        if not valid_cumulative_filled_qty(remote.filled_qty):
+            self._latch_order_ids(
+                list(local_order_ids),
+                "invalid_cumulative_fill",
+            )
+            self._trip_reconciliation_faults(
+                [
+                    "panic verified status has invalid cumulative filled_qty "
+                    f"{remote.filled_qty}"
+                ]
+            )
             return
         now = datetime.now(timezone.utc)
         values: dict[str, object] = {

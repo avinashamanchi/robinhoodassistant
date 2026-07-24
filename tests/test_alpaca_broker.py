@@ -401,6 +401,42 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     )
 
 
+def test_fill_activities_reject_unknown_side():
+    trading = FakeTrading(
+        activities=[
+            {
+                "id": "activity-invalid-side",
+                "transaction_time": "2026-07-20T13:31:16Z",
+                "price": "100",
+                "qty": "1",
+                "side": "exercise",
+                "symbol": "AAPL",
+                "order_id": "order-1",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="side"):
+        AlpacaBroker(trading, FakeData({})).get_fill_activities()
+
+
+@pytest.mark.parametrize(
+    "filled_qty",
+    ["NaN", "Infinity", "-Infinity", "-0.000001"],
+)
+def test_order_mapping_rejects_invalid_cumulative_filled_qty(filled_qty):
+    prior = FakeOrder(
+        "brk-invalid-cumulative",
+        "k1",
+        "canceled",
+        filled_qty=filled_qty,
+    )
+    broker = AlpacaBroker(FakeTrading(existing=prior), FakeData({}))
+
+    with pytest.raises(ValueError, match="filled_qty"):
+        broker.get_order_by_client_id("k1")
+
+
 def test_submit_market_order_builds_request_and_maps_result():
     trading = FakeTrading()
     broker = AlpacaBroker(trading, FakeData({}))

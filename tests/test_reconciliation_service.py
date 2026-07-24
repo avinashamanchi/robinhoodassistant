@@ -21,6 +21,7 @@ from trading_assistant.broker.models import (
 from trading_assistant.db import models as db_models
 from trading_assistant.db.models import CircuitBreakerState, Fill, Order, utcnow
 from trading_assistant.orders.application import ApprovalCommand
+from trading_assistant.risk.breakers import BreakerScope
 
 
 def _approved_order_id(service) -> int:
@@ -350,6 +351,38 @@ def test_panic_canceled_after_partial_fill_stays_latched_until_activity(
         ) == 1
 
 
+def test_panic_rejects_invalid_cumulative_fill_truth_and_trips_drift(
+    make_service,
+):
+    class InvalidCumulativeDuringPanicBroker(ActivityBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            invalid = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.CANCELED,
+                filled_qty=Decimal("-1"),
+            )
+            self._orders_by_id[order_id] = invalid
+            self._orders_by_key[current.idempotency_key] = invalid
+            return invalid
+
+    broker = InvalidCumulativeDuringPanicBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+
+    report = service.reconciliation.panic(
+        "operator:avi",
+        "invalid cumulative drill",
+    )
+
+    assert report.safe is False
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "fill_reconcile_required"
+
+
 def test_panic_requires_actor_and_reason_before_latching(make_service):
     service = make_service()
 
@@ -521,9 +554,15 @@ def test_reconcile_reports_remote_open_order_without_broker_id(make_service):
         def get_open_orders(self):
             return [OrderResult("missing-id", None, OrderStatus.SUBMITTED)]
 
-    report = make_service(broker=MissingIdBroker()).reconciliation.reconcile()
+    service = make_service(broker=MissingIdBroker())
+    report = service.reconciliation.reconcile()
+    restarted = make_service(broker=MissingIdBroker())
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert any("missing broker order id" in drift for drift in report.broker_drift)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
 
 
 class ActivityBroker(MockBroker):
@@ -538,6 +577,211 @@ class ActivityBroker(MockBroker):
         if self.fail_activities:
             raise ConnectionError("activity stream unavailable")
         return list(self.activities)
+
+
+@pytest.mark.parametrize(
+    "filled_qty",
+    [Decimal("NaN"), Decimal("Infinity"), Decimal("-1")],
+)
+def test_invalid_cumulative_fill_truth_latches_and_trips_drift_across_restart(
+    make_service,
+    filled_qty,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    invalid = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.CANCELED,
+        filled_qty=filled_qty,
+    )
+    broker._orders_by_id[broker_order_id] = invalid
+    broker._orders_by_key[client_order_id] = invalid
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    replay = restarted.reconciliation.reconcile()
+
+    assert any("invalid cumulative filled_qty" in item for item in first.broker_drift)
+    assert replay.inserted_fills == 0
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(Fill.order_id == order_id)
+        ) == 0
+
+
+def test_acceptance_resolution_rejects_invalid_cumulative_truth_durably(
+    make_service,
+):
+    class InvalidThenDisconnectBroker(ActivityBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            invalid = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                OrderStatus.CANCELED,
+                filled_qty=Decimal("NaN"),
+            )
+            self._orders_by_id[accepted.broker_order_id] = invalid
+            self._orders_by_key[accepted.idempotency_key] = invalid
+            raise ConnectionError("response lost before invalid status lookup")
+
+    broker = InvalidThenDisconnectBroker()
+    service = make_service(broker=broker)
+    order_id = _approved_order_id(service)
+    service.order_submission.submit(order_id)
+
+    assert service.reconciliation.reconcile_unknown() == (1, ())
+
+    restarted = make_service(broker=broker)
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    with restarted.session_factory() as session:
+        assert (
+            session.get(Order, order_id).acceptance_state
+            == "fill_reconcile_required"
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("side", "sell"),
+        ("side", "exercise"),
+        ("ticker", "MSFT"),
+        ("qty", Decimal("0")),
+        ("qty", Decimal("NaN")),
+        ("price", Decimal("0")),
+        ("price", Decimal("Infinity")),
+    ],
+)
+def test_invalid_exact_fill_is_rejected_latched_and_replayed_fail_closed(
+    make_service,
+    field,
+    invalid_value,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    values = {
+        "broker_fill_id": f"invalid-{field}-{invalid_value}",
+        "broker_order_id": broker_order_id,
+        "ticker": "AAPL",
+        "side": "buy",
+        "qty": Decimal("1"),
+        "price": Decimal("100"),
+        "filled_at": utcnow(),
+    }
+    values[field] = invalid_value
+    broker.activities = [BrokerFill(**values)]
+    filled = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = filled
+    broker._orders_by_key[client_order_id] = filled
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    replay = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 0
+    assert replay.inserted_fills == 0
+    assert any("invalid fill activity" in item for item in first.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(Fill.order_id == order_id)
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(db_models.ReconciliationCursor)
+            .where(db_models.ReconciliationCursor.stream == "fills")
+        ) == 0
+
+
+def test_mutated_duplicate_fill_replay_is_rejected_without_corrupting_ledger(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    valid = BrokerFill(
+        broker_fill_id="immutable-fill-id",
+        broker_order_id=broker_order_id,
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=utcnow(),
+    )
+    broker.activities = [valid]
+    filled = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = filled
+    broker._orders_by_key[client_order_id] = filled
+    assert service.reconciliation.reconcile().inserted_fills == 1
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=valid.broker_fill_id,
+            broker_order_id=valid.broker_order_id,
+            ticker=valid.ticker,
+            side="sell",
+            qty=valid.qty,
+            price=valid.price,
+            filled_at=valid.filled_at,
+        )
+    ]
+    replay = service.reconciliation.reconcile()
+
+    assert replay.inserted_fills == 0
+    assert any("invalid fill activity" in item for item in replay.broker_drift)
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        fill = session.scalar(
+            select(Fill).where(Fill.broker_fill_id == valid.broker_fill_id)
+        )
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert fill.side == "buy"
+        assert fill.ticker == "AAPL"
+        assert fill.qty == Decimal("1.000000")
+        assert fill.price == Decimal("100.000000")
 
 
 @pytest.mark.parametrize(
@@ -787,8 +1031,26 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
 
     assert first.inserted_fills == 1
     assert reconciled.realized_pnl_today == expected_loss
-    assert reconciled.broker_reconciled is True
-    assert reconciled.daily_pnl_complete is True
+    assert reconciled.broker_reconciled is False
+    assert reconciled.daily_pnl_complete is False
+
+    drift_state = service.breakers.get(BreakerScope.broker_drift())
+    assert drift_state is not None and drift_state.tripped is True
+    service.breakers.reset(
+        BreakerScope.broker_drift(),
+        actor="operator:reconciliation",
+        reason="exact fill activities reviewed",
+        prior_health={
+            "order_id": order_id,
+            "authoritative_fill_qty": str(filled_qty),
+        },
+        expected_generation=drift_state.generation,
+    )
+    after_health_reset = service.snapshot_service.assemble_for_execution(
+        "AAPL"
+    )
+    assert after_health_reset.broker_reconciled is True
+    assert after_health_reset.daily_pnl_complete is True
 
     duplicate = service.reconciliation.reconcile()
     after_duplicate = service.snapshot_service.assemble_for_execution("AAPL")
