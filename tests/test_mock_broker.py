@@ -58,3 +58,11 @@ def test_status_and_cancel(mock_broker):
     assert fetched.broker_order_id == result.broker_order_id
     canceled = mock_broker.cancel_order(result.broker_order_id)
     assert canceled.status is OrderStatus.CANCELED
+
+
+def test_get_open_orders_only_returns_live_broker_orders(mock_broker):
+    first = mock_broker.submit_order(_order("open"))
+    second = mock_broker.submit_order(_order("cancel"))
+    mock_broker.cancel_order(second.broker_order_id)
+
+    assert mock_broker.get_open_orders() == [first]

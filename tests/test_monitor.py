@@ -263,6 +263,23 @@ def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_ser
         assert s.get(Order, oid).status == "filled"
 
 
+def test_startup_monitor_delegates_to_reconciliation_service(make_service):
+    from trading_assistant.orders.reconciliation import ReconciliationReport
+
+    svc = make_service()
+    report = ReconciliationReport(1, (), 2, 3, ())
+    svc.reconciliation.reconcile = lambda: report
+    svc.sync_open_orders = lambda: (_ for _ in ()).throw(
+        AssertionError("legacy compatibility method must not be used")
+    )
+
+    summary = Monitor(svc, NullNotifier()).reconcile()
+
+    assert summary["order_sync"]["resolved_unknown"] == 1
+    assert summary["order_sync"]["synced_orders"] == 2
+    assert summary["order_sync"]["inserted_fills"] == 3
+
+
 def test_daemon_loop_body_runs_clean(make_service):
     # One full loop body: fill sync + daily-loss enforcement + rule tick + daily tasks.
     svc = make_service()

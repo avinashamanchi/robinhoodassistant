@@ -104,6 +104,16 @@ def test_killswitch_reset_endpoint(client):
     assert r["tripped"] is False
 
 
+def test_panic_endpoint_supplies_actor_and_requires_reason(client):
+    c, _, _ = client
+
+    assert c.post("/panic", json={"reason": " "}).status_code == 422
+    response = c.post("/panic", json={"reason": "manual API drill"})
+
+    assert response.status_code == 200
+    assert response.json()["safe"] is True
+
+
 def test_chat_and_rate_limit(client):
     c, svc, agent = client
     assert c.post("/chat", json={"message": "hi"}).json()["reply"] == "echo: hi"

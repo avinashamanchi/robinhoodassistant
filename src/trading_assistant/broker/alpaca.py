@@ -27,8 +27,13 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import CryptoSnapshotRequest, StockSnapshotRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
-from alpaca.trading.enums import TimeInForce
-from alpaca.trading.requests import GetCalendarRequest, LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetCalendarRequest,
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+)
 from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass
@@ -116,6 +121,8 @@ def _map_status(raw: Any) -> OrderStatus:
 
 
 class AlpacaBroker(BrokerClient):
+    reconciliation_key = "alpaca"
+
     def __init__(
         self,
         trading_client: TradingClient,
@@ -337,6 +344,13 @@ class AlpacaBroker(BrokerClient):
     def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         found = self._find_by_client_id(client_order_id)
         return self._to_result(found) if found is not None else None
+
+    def get_open_orders(self) -> list[OrderResult]:
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        return [
+            self._to_result(order)
+            for order in _retry(self._trading.get_orders, filter=request)
+        ]
 
     def cancel_order(self, order_id: str) -> OrderResult:
         _retry(self._trading.cancel_order_by_id, order_id)

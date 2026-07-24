@@ -286,7 +286,8 @@ class Monitor:
     # ── reconciliation on restart ──────────────────────────────
     def reconcile(self) -> dict[str, Any]:
         """Synchronize broker truth before resuming persisted rules on startup."""
-        order_sync = self.service.sync_open_orders()
+        report = self.service.reconciliation.reconcile()
+        order_sync = self.service.serialize_reconciliation_report(report)
         position_reconciliation = self.service.reconcile_positions()
         with self.service.session_factory() as s:
             recovered = s.execute(

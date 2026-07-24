@@ -29,6 +29,8 @@ def _deterministic_price(ticker: str) -> Decimal:
 
 
 class MockBroker(BrokerClient):
+    reconciliation_key = "mock"
+
     def __init__(
         self,
         prices: Optional[dict[str, Decimal]] = None,
@@ -93,6 +95,16 @@ class MockBroker(BrokerClient):
 
     def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         return self._orders_by_key.get(client_order_id)
+
+    def get_open_orders(self) -> list[OrderResult]:
+        return [
+            order
+            for order in self._orders_by_id.values()
+            if order.status in {
+                OrderStatus.SUBMITTED,
+                OrderStatus.PARTIALLY_FILLED,
+            }
+        ]
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         result = self.submit_order(order)

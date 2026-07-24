@@ -129,7 +129,6 @@ def test_killswitch_drill(make_service):
 def test_panic_flattens_everything(make_service):
     import json as _json
 
-    from trading_assistant.assets import AssetClass
     from trading_assistant.db.models import Rule
     from trading_assistant.risk.killswitch import KillSwitch
 
@@ -141,15 +140,17 @@ def test_panic_flattens_everything(make_service):
                    action_json=_json.dumps({"side": "sell", "qty": "1"})))
         s.commit()
 
-    res = svc.panic()
-    assert res["orders_canceled"] == 1 and res["rules_disabled"] == 1
+    res = svc.panic(actor="operator:test", reason="panic drill")
+    assert res["safe"] is True
+    assert len(res["confirmed_canceled"]) == 1
     with svc.session_factory() as s:
-        assert KillSwitch.is_tripped(s, AssetClass.EQUITY) is True
-        assert KillSwitch.is_tripped(s, AssetClass.CRYPTO) is True
+        assert KillSwitch.is_tripped(s, "operator_global") is True
+        assert s.query(Rule).filter_by(state="active").count() == 0
 
     # Idempotent: a second panic is a no-op on already-flat state.
-    res2 = svc.panic()
-    assert res2["orders_canceled"] == 0 and res2["rules_disabled"] == 0
+    res2 = svc.panic(actor="operator:test", reason="repeat panic drill")
+    assert res2["safe"] is True
+    assert res2["confirmed_canceled"] == []
 
 
 def test_panic_never_claims_an_unconfirmed_broker_cancel(make_service):
@@ -163,8 +164,9 @@ def test_panic_never_claims_an_unconfirmed_broker_cancel(make_service):
     svc = make_service(broker=CancelFailureBroker())
     oid = _submitted(svc)
 
-    result = svc.panic()
+    result = svc.panic(actor="operator:test", reason="cancel failure drill")
 
-    assert result["orders_canceled"] == 0
-    assert result["orders_unconfirmed"] == [oid]
+    assert result["safe"] is False
+    assert result["confirmed_canceled"] == []
+    assert result["unconfirmed_order_ids"] == [oid]
     assert svc.get_order_status(oid)["status"] == "submitted"

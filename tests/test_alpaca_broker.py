@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import TimeInForce
+from alpaca.trading.enums import QueryOrderStatus, TimeInForce
 
 from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
 from trading_assistant.broker.base import BrokerAcceptanceUnknown, BrokerSubmissionRejected
@@ -81,6 +81,8 @@ class FakeTrading:
         self.submit_calls = 0
         self.last_request = None
         self._by_id = {}
+        self.open_orders = []
+        self.order_filter = None
 
     def get_order_by_client_id(self, cid):
         if self._lookup_error is not None:
@@ -102,6 +104,10 @@ class FakeTrading:
 
     def get_order_by_id(self, oid):
         return self._by_id[oid]
+
+    def get_orders(self, filter):
+        self.order_filter = filter
+        return self.open_orders
 
     def cancel_order_by_id(self, oid):
         self._by_id[oid] = FakeOrder(oid, "c", "canceled")
@@ -266,6 +272,20 @@ def test_get_order_by_client_id_returns_none_or_prior_order_without_submitting()
     assert found is not None
     assert found.broker_order_id == "brk-existing"
     assert existing._trading.submit_calls == 0
+
+
+def test_get_open_orders_requests_open_only_and_maps_results():
+    trading = FakeTrading()
+    trading.open_orders = [
+        FakeOrder("brk-open", "client-open", "partially_filled", filled_qty="0.5")
+    ]
+    broker = AlpacaBroker(trading, FakeData({}))
+
+    result = broker.get_open_orders()
+
+    assert trading.order_filter.status is QueryOrderStatus.OPEN
+    assert result[0].broker_order_id == "brk-open"
+    assert result[0].status is OrderStatus.PARTIALLY_FILLED
 
 
 def test_alpaca_definitive_validation_rejection_is_typed():

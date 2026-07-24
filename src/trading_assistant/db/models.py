@@ -424,6 +424,22 @@ class KillSwitchState(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 
+class ReconciliationCursor(Base):
+    """Durable high-water mark for one broker activity stream."""
+
+    __tablename__ = "reconciliation_cursors"
+
+    broker: Mapped[str] = mapped_column(String(64), primary_key=True)
+    stream: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_activity_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    version: Mapped[int] = mapped_column(default=0)
+
+
 # ── Atomic approval primitive (A5) ──────────────────────────────
 def approve_proposed(
     session: Session,

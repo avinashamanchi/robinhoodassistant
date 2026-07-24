@@ -49,6 +49,7 @@ from .orders.application import (
     OrderApplicationService,
 )
 from .orders.snapshot import PortfolioSnapshotService
+from .orders.reconciliation import ReconciliationService
 from .orders.submission import OrderSubmissionService
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
@@ -111,6 +112,11 @@ class TradingService:
             self._killswitch_for_symbol,
             utcnow,
         )
+        self.reconciliation = ReconciliationService(
+            session_factory,
+            broker,
+            self.order_application.repository,
+        )
 
     # ── asset-class routing helpers ────────────────────────────
     @staticmethod
@@ -136,7 +142,13 @@ class TradingService:
     def _killswitch_for_symbol(self, ticker: str) -> bool:
         """Read the durable breaker in a closed session before broker I/O."""
         with self.session_factory() as session:
-            return KillSwitch.is_tripped(session, self._asset_class(ticker))
+            return self._risk_is_blocked(session, self._asset_class(ticker))
+
+    @staticmethod
+    def _risk_is_blocked(session: Session, asset_class: AssetClass) -> bool:
+        return KillSwitch.is_tripped(
+            session, asset_class
+        ) or KillSwitch.is_tripped(session, "operator_global")
 
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
@@ -276,7 +288,7 @@ class TradingService:
             result = self._risk_for(ac).check(
                 order_req,
                 snapshot,
-                killswitch_tripped=KillSwitch.is_tripped(s, ac),
+                killswitch_tripped=self._risk_is_blocked(s, ac),
                 market_open=self._clock_for(ac).is_open(),
             )
 
@@ -526,63 +538,15 @@ class TradingService:
         except Exception as exc:
             return {"db_ok": False, "error": type(exc).__name__}
 
-    def panic(self) -> dict[str, Any]:
-        """PANIC: cancel open orders, disable all rules, trip all kill switches.
-
-        Kill switches and rules are disabled before any broker I/O. An order is
-        counted canceled only when the broker confirms it.
-        """
-        from .db.models import Rule
-
-        with self.session_factory() as s:
-            order_ids = [
-                o.id
-                for o in s.execute(
-                    select(Order).where(
-                        Order.status.in_(
-                            (
-                                OrderStatus.SUBMITTED.value,
-                                OrderStatus.PARTIALLY_FILLED.value,
-                            )
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            ]
-
-            rules = s.execute(select(Rule).where(Rule.state == "active")).scalars().all()
-            for r in rules:
-                r.state = "canceled"
-
-            KillSwitch.trip(s, "panic button", AssetClass.EQUITY)
-            KillSwitch.trip(s, "panic button", AssetClass.CRYPTO)
-            s.add(RiskEvent(event_type="panic", reason="panic button engaged"))
-            s.commit()
-
-        canceled: list[int] = []
-        unconfirmed: list[int] = []
-        for order_id in order_ids:
-            result = self.cancel_live_order(order_id)
-            if result.get("status") == OrderStatus.CANCELED.value:
-                canceled.append(order_id)
-            else:
-                unconfirmed.append(order_id)
-        if unconfirmed:
-            with self.session_factory() as s:
-                s.add(
-                    RiskEvent(
-                        event_type="panic",
-                        reason=f"broker cancellation unconfirmed for orders {unconfirmed}",
-                    )
-                )
-                s.commit()
+    def panic(self, actor: str, reason: str) -> dict[str, Any]:
+        """Latch and execute panic, returning only confirmed broker/local truth."""
+        report = self.reconciliation.panic(actor, reason)
         return {
-            "panic": True,
-            "orders_canceled": len(canceled),
-            "orders_unconfirmed": unconfirmed,
-            "rules_disabled": len(rules),
-            "killswitches_tripped": ["equity", "crypto"],
+            "safe": report.safe,
+            "confirmed_canceled": list(report.confirmed_canceled),
+            "unconfirmed_order_ids": list(report.unconfirmed_order_ids),
+            "remote_open_order_ids": list(report.remote_open_order_ids),
+            "message": report.message,
         }
 
     def trip_all_killswitches(self, reason: str) -> None:
@@ -681,218 +645,27 @@ class TradingService:
                 "duplicate": False,
             }
 
-    def sync_open_orders(self) -> dict[str, Any]:
-        """Poll the broker for each live order and reconcile status + fills locally.
-
-        Closes the gap between Alpaca truth and our DB: records new fills (idempotent
-        on broker_order_id:cumulative_qty) and advances the lifecycle so realized
-        P&L, the daily-loss kill switch, and /reconcile all reflect real fills.
-        """
-        from sqlalchemy import func as _func
-
-        _STATUS_MAP = {
-            OrderStatus.FILLED: OrderStatus.FILLED,
-            OrderStatus.PARTIALLY_FILLED: OrderStatus.PARTIALLY_FILLED,
-            OrderStatus.CANCELED: OrderStatus.CANCELED,
-            OrderStatus.REJECTED: OrderStatus.REJECTED,
-            OrderStatus.EXPIRED: OrderStatus.EXPIRED,
-        }
-        synced = filled = failed = fills_repaired = 0
-        with self.session_factory() as s:
-            unknown_acceptance = s.execute(
-                select(Order).where(
-                    Order.status.in_(
-                        (
-                            OrderStatus.SUBMITTED.value,
-                            OrderStatus.PARTIALLY_FILLED.value,
-                        )
-                    ),
-                    Order.broker_order_id.is_(None),
-                )
-            ).scalars().all()
-            if unknown_acceptance:
-                failed += len(unknown_acceptance)
-                log.error(
-                    "submitted outbox rows lack broker ids: %s",
-                    [order.id for order in unknown_acceptance],
-                )
-            open_orders = s.execute(
-                select(Order).where(
-                    Order.status.in_(
-                        (OrderStatus.SUBMITTED.value, OrderStatus.PARTIALLY_FILLED.value)
-                    ),
-                    Order.broker_order_id.isnot(None),
-                )
-            ).scalars().all()
-            repair_orders: dict[int, Order] = {}
-            for prior_fill in s.execute(
-                select(Fill).where(Fill.broker_fill_id.isnot(None))
-            ).scalars().all():
-                prior_order = (
-                    s.get(Order, prior_fill.order_id)
-                    if prior_fill.order_id is not None
-                    else None
-                )
-                if (
-                    prior_order is not None
-                    and prior_order.broker_order_id
-                    and prior_fill.broker_fill_id.startswith(
-                        f"{prior_order.broker_order_id}:"
-                    )
-                ):
-                    repair_orders[prior_order.id] = prior_order
-
-            exact_activities = None
-            activity_reader = getattr(self.broker, "get_fill_activities", None)
-            activity_targets = {
-                order.id: order for order in [*open_orders, *repair_orders.values()]
-            }
-            if callable(activity_reader) and activity_targets:
-                earliest = min(
-                    order.created_at for order in activity_targets.values()
-                ) - timedelta(days=1)
-                try:
-                    exact_activities = activity_reader(after=earliest)
-                except Exception as exc:
-                    failed += len(activity_targets)
-                    log.warning(
-                        "exact broker fill activity sync failed for %d order(s): %s",
-                        len(activity_targets),
-                        type(exc).__name__,
-                    )
-                    return {
-                        "synced": 0,
-                        "newly_filled": 0,
-                        "failed": failed,
-                        "fills_repaired": 0,
-                    }
-
-            def apply_exact_activities(
-                order: Order, activities: list[Any]
-            ) -> bool:
-                matching = [
-                    activity
-                    for activity in activities
-                    if activity.broker_order_id == order.broker_order_id
-                ]
-                if not matching:
-                    return False
-                changed = False
-                for prior in s.execute(
-                    select(Fill).where(Fill.order_id == order.id)
-                ).scalars().all():
-                    if (
-                        prior.broker_fill_id
-                        and prior.broker_fill_id.startswith(
-                            f"{order.broker_order_id}:"
-                        )
-                    ):
-                        s.delete(prior)
-                        changed = True
-                s.flush()
-                existing_ids = {
-                    fill_id
-                    for fill_id in s.execute(
-                        select(Fill.broker_fill_id).where(Fill.order_id == order.id)
-                    ).scalars()
-                    if fill_id is not None
-                }
-                for activity in matching:
-                    if activity.broker_fill_id not in existing_ids:
-                        s.add(
-                            Fill(
-                                order_id=order.id,
-                                ticker=activity.ticker,
-                                side=activity.side,
-                                qty=activity.qty,
-                                price=activity.price,
-                                broker_fill_id=activity.broker_fill_id,
-                                filled_at=activity.filled_at,
-                            )
-                        )
-                        changed = True
-                s.flush()
-                return changed
-
-            if exact_activities is not None:
-                for repair_order in repair_orders.values():
-                    if apply_exact_activities(repair_order, exact_activities):
-                        fills_repaired += 1
-
-            for o in open_orders:
-                try:
-                    res = self.broker.get_order_status(o.broker_order_id)
-                except Exception as exc:
-                    failed += 1
-                    log.warning(
-                        "broker status sync failed for local order %s: %s",
-                        o.id,
-                        type(exc).__name__,
-                    )
-                    continue
-                synced += 1
-                if exact_activities is not None:
-                    apply_exact_activities(o, exact_activities)
-                recorded = Decimal(str(
-                    s.execute(
-                        select(_func.coalesce(_func.sum(Fill.qty), 0)).where(Fill.order_id == o.id)
-                    ).scalar_one()
-                ))
-                new_qty = res.filled_qty - recorded
-                if (
-                    exact_activities is not None
-                    and new_qty > Decimal("0.000001")
-                ):
-                    failed += 1
-                    log.warning(
-                        "broker order %s reports %s filled but exact activities "
-                        "contain only %s; deferring terminal transition",
-                        o.id,
-                        res.filled_qty,
-                        recorded,
-                    )
-                    continue
-                if (
-                    exact_activities is None
-                    and new_qty > 0
-                    and res.avg_fill_price is not None
-                ):
-                    prior_fills = s.execute(
-                        select(Fill).where(Fill.order_id == o.id)
-                    ).scalars().all()
-                    recorded_notional = sum(
-                        (fill.qty * fill.price for fill in prior_fills), Decimal(0)
-                    )
-                    cumulative_notional = res.filled_qty * res.avg_fill_price
-                    incremental_notional = cumulative_notional - recorded_notional
-                    if incremental_notional <= 0:
-                        log.error(
-                            "broker cumulative fill moved behind local ledger for order %s: "
-                            "broker_notional=%s local_notional=%s",
-                            o.id,
-                            cumulative_notional,
-                            recorded_notional,
-                        )
-                        continue
-                    incremental_price = incremental_notional / new_qty
-                    s.add(Fill(
-                        order_id=o.id, ticker=o.ticker, side=o.side,
-                        qty=new_qty, price=incremental_price,
-                        broker_fill_id=f"{o.broker_order_id}:{res.filled_qty}",
-                    ))
-                target = _STATUS_MAP.get(res.status)
-                if target is not None and target.value != o.status:
-                    if OrderStateMachine.can_transition(OrderStatus(o.status), target):
-                        OrderStateMachine.transition(o, target)
-                        if target is OrderStatus.FILLED:
-                            filled += 1
-            s.commit()
+    @staticmethod
+    def serialize_reconciliation_report(report) -> dict[str, Any]:
+        """Serialize the new report while retaining legacy monitor keys."""
+        failed = len(report.unresolved_unknown) + len(report.broker_drift)
         return {
-            "synced": synced,
-            "newly_filled": filled,
+            "resolved_unknown": report.resolved_unknown,
+            "unresolved_unknown": list(report.unresolved_unknown),
+            "synced_orders": report.synced_orders,
+            "inserted_fills": report.inserted_fills,
+            "broker_drift": list(report.broker_drift),
+            "synced": report.synced_orders,
+            "newly_filled": report.inserted_fills,
             "failed": failed,
-            "fills_repaired": fills_repaired,
+            "fills_repaired": 0,
         }
+
+    def sync_open_orders(self) -> dict[str, Any]:
+        """Compatibility facade for callers that still consume dictionary reports."""
+        return self.serialize_reconciliation_report(
+            self.reconciliation.reconcile()
+        )
 
     def cancel_live_order(self, order_id: int) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""

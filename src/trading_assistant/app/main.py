@@ -54,6 +54,17 @@ class ApprovalIn(BaseModel):
         return value.strip()
 
 
+class PanicIn(BaseModel):
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
+
+
 def build_default_stack() -> tuple[TradingService, Agent]:
     from ..broker.factory import build_broker, build_clock
     from ..external_accounts.factory import build_external_source
@@ -210,9 +221,9 @@ def create_app(
     def sync():  # pull fills/status from the broker (also runs each daemon loop)
         return service.sync_open_orders()
 
-    @app.post("/panic", dependencies=[auth])
-    def panic():
-        return service.panic()
+    @app.post("/panic")
+    def panic(body: PanicIn, principal: str = auth):
+        return service.panic(actor=principal, reason=body.reason)
 
     @app.get("/analyst/scorecard")
     def analyst_scorecard():

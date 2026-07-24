@@ -64,6 +64,8 @@ class _Pos:
 
 
 class SimBroker(BrokerClient):
+    reconciliation_key = "sim"
+
     def __init__(
         self, config: BacktestConfig, starting_cash: float = 100_000.0
     ) -> None:
@@ -128,6 +130,14 @@ class SimBroker(BrokerClient):
 
     def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         return self._orders_by_key.get(client_order_id)
+
+    def get_open_orders(self) -> list[OrderResult]:
+        pending_keys = {pending.order.idempotency_key for pending in self._pending}
+        return [
+            result
+            for key, result in self._orders_by_key.items()
+            if key in pending_keys
+        ]
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Record a server-side bracket (entry + OCO take-profit/stop). Test double."""

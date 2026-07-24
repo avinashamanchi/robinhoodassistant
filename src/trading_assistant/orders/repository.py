@@ -155,6 +155,44 @@ class OrderRepository:
                 raise RuntimeError(f"order {order_id} lost submission claim")
             session.commit()
 
+    def resolve_acceptance(
+        self,
+        order_id: int,
+        broker_order_id: str | None,
+        status: OrderStatus,
+        now: datetime,
+    ) -> bool:
+        """Persist broker truth for one indeterminate submission without resending."""
+        if broker_order_id is None:
+            return False
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status.in_(
+                        (
+                            OrderStatus.SUBMITTING.value,
+                            OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                        )
+                    ),
+                )
+                .values(
+                    status=status.value,
+                    broker_order_id=broker_order_id,
+                    acceptance_state="accepted",
+                    last_reconciled_at=now,
+                    last_error_code="",
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
     def record_pre_submission_rejection(
         self, order_id: int, reasons: tuple[str, ...], now: datetime
     ) -> None:

@@ -29,6 +29,7 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     upgrade(engine)
     require_current_schema(engine)
     assert "orders" in inspect(engine).get_table_names()
+    assert "reconciliation_cursors" in inspect(engine).get_table_names()
     assert "alembic_version" in inspect(engine).get_table_names()
 
 

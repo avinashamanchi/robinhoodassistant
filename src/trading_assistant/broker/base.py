@@ -28,6 +28,8 @@ class BrokerClient(abc.ABC):
     returns the existing order's status instead (checked via get_order_status).
     """
 
+    reconciliation_key = "broker"
+
     @abc.abstractmethod
     def get_quote(self, ticker: str) -> Quote: ...
 
@@ -42,6 +44,9 @@ class BrokerClient(abc.ABC):
 
     @abc.abstractmethod
     def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None: ...
+
+    @abc.abstractmethod
+    def get_open_orders(self) -> list[OrderResult]: ...
 
     @abc.abstractmethod
     def get_order_status(self, order_id: str) -> OrderResult: ...
