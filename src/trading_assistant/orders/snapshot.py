@@ -18,6 +18,7 @@ from trading_assistant.broker.models import (
     PortfolioSnapshot,
     Position,
     Quote,
+    conservative_buy_price,
 )
 from trading_assistant.config import RiskConfig
 from trading_assistant.db.models import (
@@ -398,7 +399,17 @@ class PortfolioSnapshotService:
                     remaining_qty = max(
                         pending_order.qty - recorded_qty, Decimal(0)
                     )
-                    remaining_notional = remaining_qty * quote.last
+                    if pending_order.side == OrderSide.BUY.value:
+                        reservation_price = conservative_buy_price(
+                            pending_order.order_type,
+                            pending_order.limit_price,
+                            quote,
+                        )
+                    else:
+                        reservation_price = quote.last
+                    remaining_notional = (
+                        remaining_qty * reservation_price
+                    )
                 else:
                     remaining_notional = max(
                         (pending_order.notional or Decimal(0))

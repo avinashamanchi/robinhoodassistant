@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.killswitch import KillSwitch
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
@@ -14,6 +16,7 @@ def test_trip_persists_across_restart(db_url, engine):
     factory = make_session_factory(engine)
     with factory() as s:
         assert KillSwitch.is_tripped(s) is False
+    with factory() as s:
         KillSwitch.trip(s, reason="test trip")
         s.commit()
 
@@ -22,6 +25,25 @@ def test_trip_persists_across_restart(db_url, engine):
     factory2 = make_session_factory(engine2)
     with factory2() as s:
         assert KillSwitch.is_tripped(s) is True
+
+
+@pytest.mark.parametrize("write", ["trip", "reset"])
+def test_compatibility_writes_reject_an_active_caller_transaction(
+    engine,
+    write,
+):
+    factory = make_session_factory(engine)
+    if write == "reset":
+        with factory() as session:
+            KillSwitch.trip(session, reason="seed reset")
+
+    with factory() as session:
+        KillSwitch.is_tripped(session)
+        with pytest.raises(RuntimeError, match="active transaction"):
+            if write == "trip":
+                KillSwitch.trip(session, reason="unsafe caller")
+            else:
+                KillSwitch.reset(session)
 
 
 def test_reset_unblocks(engine):

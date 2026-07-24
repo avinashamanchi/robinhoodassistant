@@ -89,6 +89,17 @@ class OrderRequest:
         assert self.qty is not None  # guaranteed by __post_init__
         return self.qty * reference_price
 
+    def buying_power_notional(self, quote: "Quote") -> Decimal:
+        """Maximum cash this buy can consume at its executable price."""
+        if self.notional is not None:
+            return self.notional
+        assert self.qty is not None
+        return self.qty * conservative_buy_price(
+            self.order_type,
+            self.limit_price,
+            quote,
+        )
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -117,6 +128,19 @@ class Quote:
         if self.prev_close is None or self.prev_close == 0:
             return None
         return (self.last - self.prev_close) / self.prev_close * Decimal(100)
+
+
+def conservative_buy_price(
+    order_type: OrderType | str,
+    limit_price: Decimal | None,
+    quote: Quote,
+) -> Decimal:
+    """Price used to reserve buying power for a quantity buy."""
+    if OrderType(order_type) is OrderType.LIMIT:
+        if limit_price is None:
+            raise ValueError("quantity limit buy requires a limit price")
+        return limit_price
+    return max(quote.ask, quote.last)
 
 
 @dataclass(frozen=True)

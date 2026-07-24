@@ -25,11 +25,20 @@ def _scope(asset_class: AssetClass | str) -> BreakerScope:
     return BreakerScope.loss(AssetClass(str(asset_class)))
 
 
+def _require_barrier_before_transaction(session: Session) -> None:
+    if session.in_transaction():
+        raise RuntimeError(
+            "compatibility breaker writes reject an active transaction; "
+            "use a fresh session so the process barrier is acquired first"
+        )
+
+
 class KillSwitch:
     """Legacy API over loss and operator-global scopes.
 
-    Compatibility writes own their commit so the process barrier remains held
-    until the new breaker state is durable.
+    Compatibility writes require a fresh session and own their commit so the
+    process barrier is acquired before SQLite and remains held until the new
+    breaker state is durable.
     """
 
     @staticmethod
@@ -51,6 +60,7 @@ class KillSwitch:
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
         scope = _scope(asset_class)
+        _require_barrier_before_transaction(session)
         with SubmissionBarrier(session).hold():
             try:
                 _state, changed = trip_in_session(
@@ -78,6 +88,7 @@ class KillSwitch:
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
         scope = _scope(asset_class)
+        _require_barrier_before_transaction(session)
         with SubmissionBarrier(session).hold():
             try:
                 row = session.get(CircuitBreakerState, scope.key)

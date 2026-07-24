@@ -33,14 +33,21 @@ def order(
     *,
     side: OrderSide = OrderSide.BUY,
     qty: str | None = None,
+    order_type: OrderType = OrderType.MARKET,
+    limit_price: str | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         ticker=ticker,
         side=side,
-        order_type=OrderType.MARKET,
-        idempotency_key=f"risk-{ticker}-{side.value}-{notional}-{qty}",
+        order_type=order_type,
+        idempotency_key=(
+            f"risk-{ticker}-{side.value}-{notional}-{qty}-{limit_price}"
+        ),
         notional=Decimal(notional) if notional is not None else None,
         qty=Decimal(qty) if qty is not None else None,
+        limit_price=(
+            Decimal(limit_price) if limit_price is not None else None
+        ),
     )
 
 
@@ -52,16 +59,21 @@ def _pending(
     status: OrderStatus,
     notional: str | None = None,
     qty: str | None = None,
+    order_type: OrderType = OrderType.MARKET,
+    limit_price: str | None = None,
 ) -> int:
     with session_factory() as session:
         row = Order(
             idempotency_key=key,
             ticker="AAPL",
             side=side.value,
-            order_type=OrderType.MARKET.value,
+            order_type=order_type.value,
             status=status.value,
             notional=Decimal(notional) if notional is not None else None,
             qty=Decimal(qty) if qty is not None else None,
+            limit_price=(
+                Decimal(limit_price) if limit_price is not None else None
+            ),
         )
         session.add(row)
         session.commit()
@@ -85,6 +97,94 @@ def test_execution_rejects_insufficient_buying_power(risk_config, make_snapshot)
     result = RiskEngine(risk_config).check(order(), snapshot)
 
     assert "insufficient buying power" in result.reasons
+
+
+def test_quantity_market_buy_uses_higher_ask_for_buying_power(
+    risk_config, make_snapshot
+):
+    snapshot = make_snapshot(
+        buying_power=Decimal("100.50"),
+    )
+    snapshot = replace(
+        snapshot,
+        quotes={
+            "AAPL": Quote(
+                "AAPL",
+                bid=Decimal("100"),
+                ask=Decimal("101"),
+                last=Decimal("100"),
+            )
+        },
+    )
+
+    result = RiskEngine(risk_config).check(
+        order(notional=None, qty="1"),
+        snapshot,
+    )
+
+    assert "insufficient buying power" in result.reasons
+
+
+def test_pending_quantity_market_buy_reserves_higher_ask(
+    make_service, risk_config
+):
+    service = make_service()
+    service.broker._buying_power = Decimal("200.05")
+    _pending(
+        service.session_factory,
+        key="pending-market-qty-buy",
+        side=OrderSide.BUY,
+        status=OrderStatus.SUBMITTED,
+        qty="1",
+    )
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(notional="100"), snapshot)
+
+    assert snapshot.pending_buy_notional_by_ticker["AAPL"] == Decimal(
+        "100.100000"
+    )
+    assert "insufficient buying power" in result.reasons
+
+
+def test_concurrent_quantity_limit_approvals_reserve_limit_price(
+    make_service,
+):
+    service = make_service()
+    service.broker._buying_power = Decimal("620")
+    first = service.propose_order(
+        "AAPL",
+        "buy",
+        "limit",
+        qty="3",
+        limit_price="105",
+    )
+    second = service.propose_order(
+        "AAPL",
+        "buy",
+        "limit",
+        qty="3",
+        limit_price="105",
+    )
+    assert first["status"] == OrderStatus.PROPOSED.value
+    assert second["status"] == OrderStatus.PROPOSED.value
+    for order_id in (first["order_id"], second["order_id"]):
+        service.order_application.approve(
+            ApprovalCommand(
+                order_id,
+                "operator:limit-reservation",
+                "independently reviewed",
+                utcnow(),
+            )
+        )
+
+    first_submission = service.order_submission.submit(first["order_id"])
+    second_submission = service.order_submission.submit(second["order_id"])
+
+    assert first_submission.status is OrderStatus.REJECTED
+    assert first_submission.risk_reasons == ("insufficient buying power",)
+    assert second_submission.status is OrderStatus.SUBMITTED
+    assert service.broker.submit_calls == 1
 
 
 def test_pending_buys_across_tickers_reserve_buying_power(

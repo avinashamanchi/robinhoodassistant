@@ -69,8 +69,8 @@ class RiskEngine:
             reasons.append("daily P&L snapshot is incomplete")
 
         if quote is not None:
-            estimated = order.estimated_notional(quote.last)
             if order.side is OrderSide.BUY:
+                estimated = order.buying_power_notional(quote)
                 reserved_buying_power = sum(
                     (
                         max(notional, Decimal(0))

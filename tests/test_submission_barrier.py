@@ -6,6 +6,7 @@ from decimal import Decimal
 from multiprocessing.context import SpawnContext
 
 import pytest
+from sqlalchemy import text
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.models import OrderResult, OrderStatus
@@ -117,6 +118,33 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
                     AssetClass.EQUITY,
                 )
         outcome.put(("ok", writer_kind))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _active_transaction_compatibility_writer_process(
+    db_url,
+    sqlite_locked,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    try:
+        with factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            sqlite_locked.set()
+            try:
+                KillSwitch.trip(
+                    session,
+                    "must reject lock inversion",
+                    AssetClass.EQUITY,
+                )
+            except RuntimeError as exc:
+                outcome.put(("rejected", str(exc)))
+            else:
+                outcome.put(("unexpected", "trip committed"))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -287,3 +315,63 @@ def test_writer_requested_after_claim_waits_until_cross_process_broker_send_fini
     assert service.breakers.is_tripped(scope) is True
     with service.session_factory() as session:
         assert session.get(Order, order_id).status == OrderStatus.SUBMITTED.value
+
+
+def test_compatibility_writer_rejects_sqlite_lock_before_waiting_for_barrier(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    order_id = _approved_order(service)
+    claim_committed = context.Event()
+    release_claim = context.Event()
+    broker_entered = context.Event()
+    release_broker = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_submission_process,
+        args=(
+            db_url,
+            order_id,
+            False,
+            claim_committed,
+            release_claim,
+            broker_entered,
+            release_broker,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    assert broker_entered.wait(timeout=10)
+
+    sqlite_locked = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_active_transaction_compatibility_writer_process,
+        args=(
+            db_url,
+            sqlite_locked,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert sqlite_locked.wait(timeout=10)
+    finished_before_barrier_release = writer_finished.wait(timeout=1)
+    if not finished_before_barrier_release:
+        writer.terminate()
+        writer.join(timeout=5)
+    else:
+        _join(writer)
+    _join(submission, release_broker)
+
+    assert finished_before_barrier_release is True
+    outcome_kind, detail = writer_outcome.get(timeout=2)
+    assert outcome_kind == "rejected"
+    assert "active transaction" in detail
+    assert submission_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.SUBMITTED.value,
+    )
