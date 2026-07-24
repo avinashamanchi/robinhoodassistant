@@ -93,17 +93,26 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     from decimal import Decimal
 
     from trading_assistant.broker.mock import MockBroker
-    from trading_assistant.broker.models import OrderResult, OrderStatus
-    from trading_assistant.db.models import Fill, Order
+    from trading_assistant.broker.models import (
+        BrokerFill,
+        OrderResult,
+        OrderStatus,
+    )
+    from trading_assistant.db.models import Fill, Order, utcnow
 
     class FillableBroker(MockBroker):
         fill = None
+        activities = []
+
         def get_order_status(self, oid):
             r = super().get_order_status(oid)
             if self.fill:
                 return OrderResult(r.idempotency_key, oid, OrderStatus.FILLED,
                                    filled_qty=self.fill[0], avg_fill_price=self.fill[1])
             return r
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
 
     broker = FillableBroker()
     broker.set_price("AAPL", Decimal("100"))
@@ -112,6 +121,19 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     _approve(svc, oid)                          # -> SUBMITTED with broker_order_id
 
     broker.fill = (Decimal("4"), Decimal("100"))
+    with svc.session_factory() as session:
+        broker_order_id = session.get(Order, oid).broker_order_id
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="launch-fill-1",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("4"),
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
     r = svc.sync_open_orders()
     assert r["newly_filled"] == 1
     with svc.session_factory() as s:
@@ -232,18 +254,21 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
         assert fills[0].filled_at == exact_time
 
 
-def test_sync_derives_incremental_prices_from_cumulative_average(make_service):
-    """Alpaca reports cumulative quantity and average price, not the latest fill.
+def test_sync_preserves_exact_incremental_activity_prices(make_service):
+    """Exact broker activities, not cumulative averages, are the P&L authority."""
+    from datetime import timedelta
 
-    A second cumulative average must be converted back into the incremental
-    fill price or FIFO P&L will be wrong.
-    """
     from trading_assistant.broker.mock import MockBroker
-    from trading_assistant.broker.models import OrderResult, OrderStatus
+    from trading_assistant.broker.models import (
+        BrokerFill,
+        OrderResult,
+        OrderStatus,
+    )
     from trading_assistant.db.models import Fill, utcnow
 
-    class CumulativeBroker(MockBroker):
+    class ExactActivityBroker(MockBroker):
         cumulative = (OrderStatus.SUBMITTED, Decimal("0"), None)
+        activities = []
 
         def get_order_status(self, oid):
             original = super().get_order_status(oid)
@@ -256,19 +281,47 @@ def test_sync_derives_incremental_prices_from_cumulative_average(make_service):
                 avg_fill_price=avg,
             )
 
-    broker = CumulativeBroker()
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
+
+    broker = ExactActivityBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="3")["order_id"]
     _approve(svc, oid)
+    with svc.session_factory() as session:
+        broker_order_id = session.get(Order, oid).broker_order_id
 
+    first_at = utcnow()
     broker.cumulative = (
         OrderStatus.PARTIALLY_FILLED,
         Decimal("1"),
         Decimal("100"),
     )
+    first = BrokerFill(
+        broker_fill_id="incremental-fill-1",
+        broker_order_id=broker_order_id,
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=first_at,
+    )
+    broker.activities = [first]
     svc.sync_open_orders()
     broker.cumulative = (OrderStatus.FILLED, Decimal("3"), Decimal("110"))
+    broker.activities = [
+        first,
+        BrokerFill(
+            broker_fill_id="incremental-fill-2",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("2"),
+            price=Decimal("115"),
+            filled_at=first_at + timedelta(seconds=1),
+        ),
+    ]
     svc.sync_open_orders()
 
     with svc.session_factory() as s:

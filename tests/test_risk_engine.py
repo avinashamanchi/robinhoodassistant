@@ -221,6 +221,60 @@ def test_quantity_market_portfolio_exposure_uses_ask_at_boundary(
     )
 
 
+def test_portfolio_exposure_uses_same_quote_mark_for_gross_and_target(
+    risk_config,
+    make_snapshot,
+):
+    cfg = risk_config.model_copy(
+        update={
+            "max_notional_per_order": 100000,
+            "max_position_per_ticker": 100000,
+            "max_portfolio_exposure": 1050,
+        }
+    )
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("10"),
+                Decimal("100"),
+                Decimal("50"),
+            )
+        ],
+    )
+
+    result = RiskEngine(cfg).check(_order(notional="100"), snapshot)
+
+    assert any(
+        "portfolio exposure" in reason for reason in result.reasons
+    )
+
+
+def test_portfolio_exposure_rejects_missing_required_position_mark(
+    risk_config,
+    make_snapshot,
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "MSFT",
+                Decimal("10"),
+                Decimal("100"),
+                Decimal("1"),
+            )
+        ],
+    )
+
+    result = RiskEngine(risk_config).check(
+        _order(notional="100"),
+        snapshot,
+    )
+
+    assert "portfolio exposure snapshot is incomplete" in result.reasons
+
+
 def test_price_sanity_on_limit_orders(risk_config, make_snapshot):
     engine = RiskEngine(risk_config)
     snap = make_snapshot(prices={"AAPL": Decimal("100")})
@@ -373,3 +427,29 @@ def test_reasons_accumulate(risk_config, make_snapshot):
     result = _check(engine, _order(ticker="TSLA", notional="100"), snap)
     assert result.rejected
     assert len(result.reasons) >= 2
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("buying_power", Decimal("-1")),
+        ("account_equity", Decimal("-1")),
+        ("cash", Decimal("-1")),
+        ("cash", Decimal("NaN")),
+    ],
+)
+def test_required_account_values_fail_closed_in_pure_risk(
+    risk_config,
+    make_snapshot,
+    field,
+    invalid,
+):
+    snapshot = make_snapshot(prices={"AAPL": Decimal("100")})
+    snapshot = replace(snapshot, **{field: invalid})
+
+    result = RiskEngine(risk_config).check(
+        _order(notional="100"),
+        snapshot,
+    )
+
+    assert "account snapshot is incomplete" in result.reasons

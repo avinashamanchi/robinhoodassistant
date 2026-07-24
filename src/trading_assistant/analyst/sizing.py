@@ -118,7 +118,18 @@ def size_trade(
     max_pos = Decimal(str(risk_cfg.max_position_per_ticker))
     pos_cap = max((max_pos / ref) - existing_qty, Decimal(0)) if ref > 0 else Decimal(0)
     max_exp = Decimal(str(risk_cfg.max_portfolio_exposure))
-    exp_cap = max((max_exp - snapshot.gross_exposure()) / ref, Decimal(0)) if ref > 0 else Decimal(0)
+    gross_exposure = snapshot.gross_exposure()
+    if gross_exposure is None:
+        return _zero(
+            symbol,
+            "portfolio exposure snapshot is incomplete",
+            risk_budget,
+        )
+    exp_cap = (
+        max((max_exp - gross_exposure) / ref, Decimal(0))
+        if ref > 0
+        else Decimal(0)
+    )
     max_added = _floor(min(pos_cap, exp_cap))
 
     target_total = min(total_desired, sum(caps, Decimal(0)), max_added)

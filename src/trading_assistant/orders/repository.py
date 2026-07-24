@@ -223,6 +223,15 @@ class OrderRepository:
         """Persist broker truth for one indeterminate submission without resending."""
         if broker_order_id is None:
             return False
+        acceptance_state = (
+            FILL_RECONCILIATION_REQUIRED
+            if status
+            in {
+                OrderStatus.PARTIALLY_FILLED,
+                OrderStatus.FILLED,
+            }
+            else "accepted"
+        )
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -238,7 +247,7 @@ class OrderRepository:
                 .values(
                     status=status.value,
                     broker_order_id=broker_order_id,
-                    acceptance_state="accepted",
+                    acceptance_state=acceptance_state,
                     last_reconciled_at=now,
                     last_error_code="",
                     updated_at=now,

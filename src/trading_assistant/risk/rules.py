@@ -30,13 +30,12 @@ def _ticker_values(
     order: OrderRequest,
     snapshot: PortfolioSnapshot,
     quote: Quote,
-) -> tuple[Decimal, Decimal]:
-    current = snapshot.positions.get(order.ticker.upper())
-    current_qty = current.qty if current else Decimal(0)
-    pending = snapshot.pending_signed_notional.get(
-        order.ticker.upper(), Decimal(0)
+) -> tuple[Decimal, Decimal] | None:
+    current_value = snapshot.effective_signed_value(
+        order.ticker.upper()
     )
-    current_value = current_qty * quote.last + pending
+    if current_value is None:
+        return None
     order_value = order.risk_notional(quote)
     signed_order_value = (
         order_value if order.side is OrderSide.BUY else -order_value
@@ -75,9 +74,12 @@ def check_max_position(
     quote = _reference_quote(order, snapshot)
     if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot size position"
-    _current_value, projected_value = _ticker_values(
+    values = _ticker_values(
         order, snapshot, quote
     )
+    if values is None:
+        return "position exposure snapshot is incomplete"
+    _current_value, projected_value = values
     limit = Decimal(str(config.max_position_per_ticker))
     if projected_value > limit:
         return (
@@ -93,11 +95,15 @@ def check_portfolio_exposure(
     quote = _reference_quote(order, snapshot)
     if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot size exposure"
-    current_ticker_value, projected_ticker_value = _ticker_values(
+    values = _ticker_values(
         order, snapshot, quote
     )
+    gross_exposure = snapshot.gross_exposure_with_pending()
+    if values is None or gross_exposure is None:
+        return "portfolio exposure snapshot is incomplete"
+    current_ticker_value, projected_ticker_value = values
     projected_gross = (
-        snapshot.gross_exposure_with_pending()
+        gross_exposure
         - current_ticker_value
         + projected_ticker_value
     )
@@ -148,9 +154,12 @@ def check_cross_broker_concentration(
     quote = _reference_quote(order, snapshot)
     if quote is None:
         return None
-    _current_value, projected_alpaca = _ticker_values(
+    values = _ticker_values(
         order, snapshot, quote
     )
+    if values is None:
+        return None
+    _current_value, projected_alpaca = values
     external = snapshot.external_position_value(order.ticker.upper())
     combined = projected_alpaca + external
     limit = Decimal(str(config.max_position_per_ticker))

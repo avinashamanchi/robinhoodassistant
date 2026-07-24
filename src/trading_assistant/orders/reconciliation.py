@@ -35,6 +35,10 @@ _REMOTE_OPEN_STATUSES = {
     OrderStatus.SUBMITTED,
     OrderStatus.PARTIALLY_FILLED,
 }
+_FILL_STATUSES = {
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.FILLED,
+}
 
 
 @dataclass(frozen=True)
@@ -374,6 +378,25 @@ class ReconciliationService:
                 order = session.get(Order, order_id)
                 if order is None:
                     continue
+                target = remote.status
+                current = OrderStatus(order.status)
+                latch_changed = False
+                if target in _FILL_STATUSES:
+                    if (
+                        target is not current
+                        and OrderStateMachine.can_transition(current, target)
+                    ):
+                        OrderStateMachine.transition(order, target)
+                        latch_changed = True
+                    if (
+                        order.acceptance_state
+                        != FILL_RECONCILIATION_REQUIRED
+                    ):
+                        order.acceptance_state = (
+                            FILL_RECONCILIATION_REQUIRED
+                        )
+                        order.updated_at = datetime.now(timezone.utc)
+                        latch_changed = True
                 prior_fills = session.scalars(
                     select(Fill).where(Fill.order_id == order.id)
                 ).all()
@@ -405,6 +428,9 @@ class ReconciliationService:
                             f"broker order {order.id} requires authoritative "
                             "fill activities"
                         )
+                        if latch_changed:
+                            order.version += 1
+                            session.commit()
                         continue
                     if (
                         not remote.filled_qty.is_finite()
@@ -420,6 +446,9 @@ class ReconciliationService:
                             f"requires {remote.filled_qty} authoritative quantity "
                             f"but exact activities contain {authoritative_qty}"
                         )
+                        if latch_changed:
+                            order.version += 1
+                            session.commit()
                         continue
                 new_qty = remote.filled_qty - recorded
                 if exact_reader and new_qty > Decimal("0.000001"):
@@ -427,6 +456,9 @@ class ReconciliationService:
                         f"broker order {order.id} reports {remote.filled_qty} filled "
                         f"but exact activities contain {recorded}"
                     )
+                    if latch_changed:
+                        order.version += 1
+                        session.commit()
                     continue
                 if (
                     not exact_reader
@@ -443,6 +475,9 @@ class ReconciliationService:
                             f"broker cumulative fill moved behind local ledger "
                             f"for order {order.id}"
                         )
+                        if latch_changed:
+                            order.version += 1
+                            session.commit()
                         continue
                     session.add(
                         Fill(
@@ -460,7 +495,6 @@ class ReconciliationService:
 
                 if fill_reconciliation_required:
                     order.acceptance_state = "accepted"
-                target = remote.status
                 current = OrderStatus(order.status)
                 if (
                     target is not current
@@ -645,15 +679,20 @@ class ReconciliationService:
         if not local_order_ids:
             return
         now = datetime.now(timezone.utc)
+        values: dict[str, object] = {
+            "status": remote.status.value,
+            "last_reconciled_at": now,
+            "updated_at": now,
+            "version": Order.version + 1,
+        }
+        if remote.status in _FILL_STATUSES:
+            values["acceptance_state"] = (
+                FILL_RECONCILIATION_REQUIRED
+            )
         with self.session_factory() as session:
             session.execute(
                 update(Order)
                 .where(Order.id.in_(local_order_ids))
-                .values(
-                    status=remote.status.value,
-                    last_reconciled_at=now,
-                    updated_at=now,
-                    version=Order.version + 1,
-                )
+                .values(**values)
             )
             session.commit()

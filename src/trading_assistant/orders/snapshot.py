@@ -89,8 +89,8 @@ class PortfolioSnapshotService:
         self._fetch_missing_quotes(quotes, wanted)
 
         captured_at = self._captured_at()
-        high_water_mark = self._record_account_risk(
-            asset_class, account.equity, captured_at
+        high_water_mark = self._account_high_water_mark(
+            asset_class, account, captured_at
         )
         active_breakers = frozenset(
             state.scope.key
@@ -144,8 +144,8 @@ class PortfolioSnapshotService:
         self._fetch_missing_quotes(quotes, wanted)
 
         captured_at = self._captured_at()
-        high_water_mark = self._record_account_risk(
-            asset_class, account.equity, captured_at
+        high_water_mark = self._account_high_water_mark(
+            asset_class, account, captured_at
         )
         active_breakers = frozenset(
             state.scope.key
@@ -241,12 +241,23 @@ class PortfolioSnapshotService:
             return captured_at.replace(tzinfo=timezone.utc)
         return captured_at.astimezone(timezone.utc)
 
-    def _record_account_risk(
+    def _account_high_water_mark(
         self,
         asset_class: AssetClass,
-        equity: Decimal,
+        account: Account,
         captured_at: datetime,
     ) -> Decimal:
+        if not account.is_valid:
+            with self.session_factory() as session:
+                state = session.get(
+                    AccountRiskState, asset_class.value
+                )
+                return (
+                    state.high_water_mark
+                    if state is not None
+                    else Decimal(0)
+                )
+        equity = account.equity
         statement = insert(AccountRiskState).values(
             asset_class=asset_class.value,
             high_water_mark=equity,
@@ -357,6 +368,12 @@ class PortfolioSnapshotService:
         unrealized_pnl_today = sum(
             finite_unrealized,
             Decimal(0),
+        )
+        account_complete = (
+            account.is_valid
+            and isinstance(high_water_mark, Decimal)
+            and high_water_mark.is_finite()
+            and high_water_mark > 0
         )
 
         try:
@@ -488,6 +505,7 @@ class PortfolioSnapshotService:
             daily_pnl_complete=daily_pnl_complete,
             account_high_water_mark=high_water_mark,
             account_equity=account.equity,
+            account_complete=account_complete,
             quote_fresh=quote_fresh,
             market_open=market_open,
             spread_pct_by_ticker=spread_pct_by_ticker,

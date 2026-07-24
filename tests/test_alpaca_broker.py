@@ -311,9 +311,42 @@ def test_get_account_and_positions_map():
     broker = AlpacaBroker(FakeTrading(), FakeData({}))
     acct = broker.get_account()
     assert acct.buying_power == Decimal("10000")
+    assert acct.is_valid is True
     pos = broker.get_positions()
     assert pos[0].ticker == "AAPL" and pos[0].qty == Decimal("10")
     assert pos[0].unrealized_intraday_pnl == Decimal("25.50")
+
+
+@pytest.mark.parametrize(
+    ("field", "raw_value"),
+    [
+        ("buying_power", None),
+        ("equity", None),
+        ("cash", None),
+        ("buying_power", "NaN"),
+        ("equity", "Infinity"),
+        ("cash", "-Infinity"),
+        ("buying_power", "0"),
+        ("equity", "-1"),
+        ("cash", "0"),
+    ],
+)
+def test_get_account_marks_missing_nonfinite_or_nonpositive_fields_invalid(
+    field,
+    raw_value,
+):
+    trading = FakeTrading()
+    values = {
+        "buying_power": "10000",
+        "equity": "12000",
+        "cash": "10000",
+    }
+    values[field] = raw_value
+    trading.get_account = lambda: SimpleNamespace(**values)
+
+    account = AlpacaBroker(trading, FakeData({})).get_account()
+
+    assert account.is_valid is False
 
 
 @pytest.mark.parametrize("raw_pnl", ["NaN", "Infinity", "-Infinity"])

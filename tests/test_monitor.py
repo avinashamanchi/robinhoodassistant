@@ -295,10 +295,21 @@ def test_startup_no_longer_recovers_legacy_per_rule_processing_claims(make_servi
 
 def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_service):
     from trading_assistant.broker.mock import MockBroker
-    from trading_assistant.broker.models import OrderResult, OrderStatus, Position
-    from trading_assistant.db.models import Order
+    from trading_assistant.broker.models import (
+        BrokerFill,
+        OrderResult,
+        OrderStatus,
+        Position,
+    )
+    from trading_assistant.db.models import Order, utcnow
 
-    broker = MockBroker()
+    class ActivityBroker(MockBroker):
+        activities = []
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
+
+    broker = ActivityBroker()
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="4")["order_id"]
@@ -320,6 +331,17 @@ def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_ser
     )
     broker._orders_by_id[broker_id] = filled
     broker._orders_by_key[client_id] = filled
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="startup-fill-1",
+            broker_order_id=broker_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("4"),
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
     broker._positions["AAPL"] = Position(
         "AAPL", Decimal("4"), Decimal("100"), Decimal("100")
     )

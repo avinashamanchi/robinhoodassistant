@@ -177,9 +177,14 @@ def _snapshot(broker: SimBroker, symbol: str) -> PortfolioSnapshot:
     quotes = {symbol.upper(): broker.get_quote(symbol)}
     for p in positions.values():
         quotes.setdefault(p.ticker, broker.get_quote(p.ticker))
+    account = broker.get_account()
     return PortfolioSnapshot(
         positions=positions,
         quotes=quotes,
-        buying_power=broker.get_account().buying_power,
+        buying_power=account.buying_power,
         realized_pnl_today=Decimal(0),
+        cash=account.cash,
+        account_high_water_mark=account.equity,
+        account_equity=account.equity,
+        account_complete=account.is_valid,
     )

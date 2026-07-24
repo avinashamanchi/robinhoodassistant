@@ -11,6 +11,7 @@ import trading_assistant.orders.snapshot as snapshot_module
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
+    Account,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -18,7 +19,7 @@ from trading_assistant.broker.models import (
     Position,
     Quote,
 )
-from trading_assistant.db.models import Order, utcnow
+from trading_assistant.db.models import AccountRiskState, Order, utcnow
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import RiskEngine
@@ -730,6 +731,57 @@ def test_account_high_water_mark_survives_service_restart(make_service):
     assert first_snapshot.account_high_water_mark == Decimal("100000")
     assert second_snapshot.account_high_water_mark == Decimal("100000")
     assert second_snapshot.account_equity == Decimal("90000")
+
+
+def test_invalid_initial_account_snapshot_does_not_initialize_high_water_mark(
+    make_service,
+):
+    service = make_service()
+    service.broker.get_account = lambda: Account(
+        buying_power=Decimal("100000"),
+        equity=Decimal("0"),
+        cash=Decimal("100000"),
+    )
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.account_complete is False
+    assert snapshot.account_high_water_mark == Decimal("0")
+    result = RiskEngine(service.config.risk).check(order(), snapshot)
+    assert "account snapshot is incomplete" in result.reasons
+    with service.session_factory() as session:
+        assert session.get(AccountRiskState, AssetClass.EQUITY.value) is None
+
+
+def test_invalid_account_snapshot_does_not_update_existing_high_water_mark(
+    make_service,
+):
+    service = make_service()
+    service.snapshot_service.assemble_for_execution("AAPL")
+    with service.session_factory() as session:
+        state = session.get(AccountRiskState, AssetClass.EQUITY.value)
+        before = (
+            state.high_water_mark,
+            state.last_equity,
+            state.updated_at,
+        )
+    service.broker.get_account = lambda: Account(
+        buying_power=Decimal("100000"),
+        equity=Decimal("NaN"),
+        cash=Decimal("100000"),
+    )
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.account_complete is False
+    assert snapshot.account_high_water_mark == before[0]
+    with service.session_factory() as session:
+        state = session.get(AccountRiskState, AssetClass.EQUITY.value)
+        assert (
+            state.high_water_mark,
+            state.last_equity,
+            state.updated_at,
+        ) == before
 
 
 def test_snapshot_contains_only_symbol_relevant_active_breakers(make_service):

@@ -174,6 +174,16 @@ class Account:
     equity: Decimal
     cash: Decimal
 
+    @property
+    def is_valid(self) -> bool:
+        """Whether every execution-required account value is usable."""
+        return all(
+            isinstance(value, Decimal)
+            and value.is_finite()
+            and value > 0
+            for value in (self.buying_power, self.equity, self.cash)
+        )
+
 
 @dataclass(frozen=True)
 class OrderResult:
@@ -223,6 +233,7 @@ class PortfolioSnapshot:
     daily_pnl_complete: bool = True
     account_high_water_mark: Decimal = Decimal(0)
     account_equity: Decimal = Decimal(0)
+    account_complete: bool = True
     quote_fresh: bool = True
     market_open: bool = True
     spread_pct_by_ticker: dict[str, Decimal] = field(default_factory=dict)
@@ -238,27 +249,64 @@ class PortfolioSnapshot:
     pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
     pending_exposure_complete: bool = True
 
-    def position_value(self, ticker: str) -> Decimal:
-        pos = self.positions.get(ticker)
-        return abs(pos.market_value) if pos else Decimal(0)
+    def _marked_position_value(self, ticker: str) -> Decimal | None:
+        symbol = ticker.upper()
+        position = self.positions.get(symbol)
+        if position is None:
+            return Decimal(0)
+        quote = self.quotes.get(symbol)
+        if (
+            quote is None
+            or not quote.is_valid
+            or not isinstance(position.qty, Decimal)
+            or not position.qty.is_finite()
+        ):
+            return None
+        value = position.qty * quote.last
+        return value if value.is_finite() else None
+
+    def position_value(self, ticker: str) -> Decimal | None:
+        value = self._marked_position_value(ticker)
+        return abs(value) if value is not None else None
 
     def external_position_value(self, ticker: str) -> Decimal:
         ext = self.external_positions.get(ticker.upper())
         return abs(ext.current_value) if ext is not None else Decimal(0)
 
-    def gross_exposure(self) -> Decimal:
-        """Total absolute market value across all positions (USD)."""
-        return sum((abs(p.market_value) for p in self.positions.values()), Decimal(0))
-
-    def effective_signed_value(self, ticker: str) -> Decimal:
-        symbol = ticker.upper()
-        position = self.positions.get(symbol)
-        held = position.market_value if position is not None else Decimal(0)
-        return held + self.pending_signed_notional.get(symbol, Decimal(0))
-
-    def gross_exposure_with_pending(self) -> Decimal:
-        symbols = set(self.positions) | set(self.pending_signed_notional)
+    def gross_exposure(self) -> Decimal | None:
+        """Quote-marked gross position value, or missing when a mark is unsafe."""
+        values = [
+            self._marked_position_value(symbol)
+            for symbol in self.positions
+        ]
+        if any(value is None for value in values):
+            return None
         return sum(
-            (abs(self.effective_signed_value(symbol)) for symbol in symbols),
+            (abs(value) for value in values if value is not None),
+            Decimal(0),
+        )
+
+    def effective_signed_value(self, ticker: str) -> Decimal | None:
+        symbol = ticker.upper()
+        held = self._marked_position_value(symbol)
+        pending = self.pending_signed_notional.get(symbol, Decimal(0))
+        if (
+            held is None
+            or not isinstance(pending, Decimal)
+            or not pending.is_finite()
+        ):
+            return None
+        value = held + pending
+        return value if value.is_finite() else None
+
+    def gross_exposure_with_pending(self) -> Decimal | None:
+        symbols = set(self.positions) | set(self.pending_signed_notional)
+        values = [
+            self.effective_signed_value(symbol) for symbol in symbols
+        ]
+        if any(value is None for value in values):
+            return None
+        return sum(
+            (abs(value) for value in values if value is not None),
             Decimal(0),
         )

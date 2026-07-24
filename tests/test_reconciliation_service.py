@@ -73,20 +73,38 @@ def test_reconcile_unknown_finds_remote_acceptance(make_service):
         assert row.broker_order_id is not None
 
 
-def test_reconcile_unknown_directly_to_filled_records_fill(make_service):
+@pytest.mark.parametrize(
+    ("remote_status", "filled_qty"),
+    [
+        (OrderStatus.PARTIALLY_FILLED, Decimal("0.5")),
+        (OrderStatus.FILLED, Decimal("1")),
+    ],
+)
+def test_reconcile_unknown_fill_latch_survives_restart_until_exact_activity(
+    make_service,
+    remote_status,
+    filled_qty,
+):
     class FilledThenDisconnectBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.activities = []
+
         def submit_order(self, order):
             accepted = super().submit_order(order)
             filled = OrderResult(
                 accepted.idempotency_key,
                 accepted.broker_order_id,
-                OrderStatus.FILLED,
-                filled_qty=Decimal("1"),
+                remote_status,
+                filled_qty=filled_qty,
                 avg_fill_price=Decimal("100"),
             )
             self._orders_by_key[order.idempotency_key] = filled
             self._orders_by_id[accepted.broker_order_id] = filled
             raise ConnectionError("response lost after fill")
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
 
     broker = FilledThenDisconnectBroker()
     broker.set_price("AAPL", Decimal("100"))
@@ -97,16 +115,49 @@ def test_reconcile_unknown_directly_to_filled_records_fill(make_service):
     report = service.reconciliation.reconcile()
 
     assert report.resolved_unknown == 1
-    assert report.inserted_fills == 1
+    assert report.inserted_fills == 0
     with service.session_factory() as session:
         order = session.get(Order, order_id)
-        fills = session.scalars(
+        assert order.status == remote_status.value
+        assert order.acceptance_state == "fill_reconcile_required"
+        broker_order_id = order.broker_order_id
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.order_id == order_id
+            )
+        ) == 0
+
+    restarted = make_service(broker=broker)
+    incomplete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=f"unknown-acceptance-{remote_status.value}",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=filled_qty,
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
+    exact = restarted.reconciliation.reconcile()
+
+    assert exact.inserted_fills == 1
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        fill = session.scalar(
             select(Fill).where(Fill.order_id == order_id)
-        ).all()
-        assert order.status == OrderStatus.FILLED.value
-        assert len(fills) == 1
-        assert fills[0].qty == Decimal("1.000000")
-        assert fills[0].price == Decimal("100.000000")
+        )
+        assert order.acceptance_state == "accepted"
+        assert (
+            fill.broker_fill_id
+            == f"unknown-acceptance-{remote_status.value}"
+        )
+        assert fill.qty == filled_qty
+        assert fill.price == Decimal("100.000000")
 
 
 def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
@@ -120,6 +171,39 @@ def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
     assert report.safe is False
     assert report.unconfirmed_order_ids == (order_id,)
     assert report.message != "everything halted"
+
+
+def test_panic_fill_discovery_persists_fill_reconciliation_latch(
+    make_service,
+):
+    class FilledDuringPanicBroker(ActivityBroker):
+        def cancel_order(self, order_id):
+            current = self.get_order_status(order_id)
+            filled = OrderResult(
+                current.idempotency_key,
+                order_id,
+                OrderStatus.FILLED,
+                filled_qty=Decimal("1"),
+                avg_fill_price=Decimal("100"),
+            )
+            self._orders_by_id[order_id] = filled
+            self._orders_by_key[current.idempotency_key] = filled
+            return filled
+
+    broker = FilledDuringPanicBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+
+    service.reconciliation.panic("operator:avi", "fill race")
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == OrderStatus.FILLED.value
+        assert order.acceptance_state == "fill_reconcile_required"
+
+    restarted = make_service(broker=broker)
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert snapshot.daily_pnl_complete is False
 
 
 def test_panic_requires_actor_and_reason_before_latching(make_service):
@@ -310,6 +394,72 @@ class ActivityBroker(MockBroker):
         if self.fail_activities:
             raise ConnectionError("activity stream unavailable")
         return list(self.activities)
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "filled_qty"),
+    [
+        (OrderStatus.PARTIALLY_FILLED, Decimal("0.5")),
+        (OrderStatus.FILLED, Decimal("1")),
+    ],
+)
+def test_status_discovery_latch_survives_restart_until_exact_activity(
+    make_service,
+    remote_status,
+    filled_qty,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        remote_status,
+        filled_qty=filled_qty,
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+
+    first = service.reconciliation.reconcile()
+
+    assert first.inserted_fills == 0
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == remote_status.value
+        assert order.acceptance_state == "fill_reconcile_required"
+
+    restarted = make_service(broker=broker)
+    incomplete = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert incomplete.broker_reconciled is False
+    assert incomplete.daily_pnl_complete is False
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=f"status-{remote_status.value}",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=filled_qty,
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
+    exact = restarted.reconciliation.reconcile()
+
+    assert exact.inserted_fills == 1
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "accepted"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.order_id == order_id
+            )
+        ) == 1
 
 
 @pytest.mark.parametrize(

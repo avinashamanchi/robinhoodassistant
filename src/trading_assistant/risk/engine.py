@@ -61,6 +61,19 @@ class RiskEngine:
             reasons.append(f"active circuit breaker: {scopes}")
         if self.config.require_broker_reconciled and not snapshot.broker_reconciled:
             reasons.append("broker reconciliation is not current")
+        account_complete = snapshot.account_complete and all(
+            isinstance(value, Decimal)
+            and value.is_finite()
+            and value > 0
+            for value in (
+                snapshot.buying_power,
+                snapshot.cash,
+                snapshot.account_equity,
+                snapshot.account_high_water_mark,
+            )
+        )
+        if not account_complete:
+            reasons.append("account snapshot is incomplete")
         pnl_is_finite = (
             snapshot.realized_pnl_today.is_finite()
             and snapshot.unrealized_pnl_today.is_finite()
@@ -69,7 +82,7 @@ class RiskEngine:
             reasons.append("daily P&L snapshot is incomplete")
 
         if quote is not None:
-            if order.side is OrderSide.BUY:
+            if order.side is OrderSide.BUY and account_complete:
                 estimated = order.risk_notional(quote)
                 reserved_buying_power = sum(
                     (
@@ -109,7 +122,7 @@ class RiskEngine:
                 str(self.config.max_daily_total_loss)
             ):
                 reasons.append("daily total-loss limit reached")
-        if snapshot.account_high_water_mark > 0:
+        if account_complete:
             drawdown = (
                 snapshot.account_high_water_mark - snapshot.account_equity
             ) / snapshot.account_high_water_mark * Decimal(100)
