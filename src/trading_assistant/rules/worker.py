@@ -112,7 +112,7 @@ class RuleWorker:
                     stored.command,
                     now=tick_now,
                     reference_price=quote.last,
-                    reference_quote=quote,
+                    quote_overrides=quotes,
                     high_water_mark=new_hwm,
                 )
                 outcomes.append(outcome)

@@ -127,6 +127,48 @@ def test_tick_fetches_one_quote_per_ticker_even_with_many_rules(make_service):
     assert broker.quote_calls == 1
 
 
+def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):
+    from collections import Counter
+
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__(
+                positions=[
+                    Position(
+                        "MSFT",
+                        Decimal("1"),
+                        Decimal("100"),
+                        Decimal("100"),
+                    )
+                ]
+            )
+            self.quote_calls = Counter()
+
+        def get_quote(self, ticker):
+            self.quote_calls[ticker.upper()] += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("MSFT", Decimal("100"))
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    svc.create_conditional_rule(
+        "MSFT",
+        {"price_above": 150},
+        {"side": "buy", "notional": "100"},
+    )
+    _rule(svc, {"price_below": 175})
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert broker.quote_calls == {"MSFT": 1, "AAPL": 1}
+
+
 def test_tick_does_not_poll_equity_quotes_while_market_is_closed(make_service):
     from trading_assistant.broker.mock import MockBroker
 

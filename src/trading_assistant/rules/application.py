@@ -6,7 +6,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Callable, Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, Mapping, TYPE_CHECKING
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -135,6 +135,7 @@ class RuleApplicationService:
         now: datetime | None = None,
         reference_price: Decimal | None = None,
         reference_quote=None,
+        quote_overrides: Mapping[str, object] | None = None,
         high_water_mark: Decimal | None = None,
     ) -> RuleOutcome:
         now = now or datetime.now(timezone.utc)
@@ -168,16 +169,15 @@ class RuleApplicationService:
             limit_price=action.limit_price,
         )
         asset_class = self.service._asset_class(request.ticker)
+        snapshot_quote_overrides = dict(quote_overrides or {})
+        if reference_quote is not None:
+            snapshot_quote_overrides.setdefault(request.ticker, reference_quote)
         with self.service.session_factory() as read_session:
             snapshot = self.service.assemble_snapshot(
                 read_session,
                 [request.ticker],
                 asset_class,
-                quote_overrides=(
-                    {request.ticker: reference_quote}
-                    if reference_quote is not None
-                    else None
-                ),
+                quote_overrides=snapshot_quote_overrides or None,
             )
             risk = self.service._risk_for(asset_class).check(
                 request,
