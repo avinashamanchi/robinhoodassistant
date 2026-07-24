@@ -1106,6 +1106,177 @@ def test_reconcile_reports_remote_open_order_without_broker_id(make_service):
     assert snapshot.daily_pnl_complete is False
 
 
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    ],
+)
+def test_remote_open_order_matching_terminal_local_order_trips_drift_on_replay(
+    make_service,
+    terminal_status,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        local = Order(
+            idempotency_key=f"terminal-open-{terminal_status.value}",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=terminal_status.value,
+            broker_order_id=f"terminal-open-broker-{terminal_status.value}",
+            acceptance_state="accepted",
+        )
+        session.add(local)
+        session.commit()
+        local_id = local.id
+        broker_order_id = local.broker_order_id
+        client_order_id = local.idempotency_key
+    remote_open = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.SUBMITTED,
+        ticker="AAPL",
+    )
+    broker.get_open_orders = lambda: [remote_open]
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    proposal = restarted.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+    )
+
+    expected = (
+        f"remote open order {broker_order_id} conflicts with terminal "
+        f"local order {local_id} status {terminal_status.value}"
+    )
+    assert expected in first.broker_drift
+    assert expected in replay.broker_drift
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+    assert proposal["status"] == OrderStatus.REJECTED.value
+    assert "active circuit breaker: broker_drift" in proposal["risk_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("remote_client_id", "remote_ticker", "expected_error"),
+    [
+        (
+            "wrong-open-client",
+            "AAPL",
+            "broker client identity does not match local idempotency key",
+        ),
+        (
+            "identity-open-client",
+            "MSFT",
+            "broker ticker identity does not match local order",
+        ),
+    ],
+)
+def test_remote_open_order_with_conflicting_identity_trips_drift_on_replay(
+    make_service,
+    remote_client_id,
+    remote_ticker,
+    expected_error,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    broker_order_id = "identity-open-broker"
+    client_order_id = "identity-open-client"
+    with service.session_factory() as session:
+        local = Order(
+            idempotency_key=client_order_id,
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id=broker_order_id,
+            acceptance_state="accepted",
+        )
+        session.add(local)
+        session.commit()
+        local_id = local.id
+    broker._orders_by_id[broker_order_id] = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.SUBMITTED,
+        ticker="AAPL",
+    )
+    remote_open = OrderResult(
+        remote_client_id,
+        broker_order_id,
+        OrderStatus.SUBMITTED,
+        ticker=remote_ticker,
+    )
+    broker.get_open_orders = lambda: [remote_open]
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+
+    assert any(
+        f"remote open order {broker_order_id} conflicts with local order "
+        f"{local_id}" in fault
+        and expected_error in fault
+        for fault in first.broker_drift
+    )
+    assert any(expected_error in fault for fault in replay.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    assert snapshot.broker_reconciled is False
+    assert snapshot.daily_pnl_complete is False
+
+
+def test_panic_remote_open_order_matching_terminal_local_order_trips_drift(
+    make_service,
+):
+    broker = MockBroker()
+    remote = broker.submit_order(
+        OrderRequest(
+            ticker="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            idempotency_key="panic-terminal-open",
+            notional=Decimal("100"),
+        )
+    )
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        session.add(
+            Order(
+                idempotency_key=remote.idempotency_key,
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                notional=Decimal("100"),
+                status=OrderStatus.FILLED.value,
+                broker_order_id=remote.broker_order_id,
+                acceptance_state="accepted",
+            )
+        )
+        session.commit()
+
+    report = service.reconciliation.panic(
+        "operator:avi",
+        "terminal open-order conflict",
+    )
+
+    assert report.safe is False
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+
+
 class ActivityBroker(MockBroker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -745,6 +745,51 @@ def test_submit_market_order_builds_request_and_maps_result():
     assert result.status is OrderStatus.SUBMITTED  # "new" -> SUBMITTED
 
 
+def test_submit_order_preserves_malformed_broker_truth_and_broker_id():
+    class MalformedSubmitTrading(FakeTrading):
+        def submit_order(self, order_data):
+            self.submit_calls += 1
+            self.last_request = order_data
+            return FakeOrder(
+                "brk-malformed-simple",
+                order_data.client_order_id,
+                "new",
+                filled_qty="NaN",
+            )
+
+    broker = AlpacaBroker(MalformedSubmitTrading(), FakeData({}))
+
+    with pytest.raises(BrokerDataIntegrityError) as exc_info:
+        broker.submit_order(_order())
+
+    assert exc_info.value.broker_order_id == "brk-malformed-simple"
+
+
+def test_submit_bracket_preserves_malformed_broker_truth_and_broker_id():
+    class MalformedBracketTrading(FakeTrading):
+        def submit_order(self, order_data):
+            self.submit_calls += 1
+            self.last_request = order_data
+            return FakeOrder(
+                "brk-malformed-bracket",
+                order_data.client_order_id,
+                "new",
+                filled_qty="Infinity",
+            )
+
+    broker = AlpacaBroker(MalformedBracketTrading(), FakeData({}))
+    order = _order(
+        key="malformed-bracket",
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("100"),
+    )
+
+    with pytest.raises(BrokerDataIntegrityError) as exc_info:
+        broker.submit_bracket(order, Decimal("110"), Decimal("95"))
+
+    assert exc_info.value.broker_order_id == "brk-malformed-bracket"
+
+
 def test_submit_crypto_order_uses_gtc_time_in_force():
     trading = FakeTrading()
     broker = AlpacaBroker(trading, FakeData({}), FakeCryptoData({}))

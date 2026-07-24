@@ -64,6 +64,12 @@ _FILL_STATUSES = {
     OrderStatus.PARTIALLY_FILLED,
     OrderStatus.FILLED,
 }
+_LOCAL_TERMINAL_STATUSES = {
+    OrderStatus.FILLED.value,
+    OrderStatus.CANCELED.value,
+    OrderStatus.REJECTED.value,
+    OrderStatus.EXPIRED.value,
+}
 
 
 def _normalized_utc(value: datetime) -> datetime:
@@ -1220,25 +1226,85 @@ class ReconciliationService:
                     "open order invalid cumulative filled_qty "
                     f"{remote.filled_qty} for {remote.broker_order_id}"
                 )
-        if any(remote.broker_order_id is None for remote in remote_open):
+        if any(
+            not isinstance(remote.broker_order_id, str)
+            or not remote.broker_order_id.strip()
+            for remote in remote_open
+        ):
             drift.append("remote open order is missing broker order id")
+        drift.extend(self._remote_open_order_faults(remote_open))
+
+    def _remote_open_order_faults(
+        self,
+        remote_open: list[OrderResult],
+        *,
+        missing_local_is_fault: bool = True,
+    ) -> tuple[str, ...]:
         remote_ids = {
             remote.broker_order_id
             for remote in remote_open
-            if remote.broker_order_id is not None
+            if isinstance(remote.broker_order_id, str)
+            and remote.broker_order_id.strip()
         }
         if not remote_ids:
-            return
+            return ()
         with self.session_factory() as session:
-            known_ids = set(
-                session.scalars(
-                    select(Order.broker_order_id).where(
-                        Order.broker_order_id.in_(remote_ids)
+            local_orders = session.scalars(
+                select(Order).where(Order.broker_order_id.in_(remote_ids))
+            ).all()
+        local_by_broker_id: dict[str, list[Order]] = {}
+        for order in local_orders:
+            if order.broker_order_id:
+                local_by_broker_id.setdefault(
+                    order.broker_order_id,
+                    [],
+                ).append(order)
+
+        faults: list[str] = []
+        for remote in remote_open:
+            broker_order_id = remote.broker_order_id
+            if (
+                not isinstance(broker_order_id, str)
+                or not broker_order_id.strip()
+            ):
+                continue
+            matches = local_by_broker_id.get(broker_order_id, [])
+            if not matches:
+                if missing_local_is_fault:
+                    faults.append(
+                        f"remote open order {broker_order_id} has no local order"
                     )
-                ).all()
+                continue
+            if len(matches) != 1:
+                faults.append(
+                    f"remote open order {broker_order_id} matches multiple "
+                    f"local orders {[order.id for order in matches]}"
+                )
+                continue
+            local = matches[0]
+            if local.status in _LOCAL_TERMINAL_STATUSES:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"terminal local order {local.id} status {local.status}"
+                )
+                continue
+            identity_error = order_result_identity_error(
+                remote,
+                local.idempotency_key,
+                local.ticker,
             )
-        for broker_order_id in sorted(remote_ids - known_ids):
-            drift.append(f"remote open order {broker_order_id} has no local order")
+            if identity_error is not None:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"local order {local.id}: {identity_error}"
+                )
+                continue
+            if local.status not in _LOCAL_LIVE_STATUSES:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"non-live local order {local.id} status {local.status}"
+                )
+        return tuple(faults)
 
     def panic(self, actor: str, reason: str) -> PanicReport:
         actor = actor.strip()
@@ -1316,6 +1382,12 @@ class ReconciliationService:
                     "panic open-order invalid cumulative filled_qty "
                     f"{remote.filled_qty} for {remote.broker_order_id}"
                 )
+        panic_drift.extend(
+            self._remote_open_order_faults(
+                remote_open,
+                missing_local_is_fault=False,
+            )
+        )
         unaddressable_remote_open = any(
             remote.broker_order_id is None for remote in remote_open
         ) or bool(invalid_remote_ids)
@@ -1415,6 +1487,12 @@ class ReconciliationService:
                     "panic final open-order invalid cumulative filled_qty "
                     f"{remote.filled_qty} for {remote.broker_order_id}"
                 )
+        panic_drift.extend(
+            self._remote_open_order_faults(
+                final_remote_open,
+                missing_local_is_fault=False,
+            )
+        )
         unaddressable_remote_open = unaddressable_remote_open or any(
             remote.broker_order_id is None for remote in final_remote_open
         ) or bool(panic_drift)

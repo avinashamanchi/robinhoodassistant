@@ -178,6 +178,43 @@ class _DriftRaceBroker(MockBroker):
         ]
 
 
+class _TerminalDriftRaceBroker(MockBroker):
+    reconciliation_key = "terminal-drift-risk-writer"
+
+    def get_open_orders(self):
+        return [
+            OrderResult(
+                idempotency_key="terminal-drift-client",
+                broker_order_id="terminal-drift-order",
+                status=OrderStatus.SUBMITTED,
+                ticker="AAPL",
+            )
+        ]
+
+
+class _IdentityDriftRaceBroker(MockBroker):
+    reconciliation_key = "identity-drift-risk-writer"
+
+    def get_order_status(self, order_id):
+        assert order_id == "identity-drift-order"
+        return OrderResult(
+            idempotency_key="identity-drift-client",
+            broker_order_id=order_id,
+            status=OrderStatus.SUBMITTED,
+            ticker="AAPL",
+        )
+
+    def get_open_orders(self):
+        return [
+            OrderResult(
+                idempotency_key="wrong-identity-drift-client",
+                broker_order_id="identity-drift-order",
+                status=OrderStatus.SUBMITTED,
+                ticker="AAPL",
+            )
+        ]
+
+
 class _ObservedPositionQty:
     def __init__(self, drift_observed, release_drift) -> None:
         self.drift_observed = drift_observed
@@ -435,11 +472,17 @@ def _drift_reconciliation_process(
     release_writer,
     finished,
     outcome,
+    conflict_kind,
 ):
     factory = make_session_factory(create_db_engine(db_url))
+    broker = {
+        "unknown": _DriftRaceBroker,
+        "terminal": _TerminalDriftRaceBroker,
+        "identity": _IdentityDriftRaceBroker,
+    }[conflict_kind]()
     reconciliation = ReconciliationService(
         factory,
-        _DriftRaceBroker(),
+        broker,
         OrderRepository(factory),
     )
     original_hold_writer = reconciliation.submission_barrier.hold_writer
@@ -1392,13 +1435,45 @@ def test_queued_submission_rechecks_acceptance_unknown_under_process_barrier(
         )
 
 
+@pytest.mark.parametrize(
+    ("conflict_kind", "expected_fault"),
+    [
+        ("unknown", "has no local order"),
+        ("terminal", "conflicts with terminal local order"),
+        (
+            "identity",
+            "broker client identity does not match local idempotency key",
+        ),
+    ],
+)
 def test_reconciliation_drift_is_durable_before_writer_interval_release(
     make_service,
     db_url,
+    conflict_kind,
+    expected_fault,
 ):
     context: SpawnContext = __import__("multiprocessing").get_context("spawn")
     service = make_service()
     order_id = _approved_order(service)
+    if conflict_kind != "unknown":
+        with service.session_factory() as session:
+            session.add(
+                Order(
+                    idempotency_key=f"{conflict_kind}-drift-client",
+                    ticker="AAPL",
+                    side="buy",
+                    order_type="market",
+                    notional=Decimal("100"),
+                    status=(
+                        OrderStatus.FILLED.value
+                        if conflict_kind == "terminal"
+                        else OrderStatus.SUBMITTED.value
+                    ),
+                    broker_order_id=f"{conflict_kind}-drift-order",
+                    acceptance_state="accepted",
+                )
+            )
+            session.commit()
     before_writer_release = context.Event()
     release_writer = context.Event()
     writer_finished = context.Event()
@@ -1411,6 +1486,7 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
             release_writer,
             writer_finished,
             writer_outcome,
+            conflict_kind,
         ),
     )
     writer.start()
@@ -1449,7 +1525,7 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
     assert broker_entered_before_release is False
     writer_result = writer_outcome.get(timeout=2)
     assert writer_result[0] == "ok"
-    assert any("has no local order" in item for item in writer_result[1])
+    assert any(expected_fault in item for item in writer_result[1])
     assert submission_outcome.get(timeout=2) == (
         "ok",
         OrderStatus.APPROVAL_RECORDED.value,
