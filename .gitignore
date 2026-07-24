@@ -38,3 +38,6 @@ htmlcov/
 
 # Runtime logs
 logs/
+
+# Local brainstorming mockups and browser-session state
+.superpowers/
