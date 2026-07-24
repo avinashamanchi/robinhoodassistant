@@ -107,15 +107,22 @@ class OrderSubmissionService:
             bracket_prices(payload_order) if submission_kind == "bracket" else None
         )
 
-        # All provider reads and deterministic risk checks precede the durable
-        # claim. Their failures leave APPROVAL_RECORDED and are safely retryable.
-        risk = self._risk_check(request, order_id)
-        if risk.rejected:
-            reasons = tuple(risk.reasons)
-            self.repository.record_pre_submission_rejection(order_id, reasons, now)
-            return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
-
         with self.submission_barrier.hold():
+            # The barrier makes this snapshot fresh relative to every earlier
+            # claim/send/persist sequence. Provider reads and the pure risk
+            # check still occur before, and outside, the claim transaction.
+            risk = self._risk_check(request, order_id)
+            if risk.rejected:
+                reasons = tuple(risk.reasons)
+                self.repository.record_pre_submission_rejection(
+                    order_id, reasons, now
+                )
+                return SubmissionResult(
+                    order_id,
+                    OrderStatus.REJECTED,
+                    risk_reasons=reasons,
+                )
+
             claim_now = self.now()
             breaker_scope_keys = tuple(
                 scope.key for scope in relevant_scopes_for_symbol(
