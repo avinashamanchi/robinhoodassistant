@@ -380,6 +380,10 @@ def test_rule_lease_upgrade_aborts_on_unknown_active_shape(tmp_path):
         ("active", "hwm", "0"),
         ("active", "hwm", "Infinity"),
         ("processing", "hwm", "Infinity"),
+        ("active", "fraction", "0.0000001"),
+        ("processing", "fraction", "0.1234567"),
+        ("active", "hwm", "0.0000001"),
+        ("processing", "hwm", "100000000000000"),
     ],
 )
 def test_rule_lease_upgrade_aborts_invalid_resumable_scalar_before_ddl(

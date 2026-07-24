@@ -42,7 +42,13 @@ def _normalized_ticker(value) -> str:
     return normalized
 
 
-def _optional_positive_decimal(value, *, maximum=None):
+def _optional_positive_decimal(
+    value,
+    *,
+    precision: int,
+    scale: int,
+    maximum=None,
+):
     if value is None:
         return None
     try:
@@ -53,6 +59,15 @@ def _optional_positive_decimal(value, *, maximum=None):
         raise ValueError("decimal scalar must be finite and positive")
     if maximum is not None and parsed > maximum:
         raise ValueError("decimal scalar exceeds maximum")
+    _, digits, exponent = parsed.normalize().as_tuple()
+    if exponent >= 0:
+        whole_digits = len(digits) + exponent
+        decimal_places = 0
+    else:
+        decimal_places = -exponent
+        whole_digits = max(len(digits) - decimal_places, 0)
+    if decimal_places > scale or whole_digits > precision - scale:
+        raise ValueError("decimal scalar exceeds persisted precision or scale")
     return parsed
 
 
@@ -148,8 +163,17 @@ def _converted(
 ) -> tuple[str, str, str, Decimal | None, Decimal | None] | None:
     try:
         ticker = _normalized_ticker(row.ticker)
-        fraction = _optional_positive_decimal(row.fraction, maximum=Decimal(1))
-        high_water_mark = _optional_positive_decimal(row.hwm)
+        fraction = _optional_positive_decimal(
+            row.fraction,
+            precision=8,
+            scale=6,
+            maximum=Decimal(1),
+        )
+        high_water_mark = _optional_positive_decimal(
+            row.hwm,
+            precision=20,
+            scale=6,
+        )
         if row.kind not in _KINDS:
             raise ValueError("unknown rule kind")
         condition = _condition(row)

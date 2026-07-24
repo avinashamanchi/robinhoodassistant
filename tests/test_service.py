@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Position
-from trading_assistant.db.models import Order, RiskEvent
+from trading_assistant.db.models import Order, RiskEvent, Rule, RuleGroup
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.service import TradingService
 
@@ -142,6 +142,81 @@ def test_conditional_rule_crud(app_config, session_factory):
     canceled = svc.cancel_rule(created["rule_id"])
     assert canceled["canceled"] is True
     assert svc.list_rules()[0]["state"] == "canceled"
+
+
+def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(
+    app_config, session_factory
+):
+    svc = _service(app_config, session_factory)
+    first = svc.create_conditional_rule(
+        "AAPL",
+        {"price_below": 90},
+        {"side": "buy", "notional": "50"},
+        group_key="processing-sibling",
+    )
+    second = svc.create_conditional_rule(
+        "AAPL",
+        {"price_above": 110},
+        {"side": "buy", "notional": "50"},
+        group_key="processing-sibling",
+    )
+    with session_factory() as session:
+        first_rule = session.get(Rule, first["rule_id"])
+        second_rule = session.get(Rule, second["rule_id"])
+        second_rule.state = "processing"
+        group = session.get(RuleGroup, first_rule.group_id)
+        initial_version = group.version
+        session.commit()
+
+    assert svc.cancel_rule(first["rule_id"])["canceled"] is True
+
+    with session_factory() as session:
+        first_rule = session.get(Rule, first["rule_id"])
+        second_rule = session.get(Rule, second["rule_id"])
+        group = session.get(RuleGroup, first_rule.group_id)
+        assert first_rule.state == "canceled"
+        assert second_rule.state == "processing"
+        assert group.state == "active"
+        assert group.version == initial_version
+
+    assert svc.cancel_rule(second["rule_id"])["canceled"] is True
+
+    with session_factory() as session:
+        second_rule = session.get(Rule, second["rule_id"])
+        group = session.get(RuleGroup, second_rule.group_id)
+        assert second_rule.state == "canceled"
+        assert group.state == "canceled"
+        assert group.version == initial_version + 1
+
+
+@pytest.mark.parametrize("terminal_state", ["triggered", "failed"])
+def test_cancel_rule_terminal_winner_is_explicit_noop(
+    app_config, session_factory, terminal_state
+):
+    svc = _service(app_config, session_factory)
+    created = svc.create_conditional_rule(
+        "AAPL", {"price_below": 90}, {"side": "buy", "notional": "50"}
+    )
+    with session_factory() as session:
+        rule = session.get(Rule, created["rule_id"])
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = terminal_state
+        group.state = terminal_state
+        group.terminal_rule_id = rule.id
+        group.version = 7
+        session.commit()
+
+    result = svc.cancel_rule(created["rule_id"])
+
+    assert result["canceled"] is False
+    assert "terminal" in result["error"]
+    with session_factory() as session:
+        rule = session.get(Rule, created["rule_id"])
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == terminal_state
+        assert group.state == terminal_state
+        assert group.terminal_rule_id == rule.id
+        assert group.version == 7
 
 
 def test_market_data_and_account_summary(app_config, session_factory):

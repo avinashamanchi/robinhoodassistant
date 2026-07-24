@@ -190,3 +190,19 @@ def test_rule_command_types_fraction_and_high_water_mark():
 
     assert command.fraction == Decimal("0.5")
     assert command.high_water_mark == Decimal("123.45")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fraction", "0.0000001"),
+        ("fraction", "0.1234567"),
+        ("high_water_mark", "0.0000001"),
+        ("high_water_mark", "100000000000000"),
+    ],
+)
+def test_rule_command_rejects_numeric_values_the_database_cannot_preserve(
+    field, value
+):
+    with pytest.raises(ValidationError):
+        _command(**{field: value})

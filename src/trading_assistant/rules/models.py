@@ -88,8 +88,19 @@ class RuleCommand(BaseModel):
     action: RuleAction
     group_key: str | None = Field(default=None, min_length=1, max_length=128)
     pre_approved: bool = False
-    fraction: Decimal | None = Field(default=None, gt=0, le=1)
-    high_water_mark: Decimal | None = Field(default=None, gt=0)
+    fraction: Decimal | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        max_digits=8,
+        decimal_places=6,
+    )
+    high_water_mark: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=20,
+        decimal_places=6,
+    )
 
     @field_validator("ticker")
     @classmethod

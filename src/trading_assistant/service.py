@@ -20,7 +20,7 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .broker.base import BrokerClient
@@ -73,6 +73,8 @@ _EXIT_RESERVATION_STATUSES = (
     OrderStatus.SUBMITTED.value,
     OrderStatus.PARTIALLY_FILLED.value,
 )
+
+_RESUMABLE_RULE_STATES = ("active", "processing")
 
 log = logging.getLogger(__name__)
 
@@ -1073,22 +1075,77 @@ class TradingService:
             rule = s.get(Rule, rule_id)
             if rule is None:
                 return {"rule_id": rule_id, "canceled": False, "error": "not found"}
-            rule.state = "canceled"
-            active_sibling = s.scalar(
+            if rule.state not in _RESUMABLE_RULE_STATES:
+                return {
+                    "rule_id": rule_id,
+                    "canceled": False,
+                    "error": f"rule is terminal: {rule.state}",
+                }
+            group = s.get(RuleGroup, rule.group_id)
+            if group is None:
+                return {
+                    "rule_id": rule_id,
+                    "canceled": False,
+                    "error": "rule group not found",
+                }
+            if group.state != "active":
+                return {
+                    "rule_id": rule_id,
+                    "canceled": False,
+                    "error": f"rule group is terminal: {group.state}",
+                }
+
+            canceled = s.execute(
+                update(Rule)
+                .where(
+                    Rule.id == rule_id,
+                    Rule.state.in_(_RESUMABLE_RULE_STATES),
+                    Rule.group_id.in_(
+                        select(RuleGroup.id).where(
+                            RuleGroup.state == "active"
+                        )
+                    ),
+                )
+                .values(state="canceled")
+            )
+            if canceled.rowcount != 1:
+                s.rollback()
+                return {
+                    "rule_id": rule_id,
+                    "canceled": False,
+                    "error": "rule or group changed during cancellation",
+                }
+
+            resumable_sibling = s.scalar(
                 select(Rule.id).where(
                     Rule.group_id == rule.group_id,
                     Rule.id != rule.id,
-                    Rule.state == "active",
+                    Rule.state.in_(_RESUMABLE_RULE_STATES),
                 ).limit(1)
             )
-            if active_sibling is None:
-                group = s.get(RuleGroup, rule.group_id)
-                if group is not None and group.state == "active":
-                    group.state = "canceled"
-                    group.lease_owner = None
-                    group.lease_expires_at = None
-                    group.version += 1
-                    group.updated_at = utcnow()
+            if resumable_sibling is None:
+                group_canceled = s.execute(
+                    update(RuleGroup)
+                    .where(
+                        RuleGroup.id == rule.group_id,
+                        RuleGroup.state == "active",
+                    )
+                    .values(
+                        state="canceled",
+                        terminal_rule_id=None,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        version=RuleGroup.version + 1,
+                        updated_at=utcnow(),
+                    )
+                )
+                if group_canceled.rowcount != 1:
+                    s.rollback()
+                    return {
+                        "rule_id": rule_id,
+                        "canceled": False,
+                        "error": "rule group changed during cancellation",
+                    }
             s.commit()
             return {"rule_id": rule_id, "canceled": True}
 
