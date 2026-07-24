@@ -97,6 +97,15 @@ def test_plans_ui_served(client):
     assert r.status_code == 200 and "Trade Plans" in r.text
 
 
+def test_plans_ui_approval_posts_a_nonempty_review_reason(client):
+    c, _ = client
+    page = c.get("/plans/ui").text
+
+    assert 'window.prompt("Review reason for plan approval:")' in page
+    assert "if (!reason)" in page
+    assert "jsonPost({ reason })" in page
+
+
 def test_propose_generates_plans(client):
     c, _ = client
     res = c.post("/propose", json={"n": 3}).json()

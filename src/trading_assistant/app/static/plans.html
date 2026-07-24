@@ -161,7 +161,9 @@
       }
     }
     async function approve(id) {
-      const r = await action("/plans/" + id + "/approve", { method: "POST" });
+      const reason = (window.prompt("Review reason for plan approval:") || "").trim();
+      if (!reason) { notify("A non-empty review reason is required to approve a plan.", "err"); return; }
+      const r = await action("/plans/" + id + "/approve", jsonPost({ reason }));
       if (r.ok) {
         const d = r.data || {};
         if (d.bracket) notify("Approved ✓ plan " + id + " — bracket order placed on Alpaca", "ok");
