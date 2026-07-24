@@ -125,7 +125,9 @@ def test_stale_approval_rejected_on_price_move(make_service):
 
     # Price jumps 10% between proposal and approval -> execution re-check refuses.
     svc.broker.set_price("AAPL", Decimal("110"))
-    result = svc.approve_order(order_id)
+    result = svc.approve_order(
+        order_id, actor="operator:stress-test", reason="stale approval drill"
+    )
     assert result["executed"] is False
     assert result["status"] == "rejected"
     assert svc.broker.submit_calls == 0

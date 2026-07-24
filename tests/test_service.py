@@ -117,7 +117,9 @@ def test_second_order_counts_first_outstanding_order(app_config, session_factory
     svc = _service(config, session_factory)
     first = svc.propose_order("AAPL", "buy", "market", notional="1800")
     assert first["status"] == "proposed"
-    assert svc.approve_order(first["order_id"])["status"] == "submitted"
+    assert svc.approve_order(
+        first["order_id"], actor="operator:test", reason="service test"
+    )["status"] == "submitted"
 
     second = svc.propose_order("AAPL", "buy", "market", notional="400")
 

@@ -46,6 +46,7 @@ from .db.models import (
     approve_proposed,
     utcnow,
 )
+from .orders.repository import OrderRepository
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.killswitch import KillSwitch
@@ -380,39 +381,46 @@ class TradingService:
         self,
         order_id: int,
         *,
-        actor: str = "operator:legacy-service",
-        reason: str = "legacy service approval",
+        actor: str,
+        reason: str,
         request_id: str = "",
     ) -> dict[str, Any]:
-        """Approve a PROPOSED order, re-run risk at execution moment, then submit.
+        """Approve, claim, and submit an order without broker I/O in a write transaction."""
+        if not actor.strip() or not reason.strip():
+            raise ValueError("approval actor and reason must be non-empty")
+        repository = OrderRepository(self.session_factory)
 
-        This is the ONLY path that trades. It: (1) refuses expired proposals (A6),
-        (2) atomically compare-and-sets PROPOSED->APPROVAL_RECORDED (A5) — a second approver
-        conflicts, (3) re-runs the full risk engine against a FRESH snapshot
-        (prices move between proposal and approval), rejecting if anything now
-        fails, and only then (4) submits to the broker.
-        """
+        # Inspect expiry before the CAS. The repository owns the state-changing
+        # expiry write so a concurrent submission claim cannot be overwritten.
         with self.session_factory() as s:
             order = s.get(Order, order_id)
             if order is None:
                 return {"order_id": order_id, "error": "not found", "executed": False}
-
-            # A6: expired proposals cannot be approved.
-            if (
-                order.status == OrderStatus.PROPOSED.value
+            is_expired = (
+                order.status
+                in (OrderStatus.PROPOSED.value, OrderStatus.APPROVAL_RECORDED.value)
                 and order.proposal is not None
                 and order.proposal.is_expired()
-            ):
-                OrderStateMachine.transition(order, OrderStatus.EXPIRED)
-                s.commit()
+            )
+
+        if is_expired:
+            status = repository.expire_if_eligible(order_id, utcnow())
+            if status is OrderStatus.EXPIRED:
                 return {
                     "order_id": order_id,
                     "status": OrderStatus.EXPIRED.value,
                     "executed": False,
                     "error": "proposal expired",
                 }
+            return {
+                "order_id": order_id,
+                "status": status.value if status is not None else None,
+                "executed": False,
+                "error": "order not in PROPOSED state (already decided?)",
+            }
 
-            # A5: atomic exactly-once approval.
+        # Commit the human approval and audit record before any broker read.
+        with self.session_factory() as s:
             try:
                 approve_proposed(
                     s,
@@ -430,9 +438,13 @@ class TradingService:
                     "executed": False,
                     "error": "order not in PROPOSED state (already decided?)",
                 }
-            s.refresh(order)  # pick up status = APPROVAL_RECORDED from the CAS UPDATE
+            s.commit()
 
-            # Execution-time risk re-check against a fresh snapshot, routed by class.
+        # Fresh risk evaluation uses only a read-only database session. Broker
+        # reads therefore cannot happen while a SQLite write is uncommitted.
+        with self.session_factory() as s:
+            order = s.get(Order, order_id)
+            assert order is not None
             ac = self._asset_class(order.ticker)
             order_req = self._order_request_from(order)
             snapshot = self.assemble_snapshot(
@@ -444,7 +456,19 @@ class TradingService:
                 killswitch_tripped=KillSwitch.is_tripped(s, ac),
                 market_open=self._clock_for(ac).is_open(),
             )
-            if result.rejected:
+
+        if result.rejected:
+            # Persist a fresh risk rejection in its own write transaction.
+            with self.session_factory() as s:
+                order = s.get(Order, order_id)
+                assert order is not None
+                if order.status != OrderStatus.APPROVAL_RECORDED.value:
+                    return {
+                        "order_id": order_id,
+                        "status": order.status,
+                        "executed": False,
+                        "error": "order not in PROPOSED state (already decided?)",
+                    }
                 OrderStateMachine.transition(order, OrderStatus.REJECTED)
                 s.add(
                     RiskEvent(
@@ -461,18 +485,33 @@ class TradingService:
                     "risk_reasons": result.reasons,
                 }
 
-            # Passed final risk check -> submit to broker.
-            OrderStateMachine.transition(order, OrderStatus.SUBMITTING)
+        # Claim submission durably before broker I/O. A retry cannot claim this
+        # order again, and any subsequent error is persisted as indeterminate.
+        if not repository.claim_submission(order_id, utcnow()):
+            with self.session_factory() as s:
+                current = s.get(Order, order_id)
+                return {
+                    "order_id": order_id,
+                    "status": current.status if current is not None else None,
+                    "executed": False,
+                    "error": "order not in PROPOSED state (already decided?)",
+                }
+
+        try:
             broker_result = self.broker.submit_order(order_req)
-            order.broker_order_id = broker_result.broker_order_id
-            OrderStateMachine.transition(order, OrderStatus.SUBMITTED)
-            s.commit()
-            return {
-                "order_id": order_id,
-                "status": order.status,
-                "executed": True,
-                "broker_order_id": order.broker_order_id,
-            }
+            if not repository.record_submission(
+                order_id, broker_result.broker_order_id, utcnow()
+            ):
+                raise RuntimeError("could not persist broker acceptance")
+        except Exception as exc:
+            repository.mark_acceptance_unknown(order_id, type(exc).__name__, utcnow())
+            raise
+        return {
+            "order_id": order_id,
+            "status": OrderStatus.SUBMITTED.value,
+            "executed": True,
+            "broker_order_id": broker_result.broker_order_id,
+        }
 
     def submit_bracket_order(
         self, order_req: OrderRequest, take_profit, stop_loss

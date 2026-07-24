@@ -14,7 +14,7 @@ from trading_assistant.db.models import Fill
 
 def _submitted(svc, notional="400") -> int:
     order_id = svc.propose_order("AAPL", "buy", "market", notional=notional)["order_id"]
-    svc.approve_order(order_id)  # -> SUBMITTED
+    svc.approve_order(order_id, actor="operator:test", reason="hardening test")  # -> SUBMITTED
     return order_id
 
 

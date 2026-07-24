@@ -160,7 +160,9 @@
     $("chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 
     async function approve(id) {
-      const r = await action("/approve/" + id, { method: "POST" });
+      const reason = window.prompt("Why are you approving this order?");
+      if (reason === null) return;
+      const r = await action("/approve/" + id, jsonPost({ reason }));
       if (r.ok) {
         const d = r.data || {};
         if (d.status === "rejected") notify("Order " + id + " REJECTED by risk: " + ((d.risk_reasons || []).join("; ") || "see log"), "err");

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
+from trading_assistant.db.models import AuditEvent
 
 
 class StubAgent:
@@ -52,9 +53,13 @@ def test_pending_approve_flow(client):
     pending = c.get("/pending").json()["pending"]
     assert len(pending) == 1 and pending[0]["order_id"] == order_id
 
-    approve = c.post(f"/approve/{order_id}").json()
+    approve = c.post(f"/approve/{order_id}", json={"reason": "reviewed in API"}).json()
     assert approve["executed"] is True
     assert svc.broker.submit_calls == 1
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(action="order.approve").one()
+        assert audit.actor == "operator:api-token"
+        assert audit.reason == "reviewed in API"
 
     # No longer pending.
     assert c.get("/pending").json()["pending"] == []
@@ -63,8 +68,14 @@ def test_pending_approve_flow(client):
 def test_double_approve_returns_409(client):
     c, svc, _ = client
     order_id = _propose(svc)
-    assert c.post(f"/approve/{order_id}").status_code == 200
-    assert c.post(f"/approve/{order_id}").status_code == 409
+    assert c.post(f"/approve/{order_id}", json={"reason": "first review"}).status_code == 200
+    assert c.post(f"/approve/{order_id}", json={"reason": "duplicate review"}).status_code == 409
+
+
+def test_approve_requires_non_empty_reason(client):
+    c, svc, _ = client
+    order_id = _propose(svc)
+    assert c.post(f"/approve/{order_id}", json={"reason": " "}).status_code == 422
 
 
 def test_reject_endpoint(client):

@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from ..config import Secrets, load_config
 from ..db.models import create_all
@@ -41,6 +41,17 @@ class AnalyzeIn(BaseModel):
 
 class ProposeIn(BaseModel):
     n: int = 3
+
+
+class ApprovalIn(BaseModel):
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
 
 
 def build_default_stack() -> tuple[TradingService, Agent]:
@@ -72,11 +83,12 @@ def _auth_dependency(token: str):
     """Require X-API-Key on mutating endpoints (constant-time). If no token is
     configured, auth is disabled (dev/test) — preflight flags that as a FAIL."""
 
-    def dep(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
+    def dep(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> str:
         if not token:
-            return
+            return "operator:api-token"
         if x_api_key is None or not hmac.compare_digest(str(x_api_key), token):
             raise HTTPException(status_code=401, detail="missing or invalid API key")
+        return "operator:api-token"
 
     return dep
 
@@ -160,11 +172,11 @@ def create_app(
     def pending():
         return {"pending": service.get_pending()}
 
-    @app.post("/approve/{order_id}", dependencies=[auth])
-    def approve(order_id: int, request: Request):
+    @app.post("/approve/{order_id}")
+    def approve(order_id: int, body: ApprovalIn, request: Request, principal: str = auth):
         if not approve_rate.allow(_client(request)):
             raise HTTPException(status_code=429, detail="rate limit exceeded")
-        result = service.approve_order(order_id)
+        result = service.approve_order(order_id, actor=principal, reason=body.reason)
         # Surface a conflict (already-decided) as HTTP 409 for the atomic guarantee.
         if result.get("error", "").startswith("order not in PROPOSED"):
             raise HTTPException(status_code=409, detail=result)

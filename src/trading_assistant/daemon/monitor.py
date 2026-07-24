@@ -208,7 +208,11 @@ class Monitor:
 
                 executed = None
                 if self.auto_execute and rule["pre_approved"]:
-                    executed = self.service.approve_order(proposal["order_id"])
+                    executed = self.service.approve_order(
+                        proposal["order_id"],
+                        actor=f"rule:{rule_id}",
+                        reason="pre-approved rule execution",
+                    )
                     if not executed.get("executed"):
                         self._finish_claim(rule_id, "failed")
                         actions.append(

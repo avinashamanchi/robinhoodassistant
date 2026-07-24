@@ -112,3 +112,53 @@ class OrderRepository:
             session.rollback()
             current = session.get(Order, order_id)
             return OrderStatus(current.status) if current is not None else None
+
+    def record_submission(
+        self, order_id: int, broker_order_id: str | None, now: datetime
+    ) -> bool:
+        """Persist a definitive broker acceptance after the submission claim."""
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status == OrderStatus.SUBMITTING.value,
+                )
+                .values(
+                    status=OrderStatus.SUBMITTED.value,
+                    broker_order_id=broker_order_id,
+                    acceptance_state="accepted",
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
+    def mark_acceptance_unknown(
+        self, order_id: int, error_code: str, now: datetime
+    ) -> bool:
+        """Persist an indeterminate broker result without ever retrying it."""
+        with self.session_factory() as session:
+            result = session.execute(
+                update(Order)
+                .where(
+                    Order.id == order_id,
+                    Order.status == OrderStatus.SUBMITTING.value,
+                )
+                .values(
+                    status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                    acceptance_state="unknown",
+                    last_error_code=error_code,
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True

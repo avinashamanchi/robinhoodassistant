@@ -76,7 +76,11 @@ def run_paper_drill(
     broker_order_id: str | None = None
     terminal = False
     try:
-        approved = service.approve_order(proposal["order_id"])
+        approved = service.approve_order(
+            proposal["order_id"],
+            actor="operator:paper-drill",
+            reason="paper drill execution",
+        )
         if not approved.get("executed") or not approved.get("broker_order_id"):
             raise PaperDrillError(f"broker did not accept paper drill: {approved}")
         broker_order_id = approved["broker_order_id"]

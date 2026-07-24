@@ -68,7 +68,7 @@ def test_rule_returns_to_active_when_proposal_raises(make_service):
         assert session.get(Rule, rule_id).state == "active"
 
 
-def test_rule_retry_reuses_stable_order_idempotency_key(make_service):
+def test_rule_does_not_retry_unknown_broker_acceptance(make_service):
     from trading_assistant.broker.mock import MockBroker
     from trading_assistant.db.models import Order, Rule
 
@@ -95,12 +95,13 @@ def test_rule_retry_reuses_stable_order_idempotency_key(make_service):
     second = monitor.tick()
 
     assert first[0]["error"] == "ConnectionError"
-    assert second[0]["executed"]["executed"] is True
+    assert second[0]["executed"] is None
     assert len(broker._orders_by_key) == 1
     with svc.session_factory() as session:
         orders = session.execute(select(Order)).scalars().all()
         assert len(orders) == 1
         assert orders[0].idempotency_key == f"rule-{rule_id}"
+        assert orders[0].status == "acceptance_unknown"
 
 
 def test_no_trigger_when_condition_unmet(make_service):
@@ -231,7 +232,7 @@ def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_ser
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="4")["order_id"]
-    svc.approve_order(oid)
+    svc.approve_order(oid, actor="operator:test", reason="monitor reconciliation test")
 
     with svc.session_factory() as s:
         local = s.get(Order, oid)

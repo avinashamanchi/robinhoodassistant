@@ -18,6 +18,10 @@ class _StubAgent:
         return {"reply": "ok", "tool_calls": []}
 
 
+def _approve(svc, order_id):
+    return svc.approve_order(order_id, actor="operator:test", reason="launch test")
+
+
 # ── D3 health + heartbeat ───────────────────────────────────────
 def test_health_reflects_heartbeat(make_service):
     svc = make_service()
@@ -71,7 +75,7 @@ def test_order_lifecycle_propose_approve_fill(make_service):
     oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
     assert svc.get_order_status(oid)["status"] == "proposed"
 
-    approve = svc.approve_order(oid)
+    approve = _approve(svc, oid)
     assert approve["executed"] is True and approve["status"] == "submitted"
 
     filled = svc.record_fill(oid, qty="4", price="100")
@@ -105,7 +109,7 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
-    svc.approve_order(oid)                      # -> SUBMITTED with broker_order_id
+    _approve(svc, oid)                          # -> SUBMITTED with broker_order_id
 
     broker.fill = (Decimal("4"), Decimal("100"))
     r = svc.sync_open_orders()
@@ -132,7 +136,7 @@ def test_sync_reports_broker_status_failures(make_service):
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="1")["order_id"]
-    svc.approve_order(oid)
+    _approve(svc, oid)
     broker.fail_status = True
 
     result = svc.sync_open_orders()
@@ -192,7 +196,7 @@ def test_sync_replaces_synthetic_fill_with_exact_broker_activity(make_service):
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="2")["order_id"]
-    svc.approve_order(oid)
+    _approve(svc, oid)
     with svc.session_factory() as session:
         order = session.get(Order, oid)
         broker.order_id = order.broker_order_id
@@ -256,7 +260,7 @@ def test_sync_derives_incremental_prices_from_cumulative_average(make_service):
     broker.set_price("AAPL", Decimal("100"))
     svc = make_service(broker=broker)
     oid = svc.propose_order("AAPL", "buy", "market", qty="3")["order_id"]
-    svc.approve_order(oid)
+    _approve(svc, oid)
 
     broker.cumulative = (
         OrderStatus.PARTIALLY_FILLED,
