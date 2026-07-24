@@ -95,6 +95,19 @@ class _InvalidIdentityProcessBroker:
         )
 
 
+class _AcceptanceContradictionBroker(MockBroker):
+    reconciliation_key = "acceptance-contradiction-process-test"
+
+    def get_order_by_client_id(self, client_order_id):
+        return OrderResult(
+            idempotency_key=client_order_id,
+            broker_order_id="acceptance-contradiction-order",
+            status=OrderStatus.CANCELED,
+            filled_qty=Decimal("0.5"),
+            avg_fill_price=Decimal("100"),
+        )
+
+
 class _QueuedSnapshotBroker(MockBroker):
     reconciliation_key = "queued-snapshot-process-test"
 
@@ -431,6 +444,41 @@ def _drift_reconciliation_process(
     try:
         report = reconciliation.reconcile()
         outcome.put(("ok", tuple(report.broker_drift)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _acceptance_contradiction_recovery_process(
+    db_url,
+    before_writer_release,
+    release_writer,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    reconciliation = ReconciliationService(
+        factory,
+        _AcceptanceContradictionBroker(),
+        OrderRepository(factory),
+    )
+    original_hold_writer = reconciliation.submission_barrier.hold_writer
+
+    @contextmanager
+    def observed_hold_writer():
+        with original_hold_writer():
+            yield
+            before_writer_release.set()
+            if not release_writer.wait(timeout=10):
+                raise TimeoutError(
+                    "test did not release acceptance contradiction writer"
+                )
+
+    reconciliation.submission_barrier.hold_writer = observed_hold_writer
+    try:
+        resolved = reconciliation.reconcile_unknown()
+        outcome.put(("ok", resolved))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -1385,6 +1433,91 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
     assert writer_result[0] == "ok"
     assert any("has no local order" in item for item in writer_result[1])
     assert submission_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.APPROVAL_RECORDED.value,
+    )
+    assert broker_entered.is_set() is False
+
+
+def test_acceptance_contradiction_is_atomic_before_writer_interval_release(
+    make_service,
+    db_url,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    follower_id = _approved_order(service)
+    with service.session_factory() as session:
+        contradicted = Order(
+            idempotency_key="acceptance-contradiction-client",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+            acceptance_state=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+        )
+        session.add(contradicted)
+        session.flush()
+        session.add(
+            Fill(
+                order_id=contradicted.id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="acceptance-contradiction-local-fill",
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+        contradicted_order_id = contradicted.id
+
+    before_writer_release = context.Event()
+    release_writer = context.Event()
+    writer_finished = context.Event()
+    writer_outcome = context.Queue()
+    writer = context.Process(
+        target=_acceptance_contradiction_recovery_process,
+        args=(
+            db_url,
+            before_writer_release,
+            release_writer,
+            writer_finished,
+            writer_outcome,
+        ),
+    )
+    writer.start()
+    assert before_writer_release.wait(timeout=10)
+
+    with service.session_factory() as session:
+        persisted = session.get(Order, contradicted_order_id)
+        assert persisted.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert persisted.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert persisted.last_error_code == "cumulative_fill_contradiction"
+    assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
+
+    broker_entered = context.Event()
+    follower_outcome = context.Queue()
+    follower = context.Process(
+        target=_immediate_submission_process,
+        args=(
+            db_url,
+            follower_id,
+            broker_entered,
+            follower_outcome,
+        ),
+    )
+    follower.start()
+    try:
+        assert broker_entered.wait(timeout=0.75) is False
+        assert writer_finished.is_set() is False
+    finally:
+        release_writer.set()
+        _join(writer, release_writer)
+        _join(follower)
+
+    assert writer_outcome.get(timeout=2) == ("ok", (1, ()))
+    assert follower_outcome.get(timeout=2) == (
         "ok",
         OrderStatus.APPROVAL_RECORDED.value,
     )

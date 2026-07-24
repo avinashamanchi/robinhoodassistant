@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import event, func, select
 
+from trading_assistant.broker.alpaca import AlpacaBroker
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     BrokerFill,
@@ -56,6 +57,26 @@ class CancelFailsBroker(MockBroker):
 
     def get_order_status(self, order_id):
         raise ConnectionError("broker unavailable")
+
+
+def _acceptance_unknown_with_exact_local_fill_ahead(service, broker) -> int:
+    broker.set_price("AAPL", Decimal("100"))
+    order_id = _approved_order_id(service)
+    service.order_submission.submit(order_id)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                order_id=order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id=f"acceptance-local-fill-{order_id}",
+                filled_at=utcnow(),
+            )
+        )
+        session.commit()
+    return order_id
 
 
 def test_reconcile_unknown_finds_remote_acceptance(make_service):
@@ -688,6 +709,69 @@ class ActivityBroker(MockBroker):
         return list(self.activities)
 
 
+def test_missing_alpaca_activity_id_never_inserts_advances_or_clears_latch(
+    make_service,
+):
+    class RawActivityTrading:
+        def __init__(self):
+            self.broker_order_id = ""
+
+        def get(self, _path, _params):
+            return [
+                {
+                    "id": None,
+                    "transaction_time": "2026-07-24T17:00:00Z",
+                    "price": "100",
+                    "qty": "1",
+                    "side": "buy",
+                    "symbol": "AAPL",
+                    "order_id": self.broker_order_id,
+                }
+            ]
+
+    class MissingActivityIdBroker(ActivityBroker):
+        def __init__(self):
+            super().__init__()
+            self.raw_trading = RawActivityTrading()
+
+        def get_fill_activities(self, after=None):
+            return AlpacaBroker(
+                self.raw_trading,
+                object(),
+            ).get_fill_activities(after)
+
+    broker = MissingActivityIdBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker.raw_trading.broker_order_id = order.broker_order_id
+        order.acceptance_state = "fill_reconcile_required"
+        order.last_error_code = "remote_fill_ahead"
+        session.commit()
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 0
+    assert replay.inserted_fills == 0
+    assert any("fill activity identity" in item for item in first.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "invalid_fill_activity"
+        assert session.scalar(
+            select(func.count()).select_from(Fill)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(
+                db_models.ReconciliationCursor
+            )
+        ) == 0
+
+
 @pytest.mark.parametrize(
     "filled_qty",
     [Decimal("NaN"), Decimal("Infinity"), Decimal("-1")],
@@ -763,6 +847,106 @@ def test_acceptance_resolution_rejects_invalid_cumulative_truth_durably(
             session.get(Order, order_id).acceptance_state
             == "fill_reconcile_required"
         )
+
+
+def test_standalone_acceptance_contradiction_latch_and_drift_share_commit(
+    make_service,
+):
+    broker = AcceptThenDisconnectBroker()
+    service = make_service(broker=broker)
+    order_id = _acceptance_unknown_with_exact_local_fill_ahead(
+        service,
+        broker,
+    )
+    session_type = service.session_factory.class_
+    observed_breaker_in_latch_transaction: list[bool] = []
+
+    def crash_before_contradiction_commit(session):
+        acceptance_state = session.scalar(
+            select(Order.acceptance_state).where(Order.id == order_id)
+        )
+        if acceptance_state != "fill_reconcile_required":
+            return
+        observed_breaker_in_latch_transaction.append(
+            session.get(
+                CircuitBreakerState,
+                BreakerScope.broker_drift().key,
+            )
+            is not None
+        )
+        raise RuntimeError("simulated crash before contradiction commit")
+
+    event.listen(session_type, "before_commit", crash_before_contradiction_commit)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="simulated crash before contradiction commit",
+        ):
+            service.reconciliation.reconcile_unknown()
+    finally:
+        event.remove(
+            session_type,
+            "before_commit",
+            crash_before_contradiction_commit,
+        )
+
+    assert observed_breaker_in_latch_transaction == [True]
+    restarted = make_service(broker=broker)
+    with restarted.session_factory() as session:
+        rolled_back = session.get(Order, order_id)
+        assert rolled_back.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert (
+            rolled_back.acceptance_state
+            != "fill_reconcile_required"
+        )
+        assert session.get(
+            CircuitBreakerState,
+            BreakerScope.broker_drift().key,
+        ) is None
+
+    assert restarted.reconciliation.reconcile_unknown() == (1, ())
+    after_commit = make_service(broker=broker)
+    assert after_commit.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    ) is True
+    with after_commit.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        assert persisted.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert persisted.acceptance_state == "fill_reconcile_required"
+        assert persisted.last_error_code == "cumulative_fill_contradiction"
+
+
+def test_full_acceptance_contradiction_trips_drift_before_later_crash(
+    make_service,
+):
+    broker = AcceptThenDisconnectBroker()
+    service = make_service(broker=broker)
+    order_id = _acceptance_unknown_with_exact_local_fill_ahead(
+        service,
+        broker,
+    )
+
+    def crash_after_acceptance_recovery(_drift):
+        raise RuntimeError("simulated crash after acceptance recovery")
+
+    service.reconciliation._reconcile_fill_activities = (
+        crash_after_acceptance_recovery
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="simulated crash after acceptance recovery",
+    ):
+        service.reconciliation.reconcile()
+
+    restarted = make_service(broker=broker)
+    assert restarted.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    ) is True
+    with restarted.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        assert persisted.status == OrderStatus.ACCEPTANCE_UNKNOWN.value
+        assert persisted.acceptance_state == "fill_reconcile_required"
+        assert persisted.last_error_code == "cumulative_fill_contradiction"
 
 
 @pytest.mark.parametrize(
@@ -1307,6 +1491,104 @@ def test_legacy_null_fill_is_quarantined_then_superseded_without_double_pnl(
     assert complete.realized_pnl_today == Decimal("-99")
     assert complete.broker_reconciled is True
     assert complete.daily_pnl_complete is True
+
+
+def test_pre_0005_supplied_fill_id_requires_exact_activity_then_replays_once(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="trusted-opening-fill-for-supplied-id",
+                filled_at=utcnow() - timedelta(minutes=3),
+            )
+        )
+        order = Order(
+            idempotency_key="pre-0005-supplied-client",
+            ticker="AAPL",
+            side="sell",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.CANCELED.value,
+            broker_order_id="pre-0005-supplied-order",
+            acceptance_state="fill_reconcile_required",
+            last_error_code="legacy_unverified_fill",
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("1"),
+                price=Decimal("1"),
+                broker_fill_id="pre-0005-caller-supplied-id",
+                reconciliation_state="quarantined",
+                filled_at=utcnow() - timedelta(minutes=2),
+            )
+        )
+        session.commit()
+        order_id = order.id
+
+    remote = OrderResult(
+        "pre-0005-supplied-client",
+        "pre-0005-supplied-order",
+        OrderStatus.CANCELED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("1"),
+    )
+    broker._orders_by_id["pre-0005-supplied-order"] = remote
+    broker._orders_by_key["pre-0005-supplied-client"] = remote
+    exact_time = utcnow()
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="pre-0005-caller-supplied-id",
+            broker_order_id="pre-0005-supplied-order",
+            ticker="AAPL",
+            side="sell",
+            qty=Decimal("1"),
+            price=Decimal("1"),
+            filled_at=exact_time,
+        )
+    ]
+
+    before = service.snapshot_service.assemble_for_execution("AAPL")
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    replay = restarted.reconciliation.reconcile()
+    after = restarted.snapshot_service.assemble_for_execution("AAPL")
+
+    assert before.realized_pnl_today == Decimal("0")
+    assert before.broker_reconciled is False
+    assert before.daily_pnl_complete is False
+    assert first.inserted_fills == 0
+    assert replay.inserted_fills == 0
+    assert after.realized_pnl_today == Decimal("-99")
+    assert after.broker_reconciled is True
+    assert after.daily_pnl_complete is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        recovered = session.scalar(
+            select(Fill).where(
+                Fill.broker_fill_id
+                == "pre-0005-caller-supplied-id"
+            )
+        )
+        assert order.acceptance_state == "accepted"
+        assert recovered.reconciliation_state == "trusted"
+        assert recovered.filled_at == exact_time
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.broker_fill_id
+                == "pre-0005-caller-supplied-id"
+            )
+        ) == 1
 
 
 @pytest.mark.parametrize(

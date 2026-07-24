@@ -29,7 +29,6 @@ def upgrade() -> None:
         """
         UPDATE fills
         SET reconciliation_state = 'quarantined'
-        WHERE broker_fill_id IS NULL OR trim(broker_fill_id) = ''
         """
     )
     op.create_table(
@@ -89,7 +88,7 @@ def upgrade() -> None:
             'broker_drift',
             '',
             1,
-            'legacy fill without authoritative broker identity requires reconciliation',
+            'legacy fill from pre-0005 lacks authoritative broker provenance',
             'migration:0005',
             1,
             CURRENT_TIMESTAMP

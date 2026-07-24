@@ -583,9 +583,20 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
     ]
 
 
-def test_breaker_upgrade_quarantines_null_id_fills_and_trips_drift(tmp_path):
+@pytest.mark.parametrize(
+    ("case_name", "broker_fill_id"),
+    [
+        ("null-id", None),
+        ("caller-supplied-id", "pre-0005-caller-supplied-id"),
+    ],
+)
+def test_breaker_upgrade_quarantines_every_preexisting_fill_and_trips_drift(
+    tmp_path,
+    case_name,
+    broker_fill_id,
+):
     engine, cfg = _engine_at_revision(
-        tmp_path / "legacy-null-fill.db",
+        tmp_path / f"legacy-{case_name}-fill.db",
         "20260724_0004",
     )
     with engine.begin() as conn:
@@ -606,8 +617,9 @@ def test_breaker_upgrade_quarantines_null_id_fills_and_trips_drift(tmp_path):
                 "INSERT INTO fills "
                 "(order_id,ticker,side,qty,price,broker_fill_id,filled_at) "
                 "VALUES "
-                "(1,'AAPL','sell',1,1,NULL,CURRENT_TIMESTAMP)"
-            )
+                "(1,'AAPL','sell',1,1,:broker_fill_id,CURRENT_TIMESTAMP)"
+            ),
+            {"broker_fill_id": broker_fill_id},
         )
 
     command.upgrade(cfg, "20260724_0005")
@@ -634,7 +646,7 @@ def test_breaker_upgrade_quarantines_null_id_fills_and_trips_drift(tmp_path):
         ).mappings().one()
 
     assert fill == {
-        "broker_fill_id": None,
+        "broker_fill_id": broker_fill_id,
         "reconciliation_state": "quarantined",
     }
     assert order == {

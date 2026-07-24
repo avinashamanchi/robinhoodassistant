@@ -440,6 +440,18 @@ class OrderRepository:
             if result.rowcount != 1:
                 session.rollback()
                 return False
+            if cumulative_contradiction:
+                trip_in_session(
+                    session,
+                    BreakerScope.broker_drift(),
+                    (
+                        f"broker cumulative fill {filled_qty} for order "
+                        f"{order_id} is below authoritative local quantity "
+                        f"{authoritative_qty}"
+                    ),
+                    "service:reconciliation",
+                    now=now,
+                )
             session.commit()
             return True
 

@@ -12,7 +12,11 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import QueryOrderStatus, TimeInForce
 
 from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
-from trading_assistant.broker.base import BrokerAcceptanceUnknown, BrokerSubmissionRejected
+from trading_assistant.broker.base import (
+    BrokerAcceptanceUnknown,
+    BrokerDataIntegrityError,
+    BrokerSubmissionRejected,
+)
 from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
@@ -451,6 +455,31 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     assert fills[0].filled_at == datetime(
         2026, 7, 20, 13, 31, 16, 178437, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize(
+    "raw_id",
+    [None, "", "   ", pytest.param(..., id="missing")],
+)
+def test_fill_activities_reject_missing_or_blank_activity_identity(raw_id):
+    activity = {
+        "id": raw_id,
+        "transaction_time": "2026-07-20T13:31:16Z",
+        "price": "100",
+        "qty": "1",
+        "side": "buy",
+        "symbol": "AAPL",
+        "order_id": "order-1",
+    }
+    if raw_id is ...:
+        activity.pop("id")
+    trading = FakeTrading(activities=[activity])
+
+    with pytest.raises(
+        BrokerDataIntegrityError,
+        match="fill activity identity",
+    ):
+        AlpacaBroker(trading, FakeData({})).get_fill_activities()
 
 
 def test_fill_activities_reject_unknown_side():

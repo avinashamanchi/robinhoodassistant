@@ -328,6 +328,19 @@ class AlpacaBroker(BrokerClient):
                     raise BrokerDataIntegrityError(
                         "invalid Alpaca fill broker order identity"
                     )
+                raw_activity_id = raw.get("id")
+                if (
+                    raw_activity_id is None
+                    or (
+                        isinstance(raw_activity_id, str)
+                        and not raw_activity_id.strip()
+                    )
+                ):
+                    raise BrokerDataIntegrityError(
+                        "invalid Alpaca fill activity identity",
+                        broker_order_id=broker_order_id,
+                    )
+                broker_fill_id = str(raw_activity_id)
                 timestamp = datetime.fromisoformat(
                     str(raw["transaction_time"]).replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
@@ -356,7 +369,7 @@ class AlpacaBroker(BrokerClient):
                     )
                 fills.append(
                     BrokerFill(
-                        broker_fill_id=str(raw["id"]),
+                        broker_fill_id=broker_fill_id,
                         broker_order_id=broker_order_id,
                         ticker=str(raw["symbol"]).upper(),
                         side=side,

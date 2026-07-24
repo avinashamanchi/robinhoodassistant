@@ -22,6 +22,7 @@ from trading_assistant.db.models import (
     FILL_RECONCILIATION_REQUIRED,
     FILL_RECONCILIATION_QUARANTINED,
     FILL_RECONCILIATION_SUPERSEDED,
+    FILL_RECONCILIATION_TRUSTED,
     Fill,
     Order,
     OrderStateMachine,
@@ -454,11 +455,19 @@ class ReconciliationService:
                         advance_cursor = False
                         continue
                     if duplicate is not None:
-                        self._supersede_matching_quarantined_fill(
-                            session,
-                            order,
-                            activity,
-                        )
+                        if fill_has_trusted_identity(duplicate):
+                            self._supersede_matching_quarantined_fill(
+                                session,
+                                order,
+                                activity,
+                            )
+                        else:
+                            self._replace_with_authoritative_activity(
+                                duplicate,
+                                order,
+                                activity,
+                            )
+                            inserted_activities.append(activity)
                         continue
                     self._remove_synthetic_fills(session, order)
                     self._supersede_matching_quarantined_fill(
@@ -510,6 +519,22 @@ class ReconciliationService:
         )
 
     @staticmethod
+    def _replace_with_authoritative_activity(
+        fill: Fill,
+        order: Order,
+        activity: BrokerFill,
+    ) -> None:
+        """Promote one validated exact activity over its untrusted legacy row."""
+        fill.order_id = order.id
+        fill.ticker = activity.ticker
+        fill.side = activity.side
+        fill.qty = activity.qty
+        fill.price = activity.price
+        fill.broker_fill_id = activity.broker_fill_id
+        fill.filled_at = activity.filled_at
+        fill.reconciliation_state = FILL_RECONCILIATION_TRUSTED
+
+    @staticmethod
     def _supersede_matching_quarantined_fill(
         session: Session,
         order: Order,
@@ -518,7 +543,10 @@ class ReconciliationService:
         legacy = session.scalar(
             select(Fill)
             .where(
-                Fill.order_id == order.id,
+                or_(
+                    Fill.order_id == order.id,
+                    Fill.order_id.is_(None),
+                ),
                 Fill.reconciliation_state
                 == FILL_RECONCILIATION_QUARANTINED,
                 Fill.ticker == activity.ticker,
@@ -526,10 +554,11 @@ class ReconciliationService:
                 Fill.qty == activity.qty,
                 Fill.price == activity.price,
             )
-            .order_by(Fill.id)
+            .order_by(Fill.order_id.is_(None), Fill.id)
             .limit(1)
         )
         if legacy is not None:
+            legacy.order_id = order.id
             legacy.reconciliation_state = FILL_RECONCILIATION_SUPERSEDED
 
     @staticmethod
@@ -576,7 +605,13 @@ class ReconciliationService:
         order: Order,
         duplicate: Fill,
     ) -> str | None:
-        if duplicate.order_id != order.id:
+        if (
+            duplicate.order_id != order.id
+            and (
+                duplicate.order_id is not None
+                or fill_has_trusted_identity(duplicate)
+            )
+        ):
             return "broker fill identity belongs to a different local order"
         if duplicate.ticker.upper() != activity.ticker.upper():
             return "broker fill identity replay changed ticker"
