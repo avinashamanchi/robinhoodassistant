@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 import requests
+from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import TimeInForce
 
 from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
 from trading_assistant.broker.models import (
@@ -17,10 +20,12 @@ from trading_assistant.broker.models import (
 )
 
 
-def _snap(last, bid, ask, prev_close):
+def _snap(last, bid, ask, prev_close, *, timestamp=None):
     return SimpleNamespace(
-        latest_trade=SimpleNamespace(price=last),
-        latest_quote=SimpleNamespace(bid_price=bid, ask_price=ask),
+        latest_trade=SimpleNamespace(price=last, timestamp=timestamp),
+        latest_quote=SimpleNamespace(
+            bid_price=bid, ask_price=ask, timestamp=timestamp
+        ),
         previous_daily_bar=SimpleNamespace(close=prev_close),
     )
 
@@ -34,6 +39,29 @@ class FakeData:
         return {sym: self._snapshots[sym]}
 
 
+class FakeCryptoData:
+    def __init__(self, snapshots):
+        self._snapshots = snapshots
+        self.requested = []
+
+    def get_crypto_snapshot(self, request):
+        sym = request.symbol_or_symbols
+        self.requested.append(sym)
+        return {sym: self._snapshots[sym]}
+
+
+def _api_error(status_code: int) -> APIError:
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b'{"code":40410000,"message":"order not found"}'
+    request = requests.Request("GET", "https://paper-api.alpaca.markets/v2/orders").prepare()
+    response.request = request
+    return APIError(
+        '{"code":40410000,"message":"order not found"}',
+        requests.HTTPError(response=response, request=request),
+    )
+
+
 class FakeOrder:
     def __init__(self, id, client_order_id, status, filled_qty="0", avg=None):
         self.id = id
@@ -44,16 +72,19 @@ class FakeOrder:
 
 
 class FakeTrading:
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, lookup_error=None):
         self._existing = existing  # simulates a prior order for the same client id
+        self._lookup_error = lookup_error
         self.submit_calls = 0
         self.last_request = None
         self._by_id = {}
 
     def get_order_by_client_order_id(self, cid):
+        if self._lookup_error is not None:
+            raise self._lookup_error
         if self._existing is not None:
             return self._existing
-        raise Exception("order not found")
+        raise _api_error(404)
 
     def submit_order(self, order_data):
         self.submit_calls += 1
@@ -92,7 +123,10 @@ def _order(key="k1", order_type=OrderType.MARKET, limit_price=None):
 
 
 def test_get_quote_maps_snapshot():
-    data = FakeData({"AAPL": _snap("101", "100.9", "101.1", "99")})
+    exchange_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
+    data = FakeData(
+        {"AAPL": _snap("101", "100.9", "101.1", "99", timestamp=exchange_time)}
+    )
     broker = AlpacaBroker(FakeTrading(), data)
     q = broker.get_quote("aapl")
     assert q.ticker == "AAPL"
@@ -100,6 +134,25 @@ def test_get_quote_maps_snapshot():
     assert q.bid == Decimal("100.9")
     assert q.ask == Decimal("101.1")
     assert q.prev_close == Decimal("99")
+    assert q.as_of == exchange_time
+
+
+def test_get_crypto_quote_routes_to_crypto_client_and_preserves_timestamp():
+    exchange_time = datetime(2026, 7, 23, 15, 5, tzinfo=timezone.utc)
+    crypto = FakeCryptoData(
+        {
+            "BTC/USD": _snap(
+                "68000", "67990", "68010", "67000", timestamp=exchange_time
+            )
+        }
+    )
+    broker = AlpacaBroker(FakeTrading(), FakeData({}), crypto)
+    quote = broker.get_quote("btc/usd")
+
+    assert crypto.requested == ["BTC/USD"]
+    assert quote.ticker == "BTC/USD"
+    assert quote.last == Decimal("68000")
+    assert quote.as_of == exchange_time
 
 
 def test_get_account_and_positions_map():
@@ -117,8 +170,41 @@ def test_submit_market_order_builds_request_and_maps_result():
     assert trading.submit_calls == 1
     assert trading.last_request.client_order_id == "k1"
     assert trading.last_request.symbol == "AAPL"
+    assert trading.last_request.time_in_force is TimeInForce.DAY
     assert result.broker_order_id == "brk-1"
     assert result.status is OrderStatus.SUBMITTED  # "new" -> SUBMITTED
+
+
+def test_submit_crypto_order_uses_gtc_time_in_force():
+    trading = FakeTrading()
+    broker = AlpacaBroker(trading, FakeData({}), FakeCryptoData({}))
+    order = OrderRequest(
+        ticker="BTC/USD",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        idempotency_key="crypto-k1",
+        notional=Decimal("25"),
+    )
+
+    broker.submit_order(order)
+
+    assert trading.last_request.symbol == "BTC/USD"
+    assert trading.last_request.time_in_force is TimeInForce.GTC
+
+
+def test_crypto_bracket_order_is_rejected_locally():
+    broker = AlpacaBroker(FakeTrading(), FakeData({}), FakeCryptoData({}))
+    order = OrderRequest(
+        ticker="BTC/USD",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="crypto-bracket",
+        qty=Decimal("0.001"),
+        limit_price=Decimal("68000"),
+    )
+
+    with pytest.raises(ValueError, match="crypto.*bracket"):
+        broker.submit_bracket(order, Decimal("70000"), Decimal("65000"))
 
 
 def test_idempotent_submit_does_not_resubmit():
@@ -130,6 +216,16 @@ def test_idempotent_submit_does_not_resubmit():
     assert trading.submit_calls == 0
     assert result.broker_order_id == "brk-existing"
     assert result.status is OrderStatus.FILLED
+
+
+def test_idempotency_lookup_failure_is_fail_closed():
+    trading = FakeTrading(lookup_error=_api_error(500))
+    broker = AlpacaBroker(trading, FakeData({}))
+
+    with pytest.raises(APIError):
+        broker.submit_order(_order())
+
+    assert trading.submit_calls == 0
 
 
 @pytest.mark.parametrize(

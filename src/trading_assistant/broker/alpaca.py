@@ -13,20 +13,24 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Optional, TypeVar
 
 import requests
+from alpaca.common.exceptions import APIError
+from alpaca.data.historical import CryptoHistoricalDataClient
 from requests.exceptions import ConnectionError as ReqConnectionError
 from requests.exceptions import Timeout as ReqTimeout
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockSnapshotRequest
+from alpaca.data.requests import CryptoSnapshotRequest, StockSnapshotRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import TimeInForce
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
+from ..assets import AssetClass
 from .base import BrokerClient
 from .models import (
     Account,
@@ -111,10 +115,14 @@ def _map_status(raw: Any) -> OrderStatus:
 
 class AlpacaBroker(BrokerClient):
     def __init__(
-        self, trading_client: TradingClient, data_client: StockHistoricalDataClient
+        self,
+        trading_client: TradingClient,
+        data_client: StockHistoricalDataClient,
+        crypto_data_client: CryptoHistoricalDataClient | None = None,
     ) -> None:
         self._trading = trading_client
         self._data = data_client
+        self._crypto_data = crypto_data_client
 
     @classmethod
     def from_credentials(
@@ -127,21 +135,46 @@ class AlpacaBroker(BrokerClient):
     ) -> "AlpacaBroker":
         trading = TradingClient(api_key, secret_key, paper=paper)
         data = StockHistoricalDataClient(api_key, secret_key)
+        crypto_data = CryptoHistoricalDataClient(api_key, secret_key)
         _install_timeout(trading, timeout_seconds)
         _install_timeout(data, timeout_seconds)
-        return cls(trading, data)
+        _install_timeout(crypto_data, timeout_seconds)
+        return cls(trading, data, crypto_data)
 
     # ── market data ────────────────────────────────────────────
     def get_quote(self, ticker: str) -> Quote:
         symbol = ticker.upper()
-        snap = _retry(
-            self._data.get_stock_snapshot,
-            StockSnapshotRequest(symbol_or_symbols=symbol),
-        )[symbol]
+        if AssetClass.for_symbol(symbol) is AssetClass.CRYPTO:
+            if self._crypto_data is None:
+                raise RuntimeError("Alpaca crypto market-data client is not configured")
+            snap = _retry(
+                self._crypto_data.get_crypto_snapshot,
+                CryptoSnapshotRequest(symbol_or_symbols=symbol),
+            )[symbol]
+        else:
+            snap = _retry(
+                self._data.get_stock_snapshot,
+                StockSnapshotRequest(symbol_or_symbols=symbol),
+            )[symbol]
         last = _d(snap.latest_trade.price) if snap.latest_trade else None
         bid = _d(snap.latest_quote.bid_price) if snap.latest_quote else None
         ask = _d(snap.latest_quote.ask_price) if snap.latest_quote else None
         prev_close = _d(snap.previous_daily_bar.close) if snap.previous_daily_bar else None
+        source_time = (
+            getattr(snap.latest_quote, "timestamp", None)
+            if snap.latest_quote
+            else None
+        ) or (
+            getattr(snap.latest_trade, "timestamp", None)
+            if snap.latest_trade
+            else None
+        )
+        if source_time is None:
+            source_time = datetime.now(timezone.utc)
+        elif source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=timezone.utc)
+        else:
+            source_time = source_time.astimezone(timezone.utc)
         # Fall back sensibly if a field is momentarily missing.
         last = last or bid or ask or Decimal(0)
         return Quote(
@@ -150,6 +183,7 @@ class AlpacaBroker(BrokerClient):
             ask=ask or last,
             last=last,
             prev_close=prev_close,
+            as_of=source_time,
         )
 
     # ── account / positions ────────────────────────────────────
@@ -192,7 +226,11 @@ class AlpacaBroker(BrokerClient):
         common = dict(
             symbol=order.ticker.upper(),
             side=side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=(
+                TimeInForce.GTC
+                if AssetClass.for_symbol(order.ticker) is AssetClass.CRYPTO
+                else TimeInForce.DAY
+            ),
             client_order_id=order.idempotency_key,
         )
         if order.qty is not None:
@@ -210,6 +248,8 @@ class AlpacaBroker(BrokerClient):
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Server-side OCO bracket: entry + take-profit + stop-loss in one order."""
+        if AssetClass.for_symbol(order.ticker) is AssetClass.CRYPTO:
+            raise ValueError("crypto bracket orders are not supported by Alpaca")
         return _retry(self._submit_bracket_once, order, take_profit, stop_loss)
 
     def _submit_bracket_once(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
@@ -252,9 +292,13 @@ class AlpacaBroker(BrokerClient):
             # A transient network error must NOT be read as "no such order" — that
             # would risk a duplicate submit. Propagate so the caller's retry re-tries.
             raise
-        except Exception:
-            # SDK raises a real error when no such order exists: not submitted yet.
-            return None
+        except APIError as exc:
+            # Only a confirmed 404 means this client id has not been submitted.
+            # Authentication errors, rate limits and server failures must fail
+            # closed or a retry could create a duplicate order.
+            if exc.status_code == 404:
+                return None
+            raise
 
     def _to_result(self, o: Any) -> OrderResult:
         return OrderResult(
