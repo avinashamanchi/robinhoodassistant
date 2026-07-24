@@ -113,7 +113,10 @@ class OrderSubmissionService:
             self.repository.record_pre_submission_rejection(order_id, reasons, now)
             return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
 
-        if not self.repository.claim_submission(order_id, self.now()):
+        claim_now = self.now()
+        if not self.repository.claim_submission(order_id, claim_now):
+            if self.repository.expire_approved(order_id, claim_now):
+                return SubmissionResult(order_id, OrderStatus.EXPIRED)
             with self.session_factory() as session:
                 changed = session.get(Order, order_id)
                 if changed is None:

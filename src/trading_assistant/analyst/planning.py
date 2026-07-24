@@ -82,7 +82,9 @@ class PlanningService:
             return row.id
 
     # ── approve (gate + decompose into rules) ──────────────────
-    def approve_plan(self, plan_id: int) -> dict[str, Any]:
+    def approve_plan(self, plan_id: int, *, actor: str, reason: str) -> dict[str, Any]:
+        if not actor.strip() or not reason.strip():
+            raise ValueError("approval actor and reason must be non-empty")
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
@@ -151,6 +153,8 @@ class PlanningService:
                         order_req,
                         plan.exit_plan.targets[0].price_level,
                         plan.exit_plan.stop,
+                        actor=actor,
+                        reason=reason,
                     )
                     if not bracket.get("executed"):
                         row.status = "rejected"

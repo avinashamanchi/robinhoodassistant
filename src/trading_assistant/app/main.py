@@ -248,9 +248,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="plan not found")
         return plan
 
-    @app.post("/plans/{plan_id}/approve", dependencies=[auth])
-    def approve_plan(plan_id: int):
-        result = _require_planning().approve_plan(plan_id)
+    @app.post("/plans/{plan_id}/approve")
+    def approve_plan(plan_id: int, body: ApprovalIn, principal: str = auth):
+        result = _require_planning().approve_plan(
+            plan_id, actor=principal, reason=body.reason
+        )
         if "error" in result and "promotion gate" in result["error"]:
             raise HTTPException(status_code=409, detail=result)
         return result

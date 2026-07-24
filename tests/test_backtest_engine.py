@@ -102,6 +102,26 @@ def test_limit_order_only_fills_when_crossed():
     assert broker.fills[0].price == 95.0
 
 
+def test_sim_broker_deduplicates_simple_and_bracket_client_ids():
+    broker = SimBroker(BacktestConfig(), starting_cash=100_000)
+    simple = _order("AAPL", OrderSide.BUY, notional=1000)
+    first = broker.submit_order(simple)
+    second = broker.submit_order(simple)
+
+    assert second == first
+    assert len(broker._pending) == 1
+    assert len(broker._orders) == 1
+
+    bracket = _order("MSFT", OrderSide.BUY, qty=1, limit=100, otype=OrderType.LIMIT)
+    bracket_first = broker.submit_bracket(bracket, Decimal("110"), Decimal("95"))
+    bracket_second = broker.submit_bracket(bracket, Decimal("110"), Decimal("95"))
+
+    assert bracket_second == bracket_first
+    assert len(broker._pending) == 2
+    assert len(broker._orders) == 2
+    assert len(broker.brackets) == 1
+
+
 # ── end-to-end ──────────────────────────────────────────────────
 def test_buy_and_hold_grows_in_uptrend():
     source = DataSource({"AAPL": make_trend(n_base=5, n_move=200, start=100.0, end=200.0)})

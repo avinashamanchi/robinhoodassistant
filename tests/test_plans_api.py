@@ -69,7 +69,7 @@ def test_analyze_and_plan_flow(client):
     detail = c.get(f"/plans/{pid}").json()
     assert detail["plan"]["action"] == "buy" and "sized" in detail
 
-    approve = c.post(f"/plans/{pid}/approve").json()
+    approve = c.post(f"/plans/{pid}/approve", json={"reason": "reviewed plan"}).json()
     # Single-target plan -> server-side bracket (0 daemon rules) OR rules armed.
     assert approve["status"] == "approved"
     assert approve.get("bracket") is not None or approve["rules_created"] >= 1

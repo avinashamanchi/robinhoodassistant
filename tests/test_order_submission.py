@@ -73,6 +73,38 @@ def test_approved_proposal_that_expires_before_submit_never_calls_broker(make_se
     assert svc.broker.submit_calls == 0
 
 
+def test_expiry_during_snapshot_prevents_submission_claim(make_service):
+    class FakeNow:
+        def __init__(self):
+            self.current = utcnow()
+
+        def __call__(self):
+            return self.current
+
+        def advance(self, **delta):
+            self.current += timedelta(**delta)
+
+    now = FakeNow()
+    svc = make_service()
+    order_id = _approved_order(svc)
+    original = svc.snapshot_service.assemble_for_execution
+
+    def slow_snapshot(*args, **kwargs):
+        snapshot = original(*args, **kwargs)
+        now.advance(minutes=16)
+        return snapshot
+
+    svc.snapshot_service.assemble_for_execution = slow_snapshot
+    svc.order_submission.now = now
+
+    result = svc.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.EXPIRED
+    assert svc.broker.submit_calls == 0
+    with svc.session_factory() as session:
+        assert session.get(Order, order_id).status == OrderStatus.EXPIRED.value
+
+
 def test_snapshot_failure_before_claim_leaves_approval_recorded(make_service):
     svc = make_service()
     order_id = _approved_order(svc)

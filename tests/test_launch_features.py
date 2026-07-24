@@ -25,7 +25,7 @@ from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.llm_runner import LLMRunConfig
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import Rule, ShadowCall, TradePlanRow, utcnow
+from trading_assistant.db.models import Order, Rule, ShadowCall, TradePlanRow, utcnow
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -155,13 +155,20 @@ def test_single_target_plan_uses_bracket(make_service):
     )
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
     pid = planning.analyze("AAPL")["plan_id"]
-    res = planning.approve_plan(pid)
+    res = planning.approve_plan(
+        pid, actor="operator:avi", reason="reviewed single-target plan"
+    )
 
     assert res["bracket"] is not None and res["bracket"]["bracket"] is True
     assert len(svc.broker.brackets) == 1                    # server-side OCO submitted
     with svc.session_factory() as s:
         kinds = {r.kind for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()}
+        bracket_order = s.execute(
+            select(Order).where(Order.idempotency_key == f"plan-{pid}-bracket-entry")
+        ).scalar_one()
     assert not ({"entry", "target", "stop"} & kinds)        # handled by the bracket
+    assert bracket_order.approval_actor == "operator:avi"
+    assert bracket_order.approval_reason == "reviewed single-target plan"
 
 
 def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
@@ -191,7 +198,13 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         limit_price=Decimal("100"),
     )
 
-    first = svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+    first = svc.submit_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="response-loss drill",
+    )
     assert first["executed"] is False
     assert first["status"] == "acceptance_unknown"
     with svc.session_factory() as session:
@@ -201,7 +214,13 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         assert stored.status == "acceptance_unknown"
         assert stored.broker_order_id is None
 
-    result = svc.submit_bracket_order(request, Decimal("110"), Decimal("95"))
+    result = svc.submit_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="response-loss drill",
+    )
 
     assert result["executed"] is False
     assert result["status"] == "acceptance_unknown"
@@ -212,7 +231,7 @@ def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
     pid = planning.analyze("AAPL")["plan_id"]
-    planning.approve_plan(pid)
+    planning.approve_plan(pid, actor="operator:test", reason="reviewed ladder plan")
     assert len(svc.broker.brackets) == 0                    # ladder -> daemon rules, not bracket
     with svc.session_factory() as s:
         kinds = {
@@ -248,12 +267,14 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
     first_result = {}
 
     def approve_first():
-        first_result.update(planning.approve_plan(plan_id))
+        first_result.update(
+            planning.approve_plan(plan_id, actor="operator:test", reason="reviewed")
+        )
 
     thread = Thread(target=approve_first)
     thread.start()
     assert entered.wait(timeout=2)
-    second = planning.approve_plan(plan_id)
+    second = planning.approve_plan(plan_id, actor="operator:second", reason="reviewed")
     release.set()
     thread.join(timeout=2)
 

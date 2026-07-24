@@ -75,7 +75,7 @@ def test_approve_decomposes_into_preapproved_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = pln.analyze("AAPL")["plan_id"]
-    res = pln.approve_plan(pid)
+    res = pln.approve_plan(pid, actor="operator:test", reason="reviewed plan")
     assert res["status"] == "approved"
 
     with svc.session_factory() as s:
@@ -91,7 +91,7 @@ def test_cancel_plan_cancels_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = pln.analyze("AAPL")["plan_id"]
-    pln.approve_plan(pid)
+    pln.approve_plan(pid, actor="operator:test", reason="reviewed plan")
     res = pln.cancel_plan(pid)
     assert res["status"] == "canceled" and res["rules_canceled"] >= 1
     with svc.session_factory() as s:
@@ -112,5 +112,7 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
     pln = PlanningService(svc_live, _StubAnalyst(_plan()), _provider, sec)
 
     pid = pln.analyze("AAPL")["plan_id"]
-    res = pln.approve_plan(pid)  # 0 graded calls -> gate blocks live approval
+    res = pln.approve_plan(
+        pid, actor="operator:test", reason="reviewed plan"
+    )  # 0 graded calls -> gate blocks live approval
     assert "promotion gate" in res["error"]

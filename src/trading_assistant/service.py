@@ -389,9 +389,18 @@ class TradingService:
         }
 
     def submit_bracket_order(
-        self, order_req: OrderRequest, take_profit, stop_loss
+        self,
+        order_req: OrderRequest,
+        take_profit,
+        stop_loss,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str = "",
     ) -> dict[str, Any]:
         """Persist, approve, and submit a bracket through the same durable outbox."""
+        if not actor.strip() or not reason.strip():
+            raise ValueError("approval actor and reason must be non-empty")
         if not hasattr(self.broker, "submit_bracket"):
             return {"error": "broker does not support bracket orders", "executed": False}
         try:
@@ -446,10 +455,10 @@ class TradingService:
             approval = self.order_application.approve(
                 ApprovalCommand(
                     order_id,
-                    "operator:plan",
-                    "approved bracket plan",
+                    actor,
+                    reason,
                     utcnow(),
-                    f"bracket-{order_req.idempotency_key}",
+                    request_id or uuid.uuid4().hex,
                 )
             )
             current_status = approval.status

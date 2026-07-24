@@ -75,6 +75,8 @@ class SimBroker(BrokerClient):
         self.fills: list[SimFill] = []
         self._ids = count(1)
         self._orders: dict[str, OrderResult] = {}
+        self._orders_by_key: dict[str, OrderResult] = {}
+        self.brackets: list[dict] = []
 
     # ── cost model ─────────────────────────────────────────────
     def _slippage(self, ac: AssetClass) -> float:
@@ -110,6 +112,9 @@ class SimBroker(BrokerClient):
         return out
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
+        existing = self._orders_by_key.get(order.idempotency_key)
+        if existing is not None:
+            return existing
         ac = AssetClass.for_symbol(order.ticker)
         self._pending.append(_Pending(order=order, asset_class=ac))
         result = OrderResult(
@@ -118,20 +123,17 @@ class SimBroker(BrokerClient):
             status=OrderStatus.SUBMITTED,
         )
         self._orders[result.broker_order_id] = result
+        self._orders_by_key[order.idempotency_key] = result
         return result
 
     def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
-        return next(
-            (
-                result
-                for result in self._orders.values()
-                if result.idempotency_key == client_order_id
-            ),
-            None,
-        )
+        return self._orders_by_key.get(client_order_id)
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Record a server-side bracket (entry + OCO take-profit/stop). Test double."""
+        existing = self.get_order_by_client_id(order.idempotency_key)
+        if existing is not None:
+            return existing
         result = self.submit_order(order)
         self.brackets.append(
             {"order": order, "take_profit": take_profit, "stop_loss": stop_loss,

@@ -5,11 +5,11 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import AuditEvent, Order, RiskEvent
+from trading_assistant.db.models import AuditEvent, Order, Proposal, RiskEvent
 
 
 class OrderRepository:
@@ -66,6 +66,10 @@ class OrderRepository:
                 .where(
                     Order.id == order_id,
                     Order.status == OrderStatus.APPROVAL_RECORDED.value,
+                    or_(
+                        ~Order.proposal.has(),
+                        Order.proposal.has(Proposal.expires_at > now),
+                    ),
                 )
                 .values(
                     status=OrderStatus.SUBMITTING.value,
@@ -180,7 +184,7 @@ class OrderRepository:
             )
             session.commit()
 
-    def expire_approved(self, order_id: int, now: datetime) -> None:
+    def expire_approved(self, order_id: int, now: datetime) -> bool:
         """Expire a still-unclaimed approval before it can reach the broker."""
         with self.session_factory() as session:
             result = session.execute(
@@ -188,6 +192,7 @@ class OrderRepository:
                 .where(
                     Order.id == order_id,
                     Order.status == OrderStatus.APPROVAL_RECORDED.value,
+                    Order.proposal.has(Proposal.expires_at <= now),
                 )
                 .values(
                     status=OrderStatus.EXPIRED.value,
@@ -196,5 +201,7 @@ class OrderRepository:
                 )
             )
             if result.rowcount != 1:
-                raise RuntimeError(f"order {order_id} changed during expiry")
+                session.rollback()
+                return False
             session.commit()
+            return True
