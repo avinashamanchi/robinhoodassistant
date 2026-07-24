@@ -211,6 +211,7 @@ class OrderSubmissionService:
                     identity_error = order_result_identity_error(
                         broker_result,
                         request.idempotency_key,
+                        request.ticker,
                     )
                     if identity_error is not None:
                         self.repository.record_invalid_broker_identity(

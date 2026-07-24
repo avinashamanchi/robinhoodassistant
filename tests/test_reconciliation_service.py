@@ -990,6 +990,146 @@ class ActivityBroker(MockBroker):
         return list(self.activities)
 
 
+def _crypto_order_with_remote_fill(
+    service,
+    broker,
+    *,
+    broker_order_id: str,
+    client_order_id: str,
+    filled_qty: Decimal,
+) -> tuple[int, datetime]:
+    submitted_at = utcnow() - timedelta(seconds=1)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key=client_order_id,
+            ticker="BTC/USD",
+            side=OrderSide.BUY.value,
+            order_type=OrderType.MARKET.value,
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id=broker_order_id,
+            submission_started_at=submitted_at,
+            acceptance_state="accepted",
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=filled_qty,
+        avg_fill_price=Decimal("80000"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+    return order_id, submitted_at + timedelta(milliseconds=500)
+
+
+def test_compact_crypto_fill_matches_slash_order_and_replays_as_noop(
+    make_service,
+):
+    broker = ActivityBroker()
+    broker.set_price("BTC/USD", Decimal("80000"))
+    service = make_service(broker=broker)
+    order_id, filled_at = _crypto_order_with_remote_fill(
+        service,
+        broker,
+        broker_order_id="crypto-equivalent-broker",
+        client_order_id="crypto-equivalent-client",
+        filled_qty=Decimal("0.001"),
+    )
+    compact = BrokerFill(
+        broker_fill_id="crypto-equivalent-fill",
+        broker_order_id="crypto-equivalent-broker",
+        ticker="BTCUSD",
+        side="buy",
+        qty=Decimal("0.001"),
+        price=Decimal("80000"),
+        filled_at=filled_at,
+    )
+    broker.activities = [compact]
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=compact.broker_fill_id,
+            broker_order_id=compact.broker_order_id,
+            ticker="BTC/USD",
+            side=compact.side,
+            qty=compact.qty,
+            price=compact.price,
+            filled_at=compact.filled_at,
+        )
+    ]
+    replay = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 1
+    assert first.broker_drift == ()
+    assert replay.inserted_fills == 0
+    assert replay.broker_drift == ()
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        fill = session.scalar(
+            select(Fill).where(
+                Fill.broker_fill_id == compact.broker_fill_id
+            )
+        )
+        assert order.acceptance_state == "accepted"
+        assert fill.ticker == "BTC/USD"
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.broker_fill_id == compact.broker_fill_id
+            )
+        ) == 1
+
+
+@pytest.mark.parametrize("wrong_pair", ["ETHUSD", "ETH/USD", "BT/CUSD"])
+def test_crypto_fill_equivalence_still_rejects_wrong_pair(
+    make_service,
+    wrong_pair,
+):
+    broker = ActivityBroker()
+    broker.set_price("BTC/USD", Decimal("80000"))
+    service = make_service(broker=broker)
+    order_id, filled_at = _crypto_order_with_remote_fill(
+        service,
+        broker,
+        broker_order_id=f"wrong-pair-{wrong_pair}-broker",
+        client_order_id=f"wrong-pair-{wrong_pair}-client",
+        filled_qty=Decimal("0.001"),
+    )
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=f"wrong-pair-{wrong_pair}-fill",
+            broker_order_id=f"wrong-pair-{wrong_pair}-broker",
+            ticker=wrong_pair,
+            side="buy",
+            qty=Decimal("0.001"),
+            price=Decimal("80000"),
+            filled_at=filled_at,
+        )
+    ]
+
+    report = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+
+    assert report.inserted_fills == 0
+    assert any("does not match local ticker" in item for item in report.broker_drift)
+    assert restarted.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    ) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        assert session.scalar(
+            select(func.count()).select_from(Fill).where(
+                Fill.order_id == order_id
+            )
+        ) == 0
+
+
 @pytest.mark.parametrize(
     (
         "local_qty",

@@ -496,6 +496,69 @@ def test_invalid_submission_identity_is_unknown_latched_and_trips_drift(
         assert order.last_error_code == "invalid_broker_identity"
 
 
+@pytest.mark.parametrize(
+    ("returned_ticker", "expected_status", "expected_drift"),
+    [
+        ("BTCUSD", OrderStatus.SUBMITTED, False),
+        ("BTC/USD", OrderStatus.SUBMITTED, False),
+        ("ETHUSD", OrderStatus.ACCEPTANCE_UNKNOWN, True),
+        ("ETH/USD", OrderStatus.ACCEPTANCE_UNKNOWN, True),
+        ("BT/CUSD", OrderStatus.ACCEPTANCE_UNKNOWN, True),
+    ],
+)
+def test_crypto_submission_identity_accepts_equivalent_symbol_only(
+    make_service,
+    returned_ticker,
+    expected_status,
+    expected_drift,
+):
+    class SymbolIdentityBroker(MockBroker):
+        def submit_order(self, order):
+            accepted = super().submit_order(order)
+            result = OrderResult(
+                accepted.idempotency_key,
+                accepted.broker_order_id,
+                OrderStatus.SUBMITTED,
+                ticker=returned_ticker,
+            )
+            self._orders_by_key[order.idempotency_key] = result
+            self._orders_by_id[accepted.broker_order_id] = result
+            return result
+
+    broker = SymbolIdentityBroker()
+    broker.set_price("BTC/USD", Decimal("80000"))
+    service = make_service(broker=broker)
+    order_id = service.propose_order(
+        "BTC/USD",
+        "buy",
+        "market",
+        notional="100",
+        idempotency_key=f"symbol-identity-{returned_ticker}",
+    )["order_id"]
+    service.order_application.approve(
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed crypto symbol identity",
+            utcnow(),
+        )
+    )
+
+    result = service.order_submission.submit(order_id)
+
+    assert result.status is expected_status
+    assert (
+        service.breakers.is_tripped(BreakerScope.broker_drift())
+        is expected_drift
+    )
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        assert order.status == expected_status.value
+        assert (
+            order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+        ) is expected_drift
+
+
 def test_malformed_position_payload_fails_before_submission_claim(make_service):
     service = make_service()
     order_id = _approved_order(service)

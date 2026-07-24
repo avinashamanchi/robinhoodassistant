@@ -9,6 +9,7 @@ from decimal import Decimal
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from trading_assistant.assets import canonicalize_broker_symbol
 from trading_assistant.broker.base import BrokerClient, BrokerDataIntegrityError
 from trading_assistant.broker.models import (
     BrokerFill,
@@ -113,7 +114,11 @@ class ReconciliationService:
     ) -> tuple[int, tuple[int, ...], tuple[tuple[int, OrderResult], ...]]:
         with self.session_factory() as session:
             rows = session.execute(
-                select(Order.id, Order.idempotency_key).where(
+                select(
+                    Order.id,
+                    Order.idempotency_key,
+                    Order.ticker,
+                ).where(
                     Order.status.in_(
                         (
                             OrderStatus.SUBMITTING.value,
@@ -126,7 +131,7 @@ class ReconciliationService:
         resolved = 0
         unresolved: list[int] = []
         resolved_results: list[tuple[int, OrderResult]] = []
-        for order_id, client_order_id in rows:
+        for order_id, client_order_id, ticker in rows:
             try:
                 remote = self.broker.get_order_by_client_id(client_order_id)
             except BrokerDataIntegrityError as exc:
@@ -148,6 +153,7 @@ class ReconciliationService:
             identity_error = order_result_identity_error(
                 remote,
                 client_order_id,
+                ticker,
             )
             if identity_error is not None:
                 self._latch_order_ids(
@@ -441,6 +447,10 @@ class ReconciliationService:
                     order = orders[0]
                     activity = replace(
                         activity,
+                        ticker=canonicalize_broker_symbol(
+                            activity.ticker,
+                            reference_symbol=order.ticker,
+                        ),
                         filled_at=_normalized_utc(activity.filled_at),
                     )
                     validation_error = self._fill_activity_validation_error(
@@ -788,6 +798,7 @@ class ReconciliationService:
                 identity_error = order_result_identity_error(
                     remote,
                     order.idempotency_key,
+                    order.ticker,
                 )
                 if (
                     identity_error is None
@@ -1376,6 +1387,7 @@ class ReconciliationService:
                     identity_error = order_result_identity_error(
                         remote,
                         order.idempotency_key,
+                        order.ticker,
                     )
                     if (
                         identity_error is None

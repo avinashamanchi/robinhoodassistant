@@ -36,7 +36,7 @@ from alpaca.trading.requests import (
 )
 from zoneinfo import ZoneInfo
 
-from ..assets import AssetClass
+from ..assets import AssetClass, canonicalize_broker_symbol
 from .base import (
     BrokerAcceptanceUnknown,
     BrokerClient,
@@ -264,7 +264,15 @@ class AlpacaBroker(BrokerClient):
                 raise BrokerDataIntegrityError(
                     "invalid Alpaca position symbol"
                 )
-            symbol = raw_symbol.strip().upper()
+            try:
+                symbol = canonicalize_broker_symbol(
+                    raw_symbol,
+                    asset_class=getattr(p, "asset_class", None),
+                )
+            except ValueError as exc:
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca position symbol"
+                ) from exc
             out.append(
                 Position(
                     ticker=symbol,
@@ -369,11 +377,21 @@ class AlpacaBroker(BrokerClient):
                         "invalid Alpaca fill quantity or price",
                         broker_order_id=broker_order_id,
                     )
+                try:
+                    symbol = canonicalize_broker_symbol(
+                        raw.get("symbol"),
+                        asset_class=raw.get("asset_class"),
+                    )
+                except ValueError as exc:
+                    raise BrokerDataIntegrityError(
+                        "invalid Alpaca fill symbol",
+                        broker_order_id=broker_order_id,
+                    ) from exc
                 fills.append(
                     BrokerFill(
                         broker_fill_id=broker_fill_id,
                         broker_order_id=broker_order_id,
-                        ticker=str(raw["symbol"]).upper(),
+                        ticker=symbol,
                         side=side,
                         qty=normalized_qty,
                         price=normalized_price,
@@ -525,12 +543,26 @@ class AlpacaBroker(BrokerClient):
                 "invalid Alpaca filled_qty",
                 broker_order_id=broker_order_id,
             )
+        raw_symbol = getattr(o, "symbol", None)
+        ticker = None
+        if raw_symbol is not None:
+            try:
+                ticker = canonicalize_broker_symbol(
+                    raw_symbol,
+                    asset_class=getattr(o, "asset_class", None),
+                )
+            except ValueError as exc:
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca order symbol",
+                    broker_order_id=broker_order_id,
+                ) from exc
         return OrderResult(
             idempotency_key=getattr(o, "client_order_id", "") or "",
             broker_order_id=broker_order_id,
             status=_map_status(o.status),
             filled_qty=filled_qty,
             avg_fill_price=_d(getattr(o, "filled_avg_price", None)),
+            ticker=ticker,
         )
 
 

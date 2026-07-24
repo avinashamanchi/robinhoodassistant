@@ -11,6 +11,7 @@ import requests
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import QueryOrderStatus, TimeInForce
 
+from trading_assistant.assets import AssetClass
 from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
 from trading_assistant.broker.base import (
     BrokerAcceptanceUnknown,
@@ -23,6 +24,8 @@ from trading_assistant.broker.models import (
     OrderStatus,
     OrderType,
 )
+from trading_assistant.orders.snapshot import PortfolioSnapshotService
+from trading_assistant.risk.clock import FakeClock
 
 
 def _snap(
@@ -90,12 +93,28 @@ def _api_error(status_code: int) -> APIError:
 
 
 class FakeOrder:
-    def __init__(self, id, client_order_id, status, filled_qty="0", avg=None):
+    def __init__(
+        self,
+        id,
+        client_order_id,
+        status,
+        filled_qty="0",
+        avg=None,
+        *,
+        symbol=None,
+        asset_class=None,
+    ):
         self.id = id
         self.client_order_id = client_order_id
         self.status = SimpleNamespace(value=status)
         self.filled_qty = filled_qty
         self.filled_avg_price = avg
+        self.symbol = symbol
+        self.asset_class = (
+            SimpleNamespace(value=asset_class)
+            if isinstance(asset_class, str)
+            else asset_class
+        )
 
 
 class FakeTrading:
@@ -322,6 +341,86 @@ def test_get_account_and_positions_map():
 
 
 @pytest.mark.parametrize(
+    ("raw_symbol", "raw_asset_class", "expected_symbol"),
+    [
+        ("BTCUSD", "crypto", "BTC/USD"),
+        ("BTC/USD", "crypto", "BTC/USD"),
+        ("ACMEUSD", "us_equity", "ACMEUSD"),
+    ],
+)
+def test_get_positions_canonicalizes_only_metadata_identified_crypto(
+    raw_symbol,
+    raw_asset_class,
+    expected_symbol,
+):
+    trading = FakeTrading()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(
+            symbol=raw_symbol,
+            asset_class=SimpleNamespace(value=raw_asset_class),
+            qty="2",
+            avg_entry_price="90",
+            current_price="100",
+            unrealized_intraday_pl="5",
+        )
+    ]
+
+    position = AlpacaBroker(trading, FakeData({})).get_positions()[0]
+
+    assert position.ticker == expected_symbol
+
+
+def test_compact_crypto_position_is_single_canonical_snapshot_exposure(
+    session_factory,
+    app_config,
+):
+    captured_at = datetime.now(timezone.utc)
+    trading = FakeTrading()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(
+            symbol="BTCUSD",
+            asset_class=SimpleNamespace(value="crypto"),
+            qty="2",
+            avg_entry_price="60000",
+            current_price="68000",
+            unrealized_intraday_pl="1000",
+        )
+    ]
+    crypto_data = FakeCryptoData(
+        {
+            "BTC/USD": _snap(
+                "70000",
+                "69990",
+                "70010",
+                "69000",
+                timestamp=captured_at,
+            )
+        }
+    )
+    broker = AlpacaBroker(trading, FakeData({}), crypto_data)
+    snapshots = PortfolioSnapshotService(
+        session_factory,
+        broker,
+        lambda _asset_class: FakeClock(is_open=True),
+        lambda: {},
+        risk_config_for_asset=lambda asset_class: (
+            app_config.crypto_risk
+            if asset_class is AssetClass.CRYPTO
+            else app_config.risk
+        ),
+        now=lambda: captured_at,
+    )
+
+    snapshot = snapshots.assemble_for_execution("BTC/USD")
+
+    assert set(snapshot.positions) == {"BTC/USD"}
+    assert snapshot.position_value("BTC/USD") == Decimal("140000")
+    assert snapshot.gross_exposure() == Decimal("140000")
+    assert snapshot.quote_fresh is True
+    assert crypto_data.requested == ["BTC/USD"]
+
+
+@pytest.mark.parametrize(
     ("field", "raw_value"),
     [
         ("qty", None),
@@ -457,6 +556,38 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     assert fills[0].filled_at == datetime(
         2026, 7, 20, 13, 31, 16, 178437, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize(
+    ("raw_symbol", "raw_asset_class", "expected_symbol"),
+    [
+        ("BTCUSD", "crypto", "BTC/USD"),
+        ("BTC/USD", "crypto", "BTC/USD"),
+        ("ACMEUSD", "us_equity", "ACMEUSD"),
+    ],
+)
+def test_fill_activities_canonicalize_only_metadata_identified_crypto(
+    raw_symbol,
+    raw_asset_class,
+    expected_symbol,
+):
+    activity = {
+        "id": f"activity-{raw_symbol}",
+        "transaction_time": "2026-07-20T13:31:16Z",
+        "price": "100",
+        "qty": "1",
+        "side": "buy",
+        "symbol": raw_symbol,
+        "asset_class": raw_asset_class,
+        "order_id": "order-1",
+    }
+
+    fill = AlpacaBroker(
+        FakeTrading(activities=[activity]),
+        FakeData({}),
+    ).get_fill_activities()[0]
+
+    assert fill.ticker == expected_symbol
 
 
 @pytest.mark.parametrize(
@@ -636,6 +767,35 @@ def test_get_order_by_client_id_returns_none_or_prior_order_without_submitting()
     assert found is not None
     assert found.broker_order_id == "brk-existing"
     assert existing._trading.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_symbol", "raw_asset_class", "expected_symbol"),
+    [
+        ("BTCUSD", "crypto", "BTC/USD"),
+        ("BTC/USD", "crypto", "BTC/USD"),
+        ("ACMEUSD", "us_equity", "ACMEUSD"),
+    ],
+)
+def test_order_status_canonicalizes_only_metadata_identified_crypto(
+    raw_symbol,
+    raw_asset_class,
+    expected_symbol,
+):
+    trading = FakeTrading()
+    trading._by_id["brk-status"] = FakeOrder(
+        "brk-status",
+        "client-status",
+        "new",
+        symbol=raw_symbol,
+        asset_class=raw_asset_class,
+    )
+
+    result = AlpacaBroker(trading, FakeData({})).get_order_status(
+        "brk-status"
+    )
+
+    assert result.ticker == expected_symbol
 
 
 def test_get_open_orders_requests_open_only_and_maps_results():

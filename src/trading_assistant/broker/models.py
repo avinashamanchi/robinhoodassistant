@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
+from trading_assistant.assets import broker_symbols_equivalent
+
 
 FILL_NUMERIC_PRECISION = 24
 FILL_NUMERIC_SCALE = 9
@@ -288,11 +290,13 @@ class OrderResult:
     filled_qty: Decimal = Decimal(0)
     avg_fill_price: Optional[Decimal] = None
     submitted_at: datetime = field(default_factory=_utcnow)
+    ticker: Optional[str] = None
 
 
 def order_result_identity_error(
     result: OrderResult,
     expected_client_id: str,
+    expected_ticker: str | None = None,
 ) -> str | None:
     """Return why a broker order result cannot identify the requested order."""
     if (
@@ -307,6 +311,16 @@ def order_result_identity_error(
         return (
             "broker client identity does not match local idempotency key"
         )
+    if result.ticker is not None and expected_ticker is not None:
+        try:
+            ticker_matches = broker_symbols_equivalent(
+                result.ticker,
+                expected_ticker,
+            )
+        except ValueError:
+            ticker_matches = False
+        if not ticker_matches:
+            return "broker ticker identity does not match local order"
     return None
 
 
