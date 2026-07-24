@@ -115,6 +115,27 @@ def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
     assert svc.broker.submit_calls == 0
 
 
+def test_shadow_batch_is_idempotent_across_process_restarts(make_service):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    source = DataSource(
+        {
+            "AAPL": make_bars(300, seed=1),
+            "SPY": make_bars(300, seed=2),
+        }
+    )
+
+    first_process = ShadowRunner(
+        svc, planning, source, lambda sym: Decimal("110"), top_n=1
+    )
+    second_process = ShadowRunner(
+        svc, planning, source, lambda sym: Decimal("110"), top_n=1
+    )
+
+    assert len(first_process.run_once()) == 1
+    assert second_process.run_once() == []
+
+
 # ── D2 digest ───────────────────────────────────────────────────
 def test_digest_has_sections(make_service):
     d = compose_digest(make_service())

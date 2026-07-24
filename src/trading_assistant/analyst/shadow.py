@@ -61,15 +61,34 @@ class ShadowRunner:
 
     def run_once(self) -> list[int]:
         """Screen + analyze the top candidates into shadow plans. No orders."""
-        from ..db.models import ShadowCall, TradePlanRow, utcnow
+        from ..db.models import AnalysisReportRow, ShadowCall, TradePlanRow, utcnow
 
         universe = self.service.config.screener.universe or self.service.config.risk.ticker_allowlist
         candidates = screener.screen_source(
             self.screen_source, [s.upper() for s in universe],
             spy_symbol=self.spy_symbol, top_n=self.top_n,
         )
+        now = utcnow()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        version = self.service.config.analyst.version
+        with self.service.session_factory() as s:
+            completed_symbols = set(
+                s.execute(
+                    select(ShadowCall.symbol)
+                    .join(
+                        AnalysisReportRow,
+                        AnalysisReportRow.id == ShadowCall.report_id,
+                    )
+                    .where(
+                        ShadowCall.created_at >= day_start,
+                        AnalysisReportRow.analyst_version == version,
+                    )
+                ).scalars()
+            )
         plan_ids: list[int] = []
         for c in candidates:
+            if c["symbol"] in completed_symbols:
+                continue
             try:
                 # Stores a shadow plan only; it never creates or executes an order.
                 out = self.planning.analyze(c["symbol"])
@@ -94,6 +113,7 @@ class ShadowRunner:
                 ))
                 s.commit()
             plan_ids.append(plan_id)
+            completed_symbols.add(plan.symbol)
         return plan_ids
 
     def grade_due(self, now=None) -> int:
