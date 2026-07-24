@@ -70,7 +70,7 @@ class RiskEngine:
 
         if quote is not None:
             if order.side is OrderSide.BUY:
-                estimated = order.buying_power_notional(quote)
+                estimated = order.risk_notional(quote)
                 reserved_buying_power = sum(
                     (
                         max(notional, Decimal(0))

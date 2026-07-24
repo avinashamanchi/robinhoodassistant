@@ -75,6 +75,33 @@ def test_max_notional_per_order(risk_config, make_snapshot):
     assert any("per order" in r for r in result.reasons)
 
 
+def test_quantity_market_max_notional_uses_ask_at_limit_boundary(
+    risk_config, make_snapshot
+):
+    cfg = risk_config.model_copy(
+        update={
+            "max_notional_per_order": 500,
+            "max_position_per_ticker": 100000,
+            "max_portfolio_exposure": 100000,
+        }
+    )
+    snapshot = replace(
+        make_snapshot(prices={"AAPL": Decimal("100")}),
+        quotes={
+            "AAPL": Quote(
+                "AAPL",
+                bid=Decimal("100"),
+                ask=Decimal("101"),
+                last=Decimal("100"),
+            )
+        },
+    )
+
+    result = RiskEngine(cfg).check(_order(qty="5"), snapshot)
+
+    assert any("per order" in reason for reason in result.reasons)
+
+
 def test_max_position_per_ticker(risk_config, make_snapshot):
     engine = RiskEngine(risk_config)
     snap = make_snapshot(
@@ -85,6 +112,30 @@ def test_max_position_per_ticker(risk_config, make_snapshot):
     result = _check(engine, _order(notional="500"), snap)
     assert result.rejected
     assert any("per ticker" in r for r in result.reasons)
+
+
+def test_quantity_limit_projected_position_uses_limit_price_at_boundary(
+    risk_config, make_snapshot
+):
+    cfg = risk_config.model_copy(
+        update={
+            "max_notional_per_order": 100000,
+            "max_position_per_ticker": 2000,
+            "max_portfolio_exposure": 100000,
+        }
+    )
+    snapshot = make_snapshot(prices={"AAPL": Decimal("100")})
+
+    result = RiskEngine(cfg).check(
+        _order(
+            order_type=OrderType.LIMIT,
+            qty="20",
+            limit_price="105",
+        ),
+        snapshot,
+    )
+
+    assert any("per ticker" in reason for reason in result.reasons)
 
 
 def test_max_position_includes_outstanding_order_exposure(
@@ -129,6 +180,35 @@ def test_max_portfolio_exposure(risk_config, make_snapshot):
     result = _check(engine, _order(notional="1000"), snap)  # gross -> 7000 > 5000
     assert result.rejected
     assert any("exposure" in r for r in result.reasons)
+
+
+def test_quantity_market_portfolio_exposure_uses_ask_at_boundary(
+    risk_config, make_snapshot
+):
+    cfg = risk_config.model_copy(
+        update={
+            "max_notional_per_order": 100000,
+            "max_position_per_ticker": 100000,
+            "max_portfolio_exposure": 10000,
+        }
+    )
+    snapshot = replace(
+        make_snapshot(prices={"AAPL": Decimal("100")}),
+        quotes={
+            "AAPL": Quote(
+                "AAPL",
+                bid=Decimal("100"),
+                ask=Decimal("101"),
+                last=Decimal("100"),
+            )
+        },
+    )
+
+    result = RiskEngine(cfg).check(_order(qty="100"), snapshot)
+
+    assert any(
+        "portfolio exposure" in reason for reason in result.reasons
+    )
 
 
 def test_price_sanity_on_limit_orders(risk_config, make_snapshot):

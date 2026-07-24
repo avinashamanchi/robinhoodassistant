@@ -89,16 +89,21 @@ class OrderRequest:
         assert self.qty is not None  # guaranteed by __post_init__
         return self.qty * reference_price
 
-    def buying_power_notional(self, quote: "Quote") -> Decimal:
-        """Maximum cash this buy can consume at its executable price."""
+    def risk_notional(self, quote: "Quote") -> Decimal:
+        """Current-order value used consistently by every risk limit."""
         if self.notional is not None:
             return self.notional
         assert self.qty is not None
-        return self.qty * conservative_buy_price(
-            self.order_type,
-            self.limit_price,
-            quote,
+        price = (
+            conservative_buy_price(
+                self.order_type,
+                self.limit_price,
+                quote,
+            )
+            if self.side is OrderSide.BUY
+            else quote.last
         )
+        return self.qty * price
 
 
 @dataclass(frozen=True)
