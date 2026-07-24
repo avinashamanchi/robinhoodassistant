@@ -20,6 +20,7 @@ _PLAYBOOK = (Path(__file__).resolve().parent.parent / "signals" / "playbook.md")
 )
 
 EARNINGS_HORIZON_DAYS = 21
+PLAN_MAX_ATTEMPTS = 2
 
 SYSTEM_PREAMBLE = (
     "You are a disciplined trading analyst. You are given deterministic, "
@@ -206,14 +207,32 @@ class Analyst:
             system = NEWS_GUARD + "\n\n" + PLAN_PREAMBLE
             user = user + "\n\n" + format_news_context(news)
 
-        resp = self.backend.create(
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            tools=[SUBMIT_PLAN_TOOL],
-            tool_choice="any",   # the plan tool call is mandatory
-        )
-        for block in getattr(resp, "content", []):
-            if getattr(block, "type", None) == "tool_use" and block.name == "submit_plan":
+        validation_error: ValueError | None = None
+        for attempt in range(PLAN_MAX_ATTEMPTS):
+            prompt = user
+            if validation_error is not None:
+                summary = str(validation_error)[:1200]
+                prompt += (
+                    "\n\nYour previous submit_plan failed deterministic validation:\n"
+                    f"{summary}\n"
+                    "Return one complete corrected submit_plan. Preserve the thesis "
+                    "where possible, but satisfy every trade-plan rule exactly."
+                )
+            resp = self.backend.create(
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[SUBMIT_PLAN_TOOL],
+                tool_choice="any",   # the plan tool call is mandatory
+            )
+            try:
+                block = next(
+                    block
+                    for block in getattr(resp, "content", [])
+                    if (
+                        getattr(block, "type", None) == "tool_use"
+                        and block.name == "submit_plan"
+                    )
+                )
                 data = dict(block.input)
                 data["symbol"] = features.symbol
                 data["as_of"] = features.as_of
@@ -221,7 +240,14 @@ class Analyst:
                 plan = TradePlan(**data)
                 self._enforce_quality(plan, features)
                 return self._apply_regime_filter(plan, features)
-        raise ValueError("analyst did not submit a plan")
+            except StopIteration:
+                validation_error = ValueError("analyst did not submit a plan")
+            except ValueError as exc:
+                validation_error = exc
+
+        raise ValueError(
+            "analyst plan remained invalid after one repair attempt"
+        ) from validation_error
 
     def _apply_regime_filter(self, report, features: MarketFeatures):
         """v2: force HOLD/NO_TRADE in RANGING regimes (deterministic post-filter)."""

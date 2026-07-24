@@ -8,6 +8,7 @@ track record on live data in parallel with manual paper trading — nothing trad
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from decimal import Decimal
 from typing import Callable, Optional
@@ -17,6 +18,8 @@ from sqlalchemy import select
 from . import screener
 from .models import AnalysisReport, AnalystAction, TradePlan
 from .store import grade_report, save_report
+
+log = logging.getLogger(__name__)
 
 
 def _base_report(plan: TradePlan) -> AnalysisReport:
@@ -67,7 +70,15 @@ class ShadowRunner:
         )
         plan_ids: list[int] = []
         for c in candidates:
-            out = self.planning.analyze(c["symbol"])   # stores a proposed plan, no orders
+            try:
+                # Stores a shadow plan only; it never creates or executes an order.
+                out = self.planning.analyze(c["symbol"])
+            except Exception:
+                log.exception(
+                    "shadow analysis failed for %s; continuing batch",
+                    c["symbol"],
+                )
+                continue
             plan_id = out["plan_id"]
             with self.service.session_factory() as s:
                 row = s.get(TradePlanRow, plan_id)

@@ -84,6 +84,37 @@ def test_shadow_creates_graded_calls_without_orders(make_service):
         assert build_scorecard_from_db(s).n_calls == len(ids)   # track record built, risk-free
 
 
+def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    source = DataSource(
+        {
+            symbol: make_bars(300, seed=i)
+            for i, symbol in enumerate(["AAPL", "MSFT", "SPY"])
+        }
+    )
+
+    class FailFirstPlanning:
+        calls = 0
+
+        def analyze(self, symbol):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("invalid model plan after repair")
+            return planning.analyze(symbol)
+
+    flaky = FailFirstPlanning()
+    shadow = ShadowRunner(
+        svc, flaky, source, lambda sym: Decimal("110"), top_n=2
+    )
+
+    ids = shadow.run_once()
+
+    assert flaky.calls == 2
+    assert len(ids) == 1
+    assert svc.broker.submit_calls == 0
+
+
 # ── D2 digest ───────────────────────────────────────────────────
 def test_digest_has_sections(make_service):
     d = compose_digest(make_service())
