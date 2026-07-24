@@ -10,7 +10,7 @@ from decimal import Decimal
 from multiprocessing.context import SpawnContext
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
@@ -170,6 +170,46 @@ class _PositionDriftRaceBroker(MockBroker):
                 Decimal("100"),
             )
         ]
+
+
+class _CancelLossRaceBroker(MockBroker):
+    reconciliation_key = "cancel-loss-risk-writer"
+
+    def __init__(self, broker_order_id, client_order_id) -> None:
+        super().__init__(prices={"AAPL": Decimal("100")})
+        self.broker_order_id = broker_order_id
+        self.client_order_id = client_order_id
+        self.canceled = OrderResult(
+            client_order_id,
+            broker_order_id,
+            OrderStatus.CANCELED,
+            filled_qty=Decimal("1"),
+            avg_fill_price=Decimal("1"),
+        )
+
+    def cancel_order(self, order_id):
+        assert order_id == self.broker_order_id
+        return self.canceled
+
+    def get_fill_activities(self, after=None):
+        return [
+            BrokerFill(
+                broker_fill_id="cancel-loss-closing-fill",
+                broker_order_id=self.broker_order_id,
+                ticker="AAPL",
+                side="sell",
+                qty=Decimal("1"),
+                price=Decimal("1"),
+                filled_at=utcnow(),
+            )
+        ]
+
+    def get_order_status(self, order_id):
+        assert order_id == self.broker_order_id
+        return self.canceled
+
+    def get_open_orders(self):
+        return []
 
 
 class _ProcessStubAgent:
@@ -429,6 +469,84 @@ def _immediate_submission_process(
     try:
         result = service.submit(order_id)
         outcome.put(("ok", result.status.value))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _cancel_loss_process(
+    db_url,
+    app_config,
+    cancel_order_id,
+    cancel_observed,
+    release_cancel,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    with factory() as session:
+        order = session.get(Order, cancel_order_id)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    service = TradingService(
+        _CancelLossRaceBroker(broker_order_id, client_order_id),
+        factory,
+        app_config,
+        FakeClock(),
+    )
+    original_sync = service.sync_open_orders
+
+    def paused_sync():
+        cancel_observed.set()
+        if not release_cancel.wait(timeout=10):
+            raise TimeoutError("test did not release cancel reconciliation")
+        return original_sync()
+
+    service.sync_open_orders = paused_sync
+    try:
+        outcome.put(("ok", service.cancel_live_order(cancel_order_id)))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _loss_checked_submission_process(
+    db_url,
+    order_id,
+    broker_entered,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    config = _process_risk_config().model_copy(
+        update={"max_daily_total_loss": 50}
+    )
+    broker = _QueuedSnapshotBroker(
+        broker_entered,
+        disconnect_after_acceptance=False,
+    )
+    breakers = BreakerService(factory)
+    snapshot_service = PortfolioSnapshotService(
+        factory,
+        broker,
+        lambda _asset_class: FakeClock(),
+        lambda: {},
+        lambda _asset_class: config,
+        breakers,
+        utcnow,
+    )
+    service = OrderSubmissionService(
+        OrderRepository(factory),
+        factory,
+        broker,
+        snapshot_service,
+        lambda _symbol: RiskEngine(config),
+        utcnow,
+    )
+    try:
+        result = service.submit(order_id)
+        outcome.put(
+            ("ok", result.status.value, tuple(result.risk_reasons))
+        )
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -1216,6 +1334,98 @@ def test_daily_loss_observation_and_trip_are_one_writer_interval(
         OrderStatus.APPROVAL_RECORDED.value,
     )
     assert broker_entered.is_set() is False
+
+
+def test_cancel_loss_reconciliation_blocks_concurrent_submission(
+    make_service,
+    db_url,
+    app_config,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context("spawn")
+    service = make_service()
+    follower_id = _approved_order(service)
+    with service.session_factory() as session:
+        session.add(
+            Fill(
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="cancel-loss-opening-fill",
+                filled_at=utcnow(),
+            )
+        )
+        cancel_order = Order(
+            idempotency_key="cancel-loss-client-order",
+            ticker="AAPL",
+            side="sell",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id="cancel-loss-broker-order",
+            acceptance_state="submitted",
+        )
+        session.add(cancel_order)
+        session.commit()
+        cancel_order_id = cancel_order.id
+
+    cancel_observed = context.Event()
+    release_cancel = context.Event()
+    cancel_finished = context.Event()
+    cancel_outcome = context.Queue()
+    cancel = context.Process(
+        target=_cancel_loss_process,
+        args=(
+            db_url,
+            app_config,
+            cancel_order_id,
+            cancel_observed,
+            release_cancel,
+            cancel_finished,
+            cancel_outcome,
+        ),
+    )
+    cancel.start()
+    assert cancel_observed.wait(timeout=10)
+
+    broker_entered = context.Event()
+    submission_outcome = context.Queue()
+    submission = context.Process(
+        target=_loss_checked_submission_process,
+        args=(
+            db_url,
+            follower_id,
+            broker_entered,
+            submission_outcome,
+        ),
+    )
+    submission.start()
+    try:
+        assert broker_entered.wait(timeout=0.75) is False
+        assert cancel_finished.is_set() is False
+    finally:
+        release_cancel.set()
+        _join(cancel, release_cancel)
+        _join(submission)
+
+    outcome_kind, result = cancel_outcome.get(timeout=2)
+    assert outcome_kind == "ok"
+    assert result["status"] == OrderStatus.CANCELED.value
+    submission_result = submission_outcome.get(timeout=2)
+    assert submission_result[0:2] == (
+        "ok",
+        OrderStatus.REJECTED.value,
+    )
+    assert "daily total-loss limit reached" in submission_result[2]
+    assert broker_entered.is_set() is False
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count())
+            .select_from(Fill)
+            .where(
+                Fill.broker_fill_id == "cancel-loss-closing-fill"
+            )
+        ) == 1
 
 
 @pytest.mark.parametrize(

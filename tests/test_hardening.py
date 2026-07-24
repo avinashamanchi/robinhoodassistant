@@ -3,11 +3,11 @@ startup reconciliation, and an end-to-end kill-switch drill."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import event
+import pytest
+from sqlalchemy import event, func, select
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
@@ -22,62 +22,43 @@ def _submitted(svc, notional="400") -> int:
     return order_id
 
 
-# ── partial fills ───────────────────────────────────────────────
-def test_partial_then_full_fill(make_service):
-    svc = make_service()                       # AAPL @ 100 -> target 4 shares
-    oid = _submitted(svc)
-    r1 = svc.record_fill(oid, qty="1.5", price="100")
-    assert r1["status"] == "partially_filled"
-    r2 = svc.record_fill(oid, qty="2.5", price="100")
-    assert r2["status"] == "filled"
-
-
-def test_duplicate_fill_is_idempotent(make_service):
-    svc = make_service()
-    oid = _submitted(svc)
-    first = svc.record_fill(oid, qty="2", price="100", broker_fill_id="fill-1")
-    dup = svc.record_fill(oid, qty="2", price="100", broker_fill_id="fill-1")
-    assert first["duplicate"] is False
-    assert dup["duplicate"] is True
-    assert dup["filled_qty"] == first["filled_qty"]   # not double-counted
-
-
-def test_record_fill_acquires_process_barrier_before_sqlite_transaction(
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        (
+            {
+                "qty": "NaN",
+                "price": "100",
+                "broker_fill_id": "corrupt-direct-fill",
+            },
+        ),
+        (
+            {
+                "qty": "1",
+                "price": "100",
+                "broker_fill_id": "duplicate-direct-fill",
+            },
+            {
+                "qty": "2",
+                "price": "90",
+                "broker_fill_id": "duplicate-direct-fill",
+            },
+        ),
+    ],
+)
+def test_direct_fill_mutation_path_is_not_available(
     make_service,
-    engine,
+    payloads,
 ):
     svc = make_service()
     oid = _submitted(svc)
 
-    class TrackingBarrier:
-        active = False
+    for payload in payloads:
+        with pytest.raises(AttributeError):
+            getattr(svc, "record_fill")(oid, **payload)
 
-        @contextmanager
-        def hold_writer(self):
-            self.active = True
-            try:
-                yield
-            finally:
-                self.active = False
-
-    barrier = TrackingBarrier()
-    svc.submission_barrier = barrier
-
-    def assert_barrier_precedes_transaction(_connection):
-        assert barrier.active is True
-
-    event.listen(engine, "begin", assert_barrier_precedes_transaction)
-    try:
-        result = svc.record_fill(
-            oid,
-            qty="1",
-            price="100",
-            broker_fill_id="barrier-ordered-fill",
-        )
-    finally:
-        event.remove(engine, "begin", assert_barrier_precedes_transaction)
-
-    assert result["duplicate"] is False
+    with svc.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Fill)) == 0
 
 
 # ── cancel / replace ────────────────────────────────────────────
@@ -87,6 +68,44 @@ def test_cancel_live_order(make_service):
     result = svc.cancel_live_order(oid)
     assert result["status"] == "canceled"
     assert "error" in svc.cancel_live_order(oid)       # cannot cancel twice
+
+
+def test_cancel_broker_io_occurs_without_sqlite_transaction(
+    make_service,
+    engine,
+):
+    active_transactions = 0
+    observed_during_cancel = None
+
+    class TransactionInspectingBroker(MockBroker):
+        def cancel_order(self, order_id):
+            nonlocal observed_during_cancel
+            observed_during_cancel = active_transactions
+            return super().cancel_order(order_id)
+
+    def transaction_began(_connection):
+        nonlocal active_transactions
+        active_transactions += 1
+
+    def transaction_ended(_connection):
+        nonlocal active_transactions
+        active_transactions -= 1
+
+    svc = make_service(broker=TransactionInspectingBroker())
+    oid = _submitted(svc)
+    event.listen(engine, "begin", transaction_began)
+    event.listen(engine, "commit", transaction_ended)
+    event.listen(engine, "rollback", transaction_ended)
+    try:
+        result = svc.cancel_live_order(oid)
+    finally:
+        event.remove(engine, "begin", transaction_began)
+        event.remove(engine, "commit", transaction_ended)
+        event.remove(engine, "rollback", transaction_ended)
+
+    assert result["status"] == "canceled"
+    assert observed_during_cancel == 0
+    assert active_transactions == 0
 
 
 def test_cancel_result_with_cumulative_partial_fill_sets_reconciliation_latch(

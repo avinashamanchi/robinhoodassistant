@@ -655,103 +655,6 @@ class TradingService:
             "generation": state.generation,
         }
 
-    # ── hardening: fills, cancel/replace, reconcile, drills (P5) ─
-    def record_fill(
-        self,
-        order_id: int,
-        qty: str,
-        price: str,
-        broker_fill_id: Optional[str] = None,
-        ts=None,
-    ) -> dict[str, Any]:
-        with self.submission_barrier.hold_writer():
-            return self._record_fill(
-                order_id,
-                qty,
-                price,
-                broker_fill_id=broker_fill_id,
-                ts=ts,
-            )
-
-    def _record_fill(
-        self,
-        order_id: int,
-        qty: str,
-        price: str,
-        broker_fill_id: Optional[str] = None,
-        ts=None,
-    ) -> dict[str, Any]:
-        """Ingest a (possibly partial) fill and advance the order lifecycle.
-
-        Idempotent on ``broker_fill_id`` — a duplicated fill event is ignored,
-        so a phantom position can't be created (Phase 7 stress scenario #7).
-        """
-        from sqlalchemy import func
-
-        with self.session_factory() as s:
-            order = s.get(Order, order_id)
-            if order is None:
-                return {"error": "not found"}
-            if broker_fill_id is not None:
-                from sqlalchemy import func as _func
-
-                dup = s.execute(
-                    select(Fill).where(Fill.broker_fill_id == broker_fill_id)
-                ).scalar_one_or_none()
-                if dup is not None:
-                    filled = s.execute(
-                        select(_func.coalesce(_func.sum(Fill.qty), 0)).where(
-                            Fill.order_id == order.id
-                        )
-                    ).scalar_one()
-                    return {
-                        "order_id": order_id,
-                        "status": order.status,
-                        "filled_qty": str(Decimal(str(filled))),
-                        "duplicate": True,
-                    }
-            if OrderStatus(order.status) not in (
-                OrderStatus.SUBMITTED,
-                OrderStatus.PARTIALLY_FILLED,
-            ):
-                return {"order_id": order_id, "status": order.status,
-                        "error": "order not open for fills"}
-
-            s.add(
-                Fill(
-                    order_id=order.id,
-                    ticker=order.ticker,
-                    side=order.side,
-                    qty=Decimal(qty),
-                    price=Decimal(price),
-                    broker_fill_id=broker_fill_id,
-                    filled_at=ts or utcnow(),
-                )
-            )
-            s.flush()
-
-            filled = s.execute(
-                select(func.coalesce(func.sum(Fill.qty), 0)).where(
-                    Fill.order_id == order.id
-                )
-            ).scalar_one()
-            filled = Decimal(str(filled))
-            target = order.qty
-            if target is None and order.notional is not None:
-                target = order.notional / Decimal(price)
-
-            if target is not None and filled >= target - Decimal("0.000001"):
-                OrderStateMachine.transition(order, OrderStatus.FILLED)
-            elif order.status == OrderStatus.SUBMITTED.value:
-                OrderStateMachine.transition(order, OrderStatus.PARTIALLY_FILLED)
-            s.commit()
-            return {
-                "order_id": order_id,
-                "status": order.status,
-                "filled_qty": str(filled),
-                "duplicate": False,
-            }
-
     @staticmethod
     def serialize_reconciliation_report(report) -> dict[str, Any]:
         """Serialize the new report while retaining legacy monitor keys."""
@@ -776,6 +679,13 @@ class TradingService:
 
     def cancel_live_order(self, order_id: int) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
+        with self.submission_barrier.hold_writer():
+            return self._cancel_live_order_under_writer(order_id)
+
+    def _cancel_live_order_under_writer(
+        self,
+        order_id: int,
+    ) -> dict[str, Any]:
         with self.session_factory() as s:
             order = s.get(Order, order_id)
             if order is None:
@@ -795,10 +705,9 @@ class TradingService:
                     "error": "live order has no broker order id",
                 }
 
-        # Broker I/O is complete before reconciliation opens any write
-        # transaction. Every returned cumulative fill quantity, including a
-        # canceled-after-partial result, then follows the same authoritative
-        # fill-latch path as scheduled reconciliation.
+        # The process writer is already held, but this read session is closed
+        # before broker I/O. Reconciliation later opens its own short write
+        # transactions and commits exact fill/latch truth before writer release.
         try:
             broker_result = self.broker.cancel_order(broker_order_id)
         except Exception as cancel_error:

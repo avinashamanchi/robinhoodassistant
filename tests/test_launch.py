@@ -71,15 +71,55 @@ def test_preflight_reconciliation_reports_position_drift(make_service):
 
 # ── B2 full order lifecycle ─────────────────────────────────────
 def test_order_lifecycle_propose_approve_fill(make_service):
-    svc = make_service()  # AAPL @ 100
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import (
+        BrokerFill,
+        OrderResult,
+        OrderStatus,
+    )
+    from trading_assistant.db.models import utcnow
+
+    class LifecycleBroker(MockBroker):
+        activities = []
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
+
+    broker = LifecycleBroker()
+    svc = make_service(broker=broker)  # AAPL @ 100
     oid = svc.propose_order("AAPL", "buy", "market", notional="400")["order_id"]
     assert svc.get_order_status(oid)["status"] == "proposed"
 
     approve = _approve(svc, oid)
     assert approve["executed"] is True and approve["status"] == "submitted"
 
-    filled = svc.record_fill(oid, qty="4", price="100")
-    assert filled["status"] == "filled"
+    with svc.session_factory() as session:
+        order = session.get(Order, oid)
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+    remote = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("4"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_order_id] = remote
+    broker._orders_by_key[client_order_id] = remote
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="lifecycle-fill-1",
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("4"),
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
+
+    sync = svc.sync_open_orders()
+    assert sync["newly_filled"] == 1
 
     with svc.session_factory() as s:
         assert s.execute(select(func.count()).select_from(Fill)).scalar_one() == 1

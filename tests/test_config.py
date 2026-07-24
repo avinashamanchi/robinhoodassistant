@@ -40,11 +40,37 @@ daemon:
   use_websocket: true
 """
 
+FLOAT_RISK_LIMITS = (
+    "max_notional_per_order",
+    "max_position_per_ticker",
+    "max_portfolio_exposure",
+    "daily_realized_loss_limit",
+    "price_sanity_pct",
+    "per_trade_risk_pct",
+    "max_quote_age_seconds",
+    "max_spread_pct",
+    "max_daily_total_loss",
+    "max_account_drawdown_pct",
+)
+
 
 def _write(tmp_path, text: str):
     p = tmp_path / "config.yaml"
     p.write_text(textwrap.dedent(text))
     return p
+
+
+def _with_risk_limit(text: str, field: str, value: str) -> str:
+    lines = textwrap.dedent(text).splitlines()
+    replacement = f"  {field}: {value}"
+    for index, line in enumerate(lines):
+        if line.startswith(f"  {field}:"):
+            lines[index] = replacement
+            break
+    else:
+        proposal_index = lines.index("  proposal_ttl_minutes: 15")
+        lines.insert(proposal_index, replacement)
+    return "\n".join(lines) + "\n"
 
 
 def test_valid_config_loads_and_normalizes(tmp_path):
@@ -80,6 +106,34 @@ def test_typo_in_risk_key_fails_to_load(tmp_path):
     typo = VALID.replace("max_notional_per_order", "max_notional_per_ordr")
     with pytest.raises(ValidationError):
         load_config(_write(tmp_path, typo))
+
+
+@pytest.mark.parametrize("field", FLOAT_RISK_LIMITS)
+def test_typo_in_float_risk_limit_fails_to_load(tmp_path, field):
+    explicit = _with_risk_limit(VALID, field, "1")
+    typo = explicit.replace(
+        f"  {field}: 1",
+        f"  {field}_typo: 1",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, typo))
+
+
+@pytest.mark.parametrize("field", FLOAT_RISK_LIMITS)
+@pytest.mark.parametrize("yaml_value", [".inf", "-.inf", ".nan"])
+def test_nonfinite_float_risk_limit_fails_to_load(
+    tmp_path,
+    field,
+    yaml_value,
+):
+    with pytest.raises(ValidationError):
+        load_config(
+            _write(
+                tmp_path,
+                _with_risk_limit(VALID, field, yaml_value),
+            )
+        )
 
 
 def test_unknown_top_level_section_fails(tmp_path):

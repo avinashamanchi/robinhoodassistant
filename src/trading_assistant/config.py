@@ -48,6 +48,8 @@ class TradingConfig(_Strict):
 
 
 class RiskConfig(_Strict):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
     ticker_allowlist: list[str] = Field(min_length=1)
     max_notional_per_order: float = Field(gt=0)
     max_position_per_ticker: float = Field(gt=0)
