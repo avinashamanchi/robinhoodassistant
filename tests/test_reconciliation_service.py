@@ -960,8 +960,12 @@ def test_full_acceptance_contradiction_trips_drift_before_later_crash(
         ("ticker", "MSFT"),
         ("qty", Decimal("0")),
         ("qty", Decimal("NaN")),
+        ("qty", Decimal("0.0000000001")),
+        ("qty", Decimal("1000000")),
         ("price", Decimal("0")),
         ("price", Decimal("Infinity")),
+        ("price", Decimal("1.0000000001")),
+        ("price", Decimal("1000000")),
     ],
 )
 def test_invalid_exact_fill_is_rejected_latched_and_replayed_fail_closed(
@@ -1163,6 +1167,111 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
         assert order.last_error_code == "invalid_fill_activity"
         assert fill.filled_at == filled_at
         assert fill.reconciliation_state == "trusted"
+
+
+@pytest.mark.parametrize(
+    ("mutated_field", "mutated_value", "expected_error"),
+    [
+        ("qty", Decimal("0.123456788"), "changed quantity"),
+        ("price", Decimal("999999.999999998"), "changed price"),
+    ],
+)
+def test_crypto_precision_replay_is_noop_and_mutation_trips_drift(
+    make_service,
+    mutated_field,
+    mutated_value,
+    expected_error,
+):
+    broker = ActivityBroker()
+    broker.set_price("BTCUSD", Decimal("80000"))
+    service = make_service(broker=broker)
+    submitted_at = utcnow() - timedelta(seconds=1)
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key=f"crypto-precision-{mutated_field}-client",
+            ticker="BTCUSD",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.SUBMITTED.value,
+            broker_order_id=f"crypto-precision-{mutated_field}-broker",
+            submission_started_at=submitted_at,
+            acceptance_state="accepted",
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+        broker_order_id = order.broker_order_id
+        client_order_id = order.idempotency_key
+        filled_at = utcnow()
+
+    exact = BrokerFill(
+        broker_fill_id=f"crypto-precision-{mutated_field}",
+        broker_order_id=broker_order_id,
+        ticker="BTCUSD",
+        side="buy",
+        qty=Decimal("0.123456789"),
+        price=Decimal("999999.999999999"),
+        filled_at=filled_at,
+    )
+    broker.activities = [exact]
+    filled = OrderResult(
+        client_order_id,
+        broker_order_id,
+        OrderStatus.FILLED,
+        filled_qty=exact.qty,
+        avg_fill_price=exact.price,
+    )
+    broker._orders_by_id[broker_order_id] = filled
+    broker._orders_by_key[client_order_id] = filled
+
+    first = service.reconciliation.reconcile()
+    restarted = make_service(broker=broker)
+    unchanged = restarted.reconciliation.reconcile()
+
+    assert first.inserted_fills == 1
+    assert unchanged.inserted_fills == 0
+    assert unchanged.broker_drift == ()
+    with restarted.session_factory() as session:
+        persisted = session.scalar(
+            select(Fill).where(Fill.broker_fill_id == exact.broker_fill_id)
+        )
+        assert persisted.qty == exact.qty
+        assert persisted.price == exact.price
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=exact.broker_fill_id,
+            broker_order_id=exact.broker_order_id,
+            ticker=exact.ticker,
+            side=exact.side,
+            qty=(
+                mutated_value
+                if mutated_field == "qty"
+                else exact.qty
+            ),
+            price=(
+                mutated_value
+                if mutated_field == "price"
+                else exact.price
+            ),
+            filled_at=exact.filled_at,
+        )
+    ]
+    mutation = restarted.reconciliation.reconcile()
+
+    assert mutation.inserted_fills == 0
+    assert any(expected_error in item for item in mutation.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift()) is True
+    with restarted.session_factory() as session:
+        order = session.get(Order, order_id)
+        persisted = session.scalar(
+            select(Fill).where(Fill.broker_fill_id == exact.broker_fill_id)
+        )
+        assert order.acceptance_state == "fill_reconcile_required"
+        assert order.last_error_code == "invalid_fill_activity"
+        assert persisted.qty == exact.qty
+        assert persisted.price == exact.price
 
 
 @pytest.mark.parametrize(
@@ -1395,6 +1504,114 @@ def test_canceled_after_partial_fill_stays_latched_until_exact_activity(
                 Fill.order_id == order_id
             )
         ) == 1
+
+
+def test_partial_fill_expiration_preserves_pnl_and_releases_remainder(
+    make_service,
+):
+    broker = ActivityBroker(
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("0.6"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ]
+    )
+    service = make_service(broker=broker)
+    now = utcnow()
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="partial-expired-client",
+            ticker="AAPL",
+            side="sell",
+            order_type="market",
+            qty=Decimal("1"),
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            broker_order_id="partial-expired-broker",
+            submission_started_at=now - timedelta(minutes=3),
+            acceptance_state="accepted",
+        )
+        session.add(order)
+        session.flush()
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="partial-expired-opening-lot",
+                    filled_at=now - timedelta(minutes=4),
+                ),
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("0.4"),
+                    price=Decimal("90"),
+                    broker_fill_id="partial-expired-exact-fill",
+                    filled_at=now - timedelta(minutes=1),
+                ),
+            ]
+        )
+        session.commit()
+        order_id = order.id
+
+    exact = BrokerFill(
+        broker_fill_id="partial-expired-exact-fill",
+        broker_order_id="partial-expired-broker",
+        ticker="AAPL",
+        side="sell",
+        qty=Decimal("0.4"),
+        price=Decimal("90"),
+        filled_at=now - timedelta(minutes=1),
+    )
+    broker.activities = [exact]
+    expired = OrderResult(
+        "partial-expired-client",
+        "partial-expired-broker",
+        OrderStatus.EXPIRED,
+        filled_qty=Decimal("0.4"),
+        avg_fill_price=Decimal("90"),
+    )
+    broker._orders_by_id[expired.broker_order_id] = expired
+    broker._orders_by_key[expired.idempotency_key] = expired
+
+    before = service.snapshot_service.assemble_for_execution("AAPL")
+    first = service.reconciliation.reconcile()
+    after = service.snapshot_service.assemble_for_execution("AAPL")
+    replay = service.reconciliation.reconcile()
+    after_replay = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert before.reserved_sell_qty_by_ticker == {
+        "AAPL": Decimal("0.600000")
+    }
+    assert before.realized_pnl_today == Decimal("-4")
+    assert first.inserted_fills == 0
+    assert first.broker_drift == ()
+    assert after.reserved_sell_qty_by_ticker == {}
+    assert after.realized_pnl_today == Decimal("-4")
+    assert replay.inserted_fills == 0
+    assert replay.broker_drift == ()
+    assert after_replay.reserved_sell_qty_by_ticker == {}
+    assert after_replay.realized_pnl_today == Decimal("-4")
+    with service.session_factory() as session:
+        persisted = session.get(Order, order_id)
+        fills = session.scalars(
+            select(Fill).where(
+                Fill.broker_fill_id.in_(
+                    (
+                        "partial-expired-opening-lot",
+                        "partial-expired-exact-fill",
+                    )
+                )
+            )
+        ).all()
+        assert persisted.status == OrderStatus.EXPIRED.value
+        assert persisted.acceptance_state == "accepted"
+        assert len(fills) == 2
 
 
 @pytest.mark.parametrize(

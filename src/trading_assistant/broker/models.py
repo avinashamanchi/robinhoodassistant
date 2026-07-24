@@ -10,8 +10,18 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
+
+
+FILL_NUMERIC_PRECISION = 24
+FILL_NUMERIC_SCALE = 9
+FILL_ECONOMIC_QUANTUM = Decimal("0.000000001")
+# SQLite's Numeric adapter round-trips through binary float. Keeping accepted
+# fills below one million and at nine fractional places limits values to at
+# most 15 significant digits, which round-trip exactly at the widened schema
+# scale while covering fractional crypto execution quantities.
+FILL_ECONOMIC_MAX_EXCLUSIVE = Decimal("1000000")
 
 
 def _utcnow() -> datetime:
@@ -59,13 +69,27 @@ def valid_cumulative_filled_qty(value: object) -> bool:
     )
 
 
+def normalize_fill_economic(value: object) -> Decimal | None:
+    """Return the exact persisted fill value, or fail closed if unrepresentable."""
+    if (
+        not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value <= 0
+        or value >= FILL_ECONOMIC_MAX_EXCLUSIVE
+    ):
+        return None
+    try:
+        normalized = value.quantize(FILL_ECONOMIC_QUANTUM)
+    except InvalidOperation:
+        return None
+    if normalized != value:
+        return None
+    return normalized
+
+
 def valid_fill_economic(value: object) -> bool:
-    """Whether an exact fill quantity or price is finite and strictly positive."""
-    return (
-        isinstance(value, Decimal)
-        and value.is_finite()
-        and value > 0
-    )
+    """Whether an exact fill quantity or price has the canonical representation."""
+    return normalize_fill_economic(value) is not None
 
 
 @dataclass(frozen=True)

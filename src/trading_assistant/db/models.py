@@ -30,7 +30,11 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from ..broker.models import OrderStatus
+from ..broker.models import (
+    FILL_NUMERIC_PRECISION,
+    FILL_NUMERIC_SCALE,
+    OrderStatus,
+)
 
 
 def utcnow() -> datetime:
@@ -121,7 +125,12 @@ _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
         }
     ),
     OrderStatus.PARTIALLY_FILLED: frozenset(
-        {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELED}
+        {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+        }
     ),
     # Terminal states.
     OrderStatus.FILLED: frozenset(),
@@ -323,8 +332,12 @@ class Fill(Base):
     )
     ticker: Mapped[str] = mapped_column(String(16), index=True)
     side: Mapped[str] = mapped_column(String(8))
-    qty: Mapped[Decimal] = mapped_column(Numeric(20, 6))
-    price: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    qty: Mapped[Decimal] = mapped_column(
+        Numeric(FILL_NUMERIC_PRECISION, FILL_NUMERIC_SCALE)
+    )
+    price: Mapped[Decimal] = mapped_column(
+        Numeric(FILL_NUMERIC_PRECISION, FILL_NUMERIC_SCALE)
+    )
     # Broker's fill event id — unique so a duplicated fill webhook is idempotent.
     broker_fill_id: Mapped[Optional[str]] = mapped_column(
         String(64), unique=True, nullable=True, index=True

@@ -596,6 +596,39 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
     ]
 
 
+def test_breaker_migration_widens_fill_precision_and_empty_downgrade_restores_it(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "fill-precision.db", "20260724_0004"
+    )
+
+    before = {
+        column["name"]: column["type"]
+        for column in inspect(engine).get_columns("fills")
+    }
+    assert (before["qty"].precision, before["qty"].scale) == (20, 6)
+    assert (before["price"].precision, before["price"].scale) == (20, 6)
+
+    command.upgrade(cfg, "20260724_0005")
+
+    widened = {
+        column["name"]: column["type"]
+        for column in inspect(engine).get_columns("fills")
+    }
+    assert (widened["qty"].precision, widened["qty"].scale) == (24, 9)
+    assert (widened["price"].precision, widened["price"].scale) == (24, 9)
+
+    command.downgrade(cfg, "20260724_0004")
+
+    restored = {
+        column["name"]: column["type"]
+        for column in inspect(engine).get_columns("fills")
+    }
+    assert (restored["qty"].precision, restored["qty"].scale) == (20, 6)
+    assert (restored["price"].precision, restored["price"].scale) == (20, 6)
+
+
 @pytest.mark.parametrize(
     ("case_name", "broker_fill_id"),
     [

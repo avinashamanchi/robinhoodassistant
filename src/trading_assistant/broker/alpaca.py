@@ -53,8 +53,8 @@ from .models import (
     OrderType,
     Position,
     Quote,
+    normalize_fill_economic,
     valid_cumulative_filled_qty,
-    valid_fill_economic,
 )
 
 # Alpaca order-status string -> our lifecycle status.
@@ -362,7 +362,9 @@ class AlpacaBroker(BrokerClient):
                         "invalid Alpaca fill quantity or price",
                         broker_order_id=broker_order_id,
                     ) from exc
-                if not valid_fill_economic(qty) or not valid_fill_economic(price):
+                normalized_qty = normalize_fill_economic(qty)
+                normalized_price = normalize_fill_economic(price)
+                if normalized_qty is None or normalized_price is None:
                     raise BrokerDataIntegrityError(
                         "invalid Alpaca fill quantity or price",
                         broker_order_id=broker_order_id,
@@ -373,8 +375,8 @@ class AlpacaBroker(BrokerClient):
                         broker_order_id=broker_order_id,
                         ticker=str(raw["symbol"]).upper(),
                         side=side,
-                        qty=qty,
-                        price=price,
+                        qty=normalized_qty,
+                        price=normalized_price,
                         filled_at=timestamp,
                     )
                 )

@@ -25,6 +25,19 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
+    with op.batch_alter_table("fills") as batch_op:
+        batch_op.alter_column(
+            "qty",
+            existing_type=sa.Numeric(precision=20, scale=6),
+            type_=sa.Numeric(precision=24, scale=9),
+            existing_nullable=False,
+        )
+        batch_op.alter_column(
+            "price",
+            existing_type=sa.Numeric(precision=20, scale=6),
+            type_=sa.Numeric(precision=24, scale=9),
+            existing_nullable=False,
+        )
     op.execute(
         """
         UPDATE fills
@@ -214,4 +227,16 @@ def downgrade() -> None:
     )
     op.drop_table("circuit_breaker_state")
     with op.batch_alter_table("fills") as batch_op:
+        batch_op.alter_column(
+            "qty",
+            existing_type=sa.Numeric(precision=24, scale=9),
+            type_=sa.Numeric(precision=20, scale=6),
+            existing_nullable=False,
+        )
+        batch_op.alter_column(
+            "price",
+            existing_type=sa.Numeric(precision=24, scale=9),
+            type_=sa.Numeric(precision=20, scale=6),
+            existing_nullable=False,
+        )
         batch_op.drop_column("reconciliation_state")

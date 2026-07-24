@@ -430,10 +430,10 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
             {
                 "id": "activity-1",
                 "transaction_time": transaction_time,
-                "price": "332.03",
-                "qty": "2",
+                "price": "999999.999999999",
+                "qty": "0.123456789",
                 "side": "sell_short",
-                "symbol": "AAPL",
+                "symbol": "BTCUSD",
                 "order_id": "order-1",
             }
         ]
@@ -451,7 +451,9 @@ def test_fill_activities_preserve_broker_ids_prices_and_timestamps():
     assert fills[0].broker_fill_id == "activity-1"
     assert fills[0].broker_order_id == "order-1"
     assert fills[0].side == "sell"
-    assert fills[0].price == Decimal("332.03")
+    assert fills[0].ticker == "BTCUSD"
+    assert fills[0].qty == Decimal("0.123456789")
+    assert fills[0].price == Decimal("999999.999999999")
     assert fills[0].filled_at == datetime(
         2026, 7, 20, 13, 31, 16, 178437, tzinfo=timezone.utc
     )
@@ -499,6 +501,37 @@ def test_fill_activities_reject_unknown_side():
 
     with pytest.raises(ValueError, match="side"):
         AlpacaBroker(trading, FakeData({})).get_fill_activities()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("qty", "0.0000000001"),
+        ("qty", "1000000"),
+        ("price", "1.0000000001"),
+        ("price", "1000000"),
+    ],
+)
+def test_fill_activities_reject_unpersistable_economics(field, value):
+    activity = {
+        "id": f"activity-invalid-{field}",
+        "transaction_time": "2026-07-20T13:31:16Z",
+        "price": "100",
+        "qty": "1",
+        "side": "buy",
+        "symbol": "AAPL",
+        "order_id": "order-1",
+    }
+    activity[field] = value
+
+    with pytest.raises(
+        BrokerDataIntegrityError,
+        match="fill quantity or price",
+    ):
+        AlpacaBroker(
+            FakeTrading(activities=[activity]),
+            FakeData({}),
+        ).get_fill_activities()
 
 
 @pytest.mark.parametrize(

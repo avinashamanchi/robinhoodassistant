@@ -14,6 +14,7 @@ from trading_assistant.broker.models import (
     BrokerFill,
     OrderResult,
     OrderStatus,
+    normalize_fill_economic,
     order_result_identity_error,
     valid_cumulative_filled_qty,
     valid_fill_economic,
@@ -445,6 +446,18 @@ class ReconciliationService:
                         order,
                         observed_at,
                     )
+                    if validation_error is None:
+                        normalized_qty = normalize_fill_economic(activity.qty)
+                        normalized_price = normalize_fill_economic(
+                            activity.price
+                        )
+                        assert normalized_qty is not None
+                        assert normalized_price is not None
+                        activity = replace(
+                            activity,
+                            qty=normalized_qty,
+                            price=normalized_price,
+                        )
                     duplicate = None
                     if validation_error is None:
                         duplicate = session.scalar(
@@ -607,9 +620,15 @@ class ReconciliationService:
                 f"{order.ticker!r}"
             )
         if not valid_fill_economic(activity.qty):
-            return f"quantity {activity.qty!r} is not finite and positive"
+            return (
+                f"quantity {activity.qty!r} is outside canonical fill "
+                "precision or bounds"
+            )
         if not valid_fill_economic(activity.price):
-            return f"price {activity.price!r} is not finite and positive"
+            return (
+                f"price {activity.price!r} is outside canonical fill "
+                "precision or bounds"
+            )
         submission_boundary = (
             order.submission_started_at or order.created_at
         )
@@ -974,22 +993,35 @@ class ReconciliationService:
                     )
                     cumulative_notional = remote.filled_qty * remote.avg_fill_price
                     incremental_notional = cumulative_notional - recorded_notional
-                    if incremental_notional <= 0:
+                    normalized_new_qty = normalize_fill_economic(new_qty)
+                    normalized_incremental_price = normalize_fill_economic(
+                        incremental_notional / new_qty
+                    )
+                    if (
+                        incremental_notional <= 0
+                        or normalized_new_qty is None
+                        or normalized_incremental_price is None
+                    ):
                         drift.append(
-                            f"broker cumulative fill moved behind local ledger "
-                            f"for order {order.id}"
+                            "broker cumulative fill is outside canonical "
+                            f"precision or moved behind local ledger for order "
+                            f"{order.id}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
                         )
                         if latch_changed:
                             order.version += 1
-                            session.commit()
+                        session.commit()
                         continue
                     session.add(
                         Fill(
                             order_id=order.id,
                             ticker=order.ticker,
                             side=order.side,
-                            qty=new_qty,
-                            price=incremental_notional / new_qty,
+                            qty=normalized_new_qty,
+                            price=normalized_incremental_price,
                             broker_fill_id=(
                                 f"{order.broker_order_id}:{remote.filled_qty}"
                             ),
