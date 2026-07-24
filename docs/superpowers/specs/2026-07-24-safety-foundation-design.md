@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-24  
 **Parent:** `2026-07-24-evidence-first-trading-platform-design.md`  
-**Status:** Approved direction, pending written-spec review
+**Status:** Approved for implementation
 
 ## 1. Objective
 
@@ -111,8 +111,11 @@ to active after reconciliation confirms no unknown submission.
 
 - App startup requires a non-empty operator secret outside tests.
 - `/health/live` returns only process/database liveness booleans.
+- `/login`, login assets, and `/auth/login` are the only additional anonymous
+  routes; they expose no account or execution data.
 - All other routes require an authenticated session.
-- `/auth/login` exchanges the operator secret for a short-lived signed session.
+- `/auth/login` exchanges the operator secret for a short-lived, opaque,
+  server-side session whose high-entropy token is stored only as a hash.
 - The session cookie is `HttpOnly`, `SameSite=Strict`, path-scoped, and `Secure`
   whenever TLS is used.
 - Mutations require a CSRF token tied to the session.
@@ -266,4 +269,3 @@ database commit. Prove that:
 The data/evidence subproject may begin only after these criteria pass a dedicated
 code review, crash drill, concurrency test run, migration rehearsal on a copied
 database, and final paper-account reconciliation.
-
