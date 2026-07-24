@@ -14,7 +14,7 @@ risk:
   max_portfolio_exposure: 10000      # USD total across positions
   daily_realized_loss_limit: 500     # USD; breach trips the kill switch
   price_sanity_pct: 5.0              # reject limit orders >5% from last trade
-  reject_when_market_closed: false   # false = let orders queue on Alpaca until open
+  reject_when_market_closed: true    # fail closed; no global after-hours queueing
   proposal_ttl_minutes: 15           # proposals older than this EXPIRE (A6)
   warn_on_cross_broker_concentration: true  # non-blocking WARNING only
   per_trade_risk_pct: 0.5             # % of equity risked per trade (sizing)

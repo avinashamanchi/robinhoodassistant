@@ -36,7 +36,7 @@ Required in `.env`: `APP_API_TOKEN` (≥32 hex), one LLM key (`GEMINI_API_KEY` /
 
 ## One-time paper order drill
 
-Run this after credentials or broker code changes:
+Run this during equity market hours after credentials or broker code changes:
 
 ```bash
 uv run python -m trading_assistant.ops.paper_drill
