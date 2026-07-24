@@ -32,10 +32,12 @@ def test_health_reflects_heartbeat(make_service):
     assert h["heartbeat_age_seconds"] < 5
 
 
-def test_health_endpoint_no_auth(make_service):
+def test_only_liveness_endpoint_is_anonymous(make_service):
     app = create_app(service=make_service(), agent=_StubAgent(), api_token="tok", planning=None)
-    r = TestClient(app).get("/health")           # no X-API-Key required
-    assert r.status_code == 200 and r.json()["db_ok"] is True
+    client = TestClient(app)
+
+    assert client.get("/health/live").status_code == 200
+    assert client.get("/health").status_code == 401
 
 
 # ── B3 preflight helpers (keyless) ──────────────────────────────

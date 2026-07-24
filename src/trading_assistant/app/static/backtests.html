@@ -48,8 +48,25 @@
     const $ = (id) => document.getElementById(id);
     function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
     function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
-    function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
-    async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
+    let csrfToken = "";
+    const sessionReady = fetch("/auth/session").then(async (response) => {
+      if (response.status === 401) {
+        window.location.replace("/login");
+        throw new Error("operator session required");
+      }
+      csrfToken = (await response.json()).csrf_token;
+    });
+    function sessionHeaders(opts) {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        opts.headers = Object.assign({ "X-CSRF-Token": csrfToken }, opts.headers || {});
+      }
+      return opts;
+    }
+    async function api(path, opts = {}) {
+      await sessionReady;
+      return (await fetch(path, sessionHeaders(opts))).json();
+    }
 
     async function refreshRuns() {
       const data = await api("/backtests");

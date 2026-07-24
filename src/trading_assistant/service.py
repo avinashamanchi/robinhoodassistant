@@ -34,6 +34,7 @@ from .broker.models import (
 from .assets import AssetClass
 from .config import AppConfig
 from .db.models import (
+    AuditEvent,
     CircuitBreakerState,
     FILL_RECONCILIATION_REQUIRED,
     Fill,
@@ -509,7 +510,18 @@ class TradingService:
             "risk_reasons": list(result.risk_reasons),
         }
 
-    def reject_order(self, order_id: int) -> dict[str, Any]:
+    def reject_order(
+        self,
+        order_id: int,
+        *,
+        actor: str = "system:order-rejection",
+        reason: str = "programmatic order rejection",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError("rejection actor and reason must be non-empty")
         with self.session_factory() as s:
             order = s.get(Order, order_id)
             if order is None:
@@ -523,7 +535,20 @@ class TradingService:
             OrderStateMachine.transition(order, OrderStatus.REJECTED)
             s.add(
                 RiskEvent(
-                    order_id=order.id, event_type="rejection", reason="rejected by human"
+                    order_id=order.id,
+                    event_type="rejection",
+                    reason=reason,
+                )
+            )
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="order.reject",
+                    target_type="order",
+                    target_id=str(order_id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=OrderStatus.REJECTED.value,
                 )
             )
             s.commit()
@@ -578,9 +603,18 @@ class TradingService:
         except Exception as exc:
             return {"db_ok": False, "error": type(exc).__name__}
 
-    def panic(self, actor: str, reason: str) -> dict[str, Any]:
+    def panic(
+        self,
+        actor: str,
+        reason: str,
+        request_id: str = "",
+    ) -> dict[str, Any]:
         """Latch and execute panic, returning only confirmed broker/local truth."""
-        report = self.reconciliation.panic(actor, reason)
+        report = self.reconciliation.panic(
+            actor,
+            reason,
+            request_id=request_id,
+        )
         return {
             "safe": report.safe,
             "confirmed_canceled": list(report.confirmed_canceled),
@@ -604,6 +638,7 @@ class TradingService:
         actor: str,
         reason: str,
         expected_generation: int,
+        request_id: str = "",
     ) -> dict[str, Any]:
         ac = (
             asset_class
@@ -652,6 +687,7 @@ class TradingService:
             reason=reason,
             prior_health=prior_health,
             expected_generation=expected_generation,
+            request_id=request_id,
         )
         return {
             "killswitch": "reset",
@@ -676,16 +712,96 @@ class TradingService:
             "fills_repaired": 0,
         }
 
-    def sync_open_orders(self) -> dict[str, Any]:
+    def sync_open_orders(
+        self,
+        *,
+        actor: str = "system:order-reconciliation",
+        reason: str = "scheduled broker order reconciliation",
+        request_id: str = "",
+    ) -> dict[str, Any]:
         """Compatibility facade for callers that still consume dictionary reports."""
-        return self.serialize_reconciliation_report(
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError(
+                "order reconciliation actor and reason must be non-empty"
+            )
+        result = self.serialize_reconciliation_report(
             self.reconciliation.reconcile()
         )
+        with self.session_factory() as session:
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="orders.sync",
+                    target_type="broker_orders",
+                    target_id="all",
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=(
+                        "reconciled"
+                        if result["failed"] == 0
+                        else "reconciliation_required"
+                    ),
+                    detail_json=json.dumps(
+                        {
+                            "resolved_unknown": result["resolved_unknown"],
+                            "unresolved_unknown": result[
+                                "unresolved_unknown"
+                            ],
+                            "synced_orders": result["synced_orders"],
+                            "inserted_fills": result["inserted_fills"],
+                            "broker_drift": result["broker_drift"],
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            )
+            session.commit()
+        return result
 
-    def cancel_live_order(self, order_id: int) -> dict[str, Any]:
+    def cancel_live_order(
+        self,
+        order_id: int,
+        *,
+        actor: str = "system:order-cancel",
+        reason: str = "programmatic live-order cancellation",
+        request_id: str = "",
+    ) -> dict[str, Any]:
         """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError(
+                "live-order cancellation actor and reason must be non-empty"
+            )
         with self.submission_barrier.hold_writer():
-            return self._cancel_live_order_under_writer(order_id)
+            result = self._cancel_live_order_under_writer(order_id)
+            with self.session_factory() as session:
+                session.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="order.cancel",
+                        target_type="order",
+                        target_id=str(order_id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code=(
+                            "canceled"
+                            if "error" not in result
+                            else "cancel_failed"
+                        ),
+                        detail_json=json.dumps(
+                            {
+                                "status": result.get("status"),
+                                "has_error": "error" in result,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                )
+                session.commit()
+            return result
 
     def _cancel_live_order_under_writer(
         self,
@@ -781,8 +897,16 @@ class TradingService:
         self,
         *,
         actor: str = "system:position-reconciliation",
+        reason: str = "scheduled position reconciliation",
+        request_id: str = "",
     ) -> dict[str, Any]:
         """Compare positions and durably trip drift in one writer interval."""
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError(
+                "position reconciliation actor and reason must be non-empty"
+            )
         with self.submission_barrier.hold_writer():
             # Broker I/O is ordered by the process barrier but occurs before
             # any SQLite transaction is opened.
@@ -808,20 +932,38 @@ class TradingService:
                             "local": str(local_qty),
                         }
                 if drift:
-                    reason = json.dumps(drift, sort_keys=True)
+                    drift_detail = json.dumps(drift, sort_keys=True)
                     session.add(
                         RiskEvent(
                             event_type="reconciliation",
-                            reason=reason,
+                            reason=drift_detail,
                         )
                     )
                     trip_in_session(
                         session,
                         BreakerScope.broker_drift(),
-                        f"position reconciliation drift: {reason}",
+                        f"position reconciliation drift: {drift_detail}",
                         actor,
+                        request_id=request_id,
                     )
-                    session.commit()
+                session.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="positions.reconcile",
+                        target_type="portfolio",
+                        target_id="all",
+                        request_id=request_id,
+                        reason=reason,
+                        result_code=(
+                            "reconciled" if not drift else "drift_detected"
+                        ),
+                        detail_json=json.dumps(
+                            {"drift": drift},
+                            sort_keys=True,
+                        ),
+                    )
+                )
+                session.commit()
             return {"reconciled": not drift, "drift": drift}
 
     def enforce_daily_loss_limits(self) -> dict[str, bool]:

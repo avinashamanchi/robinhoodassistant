@@ -1306,7 +1306,13 @@ class ReconciliationService:
                 )
         return tuple(faults)
 
-    def panic(self, actor: str, reason: str) -> PanicReport:
+    def panic(
+        self,
+        actor: str,
+        reason: str,
+        *,
+        request_id: str = "",
+    ) -> PanicReport:
         actor = actor.strip()
         reason = reason.strip()
         if not actor or not reason:
@@ -1318,6 +1324,7 @@ class ReconciliationService:
             BreakerScope.operator_global(),
             reason=f"panic by {actor}: {reason}",
             actor=actor,
+            request_id=request_id,
         )
 
         with self.session_factory() as session:

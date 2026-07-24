@@ -6,8 +6,10 @@ import stat
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import Fill, Order, Proposal, utcnow
+from trading_assistant.db.models import AuthSession, Fill, Order, Proposal, utcnow
 from trading_assistant.db.session import create_db_engine
 
 
@@ -64,6 +66,31 @@ def test_idempotency_key_unique(session_factory):
         except Exception:
             raised = True
         assert raised, "duplicate idempotency_key must violate the unique constraint"
+
+
+def test_auth_session_hash_is_unique(session_factory):
+    now = utcnow()
+    with session_factory() as session:
+        session.add(
+            AuthSession(
+                token_hash="a" * 64,
+                csrf_hash="b" * 64,
+                actor="operator:test",
+                expires_at=now + timedelta(hours=8),
+            )
+        )
+        session.commit()
+    with session_factory() as session:
+        session.add(
+            AuthSession(
+                token_hash="a" * 64,
+                csrf_hash="c" * 64,
+                actor="operator:test",
+                expires_at=now + timedelta(hours=8),
+            )
+        )
+        with pytest.raises(Exception):
+            session.commit()
 
 
 def test_sqlite_database_and_sidecars_are_owner_only(tmp_path):

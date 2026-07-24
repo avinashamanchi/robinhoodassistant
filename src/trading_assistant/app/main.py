@@ -8,13 +8,14 @@ inside TradingService.approve_order.
 
 from __future__ import annotations
 
-import hmac
+import ipaddress
+from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..assets import AssetClass
@@ -23,7 +24,17 @@ from ..db.schema import require_current_schema
 from ..db.session import create_db_engine, make_session_factory
 from ..service import TradingService
 from .agent import Agent
+from .auth import SessionAuth, SessionPrincipal
+from .errors import ApiError
 from .ratelimit import RateLimiter
+from .routers.auth import router as auth_router
+from .security import (
+    csrf_protected,
+    current_principal,
+    install_security,
+    rate_limit_key,
+    recent_principal,
+)
 
 _STATIC = Path(__file__).parent / "static"
 
@@ -106,18 +117,14 @@ def build_default_stack() -> tuple[TradingService, Agent]:
     return service, agent
 
 
-def _auth_dependency(token: str):
-    """Require X-API-Key on mutating endpoints (constant-time). If no token is
-    configured, auth is disabled (dev/test) — preflight flags that as a FAIL."""
-
-    def dep(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> str:
-        if not token:
-            return "operator:api-token"
-        if x_api_key is None or not hmac.compare_digest(str(x_api_key), token):
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
-        return "operator:api-token"
-
-    return dep
+def _is_loopback_bind(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def create_app(
@@ -131,15 +138,29 @@ def create_app(
     approve_rate: RateLimiter | None = None,
     analysis_rate: RateLimiter | None = None,
     backtest_rate: RateLimiter | None = None,
+    login_rate: RateLimiter | None = None,
+    auth_now: Callable | None = None,
+    bind_host: str | None = None,
 ) -> FastAPI:
+    runtime_secrets = Secrets()
+    if api_token is None:
+        api_token = runtime_secrets.app_api_token
+    if not api_token or not api_token.strip():
+        raise RuntimeError("APP_API_TOKEN is required")
     if service is None or agent is None:
         service, agent = build_default_stack()
-    if api_token is None:
-        api_token = Secrets().app_api_token
     from ..logging import register_secret
 
     register_secret(api_token)
-    auth = Depends(_auth_dependency(api_token))
+    security_config = service.config.security
+    configured_bind = bind_host or runtime_secrets.app_host
+    if (
+        not security_config.cookie_secure
+        and not _is_loopback_bind(configured_bind)
+    ):
+        raise RuntimeError(
+            "security.cookie_secure must be true for a non-loopback APP_HOST"
+        )
 
     _secrets_holder: dict = {}
     if planning is None:
@@ -166,112 +187,235 @@ def create_app(
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
     analysis_rate = analysis_rate or RateLimiter(max_requests=5, window_seconds=60)
     backtest_rate = backtest_rate or RateLimiter(max_requests=2, window_seconds=3600)
+    login_rate = login_rate or RateLimiter(max_requests=5, window_seconds=60)
 
-    app = FastAPI(title="Trading Assistant")
-    # Same-origin only. Cross-origin requests carrying the custom X-API-Key header
-    # must CORS-preflight; disallowed origins fail preflight -> CSRF vector closed.
+    app = FastAPI(
+        title="Trading Assistant",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.state.operator_secret = api_token
+    app.state.login_rate = login_rate
+    session_kwargs = {
+        "ttl": timedelta(hours=security_config.session_hours),
+        "reauthentication_window": timedelta(
+            minutes=security_config.reauthentication_minutes
+        ),
+        "cookie_secure": security_config.cookie_secure,
+    }
+    if auth_now is not None:
+        session_kwargs["now"] = auth_now
+    app.state.session_auth = SessionAuth(
+        service.session_factory,
+        **session_kwargs,
+    )
+    install_security(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["X-API-Key", "Content-Type"],
+        allow_headers=["X-CSRF-Token", "Content-Type"],
     )
+    app.include_router(auth_router)
 
-    def _client(request: Request) -> str:
-        return request.client.host if request.client else "unknown"
+    @app.get("/health/live")
+    def liveness():
+        return {"status": "ok"}
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return (_STATIC / "login.html").read_text(encoding="utf-8")
+
+    @app.get("/static/login.js", response_class=FileResponse)
+    def login_script():
+        return _STATIC / "login.js"
 
     @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
+    def index(
+        principal: SessionPrincipal = Depends(current_principal),
+    ) -> str:
         return (_STATIC / "index.html").read_text(encoding="utf-8")
 
-    @app.post("/chat", dependencies=[auth])
-    def chat(body: ChatIn, request: Request):
-        if not chat_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="rate limit exceeded")
+    @app.post("/chat")
+    def chat(
+        body: ChatIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        if not chat_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Chat rate limit exceeded"
+            )
         return agent.chat(body.message)
 
     @app.get("/health")
-    def health():  # no auth — for watchdogs/uptime checks
+    def health(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return service.health()
 
     @app.get("/pending")
-    def pending():
+    def pending(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return {"pending": service.get_pending()}
 
     @app.post("/approve/{order_id}")
-    def approve(order_id: int, body: ApprovalIn, request: Request, principal: str = auth):
-        if not approve_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="rate limit exceeded")
-        result = service.approve_order(order_id, actor=principal, reason=body.reason)
-        # Surface a conflict (already-decided) as HTTP 409 for the atomic guarantee.
+    def approve(
+        order_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(recent_principal),
+    ):
+        if not approve_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Approval rate limit exceeded"
+            )
+        result = service.approve_order(
+            order_id,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
         if result.get("error", "").startswith("order not in PROPOSED"):
-            raise HTTPException(status_code=409, detail=result)
+            raise ApiError(
+                "approval_conflict", 409, "Order approval is no longer current"
+            )
+        if result.get("error") == "not found":
+            raise ApiError("order_not_found", 404, "Order not found")
+        if result.get("status") == "acceptance_unknown":
+            raise ApiError(
+                "acceptance_unknown",
+                409,
+                "Broker acceptance is unknown; reconciliation is required",
+            )
+        if result.get("status") == "rejected":
+            raise ApiError(
+                "policy_denied", 403, "Order was denied by safety policy"
+            )
         return result
 
-    @app.post("/reject/{order_id}", dependencies=[auth])
-    def reject(order_id: int):
-        return service.reject_order(order_id)
+    @app.post("/reject/{order_id}")
+    def reject(
+        order_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        result = service.reject_order(
+            order_id,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
+        if result.get("error") == "not found":
+            raise ApiError("order_not_found", 404, "Order not found")
+        if "error" in result:
+            raise ApiError(
+                "order_conflict", 409, "Order is not rejectable"
+            )
+        return result
 
     @app.get("/positions")
-    def positions():
+    def positions(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return {"positions": service.get_positions()}
 
     @app.get("/log")
-    def log():
+    def log(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return service.get_log()
 
     @app.post("/killswitch/reset")
     def killswitch_reset(
         body: KillSwitchResetIn,
-        principal: str = auth,
+        request: Request,
+        principal: SessionPrincipal = Depends(recent_principal),
     ):
         from ..risk.breakers import BreakerResetConflict
 
         try:
             return service.reset_killswitch(
                 body.asset_class,
-                actor=principal,
+                actor=principal.actor,
                 reason=body.reason,
                 expected_generation=body.expected_generation,
+                request_id=request.state.request_id,
             )
         except BreakerResetConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "scope": exc.scope.key,
-                    "expected_generation": exc.expected_generation,
-                    "current_generation": (
-                        exc.current_state.generation
-                        if exc.current_state is not None
-                        else None
-                    ),
-                    "current_tripped": (
-                        exc.current_state.tripped
-                        if exc.current_state is not None
-                        else None
-                    ),
-                },
+            raise ApiError(
+                "breaker_conflict",
+                409,
+                "Circuit-breaker state changed; refresh before resetting",
             ) from exc
 
-    @app.post("/orders/{order_id}/cancel", dependencies=[auth])
-    def cancel_order(order_id: int):
-        return service.cancel_live_order(order_id)
+    @app.post("/orders/{order_id}/cancel")
+    def cancel_order(
+        order_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        result = service.cancel_live_order(
+            order_id,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
+        if result.get("error") == "not found":
+            raise ApiError("order_not_found", 404, "Order not found")
+        if "error" in result:
+            raise ApiError(
+                "order_conflict",
+                409,
+                "Order cancellation could not be confirmed",
+            )
+        return result
 
     @app.post("/reconcile")
-    def reconcile(principal: str = auth):
-        return service.reconcile_positions(actor=principal)
+    def reconcile(
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(recent_principal),
+    ):
+        return service.reconcile_positions(
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
 
-    @app.post("/sync", dependencies=[auth])
-    def sync():  # pull fills/status from the broker (also runs each daemon loop)
-        return service.sync_open_orders()
+    @app.post("/sync")
+    def sync(
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):  # pull fills/status from the broker (also runs each daemon loop)
+        return service.sync_open_orders(
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
 
     @app.post("/panic")
-    def panic(body: PanicIn, principal: str = auth):
-        return service.panic(actor=principal, reason=body.reason)
+    def panic(
+        body: PanicIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(recent_principal),
+    ):
+        return service.panic(
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
 
     @app.get("/analyst/scorecard")
-    def analyst_scorecard():
+    def analyst_scorecard(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         from ..analyst.store import promotion_status
 
         with service.session_factory() as s:
@@ -280,42 +424,94 @@ def create_app(
     # ── plans + screener (Phase 8) ─────────────────────────────
     def _require_planning():
         if planning is None:
-            raise HTTPException(status_code=503, detail="analyst/planning not configured (needs LLM + market data)")
+            raise ApiError(
+                "dependency_unavailable",
+                503,
+                "Analyst planning is unavailable",
+            )
         return planning
 
-    @app.post("/analyze", dependencies=[auth])
-    def analyze(body: AnalyzeIn, request: Request):
-        if not analysis_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
+    @app.post("/analyze")
+    def analyze(
+        body: AnalyzeIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        if not analysis_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
+            )
         return _require_planning().analyze(body.symbol)
 
     @app.get("/plans")
-    def list_plans():
+    def list_plans(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return {"plans": _require_planning().get_plans()}
 
     @app.get("/plans/ui", response_class=HTMLResponse)
-    def plans_ui() -> str:
+    def plans_ui(
+        principal: SessionPrincipal = Depends(current_principal),
+    ) -> str:
         return (_STATIC / "plans.html").read_text(encoding="utf-8")
 
     @app.get("/plans/{plan_id}")
-    def get_plan(plan_id: int):
+    def get_plan(
+        plan_id: int,
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         plan = _require_planning().get_plan(plan_id)
         if plan is None:
-            raise HTTPException(status_code=404, detail="plan not found")
+            raise ApiError("plan_not_found", 404, "Plan not found")
         return plan
 
     @app.post("/plans/{plan_id}/approve")
-    def approve_plan(plan_id: int, body: ApprovalIn, principal: str = auth):
+    def approve_plan(
+        plan_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(recent_principal),
+    ):
         result = _require_planning().approve_plan(
-            plan_id, actor=principal, reason=body.reason
+            plan_id,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
         )
         if "error" in result and "promotion gate" in result["error"]:
-            raise HTTPException(status_code=409, detail=result)
+            raise ApiError(
+                "policy_denied",
+                403,
+                "Plan approval was denied by safety policy",
+            )
+        if result.get("error") == "not found":
+            raise ApiError("plan_not_found", 404, "Plan not found")
+        if "error" in result:
+            raise ApiError(
+                "approval_conflict", 409, "Plan approval is no longer current"
+            )
         return result
 
-    @app.post("/plans/{plan_id}/cancel", dependencies=[auth])
-    def cancel_plan(plan_id: int):
-        return _require_planning().cancel_plan(plan_id)
+    @app.post("/plans/{plan_id}/cancel")
+    def cancel_plan(
+        plan_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        result = _require_planning().cancel_plan(
+            plan_id,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
+        if result.get("error") == "not found":
+            raise ApiError("plan_not_found", 404, "Plan not found")
+        if "error" in result:
+            raise ApiError(
+                "plan_conflict", 409, "Plan cancellation is not current"
+            )
+        return result
 
     def _screen_candidates(top_n: int):
         nonlocal screen_source
@@ -325,7 +521,11 @@ def create_app(
         if screen_source is None:  # lazily build the live source on first call
             sec = _secrets_holder.get("s")
             if sec is None:
-                raise HTTPException(status_code=503, detail="screener source not configured")
+                raise ApiError(
+                    "dependency_unavailable",
+                    503,
+                    "Screener source is unavailable",
+                )
             from ..analyst.live_features import build_screen_source
 
             screen_source = build_screen_source([s.upper() for s in universe], sec)
@@ -333,19 +533,30 @@ def create_app(
             screen_source, [s.upper() for s in universe], spy_symbol="SPY", top_n=top_n,
         )
 
-    @app.post("/screen", dependencies=[auth])
-    def screen(request: Request):
-        if not analysis_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
+    @app.post("/screen")
+    def screen(
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        if not analysis_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
+            )
         return {"candidates": _screen_candidates(service.config.screener.top_n)}
 
-    @app.post("/propose", dependencies=[auth])
-    def propose(body: ProposeIn, request: Request):
+    @app.post("/propose")
+    def propose(
+        body: ProposeIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
         """Screen the market and run the analyst on the top N candidates, creating
         sized plans you can approve. The analyst is UNPROVEN — these are suggestions
         the risk engine still gates; you approve each one."""
-        if not analysis_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="analysis rate limit exceeded")
+        if not analysis_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
+            )
         planning = _require_planning()
         candidates = _screen_candidates(max(body.n, service.config.screener.top_n))
         created = []
@@ -363,27 +574,41 @@ def create_app(
 
     # ── external (read-only) accounts ──────────────────────────
     @app.get("/holdings")
-    def holdings():
+    def holdings(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         """Combined Alpaca + external holdings, labeled by source (read-only external)."""
         return service.get_combined_holdings()
 
     @app.get("/external/positions")
-    def external_positions():
+    def external_positions(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return service.get_external_positions()
 
     @app.get("/external/summary")
-    def external_summary():
+    def external_summary(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return service.get_external_account_summary()
 
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")
-    def list_backtests():
+    def list_backtests(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         return {"backtests": _list_backtests(service.session_factory)}
 
-    @app.post("/backtests/run", dependencies=[auth])
-    def run_backtest_endpoint(body: BacktestRunIn, request: Request):
-        if not backtest_rate.allow(_client(request)):
-            raise HTTPException(status_code=429, detail="backtest rate limit exceeded")
+    @app.post("/backtests/run")
+    def run_backtest_endpoint(
+        body: BacktestRunIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        if not backtest_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded", 429, "Backtest rate limit exceeded"
+            )
         from ..backtest.runner import run_synthetic_backtest
 
         run_id, report = run_synthetic_backtest(
@@ -392,14 +617,19 @@ def create_app(
         return {"run_id": run_id, "report": report.to_dict()}
 
     @app.get("/backtests/{run_id}/report")
-    def backtest_report(run_id: int):
+    def backtest_report(
+        run_id: int,
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
         report = _load_backtest_report(service.session_factory, run_id)
         if report is None:
-            raise HTTPException(status_code=404, detail="run not found")
+            raise ApiError("backtest_not_found", 404, "Backtest run not found")
         return report
 
     @app.get("/backtests/ui", response_class=HTMLResponse)
-    def backtests_ui() -> str:
+    def backtests_ui(
+        principal: SessionPrincipal = Depends(current_principal),
+    ) -> str:
         return (_STATIC / "backtests.html").read_text(encoding="utf-8")
 
     return app

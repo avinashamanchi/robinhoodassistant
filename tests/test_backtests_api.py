@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 import trading_assistant.backtest.runner as runner
 from trading_assistant.app.main import create_app
 
+TOKEN = "test-backtests-operator-secret"
+
 
 class StubAgent:
     def chat(self, message: str):
@@ -15,9 +17,12 @@ class StubAgent:
 
 
 @pytest.fixture
-def client(make_service):
+def client(make_service, authenticate_client):
     svc = make_service()
-    return TestClient(create_app(service=svc, agent=StubAgent(), api_token="")), svc
+    app = create_app(service=svc, agent=StubAgent(), api_token=TOKEN)
+    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    test_client.headers.update({"X-CSRF-Token": csrf})
+    return test_client, svc
 
 
 def _seed(svc, bars=420):

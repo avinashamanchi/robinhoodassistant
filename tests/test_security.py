@@ -1,4 +1,4 @@
-"""Section A security: API-token auth + CORS (A1), no-innerHTML XSS guard (A2),
+"""Section A security: operator sessions + CORS (A1), no-innerHTML XSS guard (A2),
 redaction (A3), daemon backoff + staleness (A4)."""
 
 from __future__ import annotations
@@ -39,19 +39,25 @@ def client(make_service):
     return test_client
 
 
-# ── A1: auth on mutating endpoints ──────────────────────────────
-def test_mutating_without_token_401(client):
-    assert client.post("/approve/1").status_code == 401
-    assert client.post("/killswitch/reset").status_code == 401
-    assert client.post("/reconcile").status_code == 401
+# ── A1: fail-closed sessions + CSRF ─────────────────────────────
+def test_mutating_without_session_401(client):
+    assert client.post("/approve/1", json={"reason": "reviewed"}).status_code == 401
+    assert client.post("/killswitch/reset", json={}).status_code == 401
+    assert client.post(
+        "/reconcile", json={"reason": "reviewed positions"}
+    ).status_code == 401
     assert client.post("/chat", json={"message": "hi"}).status_code == 401
 
 
-def test_wrong_token_401(client):
-    assert client.post("/killswitch/reset", headers={"X-API-Key": "nope"}).status_code == 401
+def test_x_api_key_is_ignored(client):
+    response = client.get("/positions", headers={"X-API-Key": TOKEN})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_session"
 
 
-def test_correct_token_allows(client):
+def test_authenticated_session_and_csrf_allow_mutation(
+    client, authenticate_client
+):
     from trading_assistant.assets import AssetClass
     from trading_assistant.risk.breakers import BreakerScope
 
@@ -60,9 +66,10 @@ def test_correct_token_allows(client):
         "security drill",
         "daemon",
     )
+    client, csrf = authenticate_client(client, TOKEN)
     r = client.post(
         "/killswitch/reset",
-        headers={"X-API-Key": TOKEN},
+        headers={"X-CSRF-Token": csrf},
         json={
             "asset_class": "equity",
             "reason": "authenticated health review",
@@ -72,7 +79,9 @@ def test_correct_token_allows(client):
     assert r.status_code == 200 and r.json()["tripped"] is False
 
 
-def test_paid_analysis_and_backtest_endpoints_are_rate_limited(make_service):
+def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
+    make_service, authenticate_client
+):
     class StubPlanning:
         def analyze(self, symbol):
             return {"symbol": symbol}
@@ -86,23 +95,23 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(make_service):
         analysis_rate=blocked,
         backtest_rate=blocked,
     )
-    limited = TestClient(app)
-    headers = {"X-API-Key": TOKEN}
+    limited, csrf = authenticate_client(TestClient(app), TOKEN)
+    headers = {"X-CSRF-Token": csrf}
 
     assert limited.post("/analyze", json={"symbol": "AAPL"}, headers=headers).status_code == 429
     assert limited.post("/propose", json={"n": 1}, headers=headers).status_code == 429
     assert limited.post("/backtests/run", json={"symbols": []}, headers=headers).status_code == 429
 
 
-def test_get_endpoints_stay_open(client):
-    assert client.get("/pending").status_code == 200
-    assert client.get("/positions").status_code == 200
-    assert client.get("/log").status_code == 200
+def test_financial_get_endpoints_fail_closed(client):
+    assert client.get("/pending").status_code == 401
+    assert client.get("/positions").status_code == 401
+    assert client.get("/log").status_code == 401
 
 
 def test_cors_preflight_blocks_cross_origin(client):
     hdr = {"Origin": "http://evil.example", "Access-Control-Request-Method": "POST",
-           "Access-Control-Request-Headers": "x-api-key"}
+           "Access-Control-Request-Headers": "x-csrf-token"}
     r = client.options("/approve/1", headers=hdr)
     assert r.headers.get("access-control-allow-origin") != "http://evil.example"
     ok = client.options("/approve/1", headers={**hdr, "Origin": "http://127.0.0.1:8000"})

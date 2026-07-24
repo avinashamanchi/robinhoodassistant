@@ -17,9 +17,11 @@ from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
+from trading_assistant.db.models import AuditEvent
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
+TOKEN = "test-plans-operator-secret"
 
 
 def _plan():
@@ -48,19 +50,27 @@ class _StubAgent:
 
 
 @pytest.fixture
-def client(make_service):
+def client(make_service, authenticate_client):
     svc = make_service()
     provider = lambda sym: MarketFeatures(symbol=sym, asset_class=AssetClass.EQUITY,
                                           as_of=TS, last_close=100.0, regime=Regime.RANGING)
     planning = PlanningService(svc, _StubAnalyst(), provider, Secrets())
     source = DataSource({s: make_bars(300, seed=i)
                          for i, s in enumerate(["AAPL", "MSFT", "SPY"])})
-    app = create_app(service=svc, agent=_StubAgent(), planning=planning, screen_source=source, api_token="")
-    return TestClient(app), svc
+    app = create_app(
+        service=svc,
+        agent=_StubAgent(),
+        planning=planning,
+        screen_source=source,
+        api_token=TOKEN,
+    )
+    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    test_client.headers.update({"X-CSRF-Token": csrf})
+    return test_client, svc
 
 
 def test_analyze_and_plan_flow(client):
-    c, _ = client
+    c, svc = client
     res = c.post("/analyze", json={"symbol": "AAPL"}).json()
     pid = res["plan_id"]
     assert res["sized"]["direction"] == "long"
@@ -69,18 +79,53 @@ def test_analyze_and_plan_flow(client):
     detail = c.get(f"/plans/{pid}").json()
     assert detail["plan"]["action"] == "buy" and "sized" in detail
 
-    approve = c.post(f"/plans/{pid}/approve", json={"reason": "reviewed plan"}).json()
+    approve_response = c.post(
+        f"/plans/{pid}/approve", json={"reason": "reviewed plan"}
+    )
+    approve = approve_response.json()
     # Single-target plan -> server-side bracket (0 daemon rules) OR rules armed.
     assert approve["status"] == "approved"
     assert approve.get("bracket") is not None or approve["rules_created"] >= 1
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="plan.approve", target_id=str(pid))
+            .one()
+        )
+    assert audit.actor == "operator:local"
+    assert audit.reason == "reviewed plan"
+    assert audit.request_id == approve_response.headers["X-Request-ID"]
 
-    cancel = c.post(f"/plans/{pid}/cancel").json()
+    cancel_response = c.post(
+        f"/plans/{pid}/cancel", json={"reason": "review complete"}
+    )
+    cancel = cancel_response.json()
     assert cancel["status"] == "canceled"
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="plan.cancel", target_id=str(pid))
+            .one()
+        )
+    assert audit.actor == "operator:local"
+    assert audit.reason == "review complete"
+    assert audit.request_id == cancel_response.headers["X-Request-ID"]
 
 
 def test_plan_404(client):
     c, _ = client
     assert c.get("/plans/9999").status_code == 404
+
+
+def test_plan_cancel_missing_target_has_stable_error(client):
+    c, _ = client
+    response = c.post(
+        "/plans/9999/cancel",
+        json={"reason": "reviewed missing plan"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "plan_not_found"
 
 
 def test_screen_endpoint(client):
@@ -104,6 +149,9 @@ def test_plans_ui_approval_posts_a_nonempty_review_reason(client):
     assert 'window.prompt("Review reason for plan approval:")' in page
     assert "if (!reason)" in page
     assert "jsonPost({ reason })" in page
+    assert 'window.prompt("Reason for canceling this plan:")' in page
+    assert "X-CSRF-Token" in page
+    assert "X-API-Key" not in page
 
 
 def test_propose_generates_plans(client):

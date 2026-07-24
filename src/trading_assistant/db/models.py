@@ -235,6 +235,23 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    csrf_hash: Mapped[str] = mapped_column(String(64))
+    actor: Mapped[str] = mapped_column(String(128), default="operator")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    authenticated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utcnow
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+
+
 class Proposal(Base):
     __tablename__ = "proposals"
 

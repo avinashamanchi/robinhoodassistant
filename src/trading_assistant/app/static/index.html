@@ -94,15 +94,29 @@
       return t;
     }
 
-    // ── API token (A1): prompt once, send X-API-Key on every request ──
-    function apiKey() {
-      let t = localStorage.getItem("api_key");
-      if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); }
-      return t;
+    // Session cookies are HttpOnly. Keep the rotating CSRF value in memory only.
+    let csrfToken = "";
+    const sessionReady = fetch("/auth/session").then(async (response) => {
+      if (response.status === 401) {
+        window.location.replace("/login");
+        throw new Error("operator session required");
+      }
+      const session = await response.json();
+      csrfToken = session.csrf_token;
+    });
+    function sessionHeaders(opts) {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        opts.headers = Object.assign(
+          { "X-CSRF-Token": csrfToken },
+          opts.headers || {},
+        );
+      }
+      return opts;
     }
     async function api(path, opts = {}) {
-      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
-      const r = await fetch(path, opts);
+      await sessionReady;
+      const r = await fetch(path, sessionHeaders(opts));
       return r.json();
     }
     const jsonPost = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -117,17 +131,16 @@
     }
     // Mutating call that surfaces HTTP errors instead of swallowing them.
     async function action(path, opts = {}) {
-      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
+      await sessionReady;
       let r, data;
-      try { r = await fetch(path, opts); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
+      try { r = await fetch(path, sessionHeaders(opts)); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
       try { data = await r.json(); } catch (e) { data = {}; }
       if (r.status === 401) {
-        notify("Rejected: bad/missing API token. Click to re-enter.", "err");
-        localStorage.removeItem("api_key");
+        window.location.replace("/login");
         return { ok: false, status: 401, data };
       }
       if (!r.ok) {
-        const d = data && data.detail !== undefined ? data.detail : data;
+        const d = data && data.error !== undefined ? data.error : data;
         notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err");
         return { ok: false, status: r.status, data };
       }
@@ -171,7 +184,13 @@
       }
       refresh();
     }
-    async function reject(id) { const r = await action("/reject/" + id, { method: "POST" }); if (r.ok) notify("Rejected order " + id, "ok"); refresh(); }
+    async function reject(id) {
+      const reason = (window.prompt("Reason for rejecting this order:") || "").trim();
+      if (!reason) { notify("A non-empty rejection reason is required.", "err"); return; }
+      const r = await action("/reject/" + id, jsonPost({ reason }));
+      if (r.ok) notify("Rejected order " + id, "ok");
+      refresh();
+    }
     async function resetKill() {
       const health = await api("/health");
       const generation = health.killswitch_generation && health.killswitch_generation.equity;
@@ -191,7 +210,11 @@
     }
     async function panic() {
       if (!window.confirm("PANIC: cancel all orders, disable all rules, trip all kill switches?")) return;
-      const r = await action("/panic", { method: "POST" }); if (r.ok) notify("PANIC executed — everything halted", "ok"); refresh();
+      const reason = (window.prompt("Reason for panic shutdown:") || "").trim();
+      if (!reason) { notify("A non-empty panic reason is required.", "err"); return; }
+      const r = await action("/panic", jsonPost({ reason }));
+      if (r.ok) notify("PANIC executed — everything halted", "ok");
+      refresh();
     }
 
     async function refresh() {

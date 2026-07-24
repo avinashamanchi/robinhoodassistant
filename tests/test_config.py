@@ -91,6 +91,9 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     assert cfg.risk.require_broker_reconciled is True
     assert cfg.features.auto_execute_preapproved_rules is False
     assert cfg.execution.prefer_bracket_orders is False
+    assert cfg.security.session_hours == 8
+    assert cfg.security.reauthentication_minutes == 5
+    assert cfg.security.cookie_secure is False
 
 
 def test_deployed_config_keeps_automatic_execution_disabled():
@@ -99,6 +102,24 @@ def test_deployed_config_keeps_automatic_execution_disabled():
 
     assert cfg.features.auto_execute_preapproved_rules is False
     assert cfg.execution.prefer_bracket_orders is False
+    assert cfg.security.session_hours == 8
+    assert cfg.security.reauthentication_minutes == 5
+    assert cfg.security.cookie_secure is False
+
+
+@pytest.mark.parametrize(
+    "security",
+    [
+        "security:\n  session_hours: 0\n",
+        "security:\n  reauthentication_minutes: 0\n",
+        "security:\n  cookie_secure: false\n  misspelled: true\n",
+    ],
+)
+def test_invalid_or_unknown_security_config_fails_closed(
+    tmp_path, security
+):
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, VALID + "\n" + security))
 
 
 def test_typo_in_risk_key_fails_to_load(tmp_path):

@@ -15,6 +15,7 @@ from trading_assistant.db.models import create_all
 from trading_assistant.db.session import create_db_engine, make_session_factory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+TEST_OPERATOR_TOKEN = "test-operator-secret"
 
 
 @pytest.fixture
@@ -107,6 +108,52 @@ def make_service(app_config, session_factory):
         )
 
     return _make
+
+
+@pytest.fixture
+def operator_token() -> str:
+    return TEST_OPERATOR_TOKEN
+
+
+@pytest.fixture
+def authenticate_client(operator_token):
+    """Log in through the real route and validate the persisted session."""
+
+    def _authenticate(client, token: str | None = None):
+        login = client.post(
+            "/auth/login",
+            json={"secret": token or operator_token},
+        )
+        assert login.status_code == 200, login.text
+        session = client.get("/auth/session")
+        assert session.status_code == 200, session.text
+        assert session.json()["actor"] == "operator:local"
+        csrf = session.json()["csrf_token"]
+        return client, csrf
+
+    return _authenticate
+
+
+@pytest.fixture
+def authenticated_client(make_service, operator_token, authenticate_client):
+    from fastapi.testclient import TestClient
+
+    from trading_assistant.app.main import create_app
+
+    class _StubAgent:
+        def chat(self, message):
+            return {"reply": "ok", "tool_calls": []}
+
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=operator_token,
+        planning=None,
+    )
+    client = TestClient(app)
+    client.trading_service = service
+    return authenticate_client(client)
 
 
 @pytest.fixture

@@ -129,6 +129,7 @@ def _audit(
     action: str,
     reason: str,
     result_code: str,
+    request_id: str,
     detail: Mapping[str, object] | None = None,
     now: datetime,
 ) -> None:
@@ -138,7 +139,7 @@ def _audit(
             action=action,
             target_type="circuit_breaker",
             target_id=scope.key,
-            request_id="",
+            request_id=request_id,
             reason=reason,
             result_code=result_code,
             detail_json=json.dumps(
@@ -156,6 +157,7 @@ def trip_in_session(
     actor: str,
     *,
     now: datetime | None = None,
+    request_id: str = "",
 ) -> tuple[BreakerState, bool]:
     reason = reason.strip()
     actor = actor.strip()
@@ -201,6 +203,7 @@ def trip_in_session(
         action="circuit_breaker.trip",
         reason=reason,
         result_code="tripped" if changed else "already_tripped",
+        request_id=request_id,
         detail={"generation": row.generation},
         now=timestamp,
     )
@@ -216,6 +219,7 @@ def reset_in_session(
     *,
     expected_generation: int,
     now: datetime | None = None,
+    request_id: str = "",
 ) -> BreakerState:
     actor = actor.strip()
     reason = reason.strip()
@@ -257,6 +261,7 @@ def reset_in_session(
             action="circuit_breaker.reset",
             reason=reason,
             result_code="conflict",
+            request_id=request_id,
             detail={
                 "expected_generation": expected_generation,
                 "current_generation": (
@@ -287,6 +292,7 @@ def reset_in_session(
         action="circuit_breaker.reset",
         reason=reason,
         result_code="reset",
+        request_id=request_id,
         detail={
             "expected_generation": expected_generation,
             "generation": row.generation,
@@ -309,11 +315,17 @@ class BreakerService:
         actor: str,
         *,
         now: datetime | None = None,
+        request_id: str = "",
     ) -> BreakerState:
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
                 state, _changed = trip_in_session(
-                    session, scope, reason, actor, now=now
+                    session,
+                    scope,
+                    reason,
+                    actor,
+                    now=now,
+                    request_id=request_id,
                 )
                 session.commit()
                 return state
@@ -357,6 +369,7 @@ class BreakerService:
         *,
         expected_generation: int,
         now: datetime | None = None,
+        request_id: str = "",
     ) -> BreakerState:
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
@@ -369,6 +382,7 @@ class BreakerService:
                         prior_health,
                         expected_generation=expected_generation,
                         now=now,
+                        request_id=request_id,
                     )
                 except BreakerResetConflict:
                     session.commit()

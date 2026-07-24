@@ -599,14 +599,24 @@ def _position_reconciliation_process(
 
             from trading_assistant.app.main import create_app
 
-            response = TestClient(
+            client = TestClient(
                 create_app(
                     service=service,
                     agent=_ProcessStubAgent(),
                     planning=object(),
-                    api_token="",
+                    api_token="process-operator-secret",
                 )
-            ).post("/reconcile")
+            )
+            login = client.post(
+                "/auth/login",
+                json={"secret": "process-operator-secret"},
+            )
+            csrf = client.get("/auth/session").json()["csrf_token"]
+            response = client.post(
+                "/reconcile",
+                headers={"X-CSRF-Token": csrf},
+                json={"reason": "process drift review"},
+            )
             response.raise_for_status()
             result = response.json()
         else:
@@ -2044,7 +2054,7 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
 @pytest.mark.parametrize(
     ("entrypoint", "expected_actor"),
     [
-        ("http", "operator:api-token"),
+        ("http", "operator:local"),
         ("startup", "daemon:startup"),
     ],
 )

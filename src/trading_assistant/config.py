@@ -85,6 +85,12 @@ class ExecutionConfig(_Strict):
     prefer_bracket_orders: bool = False  # disabled until paper concurrency review
 
 
+class SecurityConfig(_Strict):
+    session_hours: int = Field(default=8, gt=0)
+    reauthentication_minutes: int = Field(default=5, gt=0)
+    cookie_secure: bool = False
+
+
 class LLMConfig(_Strict):
     model: str                                   # anthropic model
     max_tokens: int = Field(gt=0)
@@ -158,6 +164,7 @@ class AppConfig(_Strict):
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
 
 
 class Secrets(BaseSettings):
@@ -172,7 +179,7 @@ class Secrets(BaseSettings):
     groq_api_key: str = ""
     openrouter_api_key: str = ""
     marketstack_api_key: str = ""
-    app_api_token: str = ""       # X-API-Key required on mutating endpoints (A1)
+    app_api_token: str = ""       # Required operator login secret; never sent as API auth
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"

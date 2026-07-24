@@ -52,8 +52,25 @@
     const $ = (id) => document.getElementById(id);
     function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
     function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
-    function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
-    async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
+    let csrfToken = "";
+    const sessionReady = fetch("/auth/session").then(async (response) => {
+      if (response.status === 401) {
+        window.location.replace("/login");
+        throw new Error("operator session required");
+      }
+      csrfToken = (await response.json()).csrf_token;
+    });
+    function sessionHeaders(opts) {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        opts.headers = Object.assign({ "X-CSRF-Token": csrfToken }, opts.headers || {});
+      }
+      return opts;
+    }
+    async function api(path, opts = {}) {
+      await sessionReady;
+      return (await fetch(path, sessionHeaders(opts))).json();
+    }
     const jsonPost = (b) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 
     function notify(msg, kind) {
@@ -64,12 +81,12 @@
     // Mutating call that surfaces HTTP status AND a body-level {error:...}
     // (the plan endpoints return 200 with an "error" field for soft failures).
     async function action(path, opts = {}) {
-      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
+      await sessionReady;
       let r, data;
-      try { r = await fetch(path, opts); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
+      try { r = await fetch(path, sessionHeaders(opts)); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
       try { data = await r.json(); } catch (e) { data = {}; }
-      if (r.status === 401) { notify("Rejected: bad/missing API token — re-enter it.", "err"); localStorage.removeItem("api_key"); return { ok: false, data }; }
-      if (!r.ok) { const d = data.detail !== undefined ? data.detail : data; notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err"); return { ok: false, data }; }
+      if (r.status === 401) { window.location.replace("/login"); return { ok: false, data }; }
+      if (!r.ok) { const d = data.error !== undefined ? data.error : data; notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err"); return { ok: false, data }; }
       if (data && data.error) { notify(data.error, "err"); return { ok: false, data }; }
       return { ok: true, data };
     }
@@ -173,7 +190,9 @@
       await refresh(); showPlan(id);
     }
     async function cancelPlan(id) {
-      const r = await action("/plans/" + id + "/cancel", { method: "POST" });
+      const reason = (window.prompt("Reason for canceling this plan:") || "").trim();
+      if (!reason) { notify("A non-empty cancellation reason is required.", "err"); return; }
+      const r = await action("/plans/" + id + "/cancel", jsonPost({ reason }));
       if (r.ok) notify("Plan " + id + " canceled", "ok");
       await refresh(); showPlan(id);
     }

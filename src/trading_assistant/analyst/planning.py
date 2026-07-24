@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 
 from ..assets import AssetClass
 from ..config import live_trading_enabled
-from ..db.models import TradePlanRow, utcnow
+from ..db.models import AuditEvent, TradePlanRow, utcnow
 from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
@@ -82,7 +82,14 @@ class PlanningService:
             return row.id
 
     # ── approve (gate + decompose into rules) ──────────────────
-    def approve_plan(self, plan_id: int, *, actor: str, reason: str) -> dict[str, Any]:
+    def approve_plan(
+        self,
+        plan_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str = "",
+    ) -> dict[str, Any]:
         if not actor.strip() or not reason.strip():
             raise ValueError("approval actor and reason must be non-empty")
         with self.service.session_factory() as s:
@@ -135,6 +142,17 @@ class PlanningService:
                 )
                 row.status = "approved"
                 row.paper_only = not (live and promotable)
+                s.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="plan.approve",
+                        target_type="trade_plan",
+                        target_id=str(plan_id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code="approved",
+                    )
+                )
                 s.commit()
                 return {
                     "plan_id": plan_id,
@@ -280,7 +298,20 @@ class PlanningService:
         return rules
 
     # ── cancel + queries ───────────────────────────────────────
-    def cancel_plan(self, plan_id: int) -> dict[str, Any]:
+    def cancel_plan(
+        self,
+        plan_id: int,
+        *,
+        actor: str = "system:plan-cancel",
+        reason: str = "programmatic plan cancellation",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError(
+                "plan cancellation actor and reason must be non-empty"
+            )
         result = self.service.rule_repository.cancel_plan(
             plan_id,
             now=utcnow(),
@@ -294,6 +325,19 @@ class PlanningService:
         }
         if result.error is not None:
             response["error"] = result.error
+        with self.service.session_factory() as session:
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="plan.cancel",
+                    target_type="trade_plan",
+                    target_id=str(plan_id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=result.error or result.status,
+                )
+            )
+            session.commit()
         return response
 
     def get_plans(self) -> list[dict[str, Any]]:

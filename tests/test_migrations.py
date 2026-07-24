@@ -90,7 +90,48 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     require_current_schema(engine)
     assert "orders" in inspect(engine).get_table_names()
     assert "reconciliation_cursors" in inspect(engine).get_table_names()
+    assert "auth_sessions" in inspect(engine).get_table_names()
     assert "alembic_version" in inspect(engine).get_table_names()
+
+
+def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "auth-sessions.db",
+        "20260724_0005",
+    )
+    assert "auth_sessions" not in inspect(engine).get_table_names()
+
+    command.upgrade(cfg, "head")
+
+    inspector = inspect(engine)
+    assert {
+        column["name"] for column in inspector.get_columns("auth_sessions")
+    } == {
+        "id",
+        "token_hash",
+        "csrf_hash",
+        "actor",
+        "created_at",
+        "expires_at",
+        "authenticated_at",
+        "revoked_at",
+    }
+    indexes = {
+        index["name"]: index
+        for index in inspector.get_indexes("auth_sessions")
+    }
+    assert indexes["ix_auth_sessions_token_hash"]["unique"] == 1
+    assert indexes["ix_auth_sessions_expires_at"]["unique"] == 0
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0006"
+
+    command.downgrade(cfg, "20260724_0005")
+    assert "auth_sessions" not in inspect(engine).get_table_names()
+    assert "circuit_breaker_state" in inspect(engine).get_table_names()
 
 
 def test_existing_unversioned_database_must_be_adopted(tmp_path):

@@ -70,6 +70,11 @@ features:
 execution:
   prefer_bracket_orders: false            # OFF until extended paper concurrency drills pass
 
+security:
+  session_hours: 8
+  reauthentication_minutes: 5
+  cookie_secure: false                    # loopback HTTP only; true for TLS/non-loopback
+
 llm:
   provider: gemini            # anthropic | gemini | groq
   fallback_provider: groq     # tried if the primary errors at call time
