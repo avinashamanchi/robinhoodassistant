@@ -32,7 +32,12 @@ class OrderStatus(str, enum.Enum):
     """Lifecycle statuses. Transition rules live in db.models.OrderStateMachine (A4)."""
 
     PROPOSED = "proposed"
+    # Retained only to deserialize databases created before the order-outbox
+    # migration. New runtime transitions use APPROVAL_RECORDED instead.
     APPROVED = "approved"
+    APPROVAL_RECORDED = "approval_recorded"
+    SUBMITTING = "submitting"
+    ACCEPTANCE_UNKNOWN = "acceptance_unknown"
     SUBMITTED = "submitted"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"

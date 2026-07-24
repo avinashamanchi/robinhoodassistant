@@ -66,3 +66,25 @@ def test_unknown_revision_is_rejected_at_startup(tmp_path):
         ))
     with pytest.raises(SchemaOutOfDate, match="current='unknown_revision'"):
         require_current_schema(engine)
+
+
+def test_order_outbox_upgrade_preserves_and_maps_legacy_order(tmp_path):
+    path = tmp_path / "legacy-order.db"
+    engine = _legacy_engine(path)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO orders "
+            "(idempotency_key,ticker,side,order_type,status,created_at,updated_at) "
+            "VALUES ('legacy-approved','AAPL','buy','market','approved',"
+            "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        ))
+    adopt_existing(engine)
+    upgrade_backup = upgrade(engine)
+    assert upgrade_backup is not None
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, approval_actor FROM orders "
+            "WHERE idempotency_key='legacy-approved'"
+        )).one()
+    assert row.status == "approval_recorded"
+    assert row.approval_actor is None

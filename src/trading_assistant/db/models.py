@@ -15,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
@@ -79,13 +80,35 @@ class ApprovalConflict(Exception):
 _LEGAL_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.PROPOSED: frozenset(
         {
-            OrderStatus.APPROVED,
+            OrderStatus.APPROVAL_RECORDED,
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
             OrderStatus.CANCELED,
         }
     ),
-    # Execution-time risk re-check can still REJECT an approved order.
+    OrderStatus.APPROVAL_RECORDED: frozenset(
+        {OrderStatus.SUBMITTING, OrderStatus.EXPIRED}
+    ),
+    OrderStatus.SUBMITTING: frozenset(
+        {
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.ACCEPTANCE_UNKNOWN,
+            OrderStatus.REJECTED,
+        }
+    ),
+    OrderStatus.ACCEPTANCE_UNKNOWN: frozenset(
+        {
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELED,
+        }
+    ),
+    # Compatibility for orders approved by pre-outbox callers. New approval
+    # code uses APPROVAL_RECORDED and never transitions into APPROVED.
     OrderStatus.APPROVED: frozenset(
         {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELED}
     ),
@@ -139,6 +162,10 @@ class OrderStateMachine:
 # ── Tables ──────────────────────────────────────────────────────
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (
+        Index("ix_orders_status_broker_order_id", "status", "broker_order_id"),
+        Index("ix_orders_status_idempotency_key", "status", "idempotency_key"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -152,6 +179,21 @@ class Order(Base):
         String(20), default=OrderStatus.PROPOSED.value, index=True
     )
     broker_order_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    approval_actor: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    approval_reason: Mapped[str] = mapped_column(Text, default="")
+    approved_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    submission_kind: Mapped[str] = mapped_column(String(16), default="simple")
+    submission_payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    submission_attempt: Mapped[int] = mapped_column(default=0)
+    submission_started_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    acceptance_state: Mapped[str] = mapped_column(String(24), default="not_started")
+    last_reconciled_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    last_error_code: Mapped[str] = mapped_column(String(64), default="")
+    version: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
@@ -159,6 +201,23 @@ class Order(Base):
         back_populates="order", uselist=False
     )
     fills: Mapped[list["Fill"]] = relationship(back_populates="order")
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(String(128), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    target_type: Mapped[str] = mapped_column(String(32))
+    target_id: Mapped[str] = mapped_column(String(64))
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), default="", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    result_code: Mapped[str] = mapped_column(String(64), default="")
+    latency_ms: Mapped[int] = mapped_column(default=0)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 
 class Proposal(Base):
