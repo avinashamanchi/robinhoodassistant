@@ -37,6 +37,11 @@ class RiskEngine:
     ) -> RiskResult:
         symbol = order.ticker.upper()
         quote = snapshot.quotes.get(symbol)
+        if quote is not None and not quote.is_valid:
+            return RiskResult(
+                approved=False,
+                reasons=[f"quote for {symbol} is invalid"],
+            )
         reasons: list[str] = []
         base_checks = [
             rules.check_allowlist(order, self.config),

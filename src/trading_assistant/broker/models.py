@@ -100,6 +100,19 @@ class Quote:
     as_of: datetime = field(default_factory=_utcnow)
 
     @property
+    def is_valid(self) -> bool:
+        """Whether sizing and spread arithmetic are safe for this quote."""
+        return (
+            self.last.is_finite()
+            and self.last > 0
+            and self.bid.is_finite()
+            and self.bid >= 0
+            and self.ask.is_finite()
+            and self.ask > 0
+            and self.bid <= self.ask
+        )
+
+    @property
     def day_change_pct(self) -> Optional[Decimal]:
         if self.prev_close is None or self.prev_close == 0:
             return None
@@ -183,8 +196,9 @@ class PortfolioSnapshot:
     active_breakers: frozenset[str] = frozenset()
     as_of: datetime = field(default_factory=_utcnow)
     external_positions: dict[str, "object"] = field(default_factory=dict)
-    # Signed USD exposure from locally tracked outstanding orders that has not
-    # filled yet. Buys are positive, sells negative.
+    # Reserved buy notional from locally tracked outstanding orders. Pending
+    # sells reserve quantity separately in ``reserved_sell_qty_by_ticker``;
+    # opposite sides are deliberately never netted.
     pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
     pending_exposure_complete: bool = True
 

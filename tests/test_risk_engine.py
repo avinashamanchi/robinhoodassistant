@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 import inspect
+
+import pytest
 
 from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
     OrderType,
     Position,
+    Quote,
 )
 from trading_assistant.risk.engine import RiskEngine
 
@@ -163,6 +167,103 @@ def test_missing_quote_fails_closed(risk_config, make_snapshot):
     result = _check(engine, _order(notional="100"), snap)
     assert result.rejected
     assert any("no quote available" in r for r in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "last",
+    [
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_quantity_buy_rejects_non_positive_or_non_finite_last_before_arithmetic(
+    risk_config, make_snapshot, last
+):
+    snapshot = make_snapshot(prices={"AAPL": Decimal("100")})
+    snapshot = replace(
+        snapshot,
+        quotes={
+            "AAPL": Quote(
+                ticker="AAPL",
+                bid=Decimal("99"),
+                ask=Decimal("101"),
+                last=last,
+            )
+        },
+    )
+
+    result = RiskEngine(risk_config).check(_order(qty="10"), snapshot)
+
+    assert result.rejected
+    assert "quote for AAPL is invalid" in result.reasons
+
+
+def test_notional_sell_rejects_zero_last_instead_of_dividing_by_zero(
+    risk_config, make_snapshot
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position("AAPL", Decimal("10"), Decimal("100"), Decimal("100"))
+        ],
+    )
+    snapshot = replace(
+        snapshot,
+        quotes={
+            "AAPL": Quote(
+                ticker="AAPL",
+                bid=Decimal("0"),
+                ask=Decimal("0"),
+                last=Decimal("0"),
+            )
+        },
+    )
+
+    result = RiskEngine(risk_config).check(
+        _order(side=OrderSide.SELL, notional="100"),
+        snapshot,
+    )
+
+    assert result.rejected
+    assert "quote for AAPL is invalid" in result.reasons
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask"),
+    [
+        (Decimal("-1"), Decimal("101")),
+        (Decimal("99"), Decimal("-1")),
+        (Decimal("NaN"), Decimal("101")),
+        (Decimal("99"), Decimal("NaN")),
+        (Decimal("Infinity"), Decimal("101")),
+        (Decimal("99"), Decimal("Infinity")),
+        (Decimal("101"), Decimal("99")),
+        (Decimal("0"), Decimal("0")),
+    ],
+)
+def test_rejects_invalid_bid_ask_or_impossible_quote_shape_before_arithmetic(
+    risk_config, make_snapshot, bid, ask
+):
+    snapshot = make_snapshot(prices={"AAPL": Decimal("100")})
+    snapshot = replace(
+        snapshot,
+        quotes={
+            "AAPL": Quote(
+                ticker="AAPL",
+                bid=bid,
+                ask=ask,
+                last=Decimal("100"),
+            )
+        },
+    )
+
+    result = RiskEngine(risk_config).check(_order(notional="100"), snapshot)
+
+    assert result.rejected
+    assert "quote for AAPL is invalid" in result.reasons
 
 
 def test_reasons_accumulate(risk_config, make_snapshot):

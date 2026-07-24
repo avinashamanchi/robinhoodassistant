@@ -10,6 +10,7 @@ from trading_assistant.db.models import AuditEvent
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.breakers import (
     BreakerKind,
+    BreakerResetConflict,
     BreakerScope,
     BreakerService,
 )
@@ -39,6 +40,7 @@ def test_scoped_breakers_persist_and_reset_independently(session_factory):
         actor="operator:avi",
         reason="feed healthy",
         prior_health={"provider": "healthy", "age_seconds": 1},
+        expected_generation=data_state.generation,
         now=NOW,
     )
 
@@ -97,7 +99,9 @@ def test_reset_requires_reason_and_prior_health(
 ):
     service = BreakerService(session_factory)
     scope = BreakerScope.data(AssetClass.EQUITY)
-    service.trip(scope, "feed disagreement", "daemon", now=NOW)
+    observed = service.trip(
+        scope, "feed disagreement", "daemon", now=NOW
+    )
 
     with pytest.raises(ValueError):
         service.reset(
@@ -105,6 +109,7 @@ def test_reset_requires_reason_and_prior_health(
             actor="operator:avi",
             reason=reason,
             prior_health=prior_health,
+            expected_generation=observed.generation,
             now=NOW,
         )
 
@@ -114,12 +119,15 @@ def test_reset_requires_reason_and_prior_health(
 def test_each_breaker_mutation_writes_an_audit_event(session_factory):
     service = BreakerService(session_factory)
     scope = BreakerScope(BreakerKind.LIQUIDITY, "AAPL")
-    service.trip(scope, "spread too wide", "daemon", now=NOW)
+    observed = service.trip(
+        scope, "spread too wide", "daemon", now=NOW
+    )
     service.reset(
         scope,
         actor="operator:avi",
         reason="spread normalized",
         prior_health={"spread_pct": "0.2"},
+        expected_generation=observed.generation,
         now=NOW,
     )
 
@@ -137,3 +145,76 @@ def test_each_breaker_mutation_writes_an_audit_event(session_factory):
     assert [event.actor for event in events] == ["daemon", "operator:avi"]
     assert events[1].reason == "spread normalized"
     assert '"spread_pct": "0.2"' in events[1].detail_json
+
+
+def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
+    session_factory,
+):
+    service = BreakerService(session_factory)
+    scope = BreakerScope.data(AssetClass.EQUITY)
+    observed = service.trip(
+        scope,
+        "initial feed fault",
+        "daemon:first",
+        now=NOW,
+    )
+    retripped = service.trip(
+        scope,
+        "new feed fault",
+        "daemon:second",
+        now=NOW,
+    )
+
+    assert retripped.generation == observed.generation + 1
+    with pytest.raises(BreakerResetConflict) as raised:
+        service.reset(
+            scope,
+            actor="operator:avi",
+            reason="reset based on stale observation",
+            prior_health={"provider": "healthy", "age_seconds": 1},
+            expected_generation=observed.generation,
+            now=NOW,
+        )
+
+    assert raised.value.expected_generation == observed.generation
+    assert raised.value.current_state == retripped
+    current = service.get(scope)
+    assert current == retripped
+    assert current is not None and current.tripped is True
+
+    with session_factory() as session:
+        conflict = session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.target_id == scope.key,
+                AuditEvent.action == "circuit_breaker.reset",
+            )
+            .order_by(AuditEvent.id.desc())
+        ).first()
+
+    assert conflict is not None
+    assert conflict.result_code == "conflict"
+    assert f'"expected_generation": {observed.generation}' in (
+        conflict.detail_json
+    )
+    assert f'"current_generation": {retripped.generation}' in (
+        conflict.detail_json
+    )
+
+
+def test_reset_with_current_generation_advances_generation(session_factory):
+    service = BreakerService(session_factory)
+    scope = BreakerScope.liquidity("AAPL")
+    observed = service.trip(scope, "wide spread", "daemon", now=NOW)
+
+    reset = service.reset(
+        scope,
+        actor="operator:avi",
+        reason="spread normalized",
+        prior_health={"spread_pct": "0.2"},
+        expected_generation=observed.generation,
+        now=NOW,
+    )
+
+    assert reset.tripped is False
+    assert reset.generation == observed.generation + 1

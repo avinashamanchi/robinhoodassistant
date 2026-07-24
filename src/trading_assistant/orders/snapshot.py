@@ -317,7 +317,7 @@ class PortfolioSnapshotService:
         spread_pct_by_ticker = {
             symbol: (quote.ask - quote.bid) / quote.last * Decimal(100)
             for symbol, quote in quotes.items()
-            if quote.last > 0
+            if quote.is_valid
         }
         quote_fresh = (
             wanted.issubset(quotes)
@@ -379,7 +379,7 @@ class PortfolioSnapshotService:
             for pending_order in pending_orders:
                 symbol = pending_order.ticker.upper()
                 quote = quotes.get(symbol)
-                if quote is None or quote.last <= 0:
+                if quote is None or not quote.is_valid:
                     pending_exposure_complete = False
                     continue
                 order_fills = fills_by_order.get(pending_order.id, [])

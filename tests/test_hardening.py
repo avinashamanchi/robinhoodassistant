@@ -10,6 +10,7 @@ from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Position
 from trading_assistant.db.models import Fill
+from trading_assistant.risk.breakers import BreakerScope
 
 
 def _submitted(svc, notional="400") -> int:
@@ -113,6 +114,9 @@ def test_killswitch_drill(make_service):
     tripped = svc.enforce_daily_loss_limits()
     assert tripped["equity"] is True
     assert tripped["crypto"] is False          # crypto independent
+    loss_state = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
+    assert loss_state is not None
+    assert loss_state.actor == "daemon:daily-loss"
 
     # New equity orders are now blocked...
     blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
@@ -121,10 +125,27 @@ def test_killswitch_drill(make_service):
 
     # Resetting the persisted breaker does not erase the complete loss snapshot.
     # Risk remains blocked until the account is genuinely back within limits.
-    svc.reset_killswitch(AssetClass.EQUITY)
+    observed = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
+    assert observed is not None
+    svc.reset_killswitch(
+        AssetClass.EQUITY,
+        actor="operator:test",
+        reason="manual drill health reviewed",
+        expected_generation=observed.generation,
+    )
     still_blocked = svc.propose_order("AAPL", "buy", "market", notional="100")
     assert still_blocked["status"] == "rejected"
     assert "daily total-loss limit reached" in still_blocked["risk_reasons"]
+
+
+def test_operational_trip_all_uses_process_safe_global_breaker(make_service):
+    svc = make_service()
+
+    svc.trip_all_killswitches("startup reconciliation failed")
+
+    state = svc.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.actor == "daemon:operations"
 
 
 # ── panic button (D5) ───────────────────────────────────────────

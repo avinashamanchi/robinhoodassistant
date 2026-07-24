@@ -27,8 +27,16 @@ class _StubAgent:
 
 @pytest.fixture
 def client(make_service):
-    app = create_app(service=make_service(), agent=_StubAgent(), api_token=TOKEN, planning=None)
-    return TestClient(app)
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client = TestClient(app)
+    test_client.trading_service = service
+    return test_client
 
 
 # ── A1: auth on mutating endpoints ──────────────────────────────
@@ -44,7 +52,23 @@ def test_wrong_token_401(client):
 
 
 def test_correct_token_allows(client):
-    r = client.post("/killswitch/reset", headers={"X-API-Key": TOKEN})
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.risk.breakers import BreakerScope
+
+    observed = client.trading_service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        "security drill",
+        "daemon",
+    )
+    r = client.post(
+        "/killswitch/reset",
+        headers={"X-API-Key": TOKEN},
+        json={
+            "asset_class": "equity",
+            "reason": "authenticated health review",
+            "expected_generation": observed.generation,
+        },
+    )
     assert r.status_code == 200 and r.json()["tripped"] is False
 
 

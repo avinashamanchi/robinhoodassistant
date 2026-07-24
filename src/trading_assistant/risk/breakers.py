@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import AssetClass
 from ..db.models import AuditEvent, CircuitBreakerState
+from .submission_barrier import SubmissionBarrier
 
 
 class BreakerKind(str, Enum):
@@ -65,7 +66,29 @@ class BreakerState:
     tripped: bool
     reason: str
     actor: str
+    generation: int
     updated_at: datetime
+
+
+class BreakerResetConflict(RuntimeError):
+    """A reset was based on a stale or no-longer-tripped observation."""
+
+    def __init__(
+        self,
+        scope: BreakerScope,
+        expected_generation: int,
+        current_state: BreakerState | None,
+    ) -> None:
+        current_generation = (
+            current_state.generation if current_state is not None else None
+        )
+        super().__init__(
+            f"breaker reset conflict for {scope.key}: expected generation "
+            f"{expected_generation}, current generation {current_generation}"
+        )
+        self.scope = scope
+        self.expected_generation = expected_generation
+        self.current_state = current_state
 
 
 def relevant_scopes_for_symbol(symbol: str) -> tuple[BreakerScope, ...]:
@@ -93,6 +116,7 @@ def _state(row: CircuitBreakerState) -> BreakerState:
         tripped=row.tripped,
         reason=row.reason,
         actor=row.actor,
+        generation=row.generation,
         updated_at=row.updated_at,
     )
 
@@ -138,6 +162,11 @@ def trip_in_session(
     if not reason or not actor:
         raise ValueError("breaker trip actor and reason must be non-empty")
     timestamp = _now(now)
+    prior_tripped = session.scalar(
+        select(CircuitBreakerState.tripped).where(
+            CircuitBreakerState.scope_key == scope.key
+        )
+    )
     statement = insert(CircuitBreakerState).values(
         scope_key=scope.key,
         kind=scope.kind.value,
@@ -145,9 +174,10 @@ def trip_in_session(
         tripped=True,
         reason=reason,
         actor=actor,
+        generation=1,
         updated_at=timestamp,
     )
-    result = session.execute(
+    session.execute(
         statement.on_conflict_do_update(
             index_elements=[CircuitBreakerState.scope_key],
             set_={
@@ -156,12 +186,12 @@ def trip_in_session(
                 "tripped": True,
                 "reason": reason,
                 "actor": actor,
+                "generation": CircuitBreakerState.generation + 1,
                 "updated_at": timestamp,
             },
-            where=CircuitBreakerState.tripped.is_(False),
         )
     )
-    changed = result.rowcount == 1
+    changed = prior_tripped is not True
     row = session.get(CircuitBreakerState, scope.key)
     assert row is not None
     _audit(
@@ -171,6 +201,7 @@ def trip_in_session(
         action="circuit_breaker.trip",
         reason=reason,
         result_code="tripped" if changed else "already_tripped",
+        detail={"generation": row.generation},
         now=timestamp,
     )
     return _state(row), changed
@@ -183,6 +214,7 @@ def reset_in_session(
     reason: str,
     prior_health: Mapping[str, object],
     *,
+    expected_generation: int,
     now: datetime | None = None,
 ) -> BreakerState:
     actor = actor.strip()
@@ -193,29 +225,59 @@ def reset_in_session(
         raise ValueError("breaker reset reason must be non-empty")
     if not prior_health:
         raise ValueError("breaker reset prior health must be non-empty")
+    if type(expected_generation) is not int or expected_generation < 1:
+        raise ValueError(
+            "breaker reset expected generation must be a positive integer"
+        )
     timestamp = _now(now)
-    statement = insert(CircuitBreakerState).values(
-        scope_key=scope.key,
-        kind=scope.kind.value,
-        target=scope.target,
-        tripped=False,
-        reason=reason,
-        actor=actor,
-        updated_at=timestamp,
-    )
-    session.execute(
-        statement.on_conflict_do_update(
-            index_elements=[CircuitBreakerState.scope_key],
-            set_={
-                "kind": scope.kind.value,
-                "target": scope.target,
-                "tripped": False,
-                "reason": reason,
-                "actor": actor,
-                "updated_at": timestamp,
-            },
+    result = session.execute(
+        update(CircuitBreakerState)
+        .where(
+            CircuitBreakerState.scope_key == scope.key,
+            CircuitBreakerState.tripped.is_(True),
+            CircuitBreakerState.generation == expected_generation,
+        )
+        .values(
+            kind=scope.kind.value,
+            target=scope.target,
+            tripped=False,
+            reason=reason,
+            actor=actor,
+            generation=CircuitBreakerState.generation + 1,
+            updated_at=timestamp,
         )
     )
+    if result.rowcount != 1:
+        row = session.get(CircuitBreakerState, scope.key)
+        current_state = _state(row) if row is not None else None
+        _audit(
+            session,
+            scope=scope,
+            actor=actor,
+            action="circuit_breaker.reset",
+            reason=reason,
+            result_code="conflict",
+            detail={
+                "expected_generation": expected_generation,
+                "current_generation": (
+                    current_state.generation
+                    if current_state is not None
+                    else None
+                ),
+                "current_tripped": (
+                    current_state.tripped
+                    if current_state is not None
+                    else None
+                ),
+                "prior_health": dict(prior_health),
+            },
+            now=timestamp,
+        )
+        raise BreakerResetConflict(
+            scope,
+            expected_generation,
+            current_state,
+        )
     row = session.get(CircuitBreakerState, scope.key)
     assert row is not None
     _audit(
@@ -225,7 +287,11 @@ def reset_in_session(
         action="circuit_breaker.reset",
         reason=reason,
         result_code="reset",
-        detail={"prior_health": dict(prior_health)},
+        detail={
+            "expected_generation": expected_generation,
+            "generation": row.generation,
+            "prior_health": dict(prior_health),
+        },
         now=timestamp,
     )
     return _state(row)
@@ -234,6 +300,7 @@ def reset_in_session(
 class BreakerService:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self.session_factory = session_factory
+        self.submission_barrier = SubmissionBarrier(session_factory)
 
     def trip(
         self,
@@ -243,12 +310,13 @@ class BreakerService:
         *,
         now: datetime | None = None,
     ) -> BreakerState:
-        with self.session_factory() as session:
-            state, _changed = trip_in_session(
-                session, scope, reason, actor, now=now
-            )
-            session.commit()
-            return state
+        with self.submission_barrier.hold():
+            with self.session_factory() as session:
+                state, _changed = trip_in_session(
+                    session, scope, reason, actor, now=now
+                )
+                session.commit()
+                return state
 
     def is_tripped(self, scope: BreakerScope) -> bool:
         with self.session_factory() as session:
@@ -259,6 +327,11 @@ class BreakerService:
                     )
                 )
             )
+
+    def get(self, scope: BreakerScope) -> BreakerState | None:
+        with self.session_factory() as session:
+            row = session.get(CircuitBreakerState, scope.key)
+            return _state(row) if row is not None else None
 
     def active_for_symbol(self, symbol: str) -> tuple[BreakerState, ...]:
         scope_keys = tuple(
@@ -282,16 +355,23 @@ class BreakerService:
         reason: str,
         prior_health: Mapping[str, object],
         *,
+        expected_generation: int,
         now: datetime | None = None,
     ) -> BreakerState:
         with self.session_factory() as session:
-            state = reset_in_session(
-                session,
-                scope,
-                actor,
-                reason,
-                prior_health,
-                now=now,
-            )
-            session.commit()
-            return state
+            try:
+                state = reset_in_session(
+                    session,
+                    scope,
+                    actor,
+                    reason,
+                    prior_health,
+                    expected_generation=expected_generation,
+                    now=now,
+                )
+            except BreakerResetConflict:
+                session.commit()
+                raise
+            else:
+                session.commit()
+                return state

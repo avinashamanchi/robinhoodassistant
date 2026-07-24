@@ -548,7 +548,7 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
         tables = set(inspect(engine).get_table_names())
         rows = conn.execute(
             text(
-                "SELECT scope_key,kind,target,tripped,reason "
+                "SELECT scope_key,kind,target,tripped,reason,generation "
                 "FROM circuit_breaker_state ORDER BY scope_key"
             )
         ).mappings().all()
@@ -562,6 +562,7 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
             "target": "crypto",
             "tripped": 0,
             "reason": "",
+            "generation": 1,
         },
         {
             "scope_key": "loss:equity",
@@ -569,6 +570,7 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
             "target": "equity",
             "tripped": 1,
             "reason": "equity loss",
+            "generation": 1,
         },
         {
             "scope_key": "operator_global",
@@ -576,5 +578,6 @@ def test_breaker_upgrade_preserves_every_legacy_latch_and_adds_account_risk_stat
             "target": "",
             "tripped": 1,
             "reason": "panic",
+            "generation": 1,
         },
     ]

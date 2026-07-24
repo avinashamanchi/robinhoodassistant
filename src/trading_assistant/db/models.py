@@ -441,6 +441,7 @@ class CircuitBreakerState(Base):
     tripped: Mapped[bool] = mapped_column(Boolean, default=False)
     reason: Mapped[str] = mapped_column(Text, default="")
     actor: Mapped[str] = mapped_column(String(128), default="")
+    generation: Mapped[int] = mapped_column(default=0)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 

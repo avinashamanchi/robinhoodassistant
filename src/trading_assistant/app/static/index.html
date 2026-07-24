@@ -172,7 +172,23 @@
       refresh();
     }
     async function reject(id) { const r = await action("/reject/" + id, { method: "POST" }); if (r.ok) notify("Rejected order " + id, "ok"); refresh(); }
-    async function resetKill() { const r = await action("/killswitch/reset", { method: "POST" }); if (r.ok) notify("Kill switch reset", "ok"); refresh(); }
+    async function resetKill() {
+      const health = await api("/health");
+      const generation = health.killswitch_generation && health.killswitch_generation.equity;
+      if (!Number.isInteger(generation)) {
+        notify("No observed equity kill-switch generation to reset", "err");
+        return;
+      }
+      const reason = window.prompt("Why is it safe to reset the equity kill switch?");
+      if (reason === null) return;
+      const r = await action("/killswitch/reset", jsonPost({
+        asset_class: "equity",
+        reason,
+        expected_generation: generation,
+      }));
+      if (r.ok) notify("Kill switch reset", "ok");
+      refresh();
+    }
     async function panic() {
       if (!window.confirm("PANIC: cancel all orders, disable all rules, trip all kill switches?")) return;
       const r = await action("/panic", { method: "POST" }); if (r.ok) notify("PANIC executed — everything halted", "ok"); refresh();

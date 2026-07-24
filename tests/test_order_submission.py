@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import Decimal
-from threading import Event, Thread
 
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
@@ -65,75 +64,29 @@ def test_broker_call_occurs_after_claim_transaction_commits(make_service):
 def test_panic_latch_atomically_prevents_a_later_broker_submit(make_service):
     svc = make_service()
     order_id = _approved_order(svc)
-    claim_reached = Event()
-    release_claim = Event()
-    original_claim = svc.order_application.repository.claim_submission
-    outcome = {}
+    panic = svc.reconciliation.panic("operator:avi", "submission race")
 
-    def delayed_claim(*args, **kwargs):
-        claim_reached.set()
-        assert release_claim.wait(timeout=5)
-        return original_claim(*args, **kwargs)
+    result = svc.order_submission.submit(order_id)
 
-    svc.order_application.repository.claim_submission = delayed_claim
-
-    def submit():
-        try:
-            outcome["result"] = svc.order_submission.submit(order_id)
-        except BaseException as exc:  # surfaced in the test thread below
-            outcome["error"] = exc
-
-    thread = Thread(target=submit)
-    thread.start()
-    assert claim_reached.wait(timeout=5)
-    try:
-        panic = svc.reconciliation.panic("operator:avi", "submission race")
-        assert panic.safe is True
-    finally:
-        release_claim.set()
-        thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert "error" not in outcome
-    assert outcome["result"].status is OrderStatus.APPROVAL_RECORDED
+    assert panic.safe is True
+    assert result.status is OrderStatus.REJECTED
+    assert "active circuit breaker: operator_global" in result.risk_reasons
     assert svc.broker.submit_calls == 0
 
 
 def test_scoped_data_breaker_atomically_prevents_a_later_broker_submit(make_service):
     svc = make_service()
     order_id = _approved_order(svc)
-    claim_reached = Event()
-    release_claim = Event()
-    original_claim = svc.order_application.repository.claim_submission
-    outcome = {}
-
-    def delayed_claim(*args, **kwargs):
-        claim_reached.set()
-        assert release_claim.wait(timeout=5)
-        return original_claim(*args, **kwargs)
-
-    svc.order_application.repository.claim_submission = delayed_claim
-
-    def submit():
-        try:
-            outcome["result"] = svc.order_submission.submit(order_id)
-        except BaseException as exc:
-            outcome["error"] = exc
-
-    thread = Thread(target=submit)
-    thread.start()
-    assert claim_reached.wait(timeout=5)
     svc.breakers.trip(
         BreakerScope.data(AssetClass.EQUITY),
         "asset race",
         "daemon",
     )
-    release_claim.set()
-    thread.join(timeout=5)
 
-    assert not thread.is_alive()
-    assert "error" not in outcome
-    assert outcome["result"].status is OrderStatus.APPROVAL_RECORDED
+    result = svc.order_submission.submit(order_id)
+
+    assert result.status is OrderStatus.REJECTED
+    assert "active circuit breaker: data:equity" in result.risk_reasons
     assert svc.broker.submit_calls == 0
 
 

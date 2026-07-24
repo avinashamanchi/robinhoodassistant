@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,8 @@ from fastapi.testclient import TestClient
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.db.models import AuditEvent
+from trading_assistant.assets import AssetClass
+from trading_assistant.risk.breakers import BreakerScope
 
 
 class StubAgent:
@@ -95,13 +98,82 @@ def test_positions_and_log(client):
 
 def test_killswitch_reset_endpoint(client):
     c, svc, _ = client
-    with svc.session_factory() as s:
-        from trading_assistant.risk.killswitch import KillSwitch
+    observed = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="drill",
+        actor="daemon",
+    )
+    health_response = c.get("/health").json()
+    assert health_response["killswitch_generation"]["equity"] == (
+        observed.generation
+    )
 
-        KillSwitch.trip(s, reason="drill")
-        s.commit()
-    r = c.post("/killswitch/reset").json()
-    assert r["tripped"] is False
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "account and broker checks are healthy",
+            "expected_generation": observed.generation,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tripped"] is False
+    assert response.json()["generation"] == observed.generation + 1
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="circuit_breaker.reset")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "operator:api-token"
+    assert audit.reason == "account and broker checks are healthy"
+    health = json.loads(audit.detail_json)["prior_health"]
+    assert set(health) >= {
+        "captured_at",
+        "daily_pnl_complete",
+        "daily_total_pnl",
+        "broker_reconciled",
+        "account_equity",
+        "quote_fresh",
+    }
+    assert "compatibility_facade" not in health
+
+
+def test_killswitch_reset_returns_conflict_for_stale_generation(client):
+    c, svc, _ = client
+    observed = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="initial loss",
+        actor="daemon:first",
+    )
+    retripped = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="new loss evidence",
+        actor="daemon:second",
+    )
+
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "stale operator reset",
+            "expected_generation": observed.generation,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["expected_generation"] == (
+        observed.generation
+    )
+    assert response.json()["detail"]["current_generation"] == (
+        retripped.generation
+    )
+    assert svc.breakers.is_tripped(
+        BreakerScope.loss(AssetClass.EQUITY)
+    ) is True
 
 
 def test_panic_endpoint_supplies_actor_and_requires_reason(client):

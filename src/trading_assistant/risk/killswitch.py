@@ -67,12 +67,16 @@ class KillSwitch:
         asset_class: AssetClass | str = AssetClass.EQUITY,
     ) -> None:
         scope = _scope(asset_class)
+        row = session.get(CircuitBreakerState, scope.key)
+        if row is None:
+            raise ValueError("cannot reset a breaker that has not been tripped")
         reset_in_session(
             session,
             scope,
             "compat:killswitch",
             note,
             {"compatibility_facade": True},
+            expected_generation=row.generation,
         )
         session.add(
             RiskEvent(

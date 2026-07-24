@@ -34,6 +34,7 @@ from .broker.models import (
 from .assets import AssetClass
 from .config import AppConfig
 from .db.models import (
+    CircuitBreakerState,
     Fill,
     LLMDecision,
     Order,
@@ -52,10 +53,9 @@ from .orders.application import (
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.reconciliation import ReconciliationService
 from .orders.submission import OrderSubmissionService
-from .risk.breakers import BreakerService
+from .risk.breakers import BreakerScope, BreakerService
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
-from .risk.killswitch import KillSwitch
 from .risk.pnl import FillLike, realized_pnl_today
 
 # Statuses that count as "still live / open" for listing purposes.
@@ -552,8 +552,16 @@ class TradingService:
                     _select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
                 ).scalar_one_or_none()
                 age = (utcnow() - last.at).total_seconds() if last else None
-                eq_tripped = KillSwitch.is_tripped(s, AssetClass.EQUITY)
-                cr_tripped = KillSwitch.is_tripped(s, AssetClass.CRYPTO)
+                eq_state = s.get(
+                    CircuitBreakerState,
+                    BreakerScope.loss(AssetClass.EQUITY).key,
+                )
+                cr_state = s.get(
+                    CircuitBreakerState,
+                    BreakerScope.loss(AssetClass.CRYPTO).key,
+                )
+                eq_tripped = bool(eq_state and eq_state.tripped)
+                cr_tripped = bool(cr_state and cr_state.tripped)
             return {
                 "db_ok": True,
                 "heartbeat_age_seconds": round(age, 1) if age is not None else None,
@@ -562,6 +570,14 @@ class TradingService:
                     and age < self.config.daemon.heartbeat_stale_seconds
                 ),
                 "killswitch": {"equity": eq_tripped, "crypto": cr_tripped},
+                "killswitch_generation": {
+                    "equity": (
+                        eq_state.generation if eq_state is not None else None
+                    ),
+                    "crypto": (
+                        cr_state.generation if cr_state is not None else None
+                    ),
+                },
             }
         except Exception as exc:
             return {"db_ok": False, "error": type(exc).__name__}
@@ -579,19 +595,74 @@ class TradingService:
 
     def trip_all_killswitches(self, reason: str) -> None:
         """Fail closed across asset classes for an operational safety fault."""
-        with self.session_factory() as s:
-            KillSwitch.trip(s, reason, AssetClass.EQUITY)
-            KillSwitch.trip(s, reason, AssetClass.CRYPTO)
-            s.commit()
+        self.breakers.trip(
+            BreakerScope.operator_global(),
+            reason,
+            "daemon:operations",
+        )
 
     def reset_killswitch(
-        self, asset_class: AssetClass | str = AssetClass.EQUITY
+        self,
+        asset_class: AssetClass | str,
+        *,
+        actor: str,
+        reason: str,
+        expected_generation: int,
     ) -> dict[str, Any]:
-        ac = asset_class if isinstance(asset_class, AssetClass) else AssetClass(asset_class)
-        with self.session_factory() as s:
-            KillSwitch.reset(s, asset_class=ac)
-            s.commit()
-            return {"killswitch": "reset", "asset_class": ac.value, "tripped": False}
+        ac = (
+            asset_class
+            if isinstance(asset_class, AssetClass)
+            else AssetClass(asset_class)
+        )
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor or not reason:
+            raise ValueError(
+                "breaker reset actor and reason must be non-empty"
+            )
+        risk_config = (
+            self.config.crypto_risk or self.config.risk
+            if ac is AssetClass.CRYPTO
+            else self.config.risk
+        )
+        probe_symbol = next(
+            (
+                symbol
+                for symbol in risk_config.ticker_allowlist
+                if self._asset_class(symbol) is ac
+            ),
+            None,
+        )
+        if probe_symbol is None:
+            raise RuntimeError(
+                f"no configured {ac.value} symbol for fresh breaker health"
+            )
+        snapshot = self.snapshot_service.assemble_for_execution(probe_symbol)
+        prior_health = {
+            "captured_at": snapshot.as_of.isoformat(),
+            "daily_pnl_complete": snapshot.daily_pnl_complete,
+            "daily_total_pnl": str(
+                snapshot.realized_pnl_today
+                + snapshot.unrealized_pnl_today
+            ),
+            "broker_reconciled": snapshot.broker_reconciled,
+            "account_equity": str(snapshot.account_equity),
+            "quote_fresh": snapshot.quote_fresh,
+            "active_breakers": sorted(snapshot.active_breakers),
+        }
+        state = self.breakers.reset(
+            BreakerScope.loss(ac),
+            actor=actor,
+            reason=reason,
+            prior_health=prior_health,
+            expected_generation=expected_generation,
+        )
+        return {
+            "killswitch": "reset",
+            "asset_class": ac.value,
+            "tripped": state.tripped,
+            "generation": state.generation,
+        }
 
     # ── hardening: fills, cancel/replace, reconcile, drills (P5) ─
     def record_fill(
@@ -784,15 +855,25 @@ class TradingService:
 
     def enforce_daily_loss_limits(self) -> dict[str, bool]:
         """Trip each asset class's kill switch if its realized daily loss breached."""
-        result: dict[str, bool] = {}
+        realized: dict[AssetClass, Decimal] = {}
         with self.session_factory() as s:
             for ac in (AssetClass.EQUITY, AssetClass.CRYPTO):
-                pnl = self._realized_pnl_today(s, ac)
-                tripped = KillSwitch.evaluate_daily_loss(
-                    s, pnl, self._loss_limit_for(ac), ac
+                realized[ac] = self._realized_pnl_today(s, ac)
+        result: dict[str, bool] = {}
+        for ac, pnl in realized.items():
+            limit = abs(self._loss_limit_for(ac))
+            if pnl <= -limit:
+                self.breakers.trip(
+                    BreakerScope.loss(ac),
+                    (
+                        f"daily realized loss {pnl} breached limit "
+                        f"-{limit}"
+                    ),
+                    "daemon:daily-loss",
                 )
-                result[ac.value] = tripped
-            s.commit()
+            result[ac.value] = self.breakers.is_tripped(
+                BreakerScope.loss(ac)
+            )
         return result
 
     def get_pending(self) -> list[dict[str, Any]]:

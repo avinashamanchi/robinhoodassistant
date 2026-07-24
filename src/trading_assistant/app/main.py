@@ -15,8 +15,9 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..assets import AssetClass
 from ..config import Secrets, load_config
 from ..db.models import create_all
 from ..db.session import create_db_engine, make_session_factory
@@ -56,6 +57,21 @@ class ApprovalIn(BaseModel):
 
 class PanicIn(BaseModel):
     reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
+
+
+class KillSwitchResetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_class: AssetClass = AssetClass.EQUITY
+    reason: str
+    expected_generation: int = Field(gt=0)
 
     @field_validator("reason")
     @classmethod
@@ -205,9 +221,38 @@ def create_app(
     def log():
         return service.get_log()
 
-    @app.post("/killswitch/reset", dependencies=[auth])
-    def killswitch_reset():
-        return service.reset_killswitch()
+    @app.post("/killswitch/reset")
+    def killswitch_reset(
+        body: KillSwitchResetIn,
+        principal: str = auth,
+    ):
+        from ..risk.breakers import BreakerResetConflict
+
+        try:
+            return service.reset_killswitch(
+                body.asset_class,
+                actor=principal,
+                reason=body.reason,
+                expected_generation=body.expected_generation,
+            )
+        except BreakerResetConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "scope": exc.scope.key,
+                    "expected_generation": exc.expected_generation,
+                    "current_generation": (
+                        exc.current_state.generation
+                        if exc.current_state is not None
+                        else None
+                    ),
+                    "current_tripped": (
+                        exc.current_state.tripped
+                        if exc.current_state is not None
+                        else None
+                    ),
+                },
+            ) from exc
 
     @app.post("/orders/{order_id}/cancel", dependencies=[auth])
     def cancel_order(order_id: int):

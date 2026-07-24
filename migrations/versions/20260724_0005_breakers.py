@@ -24,6 +24,7 @@ def upgrade() -> None:
         sa.Column("tripped", sa.Boolean(), nullable=False),
         sa.Column("reason", sa.Text(), nullable=False),
         sa.Column("actor", sa.String(length=128), nullable=False),
+        sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("scope_key"),
     )
@@ -35,7 +36,10 @@ def upgrade() -> None:
     op.execute(
         """
         INSERT INTO circuit_breaker_state
-            (scope_key, kind, target, tripped, reason, actor, updated_at)
+            (
+                scope_key, kind, target, tripped, reason, actor, generation,
+                updated_at
+            )
         SELECT
             CASE
                 WHEN asset_class = 'operator_global' THEN 'operator_global'
@@ -52,6 +56,7 @@ def upgrade() -> None:
             tripped,
             reason,
             'migration:0005',
+            1,
             updated_at
         FROM killswitch_state
         """

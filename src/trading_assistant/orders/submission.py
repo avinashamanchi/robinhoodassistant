@@ -15,6 +15,7 @@ from trading_assistant.broker.models import OrderRequest, OrderSide, OrderStatus
 from trading_assistant.db.models import Order
 from trading_assistant.risk.breakers import relevant_scopes_for_symbol
 from trading_assistant.risk.engine import RiskResult
+from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 from .repository import OrderRepository
 
@@ -71,6 +72,7 @@ class OrderSubmissionService:
         self.snapshot_service = snapshot_service
         self.risk_for_symbol = risk_for_symbol
         self.now = now
+        self.submission_barrier = SubmissionBarrier(session_factory)
 
     def _risk_check(
         self, request: OrderRequest, order_id: int
@@ -113,50 +115,73 @@ class OrderSubmissionService:
             self.repository.record_pre_submission_rejection(order_id, reasons, now)
             return SubmissionResult(order_id, OrderStatus.REJECTED, risk_reasons=reasons)
 
-        claim_now = self.now()
-        breaker_scope_keys = tuple(
-            scope.key for scope in relevant_scopes_for_symbol(request.ticker)
-        )
-        if not self.repository.claim_submission(
-            order_id, claim_now, breaker_scope_keys
-        ):
-            if self.repository.expire_approved(order_id, claim_now):
-                return SubmissionResult(order_id, OrderStatus.EXPIRED)
-            with self.session_factory() as session:
-                changed = session.get(Order, order_id)
-                if changed is None:
-                    raise KeyError(f"order {order_id} not found")
-                return SubmissionResult(
-                    order_id, OrderStatus(changed.status), changed.broker_order_id
+        with self.submission_barrier.hold():
+            claim_now = self.now()
+            breaker_scope_keys = tuple(
+                scope.key for scope in relevant_scopes_for_symbol(
+                    request.ticker
                 )
-        try:
-            if submission_kind == "bracket":
-                assert bracket_payload is not None
-                take_profit, stop_loss = bracket_payload
-                broker_result = self.broker.submit_bracket(request, take_profit, stop_loss)
-            else:
-                broker_result = self.broker.submit_order(request)
-        except BrokerSubmissionRejected as exc:
-            self.repository.record_submission_result(
-                order_id, OrderStatus.REJECTED, None, exc.stable_code, self.now()
             )
-            return SubmissionResult(order_id, OrderStatus.REJECTED)
-        except Exception as exc:
+            if not self.repository.claim_submission(
+                order_id, claim_now, breaker_scope_keys
+            ):
+                if self.repository.expire_approved(order_id, claim_now):
+                    return SubmissionResult(order_id, OrderStatus.EXPIRED)
+                with self.session_factory() as session:
+                    changed = session.get(Order, order_id)
+                    if changed is None:
+                        raise KeyError(f"order {order_id} not found")
+                    return SubmissionResult(
+                        order_id,
+                        OrderStatus(changed.status),
+                        changed.broker_order_id,
+                    )
+            try:
+                if submission_kind == "bracket":
+                    assert bracket_payload is not None
+                    take_profit, stop_loss = bracket_payload
+                    broker_result = self.broker.submit_bracket(
+                        request, take_profit, stop_loss
+                    )
+                else:
+                    broker_result = self.broker.submit_order(request)
+            except BrokerSubmissionRejected as exc:
+                self.repository.record_submission_result(
+                    order_id,
+                    OrderStatus.REJECTED,
+                    None,
+                    exc.stable_code,
+                    self.now(),
+                )
+                return SubmissionResult(order_id, OrderStatus.REJECTED)
+            except Exception as exc:
+                self.repository.record_submission_result(
+                    order_id,
+                    OrderStatus.ACCEPTANCE_UNKNOWN,
+                    None,
+                    type(exc).__name__,
+                    self.now(),
+                )
+                return SubmissionResult(
+                    order_id, OrderStatus.ACCEPTANCE_UNKNOWN
+                )
+            status = (
+                broker_result.status
+                if broker_result.status
+                in {
+                    OrderStatus.SUBMITTED,
+                    OrderStatus.PARTIALLY_FILLED,
+                    OrderStatus.FILLED,
+                }
+                else OrderStatus.SUBMITTED
+            )
             self.repository.record_submission_result(
                 order_id,
-                OrderStatus.ACCEPTANCE_UNKNOWN,
-                None,
-                type(exc).__name__,
+                status,
+                broker_result.broker_order_id,
+                "",
                 self.now(),
             )
-            return SubmissionResult(order_id, OrderStatus.ACCEPTANCE_UNKNOWN)
-        status = (
-            broker_result.status
-            if broker_result.status
-            in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
-            else OrderStatus.SUBMITTED
-        )
-        self.repository.record_submission_result(
-            order_id, status, broker_result.broker_order_id, "", self.now()
-        )
-        return SubmissionResult(order_id, status, broker_result.broker_order_id)
+            return SubmissionResult(
+                order_id, status, broker_result.broker_order_id
+            )
