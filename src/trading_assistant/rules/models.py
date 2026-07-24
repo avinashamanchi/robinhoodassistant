@@ -11,6 +11,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
     field_validator,
     model_validator,
 )
@@ -60,6 +61,18 @@ RuleCondition = Annotated[
     Field(discriminator="type"),
 ]
 
+PersistedHighWaterMark = Annotated[
+    Decimal,
+    Field(gt=0, max_digits=20, decimal_places=6),
+]
+_HIGH_WATER_MARK_ADAPTER = TypeAdapter(PersistedHighWaterMark)
+
+
+def validate_persisted_high_water_mark(value: object) -> Decimal:
+    """Validate a runtime HWM against the exact persisted Numeric shape."""
+
+    return _HIGH_WATER_MARK_ADAPTER.validate_python(value)
+
 
 class RuleAction(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -95,12 +108,7 @@ class RuleCommand(BaseModel):
         max_digits=8,
         decimal_places=6,
     )
-    high_water_mark: Decimal | None = Field(
-        default=None,
-        gt=0,
-        max_digits=20,
-        decimal_places=6,
-    )
+    high_water_mark: PersistedHighWaterMark | None = None
 
     @field_validator("ticker")
     @classmethod

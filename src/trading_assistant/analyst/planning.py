@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 
 from ..assets import AssetClass
 from ..config import live_trading_enabled
-from ..db.models import Rule, RuleGroup, TradePlanRow, utcnow
+from ..db.models import TradePlanRow, utcnow
 from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
@@ -281,30 +281,20 @@ class PlanningService:
 
     # ── cancel + queries ───────────────────────────────────────
     def cancel_plan(self, plan_id: int) -> dict[str, Any]:
-        with self.service.session_factory() as s:
-            row = s.get(TradePlanRow, plan_id)
-            if row is None:
-                return {"error": "not found"}
-            sibs = s.execute(
-                select(Rule).where(
-                    Rule.plan_id == plan_id,
-                    Rule.state.in_(("active", "processing")),
-                )
-            ).scalars().all()
-            for r in sibs:
-                r.state = "canceled"
-            group_ids = {rule.group_id for rule in sibs}
-            for group_id in group_ids:
-                group = s.get(RuleGroup, group_id)
-                if group is not None and group.state == "active":
-                    group.state = "canceled"
-                    group.lease_owner = None
-                    group.lease_expires_at = None
-                    group.version += 1
-                    group.updated_at = utcnow()
-            row.status = "canceled"
-            s.commit()
-            return {"plan_id": plan_id, "status": "canceled", "rules_canceled": len(sibs)}
+        result = self.service.rule_repository.cancel_plan(
+            plan_id,
+            now=utcnow(),
+        )
+        if result.error == "not_found":
+            return {"error": "not found"}
+        response = {
+            "plan_id": plan_id,
+            "status": result.status,
+            "rules_canceled": result.rules_canceled,
+        }
+        if result.error is not None:
+            response["error"] = result.error
+        return response
 
     def get_plans(self) -> list[dict[str, Any]]:
         with self.service.session_factory() as s:

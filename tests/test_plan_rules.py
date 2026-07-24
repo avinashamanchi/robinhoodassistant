@@ -75,6 +75,34 @@ def test_trailing_hwm_persists_across_restart(make_service):
     assert len(acted) == 1                                 # fired -> HWM survived restart
 
 
+def test_unrepresentable_runtime_hwm_cannot_corrupt_restart(make_service):
+    svc = make_service()
+    _add_rule(
+        svc,
+        kind="trailing",
+        condition_json=json.dumps({"trailing_stop_pct": 10}),
+    )
+    svc.broker.set_price("AAPL", Decimal("0.0000001"))
+
+    outcome = Monitor(svc, NullNotifier()).tick()
+
+    assert len(outcome) == 1
+    assert outcome[0].error == "ValidationError"
+    with svc.session_factory() as session:
+        rule = session.execute(select(Rule)).scalar_one()
+        assert rule.hwm is None
+        assert rule.state == "active"
+
+    restarted = make_service()
+    restarted.broker.set_price("AAPL", Decimal("0.000001"))
+
+    assert Monitor(restarted, NullNotifier()).tick() == []
+    with restarted.session_factory() as session:
+        assert session.execute(select(Rule)).scalar_one().hwm == Decimal(
+            "0.000001"
+        )
+
+
 # ── OCO: a stop firing cancels the plan's siblings ──────────────
 def test_oco_cancels_siblings_atomically(make_service):
     from trading_assistant.broker.mock import MockBroker

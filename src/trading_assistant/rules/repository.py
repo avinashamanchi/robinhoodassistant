@@ -10,9 +10,19 @@ from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import Order, Proposal, Rule, RuleGroup
+from trading_assistant.db.models import (
+    Order,
+    Proposal,
+    Rule,
+    RuleGroup,
+    TradePlanRow,
+)
 
-from .models import RuleCommand, RuleState
+from .models import (
+    RuleCommand,
+    RuleState,
+    validate_persisted_high_water_mark,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +38,15 @@ class StoredRule:
     id: int
     group_id: int
     command: RuleCommand
+
+
+@dataclass(frozen=True)
+class PlanCancellationResult:
+    plan_id: int
+    canceled: bool
+    status: str | None
+    rules_canceled: int = 0
+    error: str | None = None
 
 
 class RuleRepository:
@@ -176,6 +195,10 @@ class RuleRepository:
         now: datetime,
         high_water_marks: dict[int, object] | None = None,
     ) -> bool:
+        validated_high_water_marks = {
+            rule_id: validate_persisted_high_water_mark(high_water_mark)
+            for rule_id, high_water_mark in (high_water_marks or {}).items()
+        }
         with self.session_factory() as session:
             released = session.execute(
                 update(RuleGroup)
@@ -195,7 +218,7 @@ class RuleRepository:
             if released.rowcount != 1:
                 session.rollback()
                 return False
-            for rule_id, high_water_mark in (high_water_marks or {}).items():
+            for rule_id, high_water_mark in validated_high_water_marks.items():
                 session.execute(
                     update(Rule)
                     .where(
@@ -226,6 +249,8 @@ class RuleRepository:
             RuleState.FAILED,
         }:
             raise ValueError("winning rule must transition to a terminal state")
+        if high_water_mark is not None:
+            high_water_mark = validate_persisted_high_water_mark(high_water_mark)
 
         owns_session = session is None
         current = session or self.session_factory()
@@ -292,3 +317,155 @@ class RuleRepository:
         finally:
             if owns_session:
                 current.close()
+
+    def cancel_plan(
+        self,
+        plan_id: int,
+        *,
+        now: datetime,
+    ) -> PlanCancellationResult:
+        """Atomically cancel one plan group or lose to a terminal worker CAS."""
+
+        with self.session_factory() as session:
+            plan = session.get(TradePlanRow, plan_id)
+            if plan is None:
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=False,
+                    status=None,
+                    error="not_found",
+                )
+            if plan.status == RuleState.CANCELED.value:
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=True,
+                    status=plan.status,
+                )
+
+            groups = session.execute(
+                select(
+                    RuleGroup.id,
+                    RuleGroup.state,
+                    RuleGroup.version,
+                    RuleGroup.lease_owner,
+                    RuleGroup.lease_expires_at,
+                )
+                .join(Rule, Rule.group_id == RuleGroup.id)
+                .where(Rule.plan_id == plan_id)
+                .distinct()
+            ).all()
+            if not groups:
+                plan_claim = session.execute(
+                    update(TradePlanRow)
+                    .where(
+                        TradePlanRow.id == plan_id,
+                        TradePlanRow.status == plan.status,
+                    )
+                    .values(status=RuleState.CANCELED.value)
+                )
+                if plan_claim.rowcount != 1:
+                    session.rollback()
+                    return PlanCancellationResult(
+                        plan_id=plan_id,
+                        canceled=False,
+                        status=plan.status,
+                        error="plan_conflict",
+                    )
+                session.commit()
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=True,
+                    status=RuleState.CANCELED.value,
+                )
+            if len(groups) != 1:
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=False,
+                    status=plan.status,
+                    error="group_conflict",
+                )
+
+            group = groups[0]
+            if group.state != RuleState.ACTIVE.value:
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=False,
+                    status=plan.status,
+                    error="group_conflict",
+                )
+
+            group_conditions = [
+                RuleGroup.id == group.id,
+                RuleGroup.state == RuleState.ACTIVE.value,
+                RuleGroup.version == group.version,
+                (
+                    RuleGroup.lease_owner.is_(None)
+                    if group.lease_owner is None
+                    else RuleGroup.lease_owner == group.lease_owner
+                ),
+                (
+                    RuleGroup.lease_expires_at.is_(None)
+                    if group.lease_expires_at is None
+                    else RuleGroup.lease_expires_at == group.lease_expires_at
+                ),
+            ]
+            group_claim = session.execute(
+                update(RuleGroup)
+                .where(*group_conditions)
+                .values(
+                    state=RuleState.CANCELED.value,
+                    terminal_rule_id=None,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    version=RuleGroup.version + 1,
+                    updated_at=now,
+                )
+            )
+            if group_claim.rowcount != 1:
+                session.rollback()
+                current_status = session.scalar(
+                    select(TradePlanRow.status).where(
+                        TradePlanRow.id == plan_id
+                    )
+                )
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=False,
+                    status=current_status,
+                    error="group_conflict",
+                )
+
+            rules_canceled = session.execute(
+                update(Rule)
+                .where(
+                    Rule.plan_id == plan_id,
+                    Rule.group_id == group.id,
+                    Rule.state.in_(
+                        (RuleState.ACTIVE.value, RuleState.PROCESSING.value)
+                    ),
+                )
+                .values(state=RuleState.CANCELED.value)
+            ).rowcount
+            plan_claim = session.execute(
+                update(TradePlanRow)
+                .where(
+                    TradePlanRow.id == plan_id,
+                    TradePlanRow.status == plan.status,
+                )
+                .values(status=RuleState.CANCELED.value)
+            )
+            if plan_claim.rowcount != 1:
+                session.rollback()
+                return PlanCancellationResult(
+                    plan_id=plan_id,
+                    canceled=False,
+                    status=plan.status,
+                    error="plan_conflict",
+                )
+            session.commit()
+            return PlanCancellationResult(
+                plan_id=plan_id,
+                canceled=True,
+                status=RuleState.CANCELED.value,
+                rules_canceled=rules_canceled,
+            )

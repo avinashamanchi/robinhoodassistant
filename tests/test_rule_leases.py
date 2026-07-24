@@ -7,6 +7,7 @@ from decimal import Decimal
 from threading import Barrier
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from trading_assistant.broker.mock import MockBroker
@@ -142,6 +143,34 @@ def test_claim_terminal_is_owner_version_guarded_and_cancels_siblings(
     assert group.lease_owner is None and group.lease_expires_at is None
     assert dict(states)[winner] == "triggered"
     assert sorted(dict(states).values()) == ["canceled", "triggered"]
+
+
+def test_claim_terminal_rejects_unpersistable_runtime_hwm_before_transition(
+    session_factory,
+):
+    command = _command(group_key="runtime-hwm-terminal")
+    group_id, (rule_id,) = _seed_group(session_factory, command)
+    repo = RuleRepository(session_factory, owner="worker-a")
+    lease = repo.lease_group(group_id, now=NOW)
+    assert lease is not None
+
+    with pytest.raises(ValidationError):
+        repo.claim_terminal(
+            lease,
+            rule_id,
+            now=NOW,
+            high_water_mark=Decimal("0.0000001"),
+        )
+
+    with session_factory() as session:
+        group = session.get(RuleGroup, group_id)
+        rule = session.get(Rule, rule_id)
+        assert group.state == "active"
+        assert group.terminal_rule_id is None
+        assert group.lease_owner == lease.owner
+        assert group.version == lease.version
+        assert rule.state == "active"
+        assert rule.hwm is None
 
 
 def test_stale_lease_cannot_create_a_proposal(make_service):

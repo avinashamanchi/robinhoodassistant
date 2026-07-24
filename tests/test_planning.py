@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import Barrier
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from trading_assistant.analyst.models import (
     EntryPlan,
@@ -20,8 +22,11 @@ from trading_assistant.analyst.models import (
 from trading_assistant.analyst.planning import PlanningService
 from trading_assistant.assets import AssetClass
 from trading_assistant.config import Secrets, TradingMode
-from trading_assistant.db.models import Rule, TradePlanRow
+from trading_assistant.db.models import Proposal, Rule, RuleGroup, TradePlanRow
 from trading_assistant.risk.clock import FakeClock
+from trading_assistant.rules.application import RuleApplicationService
+from trading_assistant.rules.repository import RuleRepository
+from trading_assistant.rules.worker import RuleWorker
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -99,6 +104,83 @@ def test_cancel_plan_cancels_rules(make_service):
     with svc.session_factory() as s:
         assert all(r.state == "canceled"
                    for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars())
+
+
+def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_service):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = planning.analyze("AAPL")["plan_id"]
+    planning.approve_plan(
+        plan_id,
+        actor="operator:test",
+        reason="reviewed plan",
+    )
+    svc.broker.set_price("AAPL", Decimal("80"))
+    barrier = Barrier(2)
+
+    def run_worker():
+        repository = RuleRepository(svc.session_factory, owner="race-worker")
+        worker = RuleWorker(
+            svc,
+            repository,
+            RuleApplicationService(svc, repository),
+            max_quote_age_seconds=10**9,
+        )
+        barrier.wait(timeout=2)
+        return worker.tick()
+
+    def cancel_plan():
+        barrier.wait(timeout=2)
+        return planning.cancel_plan(plan_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        worker_future = pool.submit(run_worker)
+        cancel_future = pool.submit(cancel_plan)
+        worker_outcomes = worker_future.result(timeout=10)
+        cancel_result = cancel_future.result(timeout=10)
+
+    with svc.session_factory() as session:
+        plan = session.get(TradePlanRow, plan_id)
+        group = session.scalar(
+            select(RuleGroup)
+            .join(Rule, Rule.group_id == RuleGroup.id)
+            .where(Rule.plan_id == plan_id)
+            .distinct()
+        )
+        rules = session.scalars(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).all()
+        proposal_count = session.scalar(
+            select(func.count())
+            .select_from(Proposal)
+            .where(Proposal.source_rule_group_id == group.id)
+        )
+
+    assert svc.broker.submit_calls == 0
+    assert group.lease_owner is None
+    assert group.lease_expires_at is None
+    if group.state == "canceled":
+        assert cancel_result["status"] == "canceled"
+        assert "error" not in cancel_result
+        assert plan.status == "canceled"
+        assert group.terminal_rule_id is None
+        assert all(rule.state == "canceled" for rule in rules)
+        assert proposal_count == 0
+        assert not worker_outcomes or worker_outcomes[0].error == "lease_conflict"
+    else:
+        assert group.state in {"triggered", "failed"}
+        assert cancel_result["error"] == "group_conflict"
+        assert plan.status == "approved"
+        assert group.terminal_rule_id is not None
+        winner = next(rule for rule in rules if rule.id == group.terminal_rule_id)
+        assert winner.state == group.state
+        assert all(
+            rule.state == "canceled"
+            for rule in rules
+            if rule.id != group.terminal_rule_id
+        )
+        assert proposal_count == 1
+        assert len(worker_outcomes) == 1
 
 
 def test_promotion_gate_blocks_live_without_track_record(make_service, app_config, session_factory):
