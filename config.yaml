@@ -5,6 +5,7 @@
 trading:
   mode: paper              # paper | live  (live ALSO requires env confirmation)
   broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
+  request_timeout_seconds: 10
 
 risk:
   ticker_allowlist: [AAPL, MSFT, GOOGL, GOOG, AMZN, NVDA, META, TSLA]
@@ -66,6 +67,7 @@ llm:
   gemini_model: gemini-flash-latest
   groq_model: llama-3.3-70b-versatile
   max_tokens: 4096
+  request_timeout_seconds: 45
 
 daemon:
   poll_interval_seconds: 15

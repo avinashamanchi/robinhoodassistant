@@ -199,3 +199,37 @@ def test_fallback_when_primary_returns_no_tool_call_but_one_required():
     # Forced -> primary's prose is unacceptable, fall back to the tool-calling provider.
     r_forced = fb.create(system="", messages=[], tools=[{"name": "t"}], tool_choice="any")
     assert r_forced.content[0].type == "tool_use"
+
+
+def test_groq_client_uses_configured_timeout(monkeypatch):
+    import groq
+
+    seen = {}
+    monkeypatch.setattr(groq, "Groq", lambda **kwargs: seen.update(kwargs) or object())
+    backend = GroqBackend("key", "model", timeout_seconds=17)
+    backend._get_client()
+    assert seen["timeout"] == 17
+
+
+def test_anthropic_client_uses_configured_timeout(monkeypatch):
+    import anthropic
+    from trading_assistant.llm.anthropic_backend import AnthropicBackend
+
+    seen = {}
+    monkeypatch.setattr(
+        anthropic, "Anthropic", lambda **kwargs: seen.update(kwargs) or object()
+    )
+    AnthropicBackend("key", "model", 100, timeout_seconds=19)
+    assert seen["timeout"] == 19
+
+
+def test_gemini_client_uses_configured_timeout(monkeypatch):
+    from google import genai
+    from trading_assistant.llm.gemini_backend import GeminiBackend
+
+    seen = {}
+    monkeypatch.setattr(
+        genai, "Client", lambda **kwargs: seen.update(kwargs) or object()
+    )
+    GeminiBackend("key", "model", timeout_seconds=23)._get_client()
+    assert seen["http_options"].timeout == 23_000

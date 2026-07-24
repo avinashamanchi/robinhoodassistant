@@ -20,7 +20,10 @@ def build_broker(config: AppConfig, secrets: Secrets) -> BrokerClient:
 
     paper = not live_trading_enabled(config, secrets)
     return AlpacaBroker.from_credentials(
-        secrets.alpaca_api_key, secrets.alpaca_secret_key, paper=paper
+        secrets.alpaca_api_key,
+        secrets.alpaca_secret_key,
+        paper=paper,
+        timeout_seconds=config.trading.request_timeout_seconds,
     )
 
 
@@ -35,5 +38,8 @@ def build_clock(config: AppConfig, secrets: Secrets):
 
     paper = not live_trading_enabled(config, secrets)
     return AlpacaClock.from_credentials(
-        secrets.alpaca_api_key, secrets.alpaca_secret_key, paper=paper
+        secrets.alpaca_api_key,
+        secrets.alpaca_secret_key,
+        paper=paper,
+        timeout_seconds=config.trading.request_timeout_seconds,
     )

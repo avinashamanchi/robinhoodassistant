@@ -49,6 +49,8 @@ def _write(tmp_path, text: str):
 def test_valid_config_loads_and_normalizes(tmp_path):
     cfg = load_config(_write(tmp_path, VALID))
     assert cfg.trading.mode is TradingMode.PAPER
+    assert cfg.trading.request_timeout_seconds == 10.0
+    assert cfg.llm.request_timeout_seconds == 45.0
     # allowlist uppercased
     assert cfg.risk.ticker_allowlist == ["AAPL", "MSFT"]
     assert cfg.risk.proposal_ttl_minutes == 15
@@ -71,6 +73,18 @@ def test_non_positive_limit_rejected(tmp_path):
     bad = VALID.replace("max_notional_per_order: 500", "max_notional_per_order: 0")
     with pytest.raises(ValidationError):
         load_config(_write(tmp_path, bad))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("broker: mock", "broker: mock\n  request_timeout_seconds: 0"),
+        ("max_tokens: 4096", "max_tokens: 4096\n  request_timeout_seconds: 0"),
+    ],
+)
+def test_non_positive_external_timeout_rejected(tmp_path, old, new):
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, VALID.replace(old, new)))
 
 
 def test_live_double_lock(tmp_path):

@@ -6,8 +6,9 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+import requests
 
-from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock
+from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
 from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
@@ -207,6 +208,22 @@ def test_non_transient_error_is_not_retried():
     with pytest.raises(ValueError):
         broker.get_quote("AAPL")
     assert data.calls == 1               # not retried — only transient errors retry
+
+
+def test_timeout_session_applies_default_to_every_request(monkeypatch):
+    seen = {}
+
+    def fake_request(self, method, url, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    session = _TimeoutSession(7.5)
+    session.request("GET", "https://example.test")
+    assert seen["timeout"] == 7.5
+
+    session.request("GET", "https://example.test", timeout=2)
+    assert seen["timeout"] == 2
 
 
 def test_alpaca_clock_maps():

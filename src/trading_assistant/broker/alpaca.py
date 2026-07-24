@@ -16,6 +16,7 @@ import time
 from decimal import Decimal
 from typing import Any, Callable, Optional, TypeVar
 
+import requests
 from requests.exceptions import ConnectionError as ReqConnectionError
 from requests.exceptions import Timeout as ReqTimeout
 
@@ -66,6 +67,22 @@ _TRANSIENT = (ReqConnectionError, ReqTimeout)
 _T = TypeVar("_T")
 
 
+class _TimeoutSession(requests.Session):
+    """Requests session with a finite default timeout on every Alpaca SDK call."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        super().__init__()
+        self._default_timeout = timeout_seconds
+
+    def request(self, method: str, url: str, **kwargs: Any):
+        kwargs.setdefault("timeout", self._default_timeout)
+        return super().request(method, url, **kwargs)
+
+
+def _install_timeout(client: Any, timeout_seconds: float) -> None:
+    client._session = _TimeoutSession(timeout_seconds)
+
+
 def _retry(fn: Callable[..., _T], *args: Any, attempts: int = 3, base_delay: float = 0.3, **kwargs: Any) -> _T:
     last: Exception | None = None
     for i in range(attempts):
@@ -101,10 +118,17 @@ class AlpacaBroker(BrokerClient):
 
     @classmethod
     def from_credentials(
-        cls, api_key: str, secret_key: str, *, paper: bool = True
+        cls,
+        api_key: str,
+        secret_key: str,
+        *,
+        paper: bool = True,
+        timeout_seconds: float = 10.0,
     ) -> "AlpacaBroker":
         trading = TradingClient(api_key, secret_key, paper=paper)
         data = StockHistoricalDataClient(api_key, secret_key)
+        _install_timeout(trading, timeout_seconds)
+        _install_timeout(data, timeout_seconds)
         return cls(trading, data)
 
     # ── market data ────────────────────────────────────────────
@@ -250,9 +274,16 @@ class AlpacaClock:
 
     @classmethod
     def from_credentials(
-        cls, api_key: str, secret_key: str, *, paper: bool = True
+        cls,
+        api_key: str,
+        secret_key: str,
+        *,
+        paper: bool = True,
+        timeout_seconds: float = 10.0,
     ) -> "AlpacaClock":
-        return cls(TradingClient(api_key, secret_key, paper=paper))
+        client = TradingClient(api_key, secret_key, paper=paper)
+        _install_timeout(client, timeout_seconds)
+        return cls(client)
 
     def is_open(self, at=None) -> bool:
         return bool(_retry(self._trading.get_clock).is_open)

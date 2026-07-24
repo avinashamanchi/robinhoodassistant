@@ -61,18 +61,30 @@ def from_gemini(resp: Any) -> LLMResponse:
 
 class GeminiBackend:
     def __init__(
-        self, api_key: str, model: str, max_tokens: int = 1024, client: Any = None
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = 1024,
+        client: Any = None,
+        timeout_seconds: float = 45.0,
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
+        self._timeout_seconds = timeout_seconds
 
     def _get_client(self):
         if self._client is None:
             from google import genai
+            from google.genai import types
 
-            self._client = genai.Client(api_key=self._api_key)
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=types.HttpOptions(
+                    timeout=int(self._timeout_seconds * 1000)
+                ),
+            )
         return self._client
 
     def create(

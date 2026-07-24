@@ -54,18 +54,26 @@ def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
 
 class GroqBackend:
     def __init__(
-        self, api_key: str, model: str, max_tokens: int = 1024, client: Any = None
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = 1024,
+        client: Any = None,
+        timeout_seconds: float = 45.0,
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
+        self._timeout_seconds = timeout_seconds
 
     def _get_client(self):
         if self._client is None:
             from groq import Groq
 
-            self._client = Groq(api_key=self._api_key)
+            self._client = Groq(
+                api_key=self._api_key, timeout=self._timeout_seconds
+            )
         return self._client
 
     def create(

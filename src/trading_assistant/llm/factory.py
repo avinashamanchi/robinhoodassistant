@@ -55,15 +55,30 @@ def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
     if provider == "anthropic":
         from .anthropic_backend import AnthropicBackend
 
-        return AnthropicBackend(secrets.anthropic_api_key, llm.model, llm.max_tokens)
+        return AnthropicBackend(
+            secrets.anthropic_api_key,
+            llm.model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
     if provider == "gemini":
         from .gemini_backend import GeminiBackend
 
-        return GeminiBackend(secrets.gemini_api_key, llm.gemini_model, llm.max_tokens)
+        return GeminiBackend(
+            secrets.gemini_api_key,
+            llm.gemini_model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
     if provider == "groq":
         from .groq_backend import GroqBackend
 
-        return GroqBackend(secrets.groq_api_key, llm.groq_model, llm.max_tokens)
+        return GroqBackend(
+            secrets.groq_api_key,
+            llm.groq_model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
     raise ValueError(f"unknown LLM provider: {provider}")
 
 

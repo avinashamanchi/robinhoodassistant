@@ -44,6 +44,7 @@ class BrokerKind(str, enum.Enum):
 class TradingConfig(_Strict):
     mode: TradingMode = TradingMode.PAPER
     broker: BrokerKind = BrokerKind.MOCK
+    request_timeout_seconds: float = Field(default=10.0, gt=0)
 
 
 class RiskConfig(_Strict):
@@ -84,6 +85,7 @@ class LLMConfig(_Strict):
     fallback_provider: Optional[str] = None      # tried if primary errors at call time
     gemini_model: str = "gemini-flash-latest"
     groq_model: str = "llama-3.3-70b-versatile"
+    request_timeout_seconds: float = Field(default=45.0, gt=0)
 
 
 class DaemonConfig(_Strict):
