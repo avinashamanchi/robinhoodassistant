@@ -485,6 +485,59 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
     assert observed == [(secrets, "watchdog")]
 
 
+def test_daemon_main_logs_startup_reconciliation_failure_with_one_secret(
+    tmp_path,
+    monkeypatch,
+):
+    from logging.handlers import RotatingFileHandler
+    from trading_assistant.daemon import main as daemon_main
+
+    marker = "daemon-startup-reconciliation-secret"
+    secrets = Secrets(app_api_token=marker)
+    config = object()
+    secret_reads = 0
+    observed = []
+
+    class ReconciliationFailureMonitor:
+        async def run(self):
+            raise RuntimeError(marker)
+
+    def one_secrets():
+        nonlocal secret_reads
+        secret_reads += 1
+        return secrets
+
+    def build(supplied_config, supplied_secrets):
+        observed.append((supplied_config, supplied_secrets))
+        return ReconciliationFailureMonitor()
+
+    monkeypatch.setattr(daemon_main, "Secrets", one_secrets)
+    monkeypatch.setattr(daemon_main, "load_config", lambda: config)
+    monkeypatch.setattr(daemon_main, "_build_monitor", build)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match=marker):
+        daemon_main.main()
+
+    path = tmp_path / "logs" / "daemon.runtime.log"
+    handlers = [
+        handler
+        for handler in logging.getLogger().handlers
+        if getattr(handler, "_trading_assistant_path", None)
+        == str(path)
+    ]
+    assert secret_reads == 1
+    assert observed == [(config, secrets)]
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], RotatingFileHandler)
+    assert handlers[0].maxBytes > 0
+    assert handlers[0].backupCount > 0
+    assert path.stat().st_mode & 0o777 == 0o600
+    content = path.read_text(encoding="utf-8")
+    assert "startup_failed role=daemon" in content
+    assert marker not in content
+
+
 @pytest.mark.parametrize(
     ("module_name", "runtime_role"),
     [

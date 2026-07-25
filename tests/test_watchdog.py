@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from datetime import timedelta
 from decimal import Decimal
@@ -793,6 +794,9 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
         encoding="utf-8"
     )
     start = Path("scripts/start.sh").read_text(encoding="utf-8")
+    operations = Path("docs/ops/README.md").read_text(
+        encoding="utf-8"
+    )
 
     assert (
         "emit_periodic com.trading.watchdog 60 "
@@ -825,3 +829,17 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
     assert "logs/daemon.log" not in start
     assert "http://127.0.0.1:8000/health " not in install
     assert "http://127.0.0.1:8000/health " not in start
+    assert "/tmp/trading-app.err" not in operations
+    assert "./scripts/launchd/install.sh" in operations
+    assert "<key>Umask</key><integer>63</integer>" in operations
+    assert "octal `077`" in operations
+    assert re.findall(
+        r"<key>StandardOutPath</key><string>([^<]+)</string>",
+        operations,
+    ) == ["/dev/null"]
+    assert re.findall(
+        r"<key>StandardErrorPath</key><string>([^<]+)</string>",
+        operations,
+    ) == ["/dev/null"]
+    for role in ("app", "daemon", "watchdog", "backup"):
+        assert f"logs/{role}.runtime.log" in operations

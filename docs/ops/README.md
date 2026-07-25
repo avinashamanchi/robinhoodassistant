@@ -2,25 +2,37 @@
 
 ## macOS (launchd)
 
-Save as `~/Library/LaunchAgents/com.trading.app.plist` (and a second for the daemon,
-swapping the command). `launchctl load` it. Adjust paths.
+Use the repository's canonical installer. It generates and loads the app,
+daemon, watchdog, and backup jobs from the current checkout:
+
+```bash
+./scripts/launchd/install.sh
+```
+
+Every generated job includes this private stream contract:
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.trading.app</string>
-  <key>WorkingDirectory</key><string>/Users/you/trading-assistant</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/opt/homebrew/bin/uv</string><string>run</string>
-    <string>uvicorn</string><string>trading_assistant.app.main:create_app</string>
-    <string>--factory</string><string>--host</string><string>127.0.0.1</string>
-    <string>--port</string><string>8000</string>
-  </array>
-  <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/trading-app.err</string>
-</dict></plist>
+<key>Umask</key><integer>63</integer>
+<key>StandardOutPath</key><string>/dev/null</string>
+<key>StandardErrorPath</key><string>/dev/null</string>
 ```
+
+The decimal plist value `63` is octal `077`: newly created files grant no
+group or other permissions. Inherited stdout and stderr are discarded so
+launchd cannot create unbounded stream files. Application logs remain
+available in private, bounded rotating files:
+
+- `logs/app.runtime.log`
+- `logs/daemon.runtime.log`
+- `logs/watchdog.runtime.log`
+- `logs/backup.runtime.log`
+- `logs/mcp.runtime.log`
+- `logs/preflight.runtime.log`
+- `logs/paper-drill.runtime.log`
+
+Do not replace the `/dev/null` paths with regular files. Re-run the canonical
+installer after an update; see `scripts/launchd/README.md` for management
+commands.
 
 ## Linux (systemd)
 
@@ -43,7 +55,7 @@ WantedBy=multi-user.target
 ## Nightly backup (cron, 14-day retention)
 
 ```cron
-0 2 * * *  cd /home/you/trading-assistant && sqlite3 trading_assistant.db ".backup backups/ta-$(date +\%F).db" && find backups -name 'ta-*.db' -mtime +14 -delete
+0 2 * * *  cd /home/you/trading-assistant && uv run python -m trading_assistant.ops.backup --destination backups --retention-days 14
 ```
 
 The watchdog probes anonymous app liveness at

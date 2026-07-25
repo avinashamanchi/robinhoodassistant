@@ -401,3 +401,83 @@ The only warnings remain the pre-existing upstream `websockets.legacy` and
 Starlette TestClient deprecations. Paper mode, human approval, auto-execution
 off, automatic brackets off, null cross-provider fallback, one-write mutation
 semantics, and the schema gate remain intact.
+
+## Final Task 9 review fix
+
+### RED
+
+The final two review regressions were added before production or documentation
+changes:
+
+```text
+uv run pytest
+tests/test_task9_round2.py::test_daemon_main_logs_startup_reconciliation_failure_with_one_secret
+tests/test_watchdog.py::test_launchd_and_start_scripts_wire_anonymous_liveness_only
+-o addopts='' -q
+```
+
+Result:
+
+```text
+2 failed in 0.86s
+```
+
+The daemon regression proved that `daemon.runtime.log` was private and bounded
+but empty after startup reconciliation raised: `build_monitor()` had already
+left its `runtime_startup` context before `asyncio.run(monitor.run())`. The
+documentation regression found the stale unbounded
+`/tmp/trading-app.err` launchd path.
+
+### GREEN
+
+Production `main()` now creates exactly one `Secrets` instance and keeps one
+`runtime_startup("daemon", secrets)` context around both `_build_monitor(...)`
+and the complete `asyncio.run(monitor.run())`. The same regression verifies the
+stable failure marker, secret redaction, owner-only mode, rotating handler, and
+exact config/secrets identity.
+
+The operations guide now names `scripts/launchd/install.sh` as canonical,
+documents `/dev/null` inherited streams, explains decimal Umask 63 as octal
+`077`, and lists the bounded private role logs. Its static regression permits
+only `/dev/null` for documented launchd stream paths.
+
+The unchanged focused pair passed:
+
+```text
+2 passed in 0.44s
+```
+
+The complete Task 9 focused matrix passed:
+
+```text
+594 passed, 2 warnings in 63.32s
+```
+
+### Full verification
+
+Repository-wide command:
+
+```text
+uv run pytest -o addopts='' -q
+```
+
+Result:
+
+```text
+1309 passed, 1 skipped, 2 warnings in 193.79s
+```
+
+Additional passing checks:
+
+```text
+uv lock --check
+uv run python -m compileall -q src tests
+find scripts -type f -name '*.sh' -print0 | xargs -0 bash -n
+plistlib parsing plus /dev/null and Umask assertions
+static paper/Alpaca/autoexecute/bracket/fallback/schema checks
+static rejection of /tmp/trading-app.err and non-/dev/null documented streams
+git diff --check
+```
+
+The warnings are unchanged upstream deprecations from `websockets.legacy` and
+Starlette TestClient. No trading guardrail was relaxed.

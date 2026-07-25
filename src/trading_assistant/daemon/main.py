@@ -76,7 +76,12 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
 
 
 def main() -> None:
-    asyncio.run(build_monitor().run())
+    from ..logging import runtime_startup
+
+    secrets = Secrets()
+    with runtime_startup("daemon", secrets):
+        monitor = _build_monitor(load_config(), secrets)
+        asyncio.run(monitor.run())
 
 
 if __name__ == "__main__":
