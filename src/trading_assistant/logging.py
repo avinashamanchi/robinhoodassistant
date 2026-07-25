@@ -7,11 +7,13 @@ explicitly registered secret string.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
 import os
 import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Iterator
 
 # Patterns for secrets that must never appear in logs.
 _PATTERNS = [
@@ -22,6 +24,17 @@ _PATTERNS = [
 
 _REGISTERED: set[str] = set()
 _MASK = "***REDACTED***"
+RUNTIME_ROLES = frozenset(
+    {
+        "app",
+        "daemon",
+        "mcp",
+        "preflight",
+        "paper-drill",
+        "watchdog",
+        "backup",
+    }
+)
 
 
 def register_secret(value: str) -> None:
@@ -173,3 +186,37 @@ def configure_logging(
             _attach_redaction(file_handler)
             root.addHandler(file_handler)
     root.setLevel(level)
+
+
+def runtime_log_path(runtime_role: str) -> Path:
+    """Return the private, role-specific production log path."""
+    if runtime_role not in RUNTIME_ROLES:
+        raise ValueError("runtime_role is invalid")
+    return Path("logs") / f"{runtime_role}.runtime.log"
+
+
+def configure_runtime_logging(
+    runtime_role: str,
+    secrets,
+) -> Path:
+    """Configure bounded logging for one production process role."""
+    path = runtime_log_path(runtime_role)
+    register_all_secrets(secrets)
+    configure_logging(log_path=path)
+    return path
+
+
+@contextmanager
+def runtime_startup(
+    runtime_role: str,
+    secrets,
+) -> Iterator[None]:
+    """Log a stable role marker when production startup fails."""
+    configure_runtime_logging(runtime_role, secrets)
+    try:
+        yield
+    except BaseException:
+        logger = logging.getLogger("trading_assistant.startup")
+        logger.disabled = False
+        logger.error("startup_failed role=%s", runtime_role)
+        raise

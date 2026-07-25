@@ -25,22 +25,33 @@ _service: Optional[TradingService] = None
 _audit: Optional[AuditRecorder] = None
 
 
-def configure(service: TradingService) -> None:
+def configure(
+    service: TradingService,
+    *,
+    audit: AuditRecorder | None = None,
+) -> None:
     """Inject a service (used by tests and by custom hosts)."""
     global _service, _audit
     _service = service
-    _audit = AuditRecorder(service.session_factory)
+    _audit = audit or AuditRecorder(service.session_factory)
+
+
+def build_default_container():
+    from .. import bootstrap
+    from ..logging import runtime_startup
+
+    secrets = Secrets()
+    with runtime_startup("mcp", secrets):
+        return bootstrap.build_container(
+            load_config(),
+            secrets,
+            runtime_role="mcp",
+        )
 
 
 def build_default_service() -> TradingService:
-    from .. import bootstrap
-    global _audit
-    container = bootstrap.build_container(
-        load_config(),
-        Secrets(),
-        runtime_role="mcp",
-    )
-    _audit = container.audit
+    container = build_default_container()
+    configure(container.service, audit=container.audit)
     return container.service
 
 
@@ -238,7 +249,12 @@ def get_external_dividends(days: int = 90) -> dict[str, Any]:
 
 
 def main() -> None:
-    mcp.run()
+    container = build_default_container()
+    from ..logging import runtime_startup
+
+    with runtime_startup("mcp", container.secrets):
+        configure(container.service, audit=container.audit)
+        mcp.run()
 
 
 if __name__ == "__main__":

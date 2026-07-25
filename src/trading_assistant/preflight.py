@@ -153,7 +153,11 @@ def _reconciliation(service) -> Result:
 def _build_service(config, secrets: Secrets):
     from .bootstrap import build_container
 
-    return build_container(config, secrets).service
+    return build_container(
+        config,
+        secrets,
+        runtime_role="preflight",
+    ).service
 
 
 def _llm(config, secrets: Secrets) -> Result:
@@ -185,12 +189,15 @@ def _telegram(config, secrets: Secrets) -> Result:
 
 
 def run() -> int:
-    config = load_config("config.yaml")
     secrets = Secrets()
-    from .logging import configure_logging, register_all_secrets
+    from .logging import runtime_startup
 
-    register_all_secrets(secrets)
-    configure_logging()
+    with runtime_startup("preflight", secrets):
+        return _run(secrets)
+
+
+def _run(secrets: Secrets) -> int:
+    config = load_config("config.yaml")
     results = [_config_parses(), _env_present(secrets), _live_off(config, secrets)]
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))

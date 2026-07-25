@@ -9,11 +9,13 @@ import pytest
 
 from trading_assistant.app.auth import SessionAuth
 from trading_assistant.app.main import create_app
+from trading_assistant.broker.mock import MockBroker
 from trading_assistant.config import BrokerKind, Secrets, TradingMode
 from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.schema import SchemaOutOfDate
 from trading_assistant.db.session import create_db_engine
 from trading_assistant.operations import AuditRecorder, OperationsService
+from trading_assistant.risk.clock import FakeClock
 
 
 def _migrated_secrets(tmp_path: Path) -> Secrets:
@@ -22,6 +24,16 @@ def _migrated_secrets(tmp_path: Path) -> Secrets:
     return Secrets(
         database_url=database_url,
         app_api_token="operator-secret-for-bootstrap-tests",
+    )
+
+
+def _alpaca_config(config):
+    return config.model_copy(
+        update={
+            "trading": config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
     )
 
 
@@ -204,7 +216,8 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
         }
     )
     secrets = Secrets(app_api_token="runtime-role-secret")
-    roles: list[str | None] = []
+    observed: list[tuple[object, object, str | None]] = []
+    secret_reads = 0
     container = SimpleNamespace(
         service=service,
         rule_worker=SimpleNamespace(notifier=None),
@@ -212,37 +225,51 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
     )
 
     def capture_container(*args, **kwargs):
-        roles.append(kwargs.get("runtime_role"))
+        observed.append(
+            (args[0], args[1], kwargs.get("runtime_role"))
+        )
         return container
+
+    def one_secrets():
+        nonlocal secret_reads
+        secret_reads += 1
+        return secrets
 
     monkeypatch.setattr(bootstrap, "build_container", capture_container)
     monkeypatch.setattr(app_main, "load_config", lambda: config)
-    monkeypatch.setattr(app_main, "Secrets", lambda: secrets)
+    monkeypatch.setattr(app_main, "Secrets", one_secrets)
     monkeypatch.setattr(daemon_main, "load_config", lambda: config)
-    monkeypatch.setattr(daemon_main, "Secrets", lambda: secrets)
+    monkeypatch.setattr(daemon_main, "Secrets", one_secrets)
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
         lambda supplied_config, supplied_secrets: object(),
     )
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
-    monkeypatch.setattr(mcp_server, "Secrets", lambda: secrets)
+    monkeypatch.setattr(mcp_server, "Secrets", one_secrets)
 
     assert app_main.build_default_container() is container
     assert daemon_main.build_monitor().service is service
     assert mcp_server.build_default_service() is service
-    assert roles == ["app", "daemon", "mcp"]
+    assert secret_reads == 3
+    assert observed == [
+        (config, secrets, "app"),
+        (config, secrets, "daemon"),
+        (config, secrets, "mcp"),
+    ]
 
 
 def test_application_container_reuses_exact_trading_service_components(
     tmp_path,
     app_config,
 ):
-    from trading_assistant.bootstrap import build_container
+    from trading_assistant.bootstrap import build_test_container
 
-    container = build_container(
-        app_config,
+    container = build_test_container(
+        _alpaca_config(app_config),
         _migrated_secrets(tmp_path),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
     )
 
     assert container.snapshot_service is container.service.snapshot_service
@@ -303,7 +330,8 @@ def test_bootstrap_rejects_every_dangerous_runtime_switch(
 ):
     from trading_assistant.bootstrap import build_container
 
-    unsafe = app_config.model_copy(update=config_update(app_config))
+    safe = _alpaca_config(app_config)
+    unsafe = safe.model_copy(update=config_update(safe))
 
     with pytest.raises(RuntimeError, match=message):
         build_container(unsafe, _migrated_secrets(tmp_path))
@@ -329,7 +357,7 @@ def test_bootstrap_rejects_outdated_schema_before_provider_construction(
 
     with pytest.raises(SchemaOutOfDate):
         bootstrap.build_container(
-            app_config,
+            _alpaca_config(app_config),
             Secrets(
                 database_url=database_url,
                 app_api_token="operator-secret-for-bootstrap-tests",

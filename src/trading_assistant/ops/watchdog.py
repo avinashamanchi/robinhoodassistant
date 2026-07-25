@@ -110,14 +110,26 @@ def fetch_health(
 
 def read_database_health(
     database_url: str | None = None,
+    *,
+    secrets: Secrets | None = None,
+    runtime_role: str | None = None,
 ) -> dict[str, Any]:
     try:
         from ..bootstrap import prepare_database_runtime
 
-        secrets = Secrets(
-            database_url=database_url or Secrets().database_url
+        if database_url is not None and secrets is not None:
+            raise ValueError(
+                "database_url and secrets are mutually exclusive"
+            )
+        effective_secrets = secrets or (
+            Secrets(database_url=database_url)
+            if database_url is not None
+            else Secrets()
         )
-        factory = prepare_database_runtime(secrets).session_factory
+        factory = prepare_database_runtime(
+            effective_secrets,
+            runtime_role=runtime_role,
+        ).session_factory
         with factory() as session:
             last = session.execute(
                 select(Heartbeat)
@@ -186,23 +198,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request-timeout", type=float, default=5.0)
     args = parser.parse_args(argv)
 
-    config = load_config()
-    try:
-        api_health = fetch_health(args.health_url, args.request_timeout)
-    except Exception:
-        api_health = None
-    labels = labels_to_restart(
-        api_health=api_health,
-        database_health=read_database_health(),
-        stale_seconds=config.daemon.heartbeat_stale_seconds,
-    )
-    restart_failures = restart_selected_components(
-        labels,
-        daemon_label=args.label,
-    )
-    if labels or restart_failures:
-        return 1
-    return 0
+    secrets = Secrets()
+    from ..logging import runtime_startup
+
+    with runtime_startup("watchdog", secrets):
+        config = load_config()
+        try:
+            api_health = fetch_health(
+                args.health_url,
+                args.request_timeout,
+            )
+        except Exception:
+            api_health = None
+        labels = labels_to_restart(
+            api_health=api_health,
+            database_health=read_database_health(
+                secrets=secrets,
+                runtime_role="watchdog",
+            ),
+            stale_seconds=config.daemon.heartbeat_stale_seconds,
+        )
+        restart_failures = restart_selected_components(
+            labels,
+            daemon_label=args.label,
+        )
+        if labels or restart_failures:
+            return 1
+        return 0
 
 
 if __name__ == "__main__":

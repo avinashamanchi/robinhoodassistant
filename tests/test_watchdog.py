@@ -335,7 +335,7 @@ def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 10},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
     )
     monkeypatch.setattr(
         watchdog,
@@ -360,7 +360,7 @@ def test_main_accepts_only_the_exact_liveness_json_contract(monkeypatch):
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 10},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
     )
     monkeypatch.setattr(
         watchdog,
@@ -411,7 +411,7 @@ def test_main_malformed_liveness_body_restarts_app_without_crashing(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 10},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
     )
     monkeypatch.setattr(
         watchdog,
@@ -438,7 +438,7 @@ def test_main_oversized_liveness_body_restarts_app_without_crashing(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 10},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
     )
     monkeypatch.setattr(
         watchdog,
@@ -502,7 +502,7 @@ def test_main_invalid_database_age_restarts_daemon_only(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {
+        lambda **_kwargs: {
             "db_ok": True,
             "heartbeat_age_seconds": age,
         },
@@ -529,7 +529,7 @@ def test_main_healthy_api_and_stale_daemon_restarts_daemon_only(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 999},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 999},
     )
     monkeypatch.setattr(
         watchdog,
@@ -557,7 +557,7 @@ def test_main_liveness_failure_restarts_app_only_and_sanitizes_error(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": True, "heartbeat_age_seconds": 10},
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
     )
     monkeypatch.setattr(
         watchdog,
@@ -584,7 +584,7 @@ def test_main_attempts_daemon_after_app_restart_failure(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+        lambda **_kwargs: {"db_ok": False, "heartbeat_age_seconds": None},
     )
 
     def restart(label):
@@ -623,7 +623,7 @@ def test_main_collects_both_restart_failures_without_duplicate_attempts(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+        lambda **_kwargs: {"db_ok": False, "heartbeat_age_seconds": None},
     )
 
     def restart(label):
@@ -663,7 +663,7 @@ def test_launchctl_timeout_on_app_still_attempts_daemon_once(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+        lambda **_kwargs: {"db_ok": False, "heartbeat_age_seconds": None},
     )
     monkeypatch.setattr(watchdog.os, "getuid", lambda: 501)
     monkeypatch.setattr(watchdog.log, "disabled", False)
@@ -718,7 +718,7 @@ def test_both_launchctl_timeouts_are_collected_before_nonzero_return(
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
-        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+        lambda **_kwargs: {"db_ok": False, "heartbeat_age_seconds": None},
     )
     monkeypatch.setattr(watchdog.os, "getuid", lambda: 501)
     monkeypatch.setattr(watchdog.log, "disabled", False)

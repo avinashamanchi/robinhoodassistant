@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import timedelta
+from functools import wraps
+import inspect
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -172,15 +174,16 @@ class KillSwitchResetIn(BaseModel):
 
 
 def build_default_container():
-    config = load_config()
     secrets = Secrets()
     from .. import bootstrap
+    from ..logging import runtime_startup
 
-    return bootstrap.build_container(
-        config,
-        secrets,
-        runtime_role="app",
-    )
+    with runtime_startup("app", secrets):
+        return bootstrap.build_container(
+            load_config(),
+            secrets,
+            runtime_role="app",
+        )
 
 
 def _build_agent(container) -> Agent:
@@ -218,12 +221,13 @@ def _is_loopback_bind(host: str) -> bool:
         return False
 
 
-def create_app(
+def _create_app(
     service: Optional[TradingService] = None,
     agent: Optional[Agent] = None,
     *,
     container: "ApplicationContainer | None" = None,
     planning=_AUTO_PLANNING,
+    runtime_secrets: Secrets | None = None,
     screen_source=None,
     api_token: Optional[str] = None,
     chat_rate: RateLimiter | None = None,
@@ -234,13 +238,29 @@ def create_app(
     auth_now: Callable | None = None,
     bind_host: str | None = None,
 ) -> FastAPI:
-    if container is None and service is None and agent is None:
+    if container is None and ((service is None) != (agent is None)):
+        raise RuntimeError(
+            "service and agent must be injected together"
+        )
+    if container is None and service is None:
+        if runtime_secrets is not None:
+            raise RuntimeError(
+                "runtime Secrets require explicit service and agent injection"
+            )
         container = build_default_container()
         service = container.service
         agent = _build_agent(container)
-    runtime_secrets = container.secrets if container is not None else Secrets()
-    if api_token is None:
-        api_token = runtime_secrets.app_api_token
+    if container is not None:
+        if (
+            runtime_secrets is not None
+            and runtime_secrets is not container.secrets
+        ):
+            raise RuntimeError(
+                "container and runtime Secrets do not match"
+            )
+        runtime_secrets = container.secrets
+        if api_token is None:
+            api_token = runtime_secrets.app_api_token
     if not api_token or not api_token.strip():
         raise RuntimeError("APP_API_TOKEN is required")
     if container is not None:
@@ -253,13 +273,30 @@ def create_app(
         service = container.service
         if agent is None:
             agent = _build_agent(container)
+    elif (
+        runtime_secrets is not None
+        and api_token != runtime_secrets.app_api_token
+    ):
+        raise RuntimeError(
+            "runtime Secrets and operator authentication secret do not match"
+        )
     if service is None or agent is None:
-        service, agent = build_default_stack()
+        raise RuntimeError(
+            "service and agent must be injected together"
+        )
+    if planning is _AUTO_PLANNING and runtime_secrets is None:
+        raise RuntimeError(
+            "automatic planning outside a container requires explicit Secrets"
+        )
     from ..logging import register_secret
 
     register_secret(api_token)
     security_config = service.config.security
-    configured_bind = bind_host or runtime_secrets.app_host
+    configured_bind = bind_host or (
+        runtime_secrets.app_host
+        if runtime_secrets is not None
+        else "127.0.0.1"
+    )
     if (
         not security_config.cookie_secure
         and not _is_loopback_bind(configured_bind)
@@ -268,7 +305,11 @@ def create_app(
             "security.cookie_secure must be true for a non-loopback APP_HOST"
         )
 
-    _secrets_holder: dict = {"s": runtime_secrets}
+    _secrets_holder: dict = (
+        {"s": runtime_secrets}
+        if runtime_secrets is not None
+        else {}
+    )
     if planning is _AUTO_PLANNING:
         try:
             from ..analyst.analyst import Analyst
@@ -1018,6 +1059,30 @@ def create_app(
         return (_STATIC / "backtests.html").read_text(encoding="utf-8")
 
     return app
+
+
+@wraps(_create_app)
+def create_app(*args, **kwargs) -> FastAPI:
+    """Build the automatic production app inside its role log boundary."""
+    bound = inspect.signature(_create_app).bind_partial(
+        *args,
+        **kwargs,
+    )
+    bound.apply_defaults()
+    automatic = (
+        bound.arguments["container"] is None
+        and bound.arguments["service"] is None
+        and bound.arguments["agent"] is None
+    )
+    if not automatic:
+        return _create_app(*args, **kwargs)
+
+    container = build_default_container()
+    bound.arguments["container"] = container
+    from ..logging import runtime_startup
+
+    with runtime_startup("app", container.secrets):
+        return _create_app(*bound.args, **bound.kwargs)
 
 
 # ── backtest DB helpers ────────────────────────────────────────

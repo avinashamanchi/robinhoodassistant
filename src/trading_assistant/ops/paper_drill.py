@@ -21,7 +21,11 @@ class PaperDrillError(RuntimeError):
 def build_paper_service(config: AppConfig, secrets: Secrets) -> "TradingService":
     from ..bootstrap import build_container
 
-    return build_container(config, secrets).service
+    return build_container(
+        config,
+        secrets,
+        runtime_role="paper-drill",
+    ).service
 
 
 def run_paper_drill(
@@ -131,16 +135,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="AAPL")
     parser.add_argument("--notional", type=Decimal, default=Decimal("1.25"))
     args = parser.parse_args(argv)
-    config = load_config()
     secrets = Secrets()
-    result = run_paper_drill(
-        config,
-        build_paper_service(config, secrets),
-        symbol=args.symbol.upper(),
-        test_notional=args.notional,
-    )
-    print(result)
-    return 0
+    from ..logging import runtime_startup
+
+    with runtime_startup("paper-drill", secrets):
+        config = load_config()
+        result = run_paper_drill(
+            config,
+            build_paper_service(config, secrets),
+            symbol=args.symbol.upper(),
+            test_notional=args.notional,
+        )
+        print(result)
+        return 0
 
 
 if __name__ == "__main__":

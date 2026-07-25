@@ -147,6 +147,7 @@ def client(make_service, authenticate_client):
         service=svc,
         agent=agent,
         api_token=TOKEN,
+        planning=None,
         chat_rate=RateLimiter(max_requests=2, window_seconds=60),
         approve_rate=RateLimiter(max_requests=100, window_seconds=60),
     )

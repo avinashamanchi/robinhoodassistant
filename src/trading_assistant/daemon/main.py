@@ -14,10 +14,16 @@ from .monitor import Monitor
 
 
 def build_monitor() -> Monitor:
+    from ..logging import runtime_startup
+
+    secrets = Secrets()
+    with runtime_startup("daemon", secrets):
+        return _build_monitor(load_config(), secrets)
+
+
+def _build_monitor(config, secrets: Secrets) -> Monitor:
     from .. import bootstrap
 
-    config = load_config()
-    secrets = Secrets()
     container = bootstrap.build_container(
         config,
         secrets,

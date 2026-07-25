@@ -242,3 +242,162 @@ git diff --check
 The residual warnings are the same upstream `websockets.legacy` and Starlette
 TestClient deprecations recorded above; no new warning or safety concern was
 introduced.
+
+## Independent-review fix round 2
+
+### RED
+
+The round-two regression file was written before production changes:
+
+```text
+uv run pytest tests/test_task9_round2.py -q
+```
+
+Initial result:
+
+```text
+20 failed
+```
+
+Those failures proved:
+
+- partial `create_app` injection still read ambient `Secrets` and could build a
+  second stack;
+- complete explicit injection could not opt out of ambient runtime secrets;
+- MCP transport started without eagerly composing and validating its container;
+- the seven production roles did not share a complete private rotating-log
+  contract;
+- preflight, paper drill, watchdog, and backup did not all pass their exact
+  role and reuse one `Secrets` instance;
+- generated periodic and daily launchd jobs still wrote unbounded inherited
+  stream files;
+- public production bootstrap accepted `BrokerKind.MOCK`;
+- no explicit test-only broker/clock composition seam existed.
+
+### GREEN
+
+The unchanged initial round-two regression set passed after the minimal
+production fixes:
+
+```text
+uv run pytest tests/test_task9_round2.py -q
+20 passed
+```
+
+After strengthening exact-secret and utility-entrypoint identity coverage, the
+same file passed:
+
+```text
+uv run pytest tests/test_task9_round2.py -q
+24 passed
+```
+
+The first broader compatibility run correctly exposed 32 watchdog tests whose
+zero-argument test doubles no longer represented the production seam:
+
+```text
+32 failed, 240 passed
+```
+
+The doubles were updated to accept the exact injected `Secrets` and
+`runtime_role`; the identical 272-test command then passed. No production
+fallback was added.
+
+The focused Task 9 matrix before the final startup-boundary check was:
+
+```text
+uv run pytest tests/test_task9_round2.py tests/test_bootstrap.py
+tests/test_launch.py tests/test_watchdog.py tests/test_ops.py
+tests/test_monitor.py tests/test_external_accounts.py
+tests/test_llm_backends.py tests/test_startup_schema.py
+tests/test_alpaca_broker.py tests/test_migrations.py
+tests/test_mcp_tools.py tests/test_security.py tests/test_api.py
+tests/test_plans_api.py tests/test_backtests_api.py -q
+```
+
+Result:
+
+```text
+591 passed, 2 warnings
+```
+
+The final review then identified two boundary cases hidden by discarded
+inherited streams: app startup after container construction and MCP transport
+startup. Their focused RED result was:
+
+```text
+2 failed
+```
+
+After wrapping those exact production boundaries with the already-tested role
+logger, the unchanged pair passed:
+
+```text
+2 passed
+```
+
+The final-tree affected regression command covered the complete round-two file,
+bootstrap, API, MCP tools, and schema startup:
+
+```text
+uv run pytest tests/test_task9_round2.py tests/test_bootstrap.py
+tests/test_api.py tests/test_mcp_tools.py tests/test_startup_schema.py
+-o addopts='' -q
+```
+
+Result:
+
+```text
+129 passed, 2 warnings in 9.42s
+```
+
+The fixes establish:
+
+- production `create_app()` automatically composes only through one container;
+  partial explicit injection fails before any ambient read, while complete
+  explicit injection requires service, agent, token, and explicit planning
+  dependencies;
+- container planning, agent construction, feature providers, screen providers,
+  authentication, audit, operations, and routes reuse exact container
+  identities;
+- MCP composes, schema-checks, and configures one exact container before
+  `mcp.run()`;
+- app, daemon, MCP, preflight, paper drill, watchdog, and backup each use a
+  private bounded `logs/<role>.runtime.log`, with stable redacted startup-failure
+  evidence;
+- all four installer-generated launchd jobs and both checked-in jobs discard
+  inherited stdout/stderr through `/dev/null`;
+- public production bootstrap rejects every non-Alpaca broker, while tests may
+  explicitly inject a fake broker and clock only with Alpaca still selected in
+  configuration.
+
+### Full verification
+
+Repository-wide command:
+
+```text
+uv run pytest -o addopts='' -q
+```
+
+Result:
+
+```text
+1308 passed, 1 skipped, 2 warnings in 206.75s
+```
+
+Additional passing checks:
+
+```text
+uv lock
+uv lock --check
+uv run python -m compileall -q src tests
+find scripts -type f -name '*.sh' -print0 | xargs -0 bash -n
+plistlib parsing and /dev/null/Umask assertions for every checked-in plist
+static paper/Alpaca/autoexecute/bracket/fallback/schema guard checks
+git diff --check
+```
+
+The only warnings remain the pre-existing upstream `websockets.legacy` and
+Starlette TestClient deprecations. Paper mode, human approval, auto-execution
+off, automatic brackets off, null cross-provider fallback, one-write mutation
+semantics, and the schema gate remain intact.

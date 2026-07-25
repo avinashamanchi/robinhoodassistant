@@ -34,7 +34,7 @@ def _patch_common_startup(monkeypatch, module, url):
     config = config.model_copy(
         update={
             "trading": config.trading.model_copy(
-                update={"broker": BrokerKind.MOCK}
+                update={"broker": BrokerKind.ALPACA}
             )
         }
     )

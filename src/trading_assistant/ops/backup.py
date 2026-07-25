@@ -75,13 +75,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--destination", default="backups")
     parser.add_argument("--retention-days", type=int, default=14)
     args = parser.parse_args(argv)
-    created = backup_database(
-        database_path(Secrets().database_url),
-        args.destination,
-        args.retention_days,
-    )
-    print(created)
-    return 0
+    secrets = Secrets()
+    from ..logging import runtime_startup
+
+    with runtime_startup("backup", secrets):
+        created = backup_database(
+            database_path(secrets.database_url),
+            args.destination,
+            args.retention_days,
+        )
+        print(created)
+        return 0
 
 
 if __name__ == "__main__":

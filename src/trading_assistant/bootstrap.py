@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from pathlib import Path
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,11 +11,21 @@ from sqlalchemy.orm import Session, sessionmaker
 from .app.auth import SessionAuth
 from .broker.base import BrokerClient
 from .broker.factory import build_broker, build_clock
-from .config import AppConfig, Secrets, TradingMode, load_config
+from .config import (
+    AppConfig,
+    BrokerKind,
+    Secrets,
+    TradingMode,
+    load_config,
+)
 from .db.schema import require_current_schema
 from .db.session import create_db_engine, make_session_factory
 from .daemon.backoff import RetryPolicy, retry_read
-from .logging import configure_logging, register_all_secrets
+from .logging import (
+    configure_logging,
+    configure_runtime_logging,
+    register_all_secrets,
+)
 from .notifications.base import NullNotifier
 from .orders.application import OrderApplicationService
 from .orders.reconciliation import ReconciliationService
@@ -64,18 +73,10 @@ def prepare_database_runtime(
             "log_path and runtime_role are mutually exclusive"
         )
     if runtime_role is not None:
-        if runtime_role not in {
-            "app",
-            "daemon",
-            "mcp",
-            "paper-drill",
-            "preflight",
-            "watchdog",
-        }:
-            raise ValueError("runtime_role is invalid")
-        log_path = Path("logs") / f"{runtime_role}.runtime.log"
-    register_all_secrets(secrets)
-    configure_logging(log_path=log_path)
+        configure_runtime_logging(runtime_role, secrets)
+    else:
+        register_all_secrets(secrets)
+        configure_logging(log_path=log_path)
     engine = create_db_engine(secrets.database_url)
     require_current_schema(engine)
     return DatabaseRuntime(
@@ -90,6 +91,10 @@ def _guard_runtime(config: AppConfig, secrets: Secrets) -> None:
     if config.trading.mode is not TradingMode.PAPER:
         raise RuntimeError(
             "live trading is locked out by the safety foundation"
+        )
+    if config.trading.broker is not BrokerKind.ALPACA:
+        raise RuntimeError(
+            "production broker must be Alpaca"
         )
     if config.features.auto_execute_preapproved_rules:
         raise RuntimeError("auto-execution must remain disabled")
@@ -109,18 +114,52 @@ def build_container(
 ) -> ApplicationContainer:
     config = config or load_config()
     secrets = secrets or Secrets()
+    return _build_container(
+        config,
+        secrets,
+        runtime_role=runtime_role,
+    )
+
+
+def build_test_container(
+    config: AppConfig,
+    secrets: Secrets,
+    *,
+    broker: BrokerClient,
+    clock,
+) -> ApplicationContainer:
+    """Compose with explicit fakes while retaining production-safe config."""
+    return _build_container(
+        config,
+        secrets,
+        broker=broker,
+        clock=clock,
+    )
+
+
+def _build_container(
+    config: AppConfig,
+    secrets: Secrets,
+    *,
+    runtime_role: str | None = None,
+    broker: BrokerClient | None = None,
+    clock=None,
+) -> ApplicationContainer:
     _guard_runtime(config, secrets)
     runtime = prepare_database_runtime(
         secrets,
         runtime_role=runtime_role,
     )
 
-    broker = build_broker(config, secrets)
+    if broker is None:
+        broker = build_broker(config, secrets)
+    if clock is None:
+        clock = build_clock(config, secrets)
     service = TradingService(
         broker,
         runtime.session_factory,
         config,
-        build_clock(config, secrets),
+        clock,
         external_source=None,
     )
     rule_worker = RuleWorker(

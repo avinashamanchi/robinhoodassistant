@@ -160,6 +160,7 @@ def test_planning_startup_internal_failure_is_not_hidden(
             service=make_service(),
             agent=_StubAgent(),
             api_token=TOKEN,
+            runtime_secrets=Secrets(app_api_token=TOKEN),
         )
 
 

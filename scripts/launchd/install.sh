@@ -15,9 +15,6 @@ UID_="$(id -u)"
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
 chmod 700 "$PROJ/logs" "$PROJ/backups"
-touch "$PROJ/logs/com.trading.watchdog.launchd.log"
-touch "$PROJ/logs/com.trading.backup.launchd.log"
-chmod 600 "$PROJ"/logs/*.launchd.log
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
 
 reload_plist () {  # launchd can briefly return EIO immediately after bootout
@@ -73,8 +70,8 @@ emit_periodic () {  # $1=label $2=interval_seconds $3...=program args
     printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>RunAtLoad</key><true/>\n'
     printf '  <key>StartInterval</key><integer>%s</integer>\n' "$interval"
-    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
-    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
+    printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+    printf '  <key>StandardErrorPath</key><string>/dev/null</string>\n'
     printf '</dict></plist>\n'
   } > "$plist"
   reload_plist "$label" "$plist"
@@ -101,8 +98,8 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
     printf '    <key>Hour</key><integer>%s</integer>\n' "$hour"
     printf '    <key>Minute</key><integer>%s</integer>\n' "$minute"
     printf '  </dict>\n'
-    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
-    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
+    printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+    printf '  <key>StandardErrorPath</key><string>/dev/null</string>\n'
     printf '</dict></plist>\n'
   } > "$plist"
   reload_plist "$label" "$plist"

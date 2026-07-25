@@ -23,7 +23,12 @@ class StubAgent:
 @pytest.fixture
 def client(make_service, authenticate_client):
     svc = make_service()
-    app = create_app(service=svc, agent=StubAgent(), api_token=TOKEN)
+    app = create_app(
+        service=svc,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
     test_client, csrf = authenticate_client(
         TestClient(app, raise_server_exceptions=False),
         TOKEN,
