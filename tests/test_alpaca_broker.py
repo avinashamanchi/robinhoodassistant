@@ -1002,6 +1002,27 @@ def test_submit_order_does_not_retry_post_send_connection_loss():
     assert trading.submit_calls == 0  # no second POST after an uncertain send
 
 
+def test_cancel_order_write_is_attempted_exactly_once_on_connection_loss():
+    from requests.exceptions import ConnectionError as ReqConnErr
+
+    class FlakyCancelTrading(FakeTrading):
+        def __init__(self):
+            super().__init__()
+            self.cancel_calls = 0
+
+        def cancel_order_by_id(self, oid):
+            self.cancel_calls += 1
+            raise ReqConnErr("provider-secret-cancel-connection")
+
+    trading = FlakyCancelTrading()
+    broker = AlpacaBroker(trading, FakeData({}))
+
+    with pytest.raises(ReqConnErr):
+        broker.cancel_order("broker-order-1")
+
+    assert trading.cancel_calls == 1
+
+
 def test_non_transient_error_is_not_retried():
     class ExplodingData:
         def __init__(self):

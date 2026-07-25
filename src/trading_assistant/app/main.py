@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +24,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from ..assets import AssetClass
 from ..broker.models import OrderStatus
 from ..config import Secrets, load_config
-from ..db.schema import require_current_schema
-from ..db.session import create_db_engine, make_session_factory
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
+from ..operations import (
+    AuditRecorder,
+    OperationsService,
+    mark_http_mutation,
+)
 from ..service import TradingService
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
@@ -45,6 +48,10 @@ from .security import (
 
 _STATIC = Path(__file__).parent / "static"
 _DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
+_AUTO_PLANNING = object()
+
+if TYPE_CHECKING:
+    from ..bootstrap import ApplicationContainer
 
 
 class _AssetOnlyStaticFiles(StaticFiles):
@@ -164,29 +171,37 @@ class KillSwitchResetIn(BaseModel):
         return value.strip()
 
 
-def build_default_stack() -> tuple[TradingService, Agent]:
-    from ..broker.factory import build_broker, build_clock
-    from ..external_accounts.factory import build_external_source
-    from ..logging import register_all_secrets
-
+def build_default_container():
     config = load_config()
     secrets = Secrets()
-    register_all_secrets(secrets)
-    engine = create_db_engine(secrets.database_url)
-    require_current_schema(engine)
-    session_factory = make_session_factory(engine)
-    broker = build_broker(config, secrets)
-    clock = build_clock(config, secrets)
-    service = TradingService(
-        broker, session_factory, config, clock,
-        external_source=build_external_source(config, secrets),
-    )
+    from .. import bootstrap
+
+    return bootstrap.build_container(config, secrets)
+
+
+def _build_agent(container) -> Agent:
     from ..llm.factory import build_llm_backend
 
-    backend = build_llm_backend(config, secrets)
-    model_label = getattr(config.llm, f"{config.llm.provider}_model", config.llm.model)
-    agent = Agent(backend, service, session_factory, model_label, config.llm.max_tokens)
-    return service, agent
+    config = container.config
+    backend = build_llm_backend(config, container.secrets)
+    model_label = getattr(
+        config.llm,
+        f"{config.llm.provider}_model",
+        config.llm.model,
+    )
+    agent = Agent(
+        backend,
+        container.service,
+        container.session_factory,
+        model_label,
+        config.llm.max_tokens,
+    )
+    return agent
+
+
+def build_default_stack() -> tuple[TradingService, Agent]:
+    container = build_default_container()
+    return container.service, _build_agent(container)
 
 
 def _is_loopback_bind(host: str) -> bool:
@@ -203,7 +218,8 @@ def create_app(
     service: Optional[TradingService] = None,
     agent: Optional[Agent] = None,
     *,
-    planning=None,
+    container: "ApplicationContainer | None" = None,
+    planning=_AUTO_PLANNING,
     screen_source=None,
     api_token: Optional[str] = None,
     chat_rate: RateLimiter | None = None,
@@ -214,11 +230,23 @@ def create_app(
     auth_now: Callable | None = None,
     bind_host: str | None = None,
 ) -> FastAPI:
-    runtime_secrets = Secrets()
+    if container is None and service is None and agent is None:
+        container = build_default_container()
+        service = container.service
+        agent = _build_agent(container)
+    runtime_secrets = container.secrets if container is not None else Secrets()
     if api_token is None:
         api_token = runtime_secrets.app_api_token
     if not api_token or not api_token.strip():
         raise RuntimeError("APP_API_TOKEN is required")
+    if container is not None:
+        if api_token != container.secrets.app_api_token:
+            raise RuntimeError(
+                "container and operator authentication secret do not match"
+            )
+        if service is not None and service is not container.service:
+            raise RuntimeError("container and service do not match")
+        service = container.service
     if service is None or agent is None:
         service, agent = build_default_stack()
     from ..logging import register_secret
@@ -235,7 +263,7 @@ def create_app(
         )
 
     _secrets_holder: dict = {}
-    if planning is None:
+    if planning is _AUTO_PLANNING:
         try:
             from ..analyst.analyst import Analyst
             from ..analyst.live_features import build_live_feature_provider
@@ -252,8 +280,10 @@ def create_app(
             planning = PlanningService(
                 service, analyst, build_live_feature_provider(service.config, sec), sec
             )
-        except RequiredDependencyUnavailable:
-            planning = None
+        except RequiredDependencyUnavailable as exc:
+            raise RuntimeError(
+                "configured planning subsystem is unavailable"
+            ) from exc
 
     chat_rate = chat_rate or RateLimiter(max_requests=20, window_seconds=60)
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
@@ -278,17 +308,32 @@ def create_app(
     }
     if auth_now is not None:
         session_kwargs["now"] = auth_now
-    app.state.session_auth = SessionAuth(
-        service.session_factory,
-        application_secret=api_token,
-        **session_kwargs,
-    )
+    if container is not None and auth_now is None:
+        app.state.session_auth = container.session_auth
+        app.state.audit = container.audit
+        app.state.operations = container.operations
+    else:
+        app.state.session_auth = SessionAuth(
+            service.session_factory,
+            application_secret=api_token,
+            **session_kwargs,
+        )
+        app.state.audit = AuditRecorder(service.session_factory)
+        app.state.operations = OperationsService(
+            service,
+            app.state.audit,
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["X-CSRF-Token", "Content-Type"],
+        allow_headers=[
+            "X-CSRF-Token",
+            "X-Request-ID",
+            "Idempotency-Key",
+            "Content-Type",
+        ],
     )
     install_security(app)
     app.include_router(auth_router)
@@ -300,11 +345,28 @@ def create_app(
 
     @app.get("/health/live")
     def liveness():
-        return {"status": "ok"}
+        return app.state.operations.liveness().as_dict()
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> str:
         return (_STATIC / "login.html").read_text(encoding="utf-8")
+
+    def _mutation(
+        request: Request,
+        principal: SessionPrincipal,
+        reason: str,
+        action: str,
+        target_type: str,
+        target_id: object,
+    ):
+        return mark_http_mutation(
+            request,
+            actor=principal.actor,
+            reason=reason,
+            action=action,
+            target_type=target_type,
+            target_id=str(target_id),
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def index(
@@ -318,22 +380,30 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.message,
+            "http.chat",
+            "conversation",
+            "active",
+        )
         if not chat_rate.allow(rate_limit_key(request, principal)):
             raise ApiError(
                 "rate_limit_exceeded", 429, "Chat rate limit exceeded"
             )
         return agent.chat(
             body.message,
-            actor=principal.actor,
-            reason=body.message,
-            request_id=request.state.request_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
 
     @app.get("/health")
     def health(
         principal: SessionPrincipal = Depends(current_principal),
     ):
-        return service.health()
+        return app.state.operations.health().as_dict()
 
     @app.get("/pending")
     def pending(
@@ -367,6 +437,14 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.approve",
+            "order",
+            order_id,
+        )
         if not approve_rate.allow(rate_limit_key(request, principal)):
             raise ApiError(
                 "rate_limit_exceeded", 429, "Approval rate limit exceeded"
@@ -374,9 +452,9 @@ def create_app(
         try:
             result = service.approve_order(
                 order_id,
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
@@ -409,11 +487,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.reject",
+            "order",
+            order_id,
+        )
         result = service.reject_order(
             order_id,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
         if result.get("error") == "not found":
             raise ApiError("order_not_found", 404, "Order not found")
@@ -446,13 +532,19 @@ def create_app(
     ):
         from ..risk.breakers import BreakerResetConflict
 
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.breaker_reset",
+            "circuit_breaker",
+            body.asset_class.value,
+        )
         try:
-            return service.reset_killswitch(
+            return app.state.operations.reset_breaker(
                 body.asset_class,
-                actor=principal.actor,
-                reason=body.reason,
                 expected_generation=body.expected_generation,
-                request_id=request.state.request_id,
+                context=context,
             )
         except BreakerResetConflict as exc:
             raise ApiError(
@@ -470,12 +562,20 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.cancel",
+            "order",
+            order_id,
+        )
         try:
             result = service.cancel_live_order(
                 order_id,
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
         except ReconciliationConflict:
             raise ApiError(
@@ -499,11 +599,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.reconcile",
+            "portfolio",
+            "alpaca-paper",
+        )
         try:
             return service.reconcile_positions(
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
@@ -514,11 +622,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):  # pull fills/status from the broker (also runs each daemon loop)
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.sync",
+            "broker_orders",
+            "all",
+        )
         try:
             return service.sync_open_orders(
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
         except ReconciliationConflict:
             raise ApiError(
@@ -535,12 +651,16 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.panic",
+            "account",
+            "alpaca-paper",
+        )
         try:
-            receipt = service.panic(
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
-            )
+            receipt = app.state.operations.panic(context)
         except Exception:
             receipt = _panic_exception_receipt(service)
         if receipt.get("safe") is not True:
@@ -594,6 +714,14 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.analyze",
+            "symbol",
+            body.symbol.upper(),
+        )
         if not analysis_rate.allow(rate_limit_key(request, principal)):
             raise ApiError(
                 "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
@@ -601,18 +729,18 @@ def create_app(
         try:
             return _require_planning().analyze(
                 body.symbol,
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
         except ApiError:
             raise
         except RequiredDependencyUnavailable:
             _audit_analysis_dependency_failure(
                 body.symbol,
-                actor=principal.actor,
-                reason=body.reason,
-                request_id=request.state.request_id,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
             )
             raise ApiError(
                 "analysis_failed",
@@ -649,11 +777,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.plan_approve",
+            "trade_plan",
+            plan_id,
+        )
         result = _require_planning().approve_plan(
             plan_id,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
         if "error" in result and "promotion gate" in result["error"]:
             raise ApiError(
@@ -676,11 +812,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.plan_cancel",
+            "trade_plan",
+            plan_id,
+        )
         result = _require_planning().cancel_plan(
             plan_id,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
         if result.get("error") == "not found":
             raise ApiError("plan_not_found", 404, "Plan not found")
@@ -740,6 +884,14 @@ def create_app(
         """Screen the market and run the analyst on the top N candidates, creating
         sized plans you can approve. The analyst is UNPROVEN — these are suggestions
         the risk engine still gates; you approve each one."""
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.propose",
+            "trade_plan_batch",
+            body.n,
+        )
         if not analysis_rate.allow(rate_limit_key(request, principal)):
             raise ApiError(
                 "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
@@ -751,9 +903,9 @@ def create_app(
             try:
                 out = planning.analyze(
                     c["symbol"],
-                    actor=principal.actor,
-                    reason=body.reason,
-                    request_id=request.state.request_id,
+                    actor=context.actor,
+                    reason=context.reason,
+                    request_id=context.request_id,
                 )
                 created.append({
                     "plan_id": out["plan_id"], "symbol": c["symbol"],
@@ -763,9 +915,9 @@ def create_app(
             except RequiredDependencyUnavailable:
                 _audit_analysis_dependency_failure(
                     c["symbol"],
-                    actor=principal.actor,
-                    reason=body.reason,
-                    request_id=request.state.request_id,
+                    actor=context.actor,
+                    reason=context.reason,
+                    request_id=context.request_id,
                 )
                 created.append(
                     {
@@ -811,6 +963,14 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.backtest_run",
+            "backtest",
+            "new",
+        )
         if not backtest_rate.allow(rate_limit_key(request, principal)):
             raise ApiError(
                 "rate_limit_exceeded", 429, "Backtest rate limit exceeded"
@@ -820,9 +980,9 @@ def create_app(
         run_id, report = run_synthetic_backtest(
             service.session_factory,
             symbols=body.symbols or None,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
         return {"run_id": run_id, "report": report.to_dict()}
 

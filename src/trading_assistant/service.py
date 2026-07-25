@@ -705,9 +705,32 @@ class TradingService:
 
     def write_heartbeat(self, source: str = "daemon") -> None:
         from .db.models import Heartbeat
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+        source = source.strip()
+        if not source or len(source) > 24:
+            raise ValueError("heartbeat source is invalid")
         with self.session_factory() as s:
-            s.add(Heartbeat(source=source))
+            if s.get_bind().dialect.name == "sqlite":
+                statement = sqlite_insert(Heartbeat).values(
+                    source=source,
+                    at=utcnow(),
+                )
+                statement = statement.on_conflict_do_update(
+                    index_elements=[Heartbeat.source],
+                    set_={"at": statement.excluded.at},
+                )
+                s.execute(statement)
+            else:
+                heartbeat = s.scalar(
+                    select(Heartbeat).where(
+                        Heartbeat.source == source
+                    )
+                )
+                if heartbeat is None:
+                    s.add(Heartbeat(source=source))
+                else:
+                    heartbeat.at = utcnow()
             s.commit()
 
     def health(self) -> dict[str, Any]:

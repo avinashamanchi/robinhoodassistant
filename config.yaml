@@ -55,13 +55,6 @@ backtest:
     crypto: 25                          # Alpaca crypto worst taker tier
   holdout_months: 12
 
-# Read-only external account sources (never a broker; never places orders).
-external_accounts:
-  robinhood:
-    enabled: false            # OFF by default
-    cache_ttl_seconds: 300    # cache reads; don't hammer their endpoints
-    token_path: ./.rh_token.pickle
-
 features:
   auto_execute_preapproved_rules: false   # keep OFF until paper evidence and safety review pass
   telegram_notifications: false           # (Phase 4)
@@ -77,7 +70,7 @@ security:
 
 llm:
   provider: gemini            # anthropic | gemini | groq
-  fallback_provider: groq     # tried if the primary errors at call time
+  fallback_provider: null     # cross-provider runtime fallback is prohibited
   model: claude-sonnet-4-6    # used only when provider=anthropic
   gemini_model: gemini-flash-latest
   groq_model: llama-3.3-70b-versatile

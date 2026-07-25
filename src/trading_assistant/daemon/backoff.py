@@ -6,7 +6,31 @@ jitter, so many daemons don't reconnect in lockstep. attempt starts at 1.
 
 from __future__ import annotations
 
+import asyncio
 import random
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, TypeVar
+
+_T = TypeVar("_T")
+RETRIABLE_READ_ERRORS = (TimeoutError, ConnectionError)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    attempts: int = 3
+    base_seconds: float = 1.0
+    cap_seconds: float = 30.0
+    jitter_fraction: float = 0.2
+
+    def __post_init__(self) -> None:
+        if (
+            self.attempts < 1
+            or self.base_seconds < 0
+            or self.cap_seconds < 0
+            or not 0 <= self.jitter_fraction <= 1
+        ):
+            raise ValueError("invalid read retry policy")
 
 
 def next_delay(
@@ -21,3 +45,49 @@ def next_delay(
     r = rng or random
     jitter = raw * jitter_frac * (2 * r.random() - 1)  # +/- jitter_frac
     return max(0.0, min(cap, raw + jitter))
+
+
+def retry_read(
+    operation: Callable[[], _T],
+    policy: RetryPolicy = RetryPolicy(),
+    *,
+    sleep: Callable[[float], object] = time.sleep,
+) -> _T:
+    for attempt in range(1, policy.attempts + 1):
+        try:
+            return operation()
+        except RETRIABLE_READ_ERRORS:
+            if attempt == policy.attempts:
+                raise
+            sleep(
+                next_delay(
+                    attempt,
+                    base=policy.base_seconds,
+                    cap=policy.cap_seconds,
+                    jitter_frac=policy.jitter_fraction,
+                )
+            )
+    raise RuntimeError("unreachable")
+
+
+async def retry_async_read(
+    operation: Callable[[], Awaitable[_T]],
+    policy: RetryPolicy = RetryPolicy(),
+    *,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> _T:
+    for attempt in range(1, policy.attempts + 1):
+        try:
+            return await operation()
+        except RETRIABLE_READ_ERRORS:
+            if attempt == policy.attempts:
+                raise
+            await sleep(
+                next_delay(
+                    attempt,
+                    base=policy.base_seconds,
+                    cap=policy.cap_seconds,
+                    jitter_frac=policy.jitter_fraction,
+                )
+            )
+    raise RuntimeError("unreachable")

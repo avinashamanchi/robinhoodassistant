@@ -7,33 +7,21 @@ from __future__ import annotations
 
 import asyncio
 
-from ..broker.factory import build_broker, build_clock
 from ..config import Secrets, load_config
-from ..db.schema import require_current_schema
-from ..db.session import create_db_engine, make_session_factory
-from ..logging import configure_logging
 from ..notifications.base import build_notifier
-from ..service import TradingService
+from .backoff import RetryPolicy, retry_read
 from .monitor import Monitor
 
 
 def build_monitor() -> Monitor:
-    from ..external_accounts.factory import build_external_source
-    from ..logging import register_all_secrets
+    from .. import bootstrap
 
     config = load_config()
     secrets = Secrets()
-    register_all_secrets(secrets)
-    engine = create_db_engine(secrets.database_url)
-    require_current_schema(engine)
-    session_factory = make_session_factory(engine)
-    service = TradingService(
-        build_broker(config, secrets),
-        session_factory,
-        config,
-        build_clock(config, secrets),
-        external_source=build_external_source(config, secrets),
-    )
+    container = bootstrap.build_container(config, secrets)
+    service = container.service
+    notifier = build_notifier(config, secrets)
+    container.rule_worker.notifier = notifier
     shadow = None
     screen_source = None
     if config.features.shadow_mode:
@@ -53,7 +41,11 @@ def build_monitor() -> Monitor:
 
         def _price(sym: str):
             try:
-                return Decimal(str(service.broker.get_quote(sym).last))
+                quote = retry_read(
+                    lambda: service.broker.get_quote(sym),
+                    RetryPolicy(),
+                )
+                return Decimal(str(quote.last))
             except Exception:
                 return None
 
@@ -61,7 +53,7 @@ def build_monitor() -> Monitor:
 
     return Monitor(
         service,
-        build_notifier(config, secrets),
+        notifier,
         auto_execute=config.features.auto_execute_preapproved_rules,
         poll_interval_seconds=config.daemon.poll_interval_seconds,
         max_quote_age_seconds=config.daemon.max_quote_age_seconds,
@@ -69,11 +61,11 @@ def build_monitor() -> Monitor:
         daily_task_timeout_seconds=config.daemon.daily_task_timeout_seconds,
         shadow=shadow,
         digest_source=screen_source,
+        rule_worker=container.rule_worker,
     )
 
 
 def main() -> None:
-    configure_logging()
     asyncio.run(build_monitor().run())
 
 

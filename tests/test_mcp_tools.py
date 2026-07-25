@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from trading_assistant.broker.mock import MockBroker
+from trading_assistant.db.models import AuditEvent
 from trading_assistant.mcp_server import server as mcp_server
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.service import TradingService
@@ -20,6 +21,7 @@ def configured(app_config, session_factory):
     mcp_server.configure(svc)
     yield svc
     mcp_server._service = None  # reset global so other tests aren't affected
+    mcp_server._audit = None
 
 
 def test_tools_are_registered():
@@ -51,3 +53,10 @@ def test_propose_order_tool_creates_pending(configured):
     assert res["status"] == "proposed"
     assert res["executed"] is False
     assert mcp_server.get_open_orders()[0]["status"] == "proposed"
+    with configured.session_factory() as session:
+        receipt = session.query(AuditEvent).filter_by(
+            action="mcp.propose_order"
+        ).one()
+    assert receipt.actor == "assistant:mcp"
+    assert receipt.request_id
+    assert receipt.result_code == "proposed"

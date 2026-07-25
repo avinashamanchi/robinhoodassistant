@@ -2,6 +2,7 @@
 # Stop and remove the launchd agents (app + daemon). Auto-start is disabled after
 # this runs; re-run install.sh to bring it back.
 set -euo pipefail
+umask 077
 LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 for label in com.trading.app com.trading.daemon com.trading.watchdog com.trading.backup; do

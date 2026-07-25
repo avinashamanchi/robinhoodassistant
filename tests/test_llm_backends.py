@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from trading_assistant.llm.base import to_gemini_contents, to_openai
-from trading_assistant.llm.factory import FallbackBackend
 from trading_assistant.llm.gemini_backend import from_gemini, _sanitize_schema
 from trading_assistant.llm.groq_backend import GroqBackend
 
@@ -165,40 +164,64 @@ def test_sanitize_schema_collapses_union():
     assert out["properties"]["note"]["type"] == "string"
 
 
-# ── fallback ────────────────────────────────────────────────────
-def test_fallback_used_on_primary_error():
-    class Boom:
-        def create(self, **kw):
-            raise RuntimeError("primary down")
+# ── explicit provider selection ────────────────────────────────
+def test_configured_cross_provider_fallback_is_rejected_without_construction(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.config import Secrets
+    from trading_assistant.llm import factory
 
-    class OK:
-        def create(self, **kw):
-            return "fallback-result"
+    providers: list[str] = []
+    monkeypatch.setattr(
+        factory,
+        "_make_backend",
+        lambda provider, *_args: providers.append(provider) or object(),
+    )
+    configured = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"fallback_provider": "groq"}
+            )
+        }
+    )
 
-    fb = FallbackBackend(Boom(), OK())
-    assert fb.create(system="", messages=[], tools=[]) == "fallback-result"
+    with pytest.raises(RuntimeError, match="cross-provider"):
+        factory.build_llm_backend(configured, Secrets())
+
+    assert providers == []
 
 
-def test_fallback_when_primary_returns_no_tool_call_but_one_required():
-    """Gemini can answer a 200 in prose even with tools; if a tool was REQUIRED,
-    the fallback provider must take over (this was 'analyst did not submit a plan')."""
-    from trading_assistant.llm.base import LLMResponse, TextBlock, ToolUseBlock
+def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.config import Secrets
+    from trading_assistant.llm import factory
 
-    class ProseOnly:  # primary: no tool_use block
-        def create(self, **kw):
-            return LLMResponse(content=[TextBlock(text="here is my prose answer")])
+    class Primary:
+        def create(self, **_kwargs):
+            raise RuntimeError("primary unavailable")
 
-    class ToolOK:  # fallback: emits the required tool call
-        def create(self, **kw):
-            return LLMResponse(content=[ToolUseBlock(id="x", name="submit_plan", input={"a": 1})])
+    providers: list[str] = []
+    monkeypatch.setattr(
+        factory,
+        "_make_backend",
+        lambda provider, *_args: providers.append(provider) or Primary(),
+    )
+    configured = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"fallback_provider": None}
+            )
+        }
+    )
+    backend = factory.build_llm_backend(configured, Secrets())
 
-    fb = FallbackBackend(ProseOnly(), ToolOK())
-    # No forcing -> prose is fine, primary result kept.
-    r_auto = fb.create(system="", messages=[], tools=[{"name": "t"}])
-    assert r_auto.content[0].type == "text"
-    # Forced -> primary's prose is unacceptable, fall back to the tool-calling provider.
-    r_forced = fb.create(system="", messages=[], tools=[{"name": "t"}], tool_choice="any")
-    assert r_forced.content[0].type == "tool_use"
+    with pytest.raises(RuntimeError, match="primary unavailable"):
+        backend.create(system="", messages=[], tools=[])
+
+    assert providers == [configured.llm.provider]
 
 
 def test_groq_client_uses_configured_timeout(monkeypatch):

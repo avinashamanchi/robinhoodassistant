@@ -26,11 +26,26 @@ def _revision_0004(tmp_path, name="startup.db"):
 
 
 def _patch_common_startup(monkeypatch, module, url):
-    monkeypatch.setattr(module, "load_config", lambda: object())
+    from trading_assistant.config import BrokerKind, load_config
+
+    config = load_config(
+        Path(__file__).resolve().parent.parent / "config.yaml"
+    )
+    config = config.model_copy(
+        update={
+            "trading": config.trading.model_copy(
+                update={"broker": BrokerKind.MOCK}
+            )
+        }
+    )
+    monkeypatch.setattr(module, "load_config", lambda: config)
     monkeypatch.setattr(
         module,
         "Secrets",
-        lambda: SimpleNamespace(database_url=url),
+        lambda: SimpleNamespace(
+            database_url=url,
+            app_api_token="startup-schema-test-secret",
+        ),
     )
     monkeypatch.setattr(app_logging, "register_all_secrets", lambda _secrets: None)
 

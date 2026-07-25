@@ -541,6 +541,68 @@ def test_core_cycle_can_recover_after_a_transient_failure(make_service):
     assert calls == 2
 
 
+def test_read_retry_is_bounded_and_does_not_wrap_mutations():
+    from trading_assistant.daemon.backoff import RetryPolicy, retry_read
+
+    calls = 0
+    delays: list[float] = []
+
+    def flaky_read():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise ConnectionError("temporary read outage")
+        return "quote"
+
+    result = retry_read(
+        flaky_read,
+        RetryPolicy(
+            attempts=3,
+            base_seconds=1,
+            cap_seconds=2,
+            jitter_fraction=0,
+        ),
+        sleep=delays.append,
+    )
+
+    assert result == "quote"
+    assert calls == 3
+    assert delays == [1, 2]
+
+
+def test_daemon_does_not_retry_a_failed_mutating_cycle(
+    make_service,
+):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()
+    monitor = Monitor(
+        service,
+        NullNotifier(),
+        cycle_timeout_seconds=0.2,
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    stop = asyncio.Event()
+    calls = 0
+
+    def failed_cycle():
+        nonlocal calls
+        calls += 1
+        stop.set()
+        raise ConnectionError("one failed mutating cycle")
+
+    monitor._core_cycle = failed_cycle
+    with pytest.raises(ConnectionError, match="failed mutating cycle"):
+        asyncio.run(monitor.run(stop))
+
+    assert calls == 1
+    breaker = service.breakers.get(BreakerScope.operator_global())
+    assert breaker is not None and breaker.tripped is True
+
+
 def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service):
     from trading_assistant.risk.breakers import BreakerScope
 
@@ -567,6 +629,34 @@ def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service
     state = svc.breakers.get(BreakerScope.operator_global())
     assert state is not None and state.tripped is True
     assert state.actor == "daemon:monitor"
+
+
+def test_runtime_reconciliation_failure_trips_global_breaker_once(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()
+    monitor = Monitor(
+        service,
+        NullNotifier(),
+        cycle_timeout_seconds=0.2,
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    service.sync_open_orders = lambda **context: {
+        "synced": 0,
+        "newly_filled": 0,
+        "failed": 1,
+        "fills_repaired": 0,
+    }
+
+    with pytest.raises(RuntimeError, match="order reconciliation"):
+        asyncio.run(monitor.run(asyncio.Event()))
+
+    state = service.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.generation == 1
 
 
 def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):

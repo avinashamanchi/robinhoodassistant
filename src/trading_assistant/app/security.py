@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
@@ -15,6 +16,9 @@ from .auth import (
     SessionPrincipal,
 )
 from .errors import ApiError
+
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
+_IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,64}\Z")
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -143,8 +147,48 @@ def install_security(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def secure_response(request: Request, call_next):
-        request.state.request_id = uuid4().hex
+        incoming_request_id = request.headers.get("X-Request-ID", "")
+        request.state.request_id = (
+            incoming_request_id
+            if _REQUEST_ID.fullmatch(incoming_request_id)
+            else uuid4().hex
+        )
+        idempotency_key = request.headers.get("Idempotency-Key", "")
+        if idempotency_key and not _IDEMPOTENCY_KEY.fullmatch(
+            idempotency_key
+        ):
+            return _error_response(
+                request,
+                ApiError(
+                    "invalid_idempotency_key",
+                    422,
+                    "Idempotency-Key is invalid",
+                ),
+            )
+        request.state.idempotency_key = idempotency_key
         response = await call_next(request)
+        receipt = getattr(request.state, "mutation_receipt", None)
+        if receipt is not None:
+            context, action, target_type, target_id = receipt
+            try:
+                request.app.state.audit.record(
+                    context,
+                    action,
+                    target_type,
+                    target_id,
+                    f"http_{response.status_code}",
+                )
+            except Exception:
+                if response.status_code >= 400:
+                    return _harden_response(request, response)
+                return _error_response(
+                    request,
+                    ApiError(
+                        "audit_unavailable",
+                        503,
+                        "Mutation audit could not be confirmed",
+                    ),
+                )
         if (
             request.method == "OPTIONS"
             and request.headers.get("Origin")

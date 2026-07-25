@@ -479,7 +479,11 @@ class Heartbeat(Base):
     __tablename__ = "heartbeats"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    source: Mapped[str] = mapped_column(String(24), default="daemon")
+    source: Mapped[str] = mapped_column(
+        String(24),
+        default="daemon",
+        unique=True,
+    )
     at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, index=True)
 
 

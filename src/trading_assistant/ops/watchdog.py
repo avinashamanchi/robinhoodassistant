@@ -16,7 +16,6 @@ from sqlalchemy import select
 
 from ..config import Secrets, load_config
 from ..db.models import Heartbeat, utcnow
-from ..db.session import create_db_engine, make_session_factory
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
 _LAUNCHCTL_TIMEOUT_SECONDS = 10.0
@@ -52,7 +51,10 @@ def needs_restart(health: object, stale_seconds: object) -> bool:
 
 
 def _api_is_live(payload: object) -> bool:
-    return type(payload) is dict and payload == {"status": "ok"}
+    return type(payload) is dict and payload == {
+        "alive": True,
+        "database_reachable": True,
+    }
 
 
 def _object_without_duplicate_members(
@@ -83,7 +85,7 @@ def labels_to_restart(
 def fetch_health(
     url: str,
     timeout_seconds: float = 5.0,
-) -> dict[str, str] | None:
+) -> dict[str, bool] | None:
     with urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310 - local URL
         body = response.read(_MAX_LIVENESS_RESPONSE_BYTES + 1)
     if not isinstance(body, (bytes, bytearray)):
@@ -103,21 +105,24 @@ def fetch_health(
         )
     except (ValueError, UnicodeError, RecursionError):
         return None
-    return {"status": "ok"} if _api_is_live(payload) else None
+    return payload if _api_is_live(payload) else None
 
 
 def read_database_health(
     database_url: str | None = None,
 ) -> dict[str, Any]:
     try:
-        factory = make_session_factory(
-            create_db_engine(database_url or Secrets().database_url)
+        from ..bootstrap import prepare_database_runtime
+
+        secrets = Secrets(
+            database_url=database_url or Secrets().database_url
         )
+        factory = prepare_database_runtime(secrets).session_factory
         with factory() as session:
             last = session.execute(
                 select(Heartbeat)
                 .where(Heartbeat.source == "daemon")
-                .order_by(Heartbeat.id.desc())
+                .order_by(Heartbeat.at.desc(), Heartbeat.id.desc())
                 .limit(1)
             ).scalar_one_or_none()
         age = (utcnow() - last.at).total_seconds() if last is not None else None

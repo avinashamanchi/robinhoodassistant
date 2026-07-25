@@ -449,7 +449,8 @@ def _read_persisted_safety_truth_in_session(
         try:
             heartbeat_at = session.scalar(
                 select(Heartbeat.at)
-                .order_by(Heartbeat.id.desc())
+                .where(Heartbeat.source == "daemon")
+                .order_by(Heartbeat.at.desc(), Heartbeat.id.desc())
                 .limit(1)
             )
             if (

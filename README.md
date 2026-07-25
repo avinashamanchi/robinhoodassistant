@@ -121,8 +121,9 @@ and a separate manual decision.
 ## LLM providers & market data
 
 The agent/analyst run on a pluggable backend (`llm/`): set `llm.provider` to
-`anthropic`, `gemini`, or `groq`, with an optional `llm.fallback_provider` that is
-tried automatically if the primary errors at call time (e.g. Gemini quota → Groq).
+`anthropic`, `gemini`, or `groq`. Runtime cross-provider fallback is prohibited:
+a provider change requires an explicit configuration edit and process restart, so
+the same financial context is never silently sent to a second vendor.
 Install with `uv pip install -e '.[llm]'` (google-genai + groq). Keys:
 `GEMINI_API_KEY` / `GROQ_API_KEY` / `ANTHROPIC_API_KEY` in `.env`.
 
@@ -131,29 +132,13 @@ Historical bars come from Alpaca, **MarketStack** (equities EOD/splits/dividends
 **CoinGecko** (crypto OHLCV, **no key required** — the recommended crypto source).
 `uv pip install -e '.[marketdata]'`.
 
-## Robinhood (read-only external source)
-
-`external_accounts/` lets the system SEE holdings at other brokers (Robinhood) so
-cross-broker exposure/correlation is visible — it is **never a broker**. It has no
-order/transfer/write method anywhere (enforced by a test), never enters the
-execution path, and is OFF by default.
-
-```bash
-uv pip install -e '.[external]'    # robin_stocks (pinned >=3.4,<4) + pyotp
-# .env: RH_USERNAME / RH_PASSWORD / RH_TOTP_SECRET (authenticator setup key) / RH_TOKEN_PATH
-# config.yaml: external_accounts.robinhood.enabled: true
-```
-
-When enabled, external positions appear in `/holdings` (labeled read-only), feed the
-analyst's cross-broker correlation check, and trigger a **non-blocking** warning if
-combined Alpaca+external exposure in one ticker exceeds `max_position_per_ticker`.
-All three RH secrets are redacted from logs; the session token is chmod 0600 and
-gitignored. Fetch failures degrade gracefully (cached, marked "stale").
+The abstract read-only external-account protocol and deterministic mock remain for
+portfolio tests. No unofficial Robinhood login library or production factory path
+is shipped.
 
 ## Safety model
 
-1. Live trading requires BOTH `config.yaml` `trading.mode: live` AND
-   `LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`.
+1. This safety-foundation runtime is paper-only and rejects live mode at startup.
 2. The LLM only ever produces `PROPOSED` orders. Execution needs human approval
    (or an explicitly pre-approved rule).
 3. The risk engine runs on every order and cannot be bypassed.

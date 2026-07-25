@@ -151,19 +151,9 @@ def _reconciliation(service) -> Result:
 
 
 def _build_service(config, secrets: Secrets):
-    from .broker.factory import build_broker, build_clock
-    from .db.schema import require_current_schema
-    from .db.session import create_db_engine, make_session_factory
-    from .service import TradingService
+    from .bootstrap import build_container
 
-    engine = create_db_engine(secrets.database_url)
-    require_current_schema(engine)
-    return TradingService(
-        build_broker(config, secrets),
-        make_session_factory(engine),
-        config,
-        build_clock(config, secrets),
-    )
+    return build_container(config, secrets).service
 
 
 def _llm(config, secrets: Secrets) -> Result:
@@ -176,22 +166,13 @@ def _llm(config, secrets: Secrets) -> Result:
         resp = backend.create(system="Reply with the single word OK.",
                               messages=[{"role": "user", "content": "ping"}], tools=[])
         text = "".join(getattr(b, "text", "") for b in getattr(resp, "content", []))
-        return Result(f"LLM ping ({config.llm.provider}->{config.llm.fallback_provider})", PASS, text.strip()[:20])
+        return Result(
+            f"LLM ping ({config.llm.provider})",
+            PASS,
+            text.strip()[:20],
+        )
     except Exception as e:
         return Result("LLM provider ping", FAIL, _safe_exception_code(e))
-
-
-def _robinhood(config, secrets: Secrets) -> Result:
-    rh = config.external_accounts.robinhood if config.external_accounts else None
-    if not (rh and rh.enabled):
-        return Result("Robinhood (read-only)", SKIP, "disabled")
-    try:
-        from .external_accounts.robinhood import RobinhoodSource
-
-        RobinhoodSource(secrets.rh_username, secrets.rh_password, secrets.rh_totp_secret, rh.token_path).get_account_summary()
-        return Result("Robinhood (read-only) login", PASS)
-    except Exception as e:
-        return Result("Robinhood login", FAIL, _safe_exception_code(e))
 
 
 def _telegram(config, secrets: Secrets) -> Result:
@@ -206,6 +187,10 @@ def _telegram(config, secrets: Secrets) -> Result:
 def run() -> int:
     config = load_config("config.yaml")
     secrets = Secrets()
+    from .logging import configure_logging, register_all_secrets
+
+    register_all_secrets(secrets)
+    configure_logging()
     results = [_config_parses(), _env_present(secrets), _live_off(config, secrets)]
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))
@@ -220,7 +205,6 @@ def run() -> int:
             )
         )
     results.append(_llm(config, secrets))
-    results.append(_robinhood(config, secrets))
     results.append(_telegram(config, secrets))
 
     width = max(len(r.name) for r in results)

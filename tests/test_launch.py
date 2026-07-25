@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 
 from trading_assistant.app.main import create_app
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import AuditEvent, Fill, Order
+from trading_assistant.db.models import AuditEvent, Fill, Heartbeat, Order
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 
 
@@ -56,12 +56,62 @@ def test_health_reflects_heartbeat(make_service):
     assert h["heartbeat_age_seconds"] < 5
 
 
+def test_authenticated_health_ignores_non_daemon_heartbeat(make_service):
+    svc = make_service()
+    svc.write_heartbeat("app")
+
+    assert svc.health()["daemon_alive"] is False
+
+
 def test_only_liveness_endpoint_is_anonymous(make_service):
     app = create_app(service=make_service(), agent=_StubAgent(), api_token="tok", planning=None)
     client = TestClient(app)
 
-    assert client.get("/health/live").status_code == 200
+    response = client.get("/health/live")
+    assert response.status_code == 200
+    assert response.json() == {
+        "alive": True,
+        "database_reachable": True,
+    }
     assert client.get("/health").status_code == 401
+
+
+def test_reject_http_receipt_captures_request_and_idempotency_identity(
+    authenticated_client,
+):
+    client, csrf = authenticated_client
+    service = client.trading_service
+    proposal = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        qty="1",
+        actor="operator:test",
+        reason="create rejection target",
+        request_id="create-rejection-target",
+    )
+
+    response = client.post(
+        f"/reject/{proposal['order_id']}",
+        headers={
+            "X-CSRF-Token": csrf,
+            "X-Request-ID": "incoming-request-id",
+            "Idempotency-Key": "reject-once",
+        },
+        json={"reason": "operator review"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "incoming-request-id"
+    with service.session_factory() as session:
+        event = session.query(AuditEvent).filter_by(
+            action="http.reject",
+            request_id="incoming-request-id",
+        ).one()
+    assert event.actor == "operator:local"
+    assert event.idempotency_key == "reject-once"
+    assert event.result_code == "http_200"
+    assert event.latency_ms >= 0
 
 
 # ── B3 preflight helpers (keyless) ──────────────────────────────

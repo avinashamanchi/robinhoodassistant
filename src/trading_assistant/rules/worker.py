@@ -38,6 +38,7 @@ class RuleWorker:
         *,
         max_quote_age_seconds: float = 60.0,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        quote_reader: Callable[[str], object] | None = None,
     ) -> None:
         self.service = service
         self.repository = repository
@@ -45,6 +46,7 @@ class RuleWorker:
         self.notifier = notifier or NullNotifier()
         self.max_quote_age_seconds = max_quote_age_seconds
         self.now = now
+        self.quote_reader = quote_reader or service.broker.get_quote
 
     def tick(
         self,
@@ -109,7 +111,7 @@ class RuleWorker:
                         continue
                     quote = quotes.get(command.ticker)
                     if quote is None:
-                        quote = self.service.broker.get_quote(command.ticker)
+                        quote = self.quote_reader(command.ticker)
                         quotes[command.ticker] = quote
                     if is_stale(
                         quote.as_of,

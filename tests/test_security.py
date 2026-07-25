@@ -429,7 +429,9 @@ def test_allowed_cors_preflight_has_security_headers_and_request_id(client):
         "accept-language",
         "content-language",
         "content-type",
+        "idempotency-key",
         "x-csrf-token",
+        "x-request-id",
     }
     assert response.headers.get("access-control-allow-credentials") is None
     assert response.headers["Content-Security-Policy"]

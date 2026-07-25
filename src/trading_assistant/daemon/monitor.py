@@ -19,11 +19,15 @@ from sqlalchemy import select
 
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
+from ..operations import MutationContext
 from ..rules.worker import RuleWorker
 from ..service import TradingService
-from .backoff import next_delay
 
 log = logging.getLogger(__name__)
+
+
+class _KillSwitchesAlreadyTripped(RuntimeError):
+    """Signal that the current failure already durably latched safety."""
 
 
 class Monitor:
@@ -65,10 +69,15 @@ class Monitor:
 
     # ── one evaluation pass (synchronous, testable) ────────────
     def tick(self):
-        return self.rule_worker.tick(
+        context = MutationContext(
             actor="daemon:rules",
             reason="daemon conditional rule evaluation",
             request_id=uuid4().hex,
+        )
+        return self.rule_worker.tick(
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
         )
 
     def run_daily_tasks(self, today=None) -> dict[str, Any]:
@@ -102,16 +111,20 @@ class Monitor:
     # ── reconciliation on restart ──────────────────────────────
     def reconcile(self) -> dict[str, Any]:
         """Synchronize broker truth before resuming persisted rules on startup."""
-        request_id = uuid4().hex
-        order_sync = self.service.sync_open_orders(
+        context = MutationContext(
             actor="daemon:startup",
+            reason="daemon startup reconciliation",
+            request_id=uuid4().hex,
+        )
+        order_sync = self.service.sync_open_orders(
+            actor=context.actor,
             reason="daemon startup broker order reconciliation",
-            request_id=request_id,
+            request_id=context.request_id,
         )
         position_reconciliation = self.service.reconcile_positions(
-            actor="daemon:startup",
+            actor=context.actor,
             reason="daemon startup position reconciliation",
-            request_id=request_id,
+            request_id=context.request_id,
         )
         with self.service.session_factory() as s:
             active = s.execute(
@@ -131,30 +144,34 @@ class Monitor:
         return summary
 
     def _core_cycle(self) -> None:
-        request_id = uuid4().hex
-        order_sync = self.service.sync_open_orders(
+        context = MutationContext(
             actor="daemon:monitor",
+            reason="daemon runtime safety cycle",
+            request_id=uuid4().hex,
+        )
+        order_sync = self.service.sync_open_orders(
+            actor=context.actor,
             reason="daemon runtime broker order reconciliation",
-            request_id=request_id,
+            request_id=context.request_id,
         )
         if order_sync.get("failed", 0):
             self.service.trip_all_killswitches(
-                actor="daemon:monitor",
+                actor=context.actor,
                 reason="runtime broker order reconciliation failed",
-                request_id=request_id,
+                request_id=context.request_id,
             )
-            raise RuntimeError(
+            raise _KillSwitchesAlreadyTripped(
                 "runtime broker order reconciliation failed; kill switches tripped"
             )
         self.service.enforce_daily_loss_limits(
-            actor="daemon:monitor",
+            actor=context.actor,
             reason="daemon scheduled daily loss enforcement",
-            request_id=request_id,
+            request_id=context.request_id,
         )
         self.rule_worker.tick(
-            actor="daemon:monitor",
+            actor=context.actor,
             reason="daemon conditional rule evaluation",
-            request_id=request_id,
+            request_id=context.request_id,
         )
 
     async def _bounded_core_cycle(self) -> None:
@@ -223,7 +240,6 @@ class Monitor:
                 request_id=uuid4().hex,
             )
             raise RuntimeError("startup reconciliation failed; kill switches tripped")
-        attempt = 0
         while not (stop_event and stop_event.is_set()):
             try:
                 await self._bounded_core_cycle()
@@ -231,17 +247,16 @@ class Monitor:
                 # Shadow analysis and the digest run independently. They can time
                 # out or fail without delaying order sync, rules, or heartbeats.
                 self._schedule_daily_tasks()
-                if attempt:  # recovered — feed is healthy again
-                    log.info("monitor recovered after %d failed attempt(s)", attempt)
-                attempt = 0
                 await asyncio.sleep(self.poll_interval)
-            except Exception:  # a bad tick must not kill the daemon
-                attempt += 1
-                delay = next_delay(attempt)
+            except Exception as exc:
+                if not isinstance(exc, _KillSwitchesAlreadyTripped):
+                    self.service.trip_all_killswitches(
+                        actor="daemon:monitor",
+                        reason="daemon mutating cycle failed",
+                        request_id=uuid4().hex,
+                    )
                 log.error(
                     "monitor tick failed code=monitor_cycle_failed "
-                    "backoff_seconds=%.1f attempt=%d",
-                    delay,
-                    attempt,
+                    "result=process_exit",
                 )
-                await asyncio.sleep(delay)
+                raise

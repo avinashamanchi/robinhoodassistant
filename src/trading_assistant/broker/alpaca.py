@@ -515,7 +515,9 @@ class AlpacaBroker(BrokerClient):
         ]
 
     def cancel_order(self, order_id: str) -> OrderResult:
-        _retry(self._trading.cancel_order_by_id, order_id)
+        # A dropped response after DELETE leaves acceptance unknown. Retrying the
+        # write would violate the one-attempt boundary; reconciliation resolves it.
+        self._trading.cancel_order_by_id(order_id)
         return self._to_result(_retry(self._trading.get_order_by_id, order_id))
 
     # ── helpers ────────────────────────────────────────────────

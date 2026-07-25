@@ -13,39 +13,32 @@ from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
-from ..broker.factory import build_broker, build_clock
 from ..config import Secrets, load_config
-from ..db.schema import require_current_schema
-from ..db.session import create_db_engine, make_session_factory
 from ..service import TradingService
+from ..operations import AuditRecorder, MutationContext
 
 mcp = FastMCP("trading-assistant")
 
 _service: Optional[TradingService] = None
+_audit: Optional[AuditRecorder] = None
 
 
 def configure(service: TradingService) -> None:
     """Inject a service (used by tests and by custom hosts)."""
-    global _service
+    global _service, _audit
     _service = service
+    _audit = AuditRecorder(service.session_factory)
 
 
 def build_default_service() -> TradingService:
-    from ..external_accounts.factory import build_external_source
-    from ..logging import register_all_secrets
-
-    config = load_config()
-    secrets = Secrets()
-    register_all_secrets(secrets)
-    engine = create_db_engine(secrets.database_url)
-    require_current_schema(engine)
-    session_factory = make_session_factory(engine)
-    broker = build_broker(config, secrets)
-    clock = build_clock(config, secrets)
-    return TradingService(
-        broker, session_factory, config, clock,
-        external_source=build_external_source(config, secrets),
+    from .. import bootstrap
+    global _audit
+    container = bootstrap.build_container(
+        load_config(),
+        Secrets(),
     )
+    _audit = container.audit
+    return container.service
 
 
 def _svc() -> TradingService:
@@ -53,6 +46,25 @@ def _svc() -> TradingService:
     if _service is None:
         _service = build_default_service()
     return _service
+
+
+def _record(
+    context: MutationContext,
+    action: str,
+    target_type: str,
+    target_id: object,
+    result: dict[str, Any],
+) -> None:
+    global _audit
+    if _audit is None:
+        _audit = AuditRecorder(_svc().session_factory)
+    _audit.record(
+        context,
+        action,
+        target_type,
+        str(target_id),
+        str(result.get("status") or result.get("state") or "completed"),
+    )
 
 
 # ── read-only tools ─────────────────────────────────────────────
@@ -98,17 +110,24 @@ def propose_order(
     ``limit_price``). The order is risk-checked and stored as PROPOSED (or
     REJECTED with a reason). A human must approve it before anything trades.
     """
-    return _svc().propose_order(
+    context = MutationContext(
+        actor="assistant:mcp",
+        reason=reason,
+        request_id=uuid4().hex,
+    )
+    result = _svc().propose_order(
         ticker=ticker,
         side=side,
         order_type=order_type,
         qty=qty,
         notional=notional,
         limit_price=limit_price,
-        actor="assistant:mcp",
-        reason=reason,
-        request_id=uuid4().hex,
+        actor=context.actor,
+        reason=context.reason,
+        request_id=context.request_id,
     )
+    _record(context, "mcp.propose_order", "order", result.get("order_id", ""), result)
+    return result
 
 
 # ── conditional rules ───────────────────────────────────────────
@@ -121,14 +140,21 @@ def create_conditional_rule(
 ) -> dict[str, Any]:
     """Store a standing rule, e.g. condition {"price_below": 175} action
     {"side": "buy", "notional": "50"}. The daemon (Phase 4) evaluates it."""
-    return _svc().create_conditional_rule(
-        ticker,
-        condition,
-        action,
+    context = MutationContext(
         actor="assistant:mcp",
         reason=reason,
         request_id=uuid4().hex,
     )
+    result = _svc().create_conditional_rule(
+        ticker,
+        condition,
+        action,
+        actor=context.actor,
+        reason=context.reason,
+        request_id=context.request_id,
+    )
+    _record(context, "mcp.rule_create", "rule_group", result.get("group_id", ""), result)
+    return result
 
 
 @mcp.tool()
@@ -140,12 +166,19 @@ def list_rules() -> list[dict[str, Any]]:
 @mcp.tool()
 def cancel_rule(rule_id: int, reason: str) -> dict[str, Any]:
     """Cancel a standing conditional rule by id."""
-    return _svc().cancel_rule(
-        rule_id,
+    context = MutationContext(
         actor="assistant:mcp",
         reason=reason,
         request_id=uuid4().hex,
     )
+    result = _svc().cancel_rule(
+        rule_id,
+        actor=context.actor,
+        reason=context.reason,
+        request_id=context.request_id,
+    )
+    _record(context, "mcp.rule_cancel", "rule", rule_id, result)
+    return result
 
 
 # ── external (read-only) account tools ──────────────────────────

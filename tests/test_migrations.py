@@ -127,11 +127,53 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260724_0006"
+        ) == "20260724_0007"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
     assert "circuit_breaker_state" in inspect(engine).get_table_names()
+
+
+def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "runtime-health.db",
+        "20260724_0006",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO heartbeats (id, source, at) VALUES "
+                "(1, 'daemon', '2026-07-24 10:00:00'),"
+                "(2, 'daemon', '2026-07-24 11:00:00'),"
+                "(3, 'daemon', '2026-07-24 11:00:00'),"
+                "(4, 'app', '2026-07-24 09:00:00')"
+            )
+        )
+
+    command.upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT id, source FROM heartbeats "
+                "ORDER BY source"
+            )
+        ).mappings().all()
+        version = connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        )
+    assert rows == [
+        {"id": 4, "source": "app"},
+        {"id": 3, "source": "daemon"},
+    ]
+    assert version == "20260724_0007"
+    heartbeat_indexes = {
+        index["name"]: index
+        for index in inspect(engine).get_indexes("heartbeats")
+    }
+    assert heartbeat_indexes["uq_heartbeats_source"]["unique"] == 1
 
 
 def test_existing_unversioned_database_must_be_adopted(tmp_path):

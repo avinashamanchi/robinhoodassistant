@@ -5,6 +5,7 @@
 #   ./scripts/launchd/install.sh          # install + load
 #   ./scripts/launchd/uninstall.sh        # stop + remove
 set -euo pipefail
+umask 077
 
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PY="$PROJ/.venv/bin/python"
@@ -13,7 +14,11 @@ UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
-chmod 700 "$PROJ/backups"
+chmod 700 "$PROJ/logs" "$PROJ/backups"
+touch "$PROJ/logs/app.launchd.log" "$PROJ/logs/daemon.launchd.log"
+touch "$PROJ/logs/com.trading.watchdog.launchd.log"
+touch "$PROJ/logs/com.trading.backup.launchd.log"
+chmod 600 "$PROJ"/logs/*.launchd.log
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
 
 reload_plist () {  # launchd can briefly return EIO immediately after bootout
@@ -42,6 +47,7 @@ emit () {  # $1=label  $2...=program args
     for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>10</integer>\n'
     printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
@@ -65,6 +71,7 @@ emit_periodic () {  # $1=label $2=interval_seconds $3...=program args
     for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>RunAtLoad</key><true/>\n'
     printf '  <key>StartInterval</key><integer>%s</integer>\n' "$interval"
     printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
@@ -90,6 +97,7 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
     for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>StartCalendarInterval</key><dict>\n'
     printf '    <key>Hour</key><integer>%s</integer>\n' "$hour"
     printf '    <key>Minute</key><integer>%s</integer>\n' "$minute"

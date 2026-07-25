@@ -2,6 +2,7 @@
 # Start the trading assistant (paper). Runs preflight first and refuses to start
 # if it isn't READY. Starts the app + daemon in the background with logs.
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 
 echo "== stopping any existing instances =="
@@ -16,6 +17,9 @@ if ! .venv/bin/python -m trading_assistant.preflight; then
 fi
 
 mkdir -p logs
+chmod 700 logs
+touch logs/app.log logs/daemon.log
+chmod 600 logs/app.log logs/daemon.log
 echo "== starting app on http://127.0.0.1:8000 =="
 nohup .venv/bin/python -m uvicorn trading_assistant.app.main:create_app \
   --factory --host 127.0.0.1 --port 8000 > logs/app.log 2>&1 &

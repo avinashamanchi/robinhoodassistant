@@ -95,7 +95,9 @@ class LLMConfig(_Strict):
     model: str                                   # anthropic model
     max_tokens: int = Field(gt=0)
     provider: str = "anthropic"                  # anthropic | gemini | groq
-    fallback_provider: Optional[str] = None      # tried if primary errors at call time
+    # Retained as an explicit null-only compatibility field. Bootstrap and the
+    # factory reject non-null values so financial context never crosses vendors.
+    fallback_provider: Optional[str] = None
     gemini_model: str = "gemini-flash-latest"
     groq_model: str = "llama-3.3-70b-versatile"
     request_timeout_seconds: float = Field(default=45.0, gt=0)
@@ -134,16 +136,6 @@ class BacktestConfig(_Strict):
     holdout_months: int = Field(default=12, gt=0)
 
 
-class RobinhoodConfig(_Strict):
-    enabled: bool = False              # OFF by default, like everything dangerous
-    cache_ttl_seconds: float = Field(default=300.0, gt=0)
-    token_path: str = "./.rh_token.pickle"
-
-
-class ExternalAccountsConfig(_Strict):
-    robinhood: RobinhoodConfig = Field(default_factory=RobinhoodConfig)
-
-
 class ScreenerConfig(_Strict):
     universe: list[str] = Field(default_factory=list)  # empty -> use risk allowlist
     top_n: int = Field(default=10, gt=0)
@@ -164,8 +156,6 @@ class AppConfig(_Strict):
     # Phase 7 additions (optional so pre-Phase-7 configs still load).
     crypto_risk: Optional[RiskConfig] = None
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
-    # Read-only external account sources (optional).
-    external_accounts: Optional[ExternalAccountsConfig] = None
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -194,13 +184,6 @@ class Secrets(BaseSettings):
     telegram_chat_id: str = ""
     app_host: str = "127.0.0.1"
     app_port: int = 8000
-    # Robinhood (read-only external source). Never logged (see logging.py).
-    rh_username: str = ""
-    rh_password: str = ""
-    rh_totp_secret: str = ""
-    rh_token_path: str = "./.rh_token.pickle"
-
-
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8)."""
     text = Path(path).read_text(encoding="utf-8")

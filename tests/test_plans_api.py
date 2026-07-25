@@ -159,7 +159,6 @@ def test_planning_startup_internal_failure_is_not_hidden(
         create_app(
             service=make_service(),
             agent=_StubAgent(),
-            planning=None,
             api_token=TOKEN,
         )
 
