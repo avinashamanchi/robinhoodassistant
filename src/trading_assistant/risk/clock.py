@@ -66,9 +66,7 @@ class FakeClock:
         self._open = is_open
         self._next_open = next_open or datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._next_close = next_close or datetime(2026, 1, 1, tzinfo=timezone.utc)
-        self._most_recent_open = most_recent_open or (
-            datetime.now(timezone.utc) - timedelta(days=1)
-        )
+        self._most_recent_open = most_recent_open
 
     def set_open(self, value: bool) -> None:
         self._open = value
@@ -76,7 +74,7 @@ class FakeClock:
     def observe(self, at: datetime) -> MarketClockObservation:
         return MarketClockObservation(
             is_open=self._open,
-            most_recent_open=self._most_recent_open,
+            most_recent_open=self.most_recent_open(at),
         )
 
     def is_open(self, at: datetime | None = None) -> bool:
@@ -89,4 +87,11 @@ class FakeClock:
         return self._next_close
 
     def most_recent_open(self, at: datetime | None = None) -> datetime:
-        return self._most_recent_open
+        if self._most_recent_open is not None:
+            return self._most_recent_open
+        observed_at = at or datetime.now(timezone.utc)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        else:
+            observed_at = observed_at.astimezone(timezone.utc)
+        return observed_at - timedelta(days=1)
