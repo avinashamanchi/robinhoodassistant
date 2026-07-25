@@ -48,6 +48,7 @@ from .db.models import (
     fill_has_trusted_identity,
     utcnow,
 )
+from .dependencies import RequiredDependencyUnavailable
 from .orders.application import (
     ApprovalCommand,
     ApprovalConflict as ApprovalApplicationConflict,
@@ -82,10 +83,6 @@ _EXIT_RESERVATION_STATUSES = (
 _RESUMABLE_RULE_STATES = ("active", "processing")
 
 log = logging.getLogger(__name__)
-
-
-class RequiredDependencyUnavailable(RuntimeError):
-    """A required provider or health input could not be collected safely."""
 
 
 def _require_mutation_context(
@@ -470,13 +467,23 @@ class TradingService:
         except ApprovalApplicationConflict:
             with self.session_factory() as session:
                 current = session.get(Order, order_id)
-                return {
-                    "order_id": order_id,
-                    "status": current.status if current else None,
-                    "executed": False,
-                    "error": "order not in PROPOSED state (already decided?)",
-                }
-        if approval.status is OrderStatus.EXPIRED:
+                if (
+                    current is not None
+                    and current.status
+                    == OrderStatus.APPROVAL_RECORDED.value
+                ):
+                    approval = None
+                else:
+                    return {
+                        "order_id": order_id,
+                        "status": current.status if current else None,
+                        "executed": False,
+                        "error": "order not in PROPOSED state (already decided?)",
+                    }
+        if (
+            approval is not None
+            and approval.status is OrderStatus.EXPIRED
+        ):
             return {
                 "order_id": order_id,
                 "status": OrderStatus.EXPIRED.value,
@@ -491,7 +498,7 @@ class TradingService:
                 reason=reason,
                 request_id=request_id,
             )
-        except Exception:
+        except RequiredDependencyUnavailable:
             self._audit_dependency_failure(
                 actor=actor,
                 reason=reason,
@@ -760,6 +767,23 @@ class TradingService:
             audit_reason=reason,
         )
 
+    @staticmethod
+    def _reset_health_complete(snapshot: PortfolioSnapshot) -> bool:
+        daily_total = (
+            snapshot.realized_pnl_today
+            + snapshot.unrealized_pnl_today
+        )
+        return (
+            snapshot.daily_pnl_complete is True
+            and snapshot.broker_reconciled is True
+            and snapshot.account_complete is True
+            and snapshot.pending_exposure_complete is True
+            and snapshot.quote_fresh is True
+            and daily_total.is_finite()
+            and snapshot.account_equity.is_finite()
+            and snapshot.account_equity > 0
+        )
+
     def reset_killswitch(
         self,
         asset_class: AssetClass | str,
@@ -800,7 +824,7 @@ class TradingService:
             snapshot = self.snapshot_service.assemble_for_execution(
                 probe_symbol
             )
-        except Exception:
+        except RequiredDependencyUnavailable:
             self._audit_dependency_failure(
                 actor=actor,
                 reason=reason,
@@ -815,6 +839,21 @@ class TradingService:
                 },
             )
             raise RequiredDependencyUnavailable from None
+        if not self._reset_health_complete(snapshot):
+            self._audit_dependency_failure(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="circuit_breaker.reset",
+                target_type="circuit_breaker",
+                target_id=BreakerScope.loss(ac).key,
+                detail={
+                    "asset_class": ac.value,
+                    "expected_generation": expected_generation,
+                    "stage": "health_validation",
+                },
+            )
+            raise RequiredDependencyUnavailable
         prior_health = {
             "captured_at": snapshot.as_of.isoformat(),
             "daily_pnl_complete": snapshot.daily_pnl_complete,
@@ -879,7 +918,7 @@ class TradingService:
                     request_id=request_id,
                 )
             )
-        except Exception:
+        except RequiredDependencyUnavailable:
             self._audit_dependency_failure(
                 actor=actor,
                 reason=reason,
@@ -1129,10 +1168,7 @@ class TradingService:
             # Broker I/O is ordered by the process barrier but occurs before
             # any SQLite transaction is opened.
             try:
-                broker_pos = {
-                    p.ticker.upper(): p.qty
-                    for p in self.broker.get_positions()
-                }
+                positions = self.broker.get_positions()
             except Exception:
                 self._audit_dependency_failure(
                     actor=actor,
@@ -1144,6 +1180,10 @@ class TradingService:
                     detail={"stage": "broker_positions"},
                 )
                 raise RequiredDependencyUnavailable from None
+            broker_pos = {
+                position.ticker.upper(): position.qty
+                for position in positions
+            }
             local: dict[str, Decimal] = {}
             with self.session_factory() as session:
                 for fill in session.execute(select(Fill)).scalars().all():
@@ -1267,6 +1307,10 @@ class TradingService:
             return out
 
     def get_positions(self) -> list[dict[str, Any]]:
+        try:
+            positions = self.broker.get_positions()
+        except Exception:
+            raise RequiredDependencyUnavailable from None
         return [
             {
                 "ticker": p.ticker,
@@ -1275,7 +1319,7 @@ class TradingService:
                 "current_price": str(p.current_price),
                 "market_value": str(p.market_value),
             }
-            for p in self.broker.get_positions()
+            for p in positions
         ]
 
     def available_reduce_qty(

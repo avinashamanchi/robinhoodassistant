@@ -27,6 +27,7 @@ from trading_assistant.db.models import (
     Proposal,
     utcnow,
 )
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.orders.submission import OrderSubmissionService
 from trading_assistant.risk.breakers import (
@@ -368,7 +369,7 @@ def test_snapshot_failure_before_claim_leaves_approval_recorded(make_service):
 
     try:
         _submit(svc.order_submission, order_id)
-    except ConnectionError:
+    except RequiredDependencyUnavailable:
         pass
     else:  # pragma: no cover - makes the desired provider failure explicit
         raise AssertionError("snapshot failure should be visible to the caller")
@@ -882,7 +883,7 @@ def test_malformed_position_payload_fails_before_submission_claim(make_service):
         ValueError("invalid Alpaca position quantity")
     )
 
-    with pytest.raises(ValueError, match="invalid Alpaca position"):
+    with pytest.raises(RequiredDependencyUnavailable):
         _submit(service.order_submission, order_id)
 
     assert service.broker.submit_calls == 0

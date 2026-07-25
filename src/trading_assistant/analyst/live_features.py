@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from ..assets import AssetClass
+from ..dependencies import RequiredDependencyUnavailable
 from ..signals.features import build_features
 from ..signals.models import MarketFeatures
 
@@ -49,8 +50,9 @@ def build_screen_source(universe: list[str], secrets):
     from ..backtest.coingecko import CoinGeckoClient
     from ..backtest.data import DataSource, download_alpaca_bars
 
+    requested = set(universe)
     frames = {}
-    for sym in set(universe) | {"SPY"}:
+    for sym in requested | {"SPY"}:
         try:
             if AssetClass.for_symbol(sym) is AssetClass.CRYPTO:
                 frames[sym] = CoinGeckoClient().bars(sym)
@@ -61,4 +63,6 @@ def build_screen_source(universe: list[str], secrets):
                 )
         except Exception:
             continue
+    if not requested.intersection(frames):
+        raise RequiredDependencyUnavailable
     return DataSource(frames)

@@ -32,6 +32,7 @@ from trading_assistant.db.models import (
     RuleGroup,
     utcnow,
 )
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.staleness import (
@@ -1845,19 +1846,18 @@ def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
     session_type = service.session_factory.class_
     event.listen(session_type, "before_flush", listener)
     try:
-        report = service.reconciliation.reconcile(
-            actor="operator:fill-rollback",
-            reason="verify fill audit rollback",
-            request_id="reconcile-fill-audit-rollback",
-        )
+        with pytest.raises(
+            RuntimeError,
+            match="injected fill.reconcile audit failure",
+        ):
+            service.reconciliation.reconcile(
+                actor="operator:fill-rollback",
+                reason="verify fill audit rollback",
+                request_id="reconcile-fill-audit-rollback",
+            )
     finally:
         event.remove(session_type, "before_flush", listener)
 
-    assert report.inserted_fills == 0
-    assert any(
-        "batch not committed" in fault
-        for fault in report.broker_drift
-    )
     with service.session_factory() as session:
         assert session.scalar(
             select(func.count())
@@ -3403,9 +3403,10 @@ def test_indeterminate_cancel_zero_fill_waits_for_successful_activity_read(
     )
     broker.fail_activities = True
 
-    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
-
-    assert any("fill activities unavailable" in item for item in report.broker_drift)
+    with pytest.raises(RequiredDependencyUnavailable):
+        service.reconciliation.reconcile(
+            **_mutation("direct reconciliation")
+        )
     with service.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.acceptance_state == "fill_reconcile_required"
@@ -4072,12 +4073,13 @@ def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
 
     event.listen(session_type, "before_commit", fail_after_flush)
     try:
-        report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
+        with pytest.raises(RuntimeError, match="forced commit failure"):
+            service.reconciliation.reconcile(
+                **_mutation("direct reconciliation")
+            )
     finally:
         event.remove(session_type, "before_commit", fail_after_flush)
 
-    assert report.inserted_fills == 0
-    assert any("batch not committed" in drift for drift in report.broker_drift)
     with service.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(Fill)) == 0
         assert session.scalar(
@@ -4117,9 +4119,10 @@ def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):
         )
 
     broker.fail_activities = True
-    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
-
-    assert any("fill activities" in drift for drift in report.broker_drift)
+    with pytest.raises(RequiredDependencyUnavailable):
+        service.reconciliation.reconcile(
+            **_mutation("direct reconciliation")
+        )
     with service.session_factory() as session:
         after = session.scalar(select(cursor_type).where(cursor_type.stream == "fills"))
         assert (

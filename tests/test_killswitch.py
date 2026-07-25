@@ -32,40 +32,23 @@ def test_trip_persists_across_restart(db_url, engine):
         assert KillSwitch.is_tripped(s) is True
 
 
-@pytest.mark.parametrize("write", ["trip", "reset"])
-def test_compatibility_writes_reject_an_active_caller_transaction(
-    engine,
-    write,
-):
+def test_compatibility_trip_rejects_an_active_caller_transaction(engine):
     factory = make_session_factory(engine)
-    if write == "reset":
-        with factory() as session:
-            KillSwitch.trip(
-                session,
-                reason="seed reset",
-                actor="test:killswitch",
-                request_id="killswitch-seed-reset",
-            )
 
     with factory() as session:
         KillSwitch.is_tripped(session)
         with pytest.raises(RuntimeError, match="active transaction"):
-            if write == "trip":
-                KillSwitch.trip(
-                    session,
-                    reason="unsafe caller",
-                    actor="test:killswitch",
-                    request_id="killswitch-unsafe-trip",
-                )
-            else:
-                KillSwitch.reset(
-                    session,
-                    actor="test:killswitch",
-                    request_id="killswitch-unsafe-reset",
-                )
+            KillSwitch.trip(
+                session,
+                reason="unsafe caller",
+                actor="test:killswitch",
+                request_id="killswitch-unsafe-trip",
+            )
 
 
-def test_reset_unblocks(engine):
+def test_compatibility_reset_is_explicitly_disabled_and_stays_tripped(
+    engine,
+):
     factory = make_session_factory(engine)
     with factory() as s:
         KillSwitch.trip(
@@ -76,14 +59,18 @@ def test_reset_unblocks(engine):
         )
         s.commit()
     with factory() as s:
-        KillSwitch.reset(
-            s,
-            actor="test:killswitch",
-            request_id="killswitch-reset",
-        )
-        s.commit()
+        with pytest.raises(
+            RuntimeError,
+            match="compatibility reset is unavailable",
+        ) as raised:
+            KillSwitch.reset(
+                s,
+                actor="test:killswitch",
+                request_id="killswitch-reset",
+            )
+        assert type(raised.value).__name__ == "KillSwitchResetUnavailable"
     with factory() as s:
-        assert KillSwitch.is_tripped(s) is False
+        assert KillSwitch.is_tripped(s) is True
 
 
 def test_daily_loss_from_fills_trips_switch(engine):

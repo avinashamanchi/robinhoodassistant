@@ -35,6 +35,10 @@ from trading_assistant.db.models import (
     fill_has_trusted_identity,
     fill_requires_reconciliation,
 )
+from trading_assistant.dependencies import (
+    RequiredDependencyUnavailable,
+    RequiredQuoteUnavailable,
+)
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
 from trading_assistant.risk.staleness import is_stale
@@ -89,14 +93,22 @@ class PortfolioSnapshotService:
             wanted,
             market_open,
             boundary,
-        ) = self._provider_values([ticker], asset_class)
+        ) = self._provider_values(
+            [ticker],
+            asset_class,
+            required_dependencies=True,
+        )
 
         with self.session_factory() as discovery_session:
             pending_symbols, discovery_complete = self._pending_symbols(
                 discovery_session, exclude_order_id
             )
         wanted.update(pending_symbols)
-        self._fetch_missing_quotes(quotes, wanted)
+        self._fetch_missing_quotes(
+            quotes,
+            wanted,
+            required=True,
+        )
 
         captured_at = self._captured_at()
         high_water_mark = self._account_high_water_mark(
@@ -107,7 +119,7 @@ class PortfolioSnapshotService:
             for state in self.breakers.active_for_symbol(ticker)
         )
         with self.session_factory() as session:
-            return self._assemble_local(
+            snapshot = self._assemble_local(
                 session,
                 ticker=ticker,
                 asset_class=asset_class,
@@ -125,6 +137,9 @@ class PortfolioSnapshotService:
                 active_breakers=active_breakers,
                 discovery_complete=discovery_complete,
             )
+        if not snapshot.quote_fresh:
+            raise RequiredQuoteUnavailable
+        return snapshot
 
     def assemble(
         self,
@@ -188,6 +203,7 @@ class PortfolioSnapshotService:
         asset_class: AssetClass,
         *,
         quote_overrides: dict[str, object] | None = None,
+        required_dependencies: bool = False,
     ) -> tuple[
         Account,
         list[Position],
@@ -198,10 +214,18 @@ class PortfolioSnapshotService:
         bool,
         datetime,
     ]:
-        account = self.broker.get_account()
-        positions = self.broker.get_positions()
-        if any(not position.risk_values_valid for position in positions):
-            raise ValueError("invalid broker position payload")
+        try:
+            account = self.broker.get_account()
+            positions = self.broker.get_positions()
+            if any(
+                not position.risk_values_valid
+                for position in positions
+            ):
+                raise ValueError("invalid broker position payload")
+        except Exception:
+            if required_dependencies:
+                raise RequiredDependencyUnavailable from None
+            raise
         positions, position_exposure_complete = self._canonical_positions(
             positions,
             tickers,
@@ -218,7 +242,11 @@ class PortfolioSnapshotService:
             {ticker.upper() for ticker in tickers}
             | {position.ticker.upper() for position in positions}
         )
-        self._fetch_missing_quotes(quotes, wanted)
+        self._fetch_missing_quotes(
+            quotes,
+            wanted,
+            required=required_dependencies,
+        )
         return (
             account,
             positions,
@@ -282,7 +310,11 @@ class PortfolioSnapshotService:
         return canonical_positions, complete
 
     def _fetch_missing_quotes(
-        self, quotes: dict[str, Quote], wanted: set[str]
+        self,
+        quotes: dict[str, Quote],
+        wanted: set[str],
+        *,
+        required: bool = False,
     ) -> None:
         for symbol in sorted(wanted):
             if symbol in quotes:
@@ -290,6 +322,8 @@ class PortfolioSnapshotService:
             try:
                 quotes[symbol] = self.broker.get_quote(symbol)
             except Exception:
+                if required:
+                    raise RequiredQuoteUnavailable from None
                 continue
 
     @staticmethod

@@ -18,6 +18,7 @@ from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import AuditEvent
+from trading_assistant.service import RequiredDependencyUnavailable
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -194,10 +195,8 @@ def test_screen_dependency_outage_returns_hardened_503(
     from trading_assistant.analyst import screener
 
     authenticated, _ = client
-    marker = "provider-secret-screen-source"
-
     def fail_screen(*args, **kwargs):
-        raise ConnectionError(marker)
+        raise RequiredDependencyUnavailable
 
     monkeypatch.setattr(screener, "screen_source", fail_screen)
     isolated, csrf = authenticate_client(
@@ -218,6 +217,62 @@ def test_screen_dependency_outage_returns_hardened_503(
         "error": {
             "code": "dependency_unavailable",
             "message": "Required dependency is unavailable",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/screen", None),
+        (
+            "/propose",
+            {
+                "n": 1,
+                "reason": "screen internal failure probe",
+            },
+        ),
+    ],
+)
+def test_screen_internal_failure_remains_hardened_500(
+    client,
+    authenticate_client,
+    monkeypatch,
+    path,
+    body,
+):
+    from trading_assistant.analyst import screener
+
+    authenticated, _ = client
+    marker = "internal-screen-invariant"
+
+    def fail_screen(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(screener, "screen_source", fail_screen)
+    isolated, csrf = authenticate_client(
+        TestClient(
+            authenticated.app,
+            raise_server_exceptions=False,
+        ),
+        TOKEN,
+    )
+    response = isolated.post(
+        path,
+        json=body,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
             "request_id": response.headers["X-Request-ID"],
         }
     }

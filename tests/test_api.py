@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +15,7 @@ from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import OrderStatus
+from trading_assistant.broker.models import BrokerFill, OrderStatus, Quote
 from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
@@ -97,6 +98,21 @@ def _assert_dependency_unavailable(response):
         "error": {
             "code": "dependency_unavailable",
             "message": "Required dependency is unavailable",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+
+
+def _assert_internal_error(response):
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
             "request_id": response.headers["X-Request-ID"],
         }
     }
@@ -308,22 +324,142 @@ def test_required_broker_read_outage_returns_hardened_503(
     assert marker not in response.text
 
 
-def test_approval_health_outage_returns_audited_hardened_503(
+@pytest.mark.parametrize(
+    ("path", "method_name"),
+    [
+        ("/positions", "get_positions"),
+        ("/holdings", "get_combined_holdings"),
+    ],
+)
+def test_required_read_internal_failure_remains_hardened_500(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    path,
+    method_name,
+):
+    service = make_service()
+    marker = f"internal-{method_name}-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(service, method_name, fail_internal)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(path)
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+
+
+def test_approval_quote_outage_preserves_outbox_and_retries_safely(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "provider-secret-approval-health"
+    original_get_quote = service.broker.get_quote
+    quote_available = False
+
+    def intermittent_quote(ticker):
+        if not quote_available:
+            raise ConnectionError(marker)
+        return original_get_quote(ticker)
+
+    service.broker.get_quote = intermittent_quote
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    unavailable = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "human reviewed before dependency outage"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(unavailable)
+    assert marker not in unavailable.text
+    assert service.broker.submit_calls == 0
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        failure = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=unavailable.headers["X-Request-ID"],
+        ).one()
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert approval_count == 1
+    assert (
+        failure.actor,
+        failure.reason,
+        failure.result_code,
+        failure.target_id,
+    ) == (
+        "operator:local",
+        "human reviewed before dependency outage",
+        "dependency_unavailable",
+        str(order_id),
+    )
+    assert marker not in failure.detail_json
+    assert "ConnectionError" not in failure.detail_json
+
+    quote_available = True
+    retried = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "retry approved outbox after quote recovery"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == OrderStatus.SUBMITTED.value
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+    assert order.status == OrderStatus.SUBMITTED.value
+    assert approval_count == 1
+
+
+def test_approval_internal_failure_is_hardened_500_without_dependency_audit(
     make_service,
     authenticate_client,
     monkeypatch,
 ):
     service = make_service()
     order_id = _propose(service)
-    marker = "provider-secret-approval-health"
+    marker = "internal-order-submission-invariant"
 
-    def fail_health(*args, **kwargs):
-        raise ConnectionError(marker)
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
 
     monkeypatch.setattr(
-        service.order_submission.snapshot_service,
-        "assemble_for_execution",
-        fail_health,
+        service.order_submission,
+        "submit",
+        fail_internal,
     )
     app = create_app(
         service=service,
@@ -338,33 +474,21 @@ def test_approval_health_outage_returns_audited_hardened_503(
 
     response = client.post(
         f"/approve/{order_id}",
-        json={"reason": "human reviewed before dependency outage"},
+        json={"reason": "approval internal failure probe"},
         headers={"X-CSRF-Token": csrf},
     )
 
-    _assert_dependency_unavailable(response)
+    _assert_internal_error(response)
     assert marker not in response.text
-    assert service.broker.submit_calls == 0
     with service.session_factory() as session:
         order = session.get(Order, order_id)
-        failure = session.query(AuditEvent).filter_by(
+        dependency_audits = session.query(AuditEvent).filter_by(
             action="order.submit",
             request_id=response.headers["X-Request-ID"],
-        ).one()
+            result_code="dependency_unavailable",
+        ).count()
     assert order.status == OrderStatus.APPROVAL_RECORDED.value
-    assert (
-        failure.actor,
-        failure.reason,
-        failure.result_code,
-        failure.target_id,
-    ) == (
-        "operator:local",
-        "human reviewed before dependency outage",
-        "dependency_unavailable",
-        str(order_id),
-    )
-    assert marker not in failure.detail_json
-    assert "ConnectionError" not in failure.detail_json
+    assert dependency_audits == 0
 
 
 def test_killswitch_reset_endpoint(client):
@@ -447,12 +571,16 @@ def test_killswitch_reset_returns_conflict_for_stale_generation(client):
     assert svc.breakers.is_tripped(
         BreakerScope.loss(AssetClass.EQUITY)
     ) is True
+    current = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
+    assert current is not None
+    assert current.generation == retripped.generation
 
 
-def test_killswitch_reset_dependency_outage_is_audited_hardened_503(
+@pytest.mark.parametrize("quote_failure", ["unavailable", "stale"])
+def test_killswitch_reset_quote_failure_is_audited_hardened_503(
     make_service,
     authenticate_client,
-    monkeypatch,
+    quote_failure,
 ):
     service = make_service()
     observed = service.breakers.trip(
@@ -462,15 +590,21 @@ def test_killswitch_reset_dependency_outage_is_audited_hardened_503(
         request_id="dependency-reset-setup",
     )
     marker = "provider-secret-reset-health"
+    original_get_quote = service.broker.get_quote
 
-    def fail_health(*args, **kwargs):
-        raise ConnectionError(marker)
+    def fail_quote(ticker):
+        if quote_failure == "unavailable":
+            raise ConnectionError(marker)
+        current = original_get_quote(ticker)
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        return replace(
+            current,
+            as_of=stale_at,
+            book_as_of=stale_at,
+            trade_as_of=stale_at,
+        )
 
-    monkeypatch.setattr(
-        service.snapshot_service,
-        "assemble_for_execution",
-        fail_health,
-    )
+    service.broker.get_quote = fail_quote
     app = create_app(
         service=service,
         agent=StubAgent(),
@@ -516,6 +650,134 @@ def test_killswitch_reset_dependency_outage_is_audited_hardened_503(
     assert marker not in audit.detail_json
     assert "ConnectionError" not in audit.detail_json
 
+
+@pytest.mark.parametrize(
+    "incomplete_field",
+    [
+        "daily_pnl_complete",
+        "broker_reconciled",
+        "account_complete",
+        "pending_exposure_complete",
+        "quote_fresh",
+    ],
+)
+def test_killswitch_reset_rejects_every_incomplete_health_field(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    incomplete_field,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="incomplete health setup",
+        actor="daemon:test",
+        request_id=f"incomplete-reset-setup-{incomplete_field}",
+    )
+    complete = service.snapshot_service.assemble_for_execution("AAPL")
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_execution",
+        lambda *_args, **_kwargs: replace(
+            complete,
+            **{incomplete_field: False},
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": f"reject incomplete {incomplete_field}",
+            "expected_generation": observed.generation,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+    assert audit.reason == f"reject incomplete {incomplete_field}"
+
+
+def test_reset_snapshot_internal_failure_is_500_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="internal reset setup",
+        actor="daemon:test",
+        request_id="internal-reset-setup",
+    )
+    marker = "internal-reset-snapshot-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_execution",
+        fail_internal,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "reset internal failure probe",
+            "expected_generation": observed.generation,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
 
 def test_unexpected_mutation_exception_remains_hardened_internal_error(
     make_service,
@@ -1010,19 +1272,14 @@ def test_sync_requires_reason_and_audits_operator_identity(client):
 def test_sync_dependency_outage_is_audited_hardened_503(
     make_service,
     authenticate_client,
-    monkeypatch,
 ):
-    service = make_service()
     marker = "provider-secret-order-sync"
 
-    def fail_sync(*args, **kwargs):
-        raise ConnectionError(marker)
+    class FillActivityOutageBroker(MockBroker):
+        def get_fill_activities(self, *, after=None):
+            raise ConnectionError(marker)
 
-    monkeypatch.setattr(
-        service.reconciliation,
-        "reconcile",
-        fail_sync,
-    )
+    service = make_service(broker=FillActivityOutageBroker())
     app = create_app(
         service=service,
         agent=StubAgent(),
@@ -1060,6 +1317,120 @@ def test_sync_dependency_outage_is_audited_hardened_503(
     )
     assert marker not in audit.detail_json
     assert "ConnectionError" not in audit.detail_json
+
+
+def test_sync_cursor_conflict_is_stable_409_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    class FillActivityBroker(MockBroker):
+        activity = None
+
+        def get_fill_activities(self, *, after=None):
+            return [] if self.activity is None else [self.activity]
+
+    broker = FillActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _propose(service)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    approved = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "approve cursor conflict probe"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert approved.status_code == 200
+    broker.activity = BrokerFill(
+        broker_fill_id="cursor-conflict-fill",
+        broker_order_id=approved.json()["broker_order_id"],
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=utcnow(),
+    )
+    monkeypatch.setattr(
+        service.reconciliation,
+        "_cursor_snapshot",
+        lambda: (None, None, 99),
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "cursor conflict probe"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "reconciliation_conflict",
+            "message": "Reconciliation state changed; retry with fresh state",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
+
+
+def test_sync_internal_failure_is_hardened_500_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    marker = "internal-reconciliation-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        service.reconciliation,
+        "reconcile",
+        fail_internal,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "sync internal failure probe"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
 
 
 def test_sync_sanitizes_provider_integrity_text_everywhere(

@@ -20,6 +20,10 @@ from trading_assistant.broker.models import (
     Quote,
 )
 from trading_assistant.db.models import AccountRiskState, Fill, Order, utcnow
+from trading_assistant.dependencies import (
+    RequiredDependencyUnavailable,
+    RequiredQuoteUnavailable,
+)
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import RiskEngine
@@ -78,6 +82,34 @@ def _quote_with_component_times(
         book_as_of=book_as_of,
         trade_as_of=trade_as_of,
     )
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "stale"])
+def test_required_execution_quote_failure_raises_typed_dependency(
+    make_service,
+    failure,
+):
+    service = make_service()
+    if failure == "unavailable":
+        service.broker.get_quote = lambda _ticker: (_ for _ in ()).throw(
+            ConnectionError("provider quote unavailable")
+        )
+    else:
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        service.broker.get_quote = lambda _ticker: Quote(
+            "AAPL",
+            Decimal("99.90"),
+            Decimal("100.10"),
+            Decimal("100"),
+            as_of=stale_at,
+            book_as_of=stale_at,
+            trade_as_of=stale_at,
+        )
+
+    with pytest.raises(RequiredQuoteUnavailable) as raised:
+        service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert type(raised.value).__name__ == "RequiredQuoteUnavailable"
 
 
 def _pending(
@@ -451,15 +483,13 @@ def test_snapshot_marks_stale_quote(make_service):
     )
     service.broker.get_quote = lambda _ticker: stale
 
-    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
-
-    assert snapshot.quote_fresh is False
+    with pytest.raises(RequiredQuoteUnavailable):
+        service.snapshot_service.assemble_for_execution("AAPL")
 
 
 @pytest.mark.parametrize("missing_component", ["book", "trade"])
 def test_snapshot_rejects_missing_component_timestamp(
     make_service,
-    risk_config,
     missing_component,
 ):
     service = make_service()
@@ -470,17 +500,13 @@ def test_snapshot_rejects_missing_component_timestamp(
     )
     service.broker.get_quote = lambda _ticker: quote
 
-    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
-    result = RiskEngine(risk_config).check(order(), snapshot)
-
-    assert snapshot.quote_fresh is False
-    assert "quote is stale" in result.reasons
+    with pytest.raises(RequiredQuoteUnavailable):
+        service.snapshot_service.assemble_for_execution("AAPL")
 
 
 @pytest.mark.parametrize("stale_component", ["book", "trade"])
 def test_snapshot_rejects_stale_component_when_other_component_is_fresh(
     make_service,
-    risk_config,
     stale_component,
 ):
     service = make_service()
@@ -492,17 +518,13 @@ def test_snapshot_rejects_stale_component_when_other_component_is_fresh(
     )
     service.broker.get_quote = lambda _ticker: quote
 
-    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
-    result = RiskEngine(risk_config).check(order(), snapshot)
-
-    assert snapshot.quote_fresh is False
-    assert "quote is stale" in result.reasons
+    with pytest.raises(RequiredQuoteUnavailable):
+        service.snapshot_service.assemble_for_execution("AAPL")
 
 
 @pytest.mark.parametrize("future_component", ["book", "trade"])
 def test_snapshot_rejects_unreasonably_future_component_timestamp(
     make_service,
-    risk_config,
     future_component,
 ):
     service = make_service()
@@ -514,11 +536,8 @@ def test_snapshot_rejects_unreasonably_future_component_timestamp(
     )
     service.broker.get_quote = lambda _ticker: quote
 
-    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
-    result = RiskEngine(risk_config).check(order(), snapshot)
-
-    assert snapshot.quote_fresh is False
-    assert "quote is stale" in result.reasons
+    with pytest.raises(RequiredQuoteUnavailable):
+        service.snapshot_service.assemble_for_execution("AAPL")
 
 
 @pytest.mark.parametrize(
@@ -531,7 +550,6 @@ def test_snapshot_rejects_unreasonably_future_component_timestamp(
 )
 def test_snapshot_rejects_zero_price_component(
     make_service,
-    risk_config,
     bid,
     ask,
     last,
@@ -541,11 +559,8 @@ def test_snapshot_rejects_zero_price_component(
     quote = _quote_with_component_times(bid=bid, ask=ask, last=last)
     service.broker.get_quote = lambda _ticker: quote
 
-    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
-    result = RiskEngine(risk_config).check(order(), snapshot)
-
-    assert snapshot.quote_fresh is False
-    assert result.rejected
+    with pytest.raises(RequiredQuoteUnavailable):
+        service.snapshot_service.assemble_for_execution("AAPL")
 
 
 def test_unrelated_stale_quote_override_does_not_stale_target_snapshot(
@@ -758,7 +773,7 @@ def test_snapshot_rejects_malformed_position_values(
     broker = MalformedPositionBroker()
     broker.set_price("AAPL", Decimal("100"))
 
-    with pytest.raises(ValueError, match="invalid broker position"):
+    with pytest.raises(RequiredDependencyUnavailable):
         make_service(broker=broker).snapshot_service.assemble_for_execution(
             "AAPL"
         )

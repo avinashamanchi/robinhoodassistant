@@ -5,12 +5,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from trading_assistant.app.main import create_app
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import Fill, Order
+from trading_assistant.db.models import AuditEvent, Fill, Order
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 
 
 class _StubAgent:
@@ -233,7 +235,9 @@ def test_sync_ingests_fills_and_advances_status(make_service):
     assert _sync(svc)["synced"] == 0
 
 
-def test_sync_reports_broker_status_failures(make_service):
+def test_sync_surfaces_broker_status_outage_with_exact_failure_audit(
+    make_service,
+):
     from trading_assistant.broker.mock import MockBroker
 
     class StatusFailureBroker(MockBroker):
@@ -257,10 +261,17 @@ def test_sync_reports_broker_status_failures(make_service):
     _approve(svc, oid)
     broker.fail_status = True
 
-    result = _sync(svc)
+    with pytest.raises(RequiredDependencyUnavailable):
+        _sync(svc)
 
-    assert result["failed"] == 1
-    assert result["synced"] == 0
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id="launch-test-sync",
+            result_code="dependency_unavailable",
+        ).one()
+    assert audit.actor == "operator:test"
+    assert audit.reason == "launch test broker reconciliation"
 
 
 def test_sync_reports_submitted_outbox_without_broker_id(make_service):

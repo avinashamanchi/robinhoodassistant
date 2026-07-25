@@ -11,7 +11,6 @@ from ..assets import AssetClass
 from ..db.models import CircuitBreakerState, RiskEvent
 from .breakers import (
     BreakerScope,
-    reset_in_session,
     trip_in_session,
 )
 from .submission_barrier import SubmissionBarrier
@@ -31,6 +30,10 @@ def _require_barrier_before_transaction(session: Session) -> None:
             "compatibility breaker writes reject an active transaction; "
             "use a fresh session so the process barrier is acquired first"
         )
+
+
+class KillSwitchResetUnavailable(RuntimeError):
+    """Legacy reset is disabled because it cannot collect server health."""
 
 
 class KillSwitch:
@@ -94,34 +97,10 @@ class KillSwitch:
         actor: str,
         request_id: str,
     ) -> None:
-        scope = _scope(asset_class)
-        _require_barrier_before_transaction(session)
-        with SubmissionBarrier(session).hold_writer():
-            try:
-                row = session.get(CircuitBreakerState, scope.key)
-                if row is None:
-                    raise ValueError(
-                        "cannot reset a breaker that has not been tripped"
-                    )
-                reset_in_session(
-                    session,
-                    scope,
-                    actor,
-                    note,
-                    {"compatibility_facade": True},
-                    expected_generation=row.generation,
-                    request_id=request_id,
-                )
-                session.add(
-                    RiskEvent(
-                        event_type="killswitch_reset",
-                        reason=f"[{scope.key}] {note}",
-                    )
-                )
-                session.commit()
-            except BaseException:
-                session.rollback()
-                raise
+        raise KillSwitchResetUnavailable(
+            "compatibility reset is unavailable; "
+            "use TradingService.reset_killswitch"
+        )
 
     @staticmethod
     def evaluate_daily_loss(

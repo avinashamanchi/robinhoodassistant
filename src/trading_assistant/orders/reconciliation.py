@@ -40,6 +40,7 @@ from trading_assistant.db.models import (
     fill_has_trusted_identity,
     fill_requires_reconciliation,
 )
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.risk.breakers import (
     BreakerScope,
     BreakerService,
@@ -76,6 +77,10 @@ _LOCAL_TERMINAL_STATUSES = {
     OrderStatus.REJECTED.value,
     OrderStatus.EXPIRED.value,
 }
+
+
+class ReconciliationConflict(RuntimeError):
+    """Reconciliation state changed after the caller's observation."""
 
 
 def _require_context(
@@ -368,8 +373,7 @@ class ReconciliationService:
                 unresolved.append(order_id)
                 continue
             except Exception:
-                unresolved.append(order_id)
-                continue
+                raise RequiredDependencyUnavailable from None
             if remote is None:
                 unresolved.append(order_id)
                 continue
@@ -803,8 +807,7 @@ class ReconciliationService:
             drift.append("broker fill activity identity invalid")
             return 0, frozenset(blocked_order_ids), False
         except Exception:
-            drift.append("broker fill activities unavailable")
-            return 0, frozenset(), False
+            raise RequiredDependencyUnavailable from None
 
         observed_at = datetime.now(timezone.utc)
         # Activity IDs are opaque, not chronological. The broker query overlaps
@@ -978,10 +981,12 @@ class ReconciliationService:
                             expected_version=expected_version,
                         )
                 _commit_reconciliation_mutations(session, actor, reason, request_id)
+            except ReconciliationConflict:
+                session.rollback()
+                raise
             except Exception:
                 session.rollback()
-                drift.append("fill activity batch not committed")
-                return 0, frozenset(blocked_order_ids), False
+                raise
         return (
             inserted,
             frozenset(blocked_order_ids),
@@ -1143,7 +1148,7 @@ class ReconciliationService:
         )
         if cursor is None:
             if expected_version is not None:
-                raise RuntimeError("reconciliation cursor changed concurrently")
+                raise ReconciliationConflict
             session.add(
                 ReconciliationCursor(
                     broker=self.broker_key,
@@ -1155,7 +1160,7 @@ class ReconciliationService:
             )
             return
         if cursor.version != expected_version:
-            raise RuntimeError("reconciliation cursor changed concurrently")
+            raise ReconciliationConflict
         cursor.last_activity_id = activity.broker_fill_id
         cursor.last_activity_at = activity.filled_at
         cursor.version += 1
@@ -1220,9 +1225,7 @@ class ReconciliationService:
                     f"local order {order_id} has invalid broker fill payload"
                 )
             except Exception:
-                drift.append(
-                    f"broker status unavailable for local order {order_id}"
-                )
+                raise RequiredDependencyUnavailable from None
 
         inserted = 0
         exact_reader = callable(getattr(self.broker, "get_fill_activities", None))
@@ -1566,8 +1569,7 @@ class ReconciliationService:
             drift.append("invalid broker open-order payload")
             return
         except Exception:
-            drift.append("broker open-order enumeration unavailable")
-            return
+            raise RequiredDependencyUnavailable from None
         for remote in remote_open:
             if not valid_cumulative_filled_qty(remote.filled_qty):
                 self._latch_broker_order_id(

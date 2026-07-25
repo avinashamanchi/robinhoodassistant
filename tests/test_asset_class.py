@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from trading_assistant.assets import AssetClass, broker_symbol_matches_local
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.clock import CryptoClock, FakeClock
@@ -70,7 +72,7 @@ def test_crypto_trip_does_not_touch_equity(engine):
         assert KillSwitch.is_tripped(s, EQ) is False
 
 
-def test_reset_is_per_class(engine):
+def test_compatibility_reset_cannot_clear_either_asset_class(engine):
     f = make_session_factory(engine)
     with f() as s:
         KillSwitch.trip(
@@ -89,16 +91,19 @@ def test_reset_is_per_class(engine):
         )
         s.commit()
     with f() as s:
-        KillSwitch.reset(
-            s,
-            asset_class=EQ,
-            actor="test:asset-class",
-            request_id="asset-equity-reset",
-        )
-        s.commit()
+        with pytest.raises(
+            RuntimeError,
+            match="compatibility reset is unavailable",
+        ):
+            KillSwitch.reset(
+                s,
+                asset_class=EQ,
+                actor="test:asset-class",
+                request_id="asset-equity-reset",
+            )
     with f() as s:
-        assert KillSwitch.is_tripped(s, EQ) is False
-        assert KillSwitch.is_tripped(s, CR) is True  # crypto stays tripped
+        assert KillSwitch.is_tripped(s, EQ) is True
+        assert KillSwitch.is_tripped(s, CR) is True
 
 
 def test_default_asset_class_is_equity(engine):

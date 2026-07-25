@@ -24,8 +24,10 @@ from ..broker.models import OrderStatus
 from ..config import Secrets, load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine, make_session_factory
+from ..dependencies import RequiredDependencyUnavailable
+from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
-from ..service import RequiredDependencyUnavailable, TradingService
+from ..service import TradingService
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
 from .errors import ApiError
@@ -398,7 +400,7 @@ def create_app(
     ):
         try:
             return {"positions": service.get_positions()}
-        except Exception:
+        except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 
     @app.get("/log")
@@ -439,12 +441,19 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
-        result = service.cancel_live_order(
-            order_id,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
-        )
+        try:
+            result = service.cancel_live_order(
+                order_id,
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
+        except ReconciliationConflict:
+            raise ApiError(
+                "reconciliation_conflict",
+                409,
+                "Reconciliation state changed; retry with fresh state",
+            ) from None
         if result.get("error") == "not found":
             raise ApiError("order_not_found", 404, "Order not found")
         if "error" in result:
@@ -482,6 +491,12 @@ def create_app(
                 reason=body.reason,
                 request_id=request.state.request_id,
             )
+        except ReconciliationConflict:
+            raise ApiError(
+                "reconciliation_conflict",
+                409,
+                "Reconciliation state changed; retry with fresh state",
+            ) from None
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 
@@ -639,7 +654,7 @@ def create_app(
                     [s.upper() for s in universe],
                     sec,
                 )
-            except Exception:
+            except RequiredDependencyUnavailable:
                 raise _dependency_unavailable() from None
         try:
             return screener.screen_source(
@@ -650,7 +665,7 @@ def create_app(
             )
         except ApiError:
             raise
-        except Exception:
+        except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 
     @app.post("/screen")
@@ -710,7 +725,7 @@ def create_app(
         """Combined Alpaca + external holdings, labeled by source (read-only external)."""
         try:
             return service.get_combined_holdings()
-        except Exception:
+        except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 
     @app.get("/external/positions")
