@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event
 
 import trading_assistant.orders.snapshot as snapshot_module
 from trading_assistant.assets import AssetClass
+from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     Account,
@@ -52,6 +54,51 @@ class _FailingProviderClock:
 
     def next_close(self, at=None):  # pragma: no cover - contract guard
         raise AssertionError("snapshot must not request the next market close")
+
+
+class _ObservedClock:
+    def __init__(self, boundary: datetime) -> None:
+        self.boundary = boundary
+        self.observations: list[tuple[str, datetime | None]] = []
+
+    def is_open(self, at=None):
+        self.observations.append(("is_open", at))
+        return True
+
+    def most_recent_open(self, at=None):
+        self.observations.append(("most_recent_open", at))
+        return self.boundary
+
+    def next_open(self, at=None):  # pragma: no cover - contract guard
+        raise AssertionError("snapshot must not request the next market open")
+
+    def next_close(self, at=None):  # pragma: no cover - contract guard
+        raise AssertionError("snapshot must not request the next market close")
+
+
+def _seed_realized_loss(service) -> None:
+    with service.session_factory() as session:
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("100"),
+                    price=Decimal("100"),
+                    broker_fill_id="clock-loss-open",
+                    filled_at=NOW - timedelta(hours=2),
+                ),
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("100"),
+                    price=Decimal("50"),
+                    broker_fill_id="clock-loss-close",
+                    filled_at=NOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
 
 
 def _submit(submission, order_id):
@@ -173,6 +220,206 @@ def test_market_clock_provider_failure_is_typed_when_required_and_explicitly_inc
     assert "market clock snapshot is incomplete" in result.reasons
     assert marker not in result.reason_text()
     assert marker not in caplog.text
+
+
+def test_snapshot_captures_one_observation_before_provider_io_and_passes_it_to_clock(
+    make_service,
+):
+    events: list[str] = []
+    service = make_service(quote_now=lambda: NOW)
+    original_account = service.broker.get_account
+    original_positions = service.broker.get_positions
+    original_quote = service.broker.get_quote
+    clock = _ObservedClock(NOW - timedelta(hours=3))
+    now_calls = 0
+
+    def observed_now():
+        nonlocal now_calls
+        now_calls += 1
+        events.append("observation")
+        return NOW
+
+    def observed_account():
+        events.append("account")
+        return original_account()
+
+    def observed_positions():
+        events.append("positions")
+        return original_positions()
+
+    def observed_quote(ticker):
+        events.append("quote")
+        return original_quote(ticker)
+
+    service.snapshot_service.now = observed_now
+    service.broker.get_account = observed_account
+    service.broker.get_positions = observed_positions
+    service.broker.get_quote = observed_quote
+    service._clocks[AssetClass.EQUITY] = clock
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert now_calls == 1
+    assert events[0] == "observation"
+    assert snapshot.as_of == NOW
+    assert clock.observations == [
+        ("is_open", NOW),
+        ("most_recent_open", NOW),
+    ]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        NOW + timedelta(microseconds=1),
+        NOW - timedelta(days=16),
+    ],
+    ids=["future", "implausibly-stale"],
+)
+def test_required_snapshot_rejects_invalid_market_boundary_from_single_observation(
+    make_service,
+    boundary,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = _ObservedClock(boundary)
+    _seed_realized_loss(service)
+
+    with pytest.raises(RequiredDependencyUnavailable) as raised:
+        service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert str(raised.value) == "required dependency unavailable"
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        NOW + timedelta(microseconds=1),
+        NOW - timedelta(days=16),
+    ],
+    ids=["future", "implausibly-stale"],
+)
+def test_optional_snapshot_never_computes_pnl_from_invalid_market_boundary(
+    make_service,
+    risk_config,
+    monkeypatch,
+    boundary,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = _ObservedClock(boundary)
+    _seed_realized_loss(service)
+    calls: list[datetime | None] = []
+    original = snapshot_module.realized_pnl_today
+
+    def observe_pnl(*args, **kwargs):
+        calls.append(kwargs.get("boundary"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        snapshot_module,
+        "realized_pnl_today",
+        observe_pnl,
+    )
+    with service.session_factory() as session:
+        snapshot = service.assemble_snapshot(
+            session,
+            ["AAPL"],
+            required_dependencies=False,
+        )
+
+    assert calls == []
+    assert snapshot.market_clock_complete is False
+    assert snapshot.daily_pnl_complete is False
+    assert snapshot.market_open is False
+    assert snapshot.realized_pnl_today == Decimal(0)
+    result = RiskEngine(risk_config).check(order(), snapshot)
+    assert result.rejected is True
+    assert "market clock snapshot is incomplete" in result.reasons
+    assert "daily P&L snapshot is incomplete" in result.reasons
+
+
+def test_correct_past_market_boundary_includes_large_loss_and_rejects_risk(
+    make_service,
+    risk_config,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = _ObservedClock(
+        NOW - timedelta(hours=3)
+    )
+    _seed_realized_loss(service)
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+    result = RiskEngine(risk_config).check(order(), snapshot)
+
+    assert snapshot.market_clock_complete is True
+    assert snapshot.daily_pnl_complete is True
+    assert snapshot.realized_pnl_today == Decimal("-5000")
+    assert result.rejected is True
+    assert "daily total-loss limit reached" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "raw_is_open",
+    ["false", 0, 1, None],
+    ids=["string-false", "integer-zero", "integer-one", "none"],
+)
+def test_invalid_alpaca_market_state_is_required_dependency_failure(
+    make_service,
+    raw_is_open,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = AlpacaClock(
+        SimpleNamespace(
+            get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+            get_calendar=lambda _request: [
+                SimpleNamespace(open=NOW - timedelta(hours=3))
+            ],
+        )
+    )
+
+    with pytest.raises(RequiredDependencyUnavailable) as raised:
+        service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert str(raised.value) == "required dependency unavailable"
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "raw_is_open",
+    ["false", 0, 1, None],
+    ids=["string-false", "integer-zero", "integer-one", "none"],
+)
+def test_invalid_alpaca_market_state_is_explicitly_incomplete_when_optional(
+    make_service,
+    risk_config,
+    raw_is_open,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = AlpacaClock(
+        SimpleNamespace(
+            get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+            get_calendar=lambda _request: [
+                SimpleNamespace(open=NOW - timedelta(hours=3))
+            ],
+        )
+    )
+
+    with service.session_factory() as session:
+        snapshot = service.assemble_snapshot(
+            session,
+            ["AAPL"],
+            required_dependencies=False,
+        )
+
+    assert snapshot.market_clock_complete is False
+    assert snapshot.daily_pnl_complete is False
+    assert snapshot.market_open is False
+    assert RiskEngine(risk_config).check(order(), snapshot).rejected is True
 
 
 def _pending(

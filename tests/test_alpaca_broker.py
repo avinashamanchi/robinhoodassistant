@@ -1047,6 +1047,30 @@ def test_alpaca_clock_maps():
     assert clock.next_close() == "2026-01-02T16:00"
 
 
+@pytest.mark.parametrize(
+    "raw_is_open",
+    ["false", 0, 1, None],
+    ids=["string-false", "integer-zero", "integer-one", "none"],
+)
+def test_alpaca_clock_rejects_non_boolean_market_state_without_provider_detail(
+    raw_is_open,
+):
+    marker = "provider-secret-invalid-market-state"
+    clock = AlpacaClock(
+        SimpleNamespace(
+            provider_marker=marker,
+            get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+        )
+    )
+
+    with pytest.raises(BrokerDataIntegrityError) as raised:
+        clock.is_open()
+
+    assert str(raised.value) == "invalid Alpaca market clock state"
+    assert marker not in str(raised.value)
+    assert type(raw_is_open).__name__ not in str(raised.value)
+
+
 def test_alpaca_clock_uses_exchange_calendar_for_most_recent_open():
     trading = SimpleNamespace(
         get_calendar=lambda request: [

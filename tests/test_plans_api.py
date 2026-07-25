@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,18 +19,65 @@ from trading_assistant.app.main import create_app
 from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
+from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
+    Fill,
     RiskEvent,
     TradePlanRow,
 )
 from trading_assistant.dependencies import RequiredDependencyUnavailable
+from trading_assistant.risk.clock import FakeClock
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
+CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 TOKEN = "test-plans-operator-secret"
+
+
+def _seed_clock_loss(service) -> None:
+    with service.session_factory() as session:
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("100"),
+                    price=Decimal("100"),
+                    broker_fill_id="plans-clock-loss-open",
+                    filled_at=CLOCK_NOW - timedelta(hours=2),
+                ),
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("100"),
+                    price=Decimal("50"),
+                    broker_fill_id="plans-clock-loss-close",
+                    filled_at=CLOCK_NOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
+
+
+def _install_equity_clock(service, clock) -> None:
+    service.clock = clock
+    service._clocks[AssetClass.EQUITY] = clock
+    service.snapshot_service.now = lambda: CLOCK_NOW
+    service.broker._now = lambda: CLOCK_NOW
+
+
+def _invalid_alpaca_clock(raw_is_open, marker: str):
+    client = SimpleNamespace(
+        provider_marker=marker,
+        get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+        get_calendar=lambda _request: [
+            SimpleNamespace(open=CLOCK_NOW - timedelta(hours=3))
+        ],
+    )
+    return AlpacaClock(client)
 
 
 def _plan():
@@ -580,6 +628,181 @@ def test_required_snapshot_clock_outage_preserves_route_contract_and_redacts_pro
     )
     assert marker not in exposed
     assert "ConnectionError" not in exposed
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected_status"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "reject future boundary analysis",
+            },
+            503,
+        ),
+        (
+            "/propose",
+            {
+                "n": 2,
+                "reason": "reject future boundary proposals",
+            },
+            200,
+        ),
+    ],
+)
+def test_planning_workflows_reject_future_market_boundary_with_large_loss(
+    client,
+    caplog,
+    path,
+    body,
+    expected_status,
+):
+    c, svc = client
+    _seed_clock_loss(svc)
+    future_boundary = CLOCK_NOW + timedelta(microseconds=1)
+    _install_equity_clock(
+        svc,
+        FakeClock(
+            is_open=True,
+            most_recent_open=future_boundary,
+        ),
+    )
+
+    response = c.post(path, json=body)
+
+    assert response.status_code == expected_status
+    request_id = response.headers["X-Request-ID"]
+    if path == "/analyze":
+        assert response.json()["error"]["code"] == "analysis_failed"
+        expected_targets = {"AAPL"}
+    else:
+        proposed = response.json()["proposed"]
+        assert proposed
+        assert {row["error"] for row in proposed} == {
+            "analysis_failed"
+        }
+        expected_targets = {row["symbol"] for row in proposed}
+    with svc.session_factory() as session:
+        failures = session.query(AuditEvent).filter_by(
+            action="plan.create",
+            request_id=request_id,
+            result_code="dependency_unavailable",
+        ).all()
+        assert session.query(TradePlanRow).count() == 0
+        risk_text = "\n".join(
+            event.reason for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            state.reason
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert {failure.target_id for failure in failures} == expected_targets
+    assert {
+        (failure.actor, failure.reason, failure.detail_json)
+        for failure in failures
+    } == {
+        (
+            "operator:local",
+            body["reason"],
+            json.dumps({"stage": "analysis"}, sort_keys=True),
+        )
+    }
+    exposed = "\n".join(
+        (
+            response.text,
+            "\n".join(failure.detail_json for failure in failures),
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert future_boundary.isoformat() not in exposed
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected_status"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "reject invalid clock analysis",
+            },
+            503,
+        ),
+        (
+            "/propose",
+            {
+                "n": 2,
+                "reason": "reject invalid clock proposals",
+            },
+            200,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "raw_is_open",
+    ["false", 0, 1, None],
+    ids=["string-false", "integer-zero", "integer-one", "none"],
+)
+def test_planning_workflows_reject_invalid_alpaca_market_state_and_redact_provider(
+    client,
+    caplog,
+    path,
+    body,
+    expected_status,
+    raw_is_open,
+):
+    c, svc = client
+    marker = "provider-secret-invalid-planning-clock"
+    _install_equity_clock(
+        svc,
+        _invalid_alpaca_clock(raw_is_open, marker),
+    )
+
+    response = c.post(path, json=body)
+
+    assert response.status_code == expected_status
+    request_id = response.headers["X-Request-ID"]
+    if path == "/analyze":
+        assert response.json()["error"]["code"] == "analysis_failed"
+        expected_targets = {"AAPL"}
+    else:
+        proposed = response.json()["proposed"]
+        assert proposed
+        assert {row["error"] for row in proposed} == {
+            "analysis_failed"
+        }
+        expected_targets = {row["symbol"] for row in proposed}
+    with svc.session_factory() as session:
+        failures = session.query(AuditEvent).filter_by(
+            action="plan.create",
+            request_id=request_id,
+            result_code="dependency_unavailable",
+        ).all()
+        assert session.query(TradePlanRow).count() == 0
+    assert {failure.target_id for failure in failures} == expected_targets
+    assert {
+        (failure.actor, failure.reason, failure.detail_json)
+        for failure in failures
+    } == {
+        (
+            "operator:local",
+            body["reason"],
+            json.dumps({"stage": "analysis"}, sort_keys=True),
+        )
+    }
+    exposed = "\n".join(
+        (
+            response.text,
+            "\n".join(failure.detail_json for failure in failures),
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "BrokerDataIntegrityError" not in exposed
+    assert "invalid Alpaca market clock state" not in exposed
 
 
 @pytest.mark.parametrize(

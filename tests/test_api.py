@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,12 +14,14 @@ from sqlalchemy import event
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
+from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import BrokerFill, OrderStatus, Quote
 from trading_assistant.db.models import (
     AuditEvent,
     CircuitBreakerState,
+    Fill,
     Order,
     Proposal,
     RiskEvent,
@@ -28,8 +31,53 @@ from trading_assistant.db.models import (
 )
 from trading_assistant.assets import AssetClass
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.clock import FakeClock
 
 TOKEN = "test-api-operator-secret"
+CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+
+
+def _seed_clock_loss(service) -> None:
+    with service.session_factory() as session:
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("100"),
+                    price=Decimal("100"),
+                    broker_fill_id="api-clock-loss-open",
+                    filled_at=CLOCK_NOW - timedelta(hours=2),
+                ),
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("100"),
+                    price=Decimal("50"),
+                    broker_fill_id="api-clock-loss-close",
+                    filled_at=CLOCK_NOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
+
+
+def _install_equity_clock(service, clock) -> None:
+    service.clock = clock
+    service._clocks[AssetClass.EQUITY] = clock
+    service.snapshot_service.now = lambda: CLOCK_NOW
+
+
+def _invalid_alpaca_clock(raw_is_open, marker: str):
+    state = {"is_open": raw_is_open}
+    client = SimpleNamespace(
+        provider_marker=marker,
+        get_clock=lambda: SimpleNamespace(is_open=state["is_open"]),
+        get_calendar=lambda _request: [
+            SimpleNamespace(open=CLOCK_NOW - timedelta(hours=3))
+        ],
+    )
+    return AlpacaClock(client), state
 
 
 class StubAgent:
@@ -850,6 +898,238 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
     )
     assert marker not in exposed
     assert "ConnectionError" not in exposed
+
+
+@pytest.mark.parametrize("workflow", ["approve", "reset"])
+def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
+    make_service,
+    authenticate_client,
+    caplog,
+    workflow,
+):
+    service = make_service(quote_now=lambda: CLOCK_NOW)
+    service.snapshot_service.now = lambda: CLOCK_NOW
+    order_id = _propose(service) if workflow == "approve" else None
+    observed = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="future boundary reset setup",
+            actor="daemon:test",
+            request_id="future-boundary-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    _seed_clock_loss(service)
+    future_boundary = CLOCK_NOW + timedelta(microseconds=1)
+    _install_equity_clock(
+        service,
+        FakeClock(
+            is_open=True,
+            most_recent_open=future_boundary,
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = f"reject {workflow} with future market boundary"
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": reason},
+            headers={"X-CSRF-Token": csrf},
+        )
+        action = "order.submit"
+    else:
+        assert observed is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "asset_class": "equity",
+                "reason": reason,
+                "expected_generation": observed.generation,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        action = "circuit_breaker.reset"
+
+    _assert_dependency_unavailable(response)
+    with service.session_factory() as session:
+        failure = session.query(AuditEvent).filter_by(
+            action=action,
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+        risk_text = "\n".join(
+            event.reason for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            state.reason
+            for state in session.query(CircuitBreakerState).all()
+        )
+        if order_id is not None:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.APPROVAL_RECORDED.value
+            )
+    assert failure.actor == "operator:local"
+    assert failure.reason == reason
+    assert service.broker.submit_calls == 0
+    if observed is not None:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is True
+        assert current.generation == observed.generation
+    exposed = "\n".join(
+        (
+            response.text,
+            failure.detail_json,
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert future_boundary.isoformat() not in exposed
+
+    if order_id is not None:
+        _install_equity_clock(
+            service,
+            FakeClock(
+                is_open=True,
+                most_recent_open=CLOCK_NOW - timedelta(hours=3),
+            ),
+        )
+        retry = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "retry against truthful loss boundary"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert retry.status_code == 403
+        assert retry.json()["error"]["code"] == "policy_denied"
+        assert service.broker.submit_calls == 0
+        with service.session_factory() as session:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.REJECTED.value
+            )
+            risk = session.query(RiskEvent).filter_by(
+                order_id=order_id,
+                event_type="rejection",
+            ).one()
+        assert "daily total-loss limit reached" in risk.reason
+
+
+@pytest.mark.parametrize("workflow", ["approve", "reset"])
+@pytest.mark.parametrize(
+    "raw_is_open",
+    ["false", 0, 1, None],
+    ids=["string-false", "integer-zero", "integer-one", "none"],
+)
+def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provider(
+    make_service,
+    authenticate_client,
+    caplog,
+    workflow,
+    raw_is_open,
+):
+    service = make_service(quote_now=lambda: CLOCK_NOW)
+    service.snapshot_service.now = lambda: CLOCK_NOW
+    order_id = _propose(service) if workflow == "approve" else None
+    observed = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="invalid clock reset setup",
+            actor="daemon:test",
+            request_id="invalid-clock-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    marker = "provider-secret-invalid-alpaca-clock"
+    clock, state = _invalid_alpaca_clock(raw_is_open, marker)
+    _install_equity_clock(service, clock)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = f"reject invalid clock data during {workflow}"
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": reason},
+            headers={"X-CSRF-Token": csrf},
+        )
+        action = "order.submit"
+    else:
+        assert observed is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "asset_class": "equity",
+                "reason": reason,
+                "expected_generation": observed.generation,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        action = "circuit_breaker.reset"
+
+    _assert_dependency_unavailable(response)
+    with service.session_factory() as session:
+        failure = session.query(AuditEvent).filter_by(
+            action=action,
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+        if order_id is not None:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.APPROVAL_RECORDED.value
+            )
+    assert failure.actor == "operator:local"
+    assert failure.reason == reason
+    exposed = "\n".join(
+        (
+            response.text,
+            failure.detail_json,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "BrokerDataIntegrityError" not in exposed
+    assert "invalid Alpaca market clock state" not in exposed
+    if observed is not None:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is True
+        assert current.generation == observed.generation
+
+    if order_id is not None:
+        state["is_open"] = True
+        retry = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "retry after valid clock data"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert retry.status_code == 200
+        assert retry.json()["status"] == OrderStatus.SUBMITTED.value
+        assert service.broker.submit_calls == 1
 
 
 @pytest.mark.parametrize(

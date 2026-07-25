@@ -610,7 +610,12 @@ class AlpacaClock:
         return cls(client)
 
     def is_open(self, at=None) -> bool:
-        return bool(_retry(self._trading.get_clock).is_open)
+        value = _retry(self._trading.get_clock).is_open
+        if type(value) is not bool:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market clock state"
+            )
+        return value
 
     def next_open(self, at=None):
         return _retry(self._trading.get_clock).next_open

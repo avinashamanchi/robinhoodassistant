@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -56,6 +56,9 @@ _UNRECONCILED_STATUSES = (
     OrderStatus.SUBMITTING.value,
     OrderStatus.ACCEPTANCE_UNKNOWN.value,
 )
+# The provider adapter queries 14 calendar dates. One extra day covers timezone
+# edges without encoding weekends or exchange holidays in the application.
+_MAX_RECENT_MARKET_OPEN_AGE = timedelta(days=15)
 
 
 class PortfolioSnapshotService:
@@ -83,6 +86,7 @@ class PortfolioSnapshotService:
     def assemble_for_execution(
         self, ticker: str, *, exclude_order_id: int | None = None
     ) -> PortfolioSnapshot:
+        captured_at = self._captured_at()
         asset_class = AssetClass.for_symbol(ticker)
         (
             account,
@@ -97,6 +101,7 @@ class PortfolioSnapshotService:
         ) = self._provider_values(
             [ticker],
             asset_class,
+            captured_at,
             required_dependencies=True,
         )
 
@@ -111,7 +116,6 @@ class PortfolioSnapshotService:
             required=True,
         )
 
-        captured_at = self._captured_at()
         high_water_mark = self._account_high_water_mark(
             asset_class, account, captured_at
         )
@@ -153,6 +157,7 @@ class PortfolioSnapshotService:
         quote_overrides: dict[str, object] | None = None,
         required_dependencies: bool = False,
     ) -> PortfolioSnapshot:
+        captured_at = self._captured_at()
         (
             account,
             positions,
@@ -166,6 +171,7 @@ class PortfolioSnapshotService:
         ) = self._provider_values(
             tickers,
             asset_class,
+            captured_at,
             quote_overrides=quote_overrides,
             required_dependencies=required_dependencies,
         )
@@ -179,7 +185,6 @@ class PortfolioSnapshotService:
             required=required_dependencies,
         )
 
-        captured_at = self._captured_at()
         high_water_mark = self._account_high_water_mark(
             asset_class, account, captured_at
         )
@@ -214,6 +219,7 @@ class PortfolioSnapshotService:
         self,
         tickers: list[str],
         asset_class: AssetClass,
+        captured_at: datetime,
         *,
         quote_overrides: dict[str, object] | None = None,
         required_dependencies: bool = False,
@@ -251,6 +257,7 @@ class PortfolioSnapshotService:
             boundary,
         ) = self._market_clock_values(
             asset_class,
+            captured_at,
             required_dependencies=required_dependencies,
         )
         quotes = {
@@ -281,13 +288,14 @@ class PortfolioSnapshotService:
     def _market_clock_values(
         self,
         asset_class: AssetClass,
+        captured_at: datetime,
         *,
         required_dependencies: bool,
     ) -> tuple[bool, bool, datetime | None]:
         try:
             clock = self.clock_for_asset(asset_class)
-            market_open = clock.is_open()
-            boundary = clock.most_recent_open()
+            market_open = clock.is_open(captured_at)
+            boundary = clock.most_recent_open(captured_at)
             if type(market_open) is not bool:
                 raise ValueError("invalid market clock state")
             if (
@@ -297,6 +305,12 @@ class PortfolioSnapshotService:
             ):
                 raise ValueError("invalid market session boundary")
             boundary = boundary.astimezone(timezone.utc)
+            boundary_age = captured_at - boundary
+            if (
+                boundary_age < timedelta(0)
+                or boundary_age > _MAX_RECENT_MARKET_OPEN_AGE
+            ):
+                raise ValueError("inconsistent market session boundary")
         except Exception:
             if required_dependencies:
                 raise RequiredDependencyUnavailable from None
@@ -388,6 +402,8 @@ class PortfolioSnapshotService:
 
     def _captured_at(self) -> datetime:
         captured_at = self.now()
+        if not isinstance(captured_at, datetime):
+            raise TypeError("snapshot observation time must be a datetime")
         if captured_at.tzinfo is None:
             return captured_at.replace(tzinfo=timezone.utc)
         return captured_at.astimezone(timezone.utc)
