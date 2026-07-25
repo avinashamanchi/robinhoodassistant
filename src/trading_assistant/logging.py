@@ -137,7 +137,7 @@ def configure_logging(
         root.addHandler(stream)
 
     if log_path is not None:
-        path = Path(log_path).expanduser()
+        path = Path(log_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)
         descriptor = os.open(

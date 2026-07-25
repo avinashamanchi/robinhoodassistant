@@ -8,6 +8,7 @@ logic — it maps tool calls to :class:`TradingService` methods.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from ..service import TradingService
 from ..operations import AuditRecorder, MutationContext
 
 mcp = FastMCP("trading-assistant")
+_LOG = logging.getLogger(__name__)
 
 _service: Optional[TradingService] = None
 _audit: Optional[AuditRecorder] = None
@@ -36,6 +38,7 @@ def build_default_service() -> TradingService:
     container = bootstrap.build_container(
         load_config(),
         Secrets(),
+        runtime_role="mcp",
     )
     _audit = container.audit
     return container.service
@@ -58,13 +61,30 @@ def _record(
     global _audit
     if _audit is None:
         _audit = AuditRecorder(_svc().session_factory)
-    _audit.record(
-        context,
-        action,
-        target_type,
-        str(target_id),
-        str(result.get("status") or result.get("state") or "completed"),
-    )
+    try:
+        result_code = (
+            "failed"
+            if result.get("error")
+            else str(
+                result.get("status")
+                or result.get("state")
+                or "completed"
+            )
+        )
+        _audit.record(
+            context,
+            action,
+            target_type,
+            str(target_id),
+            result_code,
+        )
+    except Exception:
+        _LOG.disabled = False
+        _LOG.error(
+            "boundary_audit_unavailable action=%s request_id=%s",
+            action,
+            context.request_id,
+        )
 
 
 # ── read-only tools ─────────────────────────────────────────────
@@ -145,14 +165,24 @@ def create_conditional_rule(
         reason=reason,
         request_id=uuid4().hex,
     )
-    result = _svc().create_conditional_rule(
-        ticker,
-        condition,
-        action,
-        actor=context.actor,
-        reason=context.reason,
-        request_id=context.request_id,
-    )
+    try:
+        result = _svc().create_conditional_rule(
+            ticker,
+            condition,
+            action,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
+        )
+    except Exception:
+        _record(
+            context,
+            "mcp.rule_create",
+            "rule_group",
+            ticker.upper(),
+            {"error": "failed"},
+        )
+        raise
     _record(context, "mcp.rule_create", "rule_group", result.get("group_id", ""), result)
     return result
 

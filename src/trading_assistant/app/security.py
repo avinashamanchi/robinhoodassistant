@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import logging
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
@@ -19,6 +20,7 @@ from .errors import ApiError
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 _IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,64}\Z")
+_LOG = logging.getLogger(__name__)
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -179,15 +181,11 @@ def install_security(app: FastAPI) -> None:
                     f"http_{response.status_code}",
                 )
             except Exception:
-                if response.status_code >= 400:
-                    return _harden_response(request, response)
-                return _error_response(
-                    request,
-                    ApiError(
-                        "audit_unavailable",
-                        503,
-                        "Mutation audit could not be confirmed",
-                    ),
+                _LOG.disabled = False
+                _LOG.error(
+                    "boundary_audit_unavailable action=%s request_id=%s",
+                    action,
+                    context.request_id,
                 )
         if (
             request.method == "OPTIONS"

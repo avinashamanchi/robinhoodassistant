@@ -18,22 +18,20 @@ fi
 
 mkdir -p logs
 chmod 700 logs
-touch logs/app.log logs/daemon.log
-chmod 600 logs/app.log logs/daemon.log
 echo "== starting app on http://127.0.0.1:8000 =="
 nohup .venv/bin/python -m uvicorn trading_assistant.app.main:create_app \
-  --factory --host 127.0.0.1 --port 8000 > logs/app.log 2>&1 &
+  --factory --host 127.0.0.1 --port 8000 > /dev/null 2>&1 &
 echo $! > logs/app.pid
 
 echo "== starting daemon (shadow mode) =="
-nohup .venv/bin/python -m trading_assistant.daemon.main > logs/daemon.log 2>&1 &
+nohup .venv/bin/python -m trading_assistant.daemon.main > /dev/null 2>&1 &
 echo $! > logs/daemon.pid
 
 sleep 4
 echo "== health =="
-curl -s http://127.0.0.1:8000/health/live || echo "(app still warming up — check logs/app.log)"
+curl -s http://127.0.0.1:8000/health/live || echo "(app still warming up — check logs/app.runtime.log)"
 echo
 echo "Open  : http://127.0.0.1:8000"
 echo "Token : run  grep APP_API_TOKEN .env   and paste the value when the page asks"
-echo "Logs  : logs/app.log   logs/daemon.log"
+echo "Logs  : logs/app.runtime.log   logs/daemon.runtime.log"
 echo "Stop  : ./scripts/stop.sh"

@@ -805,6 +805,23 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
     assert "umask 077" in start
     assert "<key>Umask</key><integer>63</integer>" in install
     assert "chmod 700 \"$PROJ/logs\"" in install
-    assert "chmod 600 logs/app.log logs/daemon.log" in start
+    assert (
+        "emit ()" in install
+        and (
+            "StandardOutPath</key><string>/dev/null"
+            in install
+        )
+        and (
+            "StandardErrorPath</key><string>/dev/null"
+            in install
+        )
+    )
+    assert "touch \"$PROJ/logs/app.launchd.log\"" not in install
+    assert "logs/app.runtime.log" in install
+    assert "> /dev/null 2>&1" in start
+    assert "logs/app.runtime.log" in start
+    assert "logs/daemon.runtime.log" in start
+    assert "logs/app.log" not in start
+    assert "logs/daemon.log" not in start
     assert "http://127.0.0.1:8000/health " not in install
     assert "http://127.0.0.1:8000/health " not in start

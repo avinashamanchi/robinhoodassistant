@@ -12,6 +12,6 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>/Users/avi/Desktop/robinhood/trading-assistant/logs/daemon.launchd.log</string>
-  <key>StandardErrorPath</key><string>/Users/avi/Desktop/robinhood/trading-assistant/logs/daemon.launchd.log</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
 </dict></plist>

@@ -3,16 +3,24 @@ full order lifecycle integration (B2)."""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
+import plistlib
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from trading_assistant.app.main import create_app
+from trading_assistant.app.errors import ApiError
+from trading_assistant.assets import AssetClass
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import AuditEvent, Fill, Heartbeat, Order
 from trading_assistant.dependencies import RequiredDependencyUnavailable
+from trading_assistant.operations import MutationContext, OperationsService
+from trading_assistant.operations.health import build_operational_health
+from trading_assistant.risk.breakers import BreakerScope
 
 
 class _StubAgent:
@@ -112,6 +120,357 @@ def test_reject_http_receipt_captures_request_and_idempotency_identity(
     assert event.idempotency_key == "reject-once"
     assert event.result_code == "http_200"
     assert event.latency_ms >= 0
+
+
+def test_approval_success_survives_supplementary_audit_failure_without_resubmit(
+    authenticated_client,
+):
+    client, csrf = authenticated_client
+    service = client.trading_service
+    proposal = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="prepare approval audit failure",
+        request_id="prepare-approval-audit-failure",
+    )
+
+    class FailingBoundaryAudit:
+        def record(self, context, action, *args, **kwargs):
+            if action == "http.approve":
+                raise RuntimeError("supplementary HTTP audit unavailable")
+
+    client.app.state.audit = FailingBoundaryAudit()
+    headers = {
+        "X-CSRF-Token": csrf,
+        "X-Request-ID": "approval-audit-failure",
+        "Idempotency-Key": "approval-audit-failure-once",
+    }
+    first = client.post(
+        f"/approve/{proposal['order_id']}",
+        headers=headers,
+        json={"reason": "human approval remains authoritative"},
+    )
+    second = client.post(
+        f"/approve/{proposal['order_id']}",
+        headers=headers,
+        json={"reason": "human approval remains authoritative"},
+    )
+
+    assert first.status_code == 200
+    assert first.headers["X-Request-ID"] == "approval-audit-failure"
+    assert second.status_code == 409
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        approval_rows = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(proposal["order_id"]),
+        ).all()
+    assert len(approval_rows) == 1
+    assert approval_rows[0].actor == "operator:local"
+    assert approval_rows[0].request_id == "approval-audit-failure"
+
+
+def test_operational_health_excludes_contact_committed_after_safety_snapshot(
+    engine,
+    make_service,
+):
+    service = make_service()
+    interleaved = False
+
+    def commit_contact_after_snapshot_starts(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        nonlocal interleaved
+        if interleaved or "FROM heartbeats" not in statement:
+            return
+        interleaved = True
+        with service.session_factory() as writer:
+            writer.add(
+                AuditEvent(
+                    actor="daemon:test",
+                    action="orders.sync",
+                    target_type="broker_orders",
+                    target_id="all",
+                    request_id="interleaved-health-contact",
+                    result_code="reconciled",
+                )
+            )
+            writer.commit()
+
+    event.listen(
+        engine,
+        "after_cursor_execute",
+        commit_contact_after_snapshot_starts,
+    )
+    try:
+        report = build_operational_health(service).as_dict()
+    finally:
+        event.remove(
+            engine,
+            "after_cursor_execute",
+            commit_contact_after_snapshot_starts,
+        )
+
+    assert interleaved is True
+    assert report["last_confirmed_broker_contact"] is None
+    assert report["reconciliation_age_seconds"] is None
+
+
+def test_operational_health_never_clamps_future_contact_to_zero(
+    make_service,
+):
+    service = make_service()
+    with service.session_factory() as session:
+        session.add(
+            AuditEvent(
+                actor="daemon:test",
+                action="positions.reconcile",
+                target_type="portfolio",
+                target_id="alpaca-paper",
+                request_id="future-health-contact",
+                result_code="in_sync",
+                created_at=(
+                    service.snapshot_service.now()
+                    + timedelta(days=1)
+                ),
+            )
+        )
+        session.commit()
+
+    report = build_operational_health(service).as_dict()
+
+    assert report["last_confirmed_broker_contact"] is not None
+    assert report["broker_contact_evidence_valid"] is False
+    assert report["reconciliation_age_seconds"] is None
+    assert (
+        report["broker_contact_observed_at"]
+        == report["observed_at"]
+    )
+
+
+@pytest.mark.parametrize("operation", ["panic", "reset"])
+def test_operations_domain_success_survives_supplementary_audit_failure(
+    make_service,
+    caplog,
+    operation,
+):
+    service = make_service()
+    marker = "provider-secret-must-not-enter-operations-log"
+
+    class FailingBoundaryAudit:
+        def record(self, *args, **kwargs):
+            raise RuntimeError(marker)
+
+    operations = OperationsService(
+        service,
+        FailingBoundaryAudit(),
+    )
+    context = MutationContext(
+        actor="operator:test",
+        request_id=f"operations-{operation}-audit-failure",
+        reason=f"{operation} after supplementary audit outage",
+    )
+    if operation == "panic":
+        result = operations.panic(context)
+        assert result["safe"] is True
+    else:
+        tripped = service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            "prepare operations reset audit failure",
+            "operator:test",
+            request_id="prepare-operations-reset-audit-failure",
+        )
+        result = operations.reset_breaker(
+            AssetClass.EQUITY,
+            expected_generation=tripped.generation,
+            context=context,
+        )
+        assert result["tripped"] is False
+
+    assert (
+        f"boundary_audit_unavailable action=operations.{operation}"
+        in caplog.text
+    )
+    assert marker not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "plist_name",
+    [
+        "com.trading.app.plist",
+        "com.trading.daemon.plist",
+    ],
+)
+def test_launchd_discards_unbounded_stream_files(plist_name):
+    path = Path("scripts/launchd") / plist_name
+    with path.open("rb") as handle:
+        config = plistlib.load(handle)
+
+    assert config["StandardOutPath"] == "/dev/null"
+    assert config["StandardErrorPath"] == "/dev/null"
+
+
+@pytest.mark.parametrize(
+    ("workflow", "success"),
+    [
+        ("approve", True),
+        ("approve", False),
+        ("reject", True),
+        ("reject", False),
+        ("cancel", True),
+        ("cancel", False),
+        ("reset", True),
+        ("reset", False),
+        ("panic", True),
+        ("panic", False),
+        ("backtest", True),
+        ("backtest", False),
+    ],
+)
+def test_http_mutation_provenance_matrix(
+    authenticated_client,
+    monkeypatch,
+    workflow,
+    success,
+):
+    from trading_assistant.backtest import runner as backtest_runner
+
+    client, csrf = authenticated_client
+    service = client.trading_service
+    request_id = f"provenance-{workflow}-{'ok' if success else 'failure'}"
+    idempotency_key = f"{request_id}-once"
+    reason = f"{workflow} provenance {'success' if success else 'failure'}"
+    body = {"reason": reason}
+
+    if workflow in {"approve", "reject", "cancel"}:
+        if success:
+            proposal = service.propose_order(
+                "AAPL",
+                "buy",
+                "market",
+                notional="100",
+                actor="operator:setup",
+                reason=f"prepare {workflow} provenance",
+                request_id=f"prepare-{request_id}",
+            )
+            order_id = proposal["order_id"]
+            if workflow == "cancel":
+                service.approve_order(
+                    order_id,
+                    actor="operator:setup",
+                    reason="prepare submitted cancellation",
+                    request_id=f"submit-{request_id}",
+                )
+        else:
+            order_id = 999_999
+        path = {
+            "approve": f"/approve/{order_id}",
+            "reject": f"/reject/{order_id}",
+            "cancel": f"/orders/{order_id}/cancel",
+        }[workflow]
+    elif workflow == "reset":
+        tripped = service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            "prepare reset provenance",
+            "operator:setup",
+            request_id=f"prepare-{request_id}",
+        )
+        body.update(
+            {
+                "asset_class": "equity",
+                "expected_generation": (
+                    tripped.generation
+                    if success
+                    else tripped.generation + 1
+                ),
+            }
+        )
+        path = "/killswitch/reset"
+    elif workflow == "panic":
+        path = "/panic"
+        if not success:
+            monkeypatch.setattr(
+                client.app.state.operations,
+                "panic",
+                lambda context: {
+                    "safe": False,
+                    "unconfirmed_order_ids": [101],
+                },
+            )
+    else:
+        path = "/backtests/run"
+        body["symbols"] = ["AAPL"]
+
+        class Report:
+            def to_dict(self):
+                return {"simulated": True}
+
+        if success:
+            monkeypatch.setattr(
+                backtest_runner,
+                "run_synthetic_backtest",
+                lambda *args, **kwargs: (7, Report()),
+            )
+        else:
+            def fail_backtest(*args, **kwargs):
+                raise ApiError(
+                    "backtest_failed",
+                    503,
+                    "Backtest dependency unavailable",
+                )
+
+            monkeypatch.setattr(
+                backtest_runner,
+                "run_synthetic_backtest",
+                fail_backtest,
+            )
+
+    response = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "X-Request-ID": request_id,
+            "Idempotency-Key": idempotency_key,
+        },
+        json=body,
+    )
+
+    expected_status = {
+        ("approve", False): 404,
+        ("reject", False): 404,
+        ("cancel", False): 404,
+        ("reset", False): 409,
+        ("panic", False): 503,
+        ("backtest", False): 503,
+    }.get((workflow, success), 200)
+    assert response.status_code == expected_status
+    assert response.headers["X-Request-ID"] == request_id
+    action = {
+        "approve": "http.approve",
+        "reject": "http.reject",
+        "cancel": "http.cancel",
+        "reset": "http.breaker_reset",
+        "panic": "http.panic",
+        "backtest": "http.backtest_run",
+    }[workflow]
+    with service.session_factory() as session:
+        receipt = session.query(AuditEvent).filter_by(
+            action=action,
+            request_id=request_id,
+        ).one()
+    assert receipt.actor == "operator:local"
+    assert receipt.idempotency_key == idempotency_key
+    assert receipt.reason == reason
+    assert receipt.result_code == f"http_{expected_status}"
+    assert receipt.latency_ms >= 0
 
 
 # ── B3 preflight helpers (keyless) ──────────────────────────────

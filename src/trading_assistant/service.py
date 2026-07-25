@@ -733,11 +733,12 @@ class TradingService:
                     heartbeat.at = utcnow()
             s.commit()
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, safety=None) -> dict[str, Any]:
         """Authenticated operational health and durable local safety truth."""
-        safety = read_persisted_safety_truth(
-            self.session_factory
-        )
+        if safety is None:
+            safety = read_persisted_safety_truth(
+                self.session_factory
+            )
         observed_at = safety.observed_at
         operating_context = {
             "broker": (

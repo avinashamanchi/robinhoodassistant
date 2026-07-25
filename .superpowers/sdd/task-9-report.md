@@ -1,0 +1,244 @@
+# Task 9 implementation report
+
+## Status
+
+DONE
+
+## Recovery
+
+- Preserved the uncommitted implementation based on `cb62d76`; no reset,
+  checkout, or discarded path was used.
+- Reviewed the existing Task 9 diff and retained the separate
+  `cb62d76` fake-clock fix.
+
+## RED
+
+Command:
+
+```text
+uv run pytest tests/test_bootstrap.py tests/test_launch.py
+tests/test_watchdog.py tests/test_ops.py tests/test_monitor.py
+tests/test_external_accounts.py tests/test_llm_backends.py
+tests/test_startup_schema.py tests/test_alpaca_broker.py
+tests/test_migrations.py tests/test_mcp_tools.py tests/test_security.py -v
+```
+
+Result:
+
+```text
+1 failed, 422 passed, 2 warnings
+```
+
+Failure:
+
+```text
+tests/test_monitor.py::test_runtime_reconciliation_failure_trips_global_breaker_once
+expected generation 1, observed generation 2
+```
+
+Root cause: `_core_cycle()` durably tripped the global breaker before rule
+evaluation, then `run()` caught the same untyped failure and tripped it a
+second time. The breaker service intentionally advances generation on every
+trip.
+
+## GREEN
+
+Minimal regression command:
+
+```text
+uv run pytest
+tests/test_monitor.py::test_runtime_reconciliation_failure_trips_switches_before_rules
+tests/test_monitor.py::test_runtime_reconciliation_failure_trips_global_breaker_once
+tests/test_monitor.py::test_daemon_does_not_retry_a_failed_mutating_cycle -v
+```
+
+Result:
+
+```text
+3 passed
+```
+
+Fix: raise a private `RuntimeError` subtype after the inner reconciliation
+path has already latched safety; the outer monitor handler still logs and
+exits, but does not repeat the breaker mutation. Other cycle failures continue
+to trip the breaker exactly once.
+
+Focused Task 9 command:
+
+```text
+uv run pytest tests/test_bootstrap.py tests/test_launch.py
+tests/test_watchdog.py tests/test_ops.py tests/test_monitor.py
+tests/test_external_accounts.py tests/test_llm_backends.py
+tests/test_startup_schema.py tests/test_alpaca_broker.py
+tests/test_migrations.py tests/test_mcp_tools.py tests/test_security.py -v
+```
+
+Result:
+
+```text
+423 passed, 2 warnings
+```
+
+## Full verification
+
+Command:
+
+```text
+uv run pytest
+```
+
+Result:
+
+```text
+1251 passed, 1 skipped, 2 warnings in 106.97s
+```
+
+Additional successful checks:
+
+```text
+uv lock
+uv lock --check
+uv sync --all-extras
+uv run python -m compileall -q src tests
+bash -n scripts/start.sh scripts/stop.sh scripts/launchd/install.sh scripts/launchd/uninstall.sh
+git diff --check
+```
+
+Integrity scans confirmed:
+
+- Migrations `20260724_0001` through `20260724_0006` are byte-identical to
+  `cb62d76`.
+- Task 8 static assets are byte-identical to `cb62d76`.
+- Paper mode remains selected.
+- Auto-execution and automatic bracket preference remain false.
+- Cross-provider fallback remains null.
+- Production roots contain no `create_all()`.
+- `robin_stocks`, `pyotp`, Robinhood runtime classes, and Robinhood credential
+  fields are absent from runtime configuration, dependencies, and source.
+
+## Concerns
+
+- No functional blocker remains in automated verification.
+- Two pre-existing third-party deprecation warnings remain:
+  `websockets.legacy` and Starlette's current `httpx` TestClient integration.
+
+## Independent-review fix round
+
+### RED
+
+The first review regression command covered injected-container identity,
+injected-secret reuse, production runtime logs, coherent broker-contact health,
+and post-commit HTTP/MCP audit failure behavior:
+
+```text
+uv run pytest
+tests/test_bootstrap.py::test_create_app_builds_missing_agent_from_exact_injected_container
+tests/test_bootstrap.py::test_automatic_planning_and_screen_use_exact_injected_secrets
+tests/test_bootstrap.py::test_production_runtime_role_installs_private_bounded_log
+tests/test_launch.py::test_operational_health_excludes_contact_committed_after_safety_snapshot
+tests/test_launch.py::test_operational_health_never_clamps_future_contact_to_zero
+tests/test_mcp_tools.py::test_mcp_proposal_success_survives_supplementary_audit_failure
+tests/test_mcp_tools.py::test_mcp_rule_mutation_receipts_preserve_channel_actor_and_request
+-q
+```
+
+Result: `8 failed, 1 passed`. The failures proved:
+
+- an injected container with no agent called `build_default_stack`;
+- automatic planning constructed fresh ambient `Secrets`;
+- `prepare_database_runtime` had no production-role log contract;
+- broker-contact evidence was read after the safety snapshot and future
+  evidence was clamped to age zero;
+- an MCP proposal committed, then raised when its supplementary audit failed.
+
+The HTTP post-commit regression separately failed with `503` after the
+authoritative approval had submitted exactly once.
+
+The mandated provenance matrix initially produced `3 failed, 13 passed`:
+failed MCP rule creation had no receipt, and rule failure results were not
+distinguished from success. HTTP approval, rejection, cancellation, reset,
+panic, and backtest success/failure rows already passed.
+
+The final production-root RED command produced `5 failed`:
+
+```text
+uv run pytest
+tests/test_bootstrap.py::test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles
+tests/test_launch.py::test_operations_domain_success_survives_supplementary_audit_failure
+tests/test_launch.py::test_launchd_discards_unbounded_stream_files
+-q
+```
+
+It proved daemon/MCP omitted their roles, operations panic/reset propagated a
+supplementary receipt failure after committing, and launchd still wrote
+unbounded app/daemon stream files.
+
+### GREEN
+
+The first corrected regression set passed:
+
+```text
+10 passed
+```
+
+The expanded composition, health, post-commit, and provenance set passed:
+
+```text
+26 passed
+```
+
+The production-root and launchd set passed:
+
+```text
+5 passed
+```
+
+The app/daemon/MCP role logs are separate bounded rotating files. Both checked-in
+launchd plists and the installer-generated app/daemon plists send inherited
+streams to `/dev/null`; `scripts/start.sh` does the same, so those streams cannot
+grow around the rotating handlers. The files and directory remain owner-only.
+
+Supplementary HTTP, MCP, and operations receipts are now best-effort after an
+authoritative domain transaction. Their failure emits only a stable action and
+request ID and never changes a committed mutation into a retryable transport
+failure. Atomic domain audit rows remain unchanged and authoritative.
+
+### Final verification
+
+Focused Task 9 files:
+
+```text
+uv run pytest tests/test_bootstrap.py tests/test_launch.py
+tests/test_mcp_tools.py tests/test_security.py tests/test_api.py
+tests/test_watchdog.py tests/test_monitor.py tests/test_ops.py
+tests/test_startup_schema.py -q
+```
+
+Result: all passed with the two known third-party warnings.
+
+Final complete suite after the last installer change:
+
+```text
+uv run pytest
+```
+
+Result:
+
+```text
+1282 passed, 1 skipped, 2 warnings in 201.15s
+```
+
+Additional passing checks:
+
+```text
+uv lock --check
+uv run python -m compileall -q src tests
+bash -n scripts/start.sh scripts/stop.sh scripts/launchd/install.sh
+scripts/launchd/uninstall.sh
+plistlib parsing of every checked-in launchd plist
+git diff --check
+```
+
+The residual warnings are the same upstream `websockets.legacy` and Starlette
+TestClient deprecations recorded above; no new warning or safety concern was
+introduced.

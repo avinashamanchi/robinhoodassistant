@@ -15,7 +15,6 @@ UID_="$(id -u)"
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
 chmod 700 "$PROJ/logs" "$PROJ/backups"
-touch "$PROJ/logs/app.launchd.log" "$PROJ/logs/daemon.launchd.log"
 touch "$PROJ/logs/com.trading.watchdog.launchd.log"
 touch "$PROJ/logs/com.trading.backup.launchd.log"
 chmod 600 "$PROJ"/logs/*.launchd.log
@@ -49,8 +48,8 @@ emit () {  # $1=label  $2...=program args
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
     printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>10</integer>\n'
-    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
-    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$PROJ/logs/$label.launchd.log"
+    printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+    printf '  <key>StandardErrorPath</key><string>/dev/null</string>\n'
     printf '</dict></plist>\n'
   } > "$plist"
   reload_plist "$label" "$plist"
@@ -119,5 +118,5 @@ sleep 6
 echo "=== status ==="
 launchctl list | grep com.trading || true
 echo "=== health ==="
-curl -s http://127.0.0.1:8000/health/live || echo "(app not answering yet — check logs/com.trading.app.launchd.log)"
+curl -s http://127.0.0.1:8000/health/live || echo "(app not answering yet — check logs/app.runtime.log)"
 echo

@@ -18,7 +18,11 @@ def build_monitor() -> Monitor:
 
     config = load_config()
     secrets = Secrets()
-    container = bootstrap.build_container(config, secrets)
+    container = bootstrap.build_container(
+        config,
+        secrets,
+        runtime_role="daemon",
+    )
     service = container.service
     notifier = build_notifier(config, secrets)
     container.rule_worker.notifier = notifier

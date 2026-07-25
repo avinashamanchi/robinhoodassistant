@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -56,7 +57,23 @@ def prepare_database_runtime(
     secrets: Secrets,
     *,
     log_path=None,
+    runtime_role: str | None = None,
 ) -> DatabaseRuntime:
+    if log_path is not None and runtime_role is not None:
+        raise ValueError(
+            "log_path and runtime_role are mutually exclusive"
+        )
+    if runtime_role is not None:
+        if runtime_role not in {
+            "app",
+            "daemon",
+            "mcp",
+            "paper-drill",
+            "preflight",
+            "watchdog",
+        }:
+            raise ValueError("runtime_role is invalid")
+        log_path = Path("logs") / f"{runtime_role}.runtime.log"
     register_all_secrets(secrets)
     configure_logging(log_path=log_path)
     engine = create_db_engine(secrets.database_url)
@@ -87,11 +104,16 @@ def _guard_runtime(config: AppConfig, secrets: Secrets) -> None:
 def build_container(
     config: AppConfig | None = None,
     secrets: Secrets | None = None,
+    *,
+    runtime_role: str | None = None,
 ) -> ApplicationContainer:
     config = config or load_config()
     secrets = secrets or Secrets()
     _guard_runtime(config, secrets)
-    runtime = prepare_database_runtime(secrets)
+    runtime = prepare_database_runtime(
+        secrets,
+        runtime_role=runtime_role,
+    )
 
     broker = build_broker(config, secrets)
     service = TradingService(

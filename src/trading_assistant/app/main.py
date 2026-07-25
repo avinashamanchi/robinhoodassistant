@@ -176,7 +176,11 @@ def build_default_container():
     secrets = Secrets()
     from .. import bootstrap
 
-    return bootstrap.build_container(config, secrets)
+    return bootstrap.build_container(
+        config,
+        secrets,
+        runtime_role="app",
+    )
 
 
 def _build_agent(container) -> Agent:
@@ -247,6 +251,8 @@ def create_app(
         if service is not None and service is not container.service:
             raise RuntimeError("container and service do not match")
         service = container.service
+        if agent is None:
+            agent = _build_agent(container)
     if service is None or agent is None:
         service, agent = build_default_stack()
     from ..logging import register_secret
@@ -262,7 +268,7 @@ def create_app(
             "security.cookie_secure must be true for a non-loopback APP_HOST"
         )
 
-    _secrets_holder: dict = {}
+    _secrets_holder: dict = {"s": runtime_secrets}
     if planning is _AUTO_PLANNING:
         try:
             from ..analyst.analyst import Analyst
@@ -270,15 +276,19 @@ def create_app(
             from ..analyst.planning import PlanningService
             from ..llm.factory import build_llm_backend
 
-            sec = Secrets()
-            _secrets_holder["s"] = sec
             analyst = Analyst(
-                build_llm_backend(service.config, sec),
+                build_llm_backend(service.config, runtime_secrets),
                 max_tokens=service.config.llm.max_tokens,
                 suppress_ranging=service.config.analyst.suppress_ranging,
             )
             planning = PlanningService(
-                service, analyst, build_live_feature_provider(service.config, sec), sec
+                service,
+                analyst,
+                build_live_feature_provider(
+                    service.config,
+                    runtime_secrets,
+                ),
+                runtime_secrets,
             )
         except RequiredDependencyUnavailable as exc:
             raise RuntimeError(
@@ -297,6 +307,11 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
     )
+    app.state.container = container
+    app.state.trading_service = service
+    app.state.agent = agent
+    app.state.planning = planning
+    app.state.runtime_secrets = runtime_secrets
     app.state.operator_secret = api_token
     app.state.login_rate = login_rate
     session_kwargs = {
