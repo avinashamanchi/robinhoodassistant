@@ -570,11 +570,15 @@ textarea {
 }
 
 .table-wrap {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
 }
 
 table {
   width: 100%;
+  max-width: 100%;
   border-collapse: collapse;
 }
 
@@ -582,9 +586,12 @@ th,
 td {
   padding: 0.62rem 0.7rem;
   border-bottom: 1px solid var(--mist);
+  max-width: 24rem;
+  overflow-wrap: anywhere;
   text-align: left;
   vertical-align: top;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
 }
 
 th {
@@ -920,6 +927,115 @@ dialog::backdrop {
   margin: 0.8rem 0 0;
   color: var(--alarm-red);
   font-size: 0.78rem;
+}
+
+:where(.app-header,
+  .brand,
+  .primary-nav,
+  .session-controls,
+  .critical-banner,
+  .console-layout,
+  .truth-list,
+  .truth-row,
+  .breaker-proof,
+  .workspace,
+  .page-intro,
+  .section-heading,
+  .ledger-entry,
+  .ledger-entry-title,
+  .ledger-actions,
+  .data-grid,
+  .compose-row,
+  .action-row,
+  .receipt-grid,
+  .proof-grid,
+  .dialog-actions,
+  .plans-layout,
+  .backtests-layout,
+  .login-shell,
+  .login-context) > * {
+  min-width: 0;
+  min-inline-size: 0;
+  max-width: 100%;
+}
+
+:where(.dynamic-text,
+  h1,
+  h2,
+  h3,
+  p,
+  dt,
+  dd,
+  li,
+  a,
+  span,
+  strong,
+  button,
+  label,
+  output,
+  .brand-mark,
+  .session-actor,
+  .state,
+  .ledger-entry-title,
+  .ledger-entry-data,
+  .status-chip,
+  .empty-state,
+  .message-text,
+  .event-reason,
+  .receipt,
+  .receipt-grid,
+  .proof-grid,
+  .notice,
+  .proof-status,
+  .plan-item,
+  .run-item,
+  .item-meta,
+  .muted,
+  .banner-caution,
+  .simulated-banner,
+  .login-proof,
+  .login-status,
+  .section-body,
+  .dialog-header,
+  .dialog-body) {
+  min-width: 0;
+  min-inline-size: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.brand h1,
+.session-actor {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+button {
+  white-space: normal;
+}
+
+pre,
+code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+pre {
+  overflow-x: auto;
+}
+
+.section-heading > button,
+.ledger-actions > button,
+.dialog-actions > button,
+.page-intro > button,
+.session-controls > button,
+.action-row > button {
+  flex-shrink: 0;
+  max-width: 100%;
 }
 
 @media (max-width: 900px) {

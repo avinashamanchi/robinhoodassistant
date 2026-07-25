@@ -29,6 +29,7 @@ from trading_assistant.db.models import (
     AccountRiskState,
     AuditEvent,
     CircuitBreakerState,
+    FILL_RECONCILIATION_REQUIRED,
     Fill,
     Order,
     Proposal,
@@ -583,6 +584,185 @@ def test_health_reports_server_observed_broker_and_mode(client):
 
     assert health["broker"] == "Mock"
     assert health["mode"] == "paper"
+
+
+def test_health_reports_complete_locally_clear_persisted_safety_truth(client):
+    c, _, _ = client
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    assert safety == {
+        "state": "locally_clear",
+        "complete": True,
+        "local_enumeration": "confirmed",
+        "remote_broker_open_orders": "unverified",
+        "operator_global_breaker": {
+            "tripped": False,
+            "generation": 0,
+        },
+        "active_breakers": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "unknown_categories": [],
+    }
+
+
+def test_health_reports_every_active_breaker_and_global_generation(client):
+    c, service, _ = client
+    global_state = service.breakers.trip(
+        BreakerScope.operator_global(),
+        "operator panic remains latched",
+        "operator:test",
+        request_id="health-global-breaker",
+    )
+    equity_state = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        "equity loss scope remains latched",
+        "operator:test",
+        request_id="health-equity-breaker",
+    )
+    data_state = service.breakers.trip(
+        BreakerScope.data(AssetClass.CRYPTO),
+        "crypto data scope remains latched",
+        "operator:test",
+        request_id="health-data-breaker",
+    )
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    assert safety["state"] == "unsafe"
+    assert safety["complete"] is True
+    assert safety["operator_global_breaker"] == {
+        "tripped": True,
+        "generation": global_state.generation,
+    }
+    assert safety["unknown_categories"] == []
+    assert [
+        (item["scope"], item["generation"])
+        for item in safety["active_breakers"]
+    ] == [
+        (data_state.scope.key, data_state.generation),
+        (equity_state.scope.key, equity_state.generation),
+        (global_state.scope.key, global_state.generation),
+    ]
+
+
+def test_health_marks_malformed_active_breaker_evidence_incomplete(client):
+    c, service, _ = client
+    with service.session_factory() as session:
+        session.add(
+            CircuitBreakerState(
+                scope_key="operator_global",
+                kind="operator_global",
+                target="",
+                tripped=True,
+                reason="malformed persisted generation",
+                actor="operator:test",
+                generation=0,
+            )
+        )
+        session.commit()
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    health = response.json()
+    assert health["db_ok"] is False
+    assert health["safety"]["state"] == "unsafe"
+    assert health["safety"]["complete"] is False
+    assert health["safety"]["unknown_categories"] == [
+        "active_breakers"
+    ]
+    assert health["safety"]["operator_global_breaker"] == {
+        "tripped": True,
+        "generation": 0,
+    }
+
+
+def test_health_reports_terminal_latch_and_orphan_fill_after_reload(client):
+    c, service, _ = client
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="health-terminal-latch",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.CANCELED.value,
+            acceptance_state=FILL_RECONCILIATION_REQUIRED,
+            last_error_code="waiting_for_exact_fill",
+        )
+        session.add(order)
+        session.flush()
+        orphan = Fill(
+            order_id=None,
+            ticker="MSFT",
+            side="sell",
+            qty=Decimal("1"),
+            price=Decimal("200"),
+            broker_fill_id="health-orphan-fill",
+        )
+        session.add(orphan)
+        session.commit()
+        order_id = order.id
+        fill_id = orphan.id
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    assert safety["state"] == "unsafe"
+    assert safety["complete"] is True
+    assert safety["local_enumeration"] == "confirmed"
+    assert safety["unsafe_local_state"]["latched_order_ids"] == [order_id]
+    assert safety["unsafe_local_state"]["unsafe_fill_ids"] == [fill_id]
+    assert safety["unknown_categories"] == []
+
+
+def test_health_fails_closed_when_persisted_safety_read_is_incomplete(
+    client,
+):
+    c, service, _ = client
+
+    def fail_breaker_read(execute_state):
+        if (
+            execute_state.is_select
+            and "circuit_breaker_state" in str(execute_state.statement)
+        ):
+            raise RuntimeError("database-secret-health-breaker-read")
+
+    session_type = service.session_factory.class_
+    event.listen(session_type, "do_orm_execute", fail_breaker_read)
+    try:
+        response = c.get("/health")
+    finally:
+        event.remove(
+            session_type,
+            "do_orm_execute",
+            fail_breaker_read,
+        )
+
+    assert response.status_code == 200
+    health = response.json()
+    assert health["db_ok"] is False
+    assert health["error"] == "database_unavailable"
+    assert health["safety"] == {
+        "state": "unknown",
+        "complete": False,
+        "local_enumeration": "confirmed",
+        "remote_broker_open_orders": "unverified",
+        "operator_global_breaker": {
+            "tripped": None,
+            "generation": None,
+        },
+        "active_breakers": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "unknown_categories": ["active_breakers"],
+    }
+    assert "database-secret-health-breaker-read" not in response.text
 
 
 @pytest.mark.parametrize("path", ["/positions", "/holdings"])
@@ -1711,6 +1891,15 @@ def test_unsafe_panic_returns_non_2xx_truthful_receipt(
     assert receipt["remote_open_order_ids"] == [broker_order_id]
     assert "provider cancellation detail" not in response.text
     assert "provider status detail" not in response.text
+
+    reloaded_health = c.get("/health").json()
+    assert reloaded_health["safety"]["state"] == "unsafe"
+    assert reloaded_health["safety"]["operator_global_breaker"][
+        "tripped"
+    ] is True
+    assert order_id in reloaded_health["safety"][
+        "unsafe_local_state"
+    ]["live_or_unknown_order_ids"]
 
 
 def test_panic_dependency_failure_returns_stable_non_2xx_receipt(

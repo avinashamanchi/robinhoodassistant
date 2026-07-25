@@ -9,6 +9,13 @@ import {
 
 const byId = (id) => document.getElementById(id);
 const breakerScopes = ["equity", "crypto"];
+const unsafeLocalIdFields = [
+  "live_or_unknown_order_ids",
+  "latched_order_ids",
+  "unsafe_fill_ids",
+  "active_rule_ids",
+  "unsafe_rule_group_ids",
+];
 const dialogReturnFocus = new Map();
 const HEALTH_OBSERVATION_MAX_AGE_MS = 30000;
 
@@ -604,6 +611,7 @@ function latchUnsafePanic(receipt) {
     receipt && receipt.remote_enumeration,
     "unknown",
   );
+  byId("critical-banner-title").textContent = "Panic safety unconfirmed";
   byId("critical-banner-message").textContent = (
     `Panic remains incomplete. Local enumeration: ${localState}; `
     + `remote enumeration: ${remoteState}. Review the full receipt below.`
@@ -624,7 +632,9 @@ async function submitPanic(event) {
     if (receipt && receipt.safe === true) {
       renderPanicReceipt(receipt, true);
       unsafePanicLatched = false;
-      byId("critical-banner").hidden = true;
+      renderSafetyUnknown(
+        "Refreshing persisted local safety state after the broker-verified receipt.",
+      );
       notify("Panic receipt explicitly confirms a safe state.", "notice-success");
     } else {
       renderPanicReceipt(receipt, false);
@@ -706,6 +716,7 @@ function renderUnknownHealth() {
   byId("truth-mode").textContent = "Unknown";
   setState(byId("truth-database"), "Unknown", "caution");
   setState(byId("truth-daemon"), "Unknown", "caution");
+  setState(byId("truth-safety"), "Unknown", "caution");
   breakerScopes.forEach((scope) => {
     setState(
       byId(`truth-${scope}-breaker`),
@@ -713,12 +724,154 @@ function renderUnknownHealth() {
       "caution",
     );
   });
+  renderSafetyUnknown();
   updateBreakerReset();
+}
+
+function renderSafetyUnknown(message) {
+  const banner = byId("critical-banner");
+  byId("critical-banner-title").textContent = "Safety state unverified";
+  byId("critical-banner-message").textContent = (
+    message
+    || "Complete persisted local safety evidence is unavailable; broker open orders are unverified."
+  );
+  banner.hidden = false;
 }
 
 function invalidateHealthObservation() {
   healthRequestSequence += 1;
   renderUnknownHealth();
+}
+
+function isCanonicalIdList(value) {
+  return (
+    Array.isArray(value)
+    && value.every(
+      (item) => Number.isSafeInteger(item) && item > 0,
+    )
+  );
+}
+
+function breakerScopeIsCanonical(breaker) {
+  if (
+    ["loss", "drawdown", "data", "liquidity"].includes(
+      breaker.kind,
+    )
+  ) {
+    return (
+      breaker.target.length > 0
+      && breaker.scope === `${breaker.kind}:${breaker.target}`
+    );
+  }
+  if (
+    ["broker_drift", "operator_global"].includes(
+      breaker.kind,
+    )
+  ) {
+    return (
+      breaker.target === ""
+      && breaker.scope === breaker.kind
+    );
+  }
+  return false;
+}
+
+function safetyPayloadIsComplete(health) {
+  const safety = health.safety;
+  if (
+    !safety
+    || typeof safety !== "object"
+    || safety.complete !== true
+    || !["unsafe", "locally_clear"].includes(safety.state)
+    || safety.local_enumeration !== "confirmed"
+    || safety.remote_broker_open_orders !== "unverified"
+    || !Array.isArray(safety.active_breakers)
+    || !Array.isArray(safety.unknown_categories)
+    || safety.unknown_categories.length !== 0
+    || !safety.operator_global_breaker
+    || typeof safety.operator_global_breaker !== "object"
+    || typeof safety.operator_global_breaker.tripped !== "boolean"
+    || !Number.isSafeInteger(
+      safety.operator_global_breaker.generation,
+    )
+    || safety.operator_global_breaker.generation < 0
+    || !safety.unsafe_local_state
+    || typeof safety.unsafe_local_state !== "object"
+    || !Array.isArray(
+      safety.unsafe_local_state.unknown_categories,
+    )
+    || safety.unsafe_local_state.unknown_categories.length !== 0
+  ) {
+    return false;
+  }
+
+  for (const field of unsafeLocalIdFields) {
+    if (!isCanonicalIdList(safety.unsafe_local_state[field])) {
+      return false;
+    }
+  }
+
+  const activeScopes = new Map();
+  for (const breaker of safety.active_breakers) {
+    if (
+      !breaker
+      || typeof breaker !== "object"
+      || typeof breaker.scope !== "string"
+      || !breaker.scope
+      || typeof breaker.kind !== "string"
+      || !breaker.kind
+      || typeof breaker.target !== "string"
+      || !Number.isSafeInteger(breaker.generation)
+      || breaker.generation <= 0
+      || activeScopes.has(breaker.scope)
+      || !breakerScopeIsCanonical(breaker)
+    ) {
+      return false;
+    }
+    activeScopes.set(breaker.scope, breaker.generation);
+  }
+
+  const globalBreaker = safety.operator_global_breaker;
+  const activeGlobalGeneration = activeScopes.get("operator_global");
+  if (
+    (
+      globalBreaker.tripped
+      && (
+        globalBreaker.generation <= 0
+        || activeGlobalGeneration !== globalBreaker.generation
+      )
+    )
+    || (
+      !globalBreaker.tripped
+      && activeGlobalGeneration !== undefined
+    )
+  ) {
+    return false;
+  }
+
+  for (const scope of breakerScopes) {
+    const activeGeneration = activeScopes.get(`loss:${scope}`);
+    if (
+      health.killswitch[scope] !== (
+        activeGeneration !== undefined
+      )
+      || (
+        activeGeneration !== undefined
+        && health.killswitch_generation[scope]
+          !== activeGeneration
+      )
+    ) {
+      return false;
+    }
+  }
+
+  const unsafeLocal = unsafeLocalIdFields.some(
+    (field) => safety.unsafe_local_state[field].length > 0,
+  );
+  const knownUnsafe = activeScopes.size > 0 || unsafeLocal;
+  return safety.state === (
+    knownUnsafe ? "unsafe" : "locally_clear"
+  );
 }
 
 function healthPayloadIsComplete(health) {
@@ -749,26 +902,72 @@ function healthPayloadIsComplete(health) {
     if (
       typeof health.killswitch[scope] !== "boolean"
       || !Number.isSafeInteger(health.killswitch_generation[scope])
-      || health.killswitch_generation[scope] <= 0
+      || health.killswitch_generation[scope] < 0
     ) {
       return false;
     }
   }
-  if (Object.hasOwn(health, "observed_at")) {
-    if (typeof health.observed_at !== "string") {
-      return false;
-    }
-    const observedAt = Date.parse(health.observed_at);
-    const age = Date.now() - observedAt;
-    if (
-      !Number.isFinite(observedAt)
-      || age < -5000
-      || age > HEALTH_OBSERVATION_MAX_AGE_MS
-    ) {
-      return false;
-    }
+  if (typeof health.observed_at !== "string") {
+    return false;
   }
-  return true;
+  const observedAt = Date.parse(health.observed_at);
+  const age = Date.now() - observedAt;
+  if (
+    !Number.isFinite(observedAt)
+    || age < -5000
+    || age > HEALTH_OBSERVATION_MAX_AGE_MS
+  ) {
+    return false;
+  }
+  return safetyPayloadIsComplete(health);
+}
+
+function renderSafetyTruth(safety) {
+  if (safety.state === "locally_clear") {
+    setState(
+      byId("truth-safety"),
+      "Locally clear · broker open orders unverified",
+      "caution",
+    );
+    if (!unsafePanicLatched) {
+      byId("critical-banner").hidden = true;
+    }
+    return;
+  }
+
+  setState(
+    byId("truth-safety"),
+    "Unsafe · persisted local evidence",
+    "alarm",
+  );
+  const evidence = [];
+  const activeScopes = safety.active_breakers.map(
+    (breaker) => breaker.scope,
+  );
+  if (activeScopes.length) {
+    evidence.push(`active breakers: ${activeScopes.join(", ")}`);
+  }
+  const categoryLabels = {
+    live_or_unknown_order_ids: "live or unknown orders",
+    latched_order_ids: "latched orders",
+    unsafe_fill_ids: "unsafe fills",
+    active_rule_ids: "active rules",
+    unsafe_rule_group_ids: "unsafe rule groups",
+  };
+  unsafeLocalIdFields.forEach((field) => {
+    const ids = safety.unsafe_local_state[field];
+    if (ids.length) {
+      evidence.push(`${categoryLabels[field]}: ${ids.join(", ")}`);
+    }
+  });
+  byId("critical-banner-title").textContent = (
+    "Persisted safety warning"
+  );
+  byId("critical-banner-message").textContent = (
+    `Local safety is unsafe (${evidence.join("; ")}). `
+    + "Broker open orders remain unverified after reload."
+  );
+  byId("critical-banner").hidden = false;
 }
 
 function renderHealth(health) {
@@ -793,6 +992,7 @@ function renderHealth(health) {
       tripped ? "alarm" : "verified",
     );
   });
+  renderSafetyTruth(health.safety);
   updateBreakerReset();
 }
 

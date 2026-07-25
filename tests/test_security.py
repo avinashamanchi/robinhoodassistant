@@ -1357,6 +1357,7 @@ _HEALTH_DOM_SETUP = r"""
       "truth-mode",
       "truth-database",
       "truth-daemon",
+      "truth-safety",
       "truth-equity-breaker",
       "truth-crypto-breaker",
       "breaker-scope",
@@ -1364,13 +1365,53 @@ _HEALTH_DOM_SETUP = r"""
       "breaker-health",
       "breaker-reset-reason",
       "breaker-reset-button",
+      "critical-banner",
+      "critical-banner-title",
+      "critical-banner-message",
       "status-region",
       "receipt-panel",
     ]);
     elements["breaker-scope"].value = "equity";
+    const emptyUnsafeLocalState = () => ({
+      live_or_unknown_order_ids: [],
+      latched_order_ids: [],
+      unsafe_fill_ids: [],
+      active_rule_ids: [],
+      unsafe_rule_group_ids: [],
+      unknown_categories: [],
+    });
+    const safetyTruth = ({
+      state = "unsafe",
+      complete = true,
+      globalTripped = false,
+      globalGeneration = 0,
+      activeBreakers = [{
+        scope: "loss:equity",
+        kind: "loss",
+        target: "equity",
+        generation: 7,
+      }],
+      unsafeLocalState = emptyUnsafeLocalState(),
+      unknownCategories = [],
+    } = {}) => ({
+      state,
+      complete,
+      local_enumeration: unsafeLocalState.unknown_categories.length
+        ? "unknown"
+        : "confirmed",
+      remote_broker_open_orders: "unverified",
+      operator_global_breaker: {
+        tripped: globalTripped,
+        generation: globalGeneration,
+      },
+      active_breakers: activeBreakers,
+      unsafe_local_state: unsafeLocalState,
+      unknown_categories: unknownCategories,
+    });
     const validHealth = (generation = 7) => ({
       broker: "Alpaca",
       mode: "paper",
+      observed_at: new Date().toISOString(),
       db_ok: true,
       heartbeat_age_seconds: 1.5,
       daemon_alive: true,
@@ -1382,11 +1423,20 @@ _HEALTH_DOM_SETUP = r"""
         equity: generation,
         crypto: 3,
       },
+      safety: safetyTruth({
+        activeBreakers: [{
+          scope: "loss:equity",
+          kind: "loss",
+          target: "equity",
+          generation,
+        }],
+      }),
     });
     const assertUnknownAndDisabled = () => {
       for (const id of [
         "truth-database",
         "truth-daemon",
+        "truth-safety",
         "truth-equity-breaker",
         "truth-crypto-breaker",
       ]) {
@@ -1399,6 +1449,15 @@ _HEALTH_DOM_SETUP = r"""
       }
       if (!elements["breaker-reset-button"].disabled) {
         throw new Error("breaker reset remained enabled");
+      }
+      if (elements["critical-banner"].hidden) {
+        throw new Error("unverified safety banner was hidden");
+      }
+      if (
+        elements["critical-banner-title"].textContent
+        !== "Safety state unverified"
+      ) {
+        throw new Error("unverified safety title was not restored");
       }
     };
 """
@@ -1418,6 +1477,11 @@ _HEALTH_DOM_SETUP = r"""
         (
             "({...validHealth(), observed_at: "
             "new Date(Date.now() - 120000).toISOString()})"
+        ),
+        (
+            "({...validHealth(), safety: {...validHealth().safety, "
+            "active_breakers: [{scope: \"loss:equity\", "
+            "kind: \"operator_global\", target: \"\", generation: 7}]}})"
         ),
     ),
 )
@@ -1555,6 +1619,120 @@ def test_breaker_health_ignores_older_failure_after_newer_success():
     )
 
 
+@pytest.mark.parametrize(
+    ("safety_expression", "expected_fragment"),
+    (
+        (
+            """safetyTruth({
+              globalTripped: true,
+              globalGeneration: 4,
+              activeBreakers: [{
+                scope: "operator_global",
+                kind: "operator_global",
+                target: "",
+                generation: 4,
+              }],
+            })""",
+            "operator_global",
+        ),
+        (
+            """safetyTruth({
+              activeBreakers: [],
+              unsafeLocalState: {
+                ...emptyUnsafeLocalState(),
+                latched_order_ids: [41],
+              },
+            })""",
+            "latched orders",
+        ),
+        (
+            """safetyTruth({
+              activeBreakers: [],
+              unsafeLocalState: {
+                ...emptyUnsafeLocalState(),
+                unsafe_fill_ids: [77],
+              },
+            })""",
+            "unsafe fills",
+        ),
+    ),
+)
+def test_safety_banner_rehydrates_persisted_unsafe_truth_in_new_document(
+    safety_expression,
+    expected_fragment,
+):
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshHealth",),
+        _HEALTH_DOM_SETUP
+        + f"""
+        const health = validHealth();
+        health.killswitch = {{equity: false, crypto: false}};
+        health.killswitch_generation = {{equity: 0, crypto: 0}};
+        health.safety = {safety_expression};
+        globalThis.__api = (path) => {{
+          if (path === "/health") return Promise.resolve(health);
+          throw new Error(`unexpected API path ${{path}}`);
+        }};
+
+        await module.refreshHealth();
+        if (elements["critical-banner"].hidden) {{
+          throw new Error("persisted unsafe safety banner was hidden");
+        }}
+        if (
+          !elements["critical-banner-message"].textContent
+            .toLowerCase()
+            .includes({expected_fragment!r})
+        ) {{
+          throw new Error(
+            `missing durable evidence: ${{
+              elements["critical-banner-message"].textContent
+            }}`,
+          );
+        }}
+        if (!elements["truth-safety"].textContent.includes("Unsafe")) {{
+          throw new Error("truth rail did not report unsafe persisted state");
+        }}
+        """,
+    )
+
+
+def test_safety_banner_hides_only_for_complete_locally_clear_truth():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshHealth",),
+        _HEALTH_DOM_SETUP
+        + r"""
+        const health = validHealth();
+        health.killswitch = {equity: false, crypto: false};
+        health.killswitch_generation = {equity: 0, crypto: 0};
+        health.safety = safetyTruth({
+          state: "locally_clear",
+          activeBreakers: [],
+        });
+        globalThis.__api = (path) => {
+          if (path === "/health") return Promise.resolve(health);
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshHealth();
+        if (!elements["critical-banner"].hidden) {
+          throw new Error("complete locally clear truth retained critical banner");
+        }
+        if (
+          elements["truth-safety"].textContent
+          !== "Locally clear · broker open orders unverified"
+        ) {
+          throw new Error(
+            `locally clear truth overclaimed: ${
+              elements["truth-safety"].textContent
+            }`,
+          );
+        }
+        """,
+    )
+
+
 def test_breaker_reset_invalidates_health_before_refresh_result():
     _run_page_module(
         _STATIC / "js" / "index.js",
@@ -1618,9 +1796,10 @@ def test_console_javascript_requires_truthful_approval_panic_and_scoped_reset():
     assert "remote_enumeration" in text
     assert "safe === true" in text
     assert "everything halted" not in text.lower()
-    assert '["equity", "crypto"]' in text
+    assert 'const breakerScopes = ["equity", "crypto"]' in text
     assert "expected_generation" in text
-    assert "global" not in text.lower()
+    assert "asset_class: proof.scope" in text
+    assert '"/killswitch/reset"' in text
 
 
 def test_pages_include_accessible_session_actions_dialogs_and_live_regions():
@@ -1631,6 +1810,10 @@ def test_pages_include_accessible_session_actions_dialogs_and_live_regions():
     assert 'aria-label="Primary"' in index
     assert 'id="critical-banner"' in index
     assert 'role="alert"' in index
+    banner_start = index.index('id="critical-banner"')
+    banner_tag_end = index.index(">", banner_start)
+    assert "hidden" not in index[banner_start:banner_tag_end]
+    assert "Safety state unverified" in index
     assert 'id="approval-dialog"' in index
     assert 'aria-labelledby="approval-title"' in index
     assert 'id="reauth-dialog"' in index
@@ -1670,6 +1853,53 @@ def test_console_workspace_constrains_mobile_data_without_hiding_it():
         "    grid-template-columns: minmax(0, 1fr);"
     ) in css
     assert "overflow-wrap: anywhere;" in css
+
+
+def test_dynamic_text_surfaces_have_intrinsic_width_containment():
+    css = (_STATIC / "css" / "console.css").read_text(encoding="utf-8")
+
+    child_containment = css[
+        css.index(":where(.app-header,")
+        : css.index(
+            "}",
+            css.index(":where(.app-header,"),
+        )
+    ]
+    assert "min-width: 0;" in child_containment
+    assert "min-inline-size: 0;" in child_containment
+    assert "max-width: 100%;" in child_containment
+
+    dynamic_containment = css[
+        css.index(":where(.dynamic-text,")
+        : css.index(
+            "}",
+            css.index(":where(.dynamic-text,"),
+        )
+    ]
+    assert "min-width: 0;" in dynamic_containment
+    assert "min-inline-size: 0;" in dynamic_containment
+    assert "max-width: 100%;" in dynamic_containment
+    assert "overflow-wrap: anywhere;" in dynamic_containment
+    assert "word-break: break-word;" in dynamic_containment
+
+    table_start = css.index(".table-wrap {")
+    table_rule = css[table_start:css.index("}", table_start)]
+    assert "min-width: 0;" in table_rule
+    assert "max-width: 100%;" in table_rule
+    assert "overflow-x: auto;" in table_rule
+
+    cells_start = css.index("th,\ntd {")
+    cells_rule = css[cells_start:css.index("}", cells_start)]
+    assert "white-space: normal;" in cells_rule
+    assert "overflow-wrap: anywhere;" in cells_rule
+    assert "word-break: break-word;" in cells_rule
+
+    controls_start = css.index(".section-heading > button,")
+    controls_rule = css[
+        controls_start:css.index("}", controls_start)
+    ]
+    assert "flex-shrink: 0;" in controls_rule
+    assert "max-width: 100%;" in controls_rule
 
 
 # ── A3: redaction of new secrets ────────────────────────────────

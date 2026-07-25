@@ -56,6 +56,10 @@ from .orders.application import (
 )
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.reconciliation import ReconciliationService
+from .orders.safety_state import (
+    read_persisted_safety_truth,
+    unknown_persisted_safety_truth,
+)
 from .orders.submission import OrderSubmissionService
 from .risk.breakers import BreakerScope, BreakerService, trip_in_session
 from .risk.clock import CryptoClock, MarketClock
@@ -681,11 +685,12 @@ class TradingService:
             s.commit()
 
     def health(self) -> dict[str, Any]:
-        """Authenticated operational health: heartbeat, DB, and kill switches."""
+        """Authenticated operational health and durable local safety truth."""
         from sqlalchemy import select as _select
 
         from .db.models import Heartbeat
 
+        observed_at = utcnow()
         operating_context = {
             "broker": (
                 "Alpaca"
@@ -693,46 +698,71 @@ class TradingService:
                 else self.config.trading.broker.value.title()
             ),
             "mode": self.config.trading.mode.value,
+            "observed_at": observed_at.isoformat(),
         }
+        safety = read_persisted_safety_truth(
+            self.session_factory
+        )
         try:
             with self.session_factory() as s:
                 last = s.execute(
                     _select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
                 ).scalar_one_or_none()
-                age = (utcnow() - last.at).total_seconds() if last else None
-                eq_state = s.get(
-                    CircuitBreakerState,
-                    BreakerScope.loss(AssetClass.EQUITY).key,
-                )
-                cr_state = s.get(
-                    CircuitBreakerState,
-                    BreakerScope.loss(AssetClass.CRYPTO).key,
-                )
-                eq_tripped = bool(eq_state and eq_state.tripped)
-                cr_tripped = bool(cr_state and cr_state.tripped)
-            return {
+                age = (
+                    observed_at - last.at
+                ).total_seconds() if last else None
+            eq_state = safety.breaker(
+                BreakerScope.loss(AssetClass.EQUITY).key
+            )
+            cr_state = safety.breaker(
+                BreakerScope.loss(AssetClass.CRYPTO).key
+            )
+            response = {
                 **operating_context,
-                "db_ok": True,
-                "heartbeat_age_seconds": round(age, 1) if age is not None else None,
+                "db_ok": safety.complete,
+                "heartbeat_age_seconds": (
+                    round(age, 1)
+                    if age is not None
+                    else None
+                ),
                 "daemon_alive": (
                     age is not None
-                    and age < self.config.daemon.heartbeat_stale_seconds
+                    and age
+                    < self.config.daemon.heartbeat_stale_seconds
                 ),
-                "killswitch": {"equity": eq_tripped, "crypto": cr_tripped},
-                "killswitch_generation": {
-                    "equity": (
-                        eq_state.generation if eq_state is not None else None
+                "killswitch": {
+                    "equity": bool(
+                        eq_state and eq_state.tripped
                     ),
-                    "crypto": (
-                        cr_state.generation if cr_state is not None else None
+                    "crypto": bool(
+                        cr_state and cr_state.tripped
                     ),
                 },
+                "killswitch_generation": {
+                    "equity": (
+                        eq_state.generation
+                        if eq_state is not None
+                        else 0
+                    ),
+                    "crypto": (
+                        cr_state.generation
+                        if cr_state is not None
+                        else 0
+                    ),
+                },
+                "safety": safety.as_dict(),
             }
+            if not safety.complete:
+                response["error"] = "database_unavailable"
+            return response
         except Exception:
             return {
                 **operating_context,
                 "db_ok": False,
                 "error": "database_unavailable",
+                "safety": (
+                    unknown_persisted_safety_truth().as_dict()
+                ),
             }
 
     def panic(

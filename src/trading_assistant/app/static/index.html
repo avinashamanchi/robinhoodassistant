@@ -25,9 +25,9 @@
     </div>
   </header>
 
-  <div class="critical-banner" id="critical-banner" role="alert" hidden>
-    <strong>Unsafe state</strong>
-    <span id="critical-banner-message">Panic did not confirm a safe state.</span>
+  <div class="critical-banner" id="critical-banner" role="alert">
+    <strong id="critical-banner-title">Safety state unverified</strong>
+    <span id="critical-banner-message">Waiting for complete persisted local safety evidence; broker open orders are unverified.</span>
   </div>
 
   <main class="console-layout" id="main-content">
@@ -57,6 +57,10 @@
         <div class="truth-row">
           <dt>Daemon</dt>
           <dd id="truth-daemon" class="state state-caution">Checking</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Persisted safety</dt>
+          <dd id="truth-safety" class="state state-caution">Unknown</dd>
         </div>
         <div class="truth-row">
           <dt>Equity breaker</dt>
