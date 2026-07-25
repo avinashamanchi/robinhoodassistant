@@ -31,6 +31,7 @@ from trading_assistant.db.models import (
     CircuitBreakerState,
     FILL_RECONCILIATION_REQUIRED,
     Fill,
+    Heartbeat,
     Order,
     Proposal,
     RiskEvent,
@@ -594,6 +595,31 @@ def test_health_observed_at_identifies_one_complete_safety_snapshot(client):
     assert health["db_ok"] is True
     assert health["safety"]["complete"] is True
     assert health["observed_at"] == health["safety"]["observed_at"]
+
+
+def test_health_fails_closed_instead_of_reporting_negative_heartbeat_age(
+    client,
+):
+    c, service, _ = client
+    with service.session_factory() as session:
+        session.add(
+            Heartbeat(
+                source="daemon",
+                at=utcnow() + timedelta(days=1),
+            )
+        )
+        session.commit()
+
+    health = c.get("/health").json()
+
+    assert health["db_ok"] is False
+    assert health["daemon_alive"] is False
+    assert health["heartbeat_age_seconds"] is None
+    assert health["safety"]["state"] == "unknown"
+    assert health["safety"]["complete"] is False
+    assert health["safety"]["unknown_categories"] == [
+        "heartbeat"
+    ]
 
 
 def test_health_reports_complete_locally_clear_persisted_safety_truth(client):

@@ -24,10 +24,16 @@ let healthRequestSequence = 0;
 let breakerResetInFlight = false;
 let pendingOrders = new Map();
 let pendingRequestSequence = 0;
+let pendingAbortController = null;
 let approvalDialogState = null;
 let approvalRequestSequence = 0;
 let rejectionOrderId = null;
 let unsafePanicLatched = false;
+const operationalRefreshState = {
+  positions: {requestSequence: 0, controller: null},
+  holdings: {requestSequence: 0, controller: null},
+  riskLog: {requestSequence: 0, controller: null},
+};
 
 function node(tag, value, className) {
   const element = document.createElement(tag);
@@ -165,7 +171,45 @@ function orderSummary(order) {
   return `${order.side} ${amount} · ${order.order_type}${limit}`;
 }
 
+function beginOperationalRefresh(resource, target, loadingMessage) {
+  const state = operationalRefreshState[resource];
+  if (state.controller) {
+    state.controller.abort();
+  }
+  state.requestSequence += 1;
+  state.controller = new AbortController();
+  clear(target);
+  target.appendChild(node("p", loadingMessage, "empty-state"));
+  return Object.freeze({
+    resource,
+    requestToken: state.requestSequence,
+    controller: state.controller,
+  });
+}
+
+function operationalRefreshIsCurrent(request) {
+  const state = operationalRefreshState[request.resource];
+  return Boolean(
+    state
+    && state.requestSequence === request.requestToken
+    && state.controller === request.controller
+  );
+}
+
+function finishOperationalRefresh(request) {
+  if (!operationalRefreshIsCurrent(request)) {
+    return false;
+  }
+  operationalRefreshState[request.resource].controller = null;
+  return true;
+}
+
 async function refreshPending() {
+  if (pendingAbortController) {
+    pendingAbortController.abort();
+  }
+  const controller = new AbortController();
+  pendingAbortController = controller;
   const requestToken = ++pendingRequestSequence;
   pendingOrders = new Map();
   const list = byId("pending-list");
@@ -174,22 +218,33 @@ async function refreshPending() {
   updateApprovalButton();
   let payload;
   try {
-    payload = await api("/pending");
+    payload = await api("/pending", {
+      signal: controller.signal,
+    });
   } catch (error) {
-    if (requestToken === pendingRequestSequence) {
-      clear(list);
-      list.appendChild(node(
-        "li",
-        "Pending proposal truth is unavailable.",
-        "empty-state",
-      ));
-      updateApprovalButton();
+    if (
+      requestToken !== pendingRequestSequence
+      || pendingAbortController !== controller
+    ) {
+      return false;
     }
+    pendingAbortController = null;
+    clear(list);
+    list.appendChild(node(
+      "li",
+      "Pending proposal truth is unavailable.",
+      "empty-state",
+    ));
+    updateApprovalButton();
     throw error;
   }
-  if (requestToken !== pendingRequestSequence) {
-    return;
+  if (
+    requestToken !== pendingRequestSequence
+    || pendingAbortController !== controller
+  ) {
+    return false;
   }
+  pendingAbortController = null;
   clear(list);
   const pending = Array.isArray(payload.pending) ? payload.pending : [];
   const verifiedPending = pending
@@ -205,7 +260,7 @@ async function refreshPending() {
       "No verified pending proposals.",
       "empty-state",
     ));
-    return;
+    return true;
   }
   verifiedPending.forEach((order) => {
     const item = node("li", null, "ledger-entry");
@@ -236,6 +291,7 @@ async function refreshPending() {
     item.append(content, actions);
     list.appendChild(item);
   });
+  return true;
 }
 
 function canonicalId(value) {
@@ -1075,13 +1131,38 @@ async function refreshHealth() {
 }
 
 async function refreshPositions() {
-  const payload = await api("/positions");
   const target = byId("positions");
+  const request = beginOperationalRefresh(
+    "positions",
+    target,
+    "Refreshing positions…",
+  );
+  let payload;
+  try {
+    payload = await api("/positions", {
+      signal: request.controller.signal,
+    });
+  } catch (error) {
+    if (!operationalRefreshIsCurrent(request)) {
+      return false;
+    }
+    finishOperationalRefresh(request);
+    clear(target);
+    target.appendChild(node(
+      "p",
+      "Position truth is unavailable.",
+      "empty-state",
+    ));
+    throw error;
+  }
+  if (!finishOperationalRefresh(request)) {
+    return false;
+  }
   clear(target);
   const positions = Array.isArray(payload.positions) ? payload.positions : [];
   if (!positions.length) {
     target.appendChild(node("p", "No open positions.", "empty-state"));
-    return;
+    return true;
   }
   target.appendChild(makeTable(
     ["Symbol", "Quantity", "Average", "Last", "Value"],
@@ -1093,13 +1174,42 @@ async function refreshPositions() {
       position.market_value,
     ]),
   ));
+  return true;
 }
 
 async function refreshHoldings() {
-  const payload = await api("/holdings");
   const target = byId("holdings");
+  const freshness = byId("external-stale");
+  const request = beginOperationalRefresh(
+    "holdings",
+    target,
+    "Refreshing holdings…",
+  );
+  freshness.textContent = "Refreshing external source freshness…";
+  let payload;
+  try {
+    payload = await api("/holdings", {
+      signal: request.controller.signal,
+    });
+  } catch (error) {
+    if (!operationalRefreshIsCurrent(request)) {
+      return false;
+    }
+    finishOperationalRefresh(request);
+    clear(target);
+    target.appendChild(node(
+      "p",
+      "Holding truth is unavailable.",
+      "empty-state",
+    ));
+    freshness.textContent = "External source freshness is unavailable.";
+    throw error;
+  }
+  if (!finishOperationalRefresh(request)) {
+    return false;
+  }
   clear(target);
-  byId("external-stale").textContent = (
+  freshness.textContent = (
     payload.external_stale === true
       ? "External data is stale."
       : payload.external_available === false
@@ -1112,7 +1222,7 @@ async function refreshHoldings() {
   ];
   if (!holdings.length) {
     target.appendChild(node("p", "No holdings reported.", "empty-state"));
-    return;
+    return true;
   }
   const totals = payload.combined_by_ticker || {};
   target.appendChild(makeTable(
@@ -1127,18 +1237,44 @@ async function refreshHoldings() {
       totals[holding.ticker],
     ]),
   ));
+  return true;
 }
 
 async function refreshRiskLog() {
-  const payload = await api("/log");
   const target = byId("risk-log");
+  const request = beginOperationalRefresh(
+    "riskLog",
+    target,
+    "Refreshing risk events…",
+  );
+  let payload;
+  try {
+    payload = await api("/log", {
+      signal: request.controller.signal,
+    });
+  } catch (error) {
+    if (!operationalRefreshIsCurrent(request)) {
+      return false;
+    }
+    finishOperationalRefresh(request);
+    clear(target);
+    target.appendChild(node(
+      "p",
+      "Risk event truth is unavailable.",
+      "empty-state",
+    ));
+    throw error;
+  }
+  if (!finishOperationalRefresh(request)) {
+    return false;
+  }
   clear(target);
   const events = Array.isArray(payload.risk_events)
     ? payload.risk_events
     : [];
   if (!events.length) {
     target.appendChild(node("p", "No risk events reported.", "empty-state"));
-    return;
+    return true;
   }
   events.forEach((event) => {
     const row = node("article", null, "event-row");
@@ -1150,6 +1286,7 @@ async function refreshRiskLog() {
     row.appendChild(node("div", readable(event.reason), "event-reason"));
     target.appendChild(row);
   });
+  return true;
 }
 
 function appendChat(who, message) {

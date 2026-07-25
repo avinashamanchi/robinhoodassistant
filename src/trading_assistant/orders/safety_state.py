@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -63,6 +63,66 @@ _SAFETY_LATCH_ERROR_CODES = (
     "remote_fill_ahead",
     "waiting_for_exact_fill",
 )
+
+
+def _normalize_database_utc(
+    value: datetime | str,
+    *,
+    millisecond_upper_bound: bool = False,
+) -> datetime:
+    """Normalize a database timestamp to an aware UTC observation bound."""
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    elif isinstance(value, datetime):
+        parsed = value
+    else:
+        raise TypeError("database UTC timestamp has an invalid type")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    observed_at = parsed.astimezone(timezone.utc)
+    if millisecond_upper_bound:
+        # SQLite's built-in UTC clock is millisecond-granular. Represent the
+        # end of that clock tick so application timestamps committed within
+        # the same tick cannot appear later than their containing snapshot.
+        observed_at += timedelta(microseconds=999)
+    return observed_at
+
+
+def _establish_snapshot_and_observe_utc(
+    session: Session,
+) -> datetime:
+    """Establish the read snapshot and obtain its UTC bound in one statement."""
+    connection = session.connection()
+    if connection.dialect.name == "sqlite":
+        statement = (
+            select(
+                func.strftime(
+                    "%Y-%m-%dT%H:%M:%fZ",
+                    "now",
+                ),
+                func.count(
+                    CircuitBreakerState.scope_key
+                ),
+            )
+            .select_from(CircuitBreakerState)
+        )
+        observed_at = connection.execute(statement).one()[0]
+        return _normalize_database_utc(
+            observed_at,
+            millisecond_upper_bound=True,
+        )
+
+    statement = (
+        select(
+            func.current_timestamp(),
+            func.count(CircuitBreakerState.scope_key),
+        )
+        .select_from(CircuitBreakerState)
+    )
+    observed_at = connection.execute(statement).one()[0]
+    return _normalize_database_utc(observed_at)
 
 
 @dataclass(frozen=True)
@@ -210,7 +270,9 @@ def _coherent_read_snapshot(
             )
             if not driver_connection.in_transaction:
                 connection.exec_driver_sql("BEGIN")
-        observed_at = utcnow()
+        observed_at = _establish_snapshot_and_observe_utc(
+            session
+        )
         yield observed_at
         if transaction is not None:
             transaction.commit()
@@ -390,6 +452,12 @@ def _read_persisted_safety_truth_in_session(
                 .order_by(Heartbeat.id.desc())
                 .limit(1)
             )
+            if (
+                heartbeat_at is not None
+                and heartbeat_at > observed_at
+            ):
+                heartbeat_at = None
+                heartbeat_unknown = True
         except Exception:
             heartbeat_unknown = True
 

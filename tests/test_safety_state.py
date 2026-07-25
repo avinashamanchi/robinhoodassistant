@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import event, update
 
+import trading_assistant.orders.safety_state as safety_state
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import Fill, Order, utcnow
+from trading_assistant.db.models import Fill, Heartbeat, Order, utcnow
 from trading_assistant.orders.safety_state import (
     read_persisted_safety_truth,
 )
@@ -155,6 +156,109 @@ def test_safety_read_includes_writer_committed_before_snapshot_acquisition(
         truth.unsafe_local_state.live_or_unknown_order_ids
     )
     assert fill_id in truth.unsafe_local_state.unsafe_fill_ids
+
+
+def test_safety_observation_time_is_bound_to_first_sqlite_snapshot_read(
+    engine,
+    session_factory,
+    monkeypatch,
+):
+    order_id = _terminal_order(
+        session_factory,
+        "snapshot-clock-interleaving-order",
+    )
+    stale_application_time = (
+        datetime.now(timezone.utc) - timedelta(days=1)
+    )
+    heartbeat_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).replace(microsecond=0)
+    interleaved = False
+    fill_id: int | None = None
+
+    # A persisted snapshot must use database time from the statement that
+    # establishes the SQLite snapshot, not an injectable application clock
+    # sampled in the BEGIN-to-first-read gap.
+    monkeypatch.setattr(
+        safety_state,
+        "utcnow",
+        lambda: stale_application_time,
+    )
+
+    def commit_before_first_snapshot_read(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        nonlocal interleaved, fill_id
+        if (
+            interleaved
+            or not statement.lstrip().upper().startswith("SELECT")
+        ):
+            return
+        interleaved = True
+        with session_factory() as writer:
+            writer.execute(
+                update(Order)
+                .where(Order.id == order_id)
+                .values(
+                    status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                    acceptance_state=(
+                        OrderStatus.ACCEPTANCE_UNKNOWN.value
+                    ),
+                    last_error_code="broker_submission_unknown",
+                    updated_at=heartbeat_at,
+                    version=Order.version + 1,
+                )
+            )
+            fill = Fill(
+                order_id=None,
+                ticker="MSFT",
+                side="sell",
+                qty=Decimal("1"),
+                price=Decimal("200"),
+                broker_fill_id="snapshot-clock-interleaving-fill",
+            )
+            writer.add(fill)
+            writer.add(
+                Heartbeat(
+                    source="daemon",
+                    at=heartbeat_at,
+                )
+            )
+            writer.flush()
+            fill_id = fill.id
+            writer.commit()
+
+    event.listen(
+        engine,
+        "before_cursor_execute",
+        commit_before_first_snapshot_read,
+    )
+    try:
+        truth = read_persisted_safety_truth(session_factory)
+    finally:
+        event.remove(
+            engine,
+            "before_cursor_execute",
+            commit_before_first_snapshot_read,
+        )
+
+    assert interleaved is True
+    assert fill_id is not None
+    assert order_id in (
+        truth.unsafe_local_state.live_or_unknown_order_ids
+    )
+    assert fill_id in truth.unsafe_local_state.unsafe_fill_ids
+    assert truth.heartbeat_at == heartbeat_at
+    assert truth.observed_at.tzinfo is timezone.utc
+    assert truth.observed_at >= heartbeat_at
+    assert (
+        truth.observed_at - truth.heartbeat_at
+    ).total_seconds() >= 0
 
 
 def test_safety_read_reuses_an_active_sqlite_transaction_without_nested_begin(

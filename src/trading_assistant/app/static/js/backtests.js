@@ -8,6 +8,11 @@ import {
 } from "/static/js/auth.js";
 
 const byId = (id) => document.getElementById(id);
+let runsRequestSequence = 0;
+let runsAbortController = null;
+let reportSelection = null;
+let reportRequestSequence = 0;
+let reportAbortController = null;
 
 function node(tag, value, className) {
   const element = document.createElement(tag);
@@ -44,13 +49,52 @@ function notify(message, kind = "") {
 }
 
 async function refreshRuns() {
-  const payload = await api("/backtests");
   const target = byId("backtest-runs");
+  if (runsAbortController) {
+    runsAbortController.abort();
+  }
+  const controller = new AbortController();
+  runsAbortController = controller;
+  const requestToken = ++runsRequestSequence;
+  clear(target);
+  target.appendChild(node(
+    "p",
+    "Refreshing saved runs…",
+    "empty-state",
+  ));
+  let payload;
+  try {
+    payload = await api("/backtests", {
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (
+      requestToken !== runsRequestSequence
+      || runsAbortController !== controller
+    ) {
+      return false;
+    }
+    runsAbortController = null;
+    clear(target);
+    target.appendChild(node(
+      "p",
+      "Saved run truth is unavailable.",
+      "empty-state",
+    ));
+    throw error;
+  }
+  if (
+    requestToken !== runsRequestSequence
+    || runsAbortController !== controller
+  ) {
+    return false;
+  }
+  runsAbortController = null;
   clear(target);
   const runs = Array.isArray(payload.backtests) ? payload.backtests : [];
   if (!runs.length) {
     target.appendChild(node("p", "No saved runs.", "empty-state"));
-    return;
+    return true;
   }
   runs.forEach((run) => {
     const button = node("button", null, "run-item");
@@ -66,6 +110,7 @@ async function refreshRuns() {
     button.addEventListener("click", () => showReport(run.run_id));
     target.appendChild(button);
   });
+  return true;
 }
 
 function formatMetric(value, digits = 2) {
@@ -73,14 +118,112 @@ function formatMetric(value, digits = 2) {
   return Number.isFinite(number) ? number.toFixed(digits) : "Unavailable";
 }
 
-async function showReport(runId) {
+function canonicalRunId(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function reportSelectionIsCurrent(requestToken, targetRunId, controller) {
+  return Boolean(
+    reportSelection
+    && reportSelection.requestToken === requestToken
+    && reportSelection.targetRunId === targetRunId
+    && reportSelection.controller === controller
+    && requestToken === reportRequestSequence
+    && reportAbortController === controller
+  );
+}
+
+function beginReportTransition(title, message) {
+  if (reportAbortController) {
+    reportAbortController.abort();
+    reportAbortController = null;
+  }
+  reportSelection = null;
+  const requestToken = ++reportRequestSequence;
+  byId("report-title").textContent = title;
   const target = byId("backtest-report");
   clear(target);
+  target.appendChild(node("p", message, "empty-state"));
+  return requestToken;
+}
+
+function reportTransitionIsCurrent(requestToken) {
+  return Boolean(
+    requestToken === reportRequestSequence
+    && reportSelection === null
+  );
+}
+
+async function showReport(runId) {
+  const targetRunId = canonicalRunId(runId);
+  const target = byId("backtest-report");
+  if (reportAbortController) {
+    reportAbortController.abort();
+  }
+  const controller = new AbortController();
+  reportAbortController = controller;
+  const requestToken = ++reportRequestSequence;
+  reportSelection = Object.freeze({
+    targetRunId,
+    requestToken,
+    controller,
+    report: null,
+  });
+  clear(target);
+  if (targetRunId === null) {
+    reportAbortController = null;
+    byId("report-title").textContent = "Choose a run";
+    target.appendChild(node(
+      "p",
+      "Report identity mismatch. Choose a current saved run.",
+      "banner-caution",
+    ));
+    return false;
+  }
+  byId("report-title").textContent = (
+    `Loading report #${targetRunId}`
+  );
   target.appendChild(node("p", "Loading report…", "empty-state"));
   try {
-    const report = await api(`/backtests/${runId}/report`);
+    const report = await api(
+      `/backtests/${targetRunId}/report`,
+      {signal: controller.signal},
+    );
+    if (!reportSelectionIsCurrent(
+      requestToken,
+      targetRunId,
+      controller,
+    )) {
+      return false;
+    }
+    if (canonicalRunId(report && report.run_id) !== targetRunId) {
+      reportAbortController = null;
+      reportSelection = Object.freeze({
+        targetRunId,
+        requestToken,
+        controller,
+        report: null,
+      });
+      byId("report-title").textContent = (
+        `Report #${targetRunId} unavailable`
+      );
+      clear(target);
+      target.appendChild(node(
+        "p",
+        "Report identity mismatch. Refresh and choose the run again.",
+        "banner-caution",
+      ));
+      return false;
+    }
+    reportAbortController = null;
+    reportSelection = Object.freeze({
+      targetRunId,
+      requestToken,
+      controller,
+      report: Object.freeze(report),
+    });
     byId("report-title").textContent = (
-      `Report #${readable(report.run_id)} · ${readable(report.label)}`
+      `Report #${targetRunId} · ${readable(report.label)}`
     );
     clear(target);
     target.appendChild(node("p", readable(report.disclaimer), "banner-caution"));
@@ -144,9 +287,28 @@ async function showReport(runId) {
     table.appendChild(body);
     wrapper.appendChild(table);
     target.appendChild(wrapper);
+    return true;
   } catch (error) {
+    if (!reportSelectionIsCurrent(
+      requestToken,
+      targetRunId,
+      controller,
+    )) {
+      return false;
+    }
+    reportAbortController = null;
+    reportSelection = Object.freeze({
+      targetRunId,
+      requestToken,
+      controller,
+      report: null,
+    });
+    byId("report-title").textContent = (
+      `Report #${targetRunId} unavailable`
+    );
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
+    return false;
   }
 }
 
@@ -157,18 +319,29 @@ async function submitBacktest(event) {
     notify("A non-empty backtest reason is required.", "notice-error");
     return;
   }
-  const target = byId("backtest-report");
-  clear(target);
-  target.appendChild(node("p", "Running walk-forward simulation…", "empty-state"));
+  const reportTransitionToken = beginReportTransition(
+    "Running backtest",
+    "Running walk-forward simulation…",
+  );
   try {
     const result = await api("/backtests/run", jsonPost({reason}));
     byId("backtest-reason").value = "";
     await refreshRuns();
-    await showReport(result.run_id);
+    if (reportTransitionIsCurrent(reportTransitionToken)) {
+      await showReport(result.run_id);
+    }
     notify(`Backtest ${readable(result.run_id)} completed.`, "notice-success");
   } catch (error) {
-    clear(target);
-    target.appendChild(node("p", errorText(error), "banner-caution"));
+    if (reportTransitionIsCurrent(reportTransitionToken)) {
+      byId("report-title").textContent = "Backtest run unavailable";
+      const target = byId("backtest-report");
+      clear(target);
+      target.appendChild(node(
+        "p",
+        errorText(error),
+        "banner-caution",
+      ));
+    }
   }
 }
 

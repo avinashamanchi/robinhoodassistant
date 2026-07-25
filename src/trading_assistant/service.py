@@ -553,73 +553,94 @@ class TradingService:
             raise ValueError("bracket prices must be valid decimals") from exc
         if take_profit <= 0 or stop_loss <= 0:
             raise ValueError("bracket prices must be positive")
-        with self.session_factory() as s:
-            existing = s.execute(
-                select(Order).where(
-                    Order.idempotency_key == order_req.idempotency_key
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                order_id = existing.id
-            else:
-                order = Order(
-                    idempotency_key=order_req.idempotency_key,
-                    ticker=order_req.ticker,
-                    side=order_req.side.value,
-                    order_type=order_req.order_type.value,
-                    qty=order_req.qty,
-                    notional=order_req.notional,
-                    limit_price=order_req.limit_price,
-                    status=OrderStatus.PROPOSED.value,
-                    submission_kind="bracket",
-                    submission_payload_json=json.dumps(
-                        {"take_profit": str(take_profit), "stop_loss": str(stop_loss)}
-                    ),
-                )
-                s.add(order)
-                risk_cfg = self.config.crypto_risk if self._asset_class(order_req.ticker) is AssetClass.CRYPTO else self.config.risk
-                ttl = (risk_cfg or self.config.risk).proposal_ttl_minutes
-                s.flush()
-                s.add(
-                    Proposal(
-                        order_id=order.id,
-                        ttl_minutes=ttl,
-                        expires_at=utcnow() + timedelta(minutes=ttl),
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as s:
+                existing = s.execute(
+                    select(Order).where(
+                        Order.idempotency_key
+                        == order_req.idempotency_key
                     )
-                )
-                s.add(
-                    AuditEvent(
-                        actor=actor,
-                        action="order.propose",
-                        target_type="order",
-                        target_id=str(order.id),
-                        request_id=request_id,
-                        reason=reason,
-                        result_code=OrderStatus.PROPOSED.value,
-                        detail_json=json.dumps(
-                            {"submission_kind": "bracket"},
-                            sort_keys=True,
+                ).scalar_one_or_none()
+                if existing is not None:
+                    order_id = existing.id
+                else:
+                    order = Order(
+                        idempotency_key=order_req.idempotency_key,
+                        ticker=order_req.ticker,
+                        side=order_req.side.value,
+                        order_type=order_req.order_type.value,
+                        qty=order_req.qty,
+                        notional=order_req.notional,
+                        limit_price=order_req.limit_price,
+                        status=OrderStatus.PROPOSED.value,
+                        submission_kind="bracket",
+                        submission_payload_json=json.dumps(
+                            {
+                                "take_profit": str(take_profit),
+                                "stop_loss": str(stop_loss),
+                            }
                         ),
                     )
-                )
-                s.commit()
-                order_id = order.id
+                    s.add(order)
+                    risk_cfg = (
+                        self.config.crypto_risk
+                        if self._asset_class(order_req.ticker)
+                        is AssetClass.CRYPTO
+                        else self.config.risk
+                    )
+                    ttl = (
+                        risk_cfg or self.config.risk
+                    ).proposal_ttl_minutes
+                    s.flush()
+                    s.add(
+                        Proposal(
+                            order_id=order.id,
+                            ttl_minutes=ttl,
+                            expires_at=(
+                                utcnow()
+                                + timedelta(minutes=ttl)
+                            ),
+                        )
+                    )
+                    s.add(
+                        AuditEvent(
+                            actor=actor,
+                            action="order.propose",
+                            target_type="order",
+                            target_id=str(order.id),
+                            request_id=request_id,
+                            reason=reason,
+                            result_code=(
+                                OrderStatus.PROPOSED.value
+                            ),
+                            detail_json=json.dumps(
+                                {
+                                    "submission_kind": (
+                                        "bracket"
+                                    )
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+                    s.commit()
+                    order_id = order.id
 
-        with self.session_factory() as session:
-            current = session.get(Order, order_id)
-            assert current is not None
-            current_status = OrderStatus(current.status)
-        if current_status is OrderStatus.PROPOSED:
-            approval = self.order_application.approve(
-                ApprovalCommand(
-                    order_id,
-                    actor,
-                    reason,
-                    utcnow(),
-                    request_id,
+            with self.session_factory() as session:
+                current = session.get(Order, order_id)
+                assert current is not None
+                current_status = OrderStatus(current.status)
+            if current_status is OrderStatus.PROPOSED:
+                approval = self.order_application.approve(
+                    ApprovalCommand(
+                        order_id,
+                        actor,
+                        reason,
+                        utcnow(),
+                        request_id,
+                    )
                 )
-            )
-            current_status = approval.status
+                current_status = approval.status
         result = self.order_submission.submit(
             order_id,
             actor=actor,

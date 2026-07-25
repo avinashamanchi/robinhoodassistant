@@ -11,22 +11,27 @@ from multiprocessing.context import SpawnContext
 from threading import Event, Thread
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
     BrokerFill,
+    OrderRequest,
     OrderResult,
+    OrderSide,
     OrderStatus,
+    OrderType,
     Position,
 )
 from trading_assistant.config import RiskConfig
 from trading_assistant.db.models import (
+    AuditEvent,
     FILL_RECONCILIATION_REQUIRED,
     Fill,
     Order,
+    Proposal,
     utcnow,
 )
 from trading_assistant.db.session import create_db_engine, make_session_factory
@@ -103,6 +108,38 @@ class _PausedPanicBroker(MockBroker):
     def submit_order(self, order):
         self.submit_calls += 1
         return super().submit_order(order)
+
+
+class _PausedProcessPanicBroker(MockBroker):
+    def __init__(self, entered, release) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+        self.paused = False
+
+    def get_open_orders(self):
+        if not self.paused:
+            self.paused = True
+            self.entered.set()
+            if not self.release.wait(timeout=10):
+                raise TimeoutError(
+                    "test did not release process panic enumeration"
+                )
+        return []
+
+
+class _CountingProcessBracketBroker(MockBroker):
+    def __init__(self) -> None:
+        super().__init__(prices={"AAPL": Decimal("100")})
+        self.bracket_submit_calls = 0
+
+    def submit_bracket(self, order, take_profit, stop_loss):
+        self.bracket_submit_calls += 1
+        return super().submit_bracket(
+            order,
+            take_profit,
+            stop_loss,
+        )
 
 
 class _ImmediateProcessBroker:
@@ -1185,6 +1222,119 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
         finished.set()
 
 
+def _paused_panic_process(
+    db_url,
+    panic_entered,
+    release_panic,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    broker = _PausedProcessPanicBroker(
+        panic_entered,
+        release_panic,
+    )
+    try:
+        report = ReconciliationService(
+            factory,
+            broker,
+            OrderRepository(factory),
+            BreakerService(factory),
+        ).panic(
+            "operator:process-panic",
+            "serialize bracket proposal creation",
+            request_id="process-panic-bracket-race",
+        )
+        outcome.put(("ok", report.safe))
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        finished.set()
+
+
+def _bracket_submission_process(
+    db_url,
+    app_config,
+    started,
+    proposal_committed,
+    finished,
+    outcome,
+):
+    factory = make_session_factory(create_db_engine(db_url))
+    broker = _CountingProcessBracketBroker()
+    service = TradingService(
+        broker,
+        factory,
+        app_config,
+        FakeClock(),
+    )
+    proposal_commit_pending = False
+
+    def identify_proposal_commit(session):
+        nonlocal proposal_commit_pending
+        proposal_commit_pending = any(
+            isinstance(row, Proposal)
+            for row in session.new
+        )
+
+    def announce_proposal_commit(_session):
+        nonlocal proposal_commit_pending
+        if proposal_commit_pending:
+            proposal_commit_pending = False
+            proposal_committed.set()
+
+    session_type = factory.class_
+    event.listen(
+        session_type,
+        "before_commit",
+        identify_proposal_commit,
+    )
+    event.listen(
+        session_type,
+        "after_commit",
+        announce_proposal_commit,
+    )
+    started.set()
+    try:
+        result = service.submit_bracket_order(
+            OrderRequest(
+                ticker="AAPL",
+                side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                idempotency_key="panic-racing-bracket",
+                qty=Decimal("1"),
+                limit_price=Decimal("100"),
+            ),
+            Decimal("110"),
+            Decimal("95"),
+            actor="operator:process-bracket",
+            reason="human reviewed process bracket",
+            request_id="process-bracket-race",
+        )
+        outcome.put(
+            (
+                "ok",
+                result["status"],
+                result["executed"],
+                broker.bracket_submit_calls,
+            )
+        )
+    except BaseException as exc:
+        outcome.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        event.remove(
+            session_type,
+            "before_commit",
+            identify_proposal_commit,
+        )
+        event.remove(
+            session_type,
+            "after_commit",
+            announce_proposal_commit,
+        )
+        finished.set()
+
+
 def _active_transaction_compatibility_writer_process(
     db_url,
     sqlite_locked,
@@ -1647,6 +1797,118 @@ def test_panic_serializes_approval_and_rule_writers_through_safe_decision(
             session.get(Order, order_id).status
             == OrderStatus.REJECTED.value
         )
+
+
+def test_panic_serializes_bracket_proposal_and_approval_across_processes(
+    make_service,
+    db_url,
+    app_config,
+):
+    context: SpawnContext = __import__("multiprocessing").get_context(
+        "spawn"
+    )
+    service = make_service()
+    panic_entered = context.Event()
+    release_panic = context.Event()
+    panic_finished = context.Event()
+    panic_outcome = context.Queue()
+    panic = context.Process(
+        target=_paused_panic_process,
+        args=(
+            db_url,
+            panic_entered,
+            release_panic,
+            panic_finished,
+            panic_outcome,
+        ),
+    )
+    panic.start()
+    assert panic_entered.wait(timeout=10)
+
+    bracket_started = context.Event()
+    proposal_committed = context.Event()
+    bracket_finished = context.Event()
+    bracket_outcome = context.Queue()
+    bracket = context.Process(
+        target=_bracket_submission_process,
+        args=(
+            db_url,
+            app_config,
+            bracket_started,
+            proposal_committed,
+            bracket_finished,
+            bracket_outcome,
+        ),
+    )
+    bracket.start()
+    assert bracket_started.wait(timeout=10)
+    try:
+        committed_while_panic_decides = proposal_committed.wait(
+            timeout=1
+        )
+        with service.session_factory() as session:
+            durable_during_panic = session.scalar(
+                select(func.count())
+                .select_from(Order)
+                .where(
+                    Order.idempotency_key
+                    == "panic-racing-bracket"
+                )
+            )
+    finally:
+        release_panic.set()
+        _join(panic, release_panic)
+        _join(bracket)
+
+    assert committed_while_panic_decides is False
+    assert durable_during_panic == 0
+    assert panic_finished.is_set() is True
+    assert bracket_finished.is_set() is True
+    assert panic_outcome.get(timeout=2) == ("ok", True)
+    assert bracket_outcome.get(timeout=2) == (
+        "ok",
+        OrderStatus.REJECTED.value,
+        False,
+        0,
+    )
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    ) is True
+
+    with service.session_factory() as session:
+        order = session.scalar(
+            select(Order).where(
+                Order.idempotency_key
+                == "panic-racing-bracket"
+            )
+        )
+        assert order is not None
+        assert order.status == OrderStatus.REJECTED.value
+        assert session.scalar(
+            select(func.count())
+            .select_from(Proposal)
+            .where(Proposal.order_id == order.id)
+        ) == 1
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.target_id == str(order.id),
+                AuditEvent.request_id
+                == "process-bracket-race",
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.action == "order.approve",
+                AuditEvent.target_id == str(order.id),
+                AuditEvent.request_id
+                == "process-bracket-race",
+            )
+        ) == 1
 
 
 @pytest.mark.parametrize(

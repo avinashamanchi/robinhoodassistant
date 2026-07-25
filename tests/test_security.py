@@ -1109,6 +1109,809 @@ def test_approval_dialog_requires_explicit_current_pending_status():
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "function_name",
+        "path",
+        "target_id",
+        "extra_ids",
+        "older_payload",
+        "newer_payload",
+        "older_evidence",
+        "newer_evidence",
+    ),
+    (
+        (
+            "refreshPositions",
+            "/positions",
+            "positions",
+            (),
+            (
+                '{positions: [{ticker: "OLD-POS", qty: "1", '
+                'avg_entry_price: "10", current_price: "10", '
+                'market_value: "10"}]}'
+            ),
+            (
+                '{positions: [{ticker: "NEW-POS", qty: "2", '
+                'avg_entry_price: "20", current_price: "21", '
+                'market_value: "42"}]}'
+            ),
+            "OLD-POS",
+            "NEW-POS",
+        ),
+        (
+            "refreshHoldings",
+            "/holdings",
+            "holdings",
+            ("external-stale",),
+            (
+                '{alpaca: [{ticker: "OLD-HOLD", source: "alpaca", '
+                'read_only: false, qty: "1", market_value: "10"}], '
+                'external: [], combined_by_ticker: {"OLD-HOLD": "10"}, '
+                "external_stale: true, external_available: true}"
+            ),
+            (
+                '{alpaca: [{ticker: "NEW-HOLD", source: "alpaca", '
+                'read_only: false, qty: "2", market_value: "42"}], '
+                'external: [], combined_by_ticker: {"NEW-HOLD": "42"}, '
+                "external_stale: false, external_available: true}"
+            ),
+            "OLD-HOLD",
+            "NEW-HOLD",
+        ),
+        (
+            "refreshRiskLog",
+            "/log",
+            "risk-log",
+            (),
+            (
+                '{risk_events: [{at: "2026-07-25T10:00:00Z", '
+                'type: "old", reason: "OLD-RISK"}]}'
+            ),
+            (
+                '{risk_events: [{at: "2026-07-25T10:01:00Z", '
+                'type: "new", reason: "NEW-RISK"}]}'
+            ),
+            "OLD-RISK",
+            "NEW-RISK",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "completion_order",
+    ("older_first", "newer_first"),
+)
+def test_operational_refreshes_bind_rendering_to_latest_generation(
+    function_name,
+    path,
+    target_id,
+    extra_ids,
+    older_payload,
+    newer_payload,
+    older_evidence,
+    newer_evidence,
+    completion_order,
+):
+    ids = [target_id, *extra_ids]
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (function_name,),
+        f"""
+        const elements = installDom({ids!r});
+        const older = deferred();
+        const newer = deferred();
+        const requests = [];
+        let call = 0;
+        globalThis.__api = (path, options = {{}}) => {{
+          if (path !== {path!r}) {{
+            throw new Error(`unexpected API path ${{path}}`);
+          }}
+          requests.push(options);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        }};
+        const previousTruth = document.createElement("p");
+        previousTruth.textContent = "previous broker truth";
+        elements[{target_id!r}].appendChild(previousTruth);
+
+        const manualRefresh = module[{function_name!r}]();
+        const invalidatedAtStart = (
+          elements[{target_id!r}].textContent.includes("Refreshing")
+          && !elements[{target_id!r}].textContent.includes(
+            "previous broker truth",
+          )
+        );
+        const timerRefresh = module[{function_name!r}]();
+        const firstWasAborted = Boolean(
+          requests[0]
+          && requests[0].signal
+          && requests[0].signal.aborted === true
+        );
+
+        if ({completion_order!r} === "older_first") {{
+          older.resolve({older_payload});
+          await manualRefresh;
+          newer.resolve({newer_payload});
+          await timerRefresh;
+        }} else {{
+          newer.resolve({newer_payload});
+          await timerRefresh;
+          older.resolve({older_payload});
+          await manualRefresh;
+        }}
+
+        const rendered = elements[{target_id!r}].textContent;
+        const failures = [];
+        if (!invalidatedAtStart) {{
+          failures.push("refresh retained stale visible truth while loading");
+        }}
+        if (!firstWasAborted) {{
+          failures.push("superseded request was not aborted");
+        }}
+        if (
+          !rendered.includes({newer_evidence!r})
+          || rendered.includes({older_evidence!r})
+        ) {{
+          failures.push(`rendered stale generation: ${{rendered}}`);
+        }}
+        if (failures.length) throw new Error(failures.join("; "));
+        """,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "function_name",
+        "path",
+        "target_id",
+        "extra_ids",
+        "newer_payload",
+        "newer_evidence",
+    ),
+    (
+        (
+            "refreshPositions",
+            "/positions",
+            "positions",
+            (),
+            (
+                '{positions: [{ticker: "CURRENT-POS", qty: "2", '
+                'avg_entry_price: "20", current_price: "21", '
+                'market_value: "42"}]}'
+            ),
+            "CURRENT-POS",
+        ),
+        (
+            "refreshHoldings",
+            "/holdings",
+            "holdings",
+            ("external-stale",),
+            (
+                '{alpaca: [{ticker: "CURRENT-HOLD", source: "alpaca", '
+                'read_only: false, qty: "2", market_value: "42"}], '
+                'external: [], combined_by_ticker: '
+                '{"CURRENT-HOLD": "42"}, external_stale: false, '
+                "external_available: true}"
+            ),
+            "CURRENT-HOLD",
+        ),
+        (
+            "refreshRiskLog",
+            "/log",
+            "risk-log",
+            (),
+            (
+                '{risk_events: [{at: "2026-07-25T10:01:00Z", '
+                'type: "new", reason: "CURRENT-RISK"}]}'
+            ),
+            "CURRENT-RISK",
+        ),
+    ),
+)
+def test_operational_refreshes_ignore_late_error_after_newer_success(
+    function_name,
+    path,
+    target_id,
+    extra_ids,
+    newer_payload,
+    newer_evidence,
+):
+    ids = [target_id, *extra_ids]
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (function_name,),
+        f"""
+        const elements = installDom({ids!r});
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (requestPath, _options = {{}}) => {{
+          if (requestPath !== {path!r}) {{
+            throw new Error(`unexpected API path ${{requestPath}}`);
+          }}
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        }};
+
+        const oldRefresh = module[{function_name!r}]();
+        const newRefresh = module[{function_name!r}]();
+        newer.resolve({newer_payload});
+        await newRefresh;
+        older.reject(new Error("superseded request failed late"));
+        const oldResult = await oldRefresh.then(
+          () => "ignored",
+          () => "rejected",
+        );
+
+        if (oldResult === "rejected") {{
+          throw new Error("superseded error escaped to the current refresh");
+        }}
+        const rendered = elements[{target_id!r}].textContent;
+        if (!rendered.includes({newer_evidence!r})) {{
+          throw new Error(`late error erased newer truth: ${{rendered}}`);
+        }}
+        """,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "script",
+        "function_name",
+        "path",
+        "target_id",
+        "older_payload",
+        "newer_payload",
+        "older_evidence",
+        "newer_evidence",
+    ),
+    (
+        (
+            "plans.js",
+            "refreshPlans",
+            "/plans",
+            "plans-list",
+            (
+                '{plans: [{plan_id: 1, symbol: "OLD-PLAN", '
+                'action: "buy", status: "proposed"}]}'
+            ),
+            (
+                '{plans: [{plan_id: 2, symbol: "NEW-PLAN", '
+                'action: "sell", status: "approved"}]}'
+            ),
+            "OLD-PLAN",
+            "NEW-PLAN",
+        ),
+        (
+            "backtests.js",
+            "refreshRuns",
+            "/backtests",
+            "backtest-runs",
+            (
+                '{backtests: [{run_id: 1, label: "OLD-RUN", '
+                'created_at: "2026-07-25T10:00:00Z"}]}'
+            ),
+            (
+                '{backtests: [{run_id: 2, label: "NEW-RUN", '
+                'created_at: "2026-07-25T10:01:00Z"}]}'
+            ),
+            "OLD-RUN",
+            "NEW-RUN",
+        ),
+    ),
+)
+def test_saved_resource_refresh_ignores_superseded_success(
+    script,
+    function_name,
+    path,
+    target_id,
+    older_payload,
+    newer_payload,
+    older_evidence,
+    newer_evidence,
+):
+    _run_page_module(
+        _STATIC / "js" / script,
+        (function_name,),
+        f"""
+        const elements = installDom([{target_id!r}]);
+        const older = deferred();
+        const newer = deferred();
+        const requests = [];
+        let call = 0;
+        globalThis.__api = (requestPath, options = {{}}) => {{
+          if (requestPath !== {path!r}) {{
+            throw new Error(`unexpected API path ${{requestPath}}`);
+          }}
+          requests.push(options);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        }};
+        const stale = document.createElement("p");
+        stale.textContent = "previous saved resource truth";
+        elements[{target_id!r}].appendChild(stale);
+
+        const manualRefresh = module[{function_name!r}]();
+        const invalidatedAtStart = (
+          elements[{target_id!r}].textContent.includes("Refreshing")
+          && !elements[{target_id!r}].textContent.includes("previous")
+        );
+        const actionRefresh = module[{function_name!r}]();
+        const firstWasAborted = Boolean(
+          requests[0].signal
+          && requests[0].signal.aborted === true
+        );
+        newer.resolve({newer_payload});
+        await actionRefresh;
+        older.resolve({older_payload});
+        await manualRefresh;
+
+        const rendered = elements[{target_id!r}].textContent;
+        const failures = [];
+        if (!invalidatedAtStart) {{
+          failures.push("saved resource was not invalidated while loading");
+        }}
+        if (!firstWasAborted) {{
+          failures.push("superseded saved-resource request was not aborted");
+        }}
+        if (
+          !rendered.includes({newer_evidence!r})
+          || rendered.includes({older_evidence!r})
+        ) {{
+          failures.push(`stale saved resource rendered: ${{rendered}}`);
+        }}
+        if (failures.length) throw new Error(failures.join("; "));
+        """,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "script",
+        "function_name",
+        "path",
+        "target_id",
+        "newer_payload",
+        "newer_evidence",
+    ),
+    (
+        (
+            "plans.js",
+            "refreshPlans",
+            "/plans",
+            "plans-list",
+            (
+                '{plans: [{plan_id: 2, symbol: "CURRENT-PLAN", '
+                'action: "sell", status: "approved"}]}'
+            ),
+            "CURRENT-PLAN",
+        ),
+        (
+            "backtests.js",
+            "refreshRuns",
+            "/backtests",
+            "backtest-runs",
+            (
+                '{backtests: [{run_id: 2, label: "CURRENT-RUN", '
+                'created_at: "2026-07-25T10:01:00Z"}]}'
+            ),
+            "CURRENT-RUN",
+        ),
+    ),
+)
+def test_saved_resource_refresh_ignores_superseded_error(
+    script,
+    function_name,
+    path,
+    target_id,
+    newer_payload,
+    newer_evidence,
+):
+    _run_page_module(
+        _STATIC / "js" / script,
+        (function_name,),
+        f"""
+        const elements = installDom([{target_id!r}]);
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (requestPath, _options = {{}}) => {{
+          if (requestPath !== {path!r}) {{
+            throw new Error(`unexpected API path ${{requestPath}}`);
+          }}
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        }};
+
+        const oldRefresh = module[{function_name!r}]();
+        const newRefresh = module[{function_name!r}]();
+        newer.resolve({newer_payload});
+        await newRefresh;
+        older.reject(new Error("late saved resource failure"));
+        const oldResult = await oldRefresh.then(
+          () => "ignored",
+          () => "rejected",
+        );
+
+        if (oldResult === "rejected") {{
+          throw new Error("superseded saved-resource error escaped");
+        }}
+        if (!elements[{target_id!r}].textContent.includes(
+          {newer_evidence!r},
+        )) {{
+          throw new Error("late error erased current saved resource");
+        }}
+        """,
+    )
+
+
+def test_pending_refresh_ignores_superseded_error_after_newer_truth():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshPending",),
+        r"""
+        const elements = installDom([
+          "pending-list",
+          "approval-reason",
+          "approval-confirm-button",
+        ]);
+        const older = deferred();
+        const newer = deferred();
+        const requests = [];
+        let call = 0;
+        globalThis.__api = (path, options = {}) => {
+          if (path !== "/pending") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          requests.push(options);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldRefresh = module.refreshPending();
+        const newRefresh = module.refreshPending();
+        const firstWasAborted = Boolean(
+          requests[0].signal
+          && requests[0].signal.aborted === true
+        );
+        newer.resolve({pending: []});
+        await newRefresh;
+        older.reject(new Error("late pending failure"));
+        const oldResult = await oldRefresh.then(
+          () => "ignored",
+          () => "rejected",
+        );
+
+        if (!firstWasAborted) {
+          throw new Error("superseded pending request was not aborted");
+        }
+        if (oldResult === "rejected") {
+          throw new Error("superseded pending error escaped");
+        }
+        if (
+          !elements["pending-list"].textContent.includes(
+            "No verified pending proposals",
+          )
+        ) {
+          throw new Error("late pending error erased current truth");
+        }
+        """,
+    )
+
+
+_BACKTEST_REPORT_DOM_SETUP = r"""
+    const elements = installDom([
+      "backtest-report",
+      "report-title",
+      "status-region",
+    ]);
+    const report = (runId, label, symbol, evidence) => ({
+      run_id: runId,
+      label,
+      disclaimer: evidence,
+      rows: [{
+        symbol,
+        strategy: `${label}-strategy`,
+        window: "walk-forward",
+        metrics: {
+          total_return_pct: 1,
+          sharpe: 1,
+          max_drawdown_pct: -1,
+          num_trades: 1,
+          exposure_pct: 50,
+          pnl_by_regime: {},
+        },
+        benchmark_buy_and_hold: {total_return_pct: 0},
+        beat_buy_and_hold: true,
+      }],
+    });
+"""
+
+
+@pytest.mark.parametrize(
+    "completion_order",
+    ("older_first", "newer_first"),
+)
+def test_backtest_report_is_bound_to_latest_selected_run(
+    completion_order,
+):
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + f"""
+        const older = deferred();
+        const newer = deferred();
+        const requests = [];
+        globalThis.__api = (path, options = {{}}) => {{
+          requests.push({{path, options}});
+          if (path === "/backtests/1/report") return older.promise;
+          if (path === "/backtests/2/report") return newer.promise;
+          throw new Error(`unexpected API path ${{path}}`);
+        }};
+        elements["report-title"].textContent = "Report #99 · stale";
+
+        const oldSelection = module.showReport(1);
+        const newSelection = module.showReport(2);
+        const invalidatedWhileLoading = (
+          elements["report-title"].textContent.includes("#2")
+          && elements["backtest-report"].textContent.includes("Loading")
+        );
+        const firstWasAborted = Boolean(
+          requests[0].options.signal
+          && requests[0].options.signal.aborted === true
+        );
+
+        if ({completion_order!r} === "older_first") {{
+          older.resolve(report(1, "Alpha", "AAPL", "ALPHA-EVIDENCE"));
+          await oldSelection;
+          newer.resolve(report(2, "Beta", "MSFT", "BETA-EVIDENCE"));
+          await newSelection;
+        }} else {{
+          newer.resolve(report(2, "Beta", "MSFT", "BETA-EVIDENCE"));
+          await newSelection;
+          older.resolve(report(1, "Alpha", "AAPL", "ALPHA-EVIDENCE"));
+          await oldSelection;
+        }}
+
+        const title = elements["report-title"].textContent;
+        const body = elements["backtest-report"].textContent;
+        const failures = [];
+        if (!invalidatedWhileLoading) {{
+          failures.push("selected report title was not invalidated");
+        }}
+        if (!firstWasAborted) {{
+          failures.push("superseded report request was not aborted");
+        }}
+        if (!title.includes("#2") || !title.includes("Beta")) {{
+          failures.push(`title does not match run 2: ${{title}}`);
+        }}
+        if (
+          !body.includes("BETA-EVIDENCE")
+          || !body.includes("MSFT")
+          || body.includes("ALPHA-EVIDENCE")
+          || body.includes("AAPL")
+        ) {{
+          failures.push(`evidence does not match run 2: ${{body}}`);
+        }}
+        if (failures.length) throw new Error(failures.join("; "));
+        """,
+    )
+
+
+def test_backtest_report_ignores_late_error_after_newer_selection():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        const older = deferred();
+        const newer = deferred();
+        globalThis.__api = (path, _options = {}) => {
+          if (path === "/backtests/1/report") return older.promise;
+          if (path === "/backtests/2/report") return newer.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        const oldSelection = module.showReport(1);
+        const newSelection = module.showReport(2);
+        newer.resolve(report(2, "Beta", "MSFT", "BETA-EVIDENCE"));
+        await newSelection;
+        older.reject(new Error("late Alpha failure"));
+        const oldResult = await oldSelection.then(
+          () => "ignored",
+          () => "rejected",
+        );
+
+        if (oldResult === "rejected") {
+          throw new Error("superseded report error escaped");
+        }
+        if (
+          !elements["report-title"].textContent.includes("#2")
+          || !elements["backtest-report"].textContent.includes(
+            "BETA-EVIDENCE",
+          )
+        ) {
+          throw new Error("late report error erased run 2");
+        }
+        """,
+    )
+
+
+def test_backtest_report_repeated_same_run_uses_request_generation():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (path, _options = {}) => {
+          if (path !== "/backtests/7/report") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldSelection = module.showReport(7);
+        const newSelection = module.showReport(7);
+        newer.resolve(report(7, "Fresh", "MSFT", "FRESH-EVIDENCE"));
+        await newSelection;
+        older.resolve(report(7, "Stale", "AAPL", "STALE-EVIDENCE"));
+        await oldSelection;
+
+        const title = elements["report-title"].textContent;
+        const body = elements["backtest-report"].textContent;
+        if (
+          !title.includes("Fresh")
+          || !body.includes("FRESH-EVIDENCE")
+          || body.includes("STALE-EVIDENCE")
+        ) {
+          throw new Error("same-run stale request replaced fresh evidence");
+        }
+        """,
+    )
+
+
+def test_backtest_report_response_identity_mismatch_fails_closed():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        globalThis.__api = (path) => {
+          if (path !== "/backtests/2/report") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          return Promise.resolve(
+            report(1, "Alpha", "AAPL", "ALPHA-EVIDENCE"),
+          );
+        };
+
+        await module.showReport(2);
+
+        const title = elements["report-title"].textContent;
+        const body = elements["backtest-report"].textContent;
+        if (
+          !title.includes("#2")
+          || !body.toLowerCase().includes("identity")
+          || body.includes("ALPHA-EVIDENCE")
+          || body.includes("AAPL")
+        ) {
+          throw new Error(
+            `mismatched report was rendered: ${title} / ${body}`,
+          );
+        }
+        """,
+    )
+
+
+def test_starting_backtest_invalidates_prior_report_request():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport", "submitBacktest"),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        elements["backtest-reason"] = document.createElement("textarea");
+        elements["backtest-reason"].value = "new simulation evidence";
+        elements["backtest-runs"] = document.createElement("div");
+        const priorReport = deferred();
+        const runRequest = deferred();
+        globalThis.__api = (path, _options = {}) => {
+          if (path === "/backtests/1/report") return priorReport.promise;
+          if (path === "/backtests/run") return runRequest.promise;
+          if (path === "/backtests") {
+            return Promise.resolve({backtests: []});
+          }
+          if (path === "/backtests/2/report") {
+            return Promise.resolve(
+              report(2, "Beta", "MSFT", "BETA-EVIDENCE"),
+            );
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+        document.getElementById = (id) => elements[id] || null;
+
+        const oldSelection = module.showReport(1);
+        const run = module.submitBacktest({preventDefault() {}});
+        priorReport.resolve(
+          report(1, "Alpha", "AAPL", "ALPHA-EVIDENCE"),
+        );
+        await oldSelection;
+        if (
+          !elements["backtest-report"].textContent.includes("Running")
+          || elements["backtest-report"].textContent.includes(
+            "ALPHA-EVIDENCE",
+          )
+        ) {
+          throw new Error("prior report replaced active backtest state");
+        }
+
+        runRequest.resolve({run_id: 2});
+        await run;
+        if (
+          !elements["report-title"].textContent.includes("#2")
+          || !elements["backtest-report"].textContent.includes(
+            "BETA-EVIDENCE",
+          )
+        ) {
+          throw new Error("completed run did not bind report 2");
+        }
+        """,
+    )
+
+
+def test_newer_report_selection_wins_over_older_backtest_completion():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport", "submitBacktest"),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        elements["backtest-reason"] = document.createElement("textarea");
+        elements["backtest-reason"].value = "new simulation evidence";
+        elements["backtest-runs"] = document.createElement("div");
+        const runRequest = deferred();
+        globalThis.__api = (path, _options = {}) => {
+          if (path === "/backtests/run") return runRequest.promise;
+          if (path === "/backtests/3/report") {
+            return Promise.resolve(
+              report(3, "Gamma", "NVDA", "GAMMA-EVIDENCE"),
+            );
+          }
+          if (path === "/backtests") {
+            return Promise.resolve({backtests: []});
+          }
+          if (path === "/backtests/2/report") {
+            return Promise.resolve(
+              report(2, "Beta", "MSFT", "BETA-EVIDENCE"),
+            );
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+        document.getElementById = (id) => elements[id] || null;
+
+        const run = module.submitBacktest({preventDefault() {}});
+        await module.showReport(3);
+        runRequest.resolve({run_id: 2});
+        await run;
+
+        const title = elements["report-title"].textContent;
+        const body = elements["backtest-report"].textContent;
+        if (
+          !title.includes("#3")
+          || !body.includes("GAMMA-EVIDENCE")
+          || body.includes("BETA-EVIDENCE")
+        ) {
+          throw new Error(
+            "older backtest completion replaced newer explicit selection",
+          );
+        }
+        """,
+    )
+
+
 _PLAN_DOM_SETUP = r"""
     const elements = installDom([
       "plan-detail",
@@ -1148,6 +1951,225 @@ _PLAN_DOM_SETUP = r"""
       },
     });
 """
+
+
+def test_latest_analysis_submission_owns_plan_detail_workspace():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("submitAnalysis",),
+        _PLAN_DOM_SETUP
+        + r"""
+        elements["analysis-symbol"] = document.createElement("input");
+        elements["analysis-reason"] = document.createElement("textarea");
+        elements["plans-list"] = document.createElement("div");
+        document.getElementById = (id) => elements[id] || null;
+        const older = deferred();
+        const newer = deferred();
+        let analysisCall = 0;
+        globalThis.__api = (path, _options = {}) => {
+          if (path === "/analyze") {
+            analysisCall += 1;
+            return analysisCall === 1 ? older.promise : newer.promise;
+          }
+          if (path === "/plans") return Promise.resolve({plans: []});
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/2") {
+            return Promise.resolve(planDetail(2, "MSFT"));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        elements["analysis-symbol"].value = "AAPL";
+        elements["analysis-reason"].value = "older analysis";
+        const oldSubmission = module.submitAnalysis({
+          preventDefault() {},
+        });
+        elements["analysis-symbol"].value = "MSFT";
+        elements["analysis-reason"].value = "newer analysis";
+        const newSubmission = module.submitAnalysis({
+          preventDefault() {},
+        });
+
+        newer.resolve({plan_id: 2});
+        await newSubmission;
+        older.resolve({plan_id: 1});
+        await oldSubmission;
+
+        if (
+          !elements["plan-detail-title"].textContent.startsWith(
+            "Plan #2 · MSFT",
+          )
+          || elements["plan-detail-title"].textContent.includes("AAPL")
+        ) {
+          throw new Error("older analysis replaced newer plan detail");
+        }
+        """,
+    )
+
+
+def test_latest_proposal_submission_owns_plan_detail_workspace():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("submitProposals",),
+        _PLAN_DOM_SETUP
+        + r"""
+        elements["proposal-reason"] = document.createElement("textarea");
+        elements["plans-list"] = document.createElement("div");
+        document.getElementById = (id) => elements[id] || null;
+        const older = deferred();
+        const newer = deferred();
+        let proposalCall = 0;
+        globalThis.__api = (path, _options = {}) => {
+          if (path === "/propose") {
+            proposalCall += 1;
+            return proposalCall === 1 ? older.promise : newer.promise;
+          }
+          if (path === "/plans") return Promise.resolve({plans: []});
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        elements["proposal-reason"].value = "older proposal scan";
+        const oldSubmission = module.submitProposals({
+          preventDefault() {},
+        });
+        elements["proposal-reason"].value = "newer proposal scan";
+        const newSubmission = module.submitProposals({
+          preventDefault() {},
+        });
+
+        newer.resolve({
+          note: "NEW-PROPOSAL-EVIDENCE",
+          proposed: [],
+        });
+        await newSubmission;
+        older.resolve({
+          note: "OLD-PROPOSAL-EVIDENCE",
+          proposed: [],
+        });
+        await oldSubmission;
+
+        const rendered = elements["plan-detail"].textContent;
+        if (
+          !rendered.includes("NEW-PROPOSAL-EVIDENCE")
+          || rendered.includes("OLD-PROPOSAL-EVIDENCE")
+        ) {
+          throw new Error("older proposal scan replaced newer evidence");
+        }
+        """,
+    )
+
+
+def test_latest_screen_request_owns_candidate_results():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("runScreen",),
+        r"""
+        const elements = installDom([
+          "screen-results",
+          "analysis-symbol",
+          "analysis-reason",
+        ]);
+        const older = deferred();
+        const newer = deferred();
+        const requests = [];
+        let call = 0;
+        globalThis.__api = (path, options = {}) => {
+          if (path !== "/screen") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          requests.push(options);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldScreen = module.runScreen();
+        const newScreen = module.runScreen();
+        const firstWasAborted = Boolean(
+          requests[0].signal
+          && requests[0].signal.aborted === true
+        );
+        newer.resolve({
+          candidates: [{
+            symbol: "NEW-SCREEN",
+            score: "2",
+            regime: "new",
+          }],
+        });
+        await newScreen;
+        older.resolve({
+          candidates: [{
+            symbol: "OLD-SCREEN",
+            score: "1",
+            regime: "old",
+          }],
+        });
+        await oldScreen;
+
+        const rendered = elements["screen-results"].textContent;
+        if (!firstWasAborted) {
+          throw new Error("superseded screen request was not aborted");
+        }
+        if (
+          !rendered.includes("NEW-SCREEN")
+          || rendered.includes("OLD-SCREEN")
+        ) {
+          throw new Error("older screen response replaced newer candidates");
+        }
+        """,
+    )
+
+
+def test_screen_ignores_late_error_after_newer_success():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("runScreen",),
+        r"""
+        const elements = installDom([
+          "screen-results",
+          "analysis-symbol",
+          "analysis-reason",
+        ]);
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (path) => {
+          if (path !== "/screen") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldScreen = module.runScreen();
+        const newScreen = module.runScreen();
+        newer.resolve({
+          candidates: [{
+            symbol: "CURRENT-SCREEN",
+            score: "2",
+            regime: "new",
+          }],
+        });
+        await newScreen;
+        older.reject(new Error("late screen failure"));
+        const oldResult = await oldScreen.then(
+          () => "ignored",
+          () => "rejected",
+        );
+
+        if (oldResult === "rejected") {
+          throw new Error("superseded screen error escaped");
+        }
+        if (
+          !elements["screen-results"].textContent.includes(
+            "CURRENT-SCREEN",
+          )
+        ) {
+          throw new Error("late screen error erased current candidates");
+        }
+        """,
+    )
 
 
 def test_plan_detail_and_approval_ignore_out_of_order_other_plan():

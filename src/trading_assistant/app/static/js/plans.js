@@ -9,12 +9,17 @@ import {
 
 const byId = (id) => document.getElementById(id);
 const dialogReturnFocus = new Map();
+let plansRequestSequence = 0;
+let plansAbortController = null;
 let planDetailState = null;
 let planDetailRequestSequence = 0;
+let planWorkspaceRequestSequence = 0;
 let planApprovalState = null;
 let planApprovalRequestSequence = 0;
 let planCancelState = null;
 let planCancelRequestSequence = 0;
+let screenRequestSequence = 0;
+let screenAbortController = null;
 
 function node(tag, value, className) {
   const element = document.createElement(tag);
@@ -116,13 +121,52 @@ function metricTable(headers, rows) {
 }
 
 async function refreshPlans() {
-  const payload = await api("/plans");
   const target = byId("plans-list");
+  if (plansAbortController) {
+    plansAbortController.abort();
+  }
+  const controller = new AbortController();
+  plansAbortController = controller;
+  const requestToken = ++plansRequestSequence;
+  clear(target);
+  target.appendChild(node(
+    "p",
+    "Refreshing saved plans…",
+    "empty-state",
+  ));
+  let payload;
+  try {
+    payload = await api("/plans", {
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (
+      requestToken !== plansRequestSequence
+      || plansAbortController !== controller
+    ) {
+      return false;
+    }
+    plansAbortController = null;
+    clear(target);
+    target.appendChild(node(
+      "p",
+      "Saved plan truth is unavailable.",
+      "empty-state",
+    ));
+    throw error;
+  }
+  if (
+    requestToken !== plansRequestSequence
+    || plansAbortController !== controller
+  ) {
+    return false;
+  }
+  plansAbortController = null;
   clear(target);
   const plans = Array.isArray(payload.plans) ? payload.plans : [];
   if (!plans.length) {
     target.appendChild(node("p", "No saved plans.", "empty-state"));
-    return;
+    return true;
   }
   plans.forEach((plan) => {
     const button = node("button", null, "plan-item");
@@ -139,6 +183,7 @@ async function refreshPlans() {
     button.addEventListener("click", () => showPlan(plan.plan_id));
     target.appendChild(button);
   });
+  return true;
 }
 
 async function submitAnalysis(event) {
@@ -149,17 +194,27 @@ async function submitAnalysis(event) {
     notify("A symbol and non-empty analysis reason are required.", "notice-error");
     return;
   }
+  const workspaceToken = beginPlanWorkspace();
   const target = byId("plan-detail");
+  byId("plan-detail-title").textContent = `Analyzing ${symbol}`;
   clear(target);
   target.appendChild(node("p", `Analyzing ${symbol}…`, "empty-state"));
   try {
     const result = await api("/analyze", jsonPost({symbol, reason}));
-    byId("analysis-reason").value = "";
     await refreshPlans();
+    if (workspaceToken !== planWorkspaceRequestSequence) {
+      return false;
+    }
+    byId("analysis-reason").value = "";
     await showPlan(result.plan_id);
+    return true;
   } catch (error) {
+    if (workspaceToken !== planWorkspaceRequestSequence) {
+      return false;
+    }
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
+    return false;
   }
 }
 
@@ -170,7 +225,9 @@ async function submitProposals(event) {
     notify("A non-empty proposal reason is required.", "notice-error");
     return;
   }
+  const workspaceToken = beginPlanWorkspace();
   const target = byId("plan-detail");
+  byId("plan-detail-title").textContent = "Generating proposals";
   clear(target);
   target.appendChild(node(
     "p",
@@ -179,8 +236,11 @@ async function submitProposals(event) {
   ));
   try {
     const result = await api("/propose", jsonPost({n: 3, reason}));
-    byId("proposal-reason").value = "";
     await refreshPlans();
+    if (workspaceToken !== planWorkspaceRequestSequence) {
+      return false;
+    }
+    byId("proposal-reason").value = "";
     clear(target);
     target.appendChild(node("p", readable(result.note), "banner-caution"));
     (Array.isArray(result.proposed) ? result.proposed : []).forEach((plan) => {
@@ -189,28 +249,49 @@ async function submitProposals(event) {
         : (
           `#${readable(plan.plan_id)} · ${readable(plan.symbol)} · `
           + `${readable(plan.action)} · ${readable(plan.sized_shares)} shares`
-        );
+      );
       target.appendChild(node("p", label, "muted"));
     });
+    return true;
   } catch (error) {
+    if (workspaceToken !== planWorkspaceRequestSequence) {
+      return false;
+    }
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
+    return false;
   }
 }
 
 async function runScreen() {
   const target = byId("screen-results");
+  if (screenAbortController) {
+    screenAbortController.abort();
+  }
+  const controller = new AbortController();
+  screenAbortController = controller;
+  const requestToken = ++screenRequestSequence;
   clear(target);
   target.appendChild(node("p", "Screening…", "empty-state"));
   try {
-    const result = await api("/screen", {method: "POST"});
+    const result = await api("/screen", {
+      method: "POST",
+      signal: controller.signal,
+    });
+    if (
+      requestToken !== screenRequestSequence
+      || screenAbortController !== controller
+    ) {
+      return false;
+    }
+    screenAbortController = null;
     clear(target);
     const candidates = Array.isArray(result.candidates)
       ? result.candidates
       : [];
     if (!candidates.length) {
       target.appendChild(node("p", "No candidates reported.", "empty-state"));
-      return;
+      return true;
     }
     candidates.forEach((candidate) => {
       const button = node("button", null, "plan-item");
@@ -227,14 +308,30 @@ async function runScreen() {
       });
       target.appendChild(button);
     });
+    return true;
   } catch (error) {
+    if (
+      requestToken !== screenRequestSequence
+      || screenAbortController !== controller
+    ) {
+      return false;
+    }
+    screenAbortController = null;
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
+    return false;
   }
 }
 
 function canonicalPlanId(value) {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function beginPlanWorkspace() {
+  planDetailState = null;
+  const requestToken = ++planWorkspaceRequestSequence;
+  updatePlanApprovalButton();
+  return requestToken;
 }
 
 function planDetailTokenIsCurrent(requestToken, targetPlanId) {
@@ -243,6 +340,7 @@ function planDetailTokenIsCurrent(requestToken, targetPlanId) {
     && planDetailState.requestToken === requestToken
     && planDetailState.targetPlanId === targetPlanId
     && requestToken === planDetailRequestSequence
+    && planDetailState.workspaceToken === planWorkspaceRequestSequence
   );
 }
 
@@ -379,6 +477,7 @@ function appendPlanActions(target, plan, detailRequestToken) {
 }
 
 async function showPlan(planId) {
+  const workspaceToken = beginPlanWorkspace();
   const targetPlanId = canonicalPlanId(planId);
   const target = byId("plan-detail");
   clear(target);
@@ -396,6 +495,7 @@ async function showPlan(planId) {
   planDetailState = Object.freeze({
     targetPlanId,
     requestToken,
+    workspaceToken,
     plan: null,
   });
   updatePlanApprovalButton();
@@ -410,6 +510,7 @@ async function showPlan(planId) {
       planDetailState = Object.freeze({
         targetPlanId,
         requestToken,
+        workspaceToken,
         plan: null,
       });
       clear(target);
@@ -427,6 +528,7 @@ async function showPlan(planId) {
     planDetailState = Object.freeze({
       targetPlanId,
       requestToken,
+      workspaceToken,
       plan: Object.freeze(plan),
     });
     byId("plan-detail-title").textContent = (
@@ -503,6 +605,7 @@ async function showPlan(planId) {
     planDetailState = Object.freeze({
       targetPlanId,
       requestToken,
+      workspaceToken,
       plan: null,
     });
     clear(target);
