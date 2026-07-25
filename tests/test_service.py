@@ -9,7 +9,13 @@ from sqlalchemy import func, select
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Position
-from trading_assistant.db.models import Order, RiskEvent, Rule, RuleGroup
+from trading_assistant.db.models import (
+    AuditEvent,
+    Order,
+    RiskEvent,
+    Rule,
+    RuleGroup,
+)
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.service import TradingService
 
@@ -212,6 +218,21 @@ def test_conditional_rule_crud(app_config, session_factory):
     )
     assert canceled["canceled"] is True
     assert svc.list_rules()[0]["state"] == "canceled"
+    with session_factory() as session:
+        rule = session.get(Rule, created["rule_id"])
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id
+                == "service-test-conditional-rule-cancel"
+            )
+        ).all()
+    assert {
+        (audit.action, audit.target_id)
+        for audit in audits
+    } == {
+        ("rule.cancel", str(created["rule_id"])),
+        ("rule_group.cancel", str(rule.group_id)),
+    }
 
 
 def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(

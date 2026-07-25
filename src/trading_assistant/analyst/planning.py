@@ -134,11 +134,10 @@ class PlanningService:
         reason: str,
         request_id: str,
     ) -> dict[str, Any]:
-        if (
-            not actor.strip()
-            or not reason.strip()
-            or not request_id.strip()
-        ):
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
             raise ValueError(
                 "approval actor, reason, and request_id must be non-empty"
             )
@@ -164,66 +163,55 @@ class PlanningService:
                     "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
                 }
 
+        # Decomposition is pure application work. It happens before the write
+        # transaction so a process stop cannot leave a durable claim behind.
+        rules = self._decompose(plan, sized, plan_id)
+        paper_only = not (live and promotable)
+        bracket = None
+        with self.service.session_factory() as s:
             claim = s.execute(
                 update(TradePlanRow)
                 .where(
                     TradePlanRow.id == plan_id,
                     TradePlanRow.status == "proposed",
                 )
-                .values(status="approving")
+                .values(status="approved", paper_only=paper_only)
             )
-            s.commit()
             if claim.rowcount != 1:
+                s.rollback()
                 current = s.get(TradePlanRow, plan_id)
                 return {
                     "plan_id": plan_id,
                     "status": current.status if current else None,
-                    "error": "plan approval is already in progress or complete",
+                    "error": "plan approval is already complete or unavailable",
                 }
-            s.refresh(row)
-
-            try:
-                # Automatic brackets remain disabled in this safety phase even
-                # when an older config file explicitly prefers them.
-                bracket = None
-                rules = self._decompose(plan, sized, plan_id)
-                self.service.rule_application.persist_commands(
-                    s, rules, plan_id=plan_id
+            self.service.rule_application.persist_commands(
+                s,
+                rules,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                plan_id=plan_id,
+            )
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="plan.approve",
+                    target_type="trade_plan",
+                    target_id=str(plan_id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code="approved",
                 )
-                row.status = "approved"
-                row.paper_only = not (live and promotable)
-                s.add(
-                    AuditEvent(
-                        actor=actor,
-                        action="plan.approve",
-                        target_type="trade_plan",
-                        target_id=str(plan_id),
-                        request_id=request_id,
-                        reason=reason,
-                        result_code="approved",
-                    )
-                )
-                s.commit()
-                return {
-                    "plan_id": plan_id,
-                    "status": "approved",
-                    "rules_created": len(rules),
-                    "paper_only": row.paper_only,
-                    "bracket": bracket,
-                }
-            except Exception:
-                s.rollback()
-                with self.service.session_factory() as recovery:
-                    recovery.execute(
-                        update(TradePlanRow)
-                        .where(
-                            TradePlanRow.id == plan_id,
-                            TradePlanRow.status == "approving",
-                        )
-                        .values(status="proposed")
-                    )
-                    recovery.commit()
-                raise
+            )
+            s.commit()
+            return {
+                "plan_id": plan_id,
+                "status": "approved",
+                "rules_created": len(rules),
+                "paper_only": paper_only,
+                "bracket": bracket,
+            }
 
     def _decompose(
         self, plan: TradePlan, sized: dict, plan_id: int
@@ -367,6 +355,9 @@ class PlanningService:
         result = self.service.rule_repository.cancel_plan(
             plan_id,
             now=utcnow(),
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
         )
         if result.error == "not_found":
             return {"error": "not found"}
@@ -377,19 +368,6 @@ class PlanningService:
         }
         if result.error is not None:
             response["error"] = result.error
-        with self.service.session_factory() as session:
-            session.add(
-                AuditEvent(
-                    actor=actor,
-                    action="plan.cancel",
-                    target_type="trade_plan",
-                    target_id=str(plan_id),
-                    request_id=request_id,
-                    reason=reason,
-                    result_code=result.error or result.status,
-                )
-            )
-            session.commit()
         return response
 
     def get_plans(self) -> list[dict[str, Any]]:

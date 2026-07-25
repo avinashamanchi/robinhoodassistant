@@ -215,8 +215,19 @@
       const r = await action("/panic", jsonPost({ reason }));
       if (r.ok && r.data && r.data.safe === true) {
         notify("PANIC executed — everything halted", "ok");
-      } else if (r.ok) {
-        notify("PANIC response did not confirm a safe state", "err");
+      } else {
+        const receipt = r.data && r.data.receipt;
+        if (receipt) {
+          notify(
+            "PANIC incomplete — local enumeration " + receipt.local_enumeration +
+            ", local unconfirmed " + JSON.stringify(receipt.unconfirmed_order_ids || []) +
+            ", remote enumeration " + receipt.remote_enumeration +
+            ", remote potentially open " + JSON.stringify(receipt.remote_open_order_ids || []),
+            "err"
+          );
+        } else if (r.ok) {
+          notify("PANIC response did not confirm a safe state", "err");
+        }
       }
       refresh();
     }

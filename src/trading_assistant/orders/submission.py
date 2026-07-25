@@ -136,7 +136,13 @@ class OrderSubmissionService:
             payload_order = order
             session.expunge(payload_order)
         if expired:
-            self.repository.expire_approved(order_id, now)
+            self.repository.expire_approved(
+                order_id,
+                now,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             return SubmissionResult(order_id, OrderStatus.EXPIRED)
         bracket_payload = (
             bracket_prices(payload_order) if submission_kind == "bracket" else None
@@ -152,7 +158,12 @@ class OrderSubmissionService:
                 if risk.rejected:
                     reasons = tuple(risk.reasons)
                     self.repository.record_pre_submission_rejection(
-                        order_id, reasons, now
+                        order_id,
+                        reasons,
+                        now,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                     return SubmissionResult(
                         order_id,
@@ -175,10 +186,19 @@ class OrderSubmissionService:
                         )
                     )
                     if not self.repository.claim_submission(
-                        order_id, claim_now, breaker_scope_keys
+                        order_id,
+                        claim_now,
+                        breaker_scope_keys,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     ):
                         if self.repository.expire_approved(
-                            order_id, claim_now
+                            order_id,
+                            claim_now,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
                         ):
                             return SubmissionResult(
                                 order_id, OrderStatus.EXPIRED
@@ -220,7 +240,7 @@ class OrderSubmissionService:
                     except BrokerDataIntegrityError as exc:
                         self.repository.record_invalid_broker_data(
                             order_id,
-                            str(exc),
+                            "invalid broker submission payload",
                             self.now(),
                             broker_order_id=exc.broker_order_id,
                             error_code="invalid_broker_data",
@@ -233,12 +253,12 @@ class OrderSubmissionService:
                             OrderStatus.ACCEPTANCE_UNKNOWN,
                             exc.broker_order_id,
                         )
-                    except Exception as exc:
+                    except Exception:
                         self.repository.record_submission_result(
                             order_id,
                             OrderStatus.ACCEPTANCE_UNKNOWN,
                             None,
-                            type(exc).__name__,
+                            "broker_submission_unknown",
                             self.now(),
                             actor=actor,
                             reason=reason,

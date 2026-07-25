@@ -17,9 +17,12 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 
 from ..assets import AssetClass
+from ..broker.models import OrderStatus
 from ..config import Secrets, load_config
+from ..db.models import Order
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine, make_session_factory
 from ..service import TradingService
@@ -37,6 +40,43 @@ from .security import (
 )
 
 _STATIC = Path(__file__).parent / "static"
+_PANIC_LOCAL_UNCONFIRMED_STATUSES = (
+    OrderStatus.APPROVED.value,
+    OrderStatus.APPROVAL_RECORDED.value,
+    OrderStatus.SUBMITTING.value,
+    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+    OrderStatus.SUBMITTED.value,
+    OrderStatus.PARTIALLY_FILLED.value,
+)
+
+
+def _panic_exception_receipt(service: TradingService) -> dict:
+    local_enumeration = "confirmed"
+    try:
+        with service.session_factory() as session:
+            local_unconfirmed = list(
+                session.scalars(
+                    select(Order.id)
+                    .where(
+                        Order.status.in_(
+                            _PANIC_LOCAL_UNCONFIRMED_STATUSES
+                        )
+                    )
+                    .order_by(Order.id)
+                ).all()
+            )
+    except Exception:
+        local_enumeration = "unknown"
+        local_unconfirmed = []
+    return {
+        "safe": False,
+        "local_enumeration": local_enumeration,
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": local_unconfirmed,
+        "remote_open_order_ids": [],
+        "message": "panic incomplete: safety could not be confirmed",
+    }
 
 
 class ChatIn(BaseModel):
@@ -454,15 +494,7 @@ def create_app(
                 request_id=request.state.request_id,
             )
         except Exception:
-            receipt = {
-                "safe": False,
-                "confirmed_canceled": [],
-                "unconfirmed_order_ids": [],
-                "remote_open_order_ids": [],
-                "message": (
-                    "panic incomplete: safety could not be confirmed"
-                ),
-            }
+            receipt = _panic_exception_receipt(service)
         if receipt.get("safe") is not True:
             raise ApiError(
                 "panic_incomplete",

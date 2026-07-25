@@ -8,11 +8,23 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
+from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.db.models import AuditEvent, Proposal, utcnow
+from trading_assistant.broker.models import OrderStatus
+from trading_assistant.db.models import (
+    AuditEvent,
+    CircuitBreakerState,
+    Order,
+    Proposal,
+    RiskEvent,
+    Rule,
+    RuleGroup,
+    utcnow,
+)
 from trading_assistant.assets import AssetClass
 from trading_assistant.risk.breakers import BreakerScope
 
@@ -381,6 +393,8 @@ def test_unsafe_panic_returns_non_2xx_truthful_receipt(
     )
     receipt = response.json()["receipt"]
     assert receipt["safe"] is False
+    assert receipt["local_enumeration"] == "confirmed"
+    assert receipt["remote_enumeration"] == "confirmed"
     assert receipt["confirmed_canceled"] == []
     assert receipt["unconfirmed_order_ids"] == [order_id]
     assert receipt["remote_open_order_ids"] == [broker_order_id]
@@ -414,6 +428,8 @@ def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
     assert response.json()["error"]["code"] == "panic_incomplete"
     assert response.json()["receipt"] == {
         "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
         "confirmed_canceled": [],
         "unconfirmed_order_ids": [],
         "remote_open_order_ids": [],
@@ -461,6 +477,8 @@ def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
     }
     assert response.json()["receipt"] == {
         "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
         "confirmed_canceled": [],
         "unconfirmed_order_ids": [],
         "remote_open_order_ids": [],
@@ -470,6 +488,174 @@ def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
     assert response.headers["Content-Security-Policy"]
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_panic_exception_fallback_enumerates_every_local_live_unknown_order(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    statuses = (
+        OrderStatus.APPROVED,
+        OrderStatus.APPROVAL_RECORDED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.ACCEPTANCE_UNKNOWN,
+        OrderStatus.SUBMITTED,
+        OrderStatus.PARTIALLY_FILLED,
+    )
+    with service.session_factory() as session:
+        rows = [
+            Order(
+                idempotency_key=f"panic-fallback-{status.value}",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                notional=Decimal("100"),
+                status=status.value,
+            )
+            for status in statuses
+        ]
+        session.add_all(rows)
+        session.commit()
+        expected_ids = sorted(row.id for row in rows)
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-fallback")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.post(
+        "/panic",
+        json={"reason": "enumerate local fail-closed truth"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    receipt = response.json()["receipt"]
+    assert receipt == {
+        "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": expected_ids,
+        "remote_open_order_ids": [],
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "provider-secret-panic-fallback" not in response.text
+
+
+def test_panic_exception_fallback_reports_unknown_local_enumeration_on_db_failure(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-fallback")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    class BrokenSessionFactory:
+        def __call__(self):
+            raise RuntimeError("database-secret-panic-fallback")
+
+    service.session_factory = BrokenSessionFactory()
+    response = client.post(
+        "/panic",
+        json={"reason": "database enumeration failure drill"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "local_enumeration": "unknown",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "provider-secret-panic-fallback" not in response.text
+    assert "database-secret-panic-fallback" not in response.text
+
+
+def test_panic_rule_audit_failure_returns_unsafe_receipt_without_false_claim(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    created = service.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:setup",
+        reason="prepare panic audit failure",
+        request_id="panic-audit-failure-setup",
+    )
+    with service.session_factory() as session:
+        rule = session.get(Rule, created["rule_id"])
+        group_id = rule.group_id
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    def fail_rule_panic_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "rule.panic_cancel"
+            for row in session.new
+        ):
+            raise RuntimeError("injected panic cancellation audit failure")
+
+    session_type = service.session_factory.class_
+    event.listen(
+        session_type,
+        "before_flush",
+        fail_rule_panic_audit,
+    )
+    try:
+        response = client.post(
+            "/panic",
+            json={"reason": "panic audit failure drill"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_rule_panic_audit,
+        )
+
+    assert response.status_code == 503
+    receipt = response.json()["receipt"]
+    assert receipt["safe"] is False
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["remote_enumeration"] == "unknown"
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    ) is True
+    with service.session_factory() as session:
+        assert session.get(Rule, created["rule_id"]).state == "active"
+        assert session.get(RuleGroup, group_id).state == "active"
 
 
 def test_reconcile_requires_reason_and_audits_operator_identity(client):
@@ -518,6 +704,60 @@ def test_sync_requires_reason_and_audits_operator_identity(client):
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
+def test_sync_sanitizes_provider_integrity_text_everywhere(
+    client,
+    caplog,
+):
+    c, service, _ = client
+    order_id = _propose(service)
+    approved = c.post(
+        f"/approve/{order_id}",
+        json={"reason": "approve provider sanitization probe"},
+    )
+    assert approved.status_code == 200
+    broker_order_id = approved.json()["broker_order_id"]
+    marker = "PROVIDER-SECRET-RECONCILIATION-MARKER"
+
+    def invalid_activities(after=None):
+        raise BrokerDataIntegrityError(
+            marker,
+            broker_order_id=broker_order_id,
+        )
+
+    def invalid_open_orders():
+        raise BrokerDataIntegrityError(
+            marker,
+            broker_order_id=broker_order_id,
+        )
+
+    service.broker.get_fill_activities = invalid_activities
+    service.broker.get_open_orders = invalid_open_orders
+    response = c.post(
+        "/sync",
+        json={"reason": "sanitize provider reconciliation failure"},
+    )
+
+    assert response.status_code == 200
+    assert marker not in response.text
+    assert marker not in caplog.text
+    with service.session_factory() as session:
+        audits = session.query(AuditEvent).all()
+        risk_events = session.query(RiskEvent).all()
+        breaker = session.get(
+            CircuitBreakerState,
+            BreakerScope.broker_drift().key,
+        )
+    assert breaker is not None and breaker.tripped is True
+    assert marker not in breaker.reason
+    assert all(
+        marker not in audit.reason
+        and marker not in audit.detail_json
+        and marker not in audit.result_code
+        for audit in audits
+    )
+    assert all(marker not in event_row.reason for event_row in risk_events)
+
+
 def test_chat_and_rate_limit(client):
     c, svc, agent = client
     response = c.post("/chat", json={"message": "hi"})
@@ -537,3 +777,5 @@ def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):
     page = c.get("/").text
 
     assert "r.data.safe === true" in page
+    assert "local_enumeration" in page
+    assert "remote_enumeration" in page

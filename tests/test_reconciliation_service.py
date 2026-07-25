@@ -24,9 +24,12 @@ from trading_assistant.db import models as db_models
 from trading_assistant.db.models import (
     FILL_RECONCILIATION_QUARANTINED,
     FILL_RECONCILIATION_REQUIRED,
+    AuditEvent,
     CircuitBreakerState,
     Fill,
     Order,
+    Rule,
+    RuleGroup,
     utcnow,
 )
 from trading_assistant.orders.application import ApprovalCommand
@@ -98,6 +101,17 @@ def _submitted_order_id(service) -> int:
     return order_id
 
 
+def _audit_failure_listener(action: str):
+    def fail_matching_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent) and row.action == action
+            for row in session.new
+        ):
+            raise RuntimeError(f"injected {action} audit failure")
+
+    return fail_matching_audit
+
+
 class AcceptThenDisconnectBroker(MockBroker):
     def submit_order(self, order):
         super().submit_order(order)
@@ -110,6 +124,111 @@ class CancelFailsBroker(MockBroker):
 
     def get_order_status(self, order_id):
         raise ConnectionError("broker unavailable")
+
+
+def test_panic_rule_and_group_cancellation_has_exact_atomic_audits(
+    make_service,
+):
+    service = make_service()
+    rule = service.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:panic",
+        reason="prepare panic rule",
+        request_id="panic-rule-setup",
+    )
+    with service.session_factory() as session:
+        stored_rule = session.get(Rule, rule["rule_id"])
+        group_id = stored_rule.group_id
+
+    report = service.panic(
+        actor="operator:panic",
+        reason="panic rule cancellation drill",
+        request_id="panic-rule-cancellation",
+    )
+
+    assert report["safe"] is True
+    with service.session_factory() as session:
+        stored_rule = session.get(Rule, rule["rule_id"])
+        group = session.get(RuleGroup, group_id)
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == "panic-rule-cancellation",
+                AuditEvent.action.in_(
+                    ("rule.panic_cancel", "rule_group.panic_cancel")
+                ),
+            )
+        ).all()
+    assert stored_rule.state == "canceled"
+    assert group.state == "canceled"
+    assert {
+        (audit.action, audit.target_id)
+        for audit in audits
+    } == {
+        ("rule.panic_cancel", str(rule["rule_id"])),
+        ("rule_group.panic_cancel", str(group_id)),
+    }
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            "operator:panic",
+            "panic rule cancellation drill",
+            "panic-rule-cancellation",
+        )
+    }
+
+
+def test_panic_audit_failure_keeps_rule_active_but_global_breaker_tripped(
+    make_service,
+):
+    service = make_service()
+    rule = service.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:panic",
+        reason="prepare panic rollback rule",
+        request_id="panic-rule-rollback-setup",
+    )
+    with service.session_factory() as session:
+        stored_rule = session.get(Rule, rule["rule_id"])
+        group_id = stored_rule.group_id
+
+    listener = _audit_failure_listener("rule.panic_cancel")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected rule.panic_cancel audit failure",
+        ):
+            service.panic(
+                actor="operator:panic",
+                reason="panic rollback drill",
+                request_id="panic-rule-rollback",
+            )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    ) is True
+    with service.session_factory() as session:
+        assert session.get(Rule, rule["rule_id"]).state == "active"
+        assert session.get(RuleGroup, group_id).state == "active"
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id == "panic-rule-rollback",
+                AuditEvent.action.in_(
+                    ("rule.panic_cancel", "rule_group.panic_cancel")
+                ),
+            )
+        ) == 0
 
 
 def _acceptance_unknown_with_exact_local_fill_ahead(service, broker) -> int:
@@ -146,6 +265,101 @@ def test_reconcile_unknown_finds_remote_acceptance(make_service):
         row = session.get(Order, order_id)
         assert row.status == "submitted"
         assert row.broker_order_id is not None
+
+
+def test_remote_canceled_status_has_transaction_local_exact_audit(
+    make_service,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        remote = OrderResult(
+            order.idempotency_key,
+            order.broker_order_id,
+            OrderStatus.CANCELED,
+            filled_qty=Decimal(0),
+        )
+        broker._orders_by_id[order.broker_order_id] = remote
+        broker._orders_by_key[order.idempotency_key] = remote
+
+    context = {
+        "actor": "operator:status-audit",
+        "reason": "verify remote cancellation",
+        "request_id": "reconcile-remote-canceled",
+    }
+    service.reconciliation.reconcile(**context)
+
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.reconcile",
+                AuditEvent.target_id == str(order_id),
+            )
+        ).all()
+    assert order.status == OrderStatus.CANCELED.value
+    assert len(audits) == 1
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            context["actor"],
+            context["reason"],
+            context["request_id"],
+        )
+    }
+    assert '"status"' in audits[0].detail_json
+
+
+def test_remote_status_mutation_rolls_back_when_audit_flush_fails(
+    make_service,
+):
+    broker = MockBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        remote = OrderResult(
+            order.idempotency_key,
+            order.broker_order_id,
+            OrderStatus.CANCELED,
+            filled_qty=Decimal(0),
+        )
+        broker._orders_by_id[order.broker_order_id] = remote
+        broker._orders_by_key[order.idempotency_key] = remote
+
+    listener = _audit_failure_listener("order.reconcile")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected order.reconcile audit failure",
+        ):
+            service.reconciliation.reconcile(
+                actor="operator:status-rollback",
+                reason="verify status rollback",
+                request_id="reconcile-status-rollback",
+            )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.SUBMITTED.value
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.action == "order.reconcile",
+                AuditEvent.target_id == str(order_id),
+            )
+        ) == 0
 
 
 @pytest.mark.parametrize(
@@ -1345,6 +1559,135 @@ class ActivityBroker(MockBroker):
         if self.fail_activities:
             raise ConnectionError("activity stream unavailable")
         return list(self.activities)
+
+
+def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        filled_at = order.submission_started_at + timedelta(seconds=1)
+        broker.activities = [
+            BrokerFill(
+                broker_fill_id="audited-fill",
+                broker_order_id=order.broker_order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=filled_at,
+            )
+        ]
+
+    context = {
+        "actor": "operator:fill-audit",
+        "reason": "verify fill transaction provenance",
+        "request_id": "reconcile-fill-audit",
+    }
+    report = service.reconciliation.reconcile(**context)
+
+    assert report.inserted_fills == 1
+    with service.session_factory() as session:
+        fill = session.scalar(
+            select(Fill).where(Fill.broker_fill_id == "audited-fill")
+        )
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == context["request_id"],
+                AuditEvent.action.in_(
+                    (
+                        "fill.reconcile",
+                        "reconciliation_cursor.advance",
+                        "order.reconcile",
+                    )
+                ),
+            )
+        ).all()
+    assert fill is not None
+    assert {
+        audit.action for audit in audits
+    } >= {
+        "fill.reconcile",
+        "reconciliation_cursor.advance",
+        "order.reconcile",
+    }
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            context["actor"],
+            context["reason"],
+            context["request_id"],
+        )
+    }
+
+
+def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
+    make_service,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _submitted_order_id(service)
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker.activities = [
+            BrokerFill(
+                broker_fill_id="audit-rollback-fill",
+                broker_order_id=order.broker_order_id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=order.submission_started_at
+                + timedelta(seconds=1),
+            )
+        ]
+
+    listener = _audit_failure_listener("fill.reconcile")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        report = service.reconciliation.reconcile(
+            actor="operator:fill-rollback",
+            reason="verify fill audit rollback",
+            request_id="reconcile-fill-audit-rollback",
+        )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    assert report.inserted_fills == 0
+    assert any(
+        "batch not committed" in fault
+        for fault in report.broker_drift
+    )
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count())
+            .select_from(Fill)
+            .where(Fill.broker_fill_id == "audit-rollback-fill")
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(db_models.ReconciliationCursor)
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == "reconcile-fill-audit-rollback",
+                AuditEvent.action.in_(
+                    (
+                        "fill.reconcile",
+                        "reconciliation_cursor.advance",
+                    )
+                ),
+            )
+        ) == 0
 
 
 @pytest.mark.parametrize(

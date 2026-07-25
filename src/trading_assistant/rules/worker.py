@@ -64,19 +64,37 @@ class RuleWorker:
         quotes: dict[str, object] = {}
         for group_id in self.repository.active_group_ids():
             tick_now = self.now()
-            lease = self.repository.lease_group(group_id, now=tick_now)
+            lease = self.repository.lease_group(
+                group_id,
+                now=tick_now,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             if lease is None:
                 continue
             try:
                 stored_rules = self.repository.load_rules(lease)
             except Exception as exc:
-                self.repository.release_group(lease, now=tick_now)
+                self.repository.release_group(
+                    lease,
+                    now=tick_now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
                 outcomes.append(
                     RuleOutcome(group_id=group_id, error=type(exc).__name__)
                 )
                 continue
             if not stored_rules:
-                self.repository.release_group(lease, now=tick_now)
+                self.repository.release_group(
+                    lease,
+                    now=tick_now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
                 continue
 
             high_water_marks: dict[int, Decimal] = {}
@@ -115,6 +133,9 @@ class RuleWorker:
                         lease,
                         now=tick_now,
                         high_water_marks=high_water_marks,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                     continue
 
@@ -147,7 +168,13 @@ class RuleWorker:
                             outcome.proposal["order_id"],
                         )
             except ValueError as exc:
-                self.repository.release_group(lease, now=tick_now)
+                self.repository.release_group(
+                    lease,
+                    now=tick_now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
                 outcomes.append(
                     RuleOutcome(
                         group_id=group_id,

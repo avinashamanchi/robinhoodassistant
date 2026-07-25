@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from threading import Barrier
 
-from sqlalchemy import func, select
+import pytest
+from sqlalchemy import event, func, select
 
 from trading_assistant.analyst.models import (
     EntryPlan,
@@ -22,7 +23,13 @@ from trading_assistant.analyst.models import (
 from trading_assistant.analyst.planning import PlanningService
 from trading_assistant.assets import AssetClass
 from trading_assistant.config import Secrets, TradingMode
-from trading_assistant.db.models import Proposal, Rule, RuleGroup, TradePlanRow
+from trading_assistant.db.models import (
+    AuditEvent,
+    Proposal,
+    Rule,
+    RuleGroup,
+    TradePlanRow,
+)
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.application import RuleApplicationService
 from trading_assistant.rules.repository import RuleRepository
@@ -77,6 +84,17 @@ def _analyze(planning, reason):
     )
 
 
+def _fail_audit_action(action):
+    def fail(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent) and row.action == action
+            for row in session.new
+        ):
+            raise RuntimeError(f"injected {action} audit failure")
+
+    return fail
+
+
 def test_analyze_stores_sized_plan(make_service):
     svc = make_service()
     out = _analyze(_planning(svc), "store sized plan")
@@ -108,6 +126,75 @@ def test_approve_decomposes_into_human_gated_typed_rules(make_service):
         assert s.get(TradePlanRow, pid).status == "approved"
 
 
+def test_plan_approval_crash_before_atomic_commit_is_retryable(make_service):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = _analyze(planning, "approval crash retry")["plan_id"]
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash(*args, **kwargs):
+        raise SimulatedCrash("process stopped before approval commit")
+
+    planning._decompose = crash
+    with pytest.raises(SimulatedCrash):
+        planning.approve_plan(
+            plan_id,
+            actor="operator:approval-crash",
+            reason="approval crash drill",
+            request_id="plan-approval-crash",
+        )
+
+    with svc.session_factory() as session:
+        plan = session.get(TradePlanRow, plan_id)
+        rule_count = session.scalar(
+            select(func.count())
+            .select_from(Rule)
+            .where(Rule.plan_id == plan_id)
+        )
+    assert plan.status == "proposed"
+    assert rule_count == 0
+
+
+def test_plan_approval_and_all_lifecycle_audits_roll_back_together(
+    make_service,
+):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = _analyze(planning, "approval audit rollback")["plan_id"]
+    listener = _fail_audit_action("plan.approve")
+    session_type = svc.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected plan.approve audit failure",
+        ):
+            planning.approve_plan(
+                plan_id,
+                actor="operator:approval-rollback",
+                reason="approval audit rollback drill",
+                request_id="plan-approval-audit-rollback",
+            )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with svc.session_factory() as session:
+        plan = session.get(TradePlanRow, plan_id)
+        rules = session.scalars(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).all()
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == "plan-approval-audit-rollback"
+            )
+        ).all()
+    assert plan.status == "proposed"
+    assert rules == []
+    assert audits == []
+
+
 def test_cancel_plan_cancels_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
@@ -126,8 +213,134 @@ def test_cancel_plan_cancels_rules(make_service):
     )
     assert res["status"] == "canceled" and res["rules_canceled"] >= 1
     with svc.session_factory() as s:
-        assert all(r.state == "canceled"
-                   for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars())
+        rules = s.scalars(
+            select(Rule).where(Rule.plan_id == pid)
+        ).all()
+        assert all(rule.state == "canceled" for rule in rules)
+        group_ids = {rule.group_id for rule in rules}
+        audits = s.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == "planning-cancel"
+            )
+        ).all()
+    assert [audit.action for audit in audits].count("plan.cancel") == 1
+    assert [audit.action for audit in audits].count(
+        "rule_group.cancel"
+    ) == len(group_ids)
+    assert [audit.action for audit in audits].count(
+        "rule.cancel"
+    ) == len(rules)
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            "operator:test",
+            "cancel reviewed plan",
+            "planning-cancel",
+        )
+    }
+
+
+def test_plan_cancellation_and_per_target_audits_are_one_transaction(
+    make_service,
+):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = _analyze(planning, "cancel audit rollback")["plan_id"]
+    planning.approve_plan(
+        plan_id,
+        actor="operator:cancel-setup",
+        reason="approve before cancel rollback",
+        request_id="plan-cancel-rollback-setup",
+    )
+    with svc.session_factory() as session:
+        rules = session.scalars(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).all()
+        group_id = rules[0].group_id
+        rule_ids = [rule.id for rule in rules]
+
+    listener = _fail_audit_action("plan.cancel")
+    session_type = svc.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected plan.cancel audit failure",
+        ):
+            planning.cancel_plan(
+                plan_id,
+                actor="operator:cancel-rollback",
+                reason="cancel audit rollback drill",
+                request_id="plan-cancel-audit-rollback",
+            )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with svc.session_factory() as session:
+        plan = session.get(TradePlanRow, plan_id)
+        group = session.get(RuleGroup, group_id)
+        rules = session.scalars(
+            select(Rule).where(Rule.id.in_(rule_ids))
+        ).all()
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == "plan-cancel-audit-rollback"
+            )
+        ).all()
+    assert plan.status == "approved"
+    assert group.state == "active"
+    assert {rule.state for rule in rules} == {"active"}
+    assert audits == []
+
+
+def test_plan_approval_retry_is_idempotent_and_lifecycle_audits_are_exact(
+    make_service,
+):
+    svc = make_service()
+    planning = _planning(svc)
+    plan_id = _analyze(planning, "approval idempotency")["plan_id"]
+    context = {
+        "actor": "operator:approval-idempotency",
+        "reason": "approve exactly once",
+        "request_id": "plan-approval-idempotency",
+    }
+
+    first = planning.approve_plan(plan_id, **context)
+    second = planning.approve_plan(plan_id, **context)
+
+    assert first["status"] == "approved"
+    assert second["status"] == "approved"
+    assert "error" in second
+    with svc.session_factory() as session:
+        rules = session.scalars(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).all()
+        group_ids = {rule.group_id for rule in rules}
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id == context["request_id"]
+            )
+        ).all()
+    assert len(group_ids) == 1
+    assert [audit.action for audit in audits].count("plan.approve") == 1
+    assert [audit.action for audit in audits].count(
+        "rule_group.create"
+    ) == 1
+    assert [audit.action for audit in audits].count(
+        "rule.create"
+    ) == len(rules)
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            context["actor"],
+            context["reason"],
+            context["request_id"],
+        )
+    }
 
 
 def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service):

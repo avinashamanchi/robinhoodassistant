@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from threading import Barrier, Thread
 
 import pytest
+from sqlalchemy import event, func, select
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import AuditEvent, Order
+from trading_assistant.db.models import AuditEvent, Order, Proposal
 from trading_assistant.orders.application import (
     ApprovalCommand,
     ApprovalConflict,
@@ -28,6 +29,17 @@ def _proposed_order_id(make_service) -> tuple[object, int]:
         request_id="order-application-proposal",
     )
     return service, result["order_id"]
+
+
+def _fail_audit_action(action):
+    def fail(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent) and row.action == action
+            for row in session.new
+        ):
+            raise RuntimeError(f"injected {action} audit failure")
+
+    return fail
 
 
 def test_approval_records_actor_reason_and_audit(make_service):
@@ -147,10 +159,20 @@ def test_submission_claim_succeeds_once_after_approval(make_service):
 
     scopes = ("operator_global", "equity")
     assert app.repository.claim_submission(
-        order_id, datetime.now(timezone.utc), scopes
+        order_id,
+        datetime.now(timezone.utc),
+        scopes,
+        actor="operator:avi",
+        reason="claim approved order",
+        request_id="order-application-submission-claim",
     ) is True
     assert app.repository.claim_submission(
-        order_id, datetime.now(timezone.utc), scopes
+        order_id,
+        datetime.now(timezone.utc),
+        scopes,
+        actor="operator:avi",
+        reason="retry approved order claim",
+        request_id="order-application-submission-claim-retry",
     ) is False
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -171,7 +193,12 @@ def test_expired_approval_retry_does_not_overwrite_submission_claim(make_service
     )
     app.approve(command)
     assert app.repository.claim_submission(
-        order_id, approved_at, ("operator_global", "equity")
+        order_id,
+        approved_at,
+        ("operator_global", "equity"),
+        actor=command.actor,
+        reason=command.reason,
+        request_id=command.request_id,
     ) is True
 
     with pytest.raises(ApprovalConflict):
@@ -189,3 +216,93 @@ def test_expired_approval_retry_does_not_overwrite_submission_claim(make_service
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.SUBMITTING.value
         assert order.version == 2
+
+
+def test_expired_human_approval_has_exact_atomic_status_audit(make_service):
+    service, order_id = _proposed_order_id(make_service)
+    app = OrderApplicationService(service.session_factory)
+    with service.session_factory() as session:
+        proposal = session.scalar(
+            select(Proposal).where(Proposal.order_id == order_id)
+        )
+        expired_at = proposal.expires_at.replace(
+            year=proposal.expires_at.year + 1
+        )
+
+    result = app.approve(
+        ApprovalCommand(
+            order_id,
+            "operator:expiry",
+            "review expired approval",
+            expired_at,
+            "order-approval-expired",
+        )
+    )
+
+    assert result.status is OrderStatus.EXPIRED
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.expire",
+                AuditEvent.target_id == str(order_id),
+            )
+        )
+    assert order.status == OrderStatus.EXPIRED.value
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.request_id,
+        audit.result_code,
+    ) == (
+        "operator:expiry",
+        "review expired approval",
+        "order-approval-expired",
+        OrderStatus.EXPIRED.value,
+    )
+
+
+def test_expired_approval_mutation_rolls_back_on_audit_failure(make_service):
+    service, order_id = _proposed_order_id(make_service)
+    app = OrderApplicationService(service.session_factory)
+    with service.session_factory() as session:
+        proposal = session.scalar(
+            select(Proposal).where(Proposal.order_id == order_id)
+        )
+        expired_at = proposal.expires_at.replace(
+            year=proposal.expires_at.year + 1
+        )
+
+    listener = _fail_audit_action("order.expire")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected order.expire audit failure",
+        ):
+            app.approve(
+                ApprovalCommand(
+                    order_id,
+                    "operator:expiry",
+                    "rollback expired approval",
+                    expired_at,
+                    "order-approval-expired-rollback",
+                )
+            )
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.PROPOSED.value
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == "order-approval-expired-rollback"
+            )
+        ) == 0

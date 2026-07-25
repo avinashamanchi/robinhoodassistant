@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 from decimal import Decimal
@@ -32,6 +33,69 @@ from trading_assistant.risk.breakers import (
 )
 
 
+def _require_context(
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> tuple[str, str, str]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "order mutation actor, reason, and request_id must be non-empty"
+        )
+    return actor, reason, request_id
+
+
+def _audit_order_mutation(
+    session: Session,
+    *,
+    order_id: int,
+    actor: str,
+    reason: str,
+    request_id: str,
+    action: str,
+    result_code: str,
+    detail: dict[str, object] | None = None,
+) -> None:
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type="order",
+            target_id=str(order_id),
+            request_id=request_id,
+            reason=reason,
+            result_code=result_code,
+            detail_json=json.dumps(detail or {}, sort_keys=True),
+        )
+    )
+
+
+def _audit_group_mutation(
+    session: Session,
+    *,
+    group_id: int,
+    actor: str,
+    reason: str,
+    request_id: str,
+    action: str,
+    result_code: str,
+) -> None:
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type="rule_group",
+            target_id=str(group_id),
+            request_id=request_id,
+            reason=reason,
+            result_code=result_code,
+        )
+    )
+
+
 class OrderRepository:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self.session_factory = session_factory
@@ -40,8 +104,9 @@ class OrderRepository:
         self, order_id: int, actor: str, reason: str, request_id: str, now: datetime
     ) -> bool:
         """Atomically record one human approval and its audit event."""
-        if not actor.strip() or not reason.strip():
-            raise ValueError("approval actor and reason must be non-empty")
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
 
         started = time.perf_counter()
         with self.session_factory() as session:
@@ -83,8 +148,15 @@ class OrderRepository:
         order_id: int,
         now: datetime,
         breaker_scope_keys: tuple[str, ...],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> bool:
         """Claim once iff every relevant durable breaker is absent or clear."""
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         scope_keys = tuple(dict.fromkeys(breaker_scope_keys))
         if not scope_keys or any(not key for key in scope_keys):
             raise ValueError("submission claim requires stable breaker scope keys")
@@ -121,7 +193,7 @@ class OrderRepository:
                 )
             )
             if source_rule_group_id is not None:
-                session.execute(
+                group_result = session.execute(
                     update(RuleGroup)
                     .where(RuleGroup.id == source_rule_group_id)
                     .values(
@@ -129,15 +201,45 @@ class OrderRepository:
                         updated_at=now,
                     )
                 )
+                if group_result.rowcount:
+                    _audit_group_mutation(
+                        session,
+                        group_id=source_rule_group_id,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                        action="rule_group.reconciliation_latch",
+                        result_code="required",
+                    )
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.submission_claim",
+                result_code=OrderStatus.SUBMITTING.value,
+            )
             session.commit()
             return True
 
-    def expire_if_eligible(self, order_id: int, now: datetime) -> OrderStatus | None:
+    def expire_if_eligible(
+        self,
+        order_id: int,
+        now: datetime,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> OrderStatus | None:
         """Expire only a still-pending approval and return the resulting status.
 
         A failed compare-and-set returns the current status so a retry cannot
         overwrite a submission claim that won the race.
         """
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         with self.session_factory() as session:
             status = session.execute(
                 update(Order)
@@ -158,6 +260,15 @@ class OrderRepository:
                 .returning(Order.status)
             ).scalar_one_or_none()
             if status is not None:
+                _audit_order_mutation(
+                    session,
+                    order_id=order_id,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="order.expire",
+                    result_code=OrderStatus.EXPIRED.value,
+                )
                 session.commit()
                 return OrderStatus(status)
             session.rollback()
@@ -302,7 +413,7 @@ class OrderRepository:
                     )
                 )
                 if source_rule_group_id is not None:
-                    session.execute(
+                    group_result = session.execute(
                         update(RuleGroup)
                         .where(RuleGroup.id == source_rule_group_id)
                         .values(
@@ -310,6 +421,26 @@ class OrderRepository:
                             updated_at=now,
                         )
                     )
+                    if group_result.rowcount:
+                        _audit_group_mutation(
+                            session,
+                            group_id=source_rule_group_id,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            action="rule_group.reconciliation_latch",
+                            result_code="required",
+                        )
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.submission_result",
+                result_code=persisted_status.value,
+                detail={"error_code": persisted_error_code},
+            )
             session.commit()
             return persisted_status
 
@@ -394,7 +525,7 @@ class OrderRepository:
                 )
             )
             if source_rule_group_id is not None:
-                session.execute(
+                group_result = session.execute(
                     update(RuleGroup)
                     .where(RuleGroup.id == source_rule_group_id)
                     .values(
@@ -402,6 +533,16 @@ class OrderRepository:
                         updated_at=now,
                     )
                 )
+                if group_result.rowcount:
+                    _audit_group_mutation(
+                        session,
+                        group_id=source_rule_group_id,
+                        actor=actor,
+                        reason=context_reason,
+                        request_id=request_id,
+                        action="rule_group.reconciliation_latch",
+                        result_code="required",
+                    )
             trip_in_session(
                 session,
                 BreakerScope.broker_drift(),
@@ -410,6 +551,16 @@ class OrderRepository:
                 request_id=request_id,
                 now=now,
                 audit_reason=context_reason,
+            )
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=context_reason,
+                request_id=request_id,
+                action="order.submission_result",
+                result_code=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                detail={"error_code": error_code},
             )
             session.commit()
 
@@ -477,6 +628,9 @@ class OrderRepository:
         request_id: str,
     ) -> bool:
         """Atomically persist acceptance and latch unresolved cumulative fills."""
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         if broker_order_id is None:
             return False
         with self.session_factory() as session:
@@ -569,13 +723,45 @@ class OrderRepository:
                     request_id=request_id,
                     audit_reason=reason,
                 )
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.reconcile",
+                result_code=(
+                    OrderStatus.ACCEPTANCE_UNKNOWN.value
+                    if cumulative_contradiction or exact_fill_overflow
+                    else status.value
+                ),
+                detail={
+                    "changed_fields": [
+                        "acceptance_state",
+                        "broker_order_id",
+                        "last_error_code",
+                        "last_reconciled_at",
+                        "status",
+                    ]
+                },
+            )
             session.commit()
             return not exact_fill_overflow
 
     def record_pre_submission_rejection(
-        self, order_id: int, reasons: tuple[str, ...], now: datetime
+        self,
+        order_id: int,
+        reasons: tuple[str, ...],
+        now: datetime,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> None:
         """Persist a fresh deterministic risk rejection before a broker send."""
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -599,10 +785,30 @@ class OrderRepository:
                     reason="execution-time: " + "; ".join(reasons),
                 )
             )
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.reject_execution_risk",
+                result_code=OrderStatus.REJECTED.value,
+            )
             session.commit()
 
-    def expire_approved(self, order_id: int, now: datetime) -> bool:
+    def expire_approved(
+        self,
+        order_id: int,
+        now: datetime,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> bool:
         """Expire a still-unclaimed approval before it can reach the broker."""
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         with self.session_factory() as session:
             result = session.execute(
                 update(Order)
@@ -620,5 +826,14 @@ class OrderRepository:
             if result.rowcount != 1:
                 session.rollback()
                 return False
+            _audit_order_mutation(
+                session,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.expire_approved",
+                result_code=OrderStatus.EXPIRED.value,
+            )
             session.commit()
             return True

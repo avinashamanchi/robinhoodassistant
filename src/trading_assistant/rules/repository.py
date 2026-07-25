@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import (
+    AuditEvent,
     Order,
     Proposal,
     Rule,
@@ -49,6 +50,45 @@ class PlanCancellationResult:
     error: str | None = None
 
 
+def _require_context(
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> tuple[str, str, str]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "rule mutation actor, reason, and request_id must be non-empty"
+        )
+    return actor, reason, request_id
+
+
+def _audit(
+    session: Session,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+    action: str,
+    target_type: str,
+    target_id: int,
+    result_code: str,
+) -> None:
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=str(target_id),
+            request_id=request_id,
+            reason=reason,
+            result_code=result_code,
+        )
+    )
+
+
 class RuleRepository:
     def __init__(self, session_factory: sessionmaker[Session], owner: str) -> None:
         owner = owner.strip()
@@ -72,7 +112,14 @@ class RuleRepository:
         group_id: int,
         now: datetime,
         ttl: timedelta = timedelta(seconds=30),
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> RuleGroupLease | None:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         if ttl <= timedelta(0):
             raise ValueError("rule lease ttl must be positive")
         expires_at = now + ttl
@@ -90,7 +137,7 @@ class RuleRepository:
                     ),
                 )
             )
-            session.execute(
+            latch = session.execute(
                 update(RuleGroup)
                 .where(
                     RuleGroup.id == group_id,
@@ -102,6 +149,17 @@ class RuleRepository:
                     updated_at=now,
                 )
             )
+            if latch.rowcount:
+                _audit(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="rule_group.reconciliation_latch",
+                    target_type="rule_group",
+                    target_id=group_id,
+                    result_code="required",
+                )
             version = session.execute(
                 update(RuleGroup)
                 .where(
@@ -126,6 +184,16 @@ class RuleRepository:
                 # the lease CAS itself was (correctly) denied.
                 session.commit()
                 return None
+            _audit(
+                session,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="rule_group.lease",
+                target_type="rule_group",
+                target_id=group_id,
+                result_code="leased",
+            )
             session.commit()
             return RuleGroupLease(
                 group_id=group_id,
@@ -194,7 +262,13 @@ class RuleRepository:
         *,
         now: datetime,
         high_water_marks: dict[int, object] | None = None,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> bool:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         validated_high_water_marks = {
             rule_id: validate_persisted_high_water_mark(high_water_mark)
             for rule_id, high_water_mark in (high_water_marks or {}).items()
@@ -218,8 +292,18 @@ class RuleRepository:
             if released.rowcount != 1:
                 session.rollback()
                 return False
+            _audit(
+                session,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="rule_group.release",
+                target_type="rule_group",
+                target_id=lease.group_id,
+                result_code="released",
+            )
             for rule_id, high_water_mark in validated_high_water_marks.items():
-                session.execute(
+                changed = session.execute(
                     update(Rule)
                     .where(
                         Rule.id == rule_id,
@@ -227,9 +311,21 @@ class RuleRepository:
                         Rule.state.in_(
                             (RuleState.ACTIVE.value, RuleState.PROCESSING.value)
                         ),
+                        Rule.hwm.is_distinct_from(high_water_mark),
                     )
                     .values(hwm=high_water_mark)
                 )
+                if changed.rowcount:
+                    _audit(
+                        session,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                        action="rule.high_water_mark",
+                        target_type="rule",
+                        target_id=rule_id,
+                        result_code="updated",
+                    )
             session.commit()
             return True
 
@@ -242,7 +338,13 @@ class RuleRepository:
         terminal_state: RuleState = RuleState.TRIGGERED,
         high_water_mark=None,
         session: Session | None = None,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> bool:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         if terminal_state not in {
             RuleState.TRIGGERED,
             RuleState.CANCELED,
@@ -276,6 +378,16 @@ class RuleRepository:
             if group_result.rowcount != 1:
                 current.rollback()
                 return False
+            _audit(
+                current,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="rule_group.terminal",
+                target_type="rule_group",
+                target_id=lease.group_id,
+                result_code=terminal_state.value,
+            )
             winner = current.execute(
                 update(Rule)
                 .where(
@@ -297,17 +409,44 @@ class RuleRepository:
             if winner.rowcount != 1:
                 current.rollback()
                 return False
-            current.execute(
-                update(Rule)
-                .where(
-                    Rule.group_id == lease.group_id,
-                    Rule.id != winning_rule_id,
-                    Rule.state.in_(
-                        (RuleState.ACTIVE.value, RuleState.PROCESSING.value)
-                    ),
-                )
-                .values(state=RuleState.CANCELED.value)
+            _audit(
+                current,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="rule.terminal",
+                target_type="rule",
+                target_id=winning_rule_id,
+                result_code=terminal_state.value,
             )
+            sibling_ids = list(
+                current.scalars(
+                    update(Rule)
+                    .where(
+                        Rule.group_id == lease.group_id,
+                        Rule.id != winning_rule_id,
+                        Rule.state.in_(
+                            (
+                                RuleState.ACTIVE.value,
+                                RuleState.PROCESSING.value,
+                            )
+                        ),
+                    )
+                    .values(state=RuleState.CANCELED.value)
+                    .returning(Rule.id)
+                )
+            )
+            for sibling_id in sibling_ids:
+                _audit(
+                    current,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="rule.cancel",
+                    target_type="rule",
+                    target_id=sibling_id,
+                    result_code=RuleState.CANCELED.value,
+                )
             if owns_session:
                 current.commit()
             return True
@@ -323,8 +462,14 @@ class RuleRepository:
         plan_id: int,
         *,
         now: datetime,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> PlanCancellationResult:
         """Atomically cancel one plan group or lose to a terminal worker CAS."""
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
 
         with self.session_factory() as session:
             plan = session.get(TradePlanRow, plan_id)
@@ -371,6 +516,16 @@ class RuleRepository:
                         status=plan.status,
                         error="plan_conflict",
                     )
+                _audit(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="plan.cancel",
+                    target_type="trade_plan",
+                    target_id=plan_id,
+                    result_code=RuleState.CANCELED.value,
+                )
                 session.commit()
                 return PlanCancellationResult(
                     plan_id=plan_id,
@@ -435,16 +590,43 @@ class RuleRepository:
                     error="group_conflict",
                 )
 
-            rules_canceled = session.execute(
-                update(Rule)
-                .where(
-                    Rule.group_id == group.id,
-                    Rule.state.in_(
-                        (RuleState.ACTIVE.value, RuleState.PROCESSING.value)
-                    ),
+            _audit(
+                session,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="rule_group.cancel",
+                target_type="rule_group",
+                target_id=group.id,
+                result_code=RuleState.CANCELED.value,
+            )
+            canceled_rule_ids = list(
+                session.scalars(
+                    update(Rule)
+                    .where(
+                        Rule.group_id == group.id,
+                        Rule.state.in_(
+                            (
+                                RuleState.ACTIVE.value,
+                                RuleState.PROCESSING.value,
+                            )
+                        ),
+                    )
+                    .values(state=RuleState.CANCELED.value)
+                    .returning(Rule.id)
                 )
-                .values(state=RuleState.CANCELED.value)
-            ).rowcount
+            )
+            for canceled_rule_id in canceled_rule_ids:
+                _audit(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="rule.cancel",
+                    target_type="rule",
+                    target_id=canceled_rule_id,
+                    result_code=RuleState.CANCELED.value,
+                )
             plan_claim = session.execute(
                 update(TradePlanRow)
                 .where(
@@ -461,10 +643,20 @@ class RuleRepository:
                     status=plan.status,
                     error="plan_conflict",
                 )
+            _audit(
+                session,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="plan.cancel",
+                target_type="trade_plan",
+                target_id=plan_id,
+                result_code=RuleState.CANCELED.value,
+            )
             session.commit()
             return PlanCancellationResult(
                 plan_id=plan_id,
                 canceled=True,
                 status=RuleState.CANCELED.value,
-                rules_canceled=rules_canceled,
+                rules_canceled=len(canceled_rule_ids),
             )

@@ -195,7 +195,12 @@ def test_preapproval_is_rejected_by_typed_model_and_application_boundary(make_se
 
     command = _command().model_copy(update={"pre_approved": True})
     with pytest.raises(ValueError, match="pre_approved"):
-        svc.rule_application.create_rule(command)
+        svc.rule_application.create_rule(
+            command,
+            actor="operator:test",
+            reason="reject pre-approved rule",
+            request_id="reject-pre-approved-rule",
+        )
 
 
 def test_rule_application_rejects_raw_unknown_json_without_persisting(make_service):

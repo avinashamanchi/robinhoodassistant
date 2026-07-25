@@ -53,7 +53,13 @@ class OrderApplicationService:
             if order is None:
                 raise KeyError(f"order {command.order_id} not found")
             if order.proposal is not None and order.proposal.is_expired(command.now):
-                status = self.repository.expire_if_eligible(order.id, command.now)
+                status = self.repository.expire_if_eligible(
+                    order.id,
+                    command.now,
+                    actor=command.actor,
+                    reason=command.reason,
+                    request_id=command.request_id,
+                )
                 if status is OrderStatus.EXPIRED:
                     return ApprovalResult(order.id, status)
                 if status is None:

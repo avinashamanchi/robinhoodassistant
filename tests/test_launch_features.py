@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -283,11 +283,18 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
         )
     entered = Event()
     release = Event()
+    decompose_lock = Lock()
+    decompose_calls = 0
     original = planning._decompose
 
     def blocking_decompose(*args, **kwargs):
-        entered.set()
-        assert release.wait(timeout=2)
+        nonlocal decompose_calls
+        with decompose_lock:
+            decompose_calls += 1
+            call_number = decompose_calls
+        if call_number == 1:
+            entered.set()
+            assert release.wait(timeout=2)
         return original(*args, **kwargs)
 
     planning._decompose = blocking_decompose
@@ -315,9 +322,10 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
     release.set()
     thread.join(timeout=2)
 
+    assert second["status"] == "approved"
+    assert "error" not in second
     assert first_result["status"] == "approved"
-    assert second["status"] == "approving"
-    assert "error" in second
+    assert "error" in first_result
     with svc.session_factory() as session:
         rules = session.execute(
             select(Rule).where(Rule.plan_id == plan_id)

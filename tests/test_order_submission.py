@@ -6,6 +6,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import event, func, select
 
 from trading_assistant.broker.base import (
     BrokerDataIntegrityError,
@@ -20,6 +21,7 @@ from trading_assistant.broker.models import (
 from trading_assistant.assets import AssetClass
 from trading_assistant.db.models import (
     FILL_RECONCILIATION_REQUIRED,
+    AuditEvent,
     Fill,
     Order,
     Proposal,
@@ -66,6 +68,17 @@ def _approved_order(svc) -> int:
     return order_id
 
 
+def _fail_audit_action(action):
+    def fail(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent) and row.action == action
+            for row in session.new
+        ):
+            raise RuntimeError(f"injected {action} audit failure")
+
+    return fail
+
+
 class AcceptThenDisconnectBroker(MockBroker):
     def submit_order(self, order):
         super().submit_order(order)
@@ -89,7 +102,7 @@ def test_accept_then_disconnect_becomes_unknown_without_duplicate(make_service):
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.acceptance_state == OrderStatus.ACCEPTANCE_UNKNOWN.value
-        assert order.last_error_code == "ConnectionError"
+        assert order.last_error_code == "broker_submission_unknown"
 
 
 def test_synchronous_broker_data_integrity_latches_and_trips_drift(
@@ -171,6 +184,77 @@ def test_scoped_data_breaker_atomically_prevents_a_later_broker_submit(make_serv
     assert svc.broker.submit_calls == 0
 
 
+def test_execution_risk_rejection_has_exact_atomic_status_audit(make_service):
+    service = make_service()
+    order_id = _approved_order(service)
+    service.breakers.trip(
+        BreakerScope.data(AssetClass.EQUITY),
+        "feed disagreement",
+        "daemon:risk",
+        request_id="execution-risk-breaker",
+    )
+
+    result = _submit(service.order_submission, order_id)
+
+    assert result.status is OrderStatus.REJECTED
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.reject_execution_risk",
+                AuditEvent.target_id == str(order_id),
+            )
+        )
+    assert order.status == OrderStatus.REJECTED.value
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.request_id,
+        audit.result_code,
+    ) == (
+        "operator:test",
+        "order submission test",
+        f"order-submission-{order_id}",
+        OrderStatus.REJECTED.value,
+    )
+
+
+def test_execution_risk_rejection_rolls_back_on_audit_failure(make_service):
+    service = make_service()
+    order_id = _approved_order(service)
+    service.breakers.trip(
+        BreakerScope.data(AssetClass.EQUITY),
+        "feed disagreement",
+        "daemon:risk",
+        request_id="execution-risk-rollback-breaker",
+    )
+    listener = _fail_audit_action("order.reject_execution_risk")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected order.reject_execution_risk audit failure",
+        ):
+            _submit(service.order_submission, order_id)
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.APPROVAL_RECORDED.value
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.action == "order.reject_execution_risk",
+                AuditEvent.target_id == str(order_id),
+            )
+        ) == 0
+
+
 def test_approved_proposal_that_expires_before_submit_never_calls_broker(make_service):
     svc = make_service()
     order_id = _approved_order(svc)
@@ -183,6 +267,61 @@ def test_approved_proposal_that_expires_before_submit_never_calls_broker(make_se
 
     assert result.status is OrderStatus.EXPIRED
     assert svc.broker.submit_calls == 0
+    with svc.session_factory() as session:
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.expire_approved",
+                AuditEvent.target_id == str(order_id),
+            )
+        )
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.request_id,
+        audit.result_code,
+    ) == (
+        "operator:test",
+        "order submission test",
+        f"order-submission-{order_id}",
+        OrderStatus.EXPIRED.value,
+    )
+
+
+def test_approved_expiry_rolls_back_on_audit_failure(make_service):
+    service = make_service()
+    order_id = _approved_order(service)
+    with service.session_factory() as session:
+        proposal = session.scalar(
+            select(Proposal).where(Proposal.order_id == order_id)
+        )
+        proposal.expires_at = utcnow() - timedelta(seconds=1)
+        session.commit()
+
+    listener = _fail_audit_action("order.expire_approved")
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", listener)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected order.expire_approved audit failure",
+        ):
+            _submit(service.order_submission, order_id)
+    finally:
+        event.remove(session_type, "before_flush", listener)
+
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.APPROVAL_RECORDED.value
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.action == "order.expire_approved",
+                AuditEvent.target_id == str(order_id),
+            )
+        ) == 0
 
 
 def test_expiry_during_snapshot_prevents_submission_claim(make_service):
@@ -250,6 +389,28 @@ def test_only_definitive_broker_rejection_becomes_rejected(make_service):
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.REJECTED.value
         assert order.last_error_code == "insufficient_buying_power"
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.request_id
+                == f"order-submission-{order_id}"
+            )
+        ).all()
+    assert {
+        audit.action for audit in audits
+    } >= {
+        "order.submission_claim",
+        "order.submission_result",
+    }
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            "operator:test",
+            "order submission test",
+            f"order-submission-{order_id}",
+        )
+    }
 
 
 def test_immediate_broker_fill_persists_truthfully(make_service):
@@ -388,6 +549,9 @@ def test_post_send_cumulative_below_exact_local_fill_never_adopts_terminal_statu
             scope.key
             for scope in relevant_scopes_for_symbol("AAPL")
         ),
+        actor="operator:test",
+        reason="post-send exact fill reconciliation",
+        request_id="post-send-exact-fill-claim",
     )
     with service.session_factory() as session:
         session.add(
@@ -476,6 +640,9 @@ def test_post_send_uses_canonical_fill_quantum(
             scope.key
             for scope in relevant_scopes_for_symbol("AAPL")
         ),
+        actor="operator:test",
+        reason="post-send canonical fill reconciliation",
+        request_id="post-send-fill-quantum-claim",
     )
     authoritative_qty = Decimal("0.000000500")
     with service.session_factory() as session:

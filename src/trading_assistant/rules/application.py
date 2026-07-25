@@ -68,10 +68,23 @@ class RuleApplicationService:
         return validated
 
     def create_rule(
-        self, command: RuleCommand | dict, *, plan_id: int | None = None
+        self,
+        command: RuleCommand | dict,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        plan_id: int | None = None,
     ) -> int:
         with self.service.session_factory() as session:
-            rows = self.persist_commands(session, [command], plan_id=plan_id)
+            rows = self.persist_commands(
+                session,
+                [command],
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                plan_id=plan_id,
+            )
             session.commit()
             return rows[0].id
 
@@ -80,8 +93,19 @@ class RuleApplicationService:
         session: Session,
         commands: Iterable[RuleCommand | dict],
         *,
+        actor: str,
+        reason: str,
+        request_id: str,
         plan_id: int | None = None,
     ) -> list[Rule]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "rule persistence actor, reason, and request_id "
+                "must be non-empty"
+            )
         validated = [self._validated(command) for command in commands]
         if not validated:
             return []
@@ -100,6 +124,17 @@ class RuleApplicationService:
                     group = RuleGroup(group_key=group_key)
                     session.add(group)
                     session.flush()
+                    session.add(
+                        AuditEvent(
+                            actor=actor,
+                            action="rule_group.create",
+                            target_type="rule_group",
+                            target_id=str(group.id),
+                            request_id=request_id,
+                            reason=reason,
+                            result_code=group.state,
+                        )
+                    )
                 elif group.state != RuleState.ACTIVE.value:
                     raise ValueError(
                         f"rule group {group_key!r} is not active"
@@ -142,6 +177,17 @@ class RuleApplicationService:
             )
             session.add(row)
             session.flush()
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="rule.create",
+                    target_type="rule",
+                    target_id=str(row.id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=row.state,
+                )
+            )
             rows.append(row)
         return rows
 
@@ -162,9 +208,9 @@ class RuleApplicationService:
         high_water_mark: Decimal | None = None,
     ) -> RuleOutcome:
         actor = actor.strip()
-        reason = reason.strip()
+        operation_reason = reason.strip()
         request_id = request_id.strip()
-        if not actor or not reason or not request_id:
+        if not actor or not operation_reason or not request_id:
             raise ValueError(
                 "rule proposal actor, reason, and request_id "
                 "must be non-empty"
@@ -183,7 +229,13 @@ class RuleApplicationService:
 
         action = self._bounded_action(validated, reference_price)
         if action is None:
-            self.repository.release_group(lease, now=now)
+            self.repository.release_group(
+                lease,
+                now=now,
+                actor=actor,
+                reason=operation_reason,
+                request_id=request_id,
+            )
             return RuleOutcome(
                 group_id=lease.group_id,
                 rule_id=rule_id,
@@ -246,6 +298,9 @@ class RuleApplicationService:
                 terminal_state=terminal_state,
                 high_water_mark=high_water_mark,
                 session=session,
+                actor=actor,
+                reason=operation_reason,
+                request_id=request_id,
             ):
                 return RuleOutcome(
                     group_id=lease.group_id,
@@ -284,12 +339,12 @@ class RuleApplicationService:
                     expires_at=now + timedelta(minutes=ttl),
                 )
             )
-            for reason in risk.reasons:
+            for risk_reason in risk.reasons:
                 session.add(
                     RiskEvent(
                         order_id=order.id,
                         event_type="rejection",
-                        reason=reason,
+                        reason=risk_reason,
                     )
                 )
             for warning in risk.warnings:
@@ -307,7 +362,7 @@ class RuleApplicationService:
                     target_type="order",
                     target_id=str(order.id),
                     request_id=request_id,
-                    reason=reason,
+                    reason=operation_reason,
                     result_code=order.status,
                     created_at=now,
                     detail_json=json.dumps(

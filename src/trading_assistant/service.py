@@ -674,6 +674,8 @@ class TradingService:
         )
         return {
             "safe": report.safe,
+            "local_enumeration": report.local_enumeration,
+            "remote_enumeration": report.remote_enumeration,
             "confirmed_canceled": list(report.confirmed_canceled),
             "unconfirmed_order_ids": list(report.unconfirmed_order_ids),
             "remote_open_order_ids": list(report.remote_open_order_ids),
@@ -1373,19 +1375,11 @@ class TradingService:
             rule = self.rule_application.persist_commands(
                 s,
                 [command],
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
                 plan_id=plan_id,
             )[0]
-            s.add(
-                AuditEvent(
-                    actor=actor,
-                    action="rule.create",
-                    target_type="rule",
-                    target_id=str(rule.id),
-                    request_id=request_id,
-                    reason=reason,
-                    result_code=rule.state,
-                )
-            )
             s.commit()
             return self._rule_dict(rule)
 
@@ -1514,6 +1508,17 @@ class TradingService:
                         "canceled": False,
                         "error": "rule group changed during cancellation",
                     }
+                s.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="rule_group.cancel",
+                        target_type="rule_group",
+                        target_id=str(rule.group_id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code="canceled",
+                    )
+                )
             s.add(
                 AuditEvent(
                     actor=actor,
