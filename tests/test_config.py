@@ -185,6 +185,46 @@ def test_non_positive_external_timeout_rejected(tmp_path, old, new):
         load_config(_write(tmp_path, VALID.replace(old, new)))
 
 
+@pytest.mark.parametrize(
+    "yaml_value",
+    [
+        ".nan",
+        ".inf",
+        "-.inf",
+        "0",
+        "-1",
+        "true",
+    ],
+)
+def test_invalid_daemon_heartbeat_stale_threshold_fails_to_load(
+    tmp_path,
+    yaml_value,
+):
+    invalid = VALID.replace(
+        "poll_interval_seconds: 15",
+        (
+            "poll_interval_seconds: 15\n"
+            f"  heartbeat_stale_seconds: {yaml_value}"
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, invalid))
+
+
+def test_unknown_daemon_heartbeat_setting_remains_forbidden(tmp_path):
+    invalid = VALID.replace(
+        "poll_interval_seconds: 15",
+        (
+            "poll_interval_seconds: 15\n"
+            "  heartbeat_stale_second: 180"
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, invalid))
+
+
 def test_live_double_lock(tmp_path):
     cfg = load_config(_write(tmp_path, VALID.replace("mode: paper", "mode: live")))
     # Missing confirmation string -> still not live.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 from numbers import Number
@@ -17,38 +18,71 @@ from ..config import Secrets, load_config
 from ..db.models import Heartbeat, utcnow
 from ..db.session import create_db_engine, make_session_factory
 
+_MAX_LIVENESS_RESPONSE_BYTES = 1024
+_RESTART_ORDER = (
+    ("app", "com.trading.app"),
+    ("daemon", "com.trading.daemon"),
+)
+log = logging.getLogger(__name__)
 
-def needs_restart(health: dict[str, Any], stale_seconds: float) -> bool:
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Number):
+        return None
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric_value if math.isfinite(numeric_value) else None
+
+
+def needs_restart(health: object, stale_seconds: object) -> bool:
     """Return false only for a finite age in the inclusive fresh interval."""
-    if not health.get("db_ok", False):
+    if not isinstance(health, dict) or health.get("db_ok") is not True:
+        return True
+    numeric_threshold = _finite_number(stale_seconds)
+    if numeric_threshold is None or numeric_threshold <= 0:
         return True
     age = health.get("heartbeat_age_seconds")
-    if isinstance(age, bool) or not isinstance(age, Number):
+    numeric_age = _finite_number(age)
+    if numeric_age is None:
         return True
-    try:
-        numeric_age = float(age)
-    except (TypeError, ValueError, OverflowError):
-        return True
-    return not (math.isfinite(numeric_age) and 0 <= numeric_age <= stale_seconds)
+    return not (0 <= numeric_age <= numeric_threshold)
+
+
+def _api_is_live(payload: object) -> bool:
+    return type(payload) is dict and payload == {"status": "ok"}
 
 
 def labels_to_restart(
     *,
-    api_health: dict[str, Any] | None,
+    api_health: object,
     database_health: dict[str, Any],
     stale_seconds: float,
 ) -> set[str]:
     labels: set[str] = set()
-    if api_health is None or api_health.get("status") != "ok":
+    if not _api_is_live(api_health):
         labels.add("com.trading.app")
     if needs_restart(database_health, stale_seconds):
         labels.add("com.trading.daemon")
     return labels
 
 
-def fetch_health(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
+def fetch_health(
+    url: str,
+    timeout_seconds: float = 5.0,
+) -> dict[str, str] | None:
     with urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310 - local URL
-        return json.loads(response.read())
+        body = response.read(_MAX_LIVENESS_RESPONSE_BYTES + 1)
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    if len(body) > _MAX_LIVENESS_RESPONSE_BYTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        return None
+    return {"status": "ok"} if _api_is_live(payload) else None
 
 
 def read_database_health(
@@ -76,6 +110,42 @@ def restart_launch_agent(label: str) -> None:
     subprocess.run(["launchctl", "kickstart", "-k", target], check=True)
 
 
+def restart_selected_components(
+    labels: set[str],
+    *,
+    daemon_label: str,
+) -> tuple[str, ...]:
+    """Attempt each selected component once and return fixed failure codes."""
+    failures: list[str] = []
+    attempted_targets: set[str] = set()
+    for component, label in _RESTART_ORDER:
+        if label not in labels:
+            continue
+        target = daemon_label if component == "daemon" else label
+        if target in attempted_targets:
+            failures.append(component)
+            log.error(
+                "watchdog_restart component=%s result=duplicate_target",
+                component,
+            )
+            continue
+        attempted_targets.add(target)
+        try:
+            restart_launch_agent(target)
+        except Exception:
+            failures.append(component)
+            log.error(
+                "watchdog_restart component=%s result=failed",
+                component,
+            )
+        else:
+            log.warning(
+                "watchdog_restart component=%s result=success",
+                component,
+            )
+    return tuple(failures)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -96,9 +166,11 @@ def main(argv: list[str] | None = None) -> int:
         database_health=read_database_health(),
         stale_seconds=config.daemon.heartbeat_stale_seconds,
     )
-    for label in sorted(labels):
-        restart_launch_agent(args.label if label == "com.trading.daemon" else label)
-    if labels:
+    restart_failures = restart_selected_components(
+        labels,
+        daemon_label=args.label,
+    )
+    if labels or restart_failures:
         return 1
     return 0
 
