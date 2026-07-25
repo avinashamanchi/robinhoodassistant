@@ -9,7 +9,12 @@ import {
 
 const byId = (id) => document.getElementById(id);
 const dialogReturnFocus = new Map();
-let activePlanId = null;
+let planDetailState = null;
+let planDetailRequestSequence = 0;
+let planApprovalState = null;
+let planApprovalRequestSequence = 0;
+let planCancelState = null;
+let planCancelRequestSequence = 0;
 
 function node(tag, value, className) {
   const element = document.createElement(tag);
@@ -47,12 +52,20 @@ function notify(message, kind = "") {
 
 function showDialog(dialog, trigger) {
   dialogReturnFocus.set(dialog, trigger || document.activeElement);
-  dialog.showModal();
+  if (!dialog.open) {
+    dialog.showModal();
+  }
 }
 
 function closeDialog(dialog) {
   const target = dialogReturnFocus.get(dialog);
   dialogReturnFocus.delete(dialog);
+  if (dialog.id === "plan-approval-dialog") {
+    poisonPlanApprovalState();
+  }
+  if (dialog.id === "plan-cancel-dialog") {
+    poisonPlanCancelState();
+  }
   if (dialog.open) {
     dialog.close();
   }
@@ -66,6 +79,19 @@ function bindDialogReturnFocus(dialog) {
     if (event.key === "Escape") {
       event.preventDefault();
       closeDialog(dialog);
+    }
+  });
+  dialog.addEventListener("close", () => {
+    const target = dialogReturnFocus.get(dialog);
+    dialogReturnFocus.delete(dialog);
+    if (dialog.id === "plan-approval-dialog") {
+      poisonPlanApprovalState();
+    }
+    if (dialog.id === "plan-cancel-dialog") {
+      poisonPlanCancelState();
+    }
+    if (target && typeof target.focus === "function") {
+      target.focus();
     }
   });
 }
@@ -207,7 +233,122 @@ async function runScreen() {
   }
 }
 
-function appendPlanActions(target, plan) {
+function canonicalPlanId(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function planDetailTokenIsCurrent(requestToken, targetPlanId) {
+  return Boolean(
+    planDetailState
+    && planDetailState.requestToken === requestToken
+    && planDetailState.targetPlanId === targetPlanId
+    && requestToken === planDetailRequestSequence
+  );
+}
+
+function currentDetailMatches(planId, detailRequestToken) {
+  return Boolean(
+    planDetailTokenIsCurrent(detailRequestToken, planId)
+    && planDetailState.plan
+    && planDetailState.plan.plan_id === planId
+  );
+}
+
+function poisonPlanApprovalState() {
+  planApprovalRequestSequence += 1;
+  planApprovalState = null;
+  byId("plan-approval-reason").value = "";
+  byId("plan-approval-submit").disabled = true;
+}
+
+function poisonPlanCancelState() {
+  planCancelRequestSequence += 1;
+  planCancelState = null;
+  byId("plan-cancel-reason").value = "";
+}
+
+function planApprovalIsActionable() {
+  const state = planApprovalState;
+  if (
+    !state
+    || state.submitting === true
+    || state.requestToken !== planApprovalRequestSequence
+    || !byId("plan-approval-dialog").open
+    || !currentDetailMatches(
+      state.targetPlanId,
+      state.detailRequestToken,
+    )
+  ) {
+    return false;
+  }
+  const plan = planDetailState.plan;
+  return Boolean(
+    plan.status === "proposed"
+    && Number(plan.sized && plan.sized.total_shares) > 0
+    && state.symbol === plan.symbol
+    && state.action === (plan.plan && plan.plan.action)
+  );
+}
+
+function updatePlanApprovalButton() {
+  const reason = byId("plan-approval-reason").value.trim();
+  byId("plan-approval-submit").disabled = !(
+    planApprovalIsActionable() && reason
+  );
+}
+
+function openPlanApproval(plan, detailRequestToken, invoker) {
+  const targetPlanId = canonicalPlanId(plan.plan_id);
+  if (
+    targetPlanId === null
+    || !currentDetailMatches(targetPlanId, detailRequestToken)
+  ) {
+    notify("Plan approval target is no longer current.", "notice-error");
+    return;
+  }
+  const requestToken = ++planApprovalRequestSequence;
+  planApprovalState = Object.freeze({
+    targetPlanId,
+    detailRequestToken,
+    requestToken,
+    symbol: plan.symbol,
+    action: plan.plan && plan.plan.action,
+    invoker,
+    submitting: false,
+  });
+  byId("plan-approval-target-id").textContent = String(targetPlanId);
+  byId("plan-approval-target-symbol").textContent = readable(plan.symbol);
+  byId("plan-approval-target-action").textContent = readable(
+    plan.plan && plan.plan.action,
+  );
+  byId("plan-approval-reason").value = "";
+  byId("plan-approval-submit").disabled = true;
+  showDialog(byId("plan-approval-dialog"), invoker);
+  byId("plan-approval-reason").focus();
+}
+
+function openPlanCancel(plan, detailRequestToken, invoker) {
+  const targetPlanId = canonicalPlanId(plan.plan_id);
+  if (
+    targetPlanId === null
+    || !currentDetailMatches(targetPlanId, detailRequestToken)
+  ) {
+    notify("Plan cancellation target is no longer current.", "notice-error");
+    return;
+  }
+  planCancelState = Object.freeze({
+    targetPlanId,
+    detailRequestToken,
+    requestToken: ++planCancelRequestSequence,
+    invoker,
+    submitting: false,
+  });
+  byId("plan-cancel-reason").value = "";
+  showDialog(byId("plan-cancel-dialog"), invoker);
+  byId("plan-cancel-reason").focus();
+}
+
+function appendPlanActions(target, plan, detailRequestToken) {
   if (plan.status !== "proposed") {
     return;
   }
@@ -218,10 +359,7 @@ function appendPlanActions(target, plan) {
     const approve = node("button", "Review plan approval", "button-primary");
     approve.type = "button";
     approve.addEventListener("click", () => {
-      activePlanId = plan.plan_id;
-      byId("plan-approval-reason").value = "";
-      showDialog(byId("plan-approval-dialog"), approve);
-      byId("plan-approval-reason").focus();
+      openPlanApproval(plan, detailRequestToken, approve);
     });
     actions.appendChild(approve);
   } else {
@@ -234,22 +372,63 @@ function appendPlanActions(target, plan) {
   const cancel = node("button", "Cancel plan", "button-danger");
   cancel.type = "button";
   cancel.addEventListener("click", () => {
-    activePlanId = plan.plan_id;
-    byId("plan-cancel-reason").value = "";
-    showDialog(byId("plan-cancel-dialog"), cancel);
-    byId("plan-cancel-reason").focus();
+    openPlanCancel(plan, detailRequestToken, cancel);
   });
   actions.appendChild(cancel);
   target.appendChild(actions);
 }
 
 async function showPlan(planId) {
+  const targetPlanId = canonicalPlanId(planId);
   const target = byId("plan-detail");
   clear(target);
+  if (targetPlanId === null) {
+    planDetailState = null;
+    target.appendChild(node(
+      "p",
+      "Plan identity mismatch. Choose a current plan.",
+      "banner-caution",
+    ));
+    updatePlanApprovalButton();
+    return;
+  }
+  const requestToken = ++planDetailRequestSequence;
+  planDetailState = Object.freeze({
+    targetPlanId,
+    requestToken,
+    plan: null,
+  });
+  updatePlanApprovalButton();
+  byId("plan-detail-title").textContent = `Loading plan #${targetPlanId}`;
   target.appendChild(node("p", "Loading plan…", "empty-state"));
   try {
-    const plan = await api(`/plans/${planId}`);
-    activePlanId = plan.plan_id;
+    const plan = await api(`/plans/${targetPlanId}`);
+    if (!planDetailTokenIsCurrent(requestToken, targetPlanId)) {
+      return;
+    }
+    if (canonicalPlanId(plan && plan.plan_id) !== targetPlanId) {
+      planDetailState = Object.freeze({
+        targetPlanId,
+        requestToken,
+        plan: null,
+      });
+      clear(target);
+      target.appendChild(node(
+        "p",
+        "Plan identity mismatch. Refresh and choose the plan again.",
+        "banner-caution",
+      ));
+      byId("plan-detail-title").textContent = (
+        `Plan #${targetPlanId} unavailable`
+      );
+      updatePlanApprovalButton();
+      return;
+    }
+    planDetailState = Object.freeze({
+      targetPlanId,
+      requestToken,
+      plan: Object.freeze(plan),
+    });
     byId("plan-detail-title").textContent = (
       `Plan #${readable(plan.plan_id)} · ${readable(plan.symbol)} · `
       + readable(plan.status)
@@ -315,21 +494,46 @@ async function showPlan(planId) {
       + `${readable(exitPlan.time_stop_days, "not set")}`,
       "muted",
     ));
-    appendPlanActions(target, plan);
+    appendPlanActions(target, plan, requestToken);
+    updatePlanApprovalButton();
   } catch (error) {
+    if (!planDetailTokenIsCurrent(requestToken, targetPlanId)) {
+      return;
+    }
+    planDetailState = Object.freeze({
+      targetPlanId,
+      requestToken,
+      plan: null,
+    });
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
+    updatePlanApprovalButton();
   }
 }
 
 async function submitPlanApproval(event) {
   event.preventDefault();
+  const state = planApprovalState;
   const reason = byId("plan-approval-reason").value.trim();
-  if (!reason || activePlanId === null) {
+  if (!reason || !state || !planApprovalIsActionable()) {
     notify("A non-empty review reason is required.", "notice-error");
+    updatePlanApprovalButton();
     return;
   }
-  const planId = activePlanId;
+  const planId = state.targetPlanId;
+  if (
+    state.requestToken !== planApprovalRequestSequence
+    || !currentDetailMatches(planId, state.detailRequestToken)
+    || planDetailState.plan.plan_id !== planId
+  ) {
+    updatePlanApprovalButton();
+    return;
+  }
+  planApprovalState = Object.freeze({
+    ...state,
+    submitting: true,
+  });
+  poisonPlanApprovalState();
   try {
     const result = await api(
       `/plans/${planId}/approve`,
@@ -349,19 +553,36 @@ async function submitPlanApproval(event) {
 
 async function submitPlanCancel(event) {
   event.preventDefault();
+  const state = planCancelState;
   const reason = byId("plan-cancel-reason").value.trim();
-  if (!reason || activePlanId === null) {
+  if (
+    !reason
+    || !state
+    || state.submitting === true
+    || state.requestToken !== planCancelRequestSequence
+    || !byId("plan-cancel-dialog").open
+    || !currentDetailMatches(
+      state.targetPlanId,
+      state.detailRequestToken,
+    )
+  ) {
     notify("A non-empty cancellation reason is required.", "notice-error");
     return;
   }
-  const planId = activePlanId;
+  const planId = state.targetPlanId;
+  planCancelState = Object.freeze({
+    ...state,
+    submitting: true,
+  });
   try {
     await api(`/plans/${planId}/cancel`, jsonPost({reason}));
+    poisonPlanCancelState();
     closeDialog(byId("plan-cancel-dialog"));
     notify(`Plan ${planId} canceled.`, "notice-success");
     await refreshPlans();
     await showPlan(planId);
   } catch (error) {
+    poisonPlanCancelState();
     notify(errorText(error), "notice-error");
   }
 }
@@ -389,6 +610,10 @@ async function initialize() {
   byId("screen-button").addEventListener("click", runScreen);
   byId("refresh-plans").addEventListener("click", refreshPlans);
   byId("plan-approval-form").addEventListener("submit", submitPlanApproval);
+  byId("plan-approval-reason").addEventListener(
+    "input",
+    updatePlanApprovalButton,
+  );
   byId("plan-approval-cancel").addEventListener(
     "click",
     () => closeDialog(byId("plan-approval-dialog")),

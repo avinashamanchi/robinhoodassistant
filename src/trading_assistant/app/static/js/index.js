@@ -10,10 +10,15 @@ import {
 const byId = (id) => document.getElementById(id);
 const breakerScopes = ["equity", "crypto"];
 const dialogReturnFocus = new Map();
+const HEALTH_OBSERVATION_MAX_AGE_MS = 30000;
 
 let latestHealth = null;
-let approvalOrderId = null;
-let approvalProof = null;
+let healthRequestSequence = 0;
+let breakerResetInFlight = false;
+let pendingOrders = new Map();
+let pendingRequestSequence = 0;
+let approvalDialogState = null;
+let approvalRequestSequence = 0;
 let rejectionOrderId = null;
 let unsafePanicLatched = false;
 
@@ -65,12 +70,17 @@ function notify(message, kind = "") {
 
 function showDialog(dialog, trigger) {
   dialogReturnFocus.set(dialog, trigger || document.activeElement);
-  dialog.showModal();
+  if (!dialog.open) {
+    dialog.showModal();
+  }
 }
 
 function closeDialog(dialog) {
   const target = dialogReturnFocus.get(dialog);
   dialogReturnFocus.delete(dialog);
+  if (dialog.id === "approval-dialog") {
+    poisonApprovalState();
+  }
   if (dialog.open) {
     dialog.close();
   }
@@ -89,6 +99,9 @@ function bindDialogReturnFocus(dialog) {
   dialog.addEventListener("close", () => {
     const target = dialogReturnFocus.get(dialog);
     dialogReturnFocus.delete(dialog);
+    if (dialog.id === "approval-dialog") {
+      poisonApprovalState();
+    }
     if (target && typeof target.focus === "function") {
       target.focus();
     }
@@ -146,15 +159,48 @@ function orderSummary(order) {
 }
 
 async function refreshPending() {
-  const payload = await api("/pending");
+  const requestToken = ++pendingRequestSequence;
+  pendingOrders = new Map();
   const list = byId("pending-list");
   clear(list);
-  const pending = Array.isArray(payload.pending) ? payload.pending : [];
-  if (!pending.length) {
-    list.appendChild(node("li", "No pending proposals.", "empty-state"));
+  list.appendChild(node("li", "Refreshing pending proposals…", "empty-state"));
+  updateApprovalButton();
+  let payload;
+  try {
+    payload = await api("/pending");
+  } catch (error) {
+    if (requestToken === pendingRequestSequence) {
+      clear(list);
+      list.appendChild(node(
+        "li",
+        "Pending proposal truth is unavailable.",
+        "empty-state",
+      ));
+      updateApprovalButton();
+    }
+    throw error;
+  }
+  if (requestToken !== pendingRequestSequence) {
     return;
   }
-  pending.forEach((order) => {
+  clear(list);
+  const pending = Array.isArray(payload.pending) ? payload.pending : [];
+  const verifiedPending = pending
+    .filter((order) => canonicalPendingOrder(order) !== null)
+    .map((order) => Object.freeze({...order}));
+  pendingOrders = new Map(
+    verifiedPending.map((order) => [order.order_id, order]),
+  );
+  updateApprovalButton();
+  if (!verifiedPending.length) {
+    list.appendChild(node(
+      "li",
+      "No verified pending proposals.",
+      "empty-state",
+    ));
+    return;
+  }
+  verifiedPending.forEach((order) => {
     const item = node("li", null, "ledger-entry");
     const content = node("div");
     const title = node("div", null, "ledger-entry-title");
@@ -185,8 +231,65 @@ async function refreshPending() {
   });
 }
 
-function proofHasRequiredFields(proof) {
-  if (!proof || proof.complete !== true || !proof.order || !proof.exposure) {
+function canonicalId(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function canonicalPendingOrder(order) {
+  if (
+    !order
+    || canonicalId(order.order_id) === null
+    || typeof order.ticker !== "string"
+    || !order.ticker
+    || typeof order.side !== "string"
+    || !order.side
+    || typeof order.order_type !== "string"
+    || !order.order_type
+    || order.status !== "proposed"
+    || order.expired !== false
+    || typeof order.expires_at !== "string"
+    || !order.expires_at
+  ) {
+    return null;
+  }
+  return order;
+}
+
+function exactNullableString(left, right) {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return typeof left === "string" && left === right;
+}
+
+function pendingMatchesProof(pending, proof) {
+  if (!pending || !proof || !proof.order) {
+    return false;
+  }
+  const order = proof.order;
+  return (
+    pending.order_id === order.order_id
+    && pending.ticker === order.symbol
+    && pending.side === order.side
+    && pending.order_type === order.order_type
+    && exactNullableString(pending.qty, order.quantity)
+    && exactNullableString(pending.notional, order.notional)
+    && exactNullableString(pending.limit_price, order.limit_price)
+    && pending.expires_at === proof.expires_at
+  );
+}
+
+function proofHasRequiredFields(proof, targetOrderId, pending) {
+  if (
+    !proof
+    || proof.complete !== true
+    || proof.broker !== "Alpaca"
+    || proof.mode !== "paper"
+    || !proof.order
+    || !proof.exposure
+    || canonicalId(proof.order.order_id) !== targetOrderId
+    || !pendingMatchesProof(pending, proof)
+  ) {
     return false;
   }
   const order = proof.order;
@@ -195,13 +298,12 @@ function proofHasRequiredFields(proof) {
     (typeof order.quantity === "string" && order.quantity)
     || (typeof order.notional === "string" && order.notional)
   );
+  const expiry = Date.parse(proof.expires_at);
   return Boolean(
-    typeof proof.broker === "string"
-    && proof.broker
-    && typeof proof.mode === "string"
-    && proof.mode
-    && typeof proof.expires_at === "string"
+    typeof proof.expires_at === "string"
     && proof.expires_at
+    && Number.isFinite(expiry)
+    && expiry > Date.now()
     && typeof order.symbol === "string"
     && order.symbol
     && typeof order.side === "string"
@@ -217,7 +319,79 @@ function proofHasRequiredFields(proof) {
   );
 }
 
-function renderApprovalProof(proof) {
+function approvalTokenIsCurrent(requestToken, targetOrderId) {
+  const state = approvalDialogState;
+  return Boolean(
+    state
+    && state.requestToken === requestToken
+    && state.targetOrderId === targetOrderId
+    && requestToken === approvalRequestSequence
+    && byId("approval-dialog").open
+  );
+}
+
+function currentApprovalStateIsActionable() {
+  const state = approvalDialogState;
+  if (
+    !state
+    || state.submitting === true
+    || !approvalTokenIsCurrent(state.requestToken, state.targetOrderId)
+  ) {
+    return false;
+  }
+  const pending = pendingOrders.get(state.targetOrderId);
+  return proofHasRequiredFields(
+    state.proof,
+    state.targetOrderId,
+    pending,
+  );
+}
+
+function clearApprovalProofFields() {
+  byId("approval-broker").textContent = "Unknown";
+  byId("approval-mode").textContent = "Unknown";
+  byId("approval-symbol").textContent = "Unknown";
+  byId("approval-side").textContent = "Unknown";
+  byId("approval-order-type").textContent = "Unknown";
+  byId("approval-quantity").textContent = "Not used";
+  byId("approval-notional").textContent = "Not used";
+  byId("approval-limit-price").textContent = "Not used";
+  byId("approval-expiry").textContent = "Unknown";
+  byId("approval-current-quantity").textContent = "Unknown";
+  byId("approval-current-exposure").textContent = "Unknown";
+  byId("approval-resulting-exposure").textContent = "Unknown";
+  byId("approval-exposure-time").textContent = "Unknown";
+}
+
+function poisonApprovalState() {
+  approvalRequestSequence += 1;
+  approvalDialogState = null;
+  byId("approval-confirm-button").disabled = true;
+  byId("approval-reason").value = "";
+}
+
+function renderApprovalProof(proof, requestToken, targetOrderId) {
+  if (!approvalTokenIsCurrent(requestToken, targetOrderId)) {
+    return;
+  }
+  const pending = pendingOrders.get(targetOrderId);
+  const complete = proofHasRequiredFields(proof, targetOrderId, pending);
+  if (!complete) {
+    clearApprovalProofFields();
+    approvalDialogState = Object.freeze({
+      ...approvalDialogState,
+      proof: null,
+    });
+    const missing = proof && Array.isArray(proof.missing_proof)
+      ? listText(proof.missing_proof)
+      : "required or exact proof fields";
+    const status = byId("approval-proof-status");
+    status.textContent = `Approval disabled. Refresh missing proof: ${missing}.`;
+    status.className = "proof-status";
+    updateApprovalButton();
+    return;
+  }
+
   const order = proof && proof.order ? proof.order : {};
   const exposure = proof && proof.exposure ? proof.exposure : {};
   byId("approval-broker").textContent = readable(proof && proof.broker);
@@ -240,57 +414,96 @@ function renderApprovalProof(proof) {
   );
   byId("approval-exposure-time").textContent = readable(exposure.as_of);
 
-  const complete = proofHasRequiredFields(proof);
   const status = byId("approval-proof-status");
-  if (complete) {
-    status.textContent = "Complete server proof received. Enter a reason to enable approval.";
-    status.className = "proof-status proof-status-complete";
-    approvalProof = proof;
-  } else {
-    const missing = proof && Array.isArray(proof.missing_proof)
-      ? listText(proof.missing_proof)
-      : "required proof fields";
-    status.textContent = `Approval disabled. Refresh missing proof: ${missing}.`;
-    status.className = "proof-status";
-    approvalProof = null;
-  }
+  status.textContent = "Complete server proof received. Enter a reason to enable approval.";
+  status.className = "proof-status proof-status-complete";
+  approvalDialogState = Object.freeze({
+    ...approvalDialogState,
+    proof: Object.freeze(proof),
+  });
   updateApprovalButton();
 }
 
 function updateApprovalButton() {
   const reason = byId("approval-reason").value.trim();
-  byId("approval-confirm-button").disabled = !(approvalProof && reason);
+  byId("approval-confirm-button").disabled = !(
+    currentApprovalStateIsActionable() && reason
+  );
 }
 
 async function openApproval(orderId, trigger) {
-  approvalOrderId = orderId;
-  approvalProof = null;
+  const targetOrderId = canonicalId(orderId);
+  const pending = targetOrderId === null
+    ? null
+    : pendingOrders.get(targetOrderId);
+  if (!pending) {
+    notify("Approval target is no longer a current pending order.", "notice-error");
+    return;
+  }
+  const requestToken = ++approvalRequestSequence;
+  approvalDialogState = Object.freeze({
+    targetOrderId,
+    requestToken,
+    pendingOrder: pending,
+    proof: null,
+    invoker: trigger || document.activeElement,
+    submitting: false,
+  });
   byId("approval-reason").value = "";
   byId("approval-confirm-button").disabled = true;
-  renderApprovalProof(null);
+  clearApprovalProofFields();
+  byId("approval-proof-status").textContent = "Loading exact server proof…";
+  byId("approval-proof-status").className = "proof-status";
   const dialog = byId("approval-dialog");
   showDialog(dialog, trigger);
   try {
-    const proof = await api(`/pending/${orderId}/confirmation`);
-    renderApprovalProof(proof);
+    const proof = await api(`/pending/${targetOrderId}/confirmation`);
+    if (!approvalTokenIsCurrent(requestToken, targetOrderId)) {
+      return;
+    }
+    renderApprovalProof(proof, requestToken, targetOrderId);
     byId("approval-reason").focus();
   } catch (error) {
-    renderApprovalProof(null);
+    if (!approvalTokenIsCurrent(requestToken, targetOrderId)) {
+      return;
+    }
+    clearApprovalProofFields();
+    approvalDialogState = Object.freeze({
+      ...approvalDialogState,
+      proof: null,
+    });
     byId("approval-proof-status").textContent = (
       `Approval disabled. ${errorText(error)}`
     );
+    updateApprovalButton();
   }
 }
 
 async function submitApproval(event) {
   event.preventDefault();
+  const state = approvalDialogState;
   const reason = byId("approval-reason").value.trim();
-  if (!approvalProof || !reason || approvalOrderId === null) {
+  if (!state || !reason || !currentApprovalStateIsActionable()) {
     updateApprovalButton();
     return;
   }
-  const orderId = approvalOrderId;
-  byId("approval-confirm-button").disabled = true;
+  const orderId = state.targetOrderId;
+  if (
+    !approvalTokenIsCurrent(state.requestToken, orderId)
+    || !proofHasRequiredFields(
+      state.proof,
+      orderId,
+      pendingOrders.get(orderId),
+    )
+  ) {
+    updateApprovalButton();
+    return;
+  }
+  approvalDialogState = Object.freeze({
+    ...state,
+    submitting: true,
+  });
+  poisonApprovalState();
   try {
     const result = await api(`/approve/${orderId}`, jsonPost({reason}));
     appendReceipt(
@@ -312,7 +525,10 @@ async function submitApproval(event) {
       closeDialog(byId("approval-dialog"));
       await refreshPending();
     } else {
-      updateApprovalButton();
+      clearApprovalProofFields();
+      byId("approval-proof-status").textContent = (
+        "Approval state was cleared after the failed submission. Close and review again."
+      );
     }
   }
 }
@@ -426,59 +642,170 @@ async function submitPanic(event) {
 
 function selectedBreakerProof() {
   const scope = byId("breaker-scope").value;
-  if (!breakerScopes.includes(scope) || !latestHealth) {
+  if (
+    !breakerScopes.includes(scope)
+    || !latestHealth
+    || latestHealth.requestToken !== healthRequestSequence
+    || Date.now() - latestHealth.receivedAt > HEALTH_OBSERVATION_MAX_AGE_MS
+  ) {
     return null;
   }
-  const generation = latestHealth.killswitch_generation
-    ? latestHealth.killswitch_generation[scope]
-    : null;
-  const tripped = latestHealth.killswitch
-    ? latestHealth.killswitch[scope] === true
-    : false;
+  const health = latestHealth.payload;
+  const generation = health.killswitch_generation[scope];
+  const tripped = health.killswitch[scope] === true;
   const healthComplete = (
-    latestHealth.db_ok === true
-    && latestHealth.daemon_alive === true
+    health.db_ok === true
+    && health.daemon_alive === true
   );
   if (
     !tripped
-    || !Number.isInteger(generation)
+    || !Number.isSafeInteger(generation)
     || generation <= 0
     || !healthComplete
   ) {
     return null;
   }
-  return {scope, generation};
+  return {
+    scope,
+    generation,
+    requestToken: latestHealth.requestToken,
+  };
 }
 
 function updateBreakerReset() {
   const scope = byId("breaker-scope").value;
-  const generation = latestHealth && latestHealth.killswitch_generation
-    ? latestHealth.killswitch_generation[scope]
+  const health = latestHealth
+    && latestHealth.requestToken === healthRequestSequence
+    ? latestHealth.payload
+    : null;
+  const generation = health
+    ? health.killswitch_generation[scope]
     : null;
   byId("breaker-generation").textContent = (
-    Number.isInteger(generation) && generation > 0
+    Number.isSafeInteger(generation) && generation > 0
       ? String(generation)
-      : "None"
+      : "Unknown"
   );
   const healthComplete = Boolean(
-    latestHealth
-    && latestHealth.db_ok === true
-    && latestHealth.daemon_alive === true
+    health
+    && health.db_ok === true
+    && health.daemon_alive === true
   );
   byId("breaker-health").textContent = (
-    healthComplete ? "Observed healthy" : "Incomplete"
+    healthComplete ? "Observed healthy" : "Unconfirmed"
   );
   const reason = byId("breaker-reset-reason").value.trim();
   byId("breaker-reset-button").disabled = !(
-    selectedBreakerProof() && reason
+    !breakerResetInFlight && selectedBreakerProof() && reason
   );
+}
+
+function renderUnknownHealth() {
+  latestHealth = null;
+  byId("truth-broker").textContent = "Unknown";
+  byId("truth-mode").textContent = "Unknown";
+  setState(byId("truth-database"), "Unknown", "caution");
+  setState(byId("truth-daemon"), "Unknown", "caution");
+  breakerScopes.forEach((scope) => {
+    setState(
+      byId(`truth-${scope}-breaker`),
+      "Unknown",
+      "caution",
+    );
+  });
+  updateBreakerReset();
+}
+
+function invalidateHealthObservation() {
+  healthRequestSequence += 1;
+  renderUnknownHealth();
+}
+
+function healthPayloadIsComplete(health) {
+  if (
+    !health
+    || health.broker !== "Alpaca"
+    || health.mode !== "paper"
+    || health.db_ok !== true
+    || typeof health.daemon_alive !== "boolean"
+    || !health.killswitch
+    || typeof health.killswitch !== "object"
+    || !health.killswitch_generation
+    || typeof health.killswitch_generation !== "object"
+  ) {
+    return false;
+  }
+  if (
+    health.daemon_alive === true
+    && (
+      typeof health.heartbeat_age_seconds !== "number"
+      || !Number.isFinite(health.heartbeat_age_seconds)
+      || health.heartbeat_age_seconds < 0
+    )
+  ) {
+    return false;
+  }
+  for (const scope of breakerScopes) {
+    if (
+      typeof health.killswitch[scope] !== "boolean"
+      || !Number.isSafeInteger(health.killswitch_generation[scope])
+      || health.killswitch_generation[scope] <= 0
+    ) {
+      return false;
+    }
+  }
+  if (Object.hasOwn(health, "observed_at")) {
+    if (typeof health.observed_at !== "string") {
+      return false;
+    }
+    const observedAt = Date.parse(health.observed_at);
+    const age = Date.now() - observedAt;
+    if (
+      !Number.isFinite(observedAt)
+      || age < -5000
+      || age > HEALTH_OBSERVATION_MAX_AGE_MS
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function renderHealth(health) {
+  byId("truth-broker").textContent = health.broker;
+  byId("truth-mode").textContent = health.mode;
+  setState(byId("truth-database"), "Available", "verified");
+  if (health.daemon_alive === true) {
+    setState(
+      byId("truth-daemon"),
+      `Fresh · ${readable(health.heartbeat_age_seconds)}s`,
+      "verified",
+    );
+  } else {
+    setState(byId("truth-daemon"), "Stale or absent", "caution");
+  }
+  breakerScopes.forEach((scope) => {
+    const tripped = health.killswitch[scope];
+    const generation = health.killswitch_generation[scope];
+    setState(
+      byId(`truth-${scope}-breaker`),
+      `${tripped ? "Tripped" : "Clear"} · gen ${generation}`,
+      tripped ? "alarm" : "verified",
+    );
+  });
+  updateBreakerReset();
 }
 
 async function submitBreakerReset(event) {
   event.preventDefault();
   const proof = selectedBreakerProof();
   const reason = byId("breaker-reset-reason").value.trim();
-  if (!proof || !reason) {
+  if (
+    !proof
+    || !reason
+    || breakerResetInFlight
+    || proof.requestToken !== healthRequestSequence
+  ) {
     notify(
       "Reset requires a tripped scope, positive generation, healthy server, and reason.",
       "notice-error",
@@ -486,6 +813,8 @@ async function submitBreakerReset(event) {
     updateBreakerReset();
     return;
   }
+  breakerResetInFlight = true;
+  invalidateHealthObservation();
   try {
     const result = await api("/killswitch/reset", jsonPost({
       asset_class: proof.scope,
@@ -506,42 +835,41 @@ async function submitBreakerReset(event) {
     byId("breaker-reset-reason").value = "";
     await refreshHealth();
   } catch (error) {
+    renderUnknownHealth();
     notify(errorText(error), "notice-error");
+  } finally {
+    breakerResetInFlight = false;
+    updateBreakerReset();
   }
-  updateBreakerReset();
 }
 
 async function refreshHealth() {
-  const health = await api("/health");
-  latestHealth = health;
-  byId("truth-broker").textContent = readable(health.broker);
-  byId("truth-mode").textContent = readable(health.mode);
-  if (health.db_ok === true) {
-    setState(byId("truth-database"), "Available", "verified");
-  } else {
-    setState(byId("truth-database"), "Unavailable", "alarm");
+  const requestToken = ++healthRequestSequence;
+  renderUnknownHealth();
+  let health;
+  try {
+    health = await api("/health");
+  } catch (error) {
+    if (requestToken !== healthRequestSequence) {
+      return false;
+    }
+    renderUnknownHealth();
+    throw error;
   }
-  if (health.daemon_alive === true) {
-    setState(
-      byId("truth-daemon"),
-      `Fresh · ${readable(health.heartbeat_age_seconds)}s`,
-      "verified",
-    );
-  } else {
-    setState(byId("truth-daemon"), "Stale or absent", "caution");
+  if (requestToken !== healthRequestSequence) {
+    return false;
   }
-  breakerScopes.forEach((scope) => {
-    const tripped = health.killswitch && health.killswitch[scope] === true;
-    const generation = health.killswitch_generation
-      ? health.killswitch_generation[scope]
-      : null;
-    setState(
-      byId(`truth-${scope}-breaker`),
-      `${tripped ? "Tripped" : "Clear"} · gen ${readable(generation, "none")}`,
-      tripped ? "alarm" : "verified",
-    );
+  if (!healthPayloadIsComplete(health)) {
+    renderUnknownHealth();
+    return false;
+  }
+  latestHealth = Object.freeze({
+    requestToken,
+    receivedAt: Date.now(),
+    payload: Object.freeze(health),
   });
-  updateBreakerReset();
+  renderHealth(health);
+  return true;
 }
 
 async function refreshPositions() {

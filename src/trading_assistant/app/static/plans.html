@@ -109,6 +109,14 @@
         <p>Recent sign-in may be required. Execution remains paper-only.</p>
       </div>
       <div class="dialog-body">
+        <dl class="proof-grid">
+          <dt>Plan ID</dt>
+          <dd id="plan-approval-target-id">Unknown</dd>
+          <dt>Symbol</dt>
+          <dd id="plan-approval-target-symbol">Unknown</dd>
+          <dt>Action</dt>
+          <dd id="plan-approval-target-action">Unknown</dd>
+        </dl>
         <div class="field">
           <label for="plan-approval-reason">Approval reason</label>
           <textarea id="plan-approval-reason" required></textarea>
@@ -116,7 +124,12 @@
       </div>
       <div class="dialog-actions">
         <button id="plan-approval-cancel" type="button">Cancel</button>
-        <button class="button-primary" type="submit">Approve plan</button>
+        <button
+          class="button-primary"
+          id="plan-approval-submit"
+          type="submit"
+          disabled
+        >Approve exact plan</button>
       </div>
     </form>
   </dialog>

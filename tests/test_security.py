@@ -82,6 +82,227 @@ def _run_module(path: pathlib.Path, scenario: str) -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def _run_page_module(
+    path: pathlib.Path,
+    exported_names: tuple[str, ...],
+    scenario: str,
+) -> None:
+    loader = r"""
+        import fs from "node:fs";
+
+        class FakeElement {
+          constructor(id = "", tagName = "div") {
+            this.id = id;
+            this.tagName = tagName.toUpperCase();
+            this.children = [];
+            this.parentNode = null;
+            this.listeners = new Map();
+            this._textContent = "";
+            this.className = "";
+            this.value = "";
+            this.disabled = false;
+            this.hidden = false;
+            this.open = false;
+            this.type = "";
+          }
+
+          get firstChild() {
+            return this.children[0] || null;
+          }
+
+          get textContent() {
+            return this._textContent
+              + this.children.map((child) => child.textContent).join("");
+          }
+
+          set textContent(value) {
+            this._textContent = value === null || value === undefined
+              ? ""
+              : String(value);
+            this.children = [];
+          }
+
+          appendChild(child) {
+            child.parentNode = this;
+            this.children.push(child);
+            return child;
+          }
+
+          append(...children) {
+            children.forEach((child) => this.appendChild(child));
+          }
+
+          prepend(child) {
+            child.parentNode = this;
+            this.children.unshift(child);
+          }
+
+          removeChild(child) {
+            const index = this.children.indexOf(child);
+            if (index >= 0) {
+              this.children.splice(index, 1);
+              child.parentNode = null;
+            }
+            return child;
+          }
+
+          remove() {
+            if (this.parentNode) {
+              this.parentNode.removeChild(this);
+            }
+          }
+
+          querySelector(selector) {
+            const className = selector.startsWith(".")
+              ? selector.slice(1)
+              : null;
+            for (const child of this.children) {
+              if (
+                className
+                && child.className.split(/\s+/).includes(className)
+              ) {
+                return child;
+              }
+              const nested = child.querySelector(selector);
+              if (nested) {
+                return nested;
+              }
+            }
+            return null;
+          }
+
+          addEventListener(name, callback) {
+            const callbacks = this.listeners.get(name) || [];
+            callbacks.push(callback);
+            this.listeners.set(name, callbacks);
+          }
+
+          removeEventListener(name, callback) {
+            const callbacks = this.listeners.get(name) || [];
+            this.listeners.set(
+              name,
+              callbacks.filter((candidate) => candidate !== callback),
+            );
+          }
+
+          emit(name, overrides = {}) {
+            const event = {
+              preventDefault() {},
+              currentTarget: this,
+              target: this,
+              key: undefined,
+              ...overrides,
+            };
+            return (this.listeners.get(name) || []).map(
+              (callback) => callback(event),
+            );
+          }
+
+          click() {
+            return this.emit("click");
+          }
+
+          focus() {
+            globalThis.document.activeElement = this;
+          }
+
+          showModal() {
+            this.open = true;
+          }
+
+          close() {
+            if (!this.open) {
+              return;
+            }
+            this.open = false;
+            this.emit("close");
+          }
+        }
+
+        globalThis.installDom = (ids) => {
+          const elements = new Map(
+            ids.map((id) => [id, new FakeElement(id)]),
+          );
+          globalThis.document = {
+            activeElement: null,
+            createElement: (tagName) => new FakeElement("", tagName),
+            getElementById: (id) => elements.get(id) || null,
+          };
+          globalThis.window = {
+            setTimeout: () => 0,
+            setInterval: () => 0,
+            location: {assign() {}},
+          };
+          return Object.fromEntries(elements);
+        };
+        globalThis.deferred = () => {
+          let resolve;
+          let reject;
+          const promise = new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+          });
+          return {promise, resolve, reject};
+        };
+        globalThis.flush = async () => {
+          await Promise.resolve();
+          await new Promise((resolve) => setImmediate(resolve));
+        };
+        globalThis.findButton = (root, label) => {
+          if (root.tagName === "BUTTON" && root.textContent === label) {
+            return root;
+          }
+          for (const child of root.children) {
+            const found = globalThis.findButton(child, label);
+            if (found) {
+              return found;
+            }
+          }
+          return null;
+        };
+
+        const authSource = `
+          export const api = (...args) => globalThis.__api(...args);
+          export const jsonPost = (body) => ({
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(body),
+          });
+          export const loadSession = () => Promise.resolve({
+            actor: "operator:test",
+            csrf_token: "csrf-test",
+          });
+          export const logout = () => Promise.resolve();
+        `;
+        const authUrl = `data:text/javascript;base64,${
+          Buffer.from(authSource).toString("base64")
+        }`;
+        let source = fs.readFileSync(process.argv[1], "utf8");
+        source = source.replace(
+          'from "/static/js/auth.js";',
+          `from "${authUrl}";`,
+        );
+        source = source.replace(/\ninitialize\(\);\s*$/, "\n");
+        source += `\nexport {${process.argv[2]}};\n`;
+        const encoded = Buffer.from(source).toString("base64");
+        const module = await import(`data:text/javascript;base64,${encoded}`);
+    """
+    completed = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "-e",
+            textwrap.dedent(loader + scenario),
+            str(path),
+            ",".join(exported_names),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.fixture
 def client(make_service):
     service = make_service()
@@ -500,6 +721,875 @@ def test_login_clears_secret_before_fetch_even_when_network_fails():
         if (statusLine.textContent !== "Sign-in failed. Check the connection and try again.") {
           throw new Error(`unexpected status: ${statusLine.textContent}`);
         }
+        """,
+    )
+
+
+_APPROVAL_DOM_SETUP = r"""
+    const elements = installDom([
+      "pending-list",
+      "approval-dialog",
+      "approval-form",
+      "approval-reason",
+      "approval-confirm-button",
+      "approval-proof-status",
+      "approval-broker",
+      "approval-mode",
+      "approval-symbol",
+      "approval-side",
+      "approval-order-type",
+      "approval-quantity",
+      "approval-notional",
+      "approval-limit-price",
+      "approval-expiry",
+      "approval-current-quantity",
+      "approval-current-exposure",
+      "approval-resulting-exposure",
+      "approval-exposure-time",
+      "status-region",
+      "receipt-panel",
+    ]);
+    const expiresAt = "2099-07-25T12:00:00+00:00";
+    const pendingOrder = (orderId, symbol) => ({
+      order_id: orderId,
+      ticker: symbol,
+      side: "buy",
+      order_type: "limit",
+      qty: "2.000000",
+      notional: null,
+      limit_price: "101.000000",
+      status: "proposed",
+      expires_at: expiresAt,
+      expired: false,
+    });
+    const confirmation = (
+      orderId,
+      symbol,
+      resultingExposure = "302.000000",
+    ) => ({
+      complete: true,
+      missing_proof: [],
+      broker: "Alpaca",
+      mode: "paper",
+      order: {
+        order_id: orderId,
+        symbol,
+        side: "buy",
+        order_type: "limit",
+        quantity: "2.000000",
+        notional: null,
+        limit_price: "101.000000",
+      },
+      expires_at: expiresAt,
+      exposure: {
+        currency: "USD",
+        current_position_quantity: "1.000000",
+        current_signed_notional: "100.000000",
+        resulting_signed_notional: resultingExposure,
+        as_of: "2099-07-25T11:59:00+00:00",
+      },
+    });
+"""
+
+
+def test_approval_dialog_ignores_out_of_order_proof_for_another_order():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "submitApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const pending = [pendingOrder(1, "AAPL"), pendingOrder(2, "MSFT")];
+        const a = deferred();
+        const b = deferred();
+        const approval = deferred();
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/pending") return Promise.resolve({pending});
+          if (path === "/pending/1/confirmation") return a.promise;
+          if (path === "/pending/2/confirmation") return b.promise;
+          if (path === "/approve/2") return approval.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        const first = elements["pending-list"].children[0];
+        const second = elements["pending-list"].children[1];
+        module.openApproval(1, findButton(first, "Review approval"));
+        module.openApproval(2, findButton(second, "Review approval"));
+        b.resolve(confirmation(2, "MSFT"));
+        await flush();
+        a.resolve(confirmation(1, "AAPL"));
+        await flush();
+
+        elements["approval-reason"].value = "reviewed MSFT proof";
+        module.updateApprovalButton();
+        module.submitApproval({preventDefault() {}});
+        await flush();
+
+        const submitted = calls.filter((call) => call.path.startsWith("/approve/"));
+        const failures = [];
+        if (elements["approval-symbol"].textContent !== "MSFT") {
+          failures.push(`displayed ${elements["approval-symbol"].textContent}`);
+        }
+        if (submitted.length !== 1 || submitted[0].path !== "/approve/2") {
+          failures.push(`submitted ${submitted.map((call) => call.path)}`);
+        }
+        if (
+          submitted.length === 1
+          && JSON.parse(submitted[0].options.body).reason !== "reviewed MSFT proof"
+        ) {
+          failures.push("submitted the wrong reason body");
+        }
+        if (failures.length) throw new Error(failures.join("; "));
+        """,
+    )
+
+
+def test_approval_dialog_rejects_mismatched_proof_identity_after_switch():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "submitApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const pending = [pendingOrder(1, "AAPL"), pendingOrder(2, "MSFT")];
+        const a = deferred();
+        const b = deferred();
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/pending") return Promise.resolve({pending});
+          if (path === "/pending/1/confirmation") return a.promise;
+          if (path === "/pending/2/confirmation") return b.promise;
+          if (path.startsWith("/approve/")) return Promise.resolve({});
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        module.openApproval(1, elements["approval-form"]);
+        a.resolve(confirmation(1, "AAPL"));
+        await flush();
+        module.openApproval(2, elements["approval-form"]);
+        elements["approval-reason"].value = "must remain disabled";
+        module.updateApprovalButton();
+        if (!elements["approval-confirm-button"].disabled) {
+          throw new Error("A proof remained enabled after switching to B");
+        }
+        b.resolve(confirmation("2", "MSFT"));
+        await flush();
+        module.updateApprovalButton();
+        module.submitApproval({preventDefault() {}});
+        await flush();
+
+        if (!elements["approval-confirm-button"].disabled) {
+          throw new Error("string proof ID was accepted as canonical order 2");
+        }
+        if (calls.some((call) => call.path.startsWith("/approve/"))) {
+          throw new Error("mismatched proof identity submitted an approval");
+        }
+        """,
+    )
+
+
+def test_approval_dialog_close_reopen_poison_old_same_target_response():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "closeDialog",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const first = deferred();
+        const second = deferred();
+        let confirmationCall = 0;
+        globalThis.__api = (path) => {
+          if (path === "/pending") {
+            return Promise.resolve({pending: [pendingOrder(1, "AAPL")]});
+          }
+          if (path === "/pending/1/confirmation") {
+            confirmationCall += 1;
+            return confirmationCall === 1 ? first.promise : second.promise;
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        module.openApproval(1, elements["approval-form"]);
+        module.closeDialog(elements["approval-dialog"]);
+        module.openApproval(1, elements["approval-form"]);
+        second.resolve(confirmation(1, "AAPL", "322.000000"));
+        await flush();
+        first.resolve(confirmation(1, "AAPL", "311.000000"));
+        await flush();
+
+        if (elements["approval-resulting-exposure"].textContent !== "322.000000") {
+          throw new Error(
+            `old response overwrote reopen: ${
+              elements["approval-resulting-exposure"].textContent
+            }`,
+          );
+        }
+        """,
+    )
+
+
+def test_approval_dialog_ignores_late_error_after_new_target_is_proven():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const a = deferred();
+        const b = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/pending") {
+            return Promise.resolve({
+              pending: [pendingOrder(1, "AAPL"), pendingOrder(2, "MSFT")],
+            });
+          }
+          if (path === "/pending/1/confirmation") return a.promise;
+          if (path === "/pending/2/confirmation") return b.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        module.openApproval(1, elements["approval-form"]);
+        module.openApproval(2, elements["approval-form"]);
+        b.resolve(confirmation(2, "MSFT"));
+        await flush();
+        elements["approval-reason"].value = "reviewed MSFT";
+        module.updateApprovalButton();
+        a.reject(new Error("late A failure"));
+        await flush();
+
+        if (elements["approval-symbol"].textContent !== "MSFT") {
+          throw new Error("late A error erased B identity");
+        }
+        if (elements["approval-confirm-button"].disabled) {
+          throw new Error("late A error disabled proven B");
+        }
+        """,
+    )
+
+
+def test_approval_dialog_blocks_double_submit_for_one_target():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "submitApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const approval = deferred();
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/pending") {
+            return Promise.resolve({pending: [pendingOrder(1, "AAPL")]});
+          }
+          if (path === "/pending/1/confirmation") {
+            return Promise.resolve(confirmation(1, "AAPL"));
+          }
+          if (path === "/approve/1") return approval.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        await module.openApproval(1, elements["approval-form"]);
+        elements["approval-reason"].value = "one deliberate approval";
+        module.updateApprovalButton();
+        module.submitApproval({preventDefault() {}});
+        module.submitApproval({preventDefault() {}});
+        await flush();
+
+        const approvals = calls.filter((call) => call.path === "/approve/1");
+        if (approvals.length !== 1) {
+          throw new Error(`approval submitted ${approvals.length} times`);
+        }
+        if (elements["approval-reason"].value !== "") {
+          throw new Error("approval state was not cleared after submit");
+        }
+        """,
+    )
+
+
+@pytest.mark.parametrize(
+    "proof_mutation",
+    (
+        'proof.broker = "Mock";',
+        'proof.mode = "live";',
+        'proof.expires_at = "2000-01-01T00:00:00+00:00";',
+        'proof.order.symbol = "MSFT";',
+    ),
+)
+def test_approval_dialog_fails_closed_for_noncanonical_server_proof(
+    proof_mutation,
+):
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + f"""
+        const proof = confirmation(1, "AAPL");
+        {proof_mutation}
+        globalThis.__api = (path) => {{
+          if (path === "/pending") {{
+            return Promise.resolve({{pending: [pendingOrder(1, "AAPL")]}});
+          }}
+          if (path === "/pending/1/confirmation") {{
+            return Promise.resolve(proof);
+          }}
+          throw new Error(`unexpected API path ${{path}}`);
+        }};
+
+        await module.refreshPending();
+        await module.openApproval(1, elements["approval-form"]);
+        elements["approval-reason"].value = "must not enable";
+        module.updateApprovalButton();
+        if (!elements["approval-confirm-button"].disabled) {{
+          throw new Error("noncanonical proof enabled approval");
+        }}
+        """,
+    )
+
+
+def test_approval_dialog_requires_explicit_current_pending_status():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "updateApprovalButton",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const pending = pendingOrder(1, "AAPL");
+        delete pending.expired;
+        globalThis.__api = (path) => {
+          if (path === "/pending") {
+            return Promise.resolve({pending: [pending]});
+          }
+          if (path === "/pending/1/confirmation") {
+            return Promise.resolve(confirmation(1, "AAPL"));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        await module.openApproval(1, elements["approval-form"]);
+        elements["approval-reason"].value = "missing pending truth";
+        module.updateApprovalButton();
+        if (!elements["approval-confirm-button"].disabled) {
+          throw new Error("missing explicit pending expiry status enabled approval");
+        }
+        """,
+    )
+
+
+_PLAN_DOM_SETUP = r"""
+    const elements = installDom([
+      "plan-detail",
+      "plan-detail-title",
+      "plan-approval-dialog",
+      "plan-approval-reason",
+      "plan-approval-submit",
+      "plan-approval-target-id",
+      "plan-approval-target-symbol",
+      "plan-approval-target-action",
+      "plan-cancel-dialog",
+      "plan-cancel-reason",
+      "status-region",
+    ]);
+    const planDetail = (planId, symbol) => ({
+      plan_id: planId,
+      symbol,
+      status: "proposed",
+      paper_only: true,
+      plan: {
+        action: "buy",
+        confidence: 0.8,
+        regime_note: "test regime",
+        thesis: `${symbol} test thesis`,
+        scenarios: [],
+        exit_plan: {
+          targets: [],
+          stop: "90.000000",
+          trailing_stop_pct: null,
+          time_stop_days: 30,
+        },
+      },
+      sized: {
+        total_shares: 2,
+        risk_budget: "20.000000",
+        tranches: [],
+      },
+    });
+"""
+
+
+def test_plan_detail_and_approval_ignore_out_of_order_other_plan():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const a = deferred();
+        const b = deferred();
+        const approval = deferred();
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/plans/1") return a.promise;
+          if (path === "/plans/2") return b.promise;
+          if (path === "/plans/2/approve") return approval.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        module.showPlan(1);
+        module.showPlan(2);
+        b.resolve(planDetail(2, "MSFT"));
+        await flush();
+        a.resolve(planDetail(1, "AAPL"));
+        await flush();
+
+        const approve = findButton(
+          elements["plan-detail"],
+          "Review plan approval",
+        );
+        if (!approve) throw new Error("current plan has no approval action");
+        approve.click();
+        elements["plan-approval-reason"].value = "reviewed MSFT plan";
+        module.submitPlanApproval({preventDefault() {}});
+        await flush();
+
+        const submitted = calls.filter((call) => call.path.endsWith("/approve"));
+        const failures = [];
+        if (!elements["plan-detail-title"].textContent.startsWith("Plan #2 · MSFT")) {
+          failures.push(`detail ${elements["plan-detail-title"].textContent}`);
+        }
+        if (elements["plan-approval-target-id"].textContent !== "2") {
+          failures.push(
+            `dialog plan ${elements["plan-approval-target-id"].textContent}`,
+          );
+        }
+        if (elements["plan-approval-target-symbol"].textContent !== "MSFT") {
+          failures.push("dialog symbol did not remain MSFT");
+        }
+        if (submitted.length !== 1 || submitted[0].path !== "/plans/2/approve") {
+          failures.push(`submitted ${submitted.map((call) => call.path)}`);
+        }
+        if (failures.length) throw new Error(failures.join("; "));
+        """,
+    )
+
+
+def test_plan_approval_target_is_separate_from_newly_viewed_detail():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/2") {
+            return Promise.resolve(planDetail(2, "MSFT"));
+          }
+          if (path.endsWith("/approve")) return Promise.resolve({});
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        await module.showPlan(2);
+        elements["plan-approval-reason"].value = "stale A dialog";
+        module.submitPlanApproval({preventDefault() {}});
+        await flush();
+
+        if (calls.some((call) => call.path.endsWith("/approve"))) {
+          throw new Error("A dialog submitted after detail switched to B");
+        }
+        """,
+    )
+
+
+def test_plan_approval_close_poisons_target_before_reopen():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+            "closeDialog",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/2") {
+            return Promise.resolve(planDetail(2, "MSFT"));
+          }
+          if (path.endsWith("/approve")) return Promise.resolve({});
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        module.closeDialog(elements["plan-approval-dialog"]);
+        elements["plan-approval-reason"].value = "closed dialog";
+        module.submitPlanApproval({preventDefault() {}});
+        await flush();
+        if (calls.some((call) => call.path.endsWith("/approve"))) {
+          throw new Error("closed approval dialog retained an actionable target");
+        }
+
+        await module.showPlan(2);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        if (elements["plan-approval-target-id"].textContent !== "2") {
+          throw new Error("reopened dialog did not bind immutable plan 2");
+        }
+        """,
+    )
+
+
+def test_plan_approval_blocks_double_submit():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const approval = deferred();
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/1/approve") return approval.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        elements["plan-approval-reason"].value = "single plan approval";
+        module.submitPlanApproval({preventDefault() {}});
+        module.submitPlanApproval({preventDefault() {}});
+        await flush();
+
+        const approvals = calls.filter(
+          (call) => call.path === "/plans/1/approve",
+        );
+        if (approvals.length !== 1) {
+          throw new Error(`plan approval submitted ${approvals.length} times`);
+        }
+        if (elements["plan-approval-reason"].value !== "") {
+          throw new Error("plan approval state was not cleared after submit");
+        }
+        """,
+    )
+
+
+def test_plan_detail_response_id_mismatch_fails_closed():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("showPlan",),
+        _PLAN_DOM_SETUP
+        + r"""
+        globalThis.__api = (path) => {
+          if (path === "/plans/2") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(2);
+        if (findButton(elements["plan-detail"], "Review plan approval")) {
+          throw new Error("mismatched detail response exposed approval");
+        }
+        if (!elements["plan-detail"].textContent.toLowerCase().includes("mismatch")) {
+          throw new Error("mismatched plan identity was not explained");
+        }
+        """,
+    )
+
+
+_HEALTH_DOM_SETUP = r"""
+    const elements = installDom([
+      "truth-broker",
+      "truth-mode",
+      "truth-database",
+      "truth-daemon",
+      "truth-equity-breaker",
+      "truth-crypto-breaker",
+      "breaker-scope",
+      "breaker-generation",
+      "breaker-health",
+      "breaker-reset-reason",
+      "breaker-reset-button",
+      "status-region",
+      "receipt-panel",
+    ]);
+    elements["breaker-scope"].value = "equity";
+    const validHealth = (generation = 7) => ({
+      broker: "Alpaca",
+      mode: "paper",
+      db_ok: true,
+      heartbeat_age_seconds: 1.5,
+      daemon_alive: true,
+      killswitch: {
+        equity: true,
+        crypto: false,
+      },
+      killswitch_generation: {
+        equity: generation,
+        crypto: 3,
+      },
+    });
+    const assertUnknownAndDisabled = () => {
+      for (const id of [
+        "truth-database",
+        "truth-daemon",
+        "truth-equity-breaker",
+        "truth-crypto-breaker",
+      ]) {
+        if (!elements[id].textContent.includes("Unknown")) {
+          throw new Error(`${id} retained ${elements[id].textContent}`);
+        }
+        if (elements[id].className.includes("verified")) {
+          throw new Error(`${id} remained verified`);
+        }
+      }
+      if (!elements["breaker-reset-button"].disabled) {
+        throw new Error("breaker reset remained enabled");
+      }
+    };
+"""
+
+
+@pytest.mark.parametrize(
+    "invalid_health",
+    (
+        (
+            '{broker: "Alpaca", mode: "paper", db_ok: false, '
+            'error: "database_unavailable"}'
+        ),
+        (
+            '{broker: "Alpaca", mode: "paper", db_ok: true, '
+            "daemon_alive: true, heartbeat_age_seconds: 1.5}"
+        ),
+        (
+            "({...validHealth(), observed_at: "
+            "new Date(Date.now() - 120000).toISOString()})"
+        ),
+    ),
+)
+def test_breaker_health_invalid_or_incomplete_response_is_unknown(
+    invalid_health,
+):
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshHealth",
+            "updateBreakerReset",
+        ),
+        _HEALTH_DOM_SETUP
+        + f"""
+        globalThis.__api = (path) => {{
+          if (path === "/health") return Promise.resolve({invalid_health});
+          throw new Error(`unexpected API path ${{path}}`);
+        }};
+        elements["breaker-reset-reason"].value = "must remain disabled";
+        await module.refreshHealth();
+        module.updateBreakerReset();
+        assertUnknownAndDisabled();
+        """,
+    )
+
+
+def test_breaker_health_refresh_invalidates_before_network_failure():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshHealth",
+            "updateBreakerReset",
+        ),
+        _HEALTH_DOM_SETUP
+        + r"""
+        const failure = deferred();
+        let call = 0;
+        globalThis.__api = (path) => {
+          if (path !== "/health") throw new Error(`unexpected API path ${path}`);
+          call += 1;
+          return call === 1
+            ? Promise.resolve(validHealth())
+            : failure.promise;
+        };
+
+        await module.refreshHealth();
+        elements["breaker-reset-reason"].value = "observed healthy";
+        module.updateBreakerReset();
+        if (elements["breaker-reset-button"].disabled) {
+          throw new Error("valid current health did not enable scoped reset");
+        }
+
+        const refresh = module.refreshHealth();
+        assertUnknownAndDisabled();
+        failure.reject(new Error("network unavailable"));
+        await refresh.catch(() => {});
+        assertUnknownAndDisabled();
+        """,
+    )
+
+
+def test_breaker_health_ignores_older_success_after_newer_failure():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshHealth",
+            "updateBreakerReset",
+        ),
+        _HEALTH_DOM_SETUP
+        + r"""
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (path) => {
+          if (path !== "/health") throw new Error(`unexpected API path ${path}`);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldRefresh = module.refreshHealth();
+        const newRefresh = module.refreshHealth();
+        newer.reject(new Error("new health failed"));
+        await newRefresh.catch(() => {});
+        older.resolve(validHealth(9));
+        await oldRefresh;
+        elements["breaker-reset-reason"].value = "stale result";
+        module.updateBreakerReset();
+        assertUnknownAndDisabled();
+        """,
+    )
+
+
+def test_breaker_health_ignores_older_failure_after_newer_success():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshHealth",
+            "updateBreakerReset",
+        ),
+        _HEALTH_DOM_SETUP
+        + r"""
+        const older = deferred();
+        const newer = deferred();
+        let call = 0;
+        globalThis.__api = (path) => {
+          if (path !== "/health") throw new Error(`unexpected API path ${path}`);
+          call += 1;
+          return call === 1 ? older.promise : newer.promise;
+        };
+
+        const oldRefresh = module.refreshHealth();
+        const newRefresh = module.refreshHealth();
+        newer.resolve(validHealth(11));
+        await newRefresh;
+        older.reject(new Error("old health failed"));
+        const staleResult = await oldRefresh.then(
+          (result) => result,
+          () => "rejected",
+        );
+        if (staleResult === "rejected") {
+          throw new Error("older health failure was not ignored");
+        }
+        elements["breaker-reset-reason"].value = "new health remains current";
+        module.updateBreakerReset();
+
+        if (
+          elements["truth-equity-breaker"].textContent !== "Tripped · gen 11"
+        ) {
+          throw new Error("older failure erased newer valid health");
+        }
+        if (elements["breaker-reset-button"].disabled) {
+          throw new Error("newer valid observation was not retained");
+        }
+        """,
+    )
+
+
+def test_breaker_reset_invalidates_health_before_refresh_result():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshHealth",
+            "updateBreakerReset",
+            "submitBreakerReset",
+        ),
+        _HEALTH_DOM_SETUP
+        + r"""
+        const afterReset = deferred();
+        let healthCall = 0;
+        globalThis.__api = (path) => {
+          if (path === "/health") {
+            healthCall += 1;
+            return healthCall === 1
+              ? Promise.resolve(validHealth(13))
+              : afterReset.promise;
+          }
+          if (path === "/killswitch/reset") {
+            return Promise.resolve({
+              asset_class: "equity",
+              generation: 13,
+              tripped: false,
+            });
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshHealth();
+        elements["breaker-reset-reason"].value = "reviewed breaker state";
+        module.updateBreakerReset();
+        module.submitBreakerReset({preventDefault() {}});
+        await flush();
+        assertUnknownAndDisabled();
         """,
     )
 
