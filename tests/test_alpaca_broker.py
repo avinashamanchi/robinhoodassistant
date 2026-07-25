@@ -938,7 +938,7 @@ def test_status_mapping(raw, expected):
     assert _map_status(SimpleNamespace(value=raw)) is expected
 
 
-def test_get_quote_retries_on_transient_connection_error():
+def test_get_quote_retries_on_transient_connection_error(caplog):
     """A stale keep-alive socket raises ConnectionError on first use; the broker
     must retry (fresh socket) instead of crashing the caller. This is the exact
     failure that made 'approve' 500 in the long-running app."""
@@ -951,7 +951,9 @@ def test_get_quote_retries_on_transient_connection_error():
         def get_stock_snapshot(self, request):
             self.calls += 1
             if self.calls == 1:  # first call: stale connection
-                raise ReqConnErr("Remote end closed connection without response")
+                raise ReqConnErr(
+                    "provider-secret-transient-connection"
+                )
             exchange_time = datetime(
                 2026, 7, 23, 15, 4, tzinfo=timezone.utc
             )
@@ -970,6 +972,7 @@ def test_get_quote_retries_on_transient_connection_error():
     q = broker.get_quote("AAPL")
     assert data.calls == 2               # retried once
     assert q.last == Decimal("101")
+    assert "provider-secret-transient-connection" not in caplog.text
 
 
 def test_submit_order_does_not_retry_post_send_connection_loss():
@@ -983,13 +986,19 @@ def test_submit_order_does_not_retry_post_send_connection_loss():
         def submit_order(self, order_data):
             if self._first:  # first POST: connection dropped mid-flight
                 self._first = False
-                raise ReqConnErr("Remote end closed connection without response")
+                raise ReqConnErr(
+                    "provider-secret-submit-connection"
+                )
             return super().submit_order(order_data)
 
     trading = FlakyTrading()
     broker = AlpacaBroker(trading, FakeData({}))
-    with pytest.raises(BrokerAcceptanceUnknown):
+    with pytest.raises(
+        BrokerAcceptanceUnknown,
+        match="broker submission acceptance is unknown",
+    ) as caught:
         broker.submit_order(_order())
+    assert "provider-secret-submit-connection" not in str(caught.value)
     assert trading.submit_calls == 0  # no second POST after an uncertain send
 
 

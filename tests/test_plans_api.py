@@ -218,3 +218,65 @@ def test_propose_generates_plans(client):
             response.headers["X-Request-ID"],
         )
     }
+
+
+def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
+    client,
+    monkeypatch,
+):
+    c, _ = client
+
+    class ProviderSecretAnalysisFailure(RuntimeError):
+        pass
+
+    def fail_analysis(self, *args, **kwargs):
+        raise ProviderSecretAnalysisFailure(
+            "provider-secret-propose-analysis"
+        )
+
+    monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
+
+    response = c.post(
+        "/propose",
+        json={"n": 2, "reason": "provider failure sanitization probe"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["proposed"]
+    assert {
+        row["error"] for row in response.json()["proposed"]
+    } == {"analysis_failed"}
+    exposed = str(response.json())
+    assert "ProviderSecretAnalysisFailure" not in exposed
+    assert "provider-secret-propose-analysis" not in exposed
+
+
+def test_analyze_returns_stable_error_without_provider_class_or_text(
+    client,
+    monkeypatch,
+):
+    c, _ = client
+
+    class ProviderSecretPlanFailure(RuntimeError):
+        pass
+
+    def fail_analysis(self, *args, **kwargs):
+        raise ProviderSecretPlanFailure(
+            "provider-secret-plan-analysis"
+        )
+
+    monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
+
+    response = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "provider failure plan probe",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "analysis_failed"
+    exposed = response.text
+    assert "ProviderSecretPlanFailure" not in exposed
+    assert "provider-secret-plan-analysis" not in exposed

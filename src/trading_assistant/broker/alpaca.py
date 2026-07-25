@@ -108,8 +108,13 @@ def _retry(fn: Callable[..., _T], *args: Any, attempts: int = 3, base_delay: flo
             return fn(*args, **kwargs)
         except _TRANSIENT as exc:  # stale socket / transient network blip
             last = exc
-            log.warning("alpaca transient error on %s (attempt %d/%d): %s",
-                        getattr(fn, "__name__", fn), i + 1, attempts, exc)
+            log.warning(
+                "alpaca transient failure code=broker_transient_failure "
+                "operation=%s attempt=%d/%d",
+                getattr(fn, "__name__", "broker_operation"),
+                i + 1,
+                attempts,
+            )
             if i + 1 < attempts:
                 time.sleep(base_delay * (i + 1))
     assert last is not None
@@ -419,11 +424,13 @@ class AlpacaBroker(BrokerClient):
         except BrokerDataIntegrityError:
             raise
         except APIError as exc:
-            raise self._submission_exception(exc) from exc
-        except Exception as exc:
+            raise self._submission_exception(exc) from None
+        except Exception:
             # The POST was attempted. A timeout, malformed response, or connection
             # reset cannot prove that Alpaca did not accept the client id.
-            raise BrokerAcceptanceUnknown(str(exc)) from exc
+            raise BrokerAcceptanceUnknown(
+                "broker submission acceptance is unknown"
+            ) from None
 
     def _submit_once(self, order: OrderRequest) -> OrderResult:
         side = (
@@ -464,9 +471,11 @@ class AlpacaBroker(BrokerClient):
         except BrokerDataIntegrityError:
             raise
         except APIError as exc:
-            raise self._submission_exception(exc) from exc
-        except Exception as exc:
-            raise BrokerAcceptanceUnknown(str(exc)) from exc
+            raise self._submission_exception(exc) from None
+        except Exception:
+            raise BrokerAcceptanceUnknown(
+                "broker submission acceptance is unknown"
+            ) from None
 
     def _submit_bracket_once(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         from alpaca.trading.enums import OrderClass
@@ -531,8 +540,13 @@ class AlpacaBroker(BrokerClient):
         # was accepted. Other 4xx responses can be transport/auth/rate-limit
         # edge cases, so preserve the safer indeterminate outcome.
         if status_code in {400, 422}:
-            return BrokerSubmissionRejected(f"alpaca_http_{status_code}", str(exc))
-        return BrokerAcceptanceUnknown(str(exc))
+            return BrokerSubmissionRejected(
+                f"alpaca_http_{status_code}",
+                "broker rejected the submitted order",
+            )
+        return BrokerAcceptanceUnknown(
+            "broker submission acceptance is unknown"
+        )
 
     def _to_result(self, o: Any) -> OrderResult:
         raw_broker_order_id = getattr(o, "id", None)

@@ -70,6 +70,27 @@ def _propose(svc, notional="100"):
     )["order_id"]
 
 
+def _unsafe_local_state(
+    *,
+    live_or_unknown_order_ids=(),
+    latched_order_ids=(),
+    unsafe_fill_ids=(),
+    active_rule_ids=(),
+    unsafe_rule_group_ids=(),
+    unknown_categories=(),
+):
+    return {
+        "live_or_unknown_order_ids": list(
+            live_or_unknown_order_ids
+        ),
+        "latched_order_ids": list(latched_order_ids),
+        "unsafe_fill_ids": list(unsafe_fill_ids),
+        "active_rule_ids": list(active_rule_ids),
+        "unsafe_rule_group_ids": list(unsafe_rule_group_ids),
+        "unknown_categories": list(unknown_categories),
+    }
+
+
 def test_index_served(client):
     c, _, _ = client
     r = c.get("/")
@@ -433,6 +454,7 @@ def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
         "confirmed_canceled": [],
         "unconfirmed_order_ids": [],
         "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(),
         "message": (
             "panic incomplete: safety could not be confirmed; "
             "broker_enumeration=unconfirmed "
@@ -482,6 +504,7 @@ def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
         "confirmed_canceled": [],
         "unconfirmed_order_ids": [],
         "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(),
         "message": "panic incomplete: safety could not be confirmed",
     }
     assert "raw provider panic dependency secret" not in response.text
@@ -546,6 +569,9 @@ def test_panic_exception_fallback_enumerates_every_local_live_unknown_order(
         "confirmed_canceled": [],
         "unconfirmed_order_ids": expected_ids,
         "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(
+            live_or_unknown_order_ids=expected_ids,
+        ),
         "message": "panic incomplete: safety could not be confirmed",
     }
     assert "provider-secret-panic-fallback" not in response.text
@@ -588,6 +614,15 @@ def test_panic_exception_fallback_reports_unknown_local_enumeration_on_db_failur
         "confirmed_canceled": [],
         "unconfirmed_order_ids": [],
         "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(
+            unknown_categories=(
+                "live_or_unknown_orders",
+                "latched_orders",
+                "unsafe_fills",
+                "active_rules",
+                "unsafe_rule_groups",
+            ),
+        ),
         "message": "panic incomplete: safety could not be confirmed",
     }
     assert "provider-secret-panic-fallback" not in response.text

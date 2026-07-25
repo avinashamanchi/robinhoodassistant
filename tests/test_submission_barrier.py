@@ -2026,8 +2026,9 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
     drift_state = service.breakers.get(BreakerScope.broker_drift())
     assert drift_state is not None and drift_state.tripped is True
     assert drift_state.actor == "operator:process-test"
-    assert "ConnectionError" in drift_state.reason
-    assert "TimeoutError" in drift_state.reason
+    assert drift_state.reason == (
+        f"indeterminate broker cancellation for order {cancel_order_id}"
+    )
 
     broker_entered = context.Event()
     submission_outcome = context.Queue()

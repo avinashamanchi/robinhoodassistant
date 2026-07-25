@@ -53,9 +53,11 @@ class RobinhoodSource:
         code = pyotp.TOTP(self._totp_secret).now() if self._totp_secret else None
         try:
             self._do_login(rh, code)
-        except Exception as exc:  # noqa: BLE001 — deliberately opaque, readable message
-            log.warning("robinhood auth failed: %s", type(exc).__name__)
-            raise ExternalAuthError(_UPDATE_HINT) from exc
+        except Exception:  # noqa: BLE001 — deliberately opaque, readable message
+            log.warning(
+                "robinhood auth failed code=external_auth_failed"
+            )
+            raise ExternalAuthError(_UPDATE_HINT) from None
 
         self._secure_token()
         self._logged_in = True

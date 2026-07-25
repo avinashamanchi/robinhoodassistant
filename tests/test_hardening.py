@@ -12,7 +12,13 @@ from sqlalchemy import event, func, select
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import OrderResult, OrderStatus, Position
-from trading_assistant.db.models import AuditEvent, Fill, Order
+from trading_assistant.db import models as db_models
+from trading_assistant.db.models import (
+    FILL_RECONCILIATION_REQUIRED,
+    AuditEvent,
+    Fill,
+    Order,
+)
 from trading_assistant.risk.breakers import BreakerScope
 
 
@@ -91,6 +97,149 @@ def test_cancel_live_order(make_service):
         reason="hardening duplicate cancellation",
         request_id="hardening-test-cancel-duplicate",
     )  # cannot cancel twice
+
+
+class ProviderSecretCancelFailure(RuntimeError):
+    pass
+
+
+class ProviderSecretStatusFailure(RuntimeError):
+    pass
+
+
+class IndeterminateCancelBroker(MockBroker):
+    def cancel_order(self, order_id):
+        raise ProviderSecretCancelFailure(
+            "provider-secret-cancel-message"
+        )
+
+    def get_order_status(self, order_id):
+        raise ProviderSecretStatusFailure(
+            "provider-secret-status-message"
+        )
+
+
+def test_indeterminate_cancel_latch_has_exact_atomic_audit_and_sanitized_fault(
+    make_service,
+    caplog,
+):
+    service = make_service(broker=IndeterminateCancelBroker())
+    order_id = _submitted(service)
+    context = {
+        "actor": "operator:cancel-latch",
+        "reason": "review indeterminate cancellation",
+        "request_id": "indeterminate-cancel-latch",
+    }
+
+    result = service.cancel_live_order(order_id, **context)
+
+    assert result == {
+        "order_id": order_id,
+        "status": OrderStatus.SUBMITTED.value,
+        "error": "broker cancellation could not be confirmed",
+    }
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        latch_audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.cancel_latch",
+                AuditEvent.target_id == str(order_id),
+            )
+        )
+        persisted_text = " ".join(
+            [
+                *(row.detail_json for row in session.scalars(
+                    select(AuditEvent)
+                )),
+                *(row.reason for row in session.scalars(
+                    select(db_models.RiskEvent)
+                )),
+                *(row.reason for row in session.scalars(
+                    select(db_models.CircuitBreakerState)
+                )),
+            ]
+        )
+    assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
+    assert order.last_error_code == "indeterminate_cancel"
+    assert (
+        latch_audit.actor,
+        latch_audit.reason,
+        latch_audit.request_id,
+        latch_audit.result_code,
+    ) == (
+        context["actor"],
+        context["reason"],
+        context["request_id"],
+        "indeterminate_cancel",
+    )
+    exposed = f"{result} {persisted_text} {caplog.text}"
+    assert "provider-secret" not in exposed
+    assert "ProviderSecretCancelFailure" not in exposed
+    assert "ProviderSecretStatusFailure" not in exposed
+
+
+def test_indeterminate_cancel_latch_rolls_back_on_audit_failure_but_breaker_stays(
+    make_service,
+):
+    service = make_service(broker=IndeterminateCancelBroker())
+    order_id = _submitted(service)
+    with service.session_factory() as session:
+        before = session.get(Order, order_id)
+        before_state = (
+            before.acceptance_state,
+            before.last_error_code,
+            before.version,
+        )
+
+    def fail_latch_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "order.cancel_latch"
+            for row in session.new
+        ):
+            raise RuntimeError("injected cancel latch audit failure")
+
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", fail_latch_audit)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected cancel latch audit failure",
+        ):
+            service.cancel_live_order(
+                order_id,
+                actor="operator:cancel-latch",
+                reason="rollback indeterminate cancellation latch",
+                request_id="indeterminate-cancel-latch-rollback",
+            )
+    finally:
+        event.remove(session_type, "before_flush", fail_latch_audit)
+
+    assert service.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    ) is True
+    with service.session_factory() as session:
+        after = session.get(Order, order_id)
+        breaker = session.get(
+            db_models.CircuitBreakerState,
+            BreakerScope.broker_drift().key,
+        )
+        latch_audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.cancel_latch",
+                AuditEvent.request_id
+                == "indeterminate-cancel-latch-rollback",
+            )
+        ).all()
+    assert (
+        after.acceptance_state,
+        after.last_error_code,
+        after.version,
+    ) == before_state
+    assert breaker.reason == (
+        f"indeterminate broker cancellation for order {order_id}"
+    )
+    assert latch_audits == []
 
 
 def test_cancel_nested_reconciliation_fault_keeps_operator_provenance(

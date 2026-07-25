@@ -231,6 +231,200 @@ def test_panic_audit_failure_keeps_rule_active_but_global_breaker_tripped(
         ) == 0
 
 
+def test_panic_local_enumeration_includes_terminal_latch_and_orphan_fill(
+    make_service,
+):
+    service = make_service()
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="panic-terminal-latch",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.CANCELED.value,
+            acceptance_state=FILL_RECONCILIATION_REQUIRED,
+            last_error_code="waiting_for_exact_fill",
+        )
+        session.add(order)
+        session.flush()
+        quarantined = Fill(
+            order_id=order.id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            broker_fill_id="panic-quarantined-fill",
+            reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
+        )
+        orphan = Fill(
+            order_id=None,
+            ticker="MSFT",
+            side="sell",
+            qty=Decimal("1"),
+            price=Decimal("200"),
+            broker_fill_id="panic-orphan-fill",
+            reconciliation_state="trusted",
+        )
+        session.add_all((quarantined, orphan))
+        session.commit()
+        order_id = order.id
+        fill_ids = [quarantined.id, orphan.id]
+
+    report = service.panic(
+        actor="operator:panic-enumeration",
+        reason="enumerate terminal latch and orphan fill",
+        request_id="panic-terminal-latch-enumeration",
+    )
+
+    assert report["safe"] is False
+    assert report["local_enumeration"] == "confirmed"
+    assert report["confirmed_canceled"] == []
+    assert order_id in report["unconfirmed_order_ids"]
+    assert report["unsafe_local_state"]["latched_order_ids"] == [
+        order_id
+    ]
+    assert report["unsafe_local_state"]["unsafe_fill_ids"] == fill_ids
+    assert report["unsafe_local_state"]["unknown_categories"] == []
+
+
+def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
+    make_service,
+    authenticate_client,
+):
+    from fastapi.testclient import TestClient
+
+    from trading_assistant.app.main import create_app
+
+    service = make_service()
+    active = service.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:panic-enumeration",
+        reason="create active unsafe rule",
+        request_id="panic-active-rule-setup",
+    )
+    latched = service.create_conditional_rule(
+        "MSFT",
+        {"price_below": "300"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:panic-enumeration",
+        reason="create latched unsafe group",
+        request_id="panic-latched-group-setup",
+    )
+    with service.session_factory() as session:
+        active_rule = session.get(Rule, active["rule_id"])
+        latched_rule = session.get(Rule, latched["rule_id"])
+        active_group_id = active_rule.group_id
+        latched_group_id = latched_rule.group_id
+        latched_rule.state = "canceled"
+        latched_group = session.get(RuleGroup, latched_group_id)
+        latched_group.state = "canceled"
+        latched_group.reconciliation_required = True
+        session.commit()
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-enumeration")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=type(
+            "StubAgent",
+            (),
+            {"chat": lambda self, message, **context: {
+                "reply": "",
+                "tool_calls": [],
+            }},
+        )(),
+        api_token="test-api-operator-secret",
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app),
+        "test-api-operator-secret",
+    )
+
+    response = client.post(
+        "/panic",
+        json={"reason": "fallback unsafe rule enumeration"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    receipt = response.json()["receipt"]
+    assert receipt["safe"] is False
+    assert receipt["local_enumeration"] == "confirmed"
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["unsafe_local_state"]["active_rule_ids"] == [
+        active["rule_id"]
+    ]
+    assert set(
+        receipt["unsafe_local_state"]["unsafe_rule_group_ids"]
+    ) == {active_group_id, latched_group_id}
+
+
+def test_panic_local_enumeration_marks_partial_query_failure_unknown(
+    make_service,
+    authenticate_client,
+):
+    from fastapi.testclient import TestClient
+
+    from trading_assistant.app.main import create_app
+
+    service = make_service()
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-query-failure")
+
+    def fail_fill_query(execute_state):
+        if (
+            execute_state.is_select
+            and "FROM fills" in str(execute_state.statement)
+        ):
+            raise RuntimeError("database-secret-fill-query")
+
+    service.panic = explode
+    session_type = service.session_factory.class_
+    event.listen(session_type, "do_orm_execute", fail_fill_query)
+    try:
+        app = create_app(
+            service=service,
+            agent=type(
+                "StubAgent",
+                (),
+                {"chat": lambda self, message, **context: {
+                    "reply": "",
+                    "tool_calls": [],
+                }},
+            )(),
+            api_token="test-api-operator-secret",
+            planning=None,
+        )
+        client, csrf = authenticate_client(
+            TestClient(app),
+            "test-api-operator-secret",
+        )
+        response = client.post(
+            "/panic",
+            json={"reason": "partial local enumeration failure"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    finally:
+        event.remove(session_type, "do_orm_execute", fail_fill_query)
+
+    receipt = response.json()["receipt"]
+    assert response.status_code == 503
+    assert receipt["safe"] is False
+    assert receipt["local_enumeration"] == "unknown"
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["unsafe_local_state"]["unknown_categories"] == [
+        "unsafe_fills"
+    ]
+    assert "database-secret-fill-query" not in str(response.json())
+
+
 def _acceptance_unknown_with_exact_local_fill_ahead(service, broker) -> int:
     broker.set_price("AAPL", Decimal("100"))
     order_id = _approved_order_id(service)

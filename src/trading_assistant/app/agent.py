@@ -164,7 +164,10 @@ class ToolRouter:
         try:
             return table[name]()
         except Exception:  # stable failure: never return provider/domain text
-            log.exception("agent tool %s failed", name)
+            log.error(
+                "agent tool failed code=tool_failed tool=%s",
+                name,
+            )
             return {"error": "tool_failed"}
 
 
@@ -222,7 +225,7 @@ class Agent:
                     system=SYSTEM_PROMPT, messages=messages, tools=TOOL_SPECS
                 )
             except Exception:  # noqa: BLE001 — never 500 the chat endpoint on an LLM error
-                log.exception("chat backend failed")
+                log.error("chat backend failed code=llm_backend_failed")
                 final_text = (
                     "Sorry — I couldn't complete that request (the assistant model "
                     "returned an error). Please try rephrasing, or use the Plans page "

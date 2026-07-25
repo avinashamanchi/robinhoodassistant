@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from .config import Secrets, TradingMode, load_config
+from .db.schema import SchemaOutOfDate
 
 PASS, FAIL, SKIP, NEEDS = "PASS", "FAIL", "SKIP", "NEEDS-ME"
 _EXAMPLE_TOKENS = {"", "sk-ant-xxxxxxxx"}
@@ -25,9 +26,9 @@ class Result:
     detail: str = ""
 
 
-def _safe_exception_code(exc: Exception) -> str:
-    """Return diagnostic shape without exposing untrusted exception text."""
-    return type(exc).__name__
+def _safe_exception_code(_exc: Exception) -> str:
+    """Return a fixed code without exposing provider type or text."""
+    return "dependency_failed"
 
 
 def _config_parses() -> Result:
@@ -101,6 +102,12 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
         ks = Result("kill switches", PASS if not tripped else FAIL,
                     "all clear" if not tripped else f"TRIPPED: {tripped} (reset before trading)")
         return wal, ks
+    except SchemaOutOfDate:
+        err = "schema_out_of_date"
+        return (
+            Result("DB WAL mode", FAIL, err),
+            Result("kill switches", FAIL, err),
+        )
     except Exception as e:
         err = _safe_exception_code(e)
         return Result("DB WAL mode", FAIL, err), Result("kill switches", FAIL, err)

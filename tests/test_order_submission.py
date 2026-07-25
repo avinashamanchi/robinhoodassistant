@@ -161,7 +161,12 @@ def test_panic_latch_atomically_prevents_a_later_broker_submit(make_service):
 
     result = _submit(svc.order_submission, order_id)
 
-    assert panic.safe is True
+    assert panic.safe is False
+    assert panic.local_enumeration == "confirmed"
+    assert panic.unconfirmed_order_ids == (order_id,)
+    assert panic.unsafe_local_state.live_or_unknown_order_ids == (
+        order_id,
+    )
     assert result.status is OrderStatus.REJECTED
     assert "active circuit breaker: operator_global" in result.risk_reasons
     assert svc.broker.submit_calls == 0

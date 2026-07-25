@@ -19,7 +19,7 @@ def _failed_generation(err: Exception) -> str:
         e = body.get("error")
         if isinstance(e, dict) and e.get("failed_generation"):
             return str(e["failed_generation"])
-    return str(err)
+    return ""
 
 
 def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
@@ -45,7 +45,11 @@ def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
         args = next((a for a in args if isinstance(a, dict)), None)
     if not isinstance(args, dict):
         return None
-    log.warning("recovered Groq tool_use_failed into %s(%s)", name, args)
+    log.warning(
+        "recovered Groq tool call "
+        "code=tool_call_recovered tool=%s",
+        name,
+    )
     return LLMResponse(
         content=[ToolUseBlock(id="groq-recovered", name=name, input=args)],
         stop_reason="tool_use",

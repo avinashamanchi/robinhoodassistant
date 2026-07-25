@@ -652,8 +652,8 @@ class TradingService:
                     ),
                 },
             }
-        except Exception as exc:
-            return {"db_ok": False, "error": type(exc).__name__}
+        except Exception:
+            return {"db_ok": False, "error": "database_unavailable"}
 
     def panic(
         self,
@@ -679,6 +679,7 @@ class TradingService:
             "confirmed_canceled": list(report.confirmed_canceled),
             "unconfirmed_order_ids": list(report.unconfirmed_order_ids),
             "remote_open_order_ids": list(report.remote_open_order_ids),
+            "unsafe_local_state": report.unsafe_local_state.as_dict(),
             "message": report.message,
         }
 
@@ -911,45 +912,66 @@ class TradingService:
         # transactions and commits exact fill/latch truth before writer release.
         try:
             broker_result = self.broker.cancel_order(broker_order_id)
-        except Exception as cancel_error:
+        except Exception:
             try:
                 broker_result = self.broker.get_order_status(broker_order_id)
-            except Exception as status_error:
+            except Exception:
                 fault_reason = (
-                    f"indeterminate broker cancellation for order {order_id}: "
-                    f"cancel raised {type(cancel_error).__name__}; "
-                    f"status lookup raised {type(status_error).__name__}"
+                    "indeterminate broker cancellation for order "
+                    f"{order_id}"
                 )
                 now = utcnow()
-                # Both broker calls have completed and the process writer was
-                # acquired before this transaction. Commit the order latch and
-                # broker-drift breaker atomically before releasing that writer.
+                # Fail closed first in an independent durable transaction. A
+                # later latch/audit failure must not reopen submissions.
+                self.breakers.trip(
+                    BreakerScope.broker_drift(),
+                    fault_reason,
+                    actor,
+                    now=now,
+                    request_id=request_id,
+                    audit_reason=reason,
+                )
+
+                # The latch and its exact provenance are one transaction. If
+                # either write fails, neither may be visible.
                 with self.session_factory() as session:
                     order = session.get(Order, order_id)
-                    if order is not None:
-                        order.acceptance_state = (
-                            FILL_RECONCILIATION_REQUIRED
+                    if order is None:
+                        raise RuntimeError(
+                            "order disappeared during cancellation latch"
                         )
-                        order.last_error_code = "indeterminate_cancel"
-                        order.updated_at = now
-                        order.version += 1
-                    trip_in_session(
-                        session,
-                        BreakerScope.broker_drift(),
-                        fault_reason,
-                        actor,
-                        now=now,
-                        request_id=request_id,
-                        audit_reason=reason,
+                    order.acceptance_state = (
+                        FILL_RECONCILIATION_REQUIRED
+                    )
+                    order.last_error_code = "indeterminate_cancel"
+                    order.updated_at = now
+                    order.version += 1
+                    session.add(
+                        AuditEvent(
+                            actor=actor,
+                            action="order.cancel_latch",
+                            target_type="order",
+                            target_id=str(order_id),
+                            request_id=request_id,
+                            reason=reason,
+                            result_code="indeterminate_cancel",
+                            detail_json=json.dumps(
+                                {
+                                    "acceptance_state": (
+                                        FILL_RECONCILIATION_REQUIRED
+                                    ),
+                                    "error_code": "indeterminate_cancel",
+                                },
+                                sort_keys=True,
+                            ),
+                            created_at=now,
+                        )
                     )
                     session.commit()
                 return {
                     "order_id": order_id,
                     "status": local_status,
-                    "error": (
-                        "broker cancellation could not be confirmed: "
-                        f"{type(cancel_error).__name__}"
-                    ),
+                    "error": "broker cancellation could not be confirmed",
                 }
         broker_status = broker_result.status
         sync = self.sync_open_orders(

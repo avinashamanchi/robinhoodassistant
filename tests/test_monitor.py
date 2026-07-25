@@ -85,7 +85,10 @@ def test_monitor_tick_delegates_only_to_rule_worker(make_service):
     assert svc.broker.submit_calls == 0
 
 
-def test_rule_lease_survives_when_application_crashes_before_transaction(make_service):
+def test_rule_lease_survives_when_application_crashes_before_transaction(
+    make_service,
+    caplog,
+):
     from trading_assistant.db.models import Rule
 
     svc = make_service()
@@ -98,7 +101,9 @@ def test_rule_lease_survives_when_application_crashes_before_transaction(make_se
     svc.rule_application.crash_hook = fail_before
     result = Monitor(svc, NullNotifier()).tick()
 
-    assert result[0]["error"] == "ConnectionError"
+    assert result[0]["error"] == "rule_evaluation_failed"
+    assert "database temporarily unavailable" not in caplog.text
+    assert "ConnectionError" not in caplog.text
     with svc.session_factory() as session:
         assert session.get(Rule, rule_id).state == "active"
 
@@ -295,7 +300,7 @@ def test_preapproved_database_row_is_rejected_instead_of_autoexecuted(make_servi
     acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
 
     assert acted[0]["proposal"] is None
-    assert acted[0]["error"] == "ValidationError"
+    assert acted[0]["error"] == "rule_load_failed"
     assert svc.broker.submit_calls == 0
 
 

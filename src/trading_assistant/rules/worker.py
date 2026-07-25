@@ -75,7 +75,7 @@ class RuleWorker:
                 continue
             try:
                 stored_rules = self.repository.load_rules(lease)
-            except Exception as exc:
+            except Exception:
                 self.repository.release_group(
                     lease,
                     now=tick_now,
@@ -84,7 +84,10 @@ class RuleWorker:
                     request_id=request_id,
                 )
                 outcomes.append(
-                    RuleOutcome(group_id=group_id, error=type(exc).__name__)
+                    RuleOutcome(
+                        group_id=group_id,
+                        error="rule_load_failed",
+                    )
                 )
                 continue
             if not stored_rules:
@@ -163,11 +166,12 @@ class RuleWorker:
                             f"[{outcome.proposal['status']}]"
                         )
                     except Exception:
-                        log.exception(
-                            "notification failed for committed rule proposal %s",
+                        log.error(
+                            "rule notification failed "
+                            "code=notification_failed proposal_id=%s",
                             outcome.proposal["order_id"],
                         )
-            except ValueError as exc:
+            except ValueError:
                 self.repository.release_group(
                     lease,
                     now=tick_now,
@@ -179,19 +183,23 @@ class RuleWorker:
                     RuleOutcome(
                         group_id=group_id,
                         rule_id=fired[0].id if fired is not None else None,
-                        error=type(exc).__name__,
+                        error="rule_evaluation_invalid",
                     )
                 )
-            except Exception as exc:
+            except Exception:
                 # Leave the lease intact. If the crash was before the atomic
                 # transaction, expiry permits recovery; if it was after commit,
                 # the terminal group prevents a duplicate.
-                log.exception("rule group %s evaluation failed", group_id)
+                log.error(
+                    "rule evaluation failed "
+                    "code=rule_evaluation_failed group_id=%s",
+                    group_id,
+                )
                 outcomes.append(
                     RuleOutcome(
                         group_id=group_id,
                         rule_id=fired[0].id if fired is not None else None,
-                        error=type(exc).__name__,
+                        error="rule_evaluation_failed",
                     )
                 )
         return outcomes

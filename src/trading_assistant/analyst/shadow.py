@@ -100,8 +100,9 @@ class ShadowRunner:
                     request_id=request_id,
                 )
             except Exception:
-                log.exception(
-                    "shadow analysis failed for %s; continuing batch",
+                log.error(
+                    "shadow analysis failed code=analysis_failed "
+                    "symbol=%s; continuing batch",
                     c["symbol"],
                 )
                 continue

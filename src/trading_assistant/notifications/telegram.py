@@ -35,6 +35,6 @@ class TelegramNotifier:
                 timeout=10.0,
             )
             return resp.status_code == 200
-        except Exception as exc:  # never let a notification failure break trading
-            log.warning("telegram send failed: %s", type(exc).__name__)
+        except Exception:  # never let a notification failure break trading
+            log.warning("telegram send failed code=notification_failed")
             return False

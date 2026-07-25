@@ -84,7 +84,10 @@ def test_shadow_creates_graded_calls_without_orders(make_service):
         assert build_scorecard_from_db(s).n_calls == len(ids)   # track record built, risk-free
 
 
-def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
+def test_shadow_continues_when_one_candidate_plan_is_invalid(
+    make_service,
+    caplog,
+):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
     source = DataSource(
@@ -100,7 +103,7 @@ def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
         def analyze(self, symbol, **context):
             self.calls += 1
             if self.calls == 1:
-                raise ValueError("invalid model plan after repair")
+                raise ValueError("provider-secret-shadow-plan")
             return planning.analyze(symbol, **context)
 
     flaky = FailFirstPlanning()
@@ -113,6 +116,7 @@ def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
     assert flaky.calls == 2
     assert len(ids) == 1
     assert svc.broker.submit_calls == 0
+    assert "provider-secret-shadow-plan" not in caplog.text
 
 
 def test_shadow_batch_is_idempotent_across_process_restarts(make_service):

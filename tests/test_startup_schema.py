@@ -134,6 +134,6 @@ def test_preflight_reports_outdated_schema_without_mutating_it(tmp_path):
 
     assert wal.status == FAIL
     assert breakers.status == FAIL
-    assert "SchemaOutOfDate" in wal.detail
+    assert wal.detail == "schema_out_of_date"
     assert set(inspect(engine).get_table_names()) == before
     assert "circuit_breaker_state" not in before

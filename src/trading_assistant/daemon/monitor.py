@@ -86,7 +86,9 @@ class Monitor:
                 result["shadow_graded"] = self.shadow.grade_due()
                 result["shadow_new"] = len(self.shadow.run_once())
             except Exception:
-                log.exception("shadow tasks failed")
+                log.error(
+                    "shadow tasks failed code=shadow_tasks_failed"
+                )
         try:
             from ..analyst.digest import compose_digest
 
@@ -94,7 +96,7 @@ class Monitor:
                                               screen_source=self.digest_source))
             result["digest_sent"] = True
         except Exception:
-            log.exception("digest failed")
+            log.error("digest failed code=digest_failed")
         return result
 
     # ── reconciliation on restart ──────────────────────────────
@@ -194,7 +196,10 @@ class Monitor:
                 self.daily_task_timeout,
             )
         except Exception:
-            log.exception("daily analysis task failed")
+            log.error(
+                "daily analysis task failed "
+                "code=daily_analysis_failed"
+            )
 
     def _schedule_daily_tasks(self) -> None:
         if self._daily_task is not None and not self._daily_task.done():
@@ -233,8 +238,10 @@ class Monitor:
             except Exception:  # a bad tick must not kill the daemon
                 attempt += 1
                 delay = next_delay(attempt)
-                log.exception(
-                    "monitor tick failed; reconnecting with backoff %.1fs (attempt %d)",
-                    delay, attempt,
+                log.error(
+                    "monitor tick failed code=monitor_cycle_failed "
+                    "backoff_seconds=%.1f attempt=%d",
+                    delay,
+                    attempt,
                 )
                 await asyncio.sleep(delay)

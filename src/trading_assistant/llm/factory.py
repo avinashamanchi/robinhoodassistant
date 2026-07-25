@@ -37,9 +37,10 @@ class FallbackBackend:
                     system=system, messages=messages, tools=tools, tool_choice=tool_choice
                 )
             return resp
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             log.warning(
-                "primary LLM backend failed (%s); falling back", type(exc).__name__
+                "primary LLM backend failed "
+                "code=llm_backend_failed; falling back"
             )
             return self._fallback.create(
                 system=system, messages=messages, tools=tools, tool_choice=tool_choice

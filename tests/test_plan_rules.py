@@ -90,7 +90,7 @@ def test_unrepresentable_runtime_hwm_cannot_corrupt_restart(make_service):
     outcome = Monitor(svc, NullNotifier()).tick()
 
     assert len(outcome) == 1
-    assert outcome[0].error == "ValidationError"
+    assert outcome[0].error == "rule_evaluation_invalid"
     with svc.session_factory() as session:
         rule = session.execute(select(Rule)).scalar_one()
         assert rule.hwm is None

@@ -218,9 +218,14 @@
       } else {
         const receipt = r.data && r.data.receipt;
         if (receipt) {
+          const local = receipt.unsafe_local_state || {};
           notify(
             "PANIC incomplete — local enumeration " + receipt.local_enumeration +
             ", local unconfirmed " + JSON.stringify(receipt.unconfirmed_order_ids || []) +
+            ", unsafe fills " + JSON.stringify(local.unsafe_fill_ids || []) +
+            ", active rules " + JSON.stringify(local.active_rule_ids || []) +
+            ", unsafe rule groups " + JSON.stringify(local.unsafe_rule_group_ids || []) +
+            ", unknown local categories " + JSON.stringify(local.unknown_categories || []) +
             ", remote enumeration " + receipt.remote_enumeration +
             ", remote potentially open " + JSON.stringify(receipt.remote_open_order_ids || []),
             "err"

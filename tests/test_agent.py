@@ -160,7 +160,10 @@ def test_agent_mutating_tools_preserve_operator_provenance(make_service):
     assert {audit.request_id for audit in audits} == {"chat-request-123"}
 
 
-def test_agent_tool_failure_does_not_return_raw_exception_text(make_service):
+def test_agent_tool_failure_does_not_return_raw_exception_text(
+    make_service,
+    caplog,
+):
     agent, svc = _agent(
         make_service,
         [
@@ -196,6 +199,7 @@ def test_agent_tool_failure_does_not_return_raw_exception_text(make_service):
     output = result["tool_calls"][0]["output"]
     assert output == {"error": "tool_failed"}
     assert "raw provider tool detail" not in str(result)
+    assert "raw provider tool detail" not in caplog.text
 
 
 def test_agent_records_decision(make_service):
@@ -205,7 +209,7 @@ def test_agent_records_decision(make_service):
         assert s.execute(select(func.count()).select_from(LLMDecision)).scalar_one() == 1
 
 
-def test_agent_chat_survives_backend_error(make_service):
+def test_agent_chat_survives_backend_error(make_service, caplog):
     """An LLM/provider error must not 500 the chat endpoint — return a graceful reply."""
     class BoomBackend:
         def create(self, *, system, messages, tools, tool_choice=None):
@@ -219,6 +223,7 @@ def test_agent_chat_survives_backend_error(make_service):
     # Still records the (failed) decision — no crash on the None response.
     with svc.session_factory() as s:
         assert s.execute(select(func.count()).select_from(LLMDecision)).scalar_one() == 1
+    assert "provider exploded" not in caplog.text
 
 
 def test_agent_stops_at_max_turns(make_service):

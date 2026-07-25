@@ -51,6 +51,10 @@ from trading_assistant.risk.staleness import (
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
 
 from .repository import OrderRepository
+from .safety_state import (
+    UnsafeLocalState,
+    enumerate_unsafe_local_state,
+)
 
 _LOCAL_LIVE_STATUSES = (
     OrderStatus.SUBMITTING.value,
@@ -269,6 +273,7 @@ class PanicReport:
     confirmed_canceled: tuple[str, ...]
     unconfirmed_order_ids: tuple[int, ...]
     remote_open_order_ids: tuple[str, ...]
+    unsafe_local_state: UnsafeLocalState
     message: str
 
 
@@ -1923,19 +1928,15 @@ class ReconciliationService:
             )
         )
 
-        with self.session_factory() as session:
-            local_unconfirmed = tuple(
-                session.scalars(
-                    select(Order.id)
-                    .where(Order.status.in_(_LOCAL_LIVE_STATUSES))
-                    .order_by(Order.id)
-                ).all()
-            )
+        local_state = enumerate_unsafe_local_state(
+            self.session_factory
+        )
+        local_unconfirmed = local_state.unsafe_order_ids
 
         safe = (
             not enumeration_failed
             and not unaddressable_remote_open
-            and not local_unconfirmed
+            and not local_state.has_unsafe_state
             and not remote_open_ids
         )
         self._trip_reconciliation_faults(
@@ -1956,13 +1957,14 @@ class ReconciliationService:
             )
         return PanicReport(
             safe=safe,
-            local_enumeration="confirmed",
+            local_enumeration=local_state.enumeration,
             remote_enumeration=(
                 "unknown" if enumeration_failed else "confirmed"
             ),
             confirmed_canceled=tuple(sorted(confirmed_canceled)),
             unconfirmed_order_ids=local_unconfirmed,
             remote_open_order_ids=remote_open_ids,
+            unsafe_local_state=local_state,
             message=message,
         )
 

@@ -103,7 +103,7 @@ def test_preflight_reconciliation_sanitizes_provider_exception_text():
     result = preflight._reconciliation(ExplodingService())
 
     assert result.status == "FAIL"
-    assert result.detail == "RuntimeError"
+    assert result.detail == "dependency_failed"
     assert "provider-secret-preflight-detail" not in result.detail
 
 
