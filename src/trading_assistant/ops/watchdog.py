@@ -9,7 +9,11 @@ import subprocess
 from typing import Any
 from urllib.request import urlopen
 
-from ..config import load_config
+from sqlalchemy import select
+
+from ..config import Secrets, load_config
+from ..db.models import Heartbeat, utcnow
+from ..db.session import create_db_engine, make_session_factory
 
 
 def needs_restart(health: dict[str, Any], stale_seconds: float) -> bool:
@@ -32,10 +36,9 @@ def labels_to_restart(
     stale_seconds: float,
 ) -> set[str]:
     labels: set[str] = set()
-    if api_health is None:
+    if api_health is None or api_health.get("status") != "ok":
         labels.add("com.trading.app")
-    effective = api_health if api_health is not None else database_health
-    if needs_restart(effective, stale_seconds):
+    if needs_restart(database_health, stale_seconds):
         labels.add("com.trading.daemon")
     return labels
 
@@ -45,18 +48,19 @@ def fetch_health(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
         return json.loads(response.read())
 
 
-def read_database_health() -> dict[str, Any]:
-    from sqlalchemy import select
-
-    from ..config import Secrets
-    from ..db.models import Heartbeat, utcnow
-    from ..db.session import create_db_engine, make_session_factory
-
+def read_database_health(
+    database_url: str | None = None,
+) -> dict[str, Any]:
     try:
-        factory = make_session_factory(create_db_engine(Secrets().database_url))
+        factory = make_session_factory(
+            create_db_engine(database_url or Secrets().database_url)
+        )
         with factory() as session:
             last = session.execute(
-                select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
+                select(Heartbeat)
+                .where(Heartbeat.source == "daemon")
+                .order_by(Heartbeat.id.desc())
+                .limit(1)
             ).scalar_one_or_none()
         age = (utcnow() - last.at).total_seconds() if last is not None else None
         return {"db_ok": True, "heartbeat_age_seconds": age}
@@ -71,7 +75,10 @@ def restart_launch_agent(label: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--health-url", default="http://127.0.0.1:8000/health")
+    parser.add_argument(
+        "--health-url",
+        default="http://127.0.0.1:8000/health/live",
+    )
     parser.add_argument("--label", default="com.trading.daemon")
     parser.add_argument("--request-timeout", type=float, default=5.0)
     args = parser.parse_args(argv)

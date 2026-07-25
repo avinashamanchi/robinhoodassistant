@@ -104,12 +104,12 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
 
 emit com.trading.app "$PY" -m uvicorn trading_assistant.app.main:create_app --factory --host 127.0.0.1 --port 8000
 emit com.trading.daemon "$PY" -m trading_assistant.daemon.main
-emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
+emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog --health-url http://127.0.0.1:8000/health/live
 emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/backups" --retention-days 14
 
 sleep 6
 echo "=== status ==="
 launchctl list | grep com.trading || true
 echo "=== health ==="
-curl -s http://127.0.0.1:8000/health || echo "(app not answering yet — check logs/com.trading.app.launchd.log)"
+curl -s http://127.0.0.1:8000/health/live || echo "(app not answering yet — check logs/com.trading.app.launchd.log)"
 echo

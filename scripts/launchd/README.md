@@ -33,7 +33,7 @@ DB resolve correctly.
 
 ```bash
 launchctl list | grep com.trading                 # status + pid
-curl -s http://127.0.0.1:8000/health              # liveness
+curl -s http://127.0.0.1:8000/health/live         # anonymous app liveness only
 tail -f logs/com.trading.{app,daemon}.launchd.log # logs
 
 # stop/start one until next login (bootout) then reload

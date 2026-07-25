@@ -681,7 +681,7 @@ class TradingService:
             s.commit()
 
     def health(self) -> dict[str, Any]:
-        """Liveness for GET /health (no auth): heartbeat age, DB ok, kill switches."""
+        """Authenticated operational health: heartbeat, DB, and kill switches."""
         from sqlalchemy import select as _select
 
         from .db.models import Heartbeat

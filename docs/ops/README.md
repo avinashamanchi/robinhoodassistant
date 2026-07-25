@@ -46,5 +46,7 @@ WantedBy=multi-user.target
 0 2 * * *  cd /home/you/trading-assistant && sqlite3 trading_assistant.db ".backup backups/ta-$(date +\%F).db" && find backups -name 'ta-*.db' -mtime +14 -delete
 ```
 
-A watchdog can `curl -fs http://127.0.0.1:8000/health` and alert if `daemon_alive`
-is false or `heartbeat_age_seconds` is large.
+The watchdog probes anonymous app liveness at
+`http://127.0.0.1:8000/health/live`. It reads the persisted daemon heartbeat
+directly from the local database; app liveness is never treated as proof that
+the daemon is alive.

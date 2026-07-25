@@ -27,7 +27,7 @@ echo $! > logs/daemon.pid
 
 sleep 4
 echo "== health =="
-curl -s http://127.0.0.1:8000/health || echo "(app still warming up — check logs/app.log)"
+curl -s http://127.0.0.1:8000/health/live || echo "(app still warming up — check logs/app.log)"
 echo
 echo "Open  : http://127.0.0.1:8000"
 echo "Token : run  grep APP_API_TOKEN .env   and paste the value when the page asks"
