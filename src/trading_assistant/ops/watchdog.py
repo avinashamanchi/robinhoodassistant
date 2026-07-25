@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+from numbers import Number
 import subprocess
 from typing import Any
 from urllib.request import urlopen
@@ -17,16 +19,17 @@ from ..db.session import create_db_engine, make_session_factory
 
 
 def needs_restart(health: dict[str, Any], stale_seconds: float) -> bool:
-    """Return whether health proves the daemon is missing or stale."""
+    """Return false only for a finite age in the inclusive fresh interval."""
     if not health.get("db_ok", False):
         return True
     age = health.get("heartbeat_age_seconds")
-    if age is None:
+    if isinstance(age, bool) or not isinstance(age, Number):
         return True
     try:
-        return float(age) > stale_seconds
-    except (TypeError, ValueError):
+        numeric_age = float(age)
+    except (TypeError, ValueError, OverflowError):
         return True
+    return not (math.isfinite(numeric_age) and 0 <= numeric_age <= stale_seconds)
 
 
 def labels_to_restart(

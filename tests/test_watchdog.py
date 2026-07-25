@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from trading_assistant.db.models import Heartbeat, utcnow
 from trading_assistant.ops import watchdog
@@ -27,6 +30,74 @@ def test_watchdog_restarts_only_when_health_is_stale_or_broken():
     assert needs_restart(
         {"db_ok": False, "heartbeat_age_seconds": 1}, stale_seconds=180
     ) is True
+
+
+@pytest.mark.parametrize(
+    "age",
+    [
+        -0.001,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        False,
+        "0",
+        "10.5",
+        [],
+        {},
+    ],
+)
+def test_watchdog_rejects_non_finite_negative_bool_and_malformed_ages(age):
+    assert needs_restart(
+        {"db_ok": True, "heartbeat_age_seconds": age},
+        stale_seconds=180,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "age",
+    [
+        0,
+        180,
+        Decimal("0"),
+        Decimal("180"),
+    ],
+)
+def test_watchdog_freshness_boundary_is_inclusive(age):
+    assert needs_restart(
+        {"db_ok": True, "heartbeat_age_seconds": age},
+        stale_seconds=180,
+    ) is False
+
+
+def test_watchdog_restarts_immediately_above_inclusive_boundary():
+    assert needs_restart(
+        {"db_ok": True, "heartbeat_age_seconds": 180.000001},
+        stale_seconds=180,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "age",
+    [
+        -1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        "30",
+        object(),
+    ],
+)
+def test_invalid_age_restarts_only_daemon_when_api_is_live(age):
+    assert labels_to_restart(
+        api_health={"status": "ok"},
+        database_health={
+            "db_ok": True,
+            "heartbeat_age_seconds": age,
+        },
+        stale_seconds=180,
+    ) == {"com.trading.daemon"}
 
 
 def test_healthy_api_and_fresh_daemon_restart_nothing():
@@ -95,6 +166,31 @@ def test_database_health_reads_persisted_daemon_heartbeat(
     assert stale["heartbeat_age_seconds"] >= 299
 
 
+def test_future_database_heartbeat_restarts_only_daemon(
+    make_service,
+    db_url,
+):
+    service = make_service()
+    with service.session_factory() as session:
+        session.add(
+            Heartbeat(
+                source="daemon",
+                at=utcnow() + timedelta(seconds=60),
+            )
+        )
+        session.commit()
+
+    health = read_database_health(db_url)
+
+    assert health["db_ok"] is True
+    assert health["heartbeat_age_seconds"] < 0
+    assert labels_to_restart(
+        api_health={"status": "ok"},
+        database_health=health,
+        stale_seconds=180,
+    ) == {"com.trading.daemon"}
+
+
 def test_database_health_failure_is_fixed_and_sanitized(monkeypatch):
     marker = "database-watchdog-secret"
 
@@ -115,6 +211,34 @@ def test_database_health_failure_is_fixed_and_sanitized(monkeypatch):
         "heartbeat_age_seconds": None,
     }
     assert marker not in str(health)
+
+
+def test_database_timestamp_subtraction_failure_is_fixed_and_sanitized(
+    make_service,
+    db_url,
+    monkeypatch,
+    capsys,
+):
+    service = make_service()
+    service.write_heartbeat("daemon")
+    marker = "heartbeat-subtraction-secret"
+
+    class BrokenNow:
+        def __sub__(self, other):
+            raise RuntimeError(marker)
+
+    monkeypatch.setattr(watchdog, "utcnow", lambda: BrokenNow())
+
+    health = read_database_health(db_url)
+
+    assert health == {
+        "db_ok": False,
+        "heartbeat_age_seconds": None,
+    }
+    assert marker not in str(health)
+    captured = capsys.readouterr()
+    assert marker not in captured.out
+    assert marker not in captured.err
 
 
 def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
@@ -144,6 +268,46 @@ def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
     assert watchdog.main([]) == 0
     assert observed_urls == ["http://127.0.0.1:8000/health/live"]
     assert restarted == []
+
+
+@pytest.mark.parametrize(
+    "age",
+    [
+        -1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        "20",
+        {"corrupt": "value"},
+    ],
+)
+def test_main_invalid_database_age_restarts_daemon_only(
+    monkeypatch,
+    age,
+):
+    restarted: list[str] = []
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda: {
+            "db_ok": True,
+            "heartbeat_age_seconds": age,
+        },
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "restart_launch_agent",
+        restarted.append,
+    )
+
+    assert watchdog.main([]) == 1
+    assert restarted == ["com.trading.daemon"]
 
 
 def test_main_healthy_api_and_stale_daemon_restarts_daemon_only(
