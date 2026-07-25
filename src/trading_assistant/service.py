@@ -84,6 +84,10 @@ _RESUMABLE_RULE_STATES = ("active", "processing")
 log = logging.getLogger(__name__)
 
 
+class RequiredDependencyUnavailable(RuntimeError):
+    """A required provider or health input could not be collected safely."""
+
+
 def _require_mutation_context(
     actor: str,
     reason: str,
@@ -165,6 +169,33 @@ class TradingService:
         self.rule_application = RuleApplicationService(
             self, self.rule_repository
         )
+
+    def _audit_dependency_failure(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        action: str,
+        target_type: str,
+        target_id: str,
+        detail: dict[str, object],
+    ) -> None:
+        """Persist exact failed-mutation provenance without provider detail."""
+        with self.session_factory() as session:
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action=action,
+                    target_type=target_type,
+                    target_id=target_id,
+                    request_id=request_id,
+                    reason=reason,
+                    result_code="dependency_unavailable",
+                    detail_json=json.dumps(detail, sort_keys=True),
+                )
+            )
+            session.commit()
 
     # ── asset-class routing helpers ────────────────────────────
     @staticmethod
@@ -453,12 +484,24 @@ class TradingService:
                 "error": "proposal expired",
             }
 
-        result = self.order_submission.submit(
-            order_id,
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
+        try:
+            result = self.order_submission.submit(
+                order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+        except Exception:
+            self._audit_dependency_failure(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.submit",
+                target_type="order",
+                target_id=str(order_id),
+                detail={"stage": "execution_health"},
+            )
+            raise RequiredDependencyUnavailable from None
         return {
             "order_id": order_id,
             "status": result.status.value,
@@ -525,6 +568,21 @@ class TradingService:
                         order_id=order.id,
                         ttl_minutes=ttl,
                         expires_at=utcnow() + timedelta(minutes=ttl),
+                    )
+                )
+                s.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="order.propose",
+                        target_type="order",
+                        target_id=str(order.id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code=OrderStatus.PROPOSED.value,
+                        detail_json=json.dumps(
+                            {"submission_kind": "bracket"},
+                            sort_keys=True,
+                        ),
                     )
                 )
                 s.commit()
@@ -738,7 +796,25 @@ class TradingService:
             raise RuntimeError(
                 f"no configured {ac.value} symbol for fresh breaker health"
             )
-        snapshot = self.snapshot_service.assemble_for_execution(probe_symbol)
+        try:
+            snapshot = self.snapshot_service.assemble_for_execution(
+                probe_symbol
+            )
+        except Exception:
+            self._audit_dependency_failure(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="circuit_breaker.reset",
+                target_type="circuit_breaker",
+                target_id=BreakerScope.loss(ac).key,
+                detail={
+                    "asset_class": ac.value,
+                    "expected_generation": expected_generation,
+                    "stage": "health_collection",
+                },
+            )
+            raise RequiredDependencyUnavailable from None
         prior_health = {
             "captured_at": snapshot.as_of.isoformat(),
             "daily_pnl_complete": snapshot.daily_pnl_complete,
@@ -795,13 +871,25 @@ class TradingService:
             reason,
             request_id,
         )
-        result = self.serialize_reconciliation_report(
-            self.reconciliation.reconcile(
+        try:
+            result = self.serialize_reconciliation_report(
+                self.reconciliation.reconcile(
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
+        except Exception:
+            self._audit_dependency_failure(
                 actor=actor,
                 reason=reason,
                 request_id=request_id,
+                action="orders.sync",
+                target_type="broker_orders",
+                target_id="all",
+                detail={"stage": "broker_order_sync"},
             )
-        )
+            raise RequiredDependencyUnavailable from None
         with self.session_factory() as session:
             session.add(
                 AuditEvent(
@@ -1040,10 +1128,22 @@ class TradingService:
         with self.submission_barrier.hold_writer():
             # Broker I/O is ordered by the process barrier but occurs before
             # any SQLite transaction is opened.
-            broker_pos = {
-                p.ticker.upper(): p.qty
-                for p in self.broker.get_positions()
-            }
+            try:
+                broker_pos = {
+                    p.ticker.upper(): p.qty
+                    for p in self.broker.get_positions()
+                }
+            except Exception:
+                self._audit_dependency_failure(
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="positions.reconcile",
+                    target_type="portfolio",
+                    target_id="all",
+                    detail={"stage": "broker_positions"},
+                )
+                raise RequiredDependencyUnavailable from None
             local: dict[str, Decimal] = {}
             with self.session_factory() as session:
                 for fill in session.execute(select(Fill)).scalars().all():

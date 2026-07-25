@@ -25,7 +25,7 @@ from ..config import Secrets, load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine, make_session_factory
 from ..orders.safety_state import enumerate_unsafe_local_state
-from ..service import TradingService
+from ..service import RequiredDependencyUnavailable, TradingService
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
 from .errors import ApiError
@@ -40,6 +40,17 @@ from .security import (
 )
 
 _STATIC = Path(__file__).parent / "static"
+_DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
+
+
+def _dependency_unavailable() -> ApiError:
+    return ApiError(
+        "dependency_unavailable",
+        503,
+        _DEPENDENCY_UNAVAILABLE_MESSAGE,
+    )
+
+
 def _panic_exception_receipt(service: TradingService) -> dict:
     local_state = enumerate_unsafe_local_state(
         service.session_factory
@@ -329,12 +340,15 @@ def create_app(
             raise ApiError(
                 "rate_limit_exceeded", 429, "Approval rate limit exceeded"
             )
-        result = service.approve_order(
-            order_id,
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
-        )
+        try:
+            result = service.approve_order(
+                order_id,
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
         if (
             result.get("error", "").startswith("order not in PROPOSED")
             or result.get("error") == "proposal expired"
@@ -382,7 +396,10 @@ def create_app(
     def positions(
         principal: SessionPrincipal = Depends(current_principal),
     ):
-        return {"positions": service.get_positions()}
+        try:
+            return {"positions": service.get_positions()}
+        except Exception:
+            raise _dependency_unavailable() from None
 
     @app.get("/log")
     def log(
@@ -412,6 +429,8 @@ def create_app(
                 409,
                 "Circuit-breaker state changed; refresh before resetting",
             ) from exc
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
 
     @app.post("/orders/{order_id}/cancel")
     def cancel_order(
@@ -442,11 +461,14 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
-        return service.reconcile_positions(
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
-        )
+        try:
+            return service.reconcile_positions(
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
 
     @app.post("/sync")
     def sync(
@@ -454,11 +476,14 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):  # pull fills/status from the broker (also runs each daemon loop)
-        return service.sync_open_orders(
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
-        )
+        try:
+            return service.sync_open_orders(
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
 
     @app.post("/panic")
     def panic(
@@ -606,17 +631,27 @@ def create_app(
         if screen_source is None:  # lazily build the live source on first call
             sec = _secrets_holder.get("s")
             if sec is None:
-                raise ApiError(
-                    "dependency_unavailable",
-                    503,
-                    "Screener source is unavailable",
-                )
+                raise _dependency_unavailable()
             from ..analyst.live_features import build_screen_source
 
-            screen_source = build_screen_source([s.upper() for s in universe], sec)
-        return screener.screen_source(
-            screen_source, [s.upper() for s in universe], spy_symbol="SPY", top_n=top_n,
-        )
+            try:
+                screen_source = build_screen_source(
+                    [s.upper() for s in universe],
+                    sec,
+                )
+            except Exception:
+                raise _dependency_unavailable() from None
+        try:
+            return screener.screen_source(
+                screen_source,
+                [s.upper() for s in universe],
+                spy_symbol="SPY",
+                top_n=top_n,
+            )
+        except ApiError:
+            raise
+        except Exception:
+            raise _dependency_unavailable() from None
 
     @app.post("/screen")
     def screen(
@@ -673,7 +708,10 @@ def create_app(
         principal: SessionPrincipal = Depends(current_principal),
     ):
         """Combined Alpaca + external holdings, labeled by source (read-only external)."""
-        return service.get_combined_holdings()
+        try:
+            return service.get_combined_holdings()
+        except Exception:
+            raise _dependency_unavailable() from None
 
     @app.get("/external/positions")
     def external_positions(

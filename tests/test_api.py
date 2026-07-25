@@ -91,6 +91,21 @@ def _unsafe_local_state(
     }
 
 
+def _assert_dependency_unavailable(response):
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "dependency_unavailable",
+            "message": "Required dependency is unavailable",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+
+
 def test_index_served(client):
     c, _, _ = client
     r = c.get("/")
@@ -263,6 +278,95 @@ def test_positions_and_log(client):
     assert len(log["risk_events"]) >= 1
 
 
+@pytest.mark.parametrize("path", ["/positions", "/holdings"])
+def test_required_broker_read_outage_returns_hardened_503(
+    make_service,
+    authenticate_client,
+    path,
+):
+    marker = "provider-secret-required-broker-read"
+
+    class BrokerReadOutage(MockBroker):
+        def get_positions(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=BrokerReadOutage())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(path)
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+
+
+def test_approval_health_outage_returns_audited_hardened_503(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "provider-secret-approval-health"
+
+    def fail_health(*args, **kwargs):
+        raise ConnectionError(marker)
+
+    monkeypatch.setattr(
+        service.order_submission.snapshot_service,
+        "assemble_for_execution",
+        fail_health,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "human reviewed before dependency outage"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    assert service.broker.submit_calls == 0
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        failure = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert (
+        failure.actor,
+        failure.reason,
+        failure.result_code,
+        failure.target_id,
+    ) == (
+        "operator:local",
+        "human reviewed before dependency outage",
+        "dependency_unavailable",
+        str(order_id),
+    )
+    assert marker not in failure.detail_json
+    assert "ConnectionError" not in failure.detail_json
+
+
 def test_killswitch_reset_endpoint(client):
     c, svc, _ = client
     observed = svc.breakers.trip(
@@ -343,6 +447,120 @@ def test_killswitch_reset_returns_conflict_for_stale_generation(client):
     assert svc.breakers.is_tripped(
         BreakerScope.loss(AssetClass.EQUITY)
     ) is True
+
+
+def test_killswitch_reset_dependency_outage_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="dependency outage setup",
+        actor="daemon:test",
+        request_id="dependency-reset-setup",
+    )
+    marker = "provider-secret-reset-health"
+
+    def fail_health(*args, **kwargs):
+        raise ConnectionError(marker)
+
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_execution",
+        fail_health,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "verify dependency health before reset",
+            "expected_generation": observed.generation,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    assert service.breakers.is_tripped(
+        BreakerScope.loss(AssetClass.EQUITY)
+    ) is True
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "verify dependency health before reset",
+        "dependency_unavailable",
+        BreakerScope.loss(AssetClass.EQUITY).key,
+    )
+    assert marker not in audit.detail_json
+    assert "ConnectionError" not in audit.detail_json
+
+
+def test_unexpected_mutation_exception_remains_hardened_internal_error(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    marker = "unexpected-internal-secret"
+
+    def fail_reset(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(service, "reset_killswitch", fail_reset)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "unexpected failure classification probe",
+            "expected_generation": 1,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_panic_endpoint_supplies_actor_and_requires_reason(client):
@@ -716,6 +934,56 @@ def test_reconcile_requires_reason_and_audits_operator_identity(client):
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
+def test_reconcile_dependency_outage_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+):
+    marker = "provider-secret-position-reconciliation"
+
+    class PositionOutageBroker(MockBroker):
+        def get_positions(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=PositionOutageBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/reconcile",
+        json={"reason": "verify broker positions after outage"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="positions.reconcile",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "verify broker positions after outage",
+        "dependency_unavailable",
+        "all",
+    )
+    assert marker not in audit.detail_json
+    assert "ConnectionError" not in audit.detail_json
+
+
 def test_sync_requires_reason_and_audits_operator_identity(client):
     c, svc, _ = client
 
@@ -737,6 +1005,61 @@ def test_sync_requires_reason_and_audits_operator_identity(client):
     assert audit.actor == "operator:local"
     assert audit.reason == "manual broker status refresh"
     assert audit.request_id == response.headers["X-Request-ID"]
+
+
+def test_sync_dependency_outage_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    marker = "provider-secret-order-sync"
+
+    def fail_sync(*args, **kwargs):
+        raise ConnectionError(marker)
+
+    monkeypatch.setattr(
+        service.reconciliation,
+        "reconcile",
+        fail_sync,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "manual sync dependency probe"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        audit.reason,
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "manual sync dependency probe",
+        "dependency_unavailable",
+        "all",
+    )
+    assert marker not in audit.detail_json
+    assert "ConnectionError" not in audit.detail_json
 
 
 def test_sync_sanitizes_provider_integrity_text_everywhere(

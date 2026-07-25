@@ -9,7 +9,7 @@ from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from trading_assistant.analyst.accuracy import analyst_accuracy
 from trading_assistant.analyst.analyst import Analyst
@@ -25,7 +25,15 @@ from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.llm_runner import LLMRunConfig
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import Order, Rule, ShadowCall, TradePlanRow, utcnow
+from trading_assistant.db.models import (
+    AuditEvent,
+    Order,
+    Proposal,
+    Rule,
+    ShadowCall,
+    TradePlanRow,
+    utcnow,
+)
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -241,6 +249,175 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
     assert result["executed"] is False
     assert result["status"] == "acceptance_unknown"
     assert len(broker._orders_by_key) == 1
+
+
+def test_bracket_proposal_audit_is_exact_and_idempotent(make_service):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="audited-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+    context = {
+        "actor": "operator:bracket-review",
+        "reason": "approved bracket after human review",
+        "request_id": "bracket-proposal-audit",
+    }
+
+    first = service.submit_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        **context,
+    )
+    replay = service.submit_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor=context["actor"],
+        reason="retry after confirmed response",
+        request_id="bracket-proposal-retry",
+    )
+
+    assert first["status"] == "submitted"
+    assert replay["status"] == "submitted"
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        order = session.scalar(
+            select(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        )
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.target_id == str(order.id),
+            )
+        ).all()
+        proposals = session.scalars(
+            select(Proposal).where(Proposal.order_id == order.id)
+        ).all()
+    assert len(audits) == 1
+    assert len(proposals) == 1
+    assert (
+        audits[0].actor,
+        audits[0].reason,
+        audits[0].request_id,
+        audits[0].result_code,
+    ) == (
+        context["actor"],
+        context["reason"],
+        context["request_id"],
+        "proposed",
+    )
+    assert order.approval_actor == context["actor"]
+
+
+def test_bracket_proposal_audit_failure_rolls_back_and_retry_is_safe(
+    make_service,
+):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="rollback-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    def fail_proposal_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "order.propose"
+            for row in session.new
+        ):
+            raise RuntimeError("injected bracket proposal audit failure")
+
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", fail_proposal_audit)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected bracket proposal audit failure",
+        ):
+            service.submit_bracket_order(
+                request,
+                Decimal("110"),
+                Decimal("95"),
+                actor="operator:bracket-review",
+                reason="reviewed bracket rollback probe",
+                request_id="bracket-proposal-rollback",
+            )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_proposal_audit,
+        )
+
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(Proposal)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.request_id
+                == "bracket-proposal-rollback",
+            )
+        ) == 0
+    assert service.broker.submit_calls == 0
+    assert service.broker.brackets == []
+
+    result = service.submit_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:bracket-review",
+        reason="retry reviewed bracket after audit recovery",
+        request_id="bracket-proposal-retry-after-rollback",
+    )
+
+    assert result["status"] == "submitted"
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(Proposal)
+        ) == 1
+        retry_audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.request_id
+                == "bracket-proposal-retry-after-rollback",
+            )
+        ).all()
+    assert len(retry_audits) == 1
 
 
 def test_ladder_plan_still_uses_rules(make_service):

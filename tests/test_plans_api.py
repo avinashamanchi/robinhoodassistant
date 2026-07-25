@@ -162,10 +162,70 @@ def test_plan_cancel_missing_target_has_stable_error(client):
 
 def test_screen_endpoint(client):
     c, _ = client
-    rows = c.post("/screen").json()["candidates"]
+    response = c.post("/screen")
+    rows = response.json()["candidates"]
     # Universe is the allowlist; only AAPL/MSFT exist in the source.
     assert {r["symbol"] for r in rows} <= {"AAPL", "MSFT"}
     assert all("score" in r for r in rows)
+    assert response.headers["X-Request-ID"]
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/screen", None),
+        (
+            "/propose",
+            {
+                "n": 1,
+                "reason": "screen dependency outage probe",
+            },
+        ),
+    ],
+)
+def test_screen_dependency_outage_returns_hardened_503(
+    client,
+    authenticate_client,
+    monkeypatch,
+    path,
+    body,
+):
+    from trading_assistant.analyst import screener
+
+    authenticated, _ = client
+    marker = "provider-secret-screen-source"
+
+    def fail_screen(*args, **kwargs):
+        raise ConnectionError(marker)
+
+    monkeypatch.setattr(screener, "screen_source", fail_screen)
+    isolated, csrf = authenticate_client(
+        TestClient(
+            authenticated.app,
+            raise_server_exceptions=False,
+        ),
+        TOKEN,
+    )
+    response = isolated.post(
+        path,
+        json=body,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "dependency_unavailable",
+            "message": "Required dependency is unavailable",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
 
 
 def test_plans_ui_served(client):
