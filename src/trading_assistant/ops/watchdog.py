@@ -19,6 +19,7 @@ from ..db.models import Heartbeat, utcnow
 from ..db.session import create_db_engine, make_session_factory
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
+_LAUNCHCTL_TIMEOUT_SECONDS = 10.0
 _RESTART_ORDER = (
     ("app", "com.trading.app"),
     ("daemon", "com.trading.daemon"),
@@ -54,6 +55,17 @@ def _api_is_live(payload: object) -> bool:
     return type(payload) is dict and payload == {"status": "ok"}
 
 
+def _object_without_duplicate_members(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError("duplicate_json_member")
+        parsed[key] = value
+    return parsed
+
+
 def labels_to_restart(
     *,
     api_health: object,
@@ -79,8 +91,17 @@ def fetch_health(
     if len(body) > _MAX_LIVENESS_RESPONSE_BYTES:
         return None
     try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if text.startswith("\ufeff"):
+        return None
+    try:
+        payload = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicate_members,
+        )
+    except (ValueError, UnicodeError, RecursionError):
         return None
     return {"status": "ok"} if _api_is_live(payload) else None
 
@@ -107,7 +128,11 @@ def read_database_health(
 
 def restart_launch_agent(label: str) -> None:
     target = f"gui/{os.getuid()}/{label}"
-    subprocess.run(["launchctl", "kickstart", "-k", target], check=True)
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", target],
+        check=True,
+        timeout=_LAUNCHCTL_TIMEOUT_SECONDS,
+    )
 
 
 def restart_selected_components(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
@@ -357,6 +358,9 @@ def test_main_accepts_only_the_exact_liveness_json_contract(monkeypatch):
     assert restarted == []
 
 
+_EXACT_LIVENESS_JSON = '{"status":"ok"}'
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -369,6 +373,11 @@ def test_main_accepts_only_the_exact_liveness_json_contract(monkeypatch):
         b'{"status":true}',
         b'{"status":"OK"}',
         b'{"status":"ok","alive":true}',
+        _EXACT_LIVENESS_JSON.encode("utf-16"),
+        _EXACT_LIVENESS_JSON.encode("utf-32"),
+        b"\xef\xbb\xbf" + _EXACT_LIVENESS_JSON.encode("utf-8"),
+        b'{"status":"not-ok","status":"ok"}',
+        b'{"status":"ok","meta":{"key":1,"key":2}}',
         b"{",
         b"\xff",
     ],
@@ -421,6 +430,33 @@ def test_main_oversized_liveness_body_restarts_app_without_crashing(
 
     assert watchdog.main([]) == 1
     assert restarted == ["com.trading.app"]
+
+
+def test_fetch_health_decodes_text_and_rejects_nested_duplicate_members(
+    monkeypatch,
+):
+    observed: dict[str, object] = {}
+    original_loads = watchdog.json.loads
+    body = b'{"status":"ok","meta":{"key":1,"key":2}}'
+
+    def loads(value, **kwargs):
+        observed["value_type"] = type(value)
+        observed["object_pairs_hook"] = kwargs.get("object_pairs_hook")
+        return original_loads(value, **kwargs)
+
+    monkeypatch.setattr(watchdog.json, "loads", loads)
+    monkeypatch.setattr(
+        watchdog,
+        "urlopen",
+        lambda url, timeout: BytesIO(body),
+    )
+
+    assert watchdog.fetch_health("http://127.0.0.1/health/live") is None
+    assert observed["value_type"] is str
+    hook = observed["object_pairs_hook"]
+    assert callable(hook)
+    with pytest.raises(ValueError):
+        hook([("key", 1), ("key", 2)])
 
 
 @pytest.mark.parametrize(
@@ -597,13 +633,125 @@ def test_main_collects_both_restart_failures_without_duplicate_attempts(
     assert marker not in caplog.text
 
 
+def test_launchctl_timeout_on_app_still_attempts_daemon_once(
+    monkeypatch,
+    caplog,
+    capsys,
+):
+    marker = "launchctl-timeout-provider-secret"
+    calls: list[tuple[list[str], bool, float]] = []
+
+    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+    )
+    monkeypatch.setattr(watchdog.os, "getuid", lambda: 501)
+    monkeypatch.setattr(watchdog.log, "disabled", False)
+
+    def run(command, *, check, timeout):
+        calls.append((command, check, timeout))
+        if command[-1].endswith("com.trading.app"):
+            raise subprocess.TimeoutExpired(
+                cmd=["provider-command-secret", marker],
+                timeout=timeout,
+                output=marker,
+                stderr=marker,
+            )
+
+    monkeypatch.setattr(watchdog.subprocess, "run", run)
+
+    with caplog.at_level(logging.WARNING, logger=watchdog.__name__):
+        assert watchdog.main([]) == 1
+
+    assert [call[0][-1] for call in calls] == [
+        "gui/501/com.trading.app",
+        "gui/501/com.trading.daemon",
+    ]
+    assert all(
+        check is True and timeout == 10.0
+        for _command, check, timeout in calls
+    )
+    records = [
+        record
+        for record in caplog.records
+        if record.name == watchdog.__name__
+    ]
+    assert [record.getMessage() for record in records] == [
+        "watchdog_restart component=app result=failed",
+        "watchdog_restart component=daemon result=success",
+    ]
+    captured = capsys.readouterr()
+    exposed = f"{caplog.text} {captured.out} {captured.err}"
+    assert marker not in exposed
+    assert "provider-command-secret" not in exposed
+
+
+def test_both_launchctl_timeouts_are_collected_before_nonzero_return(
+    monkeypatch,
+    caplog,
+    capsys,
+):
+    marker = "launchctl-all-timeout-secret"
+    calls: list[tuple[list[str], bool, float]] = []
+
+    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda: {"db_ok": False, "heartbeat_age_seconds": None},
+    )
+    monkeypatch.setattr(watchdog.os, "getuid", lambda: 501)
+    monkeypatch.setattr(watchdog.log, "disabled", False)
+
+    def run(command, *, check, timeout):
+        calls.append((command, check, timeout))
+        raise subprocess.TimeoutExpired(
+            cmd=["provider-command-secret", marker],
+            timeout=timeout,
+            output=marker,
+            stderr=marker,
+        )
+
+    monkeypatch.setattr(watchdog.subprocess, "run", run)
+
+    with caplog.at_level(logging.WARNING, logger=watchdog.__name__):
+        assert watchdog.main([]) == 1
+
+    assert [call[0][-1] for call in calls] == [
+        "gui/501/com.trading.app",
+        "gui/501/com.trading.daemon",
+    ]
+    assert len(calls) == len({call[0][-1] for call in calls}) == 2
+    assert all(
+        check is True and timeout == 10.0
+        for _command, check, timeout in calls
+    )
+    records = [
+        record
+        for record in caplog.records
+        if record.name == watchdog.__name__
+    ]
+    assert [record.getMessage() for record in records] == [
+        "watchdog_restart component=app result=failed",
+        "watchdog_restart component=daemon result=failed",
+    ]
+    captured = capsys.readouterr()
+    exposed = f"{caplog.text} {captured.out} {captured.err}"
+    assert marker not in exposed
+    assert "provider-command-secret" not in exposed
+
+
 def test_launchctl_kickstart_command_targets_exact_agent(monkeypatch):
     calls = []
     monkeypatch.setattr(watchdog.os, "getuid", lambda: 501)
     monkeypatch.setattr(
         watchdog.subprocess,
         "run",
-        lambda command, check: calls.append((command, check)),
+        lambda command, check, timeout: calls.append(
+            (command, check, timeout)
+        ),
     )
 
     watchdog.restart_launch_agent("com.trading.daemon")
@@ -617,6 +765,7 @@ def test_launchctl_kickstart_command_targets_exact_agent(monkeypatch):
                 "gui/501/com.trading.daemon",
             ],
             True,
+            10.0,
         )
     ]
 
