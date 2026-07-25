@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from trading_assistant.daemon.monitor import Monitor
+from trading_assistant.db.models import AuditEvent
 from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
 
 
@@ -38,6 +39,14 @@ def test_trigger_creates_proposal_and_notifies(make_service):
     assert svc.broker.submit_calls == 0          # proposed, NOT executed
     assert len(notifier.sent) == 1
     assert len(svc.get_pending()) == 1
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="order.propose",
+            target_id=str(acted[0]["proposal"]["order_id"]),
+        ).one()
+    assert audit.actor == "daemon:rules"
+    assert audit.reason == "daemon conditional rule evaluation"
+    assert audit.request_id
 
 
 def test_rule_is_one_shot(make_service):
@@ -55,7 +64,7 @@ def test_monitor_tick_delegates_only_to_rule_worker(make_service):
     class StubWorker:
         calls = 0
 
-        def tick(self):
+        def tick(self, **context):
             self.calls += 1
             return sentinel
 
@@ -418,7 +427,11 @@ def test_daemon_loop_body_runs_clean(make_service):
         reason="monitor loop body setup",
         request_id="monitor-loop-body-sync",
     )
-    svc.enforce_daily_loss_limits()
+    svc.enforce_daily_loss_limits(
+        actor="daemon:test",
+        reason="monitor loop daily loss check",
+        request_id="monitor-loop-daily-loss",
+    )
     mon.tick()
     mon.run_daily_tasks()
     svc.write_heartbeat("daemon")
@@ -548,7 +561,7 @@ def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service
     assert rules_evaluated is False
     state = svc.breakers.get(BreakerScope.operator_global())
     assert state is not None and state.tripped is True
-    assert state.actor == "daemon:operations"
+    assert state.actor == "daemon:monitor"
 
 
 def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
@@ -568,4 +581,4 @@ def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
 
     state = svc.breakers.get(BreakerScope.operator_global())
     assert state is not None and state.tripped is True
-    assert state.actor == "daemon:operations"
+    assert state.actor == "daemon:startup"

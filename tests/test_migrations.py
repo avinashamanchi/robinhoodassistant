@@ -836,12 +836,20 @@ def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
         OrderRepository(factory),
     )
 
-    first = reconciliation.reconcile()
+    first = reconciliation.reconcile(
+        actor="test:migration",
+        reason="migration reconciliation",
+        request_id="migration-reconciliation",
+    )
     replay = ReconciliationService(
         factory,
         broker,
         OrderRepository(factory),
-    ).reconcile()
+    ).reconcile(
+        actor="test:migration",
+        reason="migration reconciliation replay",
+        request_id="migration-reconciliation-replay",
+    )
 
     assert first.inserted_fills == 0
     assert replay.inserted_fills == 0

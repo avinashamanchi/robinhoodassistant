@@ -91,7 +91,14 @@ def test_walk_forward_reports_vs_buy_and_hold(session_factory):
 def test_persist_report_writes_rows_and_audit(session_factory):
     source = DataSource({"AAPL": make_bars(550, seed=4)})
     report, guard = walk_forward(source, ["AAPL"], [SmaCrossover], holdout_months=12)
-    run_id = persist_report(session_factory, report, guard)
+    run_id = persist_report(
+        session_factory,
+        report,
+        guard,
+        actor="test:backtest",
+        reason="persist evaluation report",
+        request_id="backtest-evaluation-persist",
+    )
 
     with session_factory() as s:
         assert s.get(BacktestRun, run_id) is not None

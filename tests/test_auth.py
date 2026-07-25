@@ -46,7 +46,11 @@ def fake_now():
 
 @pytest.fixture
 def session_auth(session_factory, fake_now):
-    return SessionAuth(session_factory, now=fake_now)
+    return SessionAuth(
+        session_factory,
+        application_secret=TOKEN,
+        now=fake_now,
+    )
 
 
 @pytest.fixture
@@ -129,7 +133,7 @@ def test_session_tokens_and_csrf_are_only_persisted_as_hashes(
 
     with session_factory() as session:
         row = session.query(AuthSession).one()
-        assert row.token_hash == hashlib.sha256(
+        assert row.token_hash != hashlib.sha256(
             issued.token.encode("utf-8")
         ).hexdigest()
         assert row.csrf_hash == hashlib.sha256(
@@ -202,6 +206,63 @@ def test_session_endpoint_is_non_mutating_and_multi_tab_safe(client):
     )
 
 
+def test_session_and_csrf_share_versioned_secret_lifecycle_across_restarts(
+    make_service,
+):
+    service = make_service()
+    first_app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    first = TestClient(first_app)
+    login = first.post("/auth/login", json={"secret": TOKEN})
+    token = first.cookies.get("trading_session")
+    csrf = login.json()["csrf_token"]
+
+    same_key_app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    same_key = TestClient(same_key_app)
+    same_key.cookies.set("trading_session", token)
+
+    assert same_key.get("/positions").status_code == 200
+    assert same_key.get("/auth/session").json()["csrf_token"] == csrf
+    assert (
+        same_key.post(
+            "/chat",
+            json={"message": "same-key restart"},
+            headers={"X-CSRF-Token": csrf},
+        ).status_code
+        == 200
+    )
+
+    rotated_app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="rotated-task-7-operator-secret",
+        planning=None,
+    )
+    rotated = TestClient(rotated_app)
+    rotated.cookies.set("trading_session", token)
+
+    for response in (
+        rotated.get("/positions"),
+        rotated.get("/auth/session"),
+        rotated.post(
+            "/chat",
+            json={"message": "rotated key"},
+            headers={"X-CSRF-Token": csrf},
+        ),
+    ):
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_session"
+
+
 def test_tls_cookie_uses_host_prefix_and_secure_flag(make_service):
     service = make_service()
     service.config = service.config.model_copy(
@@ -246,6 +307,7 @@ def test_mutation_requires_csrf(authenticated_client):
         BreakerScope.loss(AssetClass.EQUITY),
         reason="drill",
         actor="daemon:test",
+        request_id="auth-killswitch-drill",
     )
     body = {
         "asset_class": "equity",
@@ -272,11 +334,14 @@ def test_mutation_requires_csrf(authenticated_client):
         ("/reject/999", None),
         ("/orders/999/cancel", None),
         ("/sync", None),
-        ("/analyze", {"symbol": "AAPL"}),
+        ("/analyze", {"symbol": "AAPL", "reason": "review analysis"}),
         ("/plans/999/cancel", None),
         ("/screen", None),
-        ("/propose", {"n": 1}),
-        ("/backtests/run", {"symbols": []}),
+        ("/propose", {"n": 1, "reason": "review candidates"}),
+        (
+            "/backtests/run",
+            {"symbols": [], "reason": "review strategies"},
+        ),
     ],
 )
 def test_each_non_login_mutation_rejects_missing_csrf(

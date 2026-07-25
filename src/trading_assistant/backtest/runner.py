@@ -7,9 +7,11 @@ everything downstream (engine, metrics, holdout, persistence) is identical.
 
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from ..config import BacktestConfig
+from ..db.models import AuditEvent
 from .data import DataSource
 from .evaluate import persist_report, walk_forward
 from .report import EvaluationReport
@@ -45,20 +47,60 @@ def run_synthetic_backtest(
     session_factory,
     symbols: Optional[list[str]] = None,
     *,
+    actor: str,
+    reason: str,
+    request_id: str,
     bars: int = 650,
     holdout_months: int = 12,
     label: str = "synthetic walk-forward",
 ) -> tuple[int, EvaluationReport]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "backtest actor, reason, and request_id must be non-empty"
+        )
     symbols = symbols or DEFAULT_SYMBOLS
-    source = build_synthetic_source(symbols, bars)
-    report, guard = walk_forward(
-        source,
-        symbols,
-        STRATEGIES,
-        backtest_config=BacktestConfig(),
-        holdout_months=holdout_months,
-        spy_symbol="SPY",
-        label=label,
-    )
-    run_id = persist_report(session_factory, report, guard)
-    return run_id, report
+    try:
+        source = build_synthetic_source(symbols, bars)
+        report, guard = walk_forward(
+            source,
+            symbols,
+            STRATEGIES,
+            backtest_config=BacktestConfig(),
+            holdout_months=holdout_months,
+            spy_symbol="SPY",
+            label=label,
+        )
+        run_id = persist_report(
+            session_factory,
+            report,
+            guard,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        return run_id, report
+    except Exception:
+        with session_factory() as session:
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="backtest.run",
+                    target_type="backtest_run",
+                    target_id="unpersisted",
+                    request_id=request_id,
+                    reason=reason,
+                    result_code="failed",
+                    detail_json=json.dumps(
+                        {
+                            "stage": "launch",
+                            "symbol_count": len(symbols),
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            )
+            session.commit()
+        raise

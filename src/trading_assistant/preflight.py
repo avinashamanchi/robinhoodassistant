@@ -25,12 +25,17 @@ class Result:
     detail: str = ""
 
 
+def _safe_exception_code(exc: Exception) -> str:
+    """Return diagnostic shape without exposing untrusted exception text."""
+    return type(exc).__name__
+
+
 def _config_parses() -> Result:
     try:
         load_config("config.yaml")
         return Result("config.yaml parses (extra=forbid)", PASS)
     except Exception as e:
-        return Result("config.yaml parses", FAIL, f"{type(e).__name__}: {e}")
+        return Result("config.yaml parses", FAIL, _safe_exception_code(e))
 
 
 def _env_present(secrets: Secrets) -> Result:
@@ -66,7 +71,7 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
         data = Result("data reachable (AAPL quote)", PASS, f"last={q.last}")
         return auth, clk, data
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = _safe_exception_code(e)
         return (Result("Alpaca paper auth", FAIL, err),
                 Result("market clock reachable", FAIL, err),
                 Result("data reachable", FAIL, err))
@@ -97,7 +102,7 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
                     "all clear" if not tripped else f"TRIPPED: {tripped} (reset before trading)")
         return wal, ks
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = _safe_exception_code(e)
         return Result("DB WAL mode", FAIL, err), Result("kill switches", FAIL, err)
 
 
@@ -134,7 +139,7 @@ def _reconciliation(service) -> Result:
         )
     except Exception as e:
         return Result(
-            "broker/local reconciliation", FAIL, f"{type(e).__name__}: {e}"
+            "broker/local reconciliation", FAIL, _safe_exception_code(e)
         )
 
 
@@ -166,7 +171,7 @@ def _llm(config, secrets: Secrets) -> Result:
         text = "".join(getattr(b, "text", "") for b in getattr(resp, "content", []))
         return Result(f"LLM ping ({config.llm.provider}->{config.llm.fallback_provider})", PASS, text.strip()[:20])
     except Exception as e:
-        return Result("LLM provider ping", FAIL, f"{type(e).__name__}: {e}")
+        return Result("LLM provider ping", FAIL, _safe_exception_code(e))
 
 
 def _robinhood(config, secrets: Secrets) -> Result:
@@ -179,7 +184,7 @@ def _robinhood(config, secrets: Secrets) -> Result:
         RobinhoodSource(secrets.rh_username, secrets.rh_password, secrets.rh_totp_secret, rh.token_path).get_account_summary()
         return Result("Robinhood (read-only) login", PASS)
     except Exception as e:
-        return Result("Robinhood login", FAIL, f"{type(e).__name__}")
+        return Result("Robinhood login", FAIL, _safe_exception_code(e))
 
 
 def _telegram(config, secrets: Secrets) -> Result:

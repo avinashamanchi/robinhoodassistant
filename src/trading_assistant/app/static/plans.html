@@ -104,15 +104,19 @@
     }
     async function analyze() {
       const sym = $("sym").value.trim().toUpperCase(); if (!sym) return;
+      const reason = (window.prompt("Reason for analyzing this symbol:") || "").trim();
+      if (!reason) { notify("A non-empty analysis reason is required.", "err"); return; }
       const box = $("detail"); clear(box); box.appendChild(el("div", "Analyzing " + sym + "…", "empty"));
-      const res = await api("/analyze", jsonPost({ symbol: sym }));
+      const res = await api("/analyze", jsonPost({ symbol: sym, reason }));
       if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
       await refresh(); showPlan(res.plan_id);
     }
     async function propose() {
+      const reason = (window.prompt("Reason for generating screened plans:") || "").trim();
+      if (!reason) { notify("A non-empty proposal reason is required.", "err"); return; }
       const box = $("detail"); clear(box);
       box.appendChild(el("div", "Screening + analyzing top names (analyst v2 is UNPROVEN — review each)…", "empty"));
-      const res = await api("/propose", jsonPost({ n: 3 }));
+      const res = await api("/propose", jsonPost({ n: 3, reason }));
       if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
       await refresh();
       clear(box);

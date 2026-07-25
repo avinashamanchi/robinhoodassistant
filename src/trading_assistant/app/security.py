@@ -75,7 +75,8 @@ def rate_limit_key(request: Request, principal: SessionPrincipal) -> str:
 
 
 def _error_response(request: Request, error: ApiError) -> JSONResponse:
-    request_id = getattr(request.state, "request_id", uuid4().hex)
+    request_id = getattr(request.state, "request_id", None) or uuid4().hex
+    request.state.request_id = request_id
     content = {
         "error": {
             "code": error.code,
@@ -85,10 +86,24 @@ def _error_response(request: Request, error: ApiError) -> JSONResponse:
     }
     if error.receipt is not None:
         content["receipt"] = error.receipt
-    return JSONResponse(
+    response = JSONResponse(
         status_code=error.status_code,
         content=content,
     )
+    return _harden_response(request, response)
+
+
+def _harden_response(request: Request, response):
+    request_id = getattr(request.state, "request_id", None) or uuid4().hex
+    request.state.request_id = request_id
+    for key, value in SECURITY_HEADERS.items():
+        response.headers[key] = value
+    response.headers["X-Request-ID"] = request_id
+    if request.url.path != "/health/live":
+        response.headers["Cache-Control"] = "no-store"
+    elif "Cache-Control" in response.headers:
+        del response.headers["Cache-Control"]
+    return response
 
 
 def install_security(app: FastAPI) -> None:
@@ -144,9 +159,4 @@ def install_security(app: FastAPI) -> None:
                     "CORS preflight was rejected",
                 ),
             )
-        for key, value in SECURITY_HEADERS.items():
-            response.headers[key] = value
-        response.headers["X-Request-ID"] = request.state.request_id
-        if request.url.path != "/health/live":
-            response.headers["Cache-Control"] = "no-store"
-        return response
+        return _harden_response(request, response)

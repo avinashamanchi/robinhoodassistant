@@ -453,7 +453,12 @@ class TradingService:
                 "error": "proposal expired",
             }
 
-        result = self.order_submission.submit(order_id)
+        result = self.order_submission.submit(
+            order_id,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         return {
             "order_id": order_id,
             "status": result.status.value,
@@ -540,7 +545,12 @@ class TradingService:
                 )
             )
             current_status = approval.status
-        result = self.order_submission.submit(order_id)
+        result = self.order_submission.submit(
+            order_id,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         return {
             "executed": result.status
             in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
@@ -670,12 +680,23 @@ class TradingService:
             "message": report.message,
         }
 
-    def trip_all_killswitches(self, reason: str) -> None:
+    def trip_all_killswitches(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
         """Fail closed across asset classes for an operational safety fault."""
+        actor, reason, request_id = _require_mutation_context(
+            actor, reason, request_id
+        )
         self.breakers.trip(
             BreakerScope.operator_global(),
             reason,
-            "daemon:operations",
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
         )
 
     def reset_killswitch(
@@ -772,7 +793,11 @@ class TradingService:
             request_id,
         )
         result = self.serialize_reconciliation_report(
-            self.reconciliation.reconcile()
+            self.reconciliation.reconcile(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
         )
         with self.session_factory() as session:
             session.add(
@@ -888,7 +913,7 @@ class TradingService:
             try:
                 broker_result = self.broker.get_order_status(broker_order_id)
             except Exception as status_error:
-                reason = (
+                fault_reason = (
                     f"indeterminate broker cancellation for order {order_id}: "
                     f"cancel raised {type(cancel_error).__name__}; "
                     f"status lookup raised {type(status_error).__name__}"
@@ -909,9 +934,11 @@ class TradingService:
                     trip_in_session(
                         session,
                         BreakerScope.broker_drift(),
-                        reason,
-                        "service:cancel",
+                        fault_reason,
+                        actor,
                         now=now,
+                        request_id=request_id,
+                        audit_reason=reason,
                     )
                     session.commit()
                 return {
@@ -1024,6 +1051,7 @@ class TradingService:
                         f"position reconciliation drift: {drift_detail}",
                         actor,
                         request_id=request_id,
+                        audit_reason=reason,
                     )
                 session.add(
                     AuditEvent(
@@ -1045,8 +1073,17 @@ class TradingService:
                 session.commit()
             return {"reconciled": not drift, "drift": drift}
 
-    def enforce_daily_loss_limits(self) -> dict[str, bool]:
+    def enforce_daily_loss_limits(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, bool]:
         """Trip each asset class's kill switch if its realized daily loss breached."""
+        actor, reason, request_id = _require_mutation_context(
+            actor, reason, request_id
+        )
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
                 realized = {
@@ -1071,7 +1108,9 @@ class TradingService:
                                 f"daily realized loss {pnl} breached limit "
                                 f"-{limit}"
                             ),
-                            "daemon:daily-loss",
+                            actor,
+                            request_id=request_id,
+                            audit_reason=reason,
                         )
                         result[asset_class.value] = True
                     else:

@@ -65,7 +65,11 @@ class Monitor:
 
     # ── one evaluation pass (synchronous, testable) ────────────
     def tick(self):
-        return self.rule_worker.tick()
+        return self.rule_worker.tick(
+            actor="daemon:rules",
+            reason="daemon conditional rule evaluation",
+            request_id=uuid4().hex,
+        )
 
     def run_daily_tasks(self, today=None) -> dict[str, Any]:
         """Once per day: grade matured shadow calls, run a fresh shadow batch, and
@@ -125,20 +129,31 @@ class Monitor:
         return summary
 
     def _core_cycle(self) -> None:
+        request_id = uuid4().hex
         order_sync = self.service.sync_open_orders(
             actor="daemon:monitor",
             reason="daemon runtime broker order reconciliation",
-            request_id=uuid4().hex,
+            request_id=request_id,
         )
         if order_sync.get("failed", 0):
             self.service.trip_all_killswitches(
-                "runtime broker order reconciliation failed"
+                actor="daemon:monitor",
+                reason="runtime broker order reconciliation failed",
+                request_id=request_id,
             )
             raise RuntimeError(
                 "runtime broker order reconciliation failed; kill switches tripped"
             )
-        self.service.enforce_daily_loss_limits()
-        self.tick()
+        self.service.enforce_daily_loss_limits(
+            actor="daemon:monitor",
+            reason="daemon scheduled daily loss enforcement",
+            request_id=request_id,
+        )
+        self.rule_worker.tick(
+            actor="daemon:monitor",
+            reason="daemon conditional rule evaluation",
+            request_id=request_id,
+        )
 
     async def _bounded_core_cycle(self) -> None:
         """Run one safety cycle without ever blocking the asyncio event loop.
@@ -197,7 +212,11 @@ class Monitor:
             startup["order_sync"].get("failed", 0)
             or not startup["position_reconciliation"].get("reconciled", False)
         ):
-            self.service.trip_all_killswitches("startup reconciliation failed")
+            self.service.trip_all_killswitches(
+                actor="daemon:startup",
+                reason="startup reconciliation failed",
+                request_id=uuid4().hex,
+            )
             raise RuntimeError("startup reconciliation failed; kill switches tripped")
         attempt = 0
         while not (stop_event and stop_event.is_set()):

@@ -41,7 +41,13 @@ def test_broker_symbol_equivalence_is_directional_from_local_canonical_form():
 def test_kill_switches_trip_independently(engine):
     f = make_session_factory(engine)
     with f() as s:
-        KillSwitch.trip(s, reason="equity loss", asset_class=EQ)
+        KillSwitch.trip(
+            s,
+            reason="equity loss",
+            asset_class=EQ,
+            actor="test:asset-class",
+            request_id="asset-equity-loss",
+        )
         s.commit()
     with f() as s:
         assert KillSwitch.is_tripped(s, EQ) is True
@@ -51,7 +57,13 @@ def test_kill_switches_trip_independently(engine):
 def test_crypto_trip_does_not_touch_equity(engine):
     f = make_session_factory(engine)
     with f() as s:
-        KillSwitch.trip(s, reason="crypto dump", asset_class=CR)
+        KillSwitch.trip(
+            s,
+            reason="crypto dump",
+            asset_class=CR,
+            actor="test:asset-class",
+            request_id="asset-crypto-loss",
+        )
         s.commit()
     with f() as s:
         assert KillSwitch.is_tripped(s, CR) is True
@@ -61,11 +73,28 @@ def test_crypto_trip_does_not_touch_equity(engine):
 def test_reset_is_per_class(engine):
     f = make_session_factory(engine)
     with f() as s:
-        KillSwitch.trip(s, reason="e", asset_class=EQ)
-        KillSwitch.trip(s, reason="c", asset_class=CR)
+        KillSwitch.trip(
+            s,
+            reason="e",
+            asset_class=EQ,
+            actor="test:asset-class",
+            request_id="asset-equity-independent",
+        )
+        KillSwitch.trip(
+            s,
+            reason="c",
+            asset_class=CR,
+            actor="test:asset-class",
+            request_id="asset-crypto-independent",
+        )
         s.commit()
     with f() as s:
-        KillSwitch.reset(s, asset_class=EQ)
+        KillSwitch.reset(
+            s,
+            asset_class=EQ,
+            actor="test:asset-class",
+            request_id="asset-equity-reset",
+        )
         s.commit()
     with f() as s:
         assert KillSwitch.is_tripped(s, EQ) is False
@@ -76,7 +105,12 @@ def test_default_asset_class_is_equity(engine):
     """Pre-Phase-7 call style (no asset_class) still targets equity."""
     f = make_session_factory(engine)
     with f() as s:
-        KillSwitch.trip(s, reason="legacy call")  # defaults to equity
+        KillSwitch.trip(
+            s,
+            reason="legacy call",
+            actor="test:asset-class",
+            request_id="asset-legacy-equity",
+        )  # defaults to equity
         s.commit()
     with f() as s:
         assert KillSwitch.is_tripped(s) is True         # equity
@@ -86,7 +120,13 @@ def test_default_asset_class_is_equity(engine):
 def test_crypto_trip_persists_across_restart(db_url, engine):
     f = make_session_factory(engine)
     with f() as s:
-        KillSwitch.trip(s, reason="dump", asset_class=CR)
+        KillSwitch.trip(
+            s,
+            reason="dump",
+            asset_class=CR,
+            actor="test:asset-class",
+            request_id="asset-persistent-crypto",
+        )
         s.commit()
     engine2 = create_db_engine(db_url)
     with make_session_factory(engine2)() as s:
@@ -129,7 +169,13 @@ def test_service_routes_crypto_around_equity_killswitch(make_service):
     svc = make_service(market_open=False)  # equity market CLOSED
     svc.broker.set_price("BTC/USD", Decimal("100"))
     with svc.session_factory() as s:
-        KillSwitch.trip(s, reason="equity drill", asset_class=EQ)
+        KillSwitch.trip(
+            s,
+            reason="equity drill",
+            asset_class=EQ,
+            actor="test:asset-class",
+            request_id="asset-equity-drill",
+        )
         s.commit()
 
     # Equity order: blocked by both the equity kill switch and closed market.

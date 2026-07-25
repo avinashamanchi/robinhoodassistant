@@ -65,6 +65,7 @@ def test_authenticated_session_and_csrf_allow_mutation(
         BreakerScope.loss(AssetClass.EQUITY),
         "security drill",
         "daemon",
+        request_id="security-breaker-drill",
     )
     client, csrf = authenticate_client(client, TOKEN)
     r = client.post(
@@ -98,9 +99,21 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
     limited, csrf = authenticate_client(TestClient(app), TOKEN)
     headers = {"X-CSRF-Token": csrf}
 
-    assert limited.post("/analyze", json={"symbol": "AAPL"}, headers=headers).status_code == 429
-    assert limited.post("/propose", json={"n": 1}, headers=headers).status_code == 429
-    assert limited.post("/backtests/run", json={"symbols": []}, headers=headers).status_code == 429
+    assert limited.post(
+        "/analyze",
+        json={"symbol": "AAPL", "reason": "rate limit test"},
+        headers=headers,
+    ).status_code == 429
+    assert limited.post(
+        "/propose",
+        json={"n": 1, "reason": "rate limit test"},
+        headers=headers,
+    ).status_code == 429
+    assert limited.post(
+        "/backtests/run",
+        json={"symbols": [], "reason": "rate limit test"},
+        headers=headers,
+    ).status_code == 429
 
 
 def test_financial_get_endpoints_fail_closed(client):

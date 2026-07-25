@@ -156,13 +156,19 @@ def trip_in_session(
     reason: str,
     actor: str,
     *,
+    request_id: str,
     now: datetime | None = None,
-    request_id: str = "",
+    audit_reason: str | None = None,
 ) -> tuple[BreakerState, bool]:
     reason = reason.strip()
     actor = actor.strip()
-    if not reason or not actor:
-        raise ValueError("breaker trip actor and reason must be non-empty")
+    request_id = request_id.strip()
+    if not reason or not actor or not request_id:
+        raise ValueError(
+            "breaker trip actor, reason, and request_id must be non-empty"
+        )
+    if audit_reason is not None and not audit_reason.strip():
+        raise ValueError("breaker trip audit reason must be non-empty")
     timestamp = _now(now)
     prior_tripped = session.scalar(
         select(CircuitBreakerState.tripped).where(
@@ -201,7 +207,7 @@ def trip_in_session(
         scope=scope,
         actor=actor,
         action="circuit_breaker.trip",
-        reason=reason,
+        reason=(audit_reason or reason).strip(),
         result_code="tripped" if changed else "already_tripped",
         request_id=request_id,
         detail={"generation": row.generation},
@@ -218,15 +224,18 @@ def reset_in_session(
     prior_health: Mapping[str, object],
     *,
     expected_generation: int,
+    request_id: str,
     now: datetime | None = None,
-    request_id: str = "",
 ) -> BreakerState:
     actor = actor.strip()
     reason = reason.strip()
+    request_id = request_id.strip()
     if not actor:
         raise ValueError("breaker reset actor must be non-empty")
     if not reason:
         raise ValueError("breaker reset reason must be non-empty")
+    if not request_id:
+        raise ValueError("breaker reset request_id must be non-empty")
     if not prior_health:
         raise ValueError("breaker reset prior health must be non-empty")
     if type(expected_generation) is not int or expected_generation < 1:
@@ -314,8 +323,9 @@ class BreakerService:
         reason: str,
         actor: str,
         *,
+        request_id: str,
         now: datetime | None = None,
-        request_id: str = "",
+        audit_reason: str | None = None,
     ) -> BreakerState:
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
@@ -326,6 +336,7 @@ class BreakerService:
                     actor,
                     now=now,
                     request_id=request_id,
+                    audit_reason=audit_reason,
                 )
                 session.commit()
                 return state
@@ -368,8 +379,8 @@ class BreakerService:
         prior_health: Mapping[str, object],
         *,
         expected_generation: int,
+        request_id: str,
         now: datetime | None = None,
-        request_id: str = "",
     ) -> BreakerState:
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:

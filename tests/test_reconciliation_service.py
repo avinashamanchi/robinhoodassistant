@@ -44,6 +44,23 @@ def _mutation(reason):
     }
 
 
+def _submit(submission, order_id):
+    return submission.submit(
+        order_id,
+        actor="operator:test",
+        reason="reconciliation submission test",
+        request_id=f"reconciliation-submit-{order_id}",
+    )
+
+
+def _panic(service, actor, reason):
+    return service.reconciliation.panic(
+        actor,
+        reason,
+        request_id="reconciliation-panic-test",
+    )
+
+
 def _approved_order_id(service) -> int:
     order_id = service.propose_order(
         "AAPL",
@@ -53,7 +70,13 @@ def _approved_order_id(service) -> int:
         **_mutation("approved order proposal"),
     )["order_id"]
     service.order_application.approve(
-        ApprovalCommand(order_id, "operator:avi", "reviewed", utcnow())
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed",
+            utcnow(),
+            "reconciliation-approved-order",
+        )
     )
     return order_id
 
@@ -92,7 +115,7 @@ class CancelFailsBroker(MockBroker):
 def _acceptance_unknown_with_exact_local_fill_ahead(service, broker) -> int:
     broker.set_price("AAPL", Decimal("100"))
     order_id = _approved_order_id(service)
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
     with service.session_factory() as session:
         session.add(
             Fill(
@@ -114,9 +137,9 @@ def test_reconcile_unknown_finds_remote_acceptance(make_service):
     broker.set_price("AAPL", Decimal("100"))
     service = make_service(broker=broker)
     order_id = _approved_order_id(service)
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert report.resolved_unknown == 1
     with service.session_factory() as session:
@@ -157,16 +180,17 @@ def test_acceptance_unknown_rejects_invalid_remote_identity_durably(
             "operator:avi",
             "reviewed identity recovery",
             utcnow(),
+            "reconciliation-identity-recovery-approval",
         )
     )
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
     broker._orders_by_key["local-client-id"] = OrderResult(
         returned_client_id,
         broker_order_id,
         OrderStatus.SUBMITTED,
     )
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
@@ -208,7 +232,7 @@ def test_acceptance_recovery_keeps_broker_symbol_first_in_identity_check(
         ticker="ACME/USD",
     )
 
-    resolved, unresolved = service.reconciliation.reconcile_unknown()
+    resolved, unresolved = service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation"))
 
     assert resolved == 0
     assert unresolved == (order_id,)
@@ -258,9 +282,9 @@ def test_reconcile_unknown_fill_latch_survives_restart_until_exact_activity(
     broker.set_price("AAPL", Decimal("100"))
     service = make_service(broker=broker)
     order_id = _approved_order_id(service)
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert report.resolved_unknown == 1
     assert report.inserted_fills == 0
@@ -291,7 +315,7 @@ def test_reconcile_unknown_fill_latch_survives_restart_until_exact_activity(
             filled_at=utcnow(),
         )
     ]
-    exact = restarted.reconciliation.reconcile()
+    exact = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert exact.inserted_fills == 1
     with restarted.session_factory() as session:
@@ -341,7 +365,7 @@ def test_reconcile_unknown_atomically_latches_terminal_cumulative_fill(
     broker.set_price("AAPL", Decimal("100"))
     service = make_service(broker=broker)
     order_id = _approved_order_id(service)
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
     with service.session_factory() as session:
         session.add(
             Fill(
@@ -356,7 +380,7 @@ def test_reconcile_unknown_atomically_latches_terminal_cumulative_fill(
         )
         session.commit()
 
-    assert service.reconciliation.reconcile_unknown() == (1, ())
+    assert service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation")) == (1, ())
 
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -381,8 +405,8 @@ def test_reconcile_unknown_atomically_latches_terminal_cumulative_fill(
         )
     ]
 
-    exact = restarted.reconciliation.reconcile()
-    replay = restarted.reconciliation.reconcile()
+    exact = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert exact.inserted_fills == 1
     assert replay.inserted_fills == 0
@@ -502,7 +526,7 @@ def test_acceptance_recovery_uses_canonical_fill_quantum(
     broker._orders_by_key[client_order_id] = remote
     broker._orders_by_id[remote.broker_order_id] = remote
 
-    assert service.reconciliation.reconcile_unknown() == (1, ())
+    assert service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation")) == (1, ())
 
     assert (
         service.breakers.is_tripped(BreakerScope.broker_drift())
@@ -521,7 +545,7 @@ def test_panic_reports_unconfirmed_cancel_as_not_safe(make_service):
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
 
-    report = service.reconciliation.panic("operator:avi", "manual drill")
+    report = _panic(service, "operator:avi", "manual drill")
 
     assert report.safe is False
     assert report.unconfirmed_order_ids == (order_id,)
@@ -549,7 +573,7 @@ def test_panic_fill_discovery_persists_fill_reconciliation_latch(
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
 
-    service.reconciliation.panic("operator:avi", "fill race")
+    _panic(service, "operator:avi", "fill race")
 
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -582,7 +606,7 @@ def test_panic_canceled_after_partial_fill_stays_latched_until_activity(
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
 
-    service.reconciliation.panic("operator:avi", "cancel after fill")
+    _panic(service, "operator:avi", "cancel after fill")
 
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -603,8 +627,8 @@ def test_panic_canceled_after_partial_fill_stays_latched_until_activity(
     ]
     restarted = make_service(broker=broker)
 
-    exact = restarted.reconciliation.reconcile()
-    replay = restarted.reconciliation.reconcile()
+    exact = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert exact.inserted_fills == 1
     assert replay.inserted_fills == 0
@@ -638,7 +662,8 @@ def test_panic_rejects_invalid_cumulative_fill_truth_and_trips_drift(
     service = make_service(broker=broker)
     order_id = _submitted_order_id(service)
 
-    report = service.reconciliation.panic(
+    report = _panic(
+        service,
         "operator:avi",
         "invalid cumulative drill",
     )
@@ -684,7 +709,8 @@ def test_panic_rejects_cumulative_fill_below_exact_local_truth(
         )
         session.commit()
 
-    report = service.reconciliation.panic(
+    report = _panic(
+        service,
         "operator:avi",
         "contradictory cumulative drill",
     )
@@ -835,7 +861,8 @@ def test_panic_uses_canonical_fill_quantum(
             )
         session.commit()
 
-    service.reconciliation.panic(
+    _panic(
+        service,
         "operator:avi",
         f"quantum comparison {remote_qty}",
     )
@@ -854,10 +881,10 @@ def test_panic_uses_canonical_fill_quantum(
 def test_panic_requires_actor_and_reason_before_latching(make_service):
     service = make_service()
 
-    with pytest.raises(ValueError, match="actor and reason"):
-        service.reconciliation.panic("", "manual drill")
-    with pytest.raises(ValueError, match="actor and reason"):
-        service.reconciliation.panic("operator:avi", " ")
+    with pytest.raises(ValueError, match="actor, reason, and request_id"):
+        _panic(service, "", "manual drill")
+    with pytest.raises(ValueError, match="actor, reason, and request_id"):
+        _panic(service, "operator:avi", " ")
 
     with service.session_factory() as session:
         assert session.scalar(
@@ -906,7 +933,8 @@ def test_panic_keeps_broker_symbol_first_in_identity_check(make_service):
     broker._orders_by_id[order.broker_order_id] = remote
     broker._orders_by_key[order.idempotency_key] = remote
 
-    report = service.reconciliation.panic(
+    report = _panic(
+        service,
         "operator:avi",
         "directional broker identity",
     )
@@ -934,7 +962,7 @@ def test_panic_cancels_remote_only_open_order_by_explicit_id(make_service):
     )
     service = make_service(broker=broker)
 
-    report = service.reconciliation.panic("operator:avi", "remote cleanup")
+    report = _panic(service, "operator:avi", "remote cleanup")
 
     assert report.safe is True
     assert report.confirmed_canceled == (remote.broker_order_id,)
@@ -949,7 +977,7 @@ def test_panic_latches_global_breaker_before_broker_enumeration_failure(make_ser
 
     service = make_service(broker=EnumerationFailsBroker())
 
-    report = service.reconciliation.panic("operator:avi", "connectivity loss")
+    report = _panic(service, "operator:avi", "connectivity loss")
 
     assert report.safe is False
     with service.session_factory() as session:
@@ -1001,7 +1029,7 @@ def test_panic_preserves_unverified_remote_only_id_as_potentially_open(make_serv
     )
     service = make_service(broker=broker)
 
-    report = service.reconciliation.panic("operator:avi", "remote verification")
+    report = _panic(service, "operator:avi", "remote verification")
 
     assert report.safe is False
     assert report.remote_open_order_ids == (remote.broker_order_id,)
@@ -1023,7 +1051,7 @@ def test_panic_is_unsafe_for_remote_open_order_without_explicit_id(make_service)
 
     service = make_service(broker=MissingIdBroker())
 
-    report = service.reconciliation.panic("operator:avi", "missing broker id")
+    report = _panic(service, "operator:avi", "missing broker id")
 
     assert report.safe is False
     assert "unaddressable_remote_open=true" in report.message
@@ -1054,7 +1082,7 @@ def test_panic_never_guesses_a_cancel_id_for_unresolved_unknown(make_service):
         session.commit()
         unknown_id = unknown.id
 
-    report = service.reconciliation.panic("operator:avi", "unknown acceptance")
+    report = _panic(service, "operator:avi", "unknown acceptance")
 
     assert broker.cancel_calls == []
     assert report.safe is False
@@ -1070,7 +1098,7 @@ def test_reconcile_syncs_terminal_broker_status(make_service):
         broker_order_id = local.broker_order_id
     broker.cancel_order(broker_order_id)
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert report.synced_orders == 1
     with service.session_factory() as session:
@@ -1105,7 +1133,7 @@ def test_ordinary_reconciliation_keeps_broker_symbol_first_in_identity_check(
     broker._orders_by_id[order.broker_order_id] = remote
     broker._orders_by_key[order.idempotency_key] = remote
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert any("invalid broker identity" in item for item in report.broker_drift)
     assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
@@ -1122,7 +1150,7 @@ def test_reconcile_reports_remote_open_order_without_broker_id(make_service):
             return [OrderResult("missing-id", None, OrderStatus.SUBMITTED)]
 
     service = make_service(broker=MissingIdBroker())
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=MissingIdBroker())
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
@@ -1171,9 +1199,9 @@ def test_remote_open_order_matching_terminal_local_order_trips_drift_on_replay(
     )
     broker.get_open_orders = lambda: [remote_open]
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
     proposal = restarted.propose_order(
         "AAPL",
@@ -1249,9 +1277,9 @@ def test_remote_open_order_with_conflicting_identity_trips_drift_on_replay(
     )
     broker.get_open_orders = lambda: [remote_open]
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert any(
@@ -1295,7 +1323,8 @@ def test_panic_remote_open_order_matching_terminal_local_order_trips_drift(
         )
         session.commit()
 
-    report = service.reconciliation.panic(
+    report = _panic(
+        service,
         "operator:avi",
         "terminal open-order conflict",
     )
@@ -1379,9 +1408,9 @@ def test_quantity_order_exact_overfill_is_preserved_latched_and_replay_safe(
     broker._orders_by_id[broker_order_id] = remote
     broker._orders_by_key[client_order_id] = remote
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 2
     assert replay.inserted_fills == 0
@@ -1453,9 +1482,9 @@ def test_acceptance_recovery_never_clears_exact_quantity_overfill(
     broker._orders_by_key[remote.idempotency_key] = remote
     broker._orders_by_id[remote.broker_order_id] = remote
 
-    first = service.reconciliation.reconcile_unknown()
+    first = service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile_unknown()
+    replay = restarted.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation"))
 
     assert first == (0, (order_id,))
     assert replay == (0, (order_id,))
@@ -1538,7 +1567,8 @@ def test_panic_never_clears_exact_quantity_overfill(make_service):
     broker._orders_by_id[remote.broker_order_id] = remote
     broker._orders_by_key[remote.idempotency_key] = remote
 
-    report = service.reconciliation.panic(
+    report = _panic(
+        service,
         "operator:avi",
         "quantity overfill verification",
     )
@@ -1612,7 +1642,7 @@ def test_compact_crypto_fill_matches_slash_order_and_replays_as_noop(
     )
     broker.activities = [compact]
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
     broker.activities = [
         BrokerFill(
@@ -1625,7 +1655,7 @@ def test_compact_crypto_fill_matches_slash_order_and_replays_as_noop(
             filled_at=compact.filled_at,
         )
     ]
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 1
     assert first.broker_drift == ()
@@ -1674,7 +1704,7 @@ def test_crypto_fill_equivalence_still_rejects_wrong_pair(
         )
     ]
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
 
     assert report.inserted_fills == 0
@@ -1819,7 +1849,7 @@ def test_ordinary_reconciliation_uses_canonical_fill_quantum(
     broker._orders_by_id[broker_order_id] = remote
     broker._orders_by_key[client_order_id] = remote
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert bool(report.broker_drift) is expected_drift
     assert (
@@ -1874,9 +1904,9 @@ def test_missing_alpaca_activity_id_never_inserts_advances_or_clears_latch(
         order.last_error_code = "remote_fill_ahead"
         session.commit()
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 0
     assert replay.inserted_fills == 0
@@ -1920,10 +1950,10 @@ def test_invalid_cumulative_fill_truth_latches_and_trips_drift_across_restart(
     broker._orders_by_id[broker_order_id] = invalid
     broker._orders_by_key[client_order_id] = invalid
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert any("invalid cumulative filled_qty" in item for item in first.broker_drift)
     assert replay.inserted_fills == 0
@@ -1957,9 +1987,9 @@ def test_acceptance_resolution_rejects_invalid_cumulative_truth_durably(
     broker = InvalidThenDisconnectBroker()
     service = make_service(broker=broker)
     order_id = _approved_order_id(service)
-    service.order_submission.submit(order_id)
+    _submit(service.order_submission, order_id)
 
-    assert service.reconciliation.reconcile_unknown() == (1, ())
+    assert service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation")) == (1, ())
 
     restarted = make_service(broker=broker)
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
@@ -2006,7 +2036,7 @@ def test_standalone_acceptance_contradiction_latch_and_drift_share_commit(
             RuntimeError,
             match="simulated crash before contradiction commit",
         ):
-            service.reconciliation.reconcile_unknown()
+            service.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation"))
     finally:
         event.remove(
             session_type,
@@ -2028,7 +2058,7 @@ def test_standalone_acceptance_contradiction_latch_and_drift_share_commit(
             BreakerScope.broker_drift().key,
         ) is None
 
-    assert restarted.reconciliation.reconcile_unknown() == (1, ())
+    assert restarted.reconciliation.reconcile_unknown(**_mutation("unknown reconciliation")) == (1, ())
     after_commit = make_service(broker=broker)
     assert after_commit.breakers.is_tripped(
         BreakerScope.broker_drift()
@@ -2050,7 +2080,7 @@ def test_full_acceptance_contradiction_trips_drift_before_later_crash(
         broker,
     )
 
-    def crash_after_acceptance_recovery(_drift):
+    def crash_after_acceptance_recovery(_drift, **context):
         raise RuntimeError("simulated crash after acceptance recovery")
 
     service.reconciliation._reconcile_fill_activities = (
@@ -2060,7 +2090,7 @@ def test_full_acceptance_contradiction_trips_drift_before_later_crash(
         RuntimeError,
         match="simulated crash after acceptance recovery",
     ):
-        service.reconciliation.reconcile()
+        service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     restarted = make_service(broker=broker)
     assert restarted.breakers.is_tripped(
@@ -2122,10 +2152,10 @@ def test_invalid_exact_fill_is_rejected_latched_and_replayed_fail_closed(
     broker._orders_by_id[broker_order_id] = filled
     broker._orders_by_key[client_order_id] = filled
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 0
     assert replay.inserted_fills == 0
@@ -2175,7 +2205,7 @@ def test_mutated_duplicate_fill_replay_is_rejected_without_corrupting_ledger(
     )
     broker._orders_by_id[broker_order_id] = filled
     broker._orders_by_key[client_order_id] = filled
-    assert service.reconciliation.reconcile().inserted_fills == 1
+    assert service.reconciliation.reconcile(**_mutation("direct reconciliation")).inserted_fills == 1
 
     broker.activities = [
         BrokerFill(
@@ -2188,7 +2218,7 @@ def test_mutated_duplicate_fill_replay_is_rejected_without_corrupting_ledger(
             filled_at=valid.filled_at,
         )
     ]
-    replay = service.reconciliation.reconcile()
+    replay = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert replay.inserted_fills == 0
     assert any("invalid fill activity" in item for item in replay.broker_drift)
@@ -2236,7 +2266,7 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
     )
     broker._orders_by_id[broker_order_id] = filled
     broker._orders_by_key[client_order_id] = filled
-    assert service.reconciliation.reconcile().inserted_fills == 1
+    assert service.reconciliation.reconcile(**_mutation("direct reconciliation")).inserted_fills == 1
 
     equivalent_offset_time = filled_at.astimezone(
         timezone(timedelta(hours=-7))
@@ -2252,7 +2282,7 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
             filled_at=equivalent_offset_time,
         )
     ]
-    equivalent = service.reconciliation.reconcile()
+    equivalent = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     assert equivalent.inserted_fills == 0
     assert equivalent.broker_drift == ()
 
@@ -2269,8 +2299,8 @@ def test_duplicate_fill_timestamp_is_normalized_and_mismatch_fails_closed(
         )
     ]
     restarted = make_service(broker=broker)
-    mismatch = restarted.reconciliation.reconcile()
-    replayed = make_service(broker=broker).reconciliation.reconcile()
+    mismatch = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replayed = make_service(broker=broker).reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert mismatch.inserted_fills == 0
     assert replayed.inserted_fills == 0
@@ -2346,9 +2376,9 @@ def test_crypto_precision_replay_is_noop_and_mutation_trips_drift(
     broker._orders_by_id[broker_order_id] = filled
     broker._orders_by_key[client_order_id] = filled
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    unchanged = restarted.reconciliation.reconcile()
+    unchanged = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 1
     assert unchanged.inserted_fills == 0
@@ -2379,7 +2409,7 @@ def test_crypto_precision_replay_is_noop_and_mutation_trips_drift(
             filled_at=exact.filled_at,
         )
     ]
-    mutation = restarted.reconciliation.reconcile()
+    mutation = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert mutation.inserted_fills == 0
     assert any(expected_error in item for item in mutation.broker_drift)
@@ -2467,9 +2497,9 @@ def test_first_seen_fill_rejects_out_of_bounds_timestamp_across_restart(
     broker._orders_by_id[broker_order_id] = remote
     broker._orders_by_key[client_order_id] = remote
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert first.inserted_fills == 0
@@ -2525,7 +2555,7 @@ def test_status_discovery_latch_survives_restart_until_exact_activity(
     broker._orders_by_id[broker_order_id] = remote
     broker._orders_by_key[client_order_id] = remote
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 0
     with service.session_factory() as session:
@@ -2549,7 +2579,7 @@ def test_status_discovery_latch_survives_restart_until_exact_activity(
             filled_at=utcnow(),
         )
     ]
-    exact = restarted.reconciliation.reconcile()
+    exact = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert exact.inserted_fills == 1
     with restarted.session_factory() as session:
@@ -2582,7 +2612,7 @@ def test_canceled_after_partial_fill_stays_latched_until_exact_activity(
     broker._orders_by_id[broker_order_id] = canceled_after_fill
     broker._orders_by_key[client_order_id] = canceled_after_fill
 
-    delayed = service.reconciliation.reconcile()
+    delayed = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert delayed.inserted_fills == 0
     assert any(
@@ -2611,8 +2641,8 @@ def test_canceled_after_partial_fill_stays_latched_until_exact_activity(
         )
     ]
 
-    exact = restarted.reconciliation.reconcile()
-    replay = restarted.reconciliation.reconcile()
+    exact = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert exact.inserted_fills == 1
     assert replay.inserted_fills == 0
@@ -2701,9 +2731,9 @@ def test_partial_fill_expiration_preserves_pnl_and_releases_remainder(
     broker._orders_by_key[expired.idempotency_key] = expired
 
     before = service.snapshot_service.assemble_for_execution("AAPL")
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     after = service.snapshot_service.assemble_for_execution("AAPL")
-    replay = service.reconciliation.reconcile()
+    replay = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     after_replay = service.snapshot_service.assemble_for_execution("AAPL")
 
     assert before.reserved_sell_qty_by_ticker == {
@@ -2761,6 +2791,7 @@ def test_indeterminate_cancel_zero_fill_recovers_from_authoritative_empty_stream
         BreakerScope.broker_drift(),
         "cancel result and status were indeterminate",
         "service:cancel",
+        request_id="reconciliation-indeterminate-cancel",
     )
     remote = OrderResult(
         client_order_id,
@@ -2773,8 +2804,8 @@ def test_indeterminate_cancel_zero_fill_recovers_from_authoritative_empty_stream
 
     restarted = make_service(broker=broker)
     before = restarted.snapshot_service.assemble_for_execution("AAPL")
-    first = restarted.reconciliation.reconcile()
-    replay = restarted.reconciliation.reconcile()
+    first = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert before.broker_reconciled is False
     assert before.daily_pnl_complete is False
@@ -2807,6 +2838,7 @@ def test_indeterminate_cancel_zero_fill_recovers_from_authoritative_empty_stream
             "authoritative_fill_qty": "0",
         },
         expected_generation=drift.generation,
+        request_id="reconciliation-terminal-reset",
     )
     complete = restarted.snapshot_service.assemble_for_execution("AAPL")
     assert complete.broker_reconciled is True
@@ -2834,7 +2866,7 @@ def test_indeterminate_cancel_zero_fill_waits_for_successful_activity_read(
     )
     broker.fail_activities = True
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert any("fill activities unavailable" in item for item in report.broker_drift)
     with service.session_factory() as session:
@@ -2875,9 +2907,9 @@ def test_remote_cumulative_below_exact_local_fill_is_durable_contradiction(
     broker._orders_by_id[broker_order_id] = contradicted
     broker._orders_by_key[client_order_id] = contradicted
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert any(
@@ -2952,7 +2984,7 @@ def test_legacy_null_fill_is_quarantined_then_superseded_without_double_pnl(
     broker._orders_by_key["legacy-null-fill-client"] = remote
 
     untrusted = service.snapshot_service.assemble_for_execution("AAPL")
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
     still_untrusted = restarted.snapshot_service.assemble_for_execution("AAPL")
 
@@ -2980,8 +3012,8 @@ def test_legacy_null_fill_is_quarantined_then_superseded_without_double_pnl(
             filled_at=utcnow(),
         )
     ]
-    recovered = restarted.reconciliation.reconcile()
-    replay = restarted.reconciliation.reconcile()
+    recovered = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     after_exact = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert recovered.inserted_fills == 1
@@ -3013,6 +3045,7 @@ def test_legacy_null_fill_is_quarantined_then_superseded_without_double_pnl(
             "broker_fill_id": "authoritative-hidden-loss-fill",
         },
         expected_generation=drift.generation,
+        request_id="reconciliation-legacy-fill-reset",
     )
     complete = restarted.snapshot_service.assemble_for_execution("AAPL")
     assert complete.realized_pnl_today == Decimal("-99")
@@ -3086,9 +3119,9 @@ def test_pre_0005_supplied_fill_id_requires_exact_activity_then_replays_once(
     ]
 
     before = service.snapshot_service.assemble_for_execution("AAPL")
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
     after = restarted.snapshot_service.assemble_for_execution("AAPL")
 
     assert before.realized_pnl_today == Decimal("0")
@@ -3173,10 +3206,10 @@ def test_trusted_duplicate_replay_never_supersedes_additional_legacy_rows(
     )
     broker.activities = [exact]
 
-    first = service.reconciliation.reconcile()
-    first_replay = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
+    first_replay = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     restarted = make_service(broker=broker)
-    second_replay = restarted.reconciliation.reconcile()
+    second_replay = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 1
     assert first_replay.inserted_fills == 0
@@ -3275,9 +3308,10 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
             "operator:avi",
             "reviewed synchronous loss",
             utcnow(),
+            "reconciliation-synchronous-loss-approval",
         )
     )
-    submission = service.order_submission.submit(order_id)
+    submission = _submit(service.order_submission, order_id)
 
     assert submission.status is synchronous_status
     incomplete = service.snapshot_service.assemble_for_execution("AAPL")
@@ -3297,7 +3331,7 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
         "daily P&L snapshot is incomplete",
     }.issubset(blocked["risk_reasons"])
 
-    unresolved = service.reconciliation.reconcile()
+    unresolved = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     still_incomplete = service.snapshot_service.assemble_for_execution("AAPL")
     assert unresolved.inserted_fills == 0
     assert any(
@@ -3323,7 +3357,7 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
         )
     ]
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     reconciled = service.snapshot_service.assemble_for_execution("AAPL")
     with service.session_factory() as session:
         order = session.get(Order, order_id)
@@ -3348,6 +3382,7 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
             "authoritative_fill_qty": str(filled_qty),
         },
         expected_generation=drift_state.generation,
+        request_id="reconciliation-exact-fill-reset",
     )
     after_health_reset = service.snapshot_service.assemble_for_execution(
         "AAPL"
@@ -3355,7 +3390,7 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
     assert after_health_reset.broker_reconciled is True
     assert after_health_reset.daily_pnl_complete is True
 
-    duplicate = service.reconciliation.reconcile()
+    duplicate = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     after_duplicate = service.snapshot_service.assemble_for_execution("AAPL")
 
     assert duplicate.inserted_fills == 0
@@ -3403,13 +3438,13 @@ def test_fill_reconciliation_is_incremental_and_restart_idempotent(make_service)
     broker._orders_by_id[broker_order_id] = filled
     broker._orders_by_key[client_order_id] = filled
 
-    first = service.reconciliation.reconcile()
+    first = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     with service.session_factory() as session:
         first_cursor_version = session.scalar(
             select(cursor_type.version).where(cursor_type.stream == "fills")
         )
     restarted = make_service(broker=broker)
-    second = restarted.reconciliation.reconcile()
+    second = restarted.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert first.inserted_fills == 1
     assert second.inserted_fills == 0
@@ -3453,10 +3488,10 @@ def test_late_visible_fill_with_equal_timestamp_is_not_lost(make_service):
         filled_at=filled_at,
     )
     broker.activities = [first]
-    assert service.reconciliation.reconcile().inserted_fills == 1
+    assert service.reconciliation.reconcile(**_mutation("direct reconciliation")).inserted_fills == 1
     broker.activities = [first, late]
 
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert report.inserted_fills == 1
     with service.session_factory() as session:
@@ -3500,7 +3535,7 @@ def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
 
     event.listen(session_type, "before_commit", fail_after_flush)
     try:
-        report = service.reconciliation.reconcile()
+        report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     finally:
         event.remove(session_type, "before_commit", fail_after_flush)
 
@@ -3535,7 +3570,7 @@ def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):
             filled_at=filled_at,
         )
     ]
-    service.reconciliation.reconcile()
+    service.reconciliation.reconcile(**_mutation("direct reconciliation"))
     with service.session_factory() as session:
         before = session.scalar(select(cursor_type).where(cursor_type.stream == "fills"))
         before_state = (
@@ -3545,7 +3580,7 @@ def test_fill_activity_network_failure_leaves_cursor_unchanged(make_service):
         )
 
     broker.fail_activities = True
-    report = service.reconciliation.reconcile()
+    report = service.reconciliation.reconcile(**_mutation("direct reconciliation"))
 
     assert any("fill activities" in drift for drift in report.broker_drift)
     with service.session_factory() as session:

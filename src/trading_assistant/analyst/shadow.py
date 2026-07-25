@@ -12,6 +12,7 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 from typing import Callable, Optional
+from uuid import uuid4
 
 from sqlalchemy import select
 
@@ -86,12 +87,18 @@ class ShadowRunner:
                 ).scalars()
             )
         plan_ids: list[int] = []
+        request_id = uuid4().hex
         for c in candidates:
             if c["symbol"] in completed_symbols:
                 continue
             try:
                 # Stores a shadow plan only; it never creates or executes an order.
-                out = self.planning.analyze(c["symbol"])
+                out = self.planning.analyze(
+                    c["symbol"],
+                    actor="daemon:shadow",
+                    reason="scheduled shadow plan analysis",
+                    request_id=request_id,
+                )
             except Exception:
                 log.exception(
                     "shadow analysis failed for %s; continuing batch",

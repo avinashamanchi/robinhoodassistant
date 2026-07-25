@@ -46,7 +46,20 @@ class RuleWorker:
         self.max_quote_age_seconds = max_quote_age_seconds
         self.now = now
 
-    def tick(self) -> list[RuleOutcome]:
+    def tick(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> list[RuleOutcome]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "rule worker actor, reason, and request_id must be non-empty"
+            )
         outcomes: list[RuleOutcome] = []
         quotes: dict[str, object] = {}
         for group_id in self.repository.active_group_ids():
@@ -110,6 +123,9 @@ class RuleWorker:
                     lease,
                     stored.id,
                     stored.command,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                     now=tick_now,
                     reference_price=quote.last,
                     quote_cache=quotes,

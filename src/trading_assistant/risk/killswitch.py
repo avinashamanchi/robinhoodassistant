@@ -58,6 +58,9 @@ class KillSwitch:
         session: Session,
         reason: str,
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> None:
         scope = _scope(asset_class)
         _require_barrier_before_transaction(session)
@@ -67,7 +70,8 @@ class KillSwitch:
                     session,
                     scope,
                     reason,
-                    "compat:killswitch",
+                    actor,
+                    request_id=request_id,
                 )
                 if changed:
                     session.add(
@@ -86,6 +90,9 @@ class KillSwitch:
         session: Session,
         note: str = "manual reset",
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> None:
         scope = _scope(asset_class)
         _require_barrier_before_transaction(session)
@@ -99,10 +106,11 @@ class KillSwitch:
                 reset_in_session(
                     session,
                     scope,
-                    "compat:killswitch",
+                    actor,
                     note,
                     {"compatibility_facade": True},
                     expected_generation=row.generation,
+                    request_id=request_id,
                 )
                 session.add(
                     RiskEvent(
@@ -121,6 +129,9 @@ class KillSwitch:
         realized_pnl_today: Decimal,
         loss_limit: Decimal,
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> bool:
         if realized_pnl_today <= -abs(loss_limit):
             KillSwitch.trip(
@@ -130,5 +141,7 @@ class KillSwitch:
                     f"-{abs(loss_limit)}"
                 ),
                 asset_class=asset_class,
+                actor=actor,
+                request_id=request_id,
             )
         return KillSwitch.is_tripped(session, asset_class)

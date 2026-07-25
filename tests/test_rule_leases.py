@@ -204,7 +204,13 @@ def test_stale_lease_cannot_create_a_proposal(make_service):
         session.commit()
 
     outcome = RuleApplicationService(svc, repo).propose_from_lease(
-        stale, rule_id, command, now=NOW
+        stale,
+        rule_id,
+        command,
+        actor="daemon:worker-a",
+        reason="stale lease evaluation",
+        request_id="stale-lease-evaluation",
+        now=NOW,
     )
 
     assert outcome.proposal is None
@@ -227,7 +233,13 @@ def test_proposal_winner_and_sibling_cancellation_commit_atomically(make_service
     assert lease is not None
 
     outcome = RuleApplicationService(svc, repo).propose_from_lease(
-        lease, rule_ids[0], winner_command, now=NOW
+        lease,
+        rule_ids[0],
+        winner_command,
+        actor="daemon:worker-a",
+        reason="winning lease evaluation",
+        request_id="winning-lease-evaluation",
+        now=NOW,
     )
 
     assert outcome.proposal["status"] == "proposed"
@@ -285,7 +297,11 @@ def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
     assert recovering.lease_group(group_id, now=NOW) is None
     with svc.session_factory() as session:
         assert session.get(RuleGroup, group_id).reconciliation_required is True
-    assert svc.reconciliation.reconcile_unknown() == (0, (1,))
+    assert svc.reconciliation.reconcile_unknown(
+        actor="test:rule-leases",
+        reason="rule lease unresolved acceptance",
+        request_id="rule-lease-unresolved",
+    ) == (0, (1,))
     assert recovering.lease_group(group_id, now=NOW) is None
 
     broker.submit_order(
@@ -297,7 +313,11 @@ def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
             notional=Decimal("100"),
         )
     )
-    assert svc.reconciliation.reconcile_unknown() == (1, ())
+    assert svc.reconciliation.reconcile_unknown(
+        actor="test:rule-leases",
+        reason="rule lease acceptance recovery",
+        request_id="rule-lease-recovery",
+    ) == (1, ())
     assert recovering.lease_group(group_id, now=NOW) is not None
     with svc.session_factory() as session:
         assert session.get(RuleGroup, group_id).reconciliation_required is False
@@ -319,7 +339,13 @@ def test_unknown_acceptance_marks_group_until_reconciliation_resolves_client_id(
     repo = RuleRepository(svc.session_factory, owner="worker-a")
     lease = repo.lease_group(group_id, now=NOW)
     outcome = RuleApplicationService(svc, repo).propose_from_lease(
-        lease, rule_id, command, now=NOW
+        lease,
+        rule_id,
+        command,
+        actor="daemon:worker-a",
+        reason="unknown acceptance evaluation",
+        request_id="unknown-acceptance-evaluation",
+        now=NOW,
     )
     with svc.session_factory() as session:
         proposal = session.scalar(
@@ -341,7 +367,11 @@ def test_unknown_acceptance_marks_group_until_reconciliation_resolves_client_id(
     with svc.session_factory() as session:
         assert session.get(RuleGroup, group_id).reconciliation_required is True
 
-    assert svc.reconciliation.reconcile_unknown() == (1, ())
+    assert svc.reconciliation.reconcile_unknown(
+        actor="test:rule-leases",
+        reason="rule group acceptance recovery",
+        request_id="rule-group-recovery",
+    ) == (1, ())
     with svc.session_factory() as session:
         assert session.get(RuleGroup, group_id).reconciliation_required is False
 
@@ -363,7 +393,15 @@ def test_crash_immediately_before_or_after_transaction_creates_at_most_one_propo
 
     application = RuleApplicationService(svc, repo, crash_hook=crash)
     with pytest.raises(RuntimeError, match="crash at"):
-        application.propose_from_lease(lease, rule_id, command, now=NOW)
+        application.propose_from_lease(
+            lease,
+            rule_id,
+            command,
+            actor="daemon:worker-a",
+            reason="crash phase evaluation",
+            request_id=f"crash-phase-{crash_phase}",
+            now=NOW,
+        )
 
     restart_repo = RuleRepository(svc.session_factory, owner="worker-restart")
     recovered = restart_repo.lease_group(
@@ -374,6 +412,9 @@ def test_crash_immediately_before_or_after_transaction_creates_at_most_one_propo
             recovered,
             rule_id,
             command,
+            actor="daemon:worker-restart",
+            reason="crash recovery evaluation",
+            request_id=f"crash-recovery-{crash_phase}",
             now=NOW + timedelta(seconds=31),
         )
 
@@ -408,7 +449,11 @@ def test_two_thread_sibling_trigger_records_one_proposal_and_one_terminal_rule(
             now=lambda: NOW,
         )
         barrier.wait(timeout=2)
-        return worker.tick()
+        return worker.tick(
+            actor=f"daemon:{owner}",
+            reason="rule lease race evaluation",
+            request_id=f"rule-lease-race-{owner}",
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(run, ("worker-a", "worker-b")))

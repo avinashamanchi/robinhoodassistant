@@ -13,7 +13,12 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from ..config import BacktestConfig
-from ..db.models import BacktestMetricRow, BacktestRun, HoldoutAccessLog
+from ..db.models import (
+    AuditEvent,
+    BacktestMetricRow,
+    BacktestRun,
+    HoldoutAccessLog,
+)
 from ..strategies.base import Strategy
 from ..strategies.buy_and_hold import BuyAndHold
 from .data import DataSource
@@ -90,8 +95,24 @@ def walk_forward(
     return report, guard
 
 
-def persist_report(session_factory, report: EvaluationReport, guard: HoldoutGuard) -> int:
+def persist_report(
+    session_factory,
+    report: EvaluationReport,
+    guard: HoldoutGuard,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> int:
     """Write the report + holdout-access audit to the DB. Returns the run id."""
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "backtest persistence actor, reason, and request_id "
+            "must be non-empty"
+        )
     with session_factory() as s:
         run = BacktestRun(
             label=report.label,
@@ -116,5 +137,27 @@ def persist_report(session_factory, report: EvaluationReport, guard: HoldoutGuar
                     at=access.at, context=access.context, blocked=access.blocked
                 )
             )
+        s.add(
+            AuditEvent(
+                actor=actor,
+                action="backtest.run",
+                target_type="backtest_run",
+                target_id=str(run.id),
+                request_id=request_id,
+                reason=reason,
+                result_code="succeeded",
+                detail_json=json.dumps(
+                    {
+                        "holdout_start": (
+                            report.holdout_start.isoformat()
+                            if report.holdout_start
+                            else None
+                        ),
+                        "row_count": len(report.rows),
+                    },
+                    sort_keys=True,
+                ),
+            )
+        )
         s.commit()
         return run.id

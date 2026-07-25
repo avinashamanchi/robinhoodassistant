@@ -93,6 +93,20 @@ def test_preflight_reconciliation_reports_position_drift(make_service):
     assert "AAPL" in result.detail
 
 
+def test_preflight_reconciliation_sanitizes_provider_exception_text():
+    from trading_assistant import preflight
+
+    class ExplodingService:
+        def sync_open_orders(self, **context):
+            raise RuntimeError("provider-secret-preflight-detail")
+
+    result = preflight._reconciliation(ExplodingService())
+
+    assert result.status == "FAIL"
+    assert result.detail == "RuntimeError"
+    assert "provider-secret-preflight-detail" not in result.detail
+
+
 # ── B2 full order lifecycle ─────────────────────────────────────
 def test_order_lifecycle_propose_approve_fill(make_service):
     from trading_assistant.broker.mock import MockBroker

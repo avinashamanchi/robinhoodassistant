@@ -236,6 +236,7 @@ def test_killswitch_reset_endpoint(client):
         BreakerScope.loss(AssetClass.EQUITY),
         reason="drill",
         actor="daemon",
+        request_id="api-killswitch-drill",
     )
     health_response = c.get("/health").json()
     assert health_response["killswitch_generation"]["equity"] == (
@@ -283,11 +284,13 @@ def test_killswitch_reset_returns_conflict_for_stale_generation(client):
         BreakerScope.loss(AssetClass.EQUITY),
         reason="initial loss",
         actor="daemon:first",
+        request_id="api-initial-loss",
     )
     retripped = svc.breakers.trip(
         BreakerScope.loss(AssetClass.EQUITY),
         reason="new loss evidence",
         actor="daemon:second",
+        request_id="api-new-loss",
     )
 
     response = c.post(
@@ -422,6 +425,51 @@ def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
         ),
     }
     assert "raw provider outage" not in response.text
+
+
+def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
+    make_service, authenticate_client
+):
+    service = make_service()
+
+    def explode(**context):
+        raise RuntimeError("raw provider panic dependency secret")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = c.post(
+        "/panic",
+        json={"reason": "exception safety drill"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "panic_incomplete",
+        "message": "Panic could not confirm a safe state",
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "raw provider panic dependency secret" not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_reconcile_requires_reason_and_audits_operator_identity(client):

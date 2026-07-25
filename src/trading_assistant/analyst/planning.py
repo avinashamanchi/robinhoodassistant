@@ -53,7 +53,21 @@ class PlanningService:
         return cfg or self.service.config.risk
 
     # ── analyze → size → store ─────────────────────────────────
-    def analyze(self, symbol: str) -> dict[str, Any]:
+    def analyze(
+        self,
+        symbol: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "plan analysis actor, reason, and request_id must be non-empty"
+            )
         features = self.feature_provider(symbol)
         held = [p["ticker"] for p in self.service.get_external_positions().get("positions", [])]
         plan = self.analyst.analyze_plan(features, held_symbols=held)
@@ -64,11 +78,25 @@ class PlanningService:
         equity = self.service.broker.get_account().equity
         sized = size_trade(plan, snapshot, self._risk_cfg(symbol), equity)
 
-        plan_id = self._store(plan, sized)
+        plan_id = self._store(
+            plan,
+            sized,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         return {"plan_id": plan_id, "plan": json.loads(plan.model_dump_json()),
                 "sized": sized.to_dict()}
 
-    def _store(self, plan: TradePlan, sized: SizedTradePlan) -> int:
+    def _store(
+        self,
+        plan: TradePlan,
+        sized: SizedTradePlan,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> int:
         with self.service.session_factory() as s:
             row = TradePlanRow(
                 symbol=plan.symbol,
@@ -78,6 +106,22 @@ class PlanningService:
                 sized_json=json.dumps(sized.to_dict()),
             )
             s.add(row)
+            s.flush()
+            s.add(
+                AuditEvent(
+                    actor=actor,
+                    action="plan.create",
+                    target_type="trade_plan",
+                    target_id=str(row.id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code="proposed",
+                    detail_json=json.dumps(
+                        {"symbol": plan.symbol},
+                        sort_keys=True,
+                    ),
+                )
+            )
             s.commit()
             return row.id
 

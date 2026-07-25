@@ -543,7 +543,7 @@ def approve_proposed(
     *,
     actor: str,
     reason: str,
-    request_id: str = "",
+    request_id: str,
 ) -> None:
     """Record one identified approval via a compare-and-set.
 
@@ -552,8 +552,10 @@ def approve_proposed(
     for a concurrent second approver means a conflict -> raises ApprovalConflict.
     The caller commits the state transition and its audit event together.
     """
-    if not actor.strip() or not reason.strip():
-        raise ValueError("approval actor and reason must be non-empty")
+    if not actor.strip() or not reason.strip() or not request_id.strip():
+        raise ValueError(
+            "approval actor, reason, and request_id must be non-empty"
+        )
     idempotency_key = session.execute(
         update(Order)
         .where(Order.id == order_id, Order.status == OrderStatus.PROPOSED.value)

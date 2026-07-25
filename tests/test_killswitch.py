@@ -17,7 +17,12 @@ def test_trip_persists_across_restart(db_url, engine):
     with factory() as s:
         assert KillSwitch.is_tripped(s) is False
     with factory() as s:
-        KillSwitch.trip(s, reason="test trip")
+        KillSwitch.trip(
+            s,
+            reason="test trip",
+            actor="test:killswitch",
+            request_id="killswitch-test-trip",
+        )
         s.commit()
 
     # Simulate a process restart: brand-new engine + session on the same DB file.
@@ -35,24 +40,47 @@ def test_compatibility_writes_reject_an_active_caller_transaction(
     factory = make_session_factory(engine)
     if write == "reset":
         with factory() as session:
-            KillSwitch.trip(session, reason="seed reset")
+            KillSwitch.trip(
+                session,
+                reason="seed reset",
+                actor="test:killswitch",
+                request_id="killswitch-seed-reset",
+            )
 
     with factory() as session:
         KillSwitch.is_tripped(session)
         with pytest.raises(RuntimeError, match="active transaction"):
             if write == "trip":
-                KillSwitch.trip(session, reason="unsafe caller")
+                KillSwitch.trip(
+                    session,
+                    reason="unsafe caller",
+                    actor="test:killswitch",
+                    request_id="killswitch-unsafe-trip",
+                )
             else:
-                KillSwitch.reset(session)
+                KillSwitch.reset(
+                    session,
+                    actor="test:killswitch",
+                    request_id="killswitch-unsafe-reset",
+                )
 
 
 def test_reset_unblocks(engine):
     factory = make_session_factory(engine)
     with factory() as s:
-        KillSwitch.trip(s, reason="test")
+        KillSwitch.trip(
+            s,
+            reason="test",
+            actor="test:killswitch",
+            request_id="killswitch-reset-setup",
+        )
         s.commit()
     with factory() as s:
-        KillSwitch.reset(s)
+        KillSwitch.reset(
+            s,
+            actor="test:killswitch",
+            request_id="killswitch-reset",
+        )
         s.commit()
     with factory() as s:
         assert KillSwitch.is_tripped(s) is False
@@ -73,7 +101,11 @@ def test_daily_loss_from_fills_trips_switch(engine):
     factory = make_session_factory(engine)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
-            s, realized_pnl_today=loss, loss_limit=Decimal("500")
+            s,
+            realized_pnl_today=loss,
+            loss_limit=Decimal("500"),
+            actor="test:killswitch",
+            request_id="killswitch-daily-loss",
         )
         s.commit()
         assert tripped is True
@@ -84,7 +116,11 @@ def test_small_loss_does_not_trip(engine):
     factory = make_session_factory(engine)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
-            s, realized_pnl_today=Decimal("-100"), loss_limit=Decimal("500")
+            s,
+            realized_pnl_today=Decimal("-100"),
+            loss_limit=Decimal("500"),
+            actor="test:killswitch",
+            request_id="killswitch-daily-loss-clear",
         )
         s.commit()
         assert tripped is False

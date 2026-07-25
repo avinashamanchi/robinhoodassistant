@@ -33,14 +33,27 @@ def test_scoped_breakers_persist_and_reset_independently(session_factory):
     data_scope = BreakerScope.data(AssetClass.EQUITY)
     drift_scope = BreakerScope.broker_drift()
 
-    data_state = service.trip(data_scope, "feed disagreement", "daemon", now=NOW)
-    drift_state = service.trip(drift_scope, "position mismatch", "daemon", now=NOW)
+    data_state = service.trip(
+        data_scope,
+        "feed disagreement",
+        "daemon",
+        request_id="breaker-scope-data",
+        now=NOW,
+    )
+    drift_state = service.trip(
+        drift_scope,
+        "position mismatch",
+        "daemon",
+        request_id="breaker-scope-drift",
+        now=NOW,
+    )
     reset_state = service.reset(
         data_scope,
         actor="operator:avi",
         reason="feed healthy",
         prior_health={"provider": "healthy", "age_seconds": 1},
         expected_generation=data_state.generation,
+        request_id="breaker-scope-reset",
         now=NOW,
     )
 
@@ -54,7 +67,13 @@ def test_scoped_breakers_persist_and_reset_independently(session_factory):
 
 def test_breaker_trip_survives_restart(db_url, session_factory):
     scope = BreakerScope.loss(AssetClass.CRYPTO)
-    BreakerService(session_factory).trip(scope, "daily loss", "daemon", now=NOW)
+    BreakerService(session_factory).trip(
+        scope,
+        "daily loss",
+        "daemon",
+        request_id="breaker-restart-trip",
+        now=NOW,
+    )
 
     restarted = BreakerService(
         make_session_factory(create_db_engine(db_url))
@@ -78,7 +97,13 @@ def test_active_for_symbol_returns_only_relevant_scopes(session_factory):
         BreakerScope.liquidity("MSFT"),
     )
     for scope in expected + unrelated:
-        service.trip(scope, f"trip {scope.key}", "daemon", now=NOW)
+        service.trip(
+            scope,
+            f"trip {scope.key}",
+            "daemon",
+            request_id=f"breaker-active-{scope.key}",
+            now=NOW,
+        )
 
     active = service.active_for_symbol("aapl")
 
@@ -100,7 +125,11 @@ def test_reset_requires_reason_and_prior_health(
     service = BreakerService(session_factory)
     scope = BreakerScope.data(AssetClass.EQUITY)
     observed = service.trip(
-        scope, "feed disagreement", "daemon", now=NOW
+        scope,
+        "feed disagreement",
+        "daemon",
+        request_id="breaker-reset-validation-trip",
+        now=NOW,
     )
 
     with pytest.raises(ValueError):
@@ -110,6 +139,7 @@ def test_reset_requires_reason_and_prior_health(
             reason=reason,
             prior_health=prior_health,
             expected_generation=observed.generation,
+            request_id="breaker-reset-validation-reset",
             now=NOW,
         )
 
@@ -120,7 +150,11 @@ def test_each_breaker_mutation_writes_an_audit_event(session_factory):
     service = BreakerService(session_factory)
     scope = BreakerScope(BreakerKind.LIQUIDITY, "AAPL")
     observed = service.trip(
-        scope, "spread too wide", "daemon", now=NOW
+        scope,
+        "spread too wide",
+        "daemon",
+        request_id="breaker-audit-trip",
+        now=NOW,
     )
     service.reset(
         scope,
@@ -128,6 +162,7 @@ def test_each_breaker_mutation_writes_an_audit_event(session_factory):
         reason="spread normalized",
         prior_health={"spread_pct": "0.2"},
         expected_generation=observed.generation,
+        request_id="breaker-audit-reset",
         now=NOW,
     )
 
@@ -156,12 +191,14 @@ def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
         scope,
         "initial feed fault",
         "daemon:first",
+        request_id="breaker-generation-initial",
         now=NOW,
     )
     retripped = service.trip(
         scope,
         "new feed fault",
         "daemon:second",
+        request_id="breaker-generation-retrip",
         now=NOW,
     )
 
@@ -173,6 +210,7 @@ def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
             reason="reset based on stale observation",
             prior_health={"provider": "healthy", "age_seconds": 1},
             expected_generation=observed.generation,
+            request_id="breaker-generation-stale-reset",
             now=NOW,
         )
 
@@ -205,7 +243,13 @@ def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
 def test_reset_with_current_generation_advances_generation(session_factory):
     service = BreakerService(session_factory)
     scope = BreakerScope.liquidity("AAPL")
-    observed = service.trip(scope, "wide spread", "daemon", now=NOW)
+    observed = service.trip(
+        scope,
+        "wide spread",
+        "daemon",
+        request_id="breaker-current-generation-trip",
+        now=NOW,
+    )
 
     reset = service.reset(
         scope,
@@ -213,6 +257,7 @@ def test_reset_with_current_generation_advances_generation(session_factory):
         reason="spread normalized",
         prior_health={"spread_pct": "0.2"},
         expected_generation=observed.generation,
+        request_id="breaker-current-generation-reset",
         now=NOW,
     )
 

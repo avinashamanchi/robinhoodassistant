@@ -41,7 +41,13 @@ def _make_proposed(session_factory) -> int:
 def test_first_approval_succeeds(session_factory):
     oid = _make_proposed(session_factory)
     with session_factory() as s:
-        approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
+        approve_proposed(
+            s,
+            oid,
+            actor="operator:avi",
+            reason="reviewed",
+            request_id="atomic-first-approval",
+        )
         s.commit()
     with session_factory() as s:
         order = s.get(Order, oid)
@@ -54,12 +60,24 @@ def test_first_approval_succeeds(session_factory):
 def test_second_approval_conflicts(session_factory):
     oid = _make_proposed(session_factory)
     with session_factory() as s:
-        approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
+        approve_proposed(
+            s,
+            oid,
+            actor="operator:avi",
+            reason="reviewed",
+            request_id="atomic-initial-approval",
+        )
         s.commit()
     # A second approver sees the row is no longer PROPOSED -> conflict (would be 409).
     with session_factory() as s:
         with pytest.raises(ApprovalConflict):
-            approve_proposed(s, oid, actor="operator:avi", reason="retry")
+            approve_proposed(
+                s,
+                oid,
+                actor="operator:avi",
+                reason="retry",
+                request_id="atomic-retry-approval",
+            )
 
 
 def test_cannot_approve_rejected_order(session_factory):
@@ -70,12 +88,24 @@ def test_cannot_approve_rejected_order(session_factory):
         s.commit()
     with session_factory() as s:
         with pytest.raises(ApprovalConflict):
-            approve_proposed(s, oid, actor="operator:avi", reason="reviewed")
+            approve_proposed(
+                s,
+                oid,
+                actor="operator:avi",
+                reason="reviewed",
+                request_id="atomic-rejected-approval",
+            )
 
 
 @pytest.mark.parametrize("actor,reason", [("", "reviewed"), ("operator:avi", "")])
 def test_approval_identity_is_required(session_factory, actor, reason):
     oid = _make_proposed(session_factory)
     with session_factory() as s:
-        with pytest.raises(ValueError, match="actor and reason"):
-            approve_proposed(s, oid, actor=actor, reason=reason)
+        with pytest.raises(ValueError, match="actor, reason, and request_id"):
+            approve_proposed(
+                s,
+                oid,
+                actor=actor,
+                reason=reason,
+                request_id="atomic-invalid-approval",
+            )

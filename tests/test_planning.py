@@ -68,9 +68,18 @@ def _planning(svc):
     return PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
 
 
+def _analyze(planning, reason):
+    return planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason=reason,
+        request_id=f"planning-{reason.replace(' ', '-')}",
+    )
+
+
 def test_analyze_stores_sized_plan(make_service):
     svc = make_service()
-    out = _planning(svc).analyze("AAPL")
+    out = _analyze(_planning(svc), "store sized plan")
     assert out["plan_id"] > 0
     assert out["sized"]["direction"] == "long"
     assert Decimal(out["sized"]["total_shares"]) > 0
@@ -79,7 +88,7 @@ def test_analyze_stores_sized_plan(make_service):
 def test_approve_decomposes_into_human_gated_typed_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
-    pid = pln.analyze("AAPL")["plan_id"]
+    pid = _analyze(pln, "decompose approved plan")["plan_id"]
     res = pln.approve_plan(
         pid,
         actor="operator:test",
@@ -102,7 +111,7 @@ def test_approve_decomposes_into_human_gated_typed_rules(make_service):
 def test_cancel_plan_cancels_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
-    pid = pln.analyze("AAPL")["plan_id"]
+    pid = _analyze(pln, "cancel plan")["plan_id"]
     pln.approve_plan(
         pid,
         actor="operator:test",
@@ -124,7 +133,12 @@ def test_cancel_plan_cancels_rules(make_service):
 def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service):
     svc = make_service()
     planning = _planning(svc)
-    plan_id = planning.analyze("AAPL")["plan_id"]
+    plan_id = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="planning lifecycle analysis",
+        request_id="planning-lifecycle-analysis",
+    )["plan_id"]
     planning.approve_plan(
         plan_id,
         actor="operator:test",
@@ -181,7 +195,12 @@ def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service)
 def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_service):
     svc = make_service()
     planning = _planning(svc)
-    plan_id = planning.analyze("AAPL")["plan_id"]
+    plan_id = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="planning race analysis",
+        request_id="planning-race-analysis",
+    )["plan_id"]
     planning.approve_plan(
         plan_id,
         actor="operator:test",
@@ -200,7 +219,11 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
             max_quote_age_seconds=10**9,
         )
         barrier.wait(timeout=2)
-        return worker.tick()
+        return worker.tick(
+            actor="daemon:test-worker",
+            reason="planning worker race",
+            request_id="planning-worker-race",
+        )
 
     def cancel_plan():
         barrier.wait(timeout=2)
@@ -273,7 +296,7 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
     sec = Secrets(live_trading_confirm="I_UNDERSTAND_LIVE_TRADING")
     pln = PlanningService(svc_live, _StubAnalyst(_plan()), _provider, sec)
 
-    pid = pln.analyze("AAPL")["plan_id"]
+    pid = _analyze(pln, "promotion gate")["plan_id"]
     res = pln.approve_plan(
         pid,
         actor="operator:test",

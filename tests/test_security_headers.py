@@ -18,6 +18,22 @@ EXPECTED_CSP = (
 )
 
 
+def _assert_hardened(response, *, cache_control="no-store"):
+    assert response.headers.get_list("Content-Security-Policy") == [
+        EXPECTED_CSP
+    ]
+    assert response.headers.get_list("X-Content-Type-Options") == ["nosniff"]
+    assert response.headers.get_list("X-Frame-Options") == ["DENY"]
+    assert response.headers.get_list("Referrer-Policy") == ["no-referrer"]
+    assert response.headers.get_list("Permissions-Policy") == [
+        "camera=(), microphone=(), geolocation=(), payment=()"
+    ]
+    assert response.headers.get_list("X-Request-ID") == [
+        response.json()["error"]["request_id"]
+    ]
+    assert response.headers.get_list("Cache-Control") == [cache_control]
+
+
 class _StubAgent:
     def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
@@ -79,6 +95,7 @@ def test_provider_exception_text_is_not_returned(make_service):
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "provider-secret-response" not in response.text
+    _assert_hardened(response)
 
 
 def test_login_page_and_its_asset_are_anonymous(client):

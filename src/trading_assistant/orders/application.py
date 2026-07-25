@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from uuid import uuid4
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,11 +23,17 @@ class ApprovalCommand:
     actor: str
     reason: str
     now: datetime
-    request_id: str = ""
+    request_id: str
 
     def __post_init__(self) -> None:
-        if not self.actor.strip() or not self.reason.strip():
-            raise ValueError("approval actor and reason must be non-empty")
+        if (
+            not self.actor.strip()
+            or not self.reason.strip()
+            or not self.request_id.strip()
+        ):
+            raise ValueError(
+                "approval actor, reason, and request_id must be non-empty"
+            )
 
 
 @dataclass(frozen=True)
@@ -57,12 +62,11 @@ class OrderApplicationService:
                     f"order {command.order_id} approval already consumed ({status.value})"
                 )
 
-        request_id = command.request_id or uuid4().hex
         if not self.repository.record_approval(
             command.order_id,
             command.actor,
             command.reason,
-            request_id,
+            command.request_id,
             command.now,
         ):
             raise ApprovalConflict(f"order {command.order_id} approval already consumed")

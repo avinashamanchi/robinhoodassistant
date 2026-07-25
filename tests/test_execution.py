@@ -58,7 +58,12 @@ def test_killswitch_blocks_execution(make_service):
     svc = make_service()
     order_id = _propose(svc)["order_id"]
     with svc.session_factory() as s:
-        KillSwitch.trip(s, reason="drill")
+        KillSwitch.trip(
+            s,
+            reason="drill",
+            actor="test:execution",
+            request_id="execution-killswitch-drill",
+        )
         s.commit()
 
     result = _approve(svc, order_id)

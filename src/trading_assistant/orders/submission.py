@@ -105,7 +105,21 @@ class OrderSubmissionService:
             request, snapshot
         )
 
-    def submit(self, order_id: int) -> SubmissionResult:
+    def submit(
+        self,
+        order_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> SubmissionResult:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "submission actor, reason, and request_id must be non-empty"
+            )
         now = self.now()
         with self.session_factory() as session:
             order = session.get(Order, order_id)
@@ -196,6 +210,9 @@ class OrderSubmissionService:
                             None,
                             exc.stable_code,
                             self.now(),
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
                         )
                         return SubmissionResult(
                             order_id, OrderStatus.REJECTED
@@ -207,6 +224,9 @@ class OrderSubmissionService:
                             self.now(),
                             broker_order_id=exc.broker_order_id,
                             error_code="invalid_broker_data",
+                            actor=actor,
+                            context_reason=reason,
+                            request_id=request_id,
                         )
                         return SubmissionResult(
                             order_id,
@@ -220,6 +240,9 @@ class OrderSubmissionService:
                             None,
                             type(exc).__name__,
                             self.now(),
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
                         )
                         return SubmissionResult(
                             order_id, OrderStatus.ACCEPTANCE_UNKNOWN
@@ -234,6 +257,9 @@ class OrderSubmissionService:
                             order_id,
                             identity_error,
                             self.now(),
+                            actor=actor,
+                            context_reason=reason,
+                            request_id=request_id,
                         )
                         return SubmissionResult(
                             order_id,
@@ -251,6 +277,9 @@ class OrderSubmissionService:
                         error_code,
                         self.now(),
                         broker_result.filled_qty,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                     return SubmissionResult(
                         order_id,

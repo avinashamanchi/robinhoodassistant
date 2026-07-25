@@ -71,9 +71,25 @@ def client(make_service, authenticate_client):
 
 def test_analyze_and_plan_flow(client):
     c, svc = client
-    res = c.post("/analyze", json={"symbol": "AAPL"}).json()
+    response = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review AAPL planning inputs",
+        },
+    )
+    res = response.json()
     pid = res["plan_id"]
     assert res["sized"]["direction"] == "long"
+    with svc.session_factory() as session:
+        create_audit = (
+            session.query(AuditEvent)
+            .filter_by(action="plan.create", target_id=str(pid))
+            .one()
+        )
+    assert create_audit.actor == "operator:local"
+    assert create_audit.reason == "review AAPL planning inputs"
+    assert create_audit.request_id == response.headers["X-Request-ID"]
 
     assert any(p["plan_id"] == pid for p in c.get("/plans").json()["plans"])
     detail = c.get(f"/plans/{pid}").json()
@@ -110,6 +126,22 @@ def test_analyze_and_plan_flow(client):
     assert audit.actor == "operator:local"
     assert audit.reason == "review complete"
     assert audit.request_id == cancel_response.headers["X-Request-ID"]
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/analyze", {"symbol": "AAPL", "reason": " "}),
+        ("/propose", {"n": 1, "reason": ""}),
+    ],
+)
+def test_plan_persistence_routes_reject_blank_reason(client, path, body):
+    c, _ = client
+
+    response = c.post(path, json=body)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_plan_404(client):
@@ -150,13 +182,19 @@ def test_plans_ui_approval_posts_a_nonempty_review_reason(client):
     assert "if (!reason)" in page
     assert "jsonPost({ reason })" in page
     assert 'window.prompt("Reason for canceling this plan:")' in page
+    assert 'window.prompt("Reason for analyzing this symbol:")' in page
+    assert 'window.prompt("Reason for generating screened plans:")' in page
     assert "X-CSRF-Token" in page
     assert "X-API-Key" not in page
 
 
 def test_propose_generates_plans(client):
-    c, _ = client
-    res = c.post("/propose", json={"n": 3}).json()
+    c, svc = client
+    response = c.post(
+        "/propose",
+        json={"n": 3, "reason": "review screened candidates"},
+    )
+    res = response.json()
     assert "proposed" in res and "UNPROVEN" in res["note"]
     made = [p for p in res["proposed"] if "plan_id" in p]
     assert made  # at least one plan created from the top screener candidates
@@ -164,3 +202,19 @@ def test_propose_generates_plans(client):
     plan_ids = {p["plan_id"] for p in made}
     listed = {p["plan_id"] for p in c.get("/plans").json()["plans"]}
     assert plan_ids <= listed
+    with svc.session_factory() as session:
+        audits = session.query(AuditEvent).filter(
+            AuditEvent.action == "plan.create",
+            AuditEvent.target_id.in_({str(plan_id) for plan_id in plan_ids}),
+        ).all()
+    assert len(audits) == len(plan_ids)
+    assert {
+        (audit.actor, audit.reason, audit.request_id)
+        for audit in audits
+    } == {
+        (
+            "operator:local",
+            "review screened candidates",
+            response.headers["X-Request-ID"],
+        )
+    }

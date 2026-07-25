@@ -82,8 +82,10 @@
       });
     }
     async function run() {
+      const reason = (window.prompt("Reason for launching this backtest:") || "").trim();
+      if (!reason) return;
       const box = $("report"); clear(box); box.appendChild(el("div", "Running walk-forward…", "empty"));
-      const res = await api("/backtests/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const res = await api("/backtests/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) });
       await refreshRuns();
       if (res.run_id) showReport(res.run_id);
       else { clear(box); box.appendChild(el("div", JSON.stringify(res.detail || res), "empty")); }

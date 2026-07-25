@@ -45,7 +45,14 @@ def test_flash_crash_trips_killswitch_and_no_duplicate_stop(session_factory, moc
     assert loss == Decimal("-2500")
 
     with session_factory() as s:
-        tripped = KillSwitch.evaluate_daily_loss(s, loss, Decimal("500"), EQ)
+        tripped = KillSwitch.evaluate_daily_loss(
+            s,
+            loss,
+            Decimal("500"),
+            EQ,
+            actor="test:stress",
+            request_id="stress-equity-daily-loss",
+        )
         s.commit()
         assert tripped is True
         assert KillSwitch.is_tripped(s, EQ) is True
@@ -122,7 +129,14 @@ def test_crypto_dump_isolates_equity(make_service):
     svc = make_service(market_open=False)  # equity market closed (weekend)
     svc.broker.set_price("BTC/USD", Decimal("100"))
     with svc.session_factory() as s:
-        KillSwitch.evaluate_daily_loss(s, Decimal("-3000"), Decimal("500"), CR)
+        KillSwitch.evaluate_daily_loss(
+            s,
+            Decimal("-3000"),
+            Decimal("500"),
+            CR,
+            actor="test:stress",
+            request_id="stress-crypto-daily-loss",
+        )
         s.commit()
         assert KillSwitch.is_tripped(s, CR) is True
         assert KillSwitch.is_tripped(s, EQ) is False  # equity independent

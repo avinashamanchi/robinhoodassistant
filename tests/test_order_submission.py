@@ -35,6 +35,15 @@ from trading_assistant.risk.clock import FakeClock
 from trading_assistant.service import TradingService
 
 
+def _submit(submission, order_id):
+    return submission.submit(
+        order_id,
+        actor="operator:test",
+        reason="order submission test",
+        request_id=f"order-submission-{order_id}",
+    )
+
+
 def _approved_order(svc) -> int:
     order_id = svc.propose_order(
         "AAPL",
@@ -46,7 +55,13 @@ def _approved_order(svc) -> int:
         request_id="order-submission-proposal",
     )["order_id"]
     svc.order_application.approve(
-        ApprovalCommand(order_id, "operator:avi", "reviewed", utcnow())
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed",
+            utcnow(),
+            "order-submission-approval",
+        )
     )
     return order_id
 
@@ -63,11 +78,11 @@ def test_accept_then_disconnect_becomes_unknown_without_duplicate(make_service):
     svc = make_service(broker=broker)
     order_id = _approved_order(svc)
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert len(broker._orders_by_key) == 1
-    result2 = svc.order_submission.submit(order_id)
+    result2 = _submit(svc.order_submission, order_id)
     assert result2.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert len(broker._orders_by_key) == 1
     assert svc.breakers.is_tripped(BreakerScope.broker_drift()) is False
@@ -93,7 +108,7 @@ def test_synchronous_broker_data_integrity_latches_and_trips_drift(
     service = make_service(broker=broker)
     order_id = _approved_order(service)
 
-    result = service.order_submission.submit(order_id)
+    result = _submit(service.order_submission, order_id)
 
     assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
@@ -117,7 +132,7 @@ def test_broker_call_occurs_after_claim_transaction_commits(make_service):
         return original(order)
 
     svc.broker.submit_order = submit
-    svc.order_submission.submit(order_id)
+    _submit(svc.order_submission, order_id)
 
     assert checked["status"] == OrderStatus.SUBMITTING.value
 
@@ -125,9 +140,13 @@ def test_broker_call_occurs_after_claim_transaction_commits(make_service):
 def test_panic_latch_atomically_prevents_a_later_broker_submit(make_service):
     svc = make_service()
     order_id = _approved_order(svc)
-    panic = svc.reconciliation.panic("operator:avi", "submission race")
+    panic = svc.reconciliation.panic(
+        "operator:avi",
+        "submission race",
+        request_id="order-submission-race-panic",
+    )
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert panic.safe is True
     assert result.status is OrderStatus.REJECTED
@@ -142,9 +161,10 @@ def test_scoped_data_breaker_atomically_prevents_a_later_broker_submit(make_serv
         BreakerScope.data(AssetClass.EQUITY),
         "asset race",
         "daemon",
+        request_id="order-submission-asset-race",
     )
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.REJECTED
     assert "active circuit breaker: data:equity" in result.risk_reasons
@@ -159,7 +179,7 @@ def test_approved_proposal_that_expires_before_submit_never_calls_broker(make_se
         proposal.expires_at = utcnow() - timedelta(seconds=1)
         session.commit()
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.EXPIRED
     assert svc.broker.submit_calls == 0
@@ -189,7 +209,7 @@ def test_expiry_during_snapshot_prevents_submission_claim(make_service):
     svc.snapshot_service.assemble_for_execution = slow_snapshot
     svc.order_submission.now = now
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.EXPIRED
     assert svc.broker.submit_calls == 0
@@ -203,7 +223,7 @@ def test_snapshot_failure_before_claim_leaves_approval_recorded(make_service):
     svc.broker.get_positions = lambda: (_ for _ in ()).throw(ConnectionError("offline"))
 
     try:
-        svc.order_submission.submit(order_id)
+        _submit(svc.order_submission, order_id)
     except ConnectionError:
         pass
     else:  # pragma: no cover - makes the desired provider failure explicit
@@ -223,7 +243,7 @@ def test_only_definitive_broker_rejection_becomes_rejected(make_service):
     svc = make_service(broker=broker)
     order_id = _approved_order(svc)
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.REJECTED
     with svc.session_factory() as session:
@@ -252,14 +272,18 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
     svc = make_service(broker=broker)
     order_id = _approved_order(svc)
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.FILLED
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.FILLED.value
         assert order.acceptance_state == "fill_reconcile_required"
-    report = svc.reconciliation.reconcile()
+    report = svc.reconciliation.reconcile(
+        actor="test:order-submission",
+        reason="order submission reconciliation",
+        request_id="order-submission-reconciliation",
+    )
     snapshot = svc.snapshot_service.assemble_for_execution("AAPL")
 
     assert report.inserted_fills == 0
@@ -308,7 +332,7 @@ def test_synchronous_terminal_partial_fill_preserves_status_and_latches(
     svc = make_service(broker=broker)
     order_id = _approved_order(svc)
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is terminal_status
     with svc.session_factory() as session:
@@ -341,7 +365,7 @@ def test_synchronous_invalid_cumulative_fill_latches_before_return(
     svc = make_service(broker=broker)
     order_id = _approved_order(svc)
 
-    result = svc.order_submission.submit(order_id)
+    result = _submit(svc.order_submission, order_id)
 
     assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert svc.breakers.is_tripped(BreakerScope.broker_drift()) is True
@@ -387,6 +411,9 @@ def test_post_send_cumulative_below_exact_local_fill_never_adopts_terminal_statu
             "",
             utcnow(),
             Decimal("0"),
+            actor="operator:test",
+            reason="post-send exact fill reconciliation",
+            request_id="post-send-exact-fill",
         )
     )
 
@@ -473,6 +500,9 @@ def test_post_send_uses_canonical_fill_quantum(
             "",
             utcnow(),
             authoritative_qty + delta,
+            actor="operator:test",
+            reason="post-send quantum reconciliation",
+            request_id="post-send-quantum",
         )
     )
 
@@ -530,10 +560,11 @@ def test_invalid_submission_identity_is_unknown_latched_and_trips_drift(
             "operator:avi",
             "reviewed identity",
             utcnow(),
+            "order-submission-identity-approval",
         )
     )
 
-    result = service.order_submission.submit(order_id)
+    result = _submit(service.order_submission, order_id)
 
     assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert result.broker_order_id is None
@@ -594,10 +625,11 @@ def test_crypto_submission_identity_accepts_equivalent_symbol_only(
             "operator:avi",
             "reviewed crypto symbol identity",
             utcnow(),
+            "order-submission-crypto-identity-approval",
         )
     )
 
-    result = service.order_submission.submit(order_id)
+    result = _submit(service.order_submission, order_id)
 
     assert result.status is expected_status
     assert (
@@ -657,10 +689,11 @@ def test_submission_never_treats_local_equity_as_broker_slash_crypto(
             "operator:avi",
             "reviewed directional identity",
             utcnow(),
+            "order-submission-directional-identity-approval",
         )
     )
 
-    result = service.order_submission.submit(order_id)
+    result = _submit(service.order_submission, order_id)
 
     assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     assert service.breakers.is_tripped(BreakerScope.broker_drift()) is True
@@ -678,7 +711,7 @@ def test_malformed_position_payload_fails_before_submission_claim(make_service):
     )
 
     with pytest.raises(ValueError, match="invalid Alpaca position"):
-        service.order_submission.submit(order_id)
+        _submit(service.order_submission, order_id)
 
     assert service.broker.submit_calls == 0
     with service.session_factory() as session:

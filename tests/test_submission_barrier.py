@@ -42,6 +42,15 @@ from trading_assistant.risk.submission_barrier import SubmissionBarrier
 from trading_assistant.service import TradingService
 
 
+def _submit(submission, order_id):
+    return submission.submit(
+        order_id,
+        actor="operator:process-test",
+        reason="submission barrier test",
+        request_id=f"submission-barrier-submit-{order_id}",
+    )
+
+
 class _StaticSnapshotService:
     def assemble_for_execution(self, ticker, *, exclude_order_id=None):
         return object()
@@ -416,7 +425,7 @@ def _risk_writer_submission_process(
         utcnow,
     )
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(
             ("ok", result.status.value, tuple(result.risk_reasons))
         )
@@ -432,7 +441,11 @@ def _loss_fill_writer_process(db_url, started, finished, outcome):
             factory,
             _LossFillRaceBroker(),
             OrderRepository(factory),
-        ).reconcile()
+        ).reconcile(
+            actor="test:submission-barrier-process",
+            reason="loss fill writer reconciliation",
+            request_id="loss-fill-writer-reconciliation",
+        )
         outcome.put(("ok", report.inserted_fills))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -497,7 +510,11 @@ def _drift_reconciliation_process(
 
     reconciliation.submission_barrier.hold_writer = observed_hold_writer
     try:
-        report = reconciliation.reconcile()
+        report = reconciliation.reconcile(
+            actor="test:submission-barrier",
+            reason="writer barrier reconciliation",
+            request_id="submission-barrier-reconcile",
+        )
         outcome.put(("ok", tuple(report.broker_drift)))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -532,7 +549,11 @@ def _acceptance_contradiction_recovery_process(
 
     reconciliation.submission_barrier.hold_writer = observed_hold_writer
     try:
-        resolved = reconciliation.reconcile_unknown()
+        resolved = reconciliation.reconcile_unknown(
+            actor="test:submission-barrier",
+            reason="writer barrier unknown reconciliation",
+            request_id="submission-barrier-reconcile-unknown",
+        )
         outcome.put(("ok", resolved))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -570,7 +591,16 @@ def _daily_loss_enforcement_process(
 
     service._realized_pnl_today = observed_realized
     try:
-        outcome.put(("ok", service.enforce_daily_loss_limits()))
+        outcome.put(
+            (
+                "ok",
+                service.enforce_daily_loss_limits(
+                    actor="test:submission-barrier",
+                    reason="daily loss writer barrier",
+                    request_id="daily-loss-writer-barrier",
+                ),
+            )
+        )
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -649,7 +679,7 @@ def _immediate_submission_process(
         utcnow,
     )
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(("ok", result.status.value))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -692,7 +722,7 @@ def _invalid_submission_process(
 
     service.submission_barrier.hold_submission = observed_hold_submission
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(("ok", result.status.value, result.broker_order_id))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -829,7 +859,7 @@ def _loss_checked_submission_process(
         utcnow,
     )
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(
             ("ok", result.status.value, tuple(result.risk_reasons))
         )
@@ -945,7 +975,7 @@ def _counted_submission_process(
         main_lock_attempted,
     )
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(("ok", result.status.value, risk.calls))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}", risk.calls))
@@ -973,6 +1003,7 @@ def _observed_breaker_writer_process(
             BreakerScope.data(AssetClass.EQUITY),
             "writer priority regression",
             "daemon:writer-priority",
+            request_id="writer-priority-regression",
         )
         outcome.put(("ok", "breaker"))
     except BaseException as exc:
@@ -1039,7 +1070,7 @@ def _queued_snapshot_submission_process(
     )
     try:
         submission_started.set()
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(
             ("ok", result.status.value, tuple(result.risk_reasons))
         )
@@ -1080,7 +1111,7 @@ def _submission_process(
         utcnow,
     )
     try:
-        result = service.submit(order_id)
+        result = _submit(service, order_id)
         outcome.put(("ok", result.status.value))
     except BaseException as exc:
         outcome.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -1097,6 +1128,7 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
                 BreakerScope.data(AssetClass.EQUITY),
                 "cross-process feed fault",
                 "daemon:process-test",
+                request_id="cross-process-feed-fault",
             )
         elif writer_kind == "panic":
             from trading_assistant.broker.mock import MockBroker
@@ -1106,13 +1138,19 @@ def _writer_process(db_url, writer_kind, started, finished, outcome):
                 MockBroker(),
                 repository,
                 breakers,
-            ).panic("operator:process-test", "cross-process panic")
+            ).panic(
+                "operator:process-test",
+                "cross-process panic",
+                request_id="cross-process-panic",
+            )
         else:
             with factory() as session:
                 KillSwitch.trip(
                     session,
                     "cross-process compatibility trip",
                     AssetClass.EQUITY,
+                    actor="test:submission-barrier",
+                    request_id="cross-process-compatibility-trip",
                 )
         outcome.put(("ok", writer_kind))
     except BaseException as exc:
@@ -1137,6 +1175,8 @@ def _active_transaction_compatibility_writer_process(
                     session,
                     "must reject lock inversion",
                     AssetClass.EQUITY,
+                    actor="test:submission-barrier",
+                    request_id="lock-inversion-trip",
                 )
             except RuntimeError as exc:
                 outcome.put(("rejected", str(exc)))
@@ -1164,6 +1204,7 @@ def _approved_order(service) -> int:
             "operator:avi",
             "reviewed",
             utcnow(),
+            "submission-barrier-approval",
         )
     )
     return order_id
@@ -1984,7 +2025,7 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
         assert latched.last_error_code == "indeterminate_cancel"
     drift_state = service.breakers.get(BreakerScope.broker_drift())
     assert drift_state is not None and drift_state.tripped is True
-    assert drift_state.actor == "service:cancel"
+    assert drift_state.actor == "operator:process-test"
     assert "ConnectionError" in drift_state.reason
     assert "TimeoutError" in drift_state.reason
 
@@ -2029,7 +2070,11 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
     assert incomplete.daily_pnl_complete is False
     assert incomplete.realized_pnl_today == Decimal("0")
 
-    first = restarted.reconciliation.reconcile()
+    first = restarted.reconciliation.reconcile(
+        actor="test:submission-barrier",
+        reason="restart exact fill reconciliation",
+        request_id="submission-barrier-restart-reconcile",
+    )
     after_exact_truth = restarted.snapshot_service.assemble_for_execution(
         "AAPL"
     )
@@ -2063,13 +2108,18 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
             "authoritative_fill_qty": "1",
         },
         expected_generation=drift_state.generation,
+        request_id="submission-barrier-drift-reset",
     )
     complete = restarted.snapshot_service.assemble_for_execution("AAPL")
     assert complete.broker_reconciled is True
     assert complete.daily_pnl_complete is True
     assert complete.realized_pnl_today == Decimal("-99")
 
-    replay = restarted.reconciliation.reconcile()
+    replay = restarted.reconciliation.reconcile(
+        actor="test:submission-barrier",
+        reason="restart exact fill replay",
+        request_id="submission-barrier-restart-replay",
+    )
     after_replay = restarted.snapshot_service.assemble_for_execution("AAPL")
     assert replay.inserted_fills == 0
     assert after_replay.realized_pnl_today == Decimal("-99")

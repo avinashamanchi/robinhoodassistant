@@ -78,14 +78,18 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _derive_csrf(token: str, application_secret: str) -> str:
-    key = hashlib.sha256(
-        b"trading-assistant/csrf/v1\x00"
-        + application_secret.encode("utf-8")
+def _derive_key(application_secret: str, purpose: bytes) -> bytes:
+    return hmac.new(
+        application_secret.encode("utf-8"),
+        b"trading-assistant/session-keys/v1\x00" + purpose,
+        hashlib.sha256,
     ).digest()
+
+
+def _keyed_hash(value: str, key: bytes) -> str:
     return hmac.new(
         key,
-        token.encode("utf-8"),
+        value.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -95,12 +99,21 @@ class SessionAuth:
         self,
         session_factory,
         *,
+        application_secret: str,
         ttl: timedelta = timedelta(hours=8),
         reauthentication_window: timedelta = timedelta(minutes=5),
         cookie_secure: bool = False,
         now: Callable[[], datetime] = utcnow,
     ) -> None:
+        if not application_secret or not application_secret.strip():
+            raise RuntimeError("APP_API_TOKEN is required")
         self.session_factory = session_factory
+        self._application_secret = application_secret
+        self._session_key = _derive_key(
+            application_secret,
+            b"session-token-lookup",
+        )
+        self._csrf_key = _derive_key(application_secret, b"csrf-token")
         self.ttl = ttl
         self.reauthentication_window = reauthentication_window
         self.cookie_secure = cookie_secure
@@ -121,16 +134,18 @@ class SessionAuth:
     ) -> IssuedSession:
         if not expected_secret or not expected_secret.strip():
             raise RuntimeError("APP_API_TOKEN is required")
+        if not hmac.compare_digest(expected_secret, self._application_secret):
+            raise RuntimeError("session authentication key mismatch")
         if not isinstance(supplied_secret, str) or not hmac.compare_digest(
             supplied_secret, expected_secret
         ):
             raise InvalidCredentials
         token = secrets.token_urlsafe(32)
-        csrf = _derive_csrf(token, expected_secret)
+        csrf = _keyed_hash(token, self._csrf_key)
         now = self.now()
         with self.session_factory() as session:
             row = AuthSession(
-                token_hash=_hash(token),
+                token_hash=_keyed_hash(token, self._session_key),
                 csrf_hash=_hash(csrf),
                 actor=actor,
                 created_at=now,
@@ -145,13 +160,18 @@ class SessionAuth:
     def authenticate(self, token: str) -> SessionPrincipal:
         if not token:
             raise InvalidSession
+        token_hash = _keyed_hash(token, self._session_key)
         with self.session_factory() as session:
             row = session.execute(
                 select(AuthSession).where(
-                    AuthSession.token_hash == _hash(token)
+                    AuthSession.token_hash == token_hash
                 )
             ).scalar_one_or_none()
-            if row is None or row.revoked_at is not None:
+            if (
+                row is None
+                or row.revoked_at is not None
+                or not hmac.compare_digest(row.token_hash, token_hash)
+            ):
                 raise InvalidSession
             if self.now() >= row.expires_at:
                 raise SessionExpired
@@ -173,11 +193,9 @@ class SessionAuth:
                 raise CsrfRejected
         return principal
 
-    def csrf_token(self, token: str, application_secret: str) -> str:
+    def csrf_token(self, token: str) -> str:
         principal = self.authenticate(token)
-        if not application_secret or not application_secret.strip():
-            raise RuntimeError("APP_API_TOKEN is required")
-        csrf = _derive_csrf(token, application_secret)
+        csrf = _keyed_hash(token, self._csrf_key)
         with self.session_factory() as session:
             row = session.get(AuthSession, principal.session_id)
             if row is None or row.revoked_at is not None:
@@ -195,6 +213,8 @@ class SessionAuth:
         principal = self.authenticate(token)
         if not expected_secret or not expected_secret.strip():
             raise RuntimeError("APP_API_TOKEN is required")
+        if not hmac.compare_digest(expected_secret, self._application_secret):
+            raise RuntimeError("session authentication key mismatch")
         if not isinstance(supplied_secret, str) or not hmac.compare_digest(
             supplied_secret, expected_secret
         ):

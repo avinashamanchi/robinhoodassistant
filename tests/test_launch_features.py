@@ -97,11 +97,11 @@ def test_shadow_continues_when_one_candidate_plan_is_invalid(make_service):
     class FailFirstPlanning:
         calls = 0
 
-        def analyze(self, symbol):
+        def analyze(self, symbol, **context):
             self.calls += 1
             if self.calls == 1:
                 raise ValueError("invalid model plan after repair")
-            return planning.analyze(symbol)
+            return planning.analyze(symbol, **context)
 
     flaky = FailFirstPlanning()
     shadow = ShadowRunner(
@@ -154,7 +154,12 @@ def test_explicit_bracket_preference_still_creates_human_gated_rules(make_servic
         }
     )
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
-    pid = planning.analyze("AAPL")["plan_id"]
+    pid = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="single launch analysis",
+        request_id="single-launch-analysis",
+    )["plan_id"]
     res = planning.approve_plan(
         pid,
         actor="operator:avi",
@@ -237,7 +242,12 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
 def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
-    pid = planning.analyze("AAPL")["plan_id"]
+    pid = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="multi-rule launch analysis",
+        request_id="multi-rule-launch-analysis",
+    )["plan_id"]
     planning.approve_plan(
         pid,
         actor="operator:test",
@@ -256,7 +266,12 @@ def test_ladder_plan_still_uses_rules(make_service):
 def test_concurrent_plan_approval_claims_exactly_once(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
-    plan_id = planning.analyze("AAPL")["plan_id"]
+    plan_id = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="launch feature analysis",
+        request_id="launch-feature-analysis",
+    )["plan_id"]
     with svc.session_factory() as session:
         stored = session.get(TradePlanRow, plan_id)
         expected_rule_count = len(

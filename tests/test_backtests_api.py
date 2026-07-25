@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import trading_assistant.backtest.runner as runner
 from trading_assistant.app.main import create_app
+from trading_assistant.db.models import AuditEvent
 
 TOKEN = "test-backtests-operator-secret"
 
@@ -20,13 +21,23 @@ class StubAgent:
 def client(make_service, authenticate_client):
     svc = make_service()
     app = create_app(service=svc, agent=StubAgent(), api_token=TOKEN)
-    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    test_client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
     test_client.headers.update({"X-CSRF-Token": csrf})
     return test_client, svc
 
 
 def _seed(svc, bars=420):
-    run_id, _ = runner.run_synthetic_backtest(svc.session_factory, symbols=["TREND"], bars=bars)
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=bars,
+        actor="test:seed",
+        reason="seed backtest fixture",
+        request_id="backtest-seed",
+    )
     return run_id
 
 
@@ -54,6 +65,7 @@ def test_ui_served(client):
     r = c.get("/backtests/ui")
     assert r.status_code == 200
     assert "Simulated" in r.text  # mandatory disclaimer present in the page
+    assert 'window.prompt("Reason for launching this backtest:")' in r.text
 
 
 def test_run_endpoint_persists(client, monkeypatch):
@@ -62,10 +74,66 @@ def test_run_endpoint_persists(client, monkeypatch):
     monkeypatch.setattr(
         runner,
         "run_synthetic_backtest",
-        lambda sf, symbols=None, **kw: orig(sf, symbols=["TREND"], bars=420),
+        lambda sf, symbols=None, **kw: orig(
+            sf,
+            symbols=["TREND"],
+            bars=420,
+            **kw,
+        ),
     )
-    res = c.post("/backtests/run", json={}).json()
+    response = c.post(
+        "/backtests/run",
+        json={"reason": "compare synthetic strategies"},
+    )
+    res = response.json()
     assert "run_id" in res
     assert res["report"]["disclaimer"].startswith("Simulated")
     # The run is now listable.
     assert any(b["run_id"] == res["run_id"] for b in c.get("/backtests").json()["backtests"])
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="backtest.run",
+            target_id=str(res["run_id"]),
+        ).one()
+    assert audit.actor == "operator:local"
+    assert audit.reason == "compare synthetic strategies"
+    assert audit.request_id == response.headers["X-Request-ID"]
+    assert audit.result_code == "succeeded"
+
+
+def test_run_endpoint_rejects_blank_reason(client):
+    c, _ = client
+
+    response = c.post("/backtests/run", json={"reason": " "})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_failed_backtest_launch_is_sanitized_and_audited(
+    client, monkeypatch
+):
+    c, svc = client
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("provider-secret-backtest-prompt")
+
+    monkeypatch.setattr(runner, "build_synthetic_source", explode)
+
+    response = c.post(
+        "/backtests/run",
+        json={"reason": "failure-path review"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "provider-secret-backtest-prompt" not in response.text
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="backtest.run",
+            result_code="failed",
+        ).one()
+    assert audit.actor == "operator:local"
+    assert audit.reason == "failure-path review"
+    assert audit.request_id == response.headers["X-Request-ID"]
+    assert "provider-secret-backtest-prompt" not in audit.detail_json

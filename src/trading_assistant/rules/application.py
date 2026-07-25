@@ -18,6 +18,7 @@ from trading_assistant.broker.models import (
     OrderType,
 )
 from trading_assistant.db.models import (
+    AuditEvent,
     Order,
     Proposal,
     RiskEvent,
@@ -150,6 +151,9 @@ class RuleApplicationService:
         rule_id: int,
         command: RuleCommand | dict,
         *,
+        actor: str,
+        reason: str,
+        request_id: str,
         now: datetime | None = None,
         reference_price: Decimal | None = None,
         reference_quote=None,
@@ -157,6 +161,14 @@ class RuleApplicationService:
         quote_cache: MutableMapping[str, object] | None = None,
         high_water_mark: Decimal | None = None,
     ) -> RuleOutcome:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "rule proposal actor, reason, and request_id "
+                "must be non-empty"
+            )
         now = now or datetime.now(timezone.utc)
         validated = self._validated(command)
         stored = self.repository.load_rule(lease, rule_id)
@@ -288,6 +300,26 @@ class RuleApplicationService:
                         reason=warning,
                     )
                 )
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="order.propose",
+                    target_type="order",
+                    target_id=str(order.id),
+                    request_id=request_id,
+                    reason=reason,
+                    result_code=order.status,
+                    created_at=now,
+                    detail_json=json.dumps(
+                        {
+                            "source": "conditional_rule",
+                            "rule_id": rule_id,
+                            "rule_group_id": lease.group_id,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            )
             session.commit()
             proposal = {
                 "order_id": order.id,

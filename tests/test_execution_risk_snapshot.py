@@ -28,6 +28,15 @@ from trading_assistant.risk.engine import RiskEngine
 NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 
 
+def _submit(submission, order_id):
+    return submission.submit(
+        order_id,
+        actor="operator:test",
+        reason="execution risk snapshot test",
+        request_id=f"execution-risk-submit-{order_id}",
+    )
+
+
 def order(
     ticker: str = "AAPL",
     notional: str | None = "100",
@@ -204,11 +213,12 @@ def test_concurrent_quantity_limit_approvals_reserve_limit_price(
                 "operator:limit-reservation",
                 "independently reviewed",
                 utcnow(),
+                f"execution-limit-approval-{order_id}",
             )
         )
 
-    first_submission = service.order_submission.submit(first["order_id"])
-    second_submission = service.order_submission.submit(second["order_id"])
+    first_submission = _submit(service.order_submission, first["order_id"])
+    second_submission = _submit(service.order_submission, second["order_id"])
 
     assert first_submission.status is OrderStatus.REJECTED
     assert first_submission.risk_reasons == ("insufficient buying power",)
@@ -261,11 +271,12 @@ def test_concurrent_approvals_cannot_overcommit_buying_power(make_service):
                 "operator:concurrent-test",
                 "independently reviewed",
                 utcnow(),
+                f"execution-concurrent-approval-{order_id}",
             )
         )
 
-    first = service.order_submission.submit(first_id)
-    second = service.order_submission.submit(second_id)
+    first = _submit(service.order_submission, first_id)
+    second = _submit(service.order_submission, second_id)
 
     assert first.status is OrderStatus.REJECTED
     assert first.risk_reasons == ("insufficient buying power",)
@@ -960,11 +971,13 @@ def test_snapshot_contains_only_symbol_relevant_active_breakers(make_service):
         BreakerScope.data(AssetClass.EQUITY),
         "feed disagreement",
         "daemon",
+        request_id="execution-feed-disagreement",
     )
     service.breakers.trip(
         BreakerScope.liquidity("MSFT"),
         "wide spread",
         "daemon",
+        request_id="execution-wide-spread",
     )
 
     snapshot = service.snapshot_service.assemble_for_execution("AAPL")

@@ -52,14 +52,38 @@ class ChatIn(BaseModel):
 
 class BacktestRunIn(BaseModel):
     symbols: list[str] = []
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
 
 
 class AnalyzeIn(BaseModel):
     symbol: str
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
 
 
 class ProposeIn(BaseModel):
     n: int = 3
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
 
 
 class ApprovalIn(BaseModel):
@@ -215,6 +239,7 @@ def create_app(
         session_kwargs["now"] = auth_now
     app.state.session_auth = SessionAuth(
         service.session_factory,
+        application_secret=api_token,
         **session_kwargs,
     )
     app.add_middleware(
@@ -422,11 +447,22 @@ def create_app(
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
-        receipt = service.panic(
-            actor=principal.actor,
-            reason=body.reason,
-            request_id=request.state.request_id,
-        )
+        try:
+            receipt = service.panic(
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
+        except Exception:
+            receipt = {
+                "safe": False,
+                "confirmed_canceled": [],
+                "unconfirmed_order_ids": [],
+                "remote_open_order_ids": [],
+                "message": (
+                    "panic incomplete: safety could not be confirmed"
+                ),
+            }
         if receipt.get("safe") is not True:
             raise ApiError(
                 "panic_incomplete",
@@ -465,7 +501,12 @@ def create_app(
             raise ApiError(
                 "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
             )
-        return _require_planning().analyze(body.symbol)
+        return _require_planning().analyze(
+            body.symbol,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
+        )
 
     @app.get("/plans")
     def list_plans(
@@ -586,7 +627,12 @@ def create_app(
         created = []
         for c in candidates[: body.n]:
             try:
-                out = planning.analyze(c["symbol"])
+                out = planning.analyze(
+                    c["symbol"],
+                    actor=principal.actor,
+                    reason=body.reason,
+                    request_id=request.state.request_id,
+                )
                 created.append({
                     "plan_id": out["plan_id"], "symbol": c["symbol"],
                     "action": out["plan"]["action"], "score": c["score"],
@@ -636,7 +682,11 @@ def create_app(
         from ..backtest.runner import run_synthetic_backtest
 
         run_id, report = run_synthetic_backtest(
-            service.session_factory, symbols=body.symbols or None
+            service.session_factory,
+            symbols=body.symbols or None,
+            actor=principal.actor,
+            reason=body.reason,
+            request_id=request.state.request_id,
         )
         return {"run_id": run_id, "report": report.to_dict()}
 

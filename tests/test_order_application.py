@@ -40,6 +40,7 @@ def test_approval_records_actor_reason_and_audit(make_service):
             "operator:avi",
             "reviewed receipt",
             datetime.now(timezone.utc),
+            "order-application-approval",
         )
     )
 
@@ -56,15 +57,40 @@ def test_approval_requires_non_empty_actor_and_reason(make_service, actor, reaso
     service, order_id = _proposed_order_id(make_service)
     app = OrderApplicationService(service.session_factory)
 
-    with pytest.raises(ValueError, match="actor and reason"):
-        app.approve(ApprovalCommand(order_id, actor, reason, datetime.now(timezone.utc)))
+    with pytest.raises(ValueError, match="actor, reason, and request_id"):
+        app.approve(
+            ApprovalCommand(
+                order_id,
+                actor,
+                reason,
+                datetime.now(timezone.utc),
+                "order-application-invalid-context",
+            )
+        )
+
+
+def test_approval_requires_explicit_non_empty_request_id(make_service):
+    _service, order_id = _proposed_order_id(make_service)
+
+    with pytest.raises(ValueError, match="request_id"):
+        ApprovalCommand(
+            order_id,
+            "operator:avi",
+            "reviewed",
+            datetime.now(timezone.utc),
+            "",
+        )
 
 
 def test_approval_compare_and_set_succeeds_once(make_service):
     service, order_id = _proposed_order_id(make_service)
     app = OrderApplicationService(service.session_factory)
     command = ApprovalCommand(
-        order_id, "operator:avi", "reviewed", datetime.now(timezone.utc)
+        order_id,
+        "operator:avi",
+        "reviewed",
+        datetime.now(timezone.utc),
+        "order-application-repeat",
     )
 
     app.approve(command)
@@ -88,6 +114,7 @@ def test_concurrent_approvals_record_exactly_one_audit_event(make_service):
                     "operator:avi",
                     "reviewed concurrently",
                     datetime.now(timezone.utc),
+                    "order-application-concurrent",
                 )
             )
             outcomes.append("approved")
@@ -110,7 +137,11 @@ def test_submission_claim_succeeds_once_after_approval(make_service):
     app = OrderApplicationService(service.session_factory)
     app.approve(
         ApprovalCommand(
-            order_id, "operator:avi", "reviewed", datetime.now(timezone.utc)
+            order_id,
+            "operator:avi",
+            "reviewed",
+            datetime.now(timezone.utc),
+            "order-application-submission-claim",
         )
     )
 
@@ -131,7 +162,13 @@ def test_expired_approval_retry_does_not_overwrite_submission_claim(make_service
     service, order_id = _proposed_order_id(make_service)
     app = OrderApplicationService(service.session_factory)
     approved_at = datetime.now(timezone.utc)
-    command = ApprovalCommand(order_id, "operator:avi", "reviewed", approved_at)
+    command = ApprovalCommand(
+        order_id,
+        "operator:avi",
+        "reviewed",
+        approved_at,
+        "order-application-expiry",
+    )
     app.approve(command)
     assert app.repository.claim_submission(
         order_id, approved_at, ("operator_global", "equity")
@@ -144,6 +181,7 @@ def test_expired_approval_retry_does_not_overwrite_submission_claim(make_service
                 "operator:avi",
                 "retry after submission claim",
                 approved_at.replace(year=approved_at.year + 1),
+                "order-application-expiry-retry",
             )
         )
 

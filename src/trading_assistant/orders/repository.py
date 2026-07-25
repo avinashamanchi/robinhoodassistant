@@ -172,8 +172,20 @@ class OrderRepository:
         error_code: str,
         now: datetime,
         filled_qty: Decimal = Decimal(0),
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> OrderStatus:
         """Record the single definitive or indeterminate post-send outcome."""
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
+            raise ValueError(
+                "submission result actor, reason, and request_id "
+                "must be non-empty"
+            )
         if status not in {
             OrderStatus.SUBMITTED,
             OrderStatus.PARTIALLY_FILLED,
@@ -278,8 +290,10 @@ class OrderRepository:
                     session,
                     BreakerScope.broker_drift(),
                     drift_reason,
-                    "service:submission",
+                    actor,
+                    request_id=request_id,
                     now=now,
+                    audit_reason=reason,
                 )
             if persisted_status is OrderStatus.ACCEPTANCE_UNKNOWN:
                 source_rule_group_id = session.scalar(
@@ -304,6 +318,10 @@ class OrderRepository:
         order_id: int,
         reason: str,
         now: datetime,
+        *,
+        actor: str,
+        context_reason: str,
+        request_id: str,
     ) -> None:
         """Atomically latch an indeterminate post-send identity and drift."""
         self.record_invalid_broker_data(
@@ -312,6 +330,9 @@ class OrderRepository:
             now,
             broker_order_id=None,
             error_code="invalid_broker_identity",
+            actor=actor,
+            context_reason=context_reason,
+            request_id=request_id,
         )
 
     def record_invalid_broker_data(
@@ -322,11 +343,22 @@ class OrderRepository:
         *,
         broker_order_id: str | None,
         error_code: str,
+        actor: str,
+        context_reason: str,
+        request_id: str,
     ) -> None:
         """Atomically latch malformed synchronous broker truth and drift."""
         reason = reason.strip()
+        actor = actor.strip()
+        context_reason = context_reason.strip()
+        request_id = request_id.strip()
         if not reason:
             raise ValueError("invalid broker data reason must be non-empty")
+        if not actor or not context_reason or not request_id:
+            raise ValueError(
+                "invalid broker data actor, reason, and request_id "
+                "must be non-empty"
+            )
         if error_code not in {
             "invalid_broker_data",
             "invalid_broker_identity",
@@ -373,9 +405,11 @@ class OrderRepository:
             trip_in_session(
                 session,
                 BreakerScope.broker_drift(),
-                f"invalid broker submission data for order {order_id}: {reason}",
-                "service:submission",
+                f"invalid broker submission data for order {order_id}",
+                actor,
+                request_id=request_id,
                 now=now,
+                audit_reason=context_reason,
             )
             session.commit()
 
@@ -437,6 +471,10 @@ class OrderRepository:
         status: OrderStatus,
         filled_qty: Decimal,
         now: datetime,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> bool:
         """Atomically persist acceptance and latch unresolved cumulative fills."""
         if broker_order_id is None:
@@ -526,8 +564,10 @@ class OrderRepository:
                     session,
                     BreakerScope.broker_drift(),
                     drift_reason,
-                    "service:reconciliation",
+                    actor,
                     now=now,
+                    request_id=request_id,
+                    audit_reason=reason,
                 )
             session.commit()
             return not exact_fill_overflow

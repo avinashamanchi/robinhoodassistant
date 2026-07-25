@@ -11,8 +11,8 @@ from sqlalchemy import event, func, select
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import Position
-from trading_assistant.db.models import Fill, Order
+from trading_assistant.broker.models import OrderResult, OrderStatus, Position
+from trading_assistant.db.models import AuditEvent, Fill, Order
 from trading_assistant.risk.breakers import BreakerScope
 
 
@@ -91,6 +91,61 @@ def test_cancel_live_order(make_service):
         reason="hardening duplicate cancellation",
         request_id="hardening-test-cancel-duplicate",
     )  # cannot cancel twice
+
+
+def test_cancel_nested_reconciliation_fault_keeps_operator_provenance(
+    make_service,
+):
+    class PostCancelDriftBroker(MockBroker):
+        expose_drift = False
+
+        def cancel_order(self, order_id):
+            result = super().cancel_order(order_id)
+            self.expose_drift = True
+            return result
+
+        def get_open_orders(self):
+            rows = super().get_open_orders()
+            if self.expose_drift:
+                rows.append(
+                    OrderResult(
+                        "untracked-client-order",
+                        "untracked-broker-order",
+                        OrderStatus.SUBMITTED,
+                    )
+                )
+            return rows
+
+    service = make_service(broker=PostCancelDriftBroker())
+    order_id = _submitted(service)
+    with service.session_factory() as session:
+        prior_audit_id = session.scalar(
+            select(func.max(AuditEvent.id))
+        ) or 0
+
+    result = service.cancel_live_order(
+        order_id,
+        actor="operator:avi",
+        reason="operator reviewed nested reconciliation",
+        request_id="cancel-nested-reconciliation",
+    )
+
+    assert result["status"] == "canceled"
+    with service.session_factory() as session:
+        audits = session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.id > prior_audit_id)
+            .order_by(AuditEvent.id)
+        ).all()
+    assert {
+        "circuit_breaker.trip",
+        "orders.sync",
+        "order.cancel",
+    }.issubset({audit.action for audit in audits})
+    for audit in audits:
+        assert audit.actor == "operator:avi"
+        assert audit.reason == "operator reviewed nested reconciliation"
+        assert audit.request_id == "cancel-nested-reconciliation"
 
 
 def test_operator_mutation_services_require_explicit_context(make_service):
@@ -286,12 +341,27 @@ def test_killswitch_drill(make_service):
         )
         s.commit()
 
-    tripped = svc.enforce_daily_loss_limits()
+    tripped = svc.enforce_daily_loss_limits(
+        actor="daemon:daily-loss",
+        reason="scheduled daily loss enforcement",
+        request_id="daily-loss-cycle",
+    )
     assert tripped["equity"] is True
     assert tripped["crypto"] is False          # crypto independent
     loss_state = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
     assert loss_state is not None
     assert loss_state.actor == "daemon:daily-loss"
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="circuit_breaker.trip")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "daemon:daily-loss"
+    assert audit.reason == "scheduled daily loss enforcement"
+    assert audit.request_id == "daily-loss-cycle"
 
     # New equity orders are now blocked...
     blocked = svc.propose_order(
@@ -333,11 +403,22 @@ def test_killswitch_drill(make_service):
 def test_operational_trip_all_uses_process_safe_global_breaker(make_service):
     svc = make_service()
 
-    svc.trip_all_killswitches("startup reconciliation failed")
+    svc.trip_all_killswitches(
+        actor="daemon:startup",
+        reason="startup reconciliation failed",
+        request_id="startup-reconciliation-failure",
+    )
 
     state = svc.breakers.get(BreakerScope.operator_global())
     assert state is not None and state.tripped is True
-    assert state.actor == "daemon:operations"
+    assert state.actor == "daemon:startup"
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.trip"
+        ).one()
+    assert audit.actor == "daemon:startup"
+    assert audit.reason == "startup reconciliation failed"
+    assert audit.request_id == "startup-reconciliation-failure"
 
 
 # ── panic button (D5) ───────────────────────────────────────────

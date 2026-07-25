@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,6 +29,7 @@ from trading_assistant.db.models import (
     FILL_RECONCILIATION_QUARANTINED,
     FILL_RECONCILIATION_SUPERSEDED,
     FILL_RECONCILIATION_TRUSTED,
+    AuditEvent,
     Fill,
     Order,
     OrderStateMachine,
@@ -72,10 +74,51 @@ _LOCAL_TERMINAL_STATUSES = {
 }
 
 
+def _require_context(
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> tuple[str, str, str]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "reconciliation actor, reason, and request_id must be non-empty"
+        )
+    return actor, reason, request_id
+
+
 def _normalized_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _audit_reconciliation_mutation(
+    session: Session,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    result_code: str,
+    detail: dict[str, object] | None = None,
+) -> None:
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            request_id=request_id,
+            reason=reason,
+            result_code=result_code,
+            detail_json=json.dumps(detail or {}, sort_keys=True),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -111,17 +154,45 @@ class ReconciliationService:
         self.broker_key = broker.reconciliation_key
         self.submission_barrier = SubmissionBarrier(session_factory)
 
-    def reconcile_unknown(self) -> tuple[int, tuple[int, ...]]:
+    def reconcile_unknown(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, tuple[int, ...]]:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         with self.submission_barrier.hold_writer():
             drift: list[str] = []
-            resolved, unresolved, _ = self._resolve_unknown(drift)
-            self._clear_reconciled_rule_groups()
-            self._trip_reconciliation_faults(drift, unresolved)
+            resolved, unresolved, _ = self._resolve_unknown(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._clear_reconciled_rule_groups(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._trip_reconciliation_faults(
+                drift,
+                unresolved,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             return resolved, unresolved
 
     def _resolve_unknown(
         self,
         drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[int, tuple[int, ...], tuple[tuple[int, OrderResult], ...]]:
         with self.session_factory() as session:
             rows = session.execute(
@@ -149,6 +220,9 @@ class ReconciliationService:
                 self._latch_order_ids(
                     (order_id,),
                     "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 drift.append(
                     f"local order {order_id} invalid cumulative filled_qty: {exc}"
@@ -170,6 +244,9 @@ class ReconciliationService:
                 self._latch_order_ids(
                     (order_id,),
                     "invalid_broker_identity",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 drift.append(
                     f"local order {order_id} has invalid broker identity: "
@@ -188,6 +265,9 @@ class ReconciliationService:
                 remote.status,
                 remote.filled_qty,
                 datetime.now(timezone.utc),
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             ):
                 resolved += 1
                 resolved_results.append((order_id, remote))
@@ -199,29 +279,70 @@ class ReconciliationService:
             tuple(resolved_results),
         )
 
-    def reconcile(self) -> ReconciliationReport:
+    def reconcile(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> ReconciliationReport:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
         with self.submission_barrier.hold_writer():
             drift: list[str] = []
-            self._quarantine_legacy_fills()
-            resolved, unresolved, resolved_results = self._resolve_unknown(drift)
+            self._quarantine_legacy_fills(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            resolved, unresolved, resolved_results = self._resolve_unknown(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             (
                 inserted_fills,
                 invalid_fill_order_ids,
                 exact_fill_stream_complete,
             ) = (
-                self._reconcile_fill_activities(drift)
+                self._reconcile_fill_activities(
+                    drift,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
             )
             synced, synthetic_fills = self._reconcile_statuses(
                 drift,
                 prefetched_results=resolved_results,
                 blocked_fill_order_ids=invalid_fill_order_ids,
                 exact_fill_stream_complete=exact_fill_stream_complete,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             inserted_fills += synthetic_fills
             self._detect_quarantined_fills(drift)
-            self._clear_reconciled_rule_groups()
-            self._detect_open_order_drift(drift)
-            self._trip_reconciliation_faults(drift, unresolved)
+            self._clear_reconciled_rule_groups(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._detect_open_order_drift(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._trip_reconciliation_faults(
+                drift,
+                unresolved,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
             return ReconciliationReport(
                 resolved_unknown=resolved,
                 unresolved_unknown=unresolved,
@@ -230,7 +351,13 @@ class ReconciliationService:
                 broker_drift=tuple(drift),
             )
 
-    def _clear_reconciled_rule_groups(self) -> None:
+    def _clear_reconciled_rule_groups(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
         """Clear only groups whose linked outbox has no unresolved acceptance.
 
         This method intentionally lives in ReconciliationService: submission and
@@ -262,7 +389,7 @@ class ReconciliationService:
                     .limit(1)
                 )
                 if unresolved is None:
-                    session.execute(
+                    result = session.execute(
                         update(RuleGroup)
                         .where(
                             RuleGroup.id == group_id,
@@ -273,6 +400,17 @@ class ReconciliationService:
                             updated_at=datetime.now(timezone.utc),
                         )
                     )
+                    if result.rowcount:
+                        _audit_reconciliation_mutation(
+                            session,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            action="rule_group.reconcile",
+                            target_type="rule_group",
+                            target_id=str(group_id),
+                            result_code="cleared",
+                        )
             session.commit()
 
     @staticmethod
@@ -293,6 +431,10 @@ class ReconciliationService:
         self,
         order_ids: tuple[int, ...] | list[int],
         error_code: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[int, ...]:
         unique_ids = tuple(sorted(set(order_ids)))
         if not unique_ids:
@@ -304,7 +446,17 @@ class ReconciliationService:
                 ).all()
                 latched = tuple(order.id for order in orders)
                 for order in orders:
-                    self._latch_order_in_session(order, error_code)
+                    if self._latch_order_in_session(order, error_code):
+                        _audit_reconciliation_mutation(
+                            session,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            action="order.reconcile_latch",
+                            target_type="order",
+                            target_id=str(order.id),
+                            result_code=error_code,
+                        )
                 session.commit()
                 return latched
 
@@ -312,6 +464,10 @@ class ReconciliationService:
         self,
         broker_order_id: str | None,
         error_code: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[int, ...]:
         if not broker_order_id:
             return ()
@@ -323,9 +479,21 @@ class ReconciliationService:
                     )
                 ).all()
             )
-        return self._latch_order_ids(list(order_ids), error_code)
+        return self._latch_order_ids(
+            list(order_ids),
+            error_code,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
 
-    def _quarantine_legacy_fills(self) -> None:
+    def _quarantine_legacy_fills(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
         """Make every unidentified direct-path row explicitly untrusted."""
         with self.session_factory() as session:
             fills = session.scalars(select(Fill)).all()
@@ -352,6 +520,16 @@ class ReconciliationService:
                             or changed
                         )
             if changed:
+                _audit_reconciliation_mutation(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="fills.reconcile",
+                    target_type="fill",
+                    target_id="legacy",
+                    result_code="quarantined",
+                )
                 session.commit()
 
     def _detect_quarantined_fills(self, drift: list[str]) -> None:
@@ -372,6 +550,10 @@ class ReconciliationService:
         self,
         drift: list[str],
         unresolved_order_ids: tuple[int, ...] = (),
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> None:
         faults = list(drift)
         if unresolved_order_ids:
@@ -387,7 +569,9 @@ class ReconciliationService:
         self.breakers.trip(
             BreakerScope.broker_drift(),
             f"broker reconciliation fault: {detail}",
-            "daemon:reconciliation",
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
         )
 
     def _cursor_snapshot(self) -> tuple[str | None, datetime | None, int | None]:
@@ -440,6 +624,10 @@ class ReconciliationService:
         order: Order,
         aggregate_exact_qty: Decimal,
         drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> bool:
         detail = self._quantity_overfill_detail(
             order,
@@ -456,13 +644,19 @@ class ReconciliationService:
             session,
             BreakerScope.broker_drift(),
             detail,
-            "daemon:reconciliation",
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
         )
         return True
 
     def _reconcile_fill_activities(
         self,
         drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[int, frozenset[int], bool]:
         activity_reader = getattr(self.broker, "get_fill_activities", None)
         if not callable(activity_reader):
@@ -475,6 +669,9 @@ class ReconciliationService:
             blocked_order_ids = self._latch_broker_order_id(
                 exc.broker_order_id,
                 "invalid_fill_activity",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             drift.append(f"invalid fill activity payload: {exc}")
             return 0, frozenset(blocked_order_ids), False
@@ -583,6 +780,9 @@ class ReconciliationService:
                             order,
                             aggregate_exact_qty,
                             drift,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
                         ):
                             blocked_order_ids.add(order.id)
                         continue
@@ -622,6 +822,9 @@ class ReconciliationService:
                             order,
                             projected_exact_qty,
                             drift,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
                         )
                     ):
                         blocked_order_ids.add(order.id)
@@ -836,6 +1039,9 @@ class ReconciliationService:
         prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
         blocked_fill_order_ids: frozenset[int] = frozenset(),
         exact_fill_stream_complete: bool = False,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[int, int]:
         needs_status_reconciliation = or_(
             Order.status.in_(
@@ -878,6 +1084,9 @@ class ReconciliationService:
                 self._latch_order_ids(
                     (order_id,),
                     "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 drift.append(
                     f"local order {order_id} invalid cumulative filled_qty: {exc}"
@@ -968,6 +1177,9 @@ class ReconciliationService:
                     order,
                     authoritative_qty,
                     drift,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 ):
                     session.commit()
                     continue
@@ -1203,13 +1415,23 @@ class ReconciliationService:
                 session.commit()
         return len(results), inserted
 
-    def _detect_open_order_drift(self, drift: list[str]) -> None:
+    def _detect_open_order_drift(
+        self,
+        drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
         try:
             remote_open = self.broker.get_open_orders()
         except BrokerDataIntegrityError as exc:
             self._latch_broker_order_id(
                 exc.broker_order_id,
                 "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             drift.append(f"open order invalid cumulative filled_qty: {exc}")
             return
@@ -1221,6 +1443,9 @@ class ReconciliationService:
                 self._latch_broker_order_id(
                     remote.broker_order_id,
                     "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 drift.append(
                     "open order invalid cumulative filled_qty "
@@ -1311,12 +1536,13 @@ class ReconciliationService:
         actor: str,
         reason: str,
         *,
-        request_id: str = "",
+        request_id: str,
     ) -> PanicReport:
         actor = actor.strip()
         reason = reason.strip()
-        if not actor or not reason:
-            raise ValueError("panic actor and reason must be non-empty")
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
 
         # The durable global latch is the first side effect. No broker call occurs
         # until its transaction is closed.
@@ -1325,6 +1551,7 @@ class ReconciliationService:
             reason=f"panic by {actor}: {reason}",
             actor=actor,
             request_id=request_id,
+            audit_reason=reason,
         )
 
         with self.session_factory() as session:
@@ -1346,7 +1573,11 @@ class ReconciliationService:
             )
             session.commit()
 
-        self.reconcile_unknown()
+        self.reconcile_unknown(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
 
         with self.session_factory() as session:
             local_rows = session.execute(
@@ -1367,6 +1598,9 @@ class ReconciliationService:
             self._latch_broker_order_id(
                 exc.broker_order_id,
                 "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             panic_drift.append(
                 f"panic open-order invalid cumulative filled_qty: {exc}"
@@ -1384,6 +1618,9 @@ class ReconciliationService:
                     self._latch_broker_order_id(
                         remote.broker_order_id,
                         "invalid_cumulative_fill",
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                 panic_drift.append(
                     "panic open-order invalid cumulative filled_qty "
@@ -1427,6 +1664,9 @@ class ReconciliationService:
                 self._latch_order_ids(
                     local_by_broker_id.get(broker_order_id, []),
                     "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 panic_drift.append(
                     f"panic order {broker_order_id} invalid cumulative "
@@ -1439,6 +1679,9 @@ class ReconciliationService:
                 self._latch_order_ids(
                     local_by_broker_id.get(broker_order_id, []),
                     "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 panic_drift.append(
                     f"panic order {broker_order_id} invalid cumulative "
@@ -1454,6 +1697,9 @@ class ReconciliationService:
                     self._persist_verified_status(
                         local_by_broker_id.get(broker_order_id, ()),
                         verified,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                 )
 
@@ -1463,6 +1709,9 @@ class ReconciliationService:
             self._latch_broker_order_id(
                 exc.broker_order_id,
                 "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             panic_drift.append(
                 f"panic final open-order invalid cumulative filled_qty: {exc}"
@@ -1489,6 +1738,9 @@ class ReconciliationService:
                     self._latch_broker_order_id(
                         remote.broker_order_id,
                         "invalid_cumulative_fill",
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     )
                 panic_drift.append(
                     "panic final open-order invalid cumulative filled_qty "
@@ -1530,7 +1782,12 @@ class ReconciliationService:
             and not local_unconfirmed
             and not remote_open_ids
         )
-        self._trip_reconciliation_faults(panic_drift)
+        self._trip_reconciliation_faults(
+            panic_drift,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         if safe:
             message = "panic verified: no local unknown/open or broker open orders remain"
         else:
@@ -1550,7 +1807,13 @@ class ReconciliationService:
         )
 
     def _persist_verified_status(
-        self, local_order_ids: tuple[int, ...] | list[int], remote: OrderResult
+        self,
+        local_order_ids: tuple[int, ...] | list[int],
+        remote: OrderResult,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
     ) -> tuple[str, ...]:
         if not local_order_ids:
             return ()
@@ -1558,6 +1821,9 @@ class ReconciliationService:
             self._latch_order_ids(
                 list(local_order_ids),
                 "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
             return (
                 "panic verified status has invalid cumulative filled_qty "
@@ -1619,6 +1885,9 @@ class ReconciliationService:
                         order,
                         authoritative_qty,
                         faults,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
                     ):
                         continue
                     fill_truth_complete = (
