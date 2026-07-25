@@ -28,6 +28,7 @@ from trading_assistant.dependencies import (
 )
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.clock import MarketClockObservation
 from trading_assistant.risk.engine import RiskEngine
 
 
@@ -49,6 +50,12 @@ class _FailingProviderClock:
             raise ConnectionError(self.marker)
         return NOW - timedelta(hours=2)
 
+    def observe(self, at):
+        return MarketClockObservation(
+            is_open=self.is_open(at),
+            most_recent_open=self.most_recent_open(at),
+        )
+
     def next_open(self, at=None):  # pragma: no cover - contract guard
         raise AssertionError("snapshot must not request the next market open")
 
@@ -68,6 +75,13 @@ class _ObservedClock:
     def most_recent_open(self, at=None):
         self.observations.append(("most_recent_open", at))
         return self.boundary
+
+    def observe(self, at):
+        self.observations.append(("observe", at))
+        return MarketClockObservation(
+            is_open=True,
+            most_recent_open=self.boundary,
+        )
 
     def next_open(self, at=None):  # pragma: no cover - contract guard
         raise AssertionError("snapshot must not request the next market open")
@@ -262,10 +276,7 @@ def test_snapshot_captures_one_observation_before_provider_io_and_passes_it_to_c
     assert now_calls == 1
     assert events[0] == "observation"
     assert snapshot.as_of == NOW
-    assert clock.observations == [
-        ("is_open", NOW),
-        ("most_recent_open", NOW),
-    ]
+    assert clock.observations == [("observe", NOW)]
 
 
 @pytest.mark.parametrize(
@@ -361,12 +372,20 @@ def test_correct_past_market_boundary_includes_large_loss_and_rejects_risk(
     assert "daily total-loss limit reached" in result.reasons
 
 
-@pytest.mark.parametrize(
-    "raw_is_open",
-    ["false", 0, 1, None],
-    ids=["string-false", "integer-zero", "integer-one", "none"],
-)
-def test_invalid_alpaca_market_state_is_required_dependency_failure(
+def _alpaca_session(
+    *,
+    session_open=datetime(2026, 7, 24, 9, 30),
+    session_close=datetime(2026, 7, 24, 16),
+):
+    return SimpleNamespace(
+        date=datetime(2026, 7, 24).date(),
+        open=session_open,
+        close=session_close,
+    )
+
+
+@pytest.mark.parametrize("raw_is_open", ["false", 0, 1, None])
+def test_historical_snapshot_uses_calendar_not_malformed_later_current_state(
     make_service,
     raw_is_open,
 ):
@@ -375,8 +394,35 @@ def test_invalid_alpaca_market_state_is_required_dependency_failure(
     service._clocks[AssetClass.EQUITY] = AlpacaClock(
         SimpleNamespace(
             get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+            get_calendar=lambda _request: [_alpaca_session()],
+        )
+    )
+
+    snapshot = service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert snapshot.market_clock_complete is True
+    assert snapshot.market_open is True
+    assert snapshot.daily_pnl_complete is True
+
+
+@pytest.mark.parametrize(
+    "malformed_open",
+    ["provider-secret-open", 0, 1, None],
+    ids=["string", "integer-zero", "integer-one", "none"],
+)
+def test_malformed_alpaca_calendar_is_required_dependency_and_optional_incomplete(
+    make_service,
+    risk_config,
+    caplog,
+    malformed_open,
+):
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service._clocks[AssetClass.EQUITY] = AlpacaClock(
+        SimpleNamespace(
+            get_clock=lambda: SimpleNamespace(is_open=True),
             get_calendar=lambda _request: [
-                SimpleNamespace(open=NOW - timedelta(hours=3))
+                _alpaca_session(session_open=malformed_open)
             ],
         )
     )
@@ -386,28 +432,6 @@ def test_invalid_alpaca_market_state_is_required_dependency_failure(
 
     assert str(raised.value) == "required dependency unavailable"
     assert raised.value.__cause__ is None
-
-
-@pytest.mark.parametrize(
-    "raw_is_open",
-    ["false", 0, 1, None],
-    ids=["string-false", "integer-zero", "integer-one", "none"],
-)
-def test_invalid_alpaca_market_state_is_explicitly_incomplete_when_optional(
-    make_service,
-    risk_config,
-    raw_is_open,
-):
-    service = make_service(quote_now=lambda: NOW)
-    service.snapshot_service.now = lambda: NOW
-    service._clocks[AssetClass.EQUITY] = AlpacaClock(
-        SimpleNamespace(
-            get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
-            get_calendar=lambda _request: [
-                SimpleNamespace(open=NOW - timedelta(hours=3))
-            ],
-        )
-    )
 
     with service.session_factory() as session:
         snapshot = service.assemble_snapshot(
@@ -420,6 +444,7 @@ def test_invalid_alpaca_market_state_is_explicitly_incomplete_when_optional(
     assert snapshot.daily_pnl_complete is False
     assert snapshot.market_open is False
     assert RiskEngine(risk_config).check(order(), snapshot).rejected is True
+    assert "provider-secret-open" not in caplog.text
 
 
 def _pending(

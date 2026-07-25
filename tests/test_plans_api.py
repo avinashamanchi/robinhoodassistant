@@ -69,15 +69,52 @@ def _install_equity_clock(service, clock) -> None:
     service.broker._now = lambda: CLOCK_NOW
 
 
-def _invalid_alpaca_clock(raw_is_open, marker: str):
+def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
     client = SimpleNamespace(
         provider_marker=marker,
-        get_clock=lambda: SimpleNamespace(is_open=raw_is_open),
+        get_clock=lambda: SimpleNamespace(is_open=True),
         get_calendar=lambda _request: [
-            SimpleNamespace(open=CLOCK_NOW - timedelta(hours=3))
+            SimpleNamespace(
+                date=CLOCK_NOW.date(),
+                open=raw_session_open,
+                close=datetime(2026, 7, 24, 16),
+            )
         ],
     )
     return AlpacaClock(client)
+
+
+def _race_alpaca_clock(later_current_state: bool):
+    calls = {"clock": 0, "calendar": 0}
+
+    def get_clock():
+        calls["clock"] += 1
+        return SimpleNamespace(is_open=later_current_state)
+
+    def get_calendar(_request):
+        calls["calendar"] += 1
+        return [
+            SimpleNamespace(
+                date=datetime(2026, 7, 23).date(),
+                open=datetime(2026, 7, 23, 9, 30),
+                close=datetime(2026, 7, 23, 16),
+            ),
+            SimpleNamespace(
+                date=datetime(2026, 7, 24).date(),
+                open=datetime(2026, 7, 24, 9, 30),
+                close=datetime(2026, 7, 24, 16),
+            ),
+        ]
+
+    return (
+        AlpacaClock(
+            SimpleNamespace(
+                get_clock=get_clock,
+                get_calendar=get_calendar,
+            )
+        ),
+        calls,
+    )
 
 
 def _plan():
@@ -531,7 +568,7 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
                 "symbol": "AAPL",
                 "reason": "analyze with required market clock",
             },
-            "is_open",
+            "observe",
             503,
         ),
         (
@@ -540,7 +577,7 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
                 "n": 2,
                 "reason": "propose with required market clock",
             },
-            "most_recent_open",
+            "observe",
             200,
         ),
     ],
@@ -742,23 +779,23 @@ def test_planning_workflows_reject_future_market_boundary_with_large_loss(
     ],
 )
 @pytest.mark.parametrize(
-    "raw_is_open",
-    ["false", 0, 1, None],
-    ids=["string-false", "integer-zero", "integer-one", "none"],
+    "raw_session_open",
+    ["provider-secret-invalid-planning-clock", 0, 1, None],
+    ids=["secret-string", "integer-zero", "integer-one", "none"],
 )
-def test_planning_workflows_reject_invalid_alpaca_market_state_and_redact_provider(
+def test_planning_workflows_reject_malformed_alpaca_calendar_and_redact_provider(
     client,
     caplog,
     path,
     body,
     expected_status,
-    raw_is_open,
+    raw_session_open,
 ):
     c, svc = client
     marker = "provider-secret-invalid-planning-clock"
     _install_equity_clock(
         svc,
-        _invalid_alpaca_clock(raw_is_open, marker),
+        _malformed_alpaca_calendar_clock(raw_session_open, marker),
     )
 
     response = c.post(path, json=body)
@@ -802,7 +839,55 @@ def test_planning_workflows_reject_invalid_alpaca_market_state_and_redact_provid
     )
     assert marker not in exposed
     assert "BrokerDataIntegrityError" not in exposed
-    assert "invalid Alpaca market clock state" not in exposed
+    assert "invalid Alpaca market calendar" not in exposed
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected_calendar_calls"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "analyze exact pre-close observation",
+            },
+            1,
+        ),
+        (
+            "/propose",
+            {
+                "n": 2,
+                "reason": "propose exact pre-close observations",
+            },
+            2,
+        ),
+    ],
+)
+def test_planning_workflows_use_calendar_not_later_post_close_state(
+    client,
+    path,
+    body,
+    expected_calendar_calls,
+):
+    c, svc = client
+    clock, calls = _race_alpaca_clock(False)
+    _install_equity_clock(svc, clock)
+
+    response = c.post(path, json=body)
+
+    assert response.status_code == 200
+    assert calls == {
+        "clock": 0,
+        "calendar": expected_calendar_calls,
+    }
+    if path == "/analyze":
+        assert response.json()["plan_id"] > 0
+    else:
+        assert response.json()["proposed"]
+        assert all(
+            "error" not in candidate
+            for candidate in response.json()["proposed"]
+        )
 
 
 @pytest.mark.parametrize(

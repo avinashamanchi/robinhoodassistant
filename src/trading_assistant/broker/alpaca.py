@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Optional, TypeVar
 
@@ -37,6 +37,7 @@ from alpaca.trading.requests import (
 from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass, canonicalize_broker_symbol
+from ..risk.clock import MarketClockObservation
 from .base import (
     BrokerAcceptanceUnknown,
     BrokerClient,
@@ -610,6 +611,8 @@ class AlpacaClock:
         return cls(client)
 
     def is_open(self, at=None) -> bool:
+        if at is not None:
+            return self.observe(at).is_open
         value = _retry(self._trading.get_clock).is_open
         if type(value) is not bool:
             raise BrokerDataIntegrityError(
@@ -623,28 +626,125 @@ class AlpacaClock:
     def next_close(self, at=None):
         return _retry(self._trading.get_clock).next_close
 
-    def most_recent_open(self, at=None) -> datetime:
-        now = at or datetime.now(timezone.utc)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        now = now.astimezone(timezone.utc)
-        ny = ZoneInfo("America/New_York")
-        local_date = now.astimezone(ny).date()
-        calendar = _retry(
+    def observe(self, at: datetime) -> MarketClockObservation:
+        observed_at = self._observation_time(at)
+        exchange_timezone = ZoneInfo("America/New_York")
+        local_date = observed_at.astimezone(exchange_timezone).date()
+        start_date = local_date - timedelta(days=14)
+        # Alpaca's current-clock endpoint would be sampled after ``at`` and
+        # therefore cannot be reconciled to this exact historical instant.
+        # The official exchange calendar is the sole source for this path.
+        raw_calendar = _retry(
             self._trading.get_calendar,
-            GetCalendarRequest(
-                start=local_date - timedelta(days=14),
-                end=local_date,
-            ),
+            GetCalendarRequest(start=start_date, end=local_date),
         )
-        candidates: list[datetime] = []
-        for session in calendar:
-            session_open = session.open
-            if session_open.tzinfo is None:
-                session_open = session_open.replace(tzinfo=ny)
-            session_open = session_open.astimezone(timezone.utc)
-            if session_open <= now:
-                candidates.append(session_open)
-        if not candidates:
-            raise RuntimeError("Alpaca calendar returned no prior market session")
-        return max(candidates)
+        sessions = self._validated_sessions(
+            raw_calendar,
+            exchange_timezone=exchange_timezone,
+            start_date=start_date,
+            end_date=local_date,
+        )
+        prior_opens = [
+            session_open
+            for _, session_open, _ in sessions
+            if session_open <= observed_at
+        ]
+        if not prior_opens:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market calendar"
+            )
+        market_open = any(
+            session_open <= observed_at < session_close
+            for _, session_open, session_close in sessions
+        )
+        return MarketClockObservation(
+            is_open=market_open,
+            most_recent_open=max(prior_opens),
+        )
+
+    def most_recent_open(self, at=None) -> datetime:
+        observed_at = at or datetime.now(timezone.utc)
+        return self.observe(observed_at).most_recent_open
+
+    @staticmethod
+    def _observation_time(at: datetime) -> datetime:
+        if (
+            not isinstance(at, datetime)
+            or at.tzinfo is None
+            or at.utcoffset() is None
+        ):
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market calendar"
+            )
+        return at.astimezone(timezone.utc)
+
+    @classmethod
+    def _validated_sessions(
+        cls,
+        raw_calendar,
+        *,
+        exchange_timezone: ZoneInfo,
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, datetime, datetime]]:
+        try:
+            calendar = list(raw_calendar)
+        except Exception:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market calendar"
+            ) from None
+
+        sessions: list[tuple[date, datetime, datetime]] = []
+        seen_dates: set[date] = set()
+        try:
+            for session in calendar:
+                session_date = session.date
+                if (
+                    type(session_date) is not date
+                    or session_date < start_date
+                    or session_date > end_date
+                    or session_date in seen_dates
+                ):
+                    raise ValueError
+                session_open = cls._session_boundary(
+                    session.open,
+                    session_date=session_date,
+                    exchange_timezone=exchange_timezone,
+                )
+                session_close = cls._session_boundary(
+                    session.close,
+                    session_date=session_date,
+                    exchange_timezone=exchange_timezone,
+                )
+                if session_open >= session_close:
+                    raise ValueError
+                seen_dates.add(session_date)
+                sessions.append(
+                    (session_date, session_open, session_close)
+                )
+        except Exception:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market calendar"
+            ) from None
+        return sessions
+
+    @staticmethod
+    def _session_boundary(
+        boundary,
+        *,
+        session_date: date,
+        exchange_timezone: ZoneInfo,
+    ) -> datetime:
+        if not isinstance(boundary, datetime):
+            raise ValueError
+        if boundary.tzinfo is None:
+            local_boundary = boundary.replace(
+                tzinfo=exchange_timezone
+            )
+        else:
+            if boundary.utcoffset() is None:
+                raise ValueError
+            local_boundary = boundary.astimezone(exchange_timezone)
+        if local_boundary.date() != session_date:
+            raise ValueError
+        return local_boundary.astimezone(timezone.utc)

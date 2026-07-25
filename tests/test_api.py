@@ -68,16 +68,53 @@ def _install_equity_clock(service, clock) -> None:
     service.snapshot_service.now = lambda: CLOCK_NOW
 
 
-def _invalid_alpaca_clock(raw_is_open, marker: str):
-    state = {"is_open": raw_is_open}
+def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
+    state = {"open": raw_session_open}
     client = SimpleNamespace(
         provider_marker=marker,
-        get_clock=lambda: SimpleNamespace(is_open=state["is_open"]),
+        get_clock=lambda: SimpleNamespace(is_open=True),
         get_calendar=lambda _request: [
-            SimpleNamespace(open=CLOCK_NOW - timedelta(hours=3))
+            SimpleNamespace(
+                date=CLOCK_NOW.date(),
+                open=state["open"],
+                close=datetime(2026, 7, 24, 16),
+            )
         ],
     )
     return AlpacaClock(client), state
+
+
+def _race_alpaca_clock(later_current_state: bool):
+    calls = {"clock": 0, "calendar": 0}
+
+    def get_clock():
+        calls["clock"] += 1
+        return SimpleNamespace(is_open=later_current_state)
+
+    def get_calendar(_request):
+        calls["calendar"] += 1
+        return [
+            SimpleNamespace(
+                date=datetime(2026, 7, 23).date(),
+                open=datetime(2026, 7, 23, 9, 30),
+                close=datetime(2026, 7, 23, 16),
+            ),
+            SimpleNamespace(
+                date=datetime(2026, 7, 24).date(),
+                open=datetime(2026, 7, 24, 9, 30),
+                close=datetime(2026, 7, 24, 16),
+            ),
+        ]
+
+    return (
+        AlpacaClock(
+            SimpleNamespace(
+                get_clock=get_clock,
+                get_calendar=get_calendar,
+            )
+        ),
+        calls,
+    )
 
 
 class StubAgent:
@@ -501,14 +538,14 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
     order_id = _propose(service)
     marker = "provider-secret-approval-market-clock"
     clock_available = False
-    original_is_open = service.clock.is_open
+    original_observe = service.clock.observe
 
-    def intermittent_is_open(at=None):
+    def intermittent_observe(at):
         if not clock_available:
             raise ConnectionError(marker)
-        return original_is_open(at)
+        return original_observe(at)
 
-    service.clock.is_open = intermittent_is_open
+    service.clock.observe = intermittent_observe
     app = create_app(
         service=service,
         agent=StubAgent(),
@@ -819,10 +856,10 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
     )
     marker = "provider-secret-reset-market-calendar"
 
-    def fail_calendar(at=None):
+    def fail_calendar(at):
         raise ConnectionError(marker)
 
-    service.clock.most_recent_open = fail_calendar
+    service.clock.observe = fail_calendar
     app = create_app(
         service=service,
         agent=StubAgent(),
@@ -1030,16 +1067,16 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
 
 @pytest.mark.parametrize("workflow", ["approve", "reset"])
 @pytest.mark.parametrize(
-    "raw_is_open",
-    ["false", 0, 1, None],
-    ids=["string-false", "integer-zero", "integer-one", "none"],
+    "raw_session_open",
+    ["provider-secret-invalid-alpaca-clock", 0, 1, None],
+    ids=["secret-string", "integer-zero", "integer-one", "none"],
 )
-def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provider(
+def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider(
     make_service,
     authenticate_client,
     caplog,
     workflow,
-    raw_is_open,
+    raw_session_open,
 ):
     service = make_service(quote_now=lambda: CLOCK_NOW)
     service.snapshot_service.now = lambda: CLOCK_NOW
@@ -1055,7 +1092,10 @@ def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provid
         else None
     )
     marker = "provider-secret-invalid-alpaca-clock"
-    clock, state = _invalid_alpaca_clock(raw_is_open, marker)
+    clock, state = _malformed_alpaca_calendar_clock(
+        raw_session_open,
+        marker,
+    )
     _install_equity_clock(service, clock)
     app = create_app(
         service=service,
@@ -1111,7 +1151,7 @@ def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provid
     )
     assert marker not in exposed
     assert "BrokerDataIntegrityError" not in exposed
-    assert "invalid Alpaca market clock state" not in exposed
+    assert "invalid Alpaca market calendar" not in exposed
     if observed is not None:
         current = service.breakers.get(
             BreakerScope.loss(AssetClass.EQUITY)
@@ -1121,7 +1161,7 @@ def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provid
         assert current.generation == observed.generation
 
     if order_id is not None:
-        state["is_open"] = True
+        state["open"] = datetime(2026, 7, 24, 9, 30)
         retry = client.post(
             f"/approve/{order_id}",
             json={"reason": "retry after valid clock data"},
@@ -1130,6 +1170,88 @@ def test_operator_workflows_reject_invalid_alpaca_market_state_and_redact_provid
         assert retry.status_code == 200
         assert retry.json()["status"] == OrderStatus.SUBMITTED.value
         assert service.broker.submit_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("workflow", "observed_at", "later_state", "expected_status"),
+    [
+        (
+            "approve",
+            datetime(2026, 7, 24, 13, 29, 59, tzinfo=timezone.utc),
+            True,
+            403,
+        ),
+        (
+            "reset",
+            datetime(2026, 7, 24, 19, 59, 59, tzinfo=timezone.utc),
+            False,
+            200,
+        ),
+    ],
+    ids=["pre-open-post-open", "pre-close-post-close"],
+)
+def test_operator_workflows_use_exact_calendar_observation_across_clock_race(
+    make_service,
+    authenticate_client,
+    workflow,
+    observed_at,
+    later_state,
+    expected_status,
+):
+    service = make_service()
+    order_id = _propose(service) if workflow == "approve" else None
+    observed_breaker = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="calendar race reset setup",
+            actor="daemon:test",
+            request_id="calendar-race-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    clock, calls = _race_alpaca_clock(later_state)
+    service.broker._now = lambda: observed_at
+    service.clock = clock
+    service._clocks[AssetClass.EQUITY] = clock
+    service.snapshot_service.now = lambda: observed_at
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "approve at exact pre-open observation"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    else:
+        assert observed_breaker is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "asset_class": "equity",
+                "reason": "reset at exact pre-close observation",
+                "expected_generation": observed_breaker.generation,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+    assert response.status_code == expected_status, response.text
+    assert calls == {"clock": 0, "calendar": 1}
+    if workflow == "approve":
+        assert response.json()["error"]["code"] == "policy_denied"
+        assert service.broker.submit_calls == 0
+    else:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is False
 
 
 @pytest.mark.parametrize(

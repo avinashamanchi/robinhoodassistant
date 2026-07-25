@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -1071,18 +1071,25 @@ def test_alpaca_clock_rejects_non_boolean_market_state_without_provider_detail(
     assert type(raw_is_open).__name__ not in str(raised.value)
 
 
+def _market_session(
+    session_date: date,
+    *,
+    opens_at: dt_time = dt_time(9, 30),
+    closes_at: dt_time = dt_time(16),
+):
+    return SimpleNamespace(
+        date=session_date,
+        open=datetime.combine(session_date, opens_at),
+        close=datetime.combine(session_date, closes_at),
+    )
+
+
 def test_alpaca_clock_uses_exchange_calendar_for_most_recent_open():
     trading = SimpleNamespace(
         get_calendar=lambda request: [
-            SimpleNamespace(
-                date=datetime(2026, 7, 2).date(),
-                open=datetime(2026, 7, 2, 9, 30),
-            ),
+            _market_session(date(2026, 7, 2)),
             # July 3 is absent: exchange holiday.
-            SimpleNamespace(
-                date=datetime(2026, 7, 6).date(),
-                open=datetime(2026, 7, 6, 9, 30),
-            ),
+            _market_session(date(2026, 7, 6)),
         ]
     )
     clock = AlpacaClock(trading)
@@ -1091,3 +1098,211 @@ def test_alpaca_clock_uses_exchange_calendar_for_most_recent_open():
     assert clock.most_recent_open(before_july_6_open) == datetime(
         2026, 7, 2, 13, 30, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "later_provider_state", "expected_open"),
+    [
+        (
+            datetime(2026, 7, 24, 13, 29, 59, tzinfo=timezone.utc),
+            True,
+            False,
+        ),
+        (
+            datetime(2026, 7, 24, 19, 59, 59, tzinfo=timezone.utc),
+            False,
+            True,
+        ),
+    ],
+    ids=["pre-open-provider-post-open", "pre-close-provider-post-close"],
+)
+def test_alpaca_clock_historical_state_uses_one_calendar_observation_not_later_current_clock(
+    observed_at,
+    later_provider_state,
+    expected_open,
+):
+    calls = {"calendar": 0, "clock": 0}
+
+    def get_calendar(_request):
+        calls["calendar"] += 1
+        return [
+            _market_session(date(2026, 7, 23)),
+            _market_session(date(2026, 7, 24)),
+        ]
+
+    def get_clock():
+        calls["clock"] += 1
+        return SimpleNamespace(is_open=later_provider_state)
+
+    clock = AlpacaClock(
+        SimpleNamespace(get_calendar=get_calendar, get_clock=get_clock)
+    )
+
+    observation = clock.observe(observed_at)
+
+    assert observation.is_open is expected_open
+    assert observation.most_recent_open == (
+        datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
+        if expected_open
+        else datetime(2026, 7, 23, 13, 30, tzinfo=timezone.utc)
+    )
+    assert calls == {"calendar": 1, "clock": 0}
+
+
+def test_alpaca_clock_historical_state_ignores_malformed_later_current_state():
+    clock = AlpacaClock(
+        SimpleNamespace(
+            get_clock=lambda: SimpleNamespace(is_open="provider-secret-state"),
+            get_calendar=lambda _request: [
+                _market_session(date(2026, 7, 23)),
+                _market_session(date(2026, 7, 24)),
+            ],
+        )
+    )
+
+    assert clock.is_open(
+        datetime(2026, 7, 24, 18, tzinfo=timezone.utc)
+    ) is True
+
+    with pytest.raises(BrokerDataIntegrityError):
+        clock.is_open()
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "expected_open"),
+    [
+        (
+            datetime(2026, 3, 6, 14, 30, tzinfo=timezone.utc),
+            datetime(2026, 3, 6, 14, 30, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 3, 9, 13, 30, tzinfo=timezone.utc),
+            datetime(2026, 3, 9, 13, 30, tzinfo=timezone.utc),
+        ),
+    ],
+    ids=["standard-time", "daylight-time"],
+)
+def test_alpaca_clock_calendar_observation_applies_exchange_timezone_dst(
+    observed_at,
+    expected_open,
+):
+    sessions = [
+        _market_session(date(2026, 3, 6)),
+        _market_session(date(2026, 3, 9)),
+    ]
+
+    def get_calendar(request):
+        return [
+            session
+            for session in sessions
+            if request.start <= session.date <= request.end
+        ]
+
+    clock = AlpacaClock(
+        SimpleNamespace(get_calendar=get_calendar)
+    )
+
+    observation = clock.observe(observed_at)
+
+    assert observation.is_open is True
+    assert observation.most_recent_open == expected_open
+
+
+def test_alpaca_clock_calendar_observation_treats_omitted_holiday_as_closed():
+    clock = AlpacaClock(
+        SimpleNamespace(
+            get_calendar=lambda _request: [
+                _market_session(date(2026, 7, 2)),
+                # July 3 is omitted by the official exchange calendar.
+            ]
+        )
+    )
+
+    observation = clock.observe(
+        datetime(2026, 7, 3, 15, tzinfo=timezone.utc)
+    )
+
+    assert observation.is_open is False
+    assert observation.most_recent_open == datetime(
+        2026, 7, 2, 13, 30, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    "sessions",
+    [
+        [
+            SimpleNamespace(
+                open=datetime(2026, 7, 24, 9, 30),
+                close=datetime(2026, 7, 24, 16),
+            )
+        ],
+        [
+            SimpleNamespace(
+                date=date(2026, 7, 24),
+                open="provider-secret-open",
+                close=datetime(2026, 7, 24, 16),
+            )
+        ],
+        [
+            SimpleNamespace(
+                date=date(2026, 7, 24),
+                open=datetime(2026, 7, 24, 9, 30),
+                close="provider-secret-close",
+            )
+        ],
+        [
+            _market_session(
+                date(2026, 7, 24),
+                opens_at=dt_time(16),
+                closes_at=dt_time(9, 30),
+            )
+        ],
+        [
+            SimpleNamespace(
+                date=date(2026, 7, 24),
+                open=datetime(2026, 7, 23, 9, 30),
+                close=datetime(2026, 7, 23, 16),
+            )
+        ],
+        [
+            _market_session(date(2026, 7, 24)),
+            _market_session(date(2026, 7, 24)),
+        ],
+    ],
+    ids=[
+        "missing-date",
+        "malformed-open",
+        "malformed-close",
+        "reversed",
+        "date-mismatch",
+        "duplicate-date",
+    ],
+)
+def test_alpaca_clock_rejects_malformed_calendar_sessions_without_detail(
+    sessions,
+):
+    clock = AlpacaClock(
+        SimpleNamespace(get_calendar=lambda _request: sessions)
+    )
+
+    with pytest.raises(BrokerDataIntegrityError) as raised:
+        clock.observe(datetime(2026, 7, 24, 18, tzinfo=timezone.utc))
+
+    assert str(raised.value) == "invalid Alpaca market calendar"
+    assert "provider-secret" not in str(raised.value)
+
+
+def test_alpaca_clock_rejects_non_aware_observation_without_detail():
+    clock = AlpacaClock(
+        SimpleNamespace(
+            get_calendar=lambda _request: [
+                _market_session(date(2026, 7, 24))
+            ]
+        )
+    )
+
+    with pytest.raises(BrokerDataIntegrityError) as raised:
+        clock.observe(datetime(2026, 7, 24, 18))
+
+    assert str(raised.value) == "invalid Alpaca market calendar"

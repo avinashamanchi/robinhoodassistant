@@ -7,12 +7,22 @@ We never hand-roll a holiday calendar. Consumers depend only on the
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol, runtime_checkable
 
 
+@dataclass(frozen=True)
+class MarketClockObservation:
+    """Coherent market state and session boundary for one trusted instant."""
+
+    is_open: bool
+    most_recent_open: datetime
+
+
 @runtime_checkable
 class MarketClock(Protocol):
+    def observe(self, at: datetime) -> MarketClockObservation: ...
     def is_open(self, at: datetime | None = None) -> bool: ...
     def next_open(self, at: datetime | None = None) -> datetime: ...
     def next_close(self, at: datetime | None = None) -> datetime: ...
@@ -21,6 +31,12 @@ class MarketClock(Protocol):
 
 class CryptoClock:
     """Crypto trades 24/7 — always open. Satisfies the MarketClock protocol (Phase 7)."""
+
+    def observe(self, at: datetime) -> MarketClockObservation:
+        return MarketClockObservation(
+            is_open=True,
+            most_recent_open=self.most_recent_open(at),
+        )
 
     def is_open(self, at: datetime | None = None) -> bool:
         return True
@@ -56,6 +72,12 @@ class FakeClock:
 
     def set_open(self, value: bool) -> None:
         self._open = value
+
+    def observe(self, at: datetime) -> MarketClockObservation:
+        return MarketClockObservation(
+            is_open=self._open,
+            most_recent_open=self._most_recent_open,
+        )
 
     def is_open(self, at: datetime | None = None) -> bool:
         return self._open

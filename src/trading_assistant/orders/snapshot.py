@@ -294,8 +294,9 @@ class PortfolioSnapshotService:
     ) -> tuple[bool, bool, datetime | None]:
         try:
             clock = self.clock_for_asset(asset_class)
-            market_open = clock.is_open(captured_at)
-            boundary = clock.most_recent_open(captured_at)
+            observation = clock.observe(captured_at)
+            market_open = observation.is_open
+            boundary = observation.most_recent_open
             if type(market_open) is not bool:
                 raise ValueError("invalid market clock state")
             if (
