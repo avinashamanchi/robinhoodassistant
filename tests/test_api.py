@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,11 +15,18 @@ from sqlalchemy import event
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.ratelimit import RateLimiter
+from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import BrokerFill, OrderStatus, Quote
+from trading_assistant.broker.models import (
+    BrokerFill,
+    OrderStatus,
+    Position,
+    Quote,
+)
 from trading_assistant.db.models import (
+    AccountRiskState,
     AuditEvent,
     CircuitBreakerState,
     Fill,
@@ -35,6 +43,7 @@ from trading_assistant.risk.clock import FakeClock
 
 TOKEN = "test-api-operator-secret"
 CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+_STATIC = Path("src/trading_assistant/app/static")
 
 
 def _seed_clock_loss(service) -> None:
@@ -215,12 +224,11 @@ def test_index_served(client):
 
 
 def test_index_mutations_collect_honest_operator_reasons(client):
-    c, _, _ = client
-    page = c.get("/").text
+    script = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
 
-    assert 'window.prompt("Reason for rejecting this order:")' in page
-    assert 'window.prompt("Reason for panic shutdown:")' in page
-    assert 'jsonPost({ reason })' in page
+    assert "rejection-reason" in script
+    assert "panic-reason" in script
+    assert "reason" in script
 
 
 def test_pending_approve_flow(client):
@@ -244,6 +252,195 @@ def test_pending_approve_flow(client):
 
     # No longer pending.
     assert c.get("/pending").json()["pending"] == []
+
+
+def test_approval_confirmation_is_read_only_exact_server_truth(
+    make_service,
+    authenticate_client,
+):
+    broker = MockBroker(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                ticker="AAPL",
+                qty=Decimal("2"),
+                avg_entry_price=Decimal("90"),
+                current_price=Decimal("100"),
+            )
+        ],
+    )
+    service = make_service(broker=broker)
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "limit",
+        qty="3",
+        limit_price="101",
+        actor="operator:test-setup",
+        reason="approval confirmation setup",
+        request_id="approval-confirmation-setup",
+    )["order_id"]
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+    submit_calls_before = broker._orders_by_key.copy()
+    with service.session_factory() as session:
+        account_state_before = [
+            (
+                row.asset_class,
+                row.high_water_mark,
+                row.last_equity,
+                row.updated_at,
+            )
+            for row in session.query(AccountRiskState).all()
+        ]
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    proof = response.json()
+    assert proof["complete"] is True
+    assert proof["broker"] == "Alpaca"
+    assert proof["mode"] == "paper"
+    assert proof["order"] == {
+        "order_id": order_id,
+        "symbol": "AAPL",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "3.000000",
+        "notional": None,
+        "limit_price": "101.000000",
+    }
+    assert proof["expires_at"]
+    assert proof["exposure"]["currency"] == "USD"
+    assert proof["exposure"]["current_position_quantity"] == "2"
+    assert Decimal(
+        proof["exposure"]["current_signed_notional"]
+    ) == Decimal("200")
+    assert Decimal(
+        proof["exposure"]["resulting_signed_notional"]
+    ) == Decimal("503")
+    assert proof["exposure"]["as_of"]
+    assert broker._orders_by_key == submit_calls_before
+    with service.session_factory() as session:
+        account_state_after = [
+            (
+                row.asset_class,
+                row.high_water_mark,
+                row.last_equity,
+                row.updated_at,
+            )
+            for row in session.query(AccountRiskState).all()
+        ]
+        assert session.get(Order, order_id).status == OrderStatus.PROPOSED.value
+        assert session.query(AuditEvent).filter_by(
+            target_id=str(order_id),
+            action="order.approve",
+        ).count() == 0
+    assert account_state_after == account_state_before
+
+
+@pytest.mark.parametrize(
+    "incomplete_field",
+    ["pending_exposure_complete", "broker_reconciled"],
+)
+def test_approval_confirmation_fails_closed_when_proof_is_incomplete(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    incomplete_field,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service)
+    complete = service.snapshot_service.assemble_for_confirmation(
+        "AAPL",
+        exclude_order_id=order_id,
+    )
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_confirmation",
+        lambda *_args, **_kwargs: replace(
+            complete,
+            **{incomplete_field: False},
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    assert response.json()["complete"] is False
+    assert incomplete_field in response.json()["missing_proof"]
+    assert service.broker.submit_calls == 0
+
+
+def test_approval_confirmation_dependency_failure_is_hardened(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service)
+
+    def fail_positions():
+        raise ConnectionError("provider-secret-approval-confirmation")
+
+    service.broker.get_positions = fail_positions
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    _assert_dependency_unavailable(response)
+    assert "provider-secret-approval-confirmation" not in response.text
+    assert service.broker.submit_calls == 0
 
 
 def test_double_approve_returns_409(client):
@@ -377,6 +574,15 @@ def test_positions_and_log(client):
     assert "positions" in c.get("/positions").json()
     log = c.get("/log").json()
     assert len(log["risk_events"]) >= 1
+
+
+def test_health_reports_server_observed_broker_and_mode(client):
+    c, _, _ = client
+
+    health = c.get("/health").json()
+
+    assert health["broker"] == "Mock"
+    assert health["mode"] == "paper"
 
 
 @pytest.mark.parametrize("path", ["/positions", "/holdings"])
@@ -2106,9 +2312,9 @@ def test_chat_and_rate_limit(client):
 
 
 def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):
-    c, _, _ = client
-    page = c.get("/").text
+    script = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
 
-    assert "r.data.safe === true" in page
-    assert "local_enumeration" in page
-    assert "remote_enumeration" in page
+    assert "safe === true" in script
+    assert "local_enumeration" in script
+    assert "remote_enumeration" in script
+    assert "everything halted" not in script.lower()

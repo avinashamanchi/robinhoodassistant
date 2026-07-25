@@ -32,7 +32,7 @@ from .broker.models import (
     PortfolioSnapshot,
 )
 from .assets import AssetClass
-from .config import AppConfig
+from .config import AppConfig, BrokerKind, TradingMode
 from .db.models import (
     AuditEvent,
     CircuitBreakerState,
@@ -686,6 +686,14 @@ class TradingService:
 
         from .db.models import Heartbeat
 
+        operating_context = {
+            "broker": (
+                "Alpaca"
+                if self.config.trading.broker is BrokerKind.ALPACA
+                else self.config.trading.broker.value.title()
+            ),
+            "mode": self.config.trading.mode.value,
+        }
         try:
             with self.session_factory() as s:
                 last = s.execute(
@@ -703,6 +711,7 @@ class TradingService:
                 eq_tripped = bool(eq_state and eq_state.tripped)
                 cr_tripped = bool(cr_state and cr_state.tripped)
             return {
+                **operating_context,
                 "db_ok": True,
                 "heartbeat_age_seconds": round(age, 1) if age is not None else None,
                 "daemon_alive": (
@@ -720,7 +729,11 @@ class TradingService:
                 },
             }
         except Exception:
-            return {"db_ok": False, "error": "database_unavailable"}
+            return {
+                **operating_context,
+                "db_ok": False,
+                "error": "database_unavailable",
+            }
 
     def panic(
         self,
@@ -1308,6 +1321,136 @@ class TradingService:
                     d["expired"] = o.proposal.is_expired()
                 out.append(d)
             return out
+
+    def get_approval_confirmation(
+        self,
+        order_id: int,
+    ) -> dict[str, Any]:
+        """Return read-only server proof for a human approval decision."""
+        with self.session_factory() as session:
+            order = session.get(Order, order_id)
+            if order is None:
+                return {"error": "not_found"}
+            if order.status != OrderStatus.PROPOSED.value:
+                return {"error": "conflict"}
+            proposal = order.proposal
+            if proposal is not None and proposal.is_expired():
+                return {"error": "conflict"}
+            order_request = OrderRequest(
+                ticker=order.ticker,
+                side=OrderSide(order.side),
+                order_type=OrderType(order.order_type),
+                idempotency_key=order.idempotency_key,
+                qty=order.qty,
+                notional=order.notional,
+                limit_price=order.limit_price,
+            )
+            order_payload = {
+                "order_id": order.id,
+                "symbol": order.ticker,
+                "side": order.side,
+                "order_type": order.order_type,
+                "quantity": (
+                    None if order.qty is None else str(order.qty)
+                ),
+                "notional": (
+                    None
+                    if order.notional is None
+                    else str(order.notional)
+                ),
+                "limit_price": (
+                    None
+                    if order.limit_price is None
+                    else str(order.limit_price)
+                ),
+            }
+            expires_at = (
+                proposal.expires_at.isoformat()
+                if proposal is not None
+                else None
+            )
+
+        missing_proof: list[str] = []
+        if self.config.trading.broker is not BrokerKind.ALPACA:
+            missing_proof.append("broker")
+        if self.config.trading.mode is not TradingMode.PAPER:
+            missing_proof.append("mode")
+        if expires_at is None:
+            missing_proof.append("expires_at")
+
+        snapshot = self.snapshot_service.assemble_for_confirmation(
+            order_request.ticker,
+            exclude_order_id=order_id,
+        )
+        if snapshot.pending_exposure_complete is not True:
+            missing_proof.append("pending_exposure_complete")
+        if snapshot.broker_reconciled is not True:
+            missing_proof.append("broker_reconciled")
+
+        symbol = order_request.ticker.upper()
+        quote = snapshot.quotes.get(symbol)
+        current_position = snapshot.positions.get(symbol)
+        current_quantity = (
+            current_position.qty
+            if current_position is not None
+            else Decimal(0)
+        )
+        current_signed_notional: Decimal | None = None
+        resulting_signed_notional: Decimal | None = None
+        if (
+            quote is None
+            or not quote.is_valid
+            or snapshot.quote_fresh is not True
+        ):
+            missing_proof.append("quote")
+        else:
+            current_signed_notional = current_quantity * quote.last
+            risk_base = snapshot.effective_signed_value(symbol)
+            if risk_base is not None:
+                order_notional = order_request.risk_notional(quote)
+                signed_order_notional = (
+                    order_notional
+                    if order_request.side is OrderSide.BUY
+                    else -order_notional
+                )
+                resulting_signed_notional = (
+                    risk_base + signed_order_notional
+                )
+        if (
+            current_signed_notional is None
+            or not current_signed_notional.is_finite()
+            or resulting_signed_notional is None
+            or not resulting_signed_notional.is_finite()
+        ):
+            missing_proof.append("exposure")
+
+        return {
+            "complete": not missing_proof,
+            "missing_proof": sorted(set(missing_proof)),
+            "broker": (
+                "Alpaca"
+                if self.config.trading.broker is BrokerKind.ALPACA
+                else self.config.trading.broker.value.title()
+            ),
+            "mode": self.config.trading.mode.value,
+            "order": order_payload,
+            "expires_at": expires_at,
+            "exposure": {
+                "currency": "USD",
+                "current_position_quantity": str(current_quantity),
+                "current_signed_notional": (
+                    None
+                    if current_signed_notional is None
+                    else str(current_signed_notional)
+                ),
+                "resulting_signed_notional": (
+                    None
+                    if resulting_signed_notional is None
+                    else str(resulting_signed_notional)
+                ),
+                "as_of": snapshot.as_of.isoformat(),
+            },
+        }
 
     def get_positions(self) -> list[dict[str, Any]]:
         try:

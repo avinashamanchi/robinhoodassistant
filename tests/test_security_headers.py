@@ -100,24 +100,36 @@ def test_provider_exception_text_is_not_returned(make_service):
 
 def test_login_page_and_its_asset_are_anonymous(client):
     page = client.get("/login")
-    script = client.get("/static/login.js")
+    script = client.get("/static/js/login.js")
 
     assert page.status_code == 200
-    assert "/static/login.js" in page.text
+    assert "/static/js/login.js" in page.text
     assert script.status_code == 200
     assert "localStorage" not in script.text
 
 
 @pytest.mark.parametrize(
-    "page",
-    ["index.html", "plans.html", "backtests.html"],
+    ("page", "script"),
+    [
+        ("index.html", "index.js"),
+        ("plans.html", "plans.js"),
+        ("backtests.html", "backtests.js"),
+    ],
 )
-def test_ui_removes_api_key_and_plaintext_browser_storage(page):
+def test_ui_removes_api_key_and_plaintext_browser_storage(page, script):
     path = Path("src/trading_assistant/app/static") / page
     text = path.read_text(encoding="utf-8")
+    script_text = (
+        Path("src/trading_assistant/app/static/js") / script
+    ).read_text(encoding="utf-8")
+    auth_text = Path(
+        "src/trading_assistant/app/static/js/auth.js"
+    ).read_text(encoding="utf-8")
+    combined = text + script_text + auth_text
 
-    assert "X-API-Key" not in text
-    assert "api_key" not in text
-    assert "localStorage" not in text
-    assert "/auth/session" in text
-    assert "X-CSRF-Token" in text
+    assert "X-API-Key" not in combined
+    assert "api_key" not in combined
+    assert "localStorage" not in combined
+    assert "/auth/session" in auth_text
+    assert "X-CSRF-Token" in auth_text
+    assert "/static/js/auth.js" in script_text

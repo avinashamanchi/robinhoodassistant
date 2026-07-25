@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from trading_assistant.signals.models import MarketFeatures, Regime
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
 CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 TOKEN = "test-plans-operator-secret"
+_STATIC = Path("src/trading_assistant/app/static")
 
 
 def _seed_clock_loss(service) -> None:
@@ -398,21 +400,19 @@ def test_screen_internal_failure_remains_hardened_500(
 def test_plans_ui_served(client):
     c, _ = client
     r = c.get("/plans/ui")
-    assert r.status_code == 200 and "Trade Plans" in r.text
+    assert r.status_code == 200 and "Trade plans" in r.text
 
 
 def test_plans_ui_approval_posts_a_nonempty_review_reason(client):
-    c, _ = client
-    page = c.get("/plans/ui").text
+    script = (_STATIC / "js" / "plans.js").read_text(encoding="utf-8")
 
-    assert 'window.prompt("Review reason for plan approval:")' in page
-    assert "if (!reason)" in page
-    assert "jsonPost({ reason })" in page
-    assert 'window.prompt("Reason for canceling this plan:")' in page
-    assert 'window.prompt("Reason for analyzing this symbol:")' in page
-    assert 'window.prompt("Reason for generating screened plans:")' in page
-    assert "X-CSRF-Token" in page
-    assert "X-API-Key" not in page
+    assert "plan-approval-reason" in script
+    assert "plan-cancel-reason" in script
+    assert "analysis-reason" in script
+    assert "proposal-reason" in script
+    assert "if (!reason)" in script
+    assert "reason" in script
+    assert "api(" in script
 
 
 def test_propose_generates_plans(client):

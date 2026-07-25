@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +12,7 @@ from trading_assistant.app.main import create_app
 from trading_assistant.db.models import AuditEvent
 
 TOKEN = "test-backtests-operator-secret"
+_STATIC = Path("src/trading_assistant/app/static")
 
 
 class StubAgent:
@@ -65,7 +68,11 @@ def test_ui_served(client):
     r = c.get("/backtests/ui")
     assert r.status_code == 200
     assert "Simulated" in r.text  # mandatory disclaimer present in the page
-    assert 'window.prompt("Reason for launching this backtest:")' in r.text
+    script = (_STATIC / "js" / "backtests.js").read_text(
+        encoding="utf-8"
+    )
+    assert "backtest-reason" in script
+    assert "reason" in script
 
 
 def test_run_endpoint_persists(client, monkeypatch):

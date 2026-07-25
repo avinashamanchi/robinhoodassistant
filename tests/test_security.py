@@ -3,7 +3,10 @@ redaction (A3), daemon backoff + staleness (A4)."""
 
 from __future__ import annotations
 
+from html.parser import HTMLParser
 import pathlib
+import subprocess
+import textwrap
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from random import Random
@@ -18,11 +21,65 @@ from trading_assistant.broker.models import Quote
 
 TOKEN = "s3cret-token"
 _STATIC = pathlib.Path("src/trading_assistant/app/static")
+_PAGES = ("index.html", "plans.html", "backtests.html", "login.html")
+_SCRIPTS = (
+    "js/auth.js",
+    "js/login.js",
+    "js/index.js",
+    "js/plans.js",
+    "js/backtests.js",
+)
 
 
 class _StubAgent:
     def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}
+
+
+class _CspParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.errors: list[str] = []
+        self.scripts: list[dict[str, str | None]] = []
+        self.stylesheets: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "script":
+            self.scripts.append(attributes)
+            if not attributes.get("src"):
+                self.errors.append("inline script")
+        if tag == "style":
+            self.errors.append("inline style block")
+        if tag == "link" and attributes.get("rel") == "stylesheet":
+            self.stylesheets.append(attributes.get("href", ""))
+        for name, _value in attrs:
+            if name.lower().startswith("on"):
+                self.errors.append(f"inline handler {name}")
+            if name.lower() == "style":
+                self.errors.append("inline style attribute")
+
+
+def _run_module(path: pathlib.Path, scenario: str) -> None:
+    loader = """
+        import fs from "node:fs";
+        const source = fs.readFileSync(process.argv[1], "utf8");
+        const encoded = Buffer.from(source).toString("base64");
+        const module = await import(`data:text/javascript;base64,${encoded}`);
+    """
+    completed = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "-e",
+            textwrap.dedent(loader + scenario),
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.fixture
@@ -204,11 +261,325 @@ def test_allowed_cross_origin_response_grants_no_cookie_credentials(client):
     assert financial.headers["Cache-Control"] == "no-store"
 
 
-# ── A2: no dynamic innerHTML in the UIs ─────────────────────────
-@pytest.mark.parametrize("page", ["index.html", "backtests.html", "plans.html"])
-def test_ui_has_no_innerhtml(page):
-    text = (_STATIC / page).read_text()
-    assert "innerHTML" not in text  # all dynamic values go through textContent
+# ── A2: strict CSP-safe, credential-safe static UIs ─────────────
+@pytest.mark.parametrize("page", _PAGES)
+def test_pages_have_no_inline_script_style_or_handler(page):
+    parser = _CspParser()
+    parser.feed((_STATIC / page).read_text(encoding="utf-8"))
+
+    assert parser.errors == []
+    assert parser.stylesheets == ["/static/css/console.css"]
+    assert len(parser.scripts) == 1
+    assert parser.scripts[0]["type"] == "module"
+    assert parser.scripts[0]["src"] == (
+        f"/static/js/{page.removesuffix('.html')}.js"
+    )
+
+
+@pytest.mark.parametrize("source", (*_PAGES, *_SCRIPTS))
+def test_ui_sources_forbid_browser_secrets_and_html_sinks(source):
+    text = (_STATIC / source).read_text(encoding="utf-8")
+
+    for forbidden in (
+        "localStorage",
+        "sessionStorage",
+        "X-API-Key",
+        "innerHTML",
+        "unsafe-inline",
+    ):
+        assert forbidden not in text
+
+
+def test_static_assets_are_anonymous_but_operator_pages_remain_protected(client):
+    for path in (
+        "/static/css/console.css",
+        "/static/js/auth.js",
+        "/static/js/login.js",
+        "/static/js/index.js",
+        "/static/js/plans.js",
+        "/static/js/backtests.js",
+    ):
+        assert client.get(path).status_code == 200, path
+    assert client.get("/login").status_code == 200
+    assert client.get("/").status_code == 401
+    assert client.get("/plans/ui").status_code == 401
+    assert client.get("/backtests/ui").status_code == 401
+    for path in (
+        "/static/index.html",
+        "/static/plans.html",
+        "/static/backtests.html",
+        "/static/login.html",
+    ):
+        assert client.get(path).status_code == 404, path
+
+
+def test_auth_module_redirects_401_and_parses_stable_error_envelope():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        const redirects = [];
+        globalThis.window = {
+          location: { assign: (path) => redirects.push(path) },
+        };
+        globalThis.fetch = async () => ({
+          status: 401,
+          ok: false,
+          json: async () => ({
+            error: {
+              code: "invalid_session",
+              message: "A valid operator session is required",
+              request_id: "request-401",
+            },
+          }),
+        });
+        await module.loadSession().then(
+          () => { throw new Error("loadSession should reject"); },
+          (error) => {
+            if (error.code !== "invalid_session") throw error;
+            if (error.requestId !== "request-401") throw error;
+          },
+        );
+        if (JSON.stringify(redirects) !== JSON.stringify(["/login"])) {
+          throw new Error(`unexpected redirects: ${JSON.stringify(redirects)}`);
+        }
+        """,
+    )
+
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        let call = 0;
+        globalThis.fetch = async () => {
+          call += 1;
+          if (call === 1) {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-memory-only",
+              }),
+            };
+          }
+          return {
+            status: 422,
+            ok: false,
+            json: async () => ({
+              error: {
+                code: "invalid_request",
+                message: "Request validation failed",
+                request_id: "request-422",
+              },
+            }),
+          };
+        };
+        await module.loadSession();
+        await module.api("/chat", { method: "POST" }).then(
+          () => { throw new Error("api should reject"); },
+          (error) => {
+            if (error.code !== "invalid_request") throw error;
+            if (error.message !== "Request validation failed") throw error;
+            if (error.requestId !== "request-422") throw error;
+            if (error.status !== 422) throw error;
+          },
+        );
+        """,
+    )
+
+
+def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        const secretInput = { value: "fresh-operator-secret" };
+        module.configureReauthentication(async () => secretInput);
+        const calls = [];
+        globalThis.fetch = async (path, options = {}) => {
+          calls.push({ path, options });
+          if (path === "/auth/session") {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-memory-only",
+              }),
+            };
+          }
+          if (path === "/auth/reauth") {
+            if (secretInput.value !== "") {
+              throw new Error("reauth secret was not cleared before fetch");
+            }
+            if (JSON.parse(options.body).secret !== "fresh-operator-secret") {
+              throw new Error("reauth request did not copy the secret");
+            }
+            return { status: 200, ok: true, json: async () => ({}) };
+          }
+          return {
+            status: 403,
+            ok: false,
+            json: async () => ({
+              error: {
+                code: "recent_authentication_required",
+                message: "Recent operator reauthentication is required",
+                request_id: `approval-${calls.length}`,
+              },
+            }),
+          };
+        };
+        await module.loadSession();
+        await module.api("/approve/7", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "reviewed exact proof" }),
+        }).then(
+          () => { throw new Error("retry should surface the second 403"); },
+          (error) => {
+            if (error.code !== "recent_authentication_required") throw error;
+          },
+        );
+        const paths = calls.map((call) => call.path);
+        const expected = [
+          "/auth/session",
+          "/approve/7",
+          "/auth/reauth",
+          "/approve/7",
+        ];
+        if (JSON.stringify(paths) !== JSON.stringify(expected)) {
+          throw new Error(`unexpected calls: ${JSON.stringify(paths)}`);
+        }
+        const mutationCalls = calls.filter((call) => call.path === "/approve/7");
+        for (const call of mutationCalls) {
+          const headers = new Headers(call.options.headers);
+          if (headers.get("X-CSRF-Token") !== "csrf-memory-only") {
+            throw new Error("mutation did not carry in-memory CSRF");
+          }
+        }
+        """,
+    )
+
+
+def test_login_clears_secret_before_fetch_even_when_network_fails():
+    _run_module(
+        _STATIC / "js" / "login.js",
+        """
+        const listeners = {};
+        const form = {
+          addEventListener: (name, callback) => { listeners[name] = callback; },
+        };
+        const statusLine = { textContent: "" };
+        const secretInput = { value: "login-secret", focus() {} };
+        globalThis.document = {
+          getElementById: (id) => ({
+            "login-form": form,
+            "login-status": statusLine,
+            "login-secret": secretInput,
+          })[id],
+        };
+        globalThis.window = { location: { assign: () => {} } };
+        let requestBody = null;
+        globalThis.fetch = async (_path, options) => {
+          if (secretInput.value !== "") {
+            throw new Error("login secret was not cleared before fetch");
+          }
+          requestBody = JSON.parse(options.body);
+          throw new TypeError("network unavailable");
+        };
+        await import(`data:text/javascript;base64,${Buffer.from(
+          fs.readFileSync(process.argv[1], "utf8"),
+        ).toString("base64")}#login`);
+        await listeners.submit({ preventDefault() {} });
+        if (secretInput.value !== "") {
+          throw new Error("login secret remained in the input");
+        }
+        if (requestBody.secret !== "login-secret") {
+          throw new Error("login request did not copy the secret");
+        }
+        if (statusLine.textContent !== "Sign-in failed. Check the connection and try again.") {
+          throw new Error(`unexpected status: ${statusLine.textContent}`);
+        }
+        """,
+    )
+
+
+def test_console_javascript_requires_truthful_approval_panic_and_scoped_reset():
+    text = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
+
+    assert "/pending/" in text
+    assert "/confirmation" in text
+    assert "proof.complete" in text
+    for field in (
+        "broker",
+        "mode",
+        "expires_at",
+        "current_signed_notional",
+        "resulting_signed_notional",
+    ):
+        assert field in text
+    assert "approval-confirm-button" in text
+    assert "confirmed_canceled" in text
+    assert "unconfirmed_order_ids" in text
+    assert "remote_open_order_ids" in text
+    assert "unsafe_local_state" in text
+    assert "unknown_categories" in text
+    assert "local_enumeration" in text
+    assert "remote_enumeration" in text
+    assert "safe === true" in text
+    assert "everything halted" not in text.lower()
+    assert '["equity", "crypto"]' in text
+    assert "expected_generation" in text
+    assert "global" not in text.lower()
+
+
+def test_pages_include_accessible_session_actions_dialogs_and_live_regions():
+    index = (_STATIC / "index.html").read_text(encoding="utf-8")
+
+    assert 'href="#main-content"' in index
+    assert "<nav" in index
+    assert 'aria-label="Primary"' in index
+    assert 'id="critical-banner"' in index
+    assert 'role="alert"' in index
+    assert 'id="approval-dialog"' in index
+    assert 'aria-labelledby="approval-title"' in index
+    assert 'id="reauth-dialog"' in index
+    assert 'aria-labelledby="reauth-title"' in index
+    assert 'id="status-region"' in index
+    assert 'aria-live="polite"' in index
+    assert "Sign out" in index
+
+
+@pytest.mark.parametrize("script", ["index.js", "plans.js"])
+def test_review_dialogs_close_on_escape_and_restore_invoker_focus(script):
+    text = (_STATIC / "js" / script).read_text(encoding="utf-8")
+
+    assert 'event.key === "Escape"' in text
+    assert "closeDialog(dialog)" in text
+    assert "target.focus()" in text
+    close_start = text.index("function closeDialog(dialog)")
+    target_lookup = text.index(
+        "const target = dialogReturnFocus.get(dialog)",
+        close_start,
+    )
+    native_close = text.index("dialog.close()", close_start)
+    assert target_lookup < native_close
+
+
+def test_console_workspace_constrains_mobile_data_without_hiding_it():
+    css = (_STATIC / "css" / "console.css").read_text(encoding="utf-8")
+    workspace_start = css.index(".workspace {")
+    workspace_end = css.index("}", workspace_start)
+    workspace_rule = css[workspace_start:workspace_end]
+
+    assert "grid-template-columns: minmax(0, 1fr);" in workspace_rule
+    assert (
+        ".data-grid,\n"
+        "  .plans-layout,\n"
+        "  .backtests-layout {\n"
+        "    grid-template-columns: minmax(0, 1fr);"
+    ) in css
+    assert "overflow-wrap: anywhere;" in css
 
 
 # ── A3: redaction of new secrets ────────────────────────────────

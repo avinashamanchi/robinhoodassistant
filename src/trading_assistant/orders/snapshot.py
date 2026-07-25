@@ -84,7 +84,36 @@ class PortfolioSnapshotService:
         self.submission_barrier = SubmissionBarrier(session_factory)
 
     def assemble_for_execution(
-        self, ticker: str, *, exclude_order_id: int | None = None
+        self,
+        ticker: str,
+        *,
+        exclude_order_id: int | None = None,
+    ) -> PortfolioSnapshot:
+        return self._assemble_required_snapshot(
+            ticker,
+            exclude_order_id=exclude_order_id,
+            persist_account_state=True,
+        )
+
+    def assemble_for_confirmation(
+        self,
+        ticker: str,
+        *,
+        exclude_order_id: int | None = None,
+    ) -> PortfolioSnapshot:
+        """Build required read-only proof without advancing risk state."""
+        return self._assemble_required_snapshot(
+            ticker,
+            exclude_order_id=exclude_order_id,
+            persist_account_state=False,
+        )
+
+    def _assemble_required_snapshot(
+        self,
+        ticker: str,
+        *,
+        exclude_order_id: int | None,
+        persist_account_state: bool,
     ) -> PortfolioSnapshot:
         captured_at = self._captured_at()
         asset_class = AssetClass.for_symbol(ticker)
@@ -116,8 +145,17 @@ class PortfolioSnapshotService:
             required=True,
         )
 
-        high_water_mark = self._account_high_water_mark(
-            asset_class, account, captured_at
+        high_water_mark = (
+            self._account_high_water_mark(
+                asset_class,
+                account,
+                captured_at,
+            )
+            if persist_account_state
+            else self._observed_account_high_water_mark(
+                asset_class,
+                account,
+            )
         )
         active_breakers = frozenset(
             state.scope.key
@@ -452,6 +490,26 @@ class PortfolioSnapshotService:
                 high_water_mark = state.high_water_mark
                 session.commit()
                 return high_water_mark
+
+    def _observed_account_high_water_mark(
+        self,
+        asset_class: AssetClass,
+        account: Account,
+    ) -> Decimal:
+        """Read a usable high-water mark without changing durable state."""
+        with self.session_factory() as session:
+            state = session.get(AccountRiskState, asset_class.value)
+            persisted = (
+                state.high_water_mark
+                if state is not None
+                and isinstance(state.high_water_mark, Decimal)
+                and state.high_water_mark.is_finite()
+                and state.high_water_mark > 0
+                else Decimal(0)
+            )
+        if account.is_valid:
+            return max(persisted, account.equity)
+        return persisted
 
     def _max_quote_age(self, asset_class: AssetClass) -> Decimal:
         if self.risk_config_for_asset is None:

@@ -1,118 +1,98 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Backtests — Trading Assistant</title>
-  <style>
-    :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
-            --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
-    * { box-sizing:border-box; }
-    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-    header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
-    header h1 { font-size:16px; margin:0; font-weight:600; }
-    a { color:var(--accent); }
-    .disclaimer { background:#2a2417; color:var(--amber); text-align:center; padding:8px; font-size:13px; border-bottom:1px solid var(--line); }
-    button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg); border-radius:6px; padding:6px 12px; cursor:pointer; }
-    button:hover { border-color:var(--accent); }
-    main { max-width:1150px; margin:0 auto; padding:16px; display:grid; grid-template-columns:220px 1fr; gap:16px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-    h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin:0 0 10px; }
-    .run { padding:8px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px; cursor:pointer; font-size:13px; }
-    .run:hover { border-color:var(--accent); }
-    table { width:100%; border-collapse:collapse; }
-    th,td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; }
-    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align:left; }
-    th { color:var(--muted); font-weight:500; }
-    .beat-yes { color:var(--green); } .beat-no { color:var(--red); }
-    .win-holdout { color:var(--amber); font-weight:600; }
-    .regime { color:var(--muted); font-size:12px; }
-    .empty { color:var(--muted); font-style:italic; }
-  </style>
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/backtests.js"></script>
 </head>
 <body>
-  <header>
-    <h1>Backtests</h1>
-    <div><a href="/" style="margin-right:12px">← Assistant</a>
-    <button onclick="run()">Run new backtest</button></div>
+  <a class="skip-link" href="#main-content">Skip to backtests</a>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark">Paper operations</span>
+      <h1>Backtests</h1>
+    </div>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="/">Console</a>
+      <a href="/plans/ui">Plans</a>
+      <a href="/backtests/ui" aria-current="page">Backtests</a>
+    </nav>
+    <div class="session-controls">
+      <span class="session-actor" id="session-actor">Checking session…</span>
+      <button class="button-quiet" id="sign-out" type="button">Sign out</button>
+    </div>
   </header>
-  <div class="disclaimer">Simulated — past performance does not predict future results.</div>
+  <div class="simulated-banner">Simulated — past performance does not predict future results.</div>
 
-  <main>
-    <section class="panel"><h2>Runs</h2><div id="runs"><div class="empty">none yet</div></div></section>
-    <section class="panel"><h2 id="report-title">Report</h2>
-      <div id="report"><div class="empty">Run a backtest or pick one on the left.</div></div></section>
+  <main class="console-layout" id="main-content">
+    <aside class="truth-rail" aria-labelledby="backtest-tools-title">
+      <div class="rail-heading">
+        <p class="eyebrow">Simulation controls</p>
+        <h2 id="backtest-tools-title">Launch a run</h2>
+        <p>Backtests do not place orders.</p>
+      </div>
+      <form class="breaker-control" id="backtest-form">
+        <div class="field">
+          <label for="backtest-reason">Run reason</label>
+          <textarea id="backtest-reason" rows="4" required></textarea>
+        </div>
+        <button class="button-primary" type="submit">Run backtest</button>
+      </form>
+      <div class="breaker-control">
+        <h3>Saved runs</h3>
+        <div id="backtest-runs">
+          <p class="empty-state">Loading runs…</p>
+        </div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <section class="page-intro" aria-labelledby="backtests-page-title">
+        <div>
+          <p class="section-label">Evaluation ledger</p>
+          <h2 id="backtests-page-title">Treat simulation as evidence, not promise.</h2>
+          <p>Walk-forward results keep holdout performance and benchmark comparisons visible.</p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="report-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Simulation report</p>
+            <h2 id="report-title">Choose a run</h2>
+          </div>
+          <button class="button-quiet" id="refresh-runs" type="button">Refresh runs</button>
+        </div>
+        <div class="section-body" id="backtest-report">
+          <p class="empty-state">Run a backtest or choose a saved run.</p>
+        </div>
+      </section>
+    </div>
   </main>
 
-  <script>
-    const $ = (id) => document.getElementById(id);
-    function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
-    function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
-    let csrfToken = "";
-    const sessionReady = fetch("/auth/session").then(async (response) => {
-      if (response.status === 401) {
-        window.location.replace("/login");
-        throw new Error("operator session required");
-      }
-      csrfToken = (await response.json()).csrf_token;
-    });
-    function sessionHeaders(opts) {
-      const method = (opts.method || "GET").toUpperCase();
-      if (method !== "GET" && method !== "HEAD") {
-        opts.headers = Object.assign({ "X-CSRF-Token": csrfToken }, opts.headers || {});
-      }
-      return opts;
-    }
-    async function api(path, opts = {}) {
-      await sessionReady;
-      return (await fetch(path, sessionHeaders(opts))).json();
-    }
+  <dialog id="reauth-dialog" aria-labelledby="reauth-title">
+    <form id="reauth-form">
+      <div class="dialog-header">
+        <p class="section-label">Recent sign-in required</p>
+        <h2 id="reauth-title">Verify operator secret</h2>
+        <p>The entered secret is cleared before the verification request.</p>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="reauth-secret">Operator secret</label>
+          <input id="reauth-secret" type="password" autocomplete="current-password" required>
+        </div>
+        <p class="field-error" id="reauth-status" role="status"></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="reauth-cancel" type="button">Cancel</button>
+        <button class="button-primary" type="submit">Verify and retry once</button>
+      </div>
+    </form>
+  </dialog>
 
-    async function refreshRuns() {
-      const data = await api("/backtests");
-      const box = $("runs"); clear(box);
-      const runs = data.backtests || [];
-      if (!runs.length) { box.appendChild(el("div", "none yet", "empty")); return; }
-      runs.forEach((r) => {
-        const d = el("div", null, "run");
-        d.appendChild(el("div", "#" + r.run_id + " · " + r.label));
-        d.appendChild(el("span", r.created_at.slice(0, 16).replace("T", " "), "regime"));
-        d.addEventListener("click", () => showReport(r.run_id));
-        box.appendChild(d);
-      });
-    }
-    async function run() {
-      const reason = (window.prompt("Reason for launching this backtest:") || "").trim();
-      if (!reason) return;
-      const box = $("report"); clear(box); box.appendChild(el("div", "Running walk-forward…", "empty"));
-      const res = await api("/backtests/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) });
-      await refreshRuns();
-      if (res.run_id) showReport(res.run_id);
-      else { clear(box); box.appendChild(el("div", JSON.stringify(res.detail || res), "empty")); }
-    }
-    async function showReport(id) {
-      const rep = await api("/backtests/" + id + "/report");
-      $("report-title").textContent = "Report #" + rep.run_id + " — " + rep.label;
-      const box = $("report"); clear(box);
-      const t = el("table");
-      const hr = el("tr");
-      ["symbol","strategy","window","ret%","B&H%","sharpe","maxDD%","trades","expo","beat"].forEach((h) => hr.appendChild(el("th", h)));
-      t.appendChild(hr);
-      (rep.rows || []).forEach((r) => {
-        const m = r.metrics, b = r.benchmark_buy_and_hold, beat = r.beat_buy_and_hold;
-        const tr = el("tr", null, r.window === "holdout" ? "win-holdout" : "");
-        [r.symbol, r.strategy, r.window, m.total_return_pct.toFixed(2), b.total_return_pct.toFixed(2),
-         m.sharpe.toFixed(2), m.max_drawdown_pct.toFixed(2), m.num_trades, m.exposure_pct.toFixed(0) + "%"]
-          .forEach((v) => tr.appendChild(el("td", v)));
-        tr.appendChild(el("td", beat ? "yes" : "no", beat ? "beat-yes" : "beat-no"));
-        t.appendChild(tr);
-        const reg = m.pnl_by_regime || {};
-        const regStr = Object.entries(reg).map(([k, v]) => k + ": " + v.toFixed(0)).join(" · ");
-        if (regStr) { const rr = el("tr"); rr.appendChild(el("td", "")); const c = el("td", "P&L by regime — " + regStr, "regime"); c.colSpan = 9; rr.appendChild(c); t.appendChild(rr); }
-      });
-      box.appendChild(t);
-    }
-    refreshRuns();
-  </script>
+  <div class="status-region" id="status-region" aria-live="polite"></div>
 </body>
 </html>

@@ -15,9 +15,11 @@ from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..assets import AssetClass
 from ..broker.models import OrderStatus
@@ -43,6 +45,13 @@ from .security import (
 
 _STATIC = Path(__file__).parent / "static"
 _DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
+
+
+class _AssetOnlyStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        if Path(path).suffix.lower() not in {".css", ".js"}:
+            raise StarletteHTTPException(status_code=404)
+        return await super().get_response(path, scope)
 
 
 def _dependency_unavailable() -> ApiError:
@@ -283,6 +292,11 @@ def create_app(
     )
     install_security(app)
     app.include_router(auth_router)
+    app.mount(
+        "/static",
+        _AssetOnlyStaticFiles(directory=_STATIC),
+        name="static",
+    )
 
     @app.get("/health/live")
     def liveness():
@@ -291,10 +305,6 @@ def create_app(
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> str:
         return (_STATIC / "login.html").read_text(encoding="utf-8")
-
-    @app.get("/static/login.js", response_class=FileResponse)
-    def login_script():
-        return _STATIC / "login.js"
 
     @app.get("/", response_class=HTMLResponse)
     def index(
@@ -330,6 +340,25 @@ def create_app(
         principal: SessionPrincipal = Depends(current_principal),
     ):
         return {"pending": service.get_pending()}
+
+    @app.get("/pending/{order_id}/confirmation")
+    def pending_confirmation(
+        order_id: int,
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        try:
+            proof = service.get_approval_confirmation(order_id)
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
+        if proof.get("error") == "not_found":
+            raise ApiError("order_not_found", 404, "Order not found")
+        if proof.get("error") == "conflict":
+            raise ApiError(
+                "approval_conflict",
+                409,
+                "Order approval is no longer current",
+            )
+        return proof
 
     @app.post("/approve/{order_id}")
     def approve(

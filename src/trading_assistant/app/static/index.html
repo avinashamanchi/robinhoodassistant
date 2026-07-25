@@ -1,313 +1,311 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Trading Assistant</title>
-  <style>
-    :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
-            --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
-    * { box-sizing:border-box; }
-    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-    header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
-    header h1 { font-size:16px; margin:0; font-weight:600; }
-    header .mode { color:var(--amber); font-size:12px; margin-left:10px; }
-    a { color:var(--accent); }
-    button { font:inherit; border:1px solid var(--line); background:#222a33; color:var(--fg); border-radius:6px; padding:6px 12px; cursor:pointer; }
-    button:hover { border-color:var(--accent); }
-    button.approve { border-color:var(--green); color:var(--green); }
-    button.reject { border-color:var(--red); color:var(--red); }
-    button.danger { border-color:var(--red); color:var(--red); }
-    main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px; max-width:1100px; margin:0 auto; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-    .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin:0 0 10px; }
-    .full { grid-column:1 / -1; }
-    #log-box, #chat-box { height:220px; overflow-y:auto; background:#11151a; border:1px solid var(--line); border-radius:8px; padding:10px; }
-    .msg { margin-bottom:8px; }
-    .msg .who { color:var(--muted); font-size:11px; }
-    .msg.user .who { color:var(--accent); }
-    .row { display:flex; gap:8px; margin-top:10px; }
-    .row input { flex:1; padding:8px 10px; background:#11151a; border:1px solid var(--line); border-radius:6px; color:var(--fg); }
-    table { width:100%; border-collapse:collapse; }
-    th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; }
-    th { color:var(--muted); font-weight:500; }
-    .pill { padding:2px 7px; border-radius:20px; font-size:11px; }
-    .pill.proposed { background:#2a2f1c; color:var(--amber); }
-    .pill.ro { background:#2a2f1c; color:var(--amber); margin-left:6px; }
-    .empty { color:var(--muted); font-style:italic; padding:8px 0; }
-    .tool { color:var(--muted); font-size:12px; }
-    .evt-reason { color:var(--red); }
-    #toast { position:fixed; right:16px; bottom:16px; max-width:380px; z-index:50; display:flex; flex-direction:column; gap:8px; }
-    .toast { padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); box-shadow:0 4px 16px rgba(0,0,0,.4); font-size:13px; }
-    .toast.ok { border-color:var(--green); }
-    .toast.err { border-color:var(--red); color:#ffd7d7; }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operator console — Trading Assistant</title>
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/index.js"></script>
 </head>
 <body>
-  <header>
-    <div><h1>Trading Assistant <span class="mode" id="mode">paper</span></h1></div>
-    <div>
-      <a href="/plans/ui" style="margin-right:12px">Plans &amp; Screener</a>
-      <a href="/backtests/ui" style="margin-right:12px">Backtests</a>
-      <button class="danger" onclick="panic()">Panic</button>
-      <button class="danger" onclick="resetKill()">Reset kill switch</button>
+  <a class="skip-link" href="#main-content">Skip to operator console</a>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark">Paper operations</span>
+      <h1>Trading Assistant</h1>
+    </div>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="/" aria-current="page">Console</a>
+      <a href="/plans/ui">Plans</a>
+      <a href="/backtests/ui">Backtests</a>
+    </nav>
+    <div class="session-controls">
+      <span class="session-actor" id="session-actor">Checking session…</span>
+      <button class="button-quiet" id="sign-out" type="button">Sign out</button>
     </div>
   </header>
 
-  <main>
-    <section class="panel full">
-      <h2>Assistant</h2>
-      <div id="chat-box"></div>
-      <div class="row">
-        <input id="chat-input" placeholder="e.g. Buy $50 of AAPL if it drops below 175" />
-        <button onclick="send()">Send</button>
+  <div class="critical-banner" id="critical-banner" role="alert" hidden>
+    <strong>Unsafe state</strong>
+    <span id="critical-banner-message">Panic did not confirm a safe state.</span>
+  </div>
+
+  <main class="console-layout" id="main-content">
+    <aside class="truth-rail" aria-labelledby="truth-title">
+      <div class="rail-heading">
+        <p class="eyebrow">Server-observed</p>
+        <h2 id="truth-title">Operational truth</h2>
+        <p>Only state the server can currently report.</p>
       </div>
-    </section>
+      <dl class="truth-list">
+        <div class="truth-row">
+          <dt>Broker</dt>
+          <dd id="truth-broker">Unknown</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Trading mode</dt>
+          <dd id="truth-mode">Unknown</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Operator</dt>
+          <dd id="truth-operator">Unknown</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Database</dt>
+          <dd id="truth-database" class="state state-caution">Checking</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Daemon</dt>
+          <dd id="truth-daemon" class="state state-caution">Checking</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Equity breaker</dt>
+          <dd id="truth-equity-breaker" class="state state-caution">Unknown</dd>
+        </div>
+        <div class="truth-row">
+          <dt>Crypto breaker</dt>
+          <dd id="truth-crypto-breaker" class="state state-caution">Unknown</dd>
+        </div>
+      </dl>
+      <form class="breaker-control" id="breaker-reset-form">
+        <h3>Reset one breaker scope</h3>
+        <div class="field">
+          <label for="breaker-scope">Asset class</label>
+          <select id="breaker-scope" name="asset_class">
+            <option value="equity">Equity</option>
+            <option value="crypto">Crypto</option>
+          </select>
+        </div>
+        <div class="breaker-proof">
+          <span>Observed generation</span>
+          <output id="breaker-generation">None</output>
+          <span>Server health</span>
+          <output id="breaker-health">Unconfirmed</output>
+        </div>
+        <div class="field">
+          <label for="breaker-reset-reason">Reason</label>
+          <textarea
+            id="breaker-reset-reason"
+            name="reason"
+            rows="3"
+            required
+          ></textarea>
+        </div>
+        <p class="field-hint">A reset requires a tripped scope, a positive observed generation, complete health, and recent sign-in.</p>
+        <button id="breaker-reset-button" type="submit" disabled>Reset selected scope</button>
+      </form>
+    </aside>
 
-    <section class="panel"><h2>Pending approvals</h2><div id="pending"></div></section>
-    <section class="panel"><h2>Positions</h2><div id="positions"></div></section>
-    <section class="panel full">
-      <h2>Combined holdings <span class="mode" id="ext-stale" style="display:none">external data stale</span></h2>
-      <div id="holdings"></div>
-    </section>
-    <section class="panel full"><h2>Execution &amp; risk log</h2><div id="log-box"></div></section>
+    <div class="workspace">
+      <section class="page-intro" aria-labelledby="console-title">
+        <div>
+          <p class="section-label">Decision ledger</p>
+          <h2 id="console-title">Know what is proven before you act.</h2>
+          <p>Pending orders, operator decisions, and broker receipts remain distinct.</p>
+        </div>
+        <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>
+      </section>
+
+      <section class="ledger" aria-labelledby="pending-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Human gate</p>
+            <h2 id="pending-title">Pending decisions</h2>
+            <p>Approval always performs a fresh execution-time risk check.</p>
+          </div>
+          <button class="button-quiet" id="refresh-console" type="button">Refresh truth</button>
+        </div>
+        <div class="section-body">
+          <ol class="ledger-list" id="pending-list">
+            <li class="empty-state">Loading pending proposals…</li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="receipts-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Observed outcomes</p>
+            <h2 id="receipts-title">Action receipts</h2>
+          </div>
+        </div>
+        <div class="section-body">
+          <div class="receipt-panel" id="receipt-panel">
+            <p class="empty-state">No operator action receipts in this page session.</p>
+          </div>
+        </div>
+      </section>
+
+      <div class="data-grid">
+        <section class="panel" aria-labelledby="positions-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Broker positions</p>
+              <h2 id="positions-title">Alpaca positions</h2>
+            </div>
+          </div>
+          <div class="section-body" id="positions">
+            <p class="empty-state">Loading positions…</p>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="holdings-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Exposure context</p>
+              <h2 id="holdings-title">Combined holdings</h2>
+              <p id="external-stale">Checking external source…</p>
+            </div>
+          </div>
+          <div class="section-body" id="holdings">
+            <p class="empty-state">Loading holdings…</p>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="assistant-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Research only</p>
+            <h2 id="assistant-title">Assistant</h2>
+            <p>Model output cannot approve or execute an order.</p>
+          </div>
+        </div>
+        <div class="section-body">
+          <div class="chat-log" id="chat-log" aria-live="polite"></div>
+          <form class="compose-row" id="chat-form">
+            <div class="field">
+              <label for="chat-input">Message</label>
+              <input id="chat-input" autocomplete="off">
+            </div>
+            <button class="button-primary" type="submit">Send message</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="risk-log-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Audit trail</p>
+            <h2 id="risk-log-title">Execution and risk log</h2>
+          </div>
+        </div>
+        <div class="section-body">
+          <div class="event-log" id="risk-log">
+            <p class="empty-state">Loading risk events…</p>
+          </div>
+        </div>
+      </section>
+    </div>
   </main>
-  <div id="toast"></div>
 
-  <script>
-    // ── DOM-safe helpers: all dynamic values go through textContent, never HTML ──
-    const $ = (id) => document.getElementById(id);
-    function el(tag, text, cls) {
-      const n = document.createElement(tag);
-      if (cls) n.className = cls;
-      if (text !== undefined && text !== null) n.textContent = String(text);
-      return n;
-    }
-    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-    function cell(text) { return el("td", text); }
-    function tableFrom(headers, rows) {
-      const t = el("table");
-      const hr = el("tr");
-      headers.forEach((h) => hr.appendChild(el("th", h)));
-      t.appendChild(hr);
-      rows.forEach((r) => t.appendChild(r));
-      return t;
-    }
+  <dialog id="approval-dialog" aria-labelledby="approval-title">
+    <form id="approval-form">
+      <div class="dialog-header">
+        <p class="section-label">Server confirmation</p>
+        <h2 id="approval-title">Review exact order proof</h2>
+        <p>Approval remains disabled unless every proof field is present.</p>
+      </div>
+      <div class="dialog-body">
+        <p class="proof-status" id="approval-proof-status" role="status">Loading server proof…</p>
+        <dl class="proof-grid">
+          <dt>Broker</dt><dd id="approval-broker">Unknown</dd>
+          <dt>Mode</dt><dd id="approval-mode">Unknown</dd>
+          <dt>Symbol</dt><dd id="approval-symbol">Unknown</dd>
+          <dt>Side</dt><dd id="approval-side">Unknown</dd>
+          <dt>Order type</dt><dd id="approval-order-type">Unknown</dd>
+          <dt>Quantity</dt><dd id="approval-quantity">—</dd>
+          <dt>Notional</dt><dd id="approval-notional">—</dd>
+          <dt>Limit price</dt><dd id="approval-limit-price">—</dd>
+          <dt>Expires</dt><dd id="approval-expiry">Unknown</dd>
+          <dt>Current position quantity</dt><dd id="approval-current-quantity">Unknown</dd>
+          <dt>Current signed exposure</dt><dd id="approval-current-exposure">Unknown</dd>
+          <dt>Resulting signed exposure</dt><dd id="approval-resulting-exposure">Unknown</dd>
+          <dt>Exposure observed</dt><dd id="approval-exposure-time">Unknown</dd>
+        </dl>
+        <div class="field">
+          <label for="approval-reason">Approval reason</label>
+          <textarea id="approval-reason" name="reason" required></textarea>
+        </div>
+        <p class="field-hint">The server rechecks risk, market state, broker state, and breakers at execution time.</p>
+      </div>
+      <div class="dialog-actions">
+        <button id="approval-cancel" type="button">Cancel</button>
+        <button
+          class="button-primary"
+          id="approval-confirm-button"
+          type="submit"
+          disabled
+        >Approve exact order</button>
+      </div>
+    </form>
+  </dialog>
 
-    // Session cookies are HttpOnly. Keep the session CSRF value in memory only.
-    let csrfToken = "";
-    const sessionReady = fetch("/auth/session").then(async (response) => {
-      if (response.status === 401) {
-        window.location.replace("/login");
-        throw new Error("operator session required");
-      }
-      const session = await response.json();
-      csrfToken = session.csrf_token;
-    });
-    function sessionHeaders(opts) {
-      const method = (opts.method || "GET").toUpperCase();
-      if (method !== "GET" && method !== "HEAD") {
-        opts.headers = Object.assign(
-          { "X-CSRF-Token": csrfToken },
-          opts.headers || {},
-        );
-      }
-      return opts;
-    }
-    async function api(path, opts = {}) {
-      await sessionReady;
-      const r = await fetch(path, sessionHeaders(opts));
-      return r.json();
-    }
-    const jsonPost = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  <dialog id="rejection-dialog" aria-labelledby="rejection-title">
+    <form id="rejection-form">
+      <div class="dialog-header">
+        <p class="section-label">Human decision</p>
+        <h2 id="rejection-title">Reject proposed order</h2>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="rejection-reason">Rejection reason</label>
+          <textarea id="rejection-reason" name="reason" required></textarea>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="rejection-cancel" type="button">Cancel</button>
+        <button class="button-danger" type="submit">Reject order</button>
+      </div>
+    </form>
+  </dialog>
 
-    // Toast feedback so actions are never silent (this is the fix for
-    // "I press approve and nothing happens").
-    function notify(msg, kind) {
-      const box = $("toast");
-      const t = el("div", msg, "toast " + (kind || ""));
-      box.appendChild(t);
-      setTimeout(() => t.remove(), kind === "err" ? 9000 : 5000);
-    }
-    // Mutating call that surfaces HTTP errors instead of swallowing them.
-    async function action(path, opts = {}) {
-      await sessionReady;
-      let r, data;
-      try { r = await fetch(path, sessionHeaders(opts)); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
-      try { data = await r.json(); } catch (e) { data = {}; }
-      if (r.status === 401) {
-        window.location.replace("/login");
-        return { ok: false, status: 401, data };
-      }
-      if (!r.ok) {
-        const d = data && data.error !== undefined ? data.error : data;
-        notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err");
-        return { ok: false, status: r.status, data };
-      }
-      return { ok: true, status: r.status, data };
-    }
+  <dialog id="panic-dialog" aria-labelledby="panic-title">
+    <form id="panic-form">
+      <div class="dialog-header">
+        <p class="section-label">Destructive safety procedure</p>
+        <h2 id="panic-title">Request panic cancellation</h2>
+        <p>This asks the server to cancel orders, disable rules, and latch breakers. Only an explicit safe receipt is success.</p>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="panic-reason">Panic reason</label>
+          <textarea id="panic-reason" name="reason" required></textarea>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="panic-cancel" type="button">Cancel</button>
+        <button class="button-danger-solid" type="submit">Request panic action</button>
+      </div>
+    </form>
+  </dialog>
 
-    function chatLine(who, text, cls) {
-      const d = el("div", null, "msg " + (cls || ""));
-      d.appendChild(el("div", who, "who"));
-      d.appendChild(el("div", text));   // textContent — literal, never parsed as HTML
-      $("chat-box").appendChild(d);
-      $("chat-box").scrollTop = $("chat-box").scrollHeight;
-    }
+  <dialog id="reauth-dialog" aria-labelledby="reauth-title">
+    <form id="reauth-form">
+      <div class="dialog-header">
+        <p class="section-label">Recent sign-in required</p>
+        <h2 id="reauth-title">Verify operator secret</h2>
+        <p>The entered secret is cleared before the verification request.</p>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="reauth-secret">Operator secret</label>
+          <input
+            id="reauth-secret"
+            type="password"
+            autocomplete="current-password"
+            required
+          >
+        </div>
+        <p class="field-error" id="reauth-status" role="status"></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="reauth-cancel" type="button">Cancel</button>
+        <button class="button-primary" type="submit">Verify and retry once</button>
+      </div>
+    </form>
+  </dialog>
 
-    async function send() {
-      const input = $("chat-input");
-      const msg = input.value.trim();
-      if (!msg) return;
-      input.value = "";
-      chatLine("you", msg, "user");
-      const res = await api("/chat", jsonPost({ message: msg }));
-      if (res.detail) { chatLine("system", "Error: " + JSON.stringify(res.detail)); }
-      else {
-        (res.tool_calls || []).forEach((t) =>
-          chatLine("tool", "→ " + t.name + "(" + JSON.stringify(t.input) + ")"));
-        chatLine("assistant", res.reply || "(no reply)");
-      }
-      refresh();
-    }
-    $("chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
-
-    async function approve(id) {
-      const reason = window.prompt("Why are you approving this order?");
-      if (reason === null) return;
-      const r = await action("/approve/" + id, jsonPost({ reason }));
-      if (r.ok) {
-        const d = r.data || {};
-        if (d.status === "rejected") notify("Order " + id + " REJECTED by risk: " + ((d.risk_reasons || []).join("; ") || "see log"), "err");
-        else if (d.executed) notify("Approved ✓ order " + id + " → " + d.status + (d.broker_order_id ? " (Alpaca " + d.broker_order_id.slice(0, 8) + ")" : ""), "ok");
-        else notify("Order " + id + ": " + (d.status || "processed"), "ok");
-      }
-      refresh();
-    }
-    async function reject(id) {
-      const reason = (window.prompt("Reason for rejecting this order:") || "").trim();
-      if (!reason) { notify("A non-empty rejection reason is required.", "err"); return; }
-      const r = await action("/reject/" + id, jsonPost({ reason }));
-      if (r.ok) notify("Rejected order " + id, "ok");
-      refresh();
-    }
-    async function resetKill() {
-      const health = await api("/health");
-      const generation = health.killswitch_generation && health.killswitch_generation.equity;
-      if (!Number.isInteger(generation)) {
-        notify("No observed equity kill-switch generation to reset", "err");
-        return;
-      }
-      const reason = window.prompt("Why is it safe to reset the equity kill switch?");
-      if (reason === null) return;
-      const r = await action("/killswitch/reset", jsonPost({
-        asset_class: "equity",
-        reason,
-        expected_generation: generation,
-      }));
-      if (r.ok) notify("Kill switch reset", "ok");
-      refresh();
-    }
-    async function panic() {
-      if (!window.confirm("PANIC: cancel all orders, disable all rules, trip all kill switches?")) return;
-      const reason = (window.prompt("Reason for panic shutdown:") || "").trim();
-      if (!reason) { notify("A non-empty panic reason is required.", "err"); return; }
-      const r = await action("/panic", jsonPost({ reason }));
-      if (r.ok && r.data && r.data.safe === true) {
-        notify("PANIC executed — everything halted", "ok");
-      } else {
-        const receipt = r.data && r.data.receipt;
-        if (receipt) {
-          const local = receipt.unsafe_local_state || {};
-          notify(
-            "PANIC incomplete — local enumeration " + receipt.local_enumeration +
-            ", local unconfirmed " + JSON.stringify(receipt.unconfirmed_order_ids || []) +
-            ", unsafe fills " + JSON.stringify(local.unsafe_fill_ids || []) +
-            ", active rules " + JSON.stringify(local.active_rule_ids || []) +
-            ", unsafe rule groups " + JSON.stringify(local.unsafe_rule_group_ids || []) +
-            ", unknown local categories " + JSON.stringify(local.unknown_categories || []) +
-            ", remote enumeration " + receipt.remote_enumeration +
-            ", remote potentially open " + JSON.stringify(receipt.remote_open_order_ids || []),
-            "err"
-          );
-        } else if (r.ok) {
-          notify("PANIC response did not confirm a safe state", "err");
-        }
-      }
-      refresh();
-    }
-
-    async function refresh() {
-      const p = await api("/pending");
-      const pend = $("pending"); clear(pend);
-      if (p.pending && p.pending.length) {
-        p.pending.forEach((o) => {
-          const row = el("div", null, "row");
-          row.style.justifyContent = "space-between";
-          row.style.alignItems = "center";
-          const left = el("div");
-          left.appendChild(el("strong", o.ticker));
-          left.appendChild(document.createTextNode(
-            " " + o.side + " " + o.order_type + " " + (o.notional ? "$" + o.notional : o.qty + " sh") +
-            (o.limit_price ? " @ " + o.limit_price : "") + " "));
-          left.appendChild(el("span", "proposed", "pill proposed"));
-          const btns = el("div");
-          const a = el("button", "Approve", "approve"); a.addEventListener("click", () => approve(o.order_id));
-          const rj = el("button", "Reject", "reject"); rj.addEventListener("click", () => reject(o.order_id));
-          btns.append(a, rj);
-          row.append(left, btns);
-          pend.appendChild(row);
-        });
-      } else { pend.appendChild(el("div", "No pending proposals", "empty")); }
-
-      const pos = await api("/positions");
-      const posBox = $("positions"); clear(posBox);
-      if (pos.positions && pos.positions.length) {
-        const rows = pos.positions.map((x) => {
-          const tr = el("tr");
-          [x.ticker, x.qty, x.avg_entry_price, x.current_price, x.market_value].forEach((v) => tr.appendChild(cell(v)));
-          return tr;
-        });
-        posBox.appendChild(tableFrom(["Ticker", "Qty", "Avg", "Last", "Value"], rows));
-      } else { posBox.appendChild(el("div", "No open positions", "empty")); }
-
-      const h = await api("/holdings");
-      $("ext-stale").style.display = h.external_stale ? "inline" : "none";
-      const holdBox = $("holdings"); clear(holdBox);
-      const all = [...(h.alpaca || []), ...(h.external || [])];
-      const totals = h.combined_by_ticker || {};
-      if (all.length) {
-        const rows = all.map((x) => {
-          const tr = el("tr");
-          tr.appendChild(cell(x.ticker));
-          const src = el("td", x.source);
-          if (x.read_only) src.appendChild(el("span", "read-only", "pill ro"));
-          tr.appendChild(src);
-          tr.appendChild(cell(x.qty));
-          tr.appendChild(cell(x.market_value !== undefined ? x.market_value : x.current_value));
-          tr.appendChild(cell(totals[x.ticker] !== undefined ? totals[x.ticker] : ""));
-          return tr;
-        });
-        holdBox.appendChild(tableFrom(["Ticker", "Source", "Qty", "Value", "Combined"], rows));
-      } else {
-        holdBox.appendChild(el("div", h.external_available === false ? "Alpaca only — no external source enabled" : "No holdings", "empty"));
-      }
-
-      const logData = await api("/log");
-      const logBox = $("log-box"); clear(logBox);
-      const evts = logData.risk_events || [];
-      if (evts.length) {
-        evts.forEach((e) => {
-          const d = el("div", null, "msg");
-          d.appendChild(el("span", e.at + " · " + e.type, "who"));
-          d.appendChild(el("div", e.reason, "evt-reason"));
-          logBox.appendChild(d);
-        });
-      } else { logBox.appendChild(el("div", "No risk events yet", "empty")); }
-    }
-
-    refresh();
-    setInterval(refresh, 5000);
-  </script>
+  <div class="status-region" id="status-region" aria-live="polite"></div>
 </body>
 </html>

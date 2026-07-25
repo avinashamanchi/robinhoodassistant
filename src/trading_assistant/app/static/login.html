@@ -2,19 +2,37 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Trading Assistant Login</title>
-  <script src="/static/login.js" defer></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operator sign in — Trading Assistant</title>
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/login.js"></script>
 </head>
-<body>
-  <main>
-    <h1>Operator login required</h1>
-    <form id="login-form">
-      <label for="secret">Operator secret</label>
-      <input id="secret" name="secret" type="password" autocomplete="current-password" required>
-      <button type="submit">Sign in</button>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-context" aria-labelledby="login-context-title">
+      <div>
+        <p class="brand-mark">Paper operations</p>
+        <h1 id="login-context-title">A control room for deliberate decisions.</h1>
+        <p>Broker truth, scoped safety state, and operator actions stay visibly separate.</p>
+      </div>
+      <p class="login-proof">Local session · HttpOnly cookie · in-memory request protection</p>
+    </section>
+    <form class="login-form" id="login-form">
+      <h2>Operator sign in</h2>
+      <p>Use the local operator secret. It is cleared from this form before the request begins.</p>
+      <div class="field">
+        <label for="login-secret">Operator secret</label>
+        <input
+          id="login-secret"
+          name="secret"
+          type="password"
+          autocomplete="current-password"
+          required
+        >
+      </div>
+      <button class="button-primary" type="submit">Sign in</button>
+      <p class="login-status" id="login-status" role="status" aria-live="polite"></p>
     </form>
-    <p id="status" role="status"></p>
   </main>
 </body>
 </html>
