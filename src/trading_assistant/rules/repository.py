@@ -18,6 +18,10 @@ from trading_assistant.db.models import (
     RuleGroup,
     TradePlanRow,
 )
+from trading_assistant.risk.submission_barrier import (
+    SubmissionBarrier,
+    serialized_writer,
+)
 
 from .models import (
     RuleCommand,
@@ -96,6 +100,9 @@ class RuleRepository:
             raise ValueError("rule lease owner must be non-empty")
         self.session_factory = session_factory
         self.owner = owner
+        self.submission_barrier = SubmissionBarrier(
+            session_factory
+        )
 
     def active_group_ids(self) -> list[int]:
         with self.session_factory() as session:
@@ -107,6 +114,7 @@ class RuleRepository:
                 ).all()
             )
 
+    @serialized_writer
     def lease_group(
         self,
         group_id: int,
@@ -256,6 +264,7 @@ class RuleRepository:
         )
         return StoredRule(row.id, row.group_id, command)
 
+    @serialized_writer
     def release_group(
         self,
         lease: RuleGroupLease,
@@ -329,6 +338,7 @@ class RuleRepository:
             session.commit()
             return True
 
+    @serialized_writer
     def claim_terminal(
         self,
         lease: RuleGroupLease,
@@ -457,6 +467,7 @@ class RuleRepository:
             if owns_session:
                 current.close()
 
+    @serialized_writer
     def cancel_plan(
         self,
         plan_id: int,

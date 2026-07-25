@@ -25,6 +25,9 @@ from trading_assistant.db.models import (
     Rule,
     RuleGroup,
 )
+from trading_assistant.risk.submission_barrier import (
+    serialized_writer,
+)
 
 from .models import (
     normalize_computed_order_decimal,
@@ -52,6 +55,7 @@ class RuleApplicationService:
     ) -> None:
         self.service = service
         self.repository = repository
+        self.submission_barrier = service.submission_barrier
         self.crash_hook = crash_hook
 
     @staticmethod
@@ -67,6 +71,7 @@ class RuleApplicationService:
             )
         return validated
 
+    @serialized_writer
     def create_rule(
         self,
         command: RuleCommand | dict,
@@ -191,6 +196,7 @@ class RuleApplicationService:
             rows.append(row)
         return rows
 
+    @serialized_writer
     def propose_from_lease(
         self,
         lease: RuleGroupLease,

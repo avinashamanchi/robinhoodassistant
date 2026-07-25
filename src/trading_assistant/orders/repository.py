@@ -31,6 +31,10 @@ from trading_assistant.risk.breakers import (
     BreakerScope,
     trip_in_session,
 )
+from trading_assistant.risk.submission_barrier import (
+    SubmissionBarrier,
+    serialized_writer,
+)
 
 
 def _require_context(
@@ -99,7 +103,11 @@ def _audit_group_mutation(
 class OrderRepository:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self.session_factory = session_factory
+        self.submission_barrier = SubmissionBarrier(
+            session_factory
+        )
 
+    @serialized_writer
     def record_approval(
         self, order_id: int, actor: str, reason: str, request_id: str, now: datetime
     ) -> bool:
@@ -143,6 +151,7 @@ class OrderRepository:
             session.commit()
             return True
 
+    @serialized_writer
     def claim_submission(
         self,
         order_id: int,
@@ -223,6 +232,7 @@ class OrderRepository:
             session.commit()
             return True
 
+    @serialized_writer
     def expire_if_eligible(
         self,
         order_id: int,
@@ -275,6 +285,7 @@ class OrderRepository:
             current = session.get(Order, order_id)
             return OrderStatus(current.status) if current is not None else None
 
+    @serialized_writer
     def record_submission_result(
         self,
         order_id: int,
@@ -444,6 +455,7 @@ class OrderRepository:
             session.commit()
             return persisted_status
 
+    @serialized_writer
     def record_invalid_broker_identity(
         self,
         order_id: int,
@@ -466,6 +478,7 @@ class OrderRepository:
             request_id=request_id,
         )
 
+    @serialized_writer
     def record_invalid_broker_data(
         self,
         order_id: int,
@@ -615,6 +628,7 @@ class OrderRepository:
             cumulative_contradiction,
         )
 
+    @serialized_writer
     def resolve_acceptance(
         self,
         order_id: int,
@@ -748,6 +762,7 @@ class OrderRepository:
             session.commit()
             return not exact_fill_overflow
 
+    @serialized_writer
     def record_pre_submission_rejection(
         self,
         order_id: int,
@@ -796,6 +811,7 @@ class OrderRepository:
             )
             session.commit()
 
+    @serialized_writer
     def expire_approved(
         self,
         order_id: int,

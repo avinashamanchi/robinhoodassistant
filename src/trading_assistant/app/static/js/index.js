@@ -781,6 +781,8 @@ function safetyPayloadIsComplete(health) {
   if (
     !safety
     || typeof safety !== "object"
+    || typeof safety.observed_at !== "string"
+    || safety.observed_at !== health.observed_at
     || safety.complete !== true
     || !["unsafe", "locally_clear"].includes(safety.state)
     || safety.local_enumeration !== "confirmed"

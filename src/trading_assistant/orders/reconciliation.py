@@ -1675,9 +1675,24 @@ class ReconciliationService:
         actor, reason, request_id = _require_context(
             actor, reason, request_id
         )
+        with self.submission_barrier.hold_writer():
+            return self._panic_under_writer(
+                actor,
+                reason,
+                request_id=request_id,
+            )
 
+    def _panic_under_writer(
+        self,
+        actor: str,
+        reason: str,
+        *,
+        request_id: str,
+    ) -> PanicReport:
         # The durable global latch is the first side effect. No broker call occurs
-        # until its transaction is closed.
+        # until its transaction is closed. The outer process-safe writer interval
+        # remains held through rule cancellation, broker cancellation, final local
+        # enumeration, and the safe decision.
         self.breakers.trip(
             BreakerScope.operator_global(),
             reason=f"panic by {actor}: {reason}",

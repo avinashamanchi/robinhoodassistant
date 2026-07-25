@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from decimal import Decimal
 from multiprocessing.context import SpawnContext
+from threading import Event, Thread
 
 import pytest
 from sqlalchemy import func, select, text
@@ -77,6 +78,31 @@ class _ProcessBroker:
             broker_order_id="process-broker-order",
             status=OrderStatus.SUBMITTED,
         )
+
+
+class _PausedPanicBroker(MockBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.panic_entered = Event()
+        self.release_panic = Event()
+        self.pause_panic = False
+        self.open_order_reads = 0
+        self.submit_calls = 0
+
+    def get_open_orders(self):
+        if self.pause_panic:
+            self.open_order_reads += 1
+            if self.open_order_reads == 1:
+                self.panic_entered.set()
+                if not self.release_panic.wait(timeout=10):
+                    raise TimeoutError(
+                        "test did not release panic broker enumeration"
+                    )
+        return super().get_open_orders()
+
+    def submit_order(self, order):
+        self.submit_calls += 1
+        return super().submit_order(order)
 
 
 class _ImmediateProcessBroker:
@@ -1508,6 +1534,117 @@ def test_queued_submission_rechecks_acceptance_unknown_under_process_barrier(
         )
         assert (
             session.get(Order, follower_id).status
+            == OrderStatus.REJECTED.value
+        )
+
+
+def test_panic_serializes_approval_and_rule_writers_through_safe_decision(
+    make_service,
+):
+    broker = _PausedPanicBroker()
+    service = make_service(broker=broker)
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:panic-race",
+        reason="prepare proposal before panic",
+        request_id="panic-race-proposal",
+    )["order_id"]
+    broker.pause_panic = True
+
+    panic_outcome: list[object] = []
+    panic_errors: list[BaseException] = []
+
+    def panic_worker() -> None:
+        try:
+            panic_outcome.append(
+                service.panic(
+                    actor="operator:panic-race",
+                    reason="serialize all unsafe writers",
+                    request_id="panic-race",
+                )
+            )
+        except BaseException as exc:
+            panic_errors.append(exc)
+
+    panic_thread = Thread(target=panic_worker)
+    panic_thread.start()
+    assert broker.panic_entered.wait(timeout=10)
+
+    approval_finished = Event()
+    approval_outcome: list[object] = []
+    approval_errors: list[BaseException] = []
+
+    def approval_worker() -> None:
+        try:
+            approval_outcome.append(
+                service.approve_order(
+                    order_id,
+                    actor="operator:panic-race",
+                    reason="approval racing panic",
+                    request_id="panic-race-approval",
+                )
+            )
+        except BaseException as exc:
+            approval_errors.append(exc)
+        finally:
+            approval_finished.set()
+
+    rule_finished = Event()
+    rule_outcome: list[object] = []
+    rule_errors: list[BaseException] = []
+
+    def rule_worker() -> None:
+        try:
+            rule_outcome.append(
+                service.create_conditional_rule(
+                    "AAPL",
+                    {"price_below": "90"},
+                    {"side": "buy", "notional": "100"},
+                    actor="operator:panic-race",
+                    reason="rule creation racing panic",
+                    request_id="panic-race-rule",
+                )
+            )
+        except BaseException as exc:
+            rule_errors.append(exc)
+        finally:
+            rule_finished.set()
+
+    approval_thread = Thread(target=approval_worker)
+    rule_thread = Thread(target=rule_worker)
+    approval_thread.start()
+    rule_thread.start()
+    try:
+        assert approval_finished.wait(timeout=0.5) is False
+        assert rule_finished.wait(timeout=0.5) is False
+    finally:
+        broker.release_panic.set()
+        panic_thread.join(timeout=10)
+        approval_thread.join(timeout=10)
+        rule_thread.join(timeout=10)
+
+    assert panic_thread.is_alive() is False
+    assert approval_thread.is_alive() is False
+    assert rule_thread.is_alive() is False
+    assert panic_errors == []
+    assert approval_errors == []
+    assert rule_errors == []
+    assert panic_outcome[0]["safe"] is True
+    assert approval_outcome[0]["status"] == (
+        OrderStatus.REJECTED.value
+    )
+    assert approval_outcome[0]["executed"] is False
+    assert broker.submit_calls == 0
+    assert rule_outcome[0]["state"] == "active"
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    ) is True
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
             == OrderStatus.REJECTED.value
         )
 

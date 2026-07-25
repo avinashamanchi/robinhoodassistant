@@ -586,6 +586,16 @@ def test_health_reports_server_observed_broker_and_mode(client):
     assert health["mode"] == "paper"
 
 
+def test_health_observed_at_identifies_one_complete_safety_snapshot(client):
+    c, _, _ = client
+
+    health = c.get("/health").json()
+
+    assert health["db_ok"] is True
+    assert health["safety"]["complete"] is True
+    assert health["observed_at"] == health["safety"]["observed_at"]
+
+
 def test_health_reports_complete_locally_clear_persisted_safety_truth(client):
     c, _, _ = client
 
@@ -593,6 +603,8 @@ def test_health_reports_complete_locally_clear_persisted_safety_truth(client):
 
     assert response.status_code == 200
     safety = response.json()["safety"]
+    observed_at = safety.pop("observed_at")
+    assert datetime.fromisoformat(observed_at).tzinfo is not None
     assert safety == {
         "state": "locally_clear",
         "complete": True,
@@ -749,7 +761,9 @@ def test_health_fails_closed_when_persisted_safety_read_is_incomplete(
     health = response.json()
     assert health["db_ok"] is False
     assert health["error"] == "database_unavailable"
-    assert health["safety"] == {
+    safety = health["safety"]
+    assert safety.pop("observed_at") == health["observed_at"]
+    assert safety == {
         "state": "unknown",
         "complete": False,
         "local_enumeration": "confirmed",

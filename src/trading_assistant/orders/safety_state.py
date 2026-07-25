@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -14,9 +17,11 @@ from ..db.models import (
     FILL_RECONCILIATION_REQUIRED,
     FILL_RECONCILIATION_SUPERSEDED,
     Fill,
+    Heartbeat,
     Order,
     Rule,
     RuleGroup,
+    utcnow,
 )
 
 _LOCAL_SAFETY_CATEGORIES = (
@@ -27,6 +32,7 @@ _LOCAL_SAFETY_CATEGORIES = (
     "unsafe_rule_groups",
 )
 _ACTIVE_BREAKERS_CATEGORY = "active_breakers"
+_HEARTBEAT_CATEGORY = "heartbeat"
 _OPERATOR_GLOBAL_SCOPE = "operator_global"
 _TARGETED_BREAKER_KINDS = frozenset(
     {"loss", "drawdown", "data", "liquidity"}
@@ -126,8 +132,10 @@ class BreakerTruth:
 
 @dataclass(frozen=True)
 class PersistedSafetyTruth:
+    observed_at: datetime
     state: str
     complete: bool
+    heartbeat_at: datetime | None
     operator_global_tripped: bool | None
     operator_global_generation: int | None
     breakers: tuple[BreakerTruth, ...]
@@ -154,6 +162,7 @@ class PersistedSafetyTruth:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "observed_at": self.observed_at.isoformat(),
             "state": self.state,
             "complete": self.complete,
             "local_enumeration": (
@@ -175,6 +184,40 @@ class PersistedSafetyTruth:
                 self.unknown_categories
             ),
         }
+
+
+@contextmanager
+def _coherent_read_snapshot(
+    session: Session,
+) -> Iterator[datetime]:
+    """Open or reuse one real database read transaction.
+
+    SQLAlchemy's Session transaction is virtual until a connection is used.
+    Python's legacy sqlite3 mode then omits the database-level BEGIN for
+    SELECTs. Check the driver transaction directly so an already active
+    SQLite transaction is reused and a SELECT-only session receives exactly
+    one explicit BEGIN. Other backends retain SQLAlchemy's native transaction
+    semantics.
+    """
+
+    owns_transaction = not session.in_transaction()
+    transaction = session.begin() if owns_transaction else None
+    try:
+        connection = session.connection()
+        if connection.dialect.name == "sqlite":
+            driver_connection = (
+                connection.connection.driver_connection
+            )
+            if not driver_connection.in_transaction:
+                connection.exec_driver_sql("BEGIN")
+        observed_at = utcnow()
+        yield observed_at
+        if transaction is not None:
+            transaction.commit()
+    except BaseException:
+        if transaction is not None and transaction.is_active:
+            transaction.rollback()
+        raise
 
 
 def _breaker_row_is_canonical(
@@ -309,47 +352,46 @@ def enumerate_unsafe_local_state(
 
     try:
         with session_factory() as session:
-            # One read transaction gives normal panic one coherent local
-            # snapshot. If a database error invalidates the transaction, each
-            # affected remaining category is marked unknown rather than empty.
-            return _enumerate_unsafe_local_state_in_session(
-                session
-            )
+            with _coherent_read_snapshot(session):
+                return _enumerate_unsafe_local_state_in_session(
+                    session
+                )
     except Exception:
         return UnsafeLocalState(
             unknown_categories=_LOCAL_SAFETY_CATEGORIES
         )
 
 
-def read_persisted_safety_truth(
-    session_factory: sessionmaker[Session],
+def _read_persisted_safety_truth_in_session(
+    session: Session,
 ) -> PersistedSafetyTruth:
-    """Read durable local safety evidence without inferring broker truth."""
-    try:
-        with session_factory() as session:
-            local_state = (
-                _enumerate_unsafe_local_state_in_session(
-                    session
-                )
-            )
-            breaker_rows: tuple[CircuitBreakerState, ...] = ()
-            breaker_unknown = False
-            try:
-                breaker_rows = tuple(
-                    session.scalars(
-                        select(CircuitBreakerState).order_by(
-                            CircuitBreakerState.scope_key
-                        )
-                    ).all()
-                )
-            except Exception:
-                breaker_unknown = True
-    except Exception:
-        local_state = UnsafeLocalState(
-            unknown_categories=_LOCAL_SAFETY_CATEGORIES
+    with _coherent_read_snapshot(session) as observed_at:
+        local_state = _enumerate_unsafe_local_state_in_session(
+            session
         )
-        breaker_rows = ()
-        breaker_unknown = True
+        breaker_rows: tuple[CircuitBreakerState, ...] = ()
+        breaker_unknown = False
+        try:
+            breaker_rows = tuple(
+                session.scalars(
+                    select(CircuitBreakerState).order_by(
+                        CircuitBreakerState.scope_key
+                    )
+                ).all()
+            )
+        except Exception:
+            breaker_unknown = True
+
+        heartbeat_at: datetime | None = None
+        heartbeat_unknown = False
+        try:
+            heartbeat_at = session.scalar(
+                select(Heartbeat.at)
+                .order_by(Heartbeat.id.desc())
+                .limit(1)
+            )
+        except Exception:
+            heartbeat_unknown = True
 
     breakers = tuple(
         BreakerTruth(
@@ -383,6 +425,8 @@ def read_persisted_safety_truth(
         unknown_categories.append(
             _ACTIVE_BREAKERS_CATEGORY
         )
+    if heartbeat_unknown:
+        unknown_categories.append(_HEARTBEAT_CATEGORY)
 
     known_unsafe = bool(
         any(breaker.tripped for breaker in breakers)
@@ -400,8 +444,10 @@ def read_persisted_safety_truth(
         state = "locally_clear"
 
     return PersistedSafetyTruth(
+        observed_at=observed_at,
         state=state,
         complete=not unknown_categories,
+        heartbeat_at=heartbeat_at,
         operator_global_tripped=(
             None
             if breaker_unknown
@@ -422,14 +468,36 @@ def read_persisted_safety_truth(
     )
 
 
-def unknown_persisted_safety_truth() -> PersistedSafetyTruth:
+def read_persisted_safety_truth(
+    source: sessionmaker[Session] | Session,
+) -> PersistedSafetyTruth:
+    """Read durable local safety evidence without inferring broker truth."""
+    try:
+        if isinstance(source, Session):
+            return _read_persisted_safety_truth_in_session(
+                source
+            )
+        with source() as session:
+            return _read_persisted_safety_truth_in_session(
+                session
+            )
+    except Exception:
+        return unknown_persisted_safety_truth()
+
+
+def unknown_persisted_safety_truth(
+    *,
+    observed_at: datetime | None = None,
+) -> PersistedSafetyTruth:
     """Return an explicit unknown value after a broader DB read failure."""
     local_state = UnsafeLocalState(
         unknown_categories=_LOCAL_SAFETY_CATEGORIES
     )
     return PersistedSafetyTruth(
+        observed_at=observed_at or utcnow(),
         state="unknown",
         complete=False,
+        heartbeat_at=None,
         operator_global_tripped=None,
         operator_global_generation=None,
         breakers=(),
@@ -437,5 +505,6 @@ def unknown_persisted_safety_truth() -> PersistedSafetyTruth:
         unknown_categories=(
             *_LOCAL_SAFETY_CATEGORIES,
             _ACTIVE_BREAKERS_CATEGORY,
+            _HEARTBEAT_CATEGORY,
         ),
     )

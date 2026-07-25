@@ -173,50 +173,59 @@ class PlanningService:
         rules = self._decompose(plan, sized, plan_id)
         paper_only = not (live and promotable)
         bracket = None
-        with self.service.session_factory() as s:
-            claim = s.execute(
-                update(TradePlanRow)
-                .where(
-                    TradePlanRow.id == plan_id,
-                    TradePlanRow.status == "proposed",
+        with self.service.submission_barrier.hold_writer():
+            with self.service.session_factory() as s:
+                claim = s.execute(
+                    update(TradePlanRow)
+                    .where(
+                        TradePlanRow.id == plan_id,
+                        TradePlanRow.status == "proposed",
+                    )
+                    .values(
+                        status="approved",
+                        paper_only=paper_only,
+                    )
                 )
-                .values(status="approved", paper_only=paper_only)
-            )
-            if claim.rowcount != 1:
-                s.rollback()
-                current = s.get(TradePlanRow, plan_id)
+                if claim.rowcount != 1:
+                    s.rollback()
+                    current = s.get(TradePlanRow, plan_id)
+                    return {
+                        "plan_id": plan_id,
+                        "status": (
+                            current.status if current else None
+                        ),
+                        "error": (
+                            "plan approval is already complete "
+                            "or unavailable"
+                        ),
+                    }
+                self.service.rule_application.persist_commands(
+                    s,
+                    rules,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    plan_id=plan_id,
+                )
+                s.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="plan.approve",
+                        target_type="trade_plan",
+                        target_id=str(plan_id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code="approved",
+                    )
+                )
+                s.commit()
                 return {
                     "plan_id": plan_id,
-                    "status": current.status if current else None,
-                    "error": "plan approval is already complete or unavailable",
+                    "status": "approved",
+                    "rules_created": len(rules),
+                    "paper_only": paper_only,
+                    "bracket": bracket,
                 }
-            self.service.rule_application.persist_commands(
-                s,
-                rules,
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-                plan_id=plan_id,
-            )
-            s.add(
-                AuditEvent(
-                    actor=actor,
-                    action="plan.approve",
-                    target_type="trade_plan",
-                    target_id=str(plan_id),
-                    request_id=request_id,
-                    reason=reason,
-                    result_code="approved",
-                )
-            )
-            s.commit()
-            return {
-                "plan_id": plan_id,
-                "status": "approved",
-                "rules_created": len(rules),
-                "paper_only": paper_only,
-                "bracket": bracket,
-            }
 
     def _decompose(
         self, plan: TradePlan, sized: dict, plan_id: int

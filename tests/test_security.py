@@ -1381,6 +1381,7 @@ _HEALTH_DOM_SETUP = r"""
       unknown_categories: [],
     });
     const safetyTruth = ({
+      observedAt = new Date().toISOString(),
       state = "unsafe",
       complete = true,
       globalTripped = false,
@@ -1394,6 +1395,7 @@ _HEALTH_DOM_SETUP = r"""
       unsafeLocalState = emptyUnsafeLocalState(),
       unknownCategories = [],
     } = {}) => ({
+      observed_at: observedAt,
       state,
       complete,
       local_enumeration: unsafeLocalState.unknown_categories.length
@@ -1408,30 +1410,34 @@ _HEALTH_DOM_SETUP = r"""
       unsafe_local_state: unsafeLocalState,
       unknown_categories: unknownCategories,
     });
-    const validHealth = (generation = 7) => ({
-      broker: "Alpaca",
-      mode: "paper",
-      observed_at: new Date().toISOString(),
-      db_ok: true,
-      heartbeat_age_seconds: 1.5,
-      daemon_alive: true,
-      killswitch: {
-        equity: true,
-        crypto: false,
-      },
-      killswitch_generation: {
-        equity: generation,
-        crypto: 3,
-      },
-      safety: safetyTruth({
-        activeBreakers: [{
-          scope: "loss:equity",
-          kind: "loss",
-          target: "equity",
-          generation,
-        }],
-      }),
-    });
+    const validHealth = (generation = 7) => {
+      const observedAt = new Date().toISOString();
+      return {
+        broker: "Alpaca",
+        mode: "paper",
+        observed_at: observedAt,
+        db_ok: true,
+        heartbeat_age_seconds: 1.5,
+        daemon_alive: true,
+        killswitch: {
+          equity: true,
+          crypto: false,
+        },
+        killswitch_generation: {
+          equity: generation,
+          crypto: 3,
+        },
+        safety: safetyTruth({
+          observedAt,
+          activeBreakers: [{
+            scope: "loss:equity",
+            kind: "loss",
+            target: "equity",
+            generation,
+          }],
+        }),
+      };
+    };
     const assertUnknownAndDisabled = () => {
       for (const id of [
         "truth-database",
@@ -1477,6 +1483,12 @@ _HEALTH_DOM_SETUP = r"""
         (
             "({...validHealth(), observed_at: "
             "new Date(Date.now() - 120000).toISOString()})"
+        ),
+        (
+            "(() => { const health = validHealth(); "
+            "health.safety.observed_at = "
+            "new Date(Date.now() - 1000).toISOString(); "
+            "return health; })()"
         ),
         (
             "({...validHealth(), safety: {...validHealth().safety, "
@@ -1670,6 +1682,7 @@ def test_safety_banner_rehydrates_persisted_unsafe_truth_in_new_document(
         health.killswitch = {{equity: false, crypto: false}};
         health.killswitch_generation = {{equity: 0, crypto: 0}};
         health.safety = {safety_expression};
+        health.safety.observed_at = health.observed_at;
         globalThis.__api = (path) => {{
           if (path === "/health") return Promise.resolve(health);
           throw new Error(`unexpected API path ${{path}}`);
@@ -1707,6 +1720,7 @@ def test_safety_banner_hides_only_for_complete_locally_clear_truth():
         health.killswitch = {equity: false, crypto: false};
         health.killswitch_generation = {equity: 0, crypto: 0};
         health.safety = safetyTruth({
+          observedAt: health.observed_at,
           state: "locally_clear",
           activeBreakers: [],
         });

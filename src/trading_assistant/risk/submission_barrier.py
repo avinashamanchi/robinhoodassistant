@@ -6,14 +6,19 @@ import fcntl
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from threading import local
+from typing import Callable, Concatenate, ParamSpec, TypeVar
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 
 _ownership = local()
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_T = TypeVar("_T")
 
 
 def _owned_paths() -> dict[str, int]:
@@ -22,6 +27,24 @@ def _owned_paths() -> dict[str, int]:
         paths = {}
         _ownership.paths = paths
     return paths
+
+
+def serialized_writer(
+    method: Callable[Concatenate[_T, _P], _R],
+) -> Callable[Concatenate[_T, _P], _R]:
+    """Hold an object's shared barrier through the method's final commit."""
+
+    @wraps(method)
+    def wrapped(
+        instance: _T,
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _R:
+        barrier = getattr(instance, "submission_barrier")
+        with barrier.hold_writer():
+            return method(instance, *args, **kwargs)
+
+    return wrapped
 
 
 class SubmissionGuard:

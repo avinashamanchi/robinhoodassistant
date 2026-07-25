@@ -65,7 +65,10 @@ from .risk.breakers import BreakerScope, BreakerService, trip_in_session
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
 from .risk.pnl import FillLike, realized_pnl_today
-from .risk.submission_barrier import SubmissionBarrier
+from .risk.submission_barrier import (
+    SubmissionBarrier,
+    serialized_writer,
+)
 
 # Statuses that count as "still live / open" for listing purposes.
 _OPEN_STATUSES = (
@@ -313,6 +316,7 @@ class TradingService:
             return self._order_dict(o) if o else None
 
     # ── propose (NEVER executes) ───────────────────────────────
+    @serialized_writer
     def propose_order(
         self,
         ticker: str,
@@ -632,6 +636,7 @@ class TradingService:
             "risk_reasons": list(result.risk_reasons),
         }
 
+    @serialized_writer
     def reject_order(
         self,
         order_id: int,
@@ -686,11 +691,10 @@ class TradingService:
 
     def health(self) -> dict[str, Any]:
         """Authenticated operational health and durable local safety truth."""
-        from sqlalchemy import select as _select
-
-        from .db.models import Heartbeat
-
-        observed_at = utcnow()
+        safety = read_persisted_safety_truth(
+            self.session_factory
+        )
+        observed_at = safety.observed_at
         operating_context = {
             "broker": (
                 "Alpaca"
@@ -700,17 +704,10 @@ class TradingService:
             "mode": self.config.trading.mode.value,
             "observed_at": observed_at.isoformat(),
         }
-        safety = read_persisted_safety_truth(
-            self.session_factory
-        )
         try:
-            with self.session_factory() as s:
-                last = s.execute(
-                    _select(Heartbeat).order_by(Heartbeat.id.desc()).limit(1)
-                ).scalar_one_or_none()
-                age = (
-                    observed_at - last.at
-                ).total_seconds() if last else None
+            age = (
+                observed_at - safety.heartbeat_at
+            ).total_seconds() if safety.heartbeat_at else None
             eq_state = safety.breaker(
                 BreakerScope.loss(AssetClass.EQUITY).key
             )
@@ -761,7 +758,9 @@ class TradingService:
                 "db_ok": False,
                 "error": "database_unavailable",
                 "safety": (
-                    unknown_persisted_safety_truth().as_dict()
+                    unknown_persisted_safety_truth(
+                        observed_at=observed_at
+                    ).as_dict()
                 ),
             }
 
@@ -1669,6 +1668,7 @@ class TradingService:
         }
 
     # ── conditional rules ──────────────────────────────────────
+    @serialized_writer
     def create_conditional_rule(
         self,
         ticker: str,
@@ -1762,6 +1762,7 @@ class TradingService:
             rows = s.execute(select(Rule)).scalars().all()
             return [self._rule_dict(r) for r in rows]
 
+    @serialized_writer
     def cancel_rule(
         self,
         rule_id: int,
