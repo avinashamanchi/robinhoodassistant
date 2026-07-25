@@ -22,6 +22,7 @@ from trading_assistant.analyst.models import (
 )
 from trading_assistant.analyst.planning import PlanningService
 from trading_assistant.assets import AssetClass
+from trading_assistant.broker.mock import MockBroker
 from trading_assistant.config import Secrets, TradingMode
 from trading_assistant.db.models import (
     AuditEvent,
@@ -30,6 +31,7 @@ from trading_assistant.db.models import (
     RuleGroup,
     TradePlanRow,
 )
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.application import RuleApplicationService
 from trading_assistant.rules.repository import RuleRepository
@@ -101,6 +103,48 @@ def test_analyze_stores_sized_plan(make_service):
     assert out["plan_id"] > 0
     assert out["sized"]["direction"] == "long"
     assert Decimal(out["sized"]["total_shares"]) > 0
+
+
+def test_live_feature_provider_types_primary_market_data_outage(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.analyst import live_features
+
+    marker = "provider-market-data-secret"
+
+    def fail_market_data(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        live_features,
+        "_fetch_equity_df",
+        fail_market_data,
+    )
+    provider = live_features.build_live_feature_provider(
+        app_config,
+        Secrets(),
+    )
+
+    with pytest.raises(RequiredDependencyUnavailable) as failure:
+        provider("AAPL")
+
+    assert marker not in str(failure.value)
+
+
+def test_planning_types_required_snapshot_provider_outage(make_service):
+    marker = "provider-account-secret"
+
+    class AccountOutageBroker(MockBroker):
+        def get_account(self):
+            raise RuntimeError(marker)
+
+    planning = _planning(make_service(broker=AccountOutageBroker()))
+
+    with pytest.raises(RequiredDependencyUnavailable) as failure:
+        _analyze(planning, "required snapshot provider outage")
+
+    assert marker not in str(failure.value)
 
 
 def test_approve_decomposes_into_human_gated_typed_rules(make_service):

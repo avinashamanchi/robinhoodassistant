@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from trading_assistant.analyst.models import (
     EntryPlan, ExitPlan, ExitTarget, Invalidation, PlanAction, Scenario, TradePlan, Tranche,
@@ -17,8 +19,8 @@ from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import AuditEvent
-from trading_assistant.service import RequiredDependencyUnavailable
+from trading_assistant.db.models import AuditEvent, TradePlanRow
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -48,6 +50,26 @@ class _StubAnalyst:
 class _StubAgent:
     def chat(self, message, **context):
         return {"reply": "", "tool_calls": []}
+
+
+def test_planning_startup_internal_failure_is_not_hidden(
+    make_service,
+    monkeypatch,
+):
+    marker = "internal-planning-startup-secret"
+
+    def fail_planning_init(self, *args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(PlanningService, "__init__", fail_planning_init)
+
+    with pytest.raises(RuntimeError, match=marker):
+        create_app(
+            service=make_service(),
+            agent=_StubAgent(),
+            planning=None,
+            api_token=TOKEN,
+        )
 
 
 @pytest.fixture
@@ -339,15 +361,18 @@ def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
     client,
     monkeypatch,
 ):
-    c, _ = client
+    c, svc = client
 
     class ProviderSecretAnalysisFailure(RuntimeError):
         pass
 
     def fail_analysis(self, *args, **kwargs):
-        raise ProviderSecretAnalysisFailure(
-            "provider-secret-propose-analysis"
-        )
+        try:
+            raise ProviderSecretAnalysisFailure(
+                "provider-secret-propose-analysis"
+            )
+        except ProviderSecretAnalysisFailure as exc:
+            raise RequiredDependencyUnavailable from exc
 
     monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
 
@@ -364,21 +389,56 @@ def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
     exposed = str(response.json())
     assert "ProviderSecretAnalysisFailure" not in exposed
     assert "provider-secret-propose-analysis" not in exposed
+    with svc.session_factory() as session:
+        audits = session.query(AuditEvent).filter_by(
+            action="plan.create",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).all()
+    assert len(audits) == len(response.json()["proposed"])
+    assert {
+        (
+            audit.actor,
+            audit.reason,
+            audit.target_type,
+        )
+        for audit in audits
+    } == {
+        (
+            "operator:local",
+            "provider failure sanitization probe",
+            "trade_plan",
+        )
+    }
+    assert {
+        audit.detail_json for audit in audits
+    } == {
+        json.dumps({"stage": "analysis"}, sort_keys=True)
+    }
+    assert {
+        audit.target_id for audit in audits
+    } == {
+        row["symbol"] for row in response.json()["proposed"]
+    }
+    assert "provider-secret-propose-analysis" not in str(audits)
 
 
 def test_analyze_returns_stable_error_without_provider_class_or_text(
     client,
     monkeypatch,
 ):
-    c, _ = client
+    c, svc = client
 
     class ProviderSecretPlanFailure(RuntimeError):
         pass
 
     def fail_analysis(self, *args, **kwargs):
-        raise ProviderSecretPlanFailure(
-            "provider-secret-plan-analysis"
-        )
+        try:
+            raise ProviderSecretPlanFailure(
+                "provider-secret-plan-analysis"
+            )
+        except ProviderSecretPlanFailure as exc:
+            raise RequiredDependencyUnavailable from exc
 
     monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
 
@@ -395,3 +455,200 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
     exposed = response.text
     assert "ProviderSecretPlanFailure" not in exposed
     assert "provider-secret-plan-analysis" not in exposed
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="plan.create",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert audit.actor == "operator:local"
+    assert audit.reason == "provider failure plan probe"
+    assert audit.target_type == "trade_plan"
+    assert audit.target_id == "AAPL"
+    assert audit.result_code == "dependency_unavailable"
+    assert json.loads(audit.detail_json) == {"stage": "analysis"}
+    assert "provider-secret-plan-analysis" not in str(audit)
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "internal plan invariant probe",
+            },
+        ),
+        (
+            "/propose",
+            {
+                "n": 1,
+                "reason": "internal plan invariant probe",
+            },
+        ),
+    ],
+)
+def test_analysis_internal_failure_is_hardened_500_without_false_audit(
+    client,
+    authenticate_client,
+    monkeypatch,
+    path,
+    body,
+):
+    authenticated, svc = client
+    marker = "internal-plan-invariant-secret"
+
+    def fail_analysis(self, *args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
+    isolated, csrf = authenticate_client(
+        TestClient(authenticated.app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    response = isolated.post(
+        path,
+        json=body,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    with svc.session_factory() as session:
+        assert session.query(AuditEvent).filter_by(
+            request_id=response.headers["X-Request-ID"],
+        ).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "analysis audit failure probe",
+            },
+        ),
+        (
+            "/propose",
+            {
+                "n": 1,
+                "reason": "analysis audit failure probe",
+            },
+        ),
+    ],
+)
+def test_analysis_dependency_audit_failure_is_hardened_500(
+    client,
+    authenticate_client,
+    monkeypatch,
+    path,
+    body,
+):
+    authenticated, svc = client
+    marker = "internal-analysis-audit-secret"
+
+    def fail_analysis(self, *args, **kwargs):
+        raise RequiredDependencyUnavailable
+
+    def fail_audit(**kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(PlanningService, "analyze", fail_analysis)
+    monkeypatch.setattr(svc, "_audit_dependency_failure", fail_audit)
+    isolated, csrf = authenticate_client(
+        TestClient(authenticated.app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    response = isolated.post(
+        path,
+        json=body,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    with svc.session_factory() as session:
+        assert session.query(AuditEvent).filter_by(
+            request_id=response.headers["X-Request-ID"],
+        ).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "atomic analysis rollback probe",
+            },
+        ),
+        (
+            "/propose",
+            {
+                "n": 1,
+                "reason": "atomic analysis rollback probe",
+            },
+        ),
+    ],
+)
+def test_plan_create_audit_failure_rolls_back_and_returns_500(
+    client,
+    authenticate_client,
+    path,
+    body,
+):
+    authenticated, svc = client
+    marker = "injected plan.create audit failure"
+
+    def fail_plan_create_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "plan.create"
+            for row in session.new
+        ):
+            raise RuntimeError(marker)
+
+    session_type = svc.session_factory.class_
+    event.listen(session_type, "before_flush", fail_plan_create_audit)
+    try:
+        isolated, csrf = authenticate_client(
+            TestClient(authenticated.app, raise_server_exceptions=False),
+            TOKEN,
+        )
+        response = isolated.post(
+            path,
+            json=body,
+            headers={"X-CSRF-Token": csrf},
+        )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_plan_create_audit,
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    with svc.session_factory() as session:
+        assert session.query(TradePlanRow).count() == 0
+        assert session.query(AuditEvent).filter_by(
+            request_id=response.headers["X-Request-ID"],
+        ).count() == 0

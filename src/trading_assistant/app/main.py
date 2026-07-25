@@ -243,7 +243,7 @@ def create_app(
             planning = PlanningService(
                 service, analyst, build_live_feature_provider(service.config, sec), sec
             )
-        except Exception:  # keep the app up; plan endpoints return 503
+        except RequiredDependencyUnavailable:
             planning = None
 
     chat_rate = chat_rate or RateLimiter(max_requests=20, window_seconds=60)
@@ -277,7 +277,7 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["X-CSRF-Token", "Content-Type"],
     )
@@ -542,6 +542,23 @@ def create_app(
             )
         return planning
 
+    def _audit_analysis_dependency_failure(
+        symbol: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
+        service._audit_dependency_failure(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            action="plan.create",
+            target_type="trade_plan",
+            target_id=symbol.upper(),
+            detail={"stage": "analysis"},
+        )
+
     @app.post("/analyze")
     def analyze(
         body: AnalyzeIn,
@@ -561,7 +578,13 @@ def create_app(
             )
         except ApiError:
             raise
-        except Exception:
+        except RequiredDependencyUnavailable:
+            _audit_analysis_dependency_failure(
+                body.symbol,
+                actor=principal.actor,
+                reason=body.reason,
+                request_id=request.state.request_id,
+            )
             raise ApiError(
                 "analysis_failed",
                 503,
@@ -708,7 +731,13 @@ def create_app(
                     "action": out["plan"]["action"], "score": c["score"],
                     "sized_shares": out["sized"]["total_shares"],
                 })
-            except Exception:  # skip a bad candidate, keep going
+            except RequiredDependencyUnavailable:
+                _audit_analysis_dependency_failure(
+                    c["symbol"],
+                    actor=principal.actor,
+                    reason=body.reason,
+                    request_id=request.state.request_id,
+                )
                 created.append(
                     {
                         "symbol": c["symbol"],

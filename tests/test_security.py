@@ -137,6 +137,23 @@ def test_allowed_cors_preflight_has_security_headers_and_request_id(client):
         response.headers["access-control-allow-origin"]
         == "http://127.0.0.1:8000"
     )
+    assert (
+        response.headers["access-control-allow-methods"]
+        == "GET, POST, OPTIONS"
+    )
+    assert {
+        value.strip().lower()
+        for value in response.headers[
+            "access-control-allow-headers"
+        ].split(",")
+    } == {
+        "accept",
+        "accept-language",
+        "content-language",
+        "content-type",
+        "x-csrf-token",
+    }
+    assert response.headers.get("access-control-allow-credentials") is None
     assert response.headers["Content-Security-Policy"]
     assert response.headers["X-Request-ID"]
     assert response.headers["Cache-Control"] == "no-store"
@@ -154,6 +171,7 @@ def test_rejected_cors_preflight_has_stable_hardened_error(client):
 
     assert response.status_code == 403
     assert response.headers.get("access-control-allow-origin") is None
+    assert response.headers.get("access-control-allow-credentials") is None
     assert response.headers["Content-Security-Policy"]
     assert response.headers["X-Request-ID"]
     assert response.headers["Cache-Control"] == "no-store"
@@ -164,6 +182,26 @@ def test_rejected_cors_preflight_has_stable_hardened_error(client):
             "request_id": response.headers["X-Request-ID"],
         }
     }
+
+
+def test_allowed_cross_origin_response_grants_no_cookie_credentials(client):
+    origin = "http://localhost:8000"
+    login = client.post(
+        "/auth/login",
+        json={"secret": TOKEN},
+    )
+
+    assert login.status_code == 200
+    assert "SameSite=strict" in login.headers["set-cookie"]
+
+    financial = client.get("/pending", headers={"Origin": origin})
+
+    assert financial.status_code == 200
+    assert financial.headers["access-control-allow-origin"] == origin
+    assert financial.headers.get("access-control-allow-credentials") is None
+    assert financial.headers["Content-Security-Policy"]
+    assert financial.headers["X-Request-ID"]
+    assert financial.headers["Cache-Control"] == "no-store"
 
 
 # ── A2: no dynamic innerHTML in the UIs ─────────────────────────

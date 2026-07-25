@@ -74,8 +74,13 @@ class PlanningService:
 
         ac = AssetClass.for_symbol(symbol)
         with self.service.session_factory() as s:
-            snapshot = self.service.assemble_snapshot(s, [symbol], ac)
-        equity = self.service.broker.get_account().equity
+            snapshot = self.service.assemble_snapshot(
+                s,
+                [symbol],
+                ac,
+                required_dependencies=True,
+            )
+        equity = snapshot.account_equity
         sized = size_trade(plan, snapshot, self._risk_cfg(symbol), equity)
 
         plan_id = self._store(

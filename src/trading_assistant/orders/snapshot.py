@@ -149,6 +149,7 @@ class PortfolioSnapshotService:
         *,
         exclude_order_id: int | None = None,
         quote_overrides: dict[str, object] | None = None,
+        required_dependencies: bool = False,
     ) -> PortfolioSnapshot:
         (
             account,
@@ -163,12 +164,17 @@ class PortfolioSnapshotService:
             tickers,
             asset_class,
             quote_overrides=quote_overrides,
+            required_dependencies=required_dependencies,
         )
         pending_symbols, discovery_complete = self._pending_symbols(
             session, exclude_order_id
         )
         wanted.update(pending_symbols)
-        self._fetch_missing_quotes(quotes, wanted)
+        self._fetch_missing_quotes(
+            quotes,
+            wanted,
+            required=required_dependencies,
+        )
 
         captured_at = self._captured_at()
         high_water_mark = self._account_high_water_mark(
@@ -178,7 +184,7 @@ class PortfolioSnapshotService:
             state.scope.key
             for state in self.breakers.active_for_symbol(tickers[0])
         )
-        return self._assemble_local(
+        snapshot = self._assemble_local(
             session,
             ticker=tickers[0],
             asset_class=asset_class,
@@ -196,6 +202,9 @@ class PortfolioSnapshotService:
             active_breakers=active_breakers,
             discovery_complete=discovery_complete,
         )
+        if required_dependencies and not snapshot.quote_fresh:
+            raise RequiredQuoteUnavailable
+        return snapshot
 
     def _provider_values(
         self,

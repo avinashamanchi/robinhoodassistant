@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from ..dependencies import RequiredDependencyUnavailable
 from ..signals.models import MarketFeatures
 from .models import AnalysisReport
 
@@ -165,10 +166,18 @@ class Analyst:
             f"FEATURES:\n{json.dumps(payload, indent=2, default=str)}"
         )
 
+    def _create(self, **kwargs):
+        try:
+            return self.backend.create(**kwargs)
+        except RequiredDependencyUnavailable:
+            raise
+        except Exception:
+            raise RequiredDependencyUnavailable from None
+
     def analyze(
         self, features: MarketFeatures, held_symbols: Optional[list[str]] = None
     ) -> AnalysisReport:
-        resp = self.backend.create(
+        resp = self._create(
             system=SYSTEM_PREAMBLE,
             messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
             tools=[SUBMIT_TOOL],
@@ -218,7 +227,7 @@ class Analyst:
                     "Return one complete corrected submit_plan. Preserve the thesis "
                     "where possible, but satisfy every trade-plan rule exactly."
                 )
-            resp = self.backend.create(
+            resp = self._create(
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
                 tools=[SUBMIT_PLAN_TOOL],

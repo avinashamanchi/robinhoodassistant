@@ -243,6 +243,7 @@ class TradingService:
         asset_class: AssetClass = AssetClass.EQUITY,
         exclude_order_id: int | None = None,
         quote_overrides: dict[str, object] | None = None,
+        required_dependencies: bool = False,
     ) -> PortfolioSnapshot:
         return self.snapshot_service.assemble(
             session,
@@ -250,6 +251,7 @@ class TradingService:
             asset_class,
             exclude_order_id=exclude_order_id,
             quote_overrides=quote_overrides,
+            required_dependencies=required_dependencies,
         )
 
     def _external_positions_map(self) -> dict:

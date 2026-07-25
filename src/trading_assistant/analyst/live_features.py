@@ -34,7 +34,16 @@ def _fetch_crypto_df(symbol: str, days: int = 365):
 def build_live_feature_provider(config, secrets) -> Callable[[str], MarketFeatures]:
     def provider(symbol: str) -> MarketFeatures:
         ac = AssetClass.for_symbol(symbol)
-        df = _fetch_crypto_df(symbol) if ac is AssetClass.CRYPTO else _fetch_equity_df(symbol, secrets)
+        try:
+            df = (
+                _fetch_crypto_df(symbol)
+                if ac is AssetClass.CRYPTO
+                else _fetch_equity_df(symbol, secrets)
+            )
+        except RequiredDependencyUnavailable:
+            raise
+        except Exception:
+            raise RequiredDependencyUnavailable from None
         spy_df = None
         try:
             spy_df = _fetch_equity_df("SPY", secrets)

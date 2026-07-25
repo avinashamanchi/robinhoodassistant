@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from trading_assistant.analyst.analyst import Analyst
 from trading_assistant.analyst.models import AnalystAction
 from trading_assistant.assets import AssetClass
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -74,3 +75,17 @@ def test_no_tool_call_raises():
 
     with pytest.raises(ValueError):
         Analyst(B()).analyze(_feat())
+
+
+@pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
+def test_analyst_types_backend_outage_without_exposing_provider_text(method):
+    marker = "provider-analyst-secret"
+
+    class B:
+        def create(self, *, system, messages, tools, tool_choice=None):
+            raise RuntimeError(marker)
+
+    with pytest.raises(RequiredDependencyUnavailable) as failure:
+        getattr(Analyst(B()), method)(_feat())
+
+    assert marker not in str(failure.value)
