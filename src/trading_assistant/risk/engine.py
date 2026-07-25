@@ -43,10 +43,19 @@ class RiskEngine:
                 reasons=[f"quote for {symbol} is invalid"],
             )
         reasons: list[str] = []
+        market_hours_reason = (
+            "market clock snapshot is incomplete"
+            if snapshot.market_clock_complete is not True
+            else rules.check_market_hours(
+                order,
+                self.config,
+                snapshot.market_open,
+            )
+        )
         base_checks = [
             rules.check_allowlist(order, self.config),
             rules.check_pending_exposure_known(snapshot),
-            rules.check_market_hours(order, self.config, snapshot.market_open),
+            market_hours_reason,
             rules.check_max_notional(order, snapshot, self.config),
             rules.check_max_position(order, snapshot, self.config),
             rules.check_portfolio_exposure(order, snapshot, self.config),

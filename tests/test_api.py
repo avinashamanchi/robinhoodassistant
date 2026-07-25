@@ -444,6 +444,112 @@ def test_approval_quote_outage_preserves_outbox_and_retries_safely(
     assert approval_count == 1
 
 
+def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries(
+    make_service,
+    authenticate_client,
+    caplog,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "provider-secret-approval-market-clock"
+    clock_available = False
+    original_is_open = service.clock.is_open
+
+    def intermittent_is_open(at=None):
+        if not clock_available:
+            raise ConnectionError(marker)
+        return original_is_open(at)
+
+    service.clock.is_open = intermittent_is_open
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = "human approved before market clock outage"
+
+    unavailable = client.post(
+        f"/approve/{order_id}",
+        json={"reason": reason},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(unavailable)
+    assert service.broker.submit_calls == 0
+    request_id = unavailable.headers["X-Request-ID"]
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        failures = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=request_id,
+            result_code="dependency_unavailable",
+        ).all()
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+        risk_text = "\n".join(
+            event.reason for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            state.reason
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert approval_count == 1
+    assert len(failures) == 1
+    failure = failures[0]
+    assert (
+        failure.actor,
+        failure.reason,
+        failure.target_type,
+        failure.target_id,
+        failure.detail_json,
+    ) == (
+        "operator:local",
+        reason,
+        "order",
+        str(order_id),
+        json.dumps({"stage": "execution_health"}, sort_keys=True),
+    )
+    exposed = "\n".join(
+        (
+            unavailable.text,
+            failure.detail_json,
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "ConnectionError" not in exposed
+
+    clock_available = True
+    retried = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "retry approved outbox after clock recovery"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == OrderStatus.SUBMITTED.value
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.SUBMITTED.value
+        )
+        assert session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count() == 1
+
+
 def test_approval_internal_failure_is_hardened_500_without_dependency_audit(
     make_service,
     authenticate_client,
@@ -651,6 +757,101 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
     assert "ConnectionError" not in audit.detail_json
 
 
+def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context(
+    make_service,
+    authenticate_client,
+    caplog,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="clock dependency outage setup",
+        actor="daemon:test",
+        request_id="clock-dependency-reset-setup",
+    )
+    marker = "provider-secret-reset-market-calendar"
+
+    def fail_calendar(at=None):
+        raise ConnectionError(marker)
+
+    service.clock.most_recent_open = fail_calendar
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = "verify market clock before breaker reset"
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": reason,
+            "expected_generation": observed.generation,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    _assert_dependency_unavailable(response)
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        failures = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).all()
+        risk_text = "\n".join(
+            event.reason for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            state.reason
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert len(failures) == 1
+    failure = failures[0]
+    assert (
+        failure.actor,
+        failure.reason,
+        failure.target_type,
+        failure.target_id,
+        failure.detail_json,
+    ) == (
+        "operator:local",
+        reason,
+        "circuit_breaker",
+        BreakerScope.loss(AssetClass.EQUITY).key,
+        json.dumps(
+            {
+                "asset_class": "equity",
+                "expected_generation": observed.generation,
+                "stage": "health_collection",
+            },
+            sort_keys=True,
+        ),
+    )
+    exposed = "\n".join(
+        (
+            response.text,
+            failure.detail_json,
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "ConnectionError" not in exposed
+
+
 @pytest.mark.parametrize(
     "incomplete_field",
     [
@@ -659,6 +860,7 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
         "account_complete",
         "pending_exposure_complete",
         "quote_fresh",
+        "market_clock_complete",
     ],
 )
 def test_killswitch_reset_rejects_every_incomplete_health_field(

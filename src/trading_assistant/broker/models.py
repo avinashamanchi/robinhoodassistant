@@ -376,6 +376,8 @@ class PortfolioSnapshot:
     account_complete: bool = True
     quote_fresh: bool = True
     market_open: bool = True
+    # False distinguishes an unavailable market schedule from a confirmed close.
+    market_clock_complete: bool = True
     spread_pct_by_ticker: dict[str, Decimal] = field(default_factory=dict)
     pending_buy_notional_by_ticker: dict[str, Decimal] = field(default_factory=dict)
     reserved_sell_qty_by_ticker: dict[str, Decimal] = field(default_factory=dict)

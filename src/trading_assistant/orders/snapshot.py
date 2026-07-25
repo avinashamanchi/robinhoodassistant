@@ -92,6 +92,7 @@ class PortfolioSnapshotService:
             quotes,
             wanted,
             market_open,
+            market_clock_complete,
             boundary,
         ) = self._provider_values(
             [ticker],
@@ -131,6 +132,7 @@ class PortfolioSnapshotService:
                 quotes=quotes,
                 wanted=wanted,
                 market_open=market_open,
+                market_clock_complete=market_clock_complete,
                 boundary=boundary,
                 captured_at=captured_at,
                 high_water_mark=high_water_mark,
@@ -159,6 +161,7 @@ class PortfolioSnapshotService:
             quotes,
             wanted,
             market_open,
+            market_clock_complete,
             boundary,
         ) = self._provider_values(
             tickers,
@@ -196,6 +199,7 @@ class PortfolioSnapshotService:
             quotes=quotes,
             wanted=wanted,
             market_open=market_open,
+            market_clock_complete=market_clock_complete,
             boundary=boundary,
             captured_at=captured_at,
             high_water_mark=high_water_mark,
@@ -221,7 +225,8 @@ class PortfolioSnapshotService:
         dict[str, Quote],
         set[str],
         bool,
-        datetime,
+        bool,
+        datetime | None,
     ]:
         try:
             account = self.broker.get_account()
@@ -240,9 +245,14 @@ class PortfolioSnapshotService:
             tickers,
         )
         external = self.external_positions()
-        clock = self.clock_for_asset(asset_class)
-        market_open = clock.is_open()
-        boundary = clock.most_recent_open()
+        (
+            market_open,
+            market_clock_complete,
+            boundary,
+        ) = self._market_clock_values(
+            asset_class,
+            required_dependencies=required_dependencies,
+        )
         quotes = {
             symbol.upper(): quote
             for symbol, quote in (quote_overrides or {}).items()
@@ -264,8 +274,34 @@ class PortfolioSnapshotService:
             quotes,
             wanted,
             market_open,
+            market_clock_complete,
             boundary,
         )
+
+    def _market_clock_values(
+        self,
+        asset_class: AssetClass,
+        *,
+        required_dependencies: bool,
+    ) -> tuple[bool, bool, datetime | None]:
+        try:
+            clock = self.clock_for_asset(asset_class)
+            market_open = clock.is_open()
+            boundary = clock.most_recent_open()
+            if type(market_open) is not bool:
+                raise ValueError("invalid market clock state")
+            if (
+                not isinstance(boundary, datetime)
+                or boundary.tzinfo is None
+                or boundary.utcoffset() is None
+            ):
+                raise ValueError("invalid market session boundary")
+            boundary = boundary.astimezone(timezone.utc)
+        except Exception:
+            if required_dependencies:
+                raise RequiredDependencyUnavailable from None
+            return False, False, None
+        return market_open, True, boundary
 
     @staticmethod
     def _canonical_positions(
@@ -443,7 +479,8 @@ class PortfolioSnapshotService:
         quotes: dict[str, Quote],
         wanted: set[str],
         market_open: bool,
-        boundary: datetime,
+        market_clock_complete: bool,
+        boundary: datetime | None,
         captured_at: datetime,
         high_water_mark: Decimal,
         active_breakers: frozenset[str],
@@ -483,7 +520,8 @@ class PortfolioSnapshotService:
             )
         ]
         daily_pnl_complete = (
-            position_exposure_complete
+            market_clock_complete
+            and position_exposure_complete
             and len(finite_unrealized) == len(relevant_positions)
             and not broker_drift_active
         )
@@ -614,11 +652,15 @@ class PortfolioSnapshotService:
                 for row in fills
                 if AssetClass.for_symbol(row.ticker) is asset_class
             ]
-            realized = realized_pnl_today(
-                class_fills,
-                asset_class=asset_class,
-                boundary=boundary,
-            )
+            if boundary is None:
+                realized = Decimal(0)
+                daily_pnl_complete = False
+            else:
+                realized = realized_pnl_today(
+                    class_fills,
+                    asset_class=asset_class,
+                    boundary=boundary,
+                )
             if not realized.is_finite():
                 daily_pnl_complete = False
                 realized = Decimal(0)
@@ -646,6 +688,7 @@ class PortfolioSnapshotService:
             account_complete=account_complete,
             quote_fresh=quote_fresh,
             market_open=market_open,
+            market_clock_complete=market_clock_complete,
             spread_pct_by_ticker=spread_pct_by_ticker,
             pending_buy_notional_by_ticker=pending_buy_notional,
             reserved_sell_qty_by_ticker=reserved_sell_qty,

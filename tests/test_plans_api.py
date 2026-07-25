@@ -19,7 +19,12 @@ from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import AuditEvent, TradePlanRow
+from trading_assistant.db.models import (
+    AuditEvent,
+    CircuitBreakerState,
+    RiskEvent,
+    TradePlanRow,
+)
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.signals.models import MarketFeatures, Regime
 
@@ -467,6 +472,114 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
     assert audit.result_code == "dependency_unavailable"
     assert json.loads(audit.detail_json) == {"stage": "analysis"}
     assert "provider-secret-plan-analysis" not in str(audit)
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "clock_method", "expected_status"),
+    [
+        (
+            "/analyze",
+            {
+                "symbol": "AAPL",
+                "reason": "analyze with required market clock",
+            },
+            "is_open",
+            503,
+        ),
+        (
+            "/propose",
+            {
+                "n": 2,
+                "reason": "propose with required market clock",
+            },
+            "most_recent_open",
+            200,
+        ),
+    ],
+)
+def test_required_snapshot_clock_outage_preserves_route_contract_and_redacts_provider(
+    client,
+    monkeypatch,
+    caplog,
+    path,
+    body,
+    clock_method,
+    expected_status,
+):
+    c, svc = client
+    marker = f"provider-secret-{clock_method}-planning"
+
+    def fail_clock(*args, **kwargs):
+        raise ConnectionError(marker)
+
+    monkeypatch.setattr(svc.clock, clock_method, fail_clock)
+
+    response = c.post(path, json=body)
+
+    assert response.status_code == expected_status
+    request_id = response.headers["X-Request-ID"]
+    if path == "/analyze":
+        assert response.json() == {
+            "error": {
+                "code": "analysis_failed",
+                "message": "Analysis could not be completed",
+                "request_id": request_id,
+            }
+        }
+        expected_targets = {"AAPL"}
+    else:
+        proposed = response.json()["proposed"]
+        assert proposed
+        assert {row["error"] for row in proposed} == {
+            "analysis_failed"
+        }
+        expected_targets = {row["symbol"] for row in proposed}
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+
+    with svc.session_factory() as session:
+        failures = session.query(AuditEvent).filter_by(
+            action="plan.create",
+            request_id=request_id,
+            result_code="dependency_unavailable",
+        ).all()
+        persisted_plans = session.query(TradePlanRow).count()
+        risk_text = "\n".join(
+            event.reason for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            state.reason
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert {failure.target_id for failure in failures} == expected_targets
+    assert {
+        (
+            failure.actor,
+            failure.reason,
+            failure.target_type,
+            failure.detail_json,
+        )
+        for failure in failures
+    } == {
+        (
+            "operator:local",
+            body["reason"],
+            "trade_plan",
+            json.dumps({"stage": "analysis"}, sort_keys=True),
+        )
+    }
+    assert persisted_plans == 0
+    exposed = "\n".join(
+        (
+            response.text,
+            "\n".join(failure.detail_json for failure in failures),
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "ConnectionError" not in exposed
 
 
 @pytest.mark.parametrize(

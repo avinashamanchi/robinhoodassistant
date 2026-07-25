@@ -32,6 +32,28 @@ from trading_assistant.risk.engine import RiskEngine
 NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 
 
+class _FailingProviderClock:
+    def __init__(self, failure_method: str, marker: str) -> None:
+        self.failure_method = failure_method
+        self.marker = marker
+
+    def is_open(self, at=None):
+        if self.failure_method == "is_open":
+            raise ConnectionError(self.marker)
+        return True
+
+    def most_recent_open(self, at=None):
+        if self.failure_method == "most_recent_open":
+            raise ConnectionError(self.marker)
+        return NOW - timedelta(hours=2)
+
+    def next_open(self, at=None):  # pragma: no cover - contract guard
+        raise AssertionError("snapshot must not request the next market open")
+
+    def next_close(self, at=None):  # pragma: no cover - contract guard
+        raise AssertionError("snapshot must not request the next market close")
+
+
 def _submit(submission, order_id):
     return submission.submit(
         order_id,
@@ -110,6 +132,47 @@ def test_required_execution_quote_failure_raises_typed_dependency(
         service.snapshot_service.assemble_for_execution("AAPL")
 
     assert type(raised.value).__name__ == "RequiredQuoteUnavailable"
+
+
+@pytest.mark.parametrize(
+    "failure_method",
+    ["is_open", "most_recent_open"],
+)
+def test_market_clock_provider_failure_is_typed_when_required_and_explicitly_incomplete_when_optional(
+    make_service,
+    risk_config,
+    caplog,
+    failure_method,
+):
+    service = make_service()
+    marker = f"provider-secret-market-clock-{failure_method}"
+    service._clocks[AssetClass.EQUITY] = _FailingProviderClock(
+        failure_method,
+        marker,
+    )
+
+    with pytest.raises(RequiredDependencyUnavailable) as raised:
+        service.snapshot_service.assemble_for_execution("AAPL")
+
+    assert str(raised.value) == "required dependency unavailable"
+    assert raised.value.__cause__ is None
+
+    with service.session_factory() as session:
+        snapshot = service.assemble_snapshot(
+            session,
+            ["AAPL"],
+            AssetClass.EQUITY,
+            required_dependencies=False,
+        )
+
+    assert snapshot.market_clock_complete is False
+    assert snapshot.market_open is False
+    assert snapshot.daily_pnl_complete is False
+    assert snapshot.realized_pnl_today == Decimal(0)
+    result = RiskEngine(risk_config).check(order(), snapshot)
+    assert "market clock snapshot is incomplete" in result.reasons
+    assert marker not in result.reason_text()
+    assert marker not in caplog.text
 
 
 def _pending(

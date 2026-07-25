@@ -781,6 +781,7 @@ class TradingService:
             and snapshot.account_complete is True
             and snapshot.pending_exposure_complete is True
             and snapshot.quote_fresh is True
+            and snapshot.market_clock_complete is True
             and daily_total.is_finite()
             and snapshot.account_equity.is_finite()
             and snapshot.account_equity > 0
