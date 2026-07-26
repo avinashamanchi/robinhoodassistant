@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Optional, TypeVar
 
 import requests
@@ -203,10 +204,16 @@ class AlpacaBroker(BrokerClient):
         self._trading = trading_client
         self._data = data_client
         self._crypto_data = crypto_data_client
+        self._mutation_lock = RLock()
+        self._paper_only_mutations_armed = False
 
     @property
     def execution_target(self) -> AlpacaExecutionTarget | None:
         """Derive the capability from the SDK client at inspection time."""
+        with self._mutation_lock:
+            return self._execution_target_unlocked()
+
+    def _execution_target_unlocked(self) -> AlpacaExecutionTarget | None:
         raw_sandbox = getattr(self._trading, "_sandbox", None)
         raw_base_url = getattr(self._trading, "_base_url", None)
         raw_base_url = getattr(raw_base_url, "value", raw_base_url)
@@ -219,6 +226,36 @@ class AlpacaBroker(BrokerClient):
             and isinstance(raw_base_url, str)
             else None
         )
+
+    def arm_paper_only_mutations(self) -> None:
+        """Permanently fail closed if a later mutation is not official paper."""
+        with self._mutation_lock:
+            self._require_armed_paper_target_unlocked(force=True)
+            self._paper_only_mutations_armed = True
+
+    def validate_armed_paper_target(self) -> None:
+        """Dynamically prove the currently armed SDK client is official paper."""
+        with self._mutation_lock:
+            if not self._paper_only_mutations_armed:
+                raise BrokerSubmissionRejected(
+                    "paper_mutation_guard_unarmed",
+                    "paper-only mutation guard is not armed",
+                )
+            self._require_armed_paper_target_unlocked(force=True)
+
+    def _require_armed_paper_target_unlocked(
+        self,
+        *,
+        force: bool = False,
+    ) -> None:
+        if not force and not self._paper_only_mutations_armed:
+            return
+        target = self._execution_target_unlocked()
+        if target is None or target.is_official_paper is not True:
+            raise BrokerSubmissionRejected(
+                "unsafe_execution_target",
+                "broker mutation target is not official Alpaca paper",
+            )
 
     @classmethod
     def from_credentials(
@@ -456,6 +493,8 @@ class AlpacaBroker(BrokerClient):
             return existing
         try:
             return self._submit_once(order)
+        except BrokerSubmissionRejected:
+            raise
         except BrokerDataIntegrityError:
             raise
         except APIError as exc:
@@ -494,7 +533,9 @@ class AlpacaBroker(BrokerClient):
         else:
             request = MarketOrderRequest(**common)
 
-        placed = self._trading.submit_order(order_data=request)
+        with self._mutation_lock:
+            self._require_armed_paper_target_unlocked()
+            placed = self._trading.submit_order(order_data=request)
         return self._to_result(placed)
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
@@ -535,7 +576,10 @@ class AlpacaBroker(BrokerClient):
             take_profit=TakeProfitRequest(limit_price=float(take_profit)),
             stop_loss=StopLossRequest(stop_price=float(stop_loss)),
         )
-        return self._to_result(self._trading.submit_order(order_data=req))
+        with self._mutation_lock:
+            self._require_armed_paper_target_unlocked()
+            placed = self._trading.submit_order(order_data=req)
+        return self._to_result(placed)
 
     def get_order_status(self, order_id: str) -> OrderResult:
         return self._to_result(_retry(self._trading.get_order_by_id, order_id))
@@ -554,7 +598,9 @@ class AlpacaBroker(BrokerClient):
     def cancel_order(self, order_id: str) -> OrderResult:
         # A dropped response after DELETE leaves acceptance unknown. Retrying the
         # write would violate the one-attempt boundary; reconciliation resolves it.
-        self._trading.cancel_order_by_id(order_id)
+        with self._mutation_lock:
+            self._require_armed_paper_target_unlocked()
+            self._trading.cancel_order_by_id(order_id)
         return self._to_result(_retry(self._trading.get_order_by_id, order_id))
 
     # ── helpers ────────────────────────────────────────────────

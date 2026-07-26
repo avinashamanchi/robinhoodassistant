@@ -12,6 +12,9 @@ First correction review base:
 Second correction review base:
 `d7bf50ad4878dc4f54219eb2a8d25f5ef71ac362`
 
+Third correction review base:
+`a0c0106`
+
 ## Final result
 
 The deterministic release gate passes. The release remains Alpaca paper-only,
@@ -42,10 +45,36 @@ The correction is test-first and fail-closed:
 - obvious periodic operator tokens now fail; successful preflight wording says
   the check is basic format/placeholder validation, not entropy proof.
 
-The remaining threat boundary is explicit: no user-space sequence can prove
-immunity to a malicious process with the same OS principal repeatedly swapping
-paths between individual system calls. Release evidence requires no untrusted
-concurrent same-user process.
+The remaining threat boundary is explicit: the copy is bound to held source
+inodes, but a malicious process with the same OS principal can still mutate
+those inodes or interfere with the private alias directory. Such interference
+must fail the identity/fingerprint/cleanup gates; release evidence still
+requires no untrusted concurrent same-user process.
+
+## Third review correction
+
+The third independent review reproduced four narrower races or evidence
+overclaims. The correction is test-first and fail-closed:
+
+- credentialed validation arms a broker-owned paper-only mutation guard;
+  `AlpacaBroker` holds an `RLock` across the final dynamic SDK-target check and
+  the actual SDK submit/cancel call, after preliminary lookup/request work;
+- the guard is armed only by the explicit credentialed safety drill, so normal
+  intentionally configured live-mode behavior is not globally disabled;
+- compensation obtains exact terminal/fill/position evidence after terminal
+  checks, then repeats it after proposal creation and immediately before
+  approval; any account drift or initial status/fill change aborts without a
+  compensation submission;
+- while source descriptors remain held, the backup creates a random private
+  `0700` directory in the verified source parent and hard-links every present
+  main/WAL/SHM inode under one alias basename. SQLite opens that private alias
+  with `mode=ro&nofollow=1`, preserving active-WAL rows while defeating a
+  swap/open/restore of the original pathname;
+- alias identities and controlled link counts are checked throughout cleanup.
+  Unverified paths are never unlinked, cleanup failure is unsafe, and the
+  source inode/content/mode/link counts must return to baseline;
+- `alpaca_paper:passed` now requires every report gate plus a final dynamic
+  paper-target validation. Clean reconciliation alone cannot emit the label.
 
 ## Strict TDD correction evidence
 
@@ -167,19 +196,46 @@ mutation checks, zero-write submit/cancel refusals, mock-only offline broker,
 stable-terminal compensation requirement, failed/unconfirmed-cancel cases,
 delayed later fill, and periodic-token check all pass.
 
+### Third correction RED and GREEN
+
+The focused reproduction command was:
+
+```text
+uv run pytest -q \
+  tests/test_safety_drill.py::test_active_wal_backup_opens_an_inode_bound_private_alias \
+  tests/test_safety_drill.py::test_online_copy_defeats_source_swap_open_restore_race \
+  tests/test_safety_drill.py::test_armed_paper_guard_blocks_submit_after_idempotency_lookup_redirects_live \
+  tests/test_safety_drill.py::test_armed_paper_guard_blocks_cancel_after_target_redirects_live \
+  tests/test_safety_drill.py::test_compensation_rechecks_position_after_terminal_and_fill_reads \
+  tests/test_safety_drill.py::test_compensation_rechecks_position_after_proposal_before_approval \
+  tests/test_safety_drill.py::test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed
+```
+
+RED result: `8 failed`. The old implementation opened the replacement
+pathname, allowed submit/cancel to observe a mutated live SDK client, reached
+compensation proposal/approval after intervening position drift, and emitted a
+paper pass label when another report gate was false.
+
+GREEN result: `8 passed, 1 warning`.
+
+The post-proposal initial-status reproduction is
+`test_compensation_rechecks_initial_terminal_status_after_proposal`. Removing
+the terminal/fill equality recheck made that test fail; restoring it made the
+test pass.
+
 ## Full deterministic suite and genuine branch gate
 
 ```text
 uv run pytest
 ```
 
-Result: `1421 passed, 1 skipped, 1 warning in 116.72s`.
+Result: `1430 passed, 1 skipped, 1 warning in 119.62s`.
 
 ```text
 uv run pytest --cov=trading_assistant.risk --cov=trading_assistant.orders --cov=trading_assistant.rules --cov=trading_assistant.app.auth --cov-branch --cov-report=term-missing --cov-fail-under=90
 ```
 
-Result: `1421 passed, 1 skipped, 1 warning in 182.55s`.
+Result: `1430 passed, 1 skipped, 1 warning in 183.54s`.
 
 - Statements: `2834`
 - Missed statements: `209`
@@ -191,19 +247,21 @@ Result: `1421 passed, 1 skipped, 1 warning in 182.55s`.
 
 ## Copy, crash, concurrency, fill, and cleanup evidence
 
-- Credentialed mode requires the exact broker/SDK client types and dynamically
-  validates the current `_sandbox` and `_base_url` before every mutation; only
-  the exact official paper endpoint passes. Live, uninitialized, subclassed,
-  sandbox-false, and URL-overridden targets fail before broker mutation.
+- Credentialed mode requires the exact broker/SDK client types and arms a
+  broker-owned paper-only guard. After lookup/request preparation, the broker
+  dynamically validates `_sandbox` and `_base_url` while holding its `RLock`
+  across the actual SDK submit/cancel. Live, uninitialized, subclassed,
+  sandbox-false, and URL-overridden targets fail before SDK mutation.
 - The primary and present sidecars are descriptor-held with `O_NOFOLLOW`,
-  `fstat`, safe-parent checks, and repeated pathname identity verification. It
-  opens via a quoted `file:` URI with `mode=ro&nofollow=1`, `uri=True`.
-  Source writes through that connection fail. A normal active WAL database is
-  supported when regular WAL and SHM sidecars already exist. Main/WAL
-  inode/content and logical schema/state remain unchanged when no unrelated
-  writer changes them; SHM identity/presence remains fixed while ephemeral read
-  marks may change. A hot journal and a closed WAL-mode database lacking
-  WAL/SHM fail before recovery or sidecar creation.
+  `fstat`, safe-parent checks, and inode verification. A private `0700`
+  source-parent directory contains identity-checked hard-link aliases for the
+  held main/WAL/SHM set; SQLite opens that alias via a quoted `file:` URI with
+  `mode=ro&nofollow=1`, `uri=True`. Source writes through that connection fail,
+  and swapping/restoring the original pathname cannot redirect the connection.
+  A normal active WAL database is supported when regular WAL and SHM sidecars
+  already exist. Cleanup verifies every alias before unlinking and restores the
+  baseline source link counts. A hot journal and a closed WAL-mode database
+  lacking WAL/SHM fail before recovery or sidecar creation.
 - Destination traversal rejects every symlink component and unsafe parents.
   Staging is `O_CREAT|O_EXCL|O_NOFOLLOW`, regular, link-count one, mode `0600`;
   publication is directory-relative and no-overwrite with post-link identity
@@ -217,10 +275,12 @@ Result: `1421 passed, 1 skipped, 1 warning in 182.55s`.
   while either worker is alive.
 - Compensation requires stable identity-verified terminal truth for the
   original, exact tagged `BrokerFill` aggregation equal to broker cumulative
-  `filled_qty`, and exact full-manifest drift. Failed/unconfirmed cancellation
-  submits no compensation. Any compensation uses the normal persisted
-  human-gated path, is reconciled to terminal truth, and must be opposite/exact
-  with tagged fills.
+  `filled_qty`, and exact full-manifest drift after terminal reads. The same
+  terminal/fill/manifest evidence is repeated after proposal creation and
+  before approval. Failed/unconfirmed cancellation or intervening drift submits
+  no compensation. Any compensation uses the normal persisted human-gated
+  path, is reconciled to terminal truth, and must be opposite/exact with tagged
+  fills.
 - Cleanup runs from the outer mutation `finally`, validates each tagged order
   against the known drill symbol, isolates provider failures per order, cancels
   stale-local but remotely validated tagged IDs, and never touches pre-existing
@@ -246,13 +306,13 @@ source open in WAL mode with an uncheckpointed committed sentinel and existing
 regular WAL/SHM. No unrelated writes occurred during the copy.
 
 ```json
-{"auth_fail_closed": true, "breakers_persisted": true, "crash_recovered_without_duplicate": true, "details": ["mode:mock", "schema:current", "auth:fail_closed", "crash:reconstructed_once", "oco:single_terminal", "breakers:persisted_scoped_reset", "reconciliation:clean"], "oco_single_terminal": true, "reconciliation_clean": true, "safe": true, "schema_current": true}
+{"active_wal_mock_exit": 0, "alias_residue": false, "safe": true, "source_files_restored": true}
 ```
 
-Result: `mock_exit=0`. CI uses a separately created private non-WAL source;
-the active-WAL source path is exercised by focused tests and this release
-rehearsal. A closed WAL-mode source without both sidecars is an explicit
-operational refusal, not a supported drill source.
+The source contained an uncheckpointed committed sentinel, which the copied
+database preserved. Source main/WAL/SHM inode, mode, and link count returned to
+baseline; main/WAL hashes were unchanged. A closed WAL-mode source without both
+sidecars is an explicit operational refusal, not a supported drill source.
 
 ## Preflight
 
@@ -282,9 +342,9 @@ credential is missing.
 - `find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n`: PASS.
 - `config.yaml` and `.github/workflows/ci.yml` YAML parse: PASS.
 - `git diff --check`: PASS.
-- Gitleaks `8.24.3` archive checksum: PASS.
-- Redacted post-commit full-history scan: `124 commits`, no leaks.
-- Redacted current-directory scan: no leaks.
+- The prior correction's verified Gitleaks `8.24.3` full-history/current-tree
+  scans remain recorded, but no local Gitleaks binary was available for a fresh
+  third-correction scan. The deterministic tracked-secret/static checks pass.
 - CI retains `fetch-depth: 0` and `gitleaks/gitleaks-action@v2`.
 
 ## Warning triage

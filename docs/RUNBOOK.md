@@ -65,12 +65,17 @@ The deterministic gate is offline. It uses SQLite's online backup API to create
 the explicit destination, upgrades and exercises only that copy, and refuses
 relative, existing, alias, symlink, hardlink, primary, non-SQLite, or in-memory
 destinations. It holds the primary and every present SQLite sidecar through
-directory-relative `O_NOFOLLOW` descriptors, rejects a group/world-writable
-source directory, and opens the verified pathname through a quoted `file:` URI
-with `mode=ro&nofollow=1`. Pathname-to-inode identity is checked before
-connection, after connection, and after backup; held main/WAL/journal
-fingerprints are checked before and after. Destination parents and staging are
-private, symlink-resistant, and published without overwrite.
+directory-relative `O_NOFOLLOW` descriptors and rejects a group/world-writable
+source directory. While those descriptors remain held, it creates a random
+private `0700` binding directory in the verified source parent, hard-links each
+present main/WAL/SHM inode under one alias basename, verifies every alias
+against its held descriptor, and opens SQLite read-only through the alias URI
+with `mode=ro&nofollow=1`. This binds connection open to the original inodes
+even if the original pathname is swapped and restored. Controlled link counts
+and identities are checked during cleanup; cleanup failure is unsafe,
+unverified paths are never unlinked, and source link counts must return to
+baseline. Destination parents and staging are private, symlink-resistant, and
+published without overwrite.
 
 An active WAL source is supported when its regular `-wal` and `-shm` files
 already exist. The drill requires those sidecars rather than creating recovery
@@ -84,11 +89,12 @@ application writes. A release rehearsal must therefore use either a non-WAL
 source or a held-open WAL source with both regular sidecars; do not run it
 against a closed WAL-mode file whose sidecars have disappeared.
 
-These controls close pathname, symlink, hardlink, and ordinary replacement
-races. They do not claim protection from a malicious process running
-concurrently as the same OS user that can repeatedly swap a pathname between
-individual system calls. Stop untrusted same-user processes before collecting
-release evidence.
+These controls close the tested pathname, symlink, hardlink, and
+swap/open/restore races. They do not claim protection from a malicious
+same-user process that directly mutates a held inode or interferes with the
+private binding directory. Such interference must fail the
+identity/fingerprint/cleanup gates. Stop untrusted same-user processes before
+collecting release evidence.
 
 ```bash
 uv run python scripts/check_release_safety.py
@@ -128,9 +134,14 @@ and valid Alpaca paper credentials are configured. Before copy or broker access,
 the gate requires the exact `AlpacaBroker` and exact initialized SDK
 `TradingClient`, dynamically re-derives the execution target from the client's
 current `_sandbox` and `_base_url`, and requires the exact official paper
-endpoint. It repeats that validation immediately before every submit or cancel,
-including compensation. Live, uninitialized, subclassed, sandbox-false, or
-URL-overridden clients are refused. Offline doubles can exercise mock behavior
+endpoint. Initial validation arms the broker's paper-only mutation guard.
+After preliminary idempotency lookup and request preparation, `AlpacaBroker`
+dynamically rechecks the exact SDK target while holding a broker-owned `RLock`
+across the actual SDK submit or cancel call, including compensation. The outer
+drill checks remain defense in depth. Live, uninitialized, subclassed,
+sandbox-false, or URL-overridden clients are refused. The guard is armed only
+by this explicit credentialed drill, so it does not globally disable
+intentionally configured live mode. Offline doubles can exercise mock behavior
 only and can never produce `alpaca_paper:passed`.
 
 The gate snapshots pre-existing open-order IDs and exact position quantities,
@@ -143,19 +154,25 @@ avoids Alpaca's fractional-GTC restriction and is never inferred from a tag.
 
 If the order fills, compensation is allowed only when exact `BrokerFill` records
 for the tagged broker-order ID aggregate to broker cumulative `filled_qty` and
-the full position-manifest drift equals that signed exposure. Unrelated or
-masked drift blocks compensation. The original must first be identity-verified
-terminal with two stable cumulative-fill observations. If cancellation is
-failed or unconfirmed, compensation is not submitted and the drill remains
-unsafe for operator intervention. A tagged opposite exact-quantity order then
-uses the same human-gated service and must be boundedly reconciled to terminal
-fill truth. An outer cleanup path resolves stale `SUBMITTING` or
-`acceptance_unknown` local state, validates remote identity before cancellation,
-requires every tagged remote/read/cancel result to match the known drill symbol,
-isolates per-order provider failures so later tagged IDs are still attempted,
+the full position-manifest drift equals that signed exposure. The terminal,
+fill, and full-manifest evidence is collected after terminal checks and is
+repeated after the local compensation proposal is created, immediately before
+approval. Any intervening account delta or original status/fill change blocks
+approval, so no compensation order is submitted. The original must first be
+identity-verified terminal with two stable cumulative-fill observations. If
+cancellation is failed or unconfirmed, compensation is not submitted and the
+drill remains unsafe for operator intervention. A tagged opposite
+exact-quantity order then uses the same human-gated service and must be
+boundedly reconciled to terminal fill truth. An outer cleanup path resolves
+stale `SUBMITTING` or `acceptance_unknown` local state, validates remote
+identity before cancellation, requires every tagged remote/read/cancel result
+to match the known drill symbol, isolates per-order provider failures so later
+tagged IDs are still attempted,
 and never touches a pre-existing ID. Any unavailable evidence, nonterminal
-compensation, or final-manifest mismatch remains unsafe. Missing credentials
-are a skip, never a pass.
+compensation, or final-manifest mismatch remains unsafe. The
+`alpaca_paper:passed` label requires every report gate plus one final dynamic
+paper-target validation; clean reconciliation alone is insufficient. Missing
+credentials are a skip, never a pass.
 
 ## Daily preflight and startup
 

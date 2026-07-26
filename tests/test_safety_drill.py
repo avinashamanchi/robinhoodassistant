@@ -37,6 +37,7 @@ from trading_assistant.ops.safety_drill import (
     _CrashAfterAcceptanceOnceBroker,
     _DrillCrash,
     _cancel_validated_tagged_open,
+    _compensate_drill_fill,
     _online_copy,
     _validate_credentialed_paper,
     main,
@@ -259,6 +260,123 @@ def test_source_backup_connection_is_read_only_and_preserves_main_wal_shm(
             "SELECT source FROM heartbeats "
             "WHERE source = 'task-10-source-sentinel'"
         ).fetchone() == ("task-10-source-sentinel",)
+
+
+def test_active_wal_backup_opens_an_inode_bound_private_alias(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    writer = _open_wal_source(primary)
+    before = _sqlite_file_snapshot(primary)
+    real_connect = sqlite3.connect
+    alias_seen = False
+
+    def inspect_source_alias(database, *args, **kwargs):
+        nonlocal alias_seen
+        raw = str(database)
+        if raw.startswith("file:") and "mode=ro" in raw:
+            from urllib.parse import unquote, urlsplit
+
+            alias = Path(unquote(urlsplit(raw).path))
+            alias_seen = True
+            assert alias != primary
+            assert alias.parent.parent == primary.parent
+            assert stat.S_IMODE(alias.parent.stat().st_mode) == 0o700
+            assert (alias.stat().st_dev, alias.stat().st_ino) == (
+                primary.stat().st_dev,
+                primary.stat().st_ino,
+            )
+            assert (
+                alias.with_name(f"{alias.name}-wal").stat().st_ino
+                == primary.with_name(f"{primary.name}-wal").stat().st_ino
+            )
+            assert (
+                alias.with_name(f"{alias.name}-shm").stat().st_ino
+                == primary.with_name(f"{primary.name}-shm").stat().st_ino
+            )
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safety_drill_module.sqlite3,
+        "connect",
+        inspect_source_alias,
+    )
+    try:
+        assert _online_copy(primary, destination) == destination
+        after = _sqlite_file_snapshot(primary)
+    finally:
+        writer.close()
+
+    assert alias_seen
+    _assert_source_files_unchanged_allowing_shm_read_marks(before, after)
+    with sqlite3.connect(destination) as copied:
+        assert copied.execute(
+            "SELECT source FROM heartbeats "
+            "WHERE source = 'task-10-source-sentinel'"
+        ).fetchone() == ("task-10-source-sentinel",)
+    assert not tuple(primary.parent.glob(".safety-drill-db-*"))
+
+
+def test_online_copy_defeats_source_swap_open_restore_race(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    replacement = tmp_path / "replacement.db"
+    held_original = tmp_path / "held-original.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    _upgrade_database(replacement)
+    with sqlite3.connect(primary) as connection:
+        connection.execute(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('original-inode', CURRENT_TIMESTAMP)"
+        )
+    with sqlite3.connect(replacement) as connection:
+        connection.execute(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('replacement-inode', CURRENT_TIMESTAMP)"
+        )
+    real_connect = sqlite3.connect
+    raced = False
+
+    def swap_open_restore(database, *args, **kwargs):
+        nonlocal raced
+        raw = str(database)
+        if raw.startswith("file:") and "mode=ro" in raw and not raced:
+            primary.rename(held_original)
+            replacement.rename(primary)
+            try:
+                connection = real_connect(database, *args, **kwargs)
+            finally:
+                primary.rename(replacement)
+                held_original.rename(primary)
+            raced = True
+            return connection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safety_drill_module.sqlite3,
+        "connect",
+        swap_open_restore,
+    )
+
+    assert _online_copy(primary, destination) == destination
+
+    assert raced
+    with sqlite3.connect(destination) as copied:
+        sources = {
+            row[0]
+            for row in copied.execute(
+                "SELECT source FROM heartbeats "
+                "WHERE source IN ('original-inode', 'replacement-inode')"
+            )
+        }
+    assert sources == {"original-inode"}
+    assert not tuple(primary.parent.glob(".safety-drill-db-*"))
 
 
 def test_online_copy_quotes_special_characters_in_read_only_source_uri(
@@ -1667,6 +1785,81 @@ def test_credentialed_wrapper_revalidates_each_submission(monkeypatch):
     assert writes == ["safety-drill-test-crash"]
 
 
+def test_armed_paper_guard_blocks_submit_after_idempotency_lookup_redirects_live(
+    monkeypatch,
+):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+    trading = TradingClient(
+        "paper-key-present",
+        "paper-secret-present",
+        paper=True,
+    )
+    broker = AlpacaBroker(trading, object())
+    _validate_credentialed_paper(broker, Secrets())
+    live_writes: list[tuple[bool, str]] = []
+
+    def redirect_during_lookup(client_order_id):
+        assert client_order_id == "safety-drill-inner-submit"
+        trading._sandbox = False
+        trading._base_url = "https://api.alpaca.markets"
+        return None
+
+    def observe_submit(*, order_data):
+        live_writes.append((trading._sandbox, str(trading._base_url)))
+        raise RuntimeError("SDK submit must not be reached")
+
+    monkeypatch.setattr(
+        broker,
+        "get_order_by_client_id",
+        redirect_during_lookup,
+    )
+    monkeypatch.setattr(trading, "submit_order", observe_submit)
+
+    with pytest.raises(RuntimeError):
+        broker.submit_order(
+            OrderRequest(
+                ticker="AAPL",
+                side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                qty=Decimal("1"),
+                limit_price=Decimal("96"),
+                time_in_force=OrderTimeInForce.GTC,
+                idempotency_key="safety-drill-inner-submit",
+            )
+        )
+
+    assert live_writes == []
+
+
+def test_armed_paper_guard_blocks_cancel_after_target_redirects_live(
+    monkeypatch,
+):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+    trading = TradingClient(
+        "paper-key-present",
+        "paper-secret-present",
+        paper=True,
+    )
+    broker = AlpacaBroker(trading, object())
+    _validate_credentialed_paper(broker, Secrets())
+    live_writes: list[tuple[bool, str]] = []
+
+    def observe_cancel(order_id):
+        live_writes.append((trading._sandbox, str(trading._base_url)))
+        raise RuntimeError(f"SDK cancel must not be reached: {order_id}")
+
+    monkeypatch.setattr(trading, "cancel_order_by_id", observe_cancel)
+    trading._sandbox = False
+    trading._base_url = "https://api.alpaca.markets"
+
+    with pytest.raises(RuntimeError):
+        broker.cancel_order("paper-order")
+
+    assert live_writes == []
+
+
 def test_mock_mode_preserves_preexisting_manifest_and_cleans_tagged_order(
     tmp_path,
     app_config,
@@ -1928,6 +2121,251 @@ def test_mock_mode_refuses_unrelated_or_masked_position_drift_before_compensatio
         for request in broker.submit_requests
     )
     assert broker.cancel_ids == []
+
+
+@pytest.mark.parametrize("intervening_delta", [Decimal("1"), Decimal("-1")])
+def test_compensation_rechecks_position_after_terminal_and_fill_reads(
+    intervening_delta,
+):
+    tag = "safety-drill-terminal-race"
+    initial = OrderResult(
+        idempotency_key=f"{tag}-crash",
+        broker_order_id="initial-order",
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+        ticker="AAPL",
+    )
+
+    class RacingBroker:
+        def __init__(self):
+            self.qty = Decimal("6")
+            self.changed = False
+
+        def get_positions(self):
+            return [
+                Position(
+                    "AAPL",
+                    self.qty,
+                    Decimal("100"),
+                    Decimal("100"),
+                    Decimal("0"),
+                )
+            ]
+
+        def get_order_by_client_id(self, client_order_id):
+            assert client_order_id == initial.idempotency_key
+            return initial
+
+        def get_order_status(self, order_id):
+            assert order_id == initial.broker_order_id
+            if not self.changed:
+                self.qty += intervening_delta
+                self.changed = True
+            return initial
+
+        def get_fill_activities(self):
+            return [
+                BrokerFill(
+                    broker_fill_id="initial-fill",
+                    broker_order_id=initial.broker_order_id,
+                    ticker="AAPL",
+                    side=OrderSide.BUY.value,
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    filled_at=datetime.now(timezone.utc),
+                )
+            ]
+
+    broker = RacingBroker()
+    proposed: list[str] = []
+
+    class Service:
+        def sync_open_orders(self, **kwargs):
+            return {"failed": 0}
+
+        def propose_order(self, *args, **kwargs):
+            proposed.append(kwargs["idempotency_key"])
+            return {"status": OrderStatus.REJECTED.value}
+
+    container = type(
+        "Container",
+        (),
+        {"broker": broker, "service": Service()},
+    )()
+
+    assert not _compensate_drill_fill(
+        container,
+        before_positions={"AAPL": Decimal("5")},
+        tag=tag,
+        symbol="AAPL",
+    )
+    assert broker.changed
+    assert proposed == []
+
+
+def test_compensation_rechecks_position_after_proposal_before_approval():
+    tag = "safety-drill-proposal-race"
+    initial = OrderResult(
+        idempotency_key=f"{tag}-crash",
+        broker_order_id="initial-order",
+        status=OrderStatus.FILLED,
+        filled_qty=Decimal("1"),
+        avg_fill_price=Decimal("100"),
+        ticker="AAPL",
+    )
+
+    class RacingBroker:
+        qty = Decimal("6")
+
+        def get_positions(self):
+            return [
+                Position(
+                    "AAPL",
+                    self.qty,
+                    Decimal("100"),
+                    Decimal("100"),
+                    Decimal("0"),
+                )
+            ]
+
+        def get_order_by_client_id(self, client_order_id):
+            assert client_order_id == initial.idempotency_key
+            return initial
+
+        def get_order_status(self, order_id):
+            assert order_id == initial.broker_order_id
+            return initial
+
+        def get_fill_activities(self):
+            return [
+                BrokerFill(
+                    broker_fill_id="initial-fill",
+                    broker_order_id=initial.broker_order_id,
+                    ticker="AAPL",
+                    side=OrderSide.BUY.value,
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    filled_at=datetime.now(timezone.utc),
+                )
+            ]
+
+    broker = RacingBroker()
+    approvals: list[int] = []
+
+    class Service:
+        def sync_open_orders(self, **kwargs):
+            return {"failed": 0}
+
+        def propose_order(self, *args, **kwargs):
+            broker.qty += Decimal("1")
+            return {
+                "status": OrderStatus.PROPOSED.value,
+                "order_id": 91,
+            }
+
+        def approve_order(self, order_id, **kwargs):
+            approvals.append(order_id)
+            return {"status": OrderStatus.REJECTED.value}
+
+    container = type(
+        "Container",
+        (),
+        {"broker": broker, "service": Service()},
+    )()
+
+    assert not _compensate_drill_fill(
+        container,
+        before_positions={"AAPL": Decimal("5")},
+        tag=tag,
+        symbol="AAPL",
+    )
+    assert approvals == []
+
+
+def test_compensation_rechecks_initial_terminal_status_after_proposal():
+    tag = "safety-drill-status-race"
+    state = {
+        "order": OrderResult(
+            idempotency_key=f"{tag}-crash",
+            broker_order_id="initial-order",
+            status=OrderStatus.FILLED,
+            filled_qty=Decimal("1"),
+            avg_fill_price=Decimal("100"),
+            ticker="AAPL",
+        )
+    }
+
+    class RacingBroker:
+        def get_positions(self):
+            return [
+                Position(
+                    "AAPL",
+                    Decimal("6"),
+                    Decimal("100"),
+                    Decimal("100"),
+                    Decimal("0"),
+                )
+            ]
+
+        def get_order_by_client_id(self, client_order_id):
+            assert client_order_id == f"{tag}-crash"
+            return state["order"]
+
+        def get_order_status(self, order_id):
+            assert order_id == "initial-order"
+            return state["order"]
+
+        def get_fill_activities(self):
+            return [
+                BrokerFill(
+                    broker_fill_id="initial-fill",
+                    broker_order_id="initial-order",
+                    ticker="AAPL",
+                    side=OrderSide.BUY.value,
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    filled_at=datetime.now(timezone.utc),
+                )
+            ]
+
+    approvals: list[int] = []
+
+    class Service:
+        def sync_open_orders(self, **kwargs):
+            return {"failed": 0}
+
+        def propose_order(self, *args, **kwargs):
+            state["order"] = OrderResult(
+                idempotency_key=f"{tag}-crash",
+                broker_order_id="initial-order",
+                status=OrderStatus.CANCELED,
+                filled_qty=Decimal("1"),
+                avg_fill_price=Decimal("100"),
+                ticker="AAPL",
+            )
+            return {
+                "status": OrderStatus.PROPOSED.value,
+                "order_id": 92,
+            }
+
+        def approve_order(self, order_id, **kwargs):
+            approvals.append(order_id)
+            return {"status": OrderStatus.REJECTED.value}
+
+    container = type(
+        "Container",
+        (),
+        {"broker": RacingBroker(), "service": Service()},
+    )()
+
+    assert not _compensate_drill_fill(
+        container,
+        before_positions={"AAPL": Decimal("5")},
+        tag=tag,
+        symbol="AAPL",
+    )
+    assert approvals == []
 
 
 def test_mock_mode_requires_exact_initial_fill_activity_before_compensation(
@@ -2405,3 +2843,34 @@ def test_credentialed_mode_refuses_missing_keys_or_nonpaper_endpoint_before_copy
     assert endpoint.value.code == "unsafe_configuration"
     assert not destination.exists()
     assert accesses == 0
+
+
+def test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    _upgrade_database(primary)
+    _seed_preexisting_paper_order(primary)
+    _credentialed_environment(monkeypatch, primary)
+    broker = PaperStateBroker(identity_failures=2)
+    monkeypatch.setattr(
+        safety_drill_module,
+        "_validate_credentialed_paper",
+        lambda broker, secrets: None,
+    )
+
+    report = run_safety_drill(
+        database_copy=tmp_path / "label-copy.db",
+        config=_safe_config(app_config),
+        broker=broker,
+        credentialed_paper=True,
+        clock=FakeClock(is_open=True),
+    )
+
+    assert report.crash_recovered_without_duplicate is False
+    assert report.reconciliation_clean
+    assert report.safe is False
+    assert "alpaca_paper:passed" not in report.details
+    assert "alpaca_paper:unconfirmed" in report.details

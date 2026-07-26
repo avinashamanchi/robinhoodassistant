@@ -212,13 +212,20 @@ class _HeldDatabaseSource:
         )
 
     @staticmethod
-    def _valid_regular(metadata: os.stat_result) -> bool:
-        return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    def _valid_regular(
+        metadata: os.stat_result,
+        *,
+        expected_nlink: int = 1,
+    ) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == expected_nlink
+        )
 
     def _name(self, suffix: str) -> str:
         return f"{self.path.name}{suffix}"
 
-    def paths_match_held_files(self) -> bool:
+    def paths_match_held_files(self, *, expected_nlink: int = 1) -> bool:
         """Check both the held parent and the current absolute pathname."""
         for suffix, descriptor in self.file_fds.items():
             name = self._name(suffix)
@@ -244,7 +251,10 @@ class _HeldDatabaseSource:
                 continue
 
             held = os.fstat(descriptor)
-            if not self._valid_regular(held):
+            if not self._valid_regular(
+                held,
+                expected_nlink=expected_nlink,
+            ):
                 return False
             for path, kwargs in (
                 (
@@ -261,7 +271,10 @@ class _HeldDatabaseSource:
                 except OSError:
                     return False
                 if (
-                    not self._valid_regular(observed)
+                    not self._valid_regular(
+                        observed,
+                        expected_nlink=expected_nlink,
+                    )
                     or self._identity(observed) != self._identity(held)
                 ):
                     return False
@@ -311,6 +324,239 @@ class _HeldDatabaseSource:
                 )
             )
         return tuple(files)
+
+
+@dataclass
+class _DatabaseSourceBinding:
+    held: _HeldDatabaseSource
+    directory_name: str
+    directory_fd: int
+    directory_identity: tuple[int, int]
+    linked_suffixes: set[str]
+
+    @property
+    def main_path(self) -> Path:
+        return (
+            self.held.path.parent
+            / self.directory_name
+            / self.held.path.name
+        )
+
+    def _directory_matches(self) -> bool:
+        held_directory = os.fstat(self.directory_fd)
+        if (
+            not stat.S_ISDIR(held_directory.st_mode)
+            or stat.S_IMODE(held_directory.st_mode) != 0o700
+            or (held_directory.st_dev, held_directory.st_ino)
+            != self.directory_identity
+        ):
+            return False
+        for path, kwargs in (
+            (
+                self.directory_name,
+                {
+                    "dir_fd": self.held.parent_fd,
+                    "follow_symlinks": False,
+                },
+            ),
+            (
+                self.held.path.parent / self.directory_name,
+                {"follow_symlinks": False},
+            ),
+        ):
+            try:
+                observed = os.stat(path, **kwargs)
+            except OSError:
+                return False
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or stat.S_IMODE(observed.st_mode) != 0o700
+                or (observed.st_dev, observed.st_ino)
+                != self.directory_identity
+            ):
+                return False
+        return True
+
+    def verified(self) -> bool:
+        if not self._directory_matches():
+            return False
+        if not self.held.paths_match_held_files(expected_nlink=2):
+            return False
+        for suffix, descriptor in self.held.file_fds.items():
+            alias_name = self.held._name(suffix)
+            alias_path = self.main_path.with_name(alias_name)
+            if descriptor is None:
+                for path, kwargs in (
+                    (
+                        alias_name,
+                        {
+                            "dir_fd": self.directory_fd,
+                            "follow_symlinks": False,
+                        },
+                    ),
+                    (alias_path, {"follow_symlinks": False}),
+                ):
+                    try:
+                        os.stat(path, **kwargs)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        return False
+                    return False
+                continue
+            held_file = os.fstat(descriptor)
+            if not self.held._valid_regular(
+                held_file,
+                expected_nlink=2,
+            ):
+                return False
+            for path, kwargs in (
+                (
+                    alias_name,
+                    {
+                        "dir_fd": self.directory_fd,
+                        "follow_symlinks": False,
+                    },
+                ),
+                (alias_path, {"follow_symlinks": False}),
+            ):
+                try:
+                    observed = os.stat(path, **kwargs)
+                except OSError:
+                    return False
+                if (
+                    not self.held._valid_regular(
+                        observed,
+                        expected_nlink=2,
+                    )
+                    or self.held._identity(observed)
+                    != self.held._identity(held_file)
+                ):
+                    return False
+        return True
+
+
+@contextmanager
+def _bind_database_source(held: _HeldDatabaseSource):
+    """Expose held SQLite inodes through one private, verified alias basename."""
+    directory_name = f".safety-drill-db-{uuid4().hex}"
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    linked_suffixes: set[str] = set()
+    binding: _DatabaseSourceBinding | None = None
+    cleanup_failed = False
+    try:
+        try:
+            os.mkdir(directory_name, 0o700, dir_fd=held.parent_fd)
+            directory_fd = os.open(
+                directory_name,
+                directory_flags | nofollow,
+                dir_fd=held.parent_fd,
+            )
+            os.fchmod(directory_fd, 0o700)
+        except OSError:
+            raise SafetyDrillError("database_copy_failed") from None
+        directory_metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise SafetyDrillError("database_copy_failed")
+        directory_identity = (
+            directory_metadata.st_dev,
+            directory_metadata.st_ino,
+        )
+        binding = _DatabaseSourceBinding(
+            held=held,
+            directory_name=directory_name,
+            directory_fd=directory_fd,
+            directory_identity=directory_identity,
+            linked_suffixes=linked_suffixes,
+        )
+        for suffix, descriptor in held.file_fds.items():
+            if descriptor is None:
+                continue
+            alias_name = held._name(suffix)
+            try:
+                os.link(
+                    alias_name,
+                    alias_name,
+                    src_dir_fd=held.parent_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                raise SafetyDrillError("database_copy_failed") from None
+            linked_suffixes.add(suffix)
+            alias_metadata = os.stat(
+                alias_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            held_metadata = os.fstat(descriptor)
+            if (
+                not held._valid_regular(
+                    alias_metadata,
+                    expected_nlink=2,
+                )
+                or held._identity(alias_metadata)
+                != held._identity(held_metadata)
+            ):
+                raise SafetyDrillError("database_copy_failed")
+        if not binding.verified():
+            raise SafetyDrillError("database_copy_failed")
+        yield binding
+    finally:
+        if directory_fd is not None:
+            for suffix in tuple(linked_suffixes):
+                descriptor = held.file_fds[suffix]
+                alias_name = held._name(suffix)
+                if descriptor is None:
+                    cleanup_failed = True
+                    continue
+                try:
+                    held_metadata = os.fstat(descriptor)
+                    alias_metadata = os.stat(
+                        alias_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not held._valid_regular(
+                            held_metadata,
+                            expected_nlink=2,
+                        )
+                        or held._identity(alias_metadata)
+                        != held._identity(held_metadata)
+                    ):
+                        cleanup_failed = True
+                        continue
+                    os.unlink(alias_name, dir_fd=directory_fd)
+                    if not held._valid_regular(
+                        os.fstat(descriptor),
+                        expected_nlink=1,
+                    ):
+                        cleanup_failed = True
+                except OSError:
+                    cleanup_failed = True
+            directory_matches = (
+                binding is not None and binding._directory_matches()
+            )
+            if directory_matches:
+                try:
+                    os.rmdir(directory_name, dir_fd=held.parent_fd)
+                except OSError:
+                    cleanup_failed = True
+            else:
+                cleanup_failed = True
+            try:
+                os.close(directory_fd)
+            except OSError:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise SafetyDrillError("database_copy_failed")
+
 
 @contextmanager
 def _hold_database_source(source: Path):
@@ -438,8 +684,11 @@ def _online_copy_from_held(
     journal_versions = os.pread(held_source.file_fds[""], 2, 18)
     wal_format = journal_versions == b"\x02\x02"
     if (
-        source_files["-wal"]
-        and not source_files["-shm"]
+        source_files["-journal"]
+        or (
+            source_files["-wal"]
+            and not source_files["-shm"]
+        )
     ) or (
         wal_format
         and (
@@ -525,9 +774,6 @@ def _online_copy_from_held(
             raise SafetyDrillError("unsafe_database_copy")
 
         temporary = destination.with_name(temporary_name)
-        source_uri = (
-            f"file:{quote(str(source), safe='/')}?mode=ro&nofollow=1"
-        )
         temporary_uri = (
             f"file:{quote(str(temporary), safe='/')}?mode=rw&nofollow=1"
         )
@@ -546,38 +792,49 @@ def _online_copy_from_held(
                 raise SafetyDrillError("unsafe_database_copy")
             if not held_source.paths_match_held_files():
                 raise SafetyDrillError("database_copy_failed")
-            with (
-                sqlite3.connect(
-                    source_uri,
-                    uri=True,
-                ) as source_connection,
-                sqlite3.connect(temporary_uri, uri=True) as target_connection,
-            ):
-                if not held_source.paths_match_held_files():
-                    raise SafetyDrillError("database_copy_failed")
-                opened = os.stat(
-                    temporary_name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
+            with _bind_database_source(held_source) as source_binding:
+                source_uri = (
+                    "file:"
+                    f"{quote(str(source_binding.main_path), safe='/')}"
+                    "?mode=ro&nofollow=1"
                 )
-                if (
-                    not stat.S_ISREG(opened.st_mode)
-                    or (opened.st_dev, opened.st_ino)
-                    != (expected.st_dev, expected.st_ino)
-                    or opened.st_nlink != 1
+                if not source_binding.verified():
+                    raise SafetyDrillError("database_copy_failed")
+                with (
+                    sqlite3.connect(
+                        source_uri,
+                        uri=True,
+                    ) as source_connection,
+                    sqlite3.connect(
+                        temporary_uri,
+                        uri=True,
+                    ) as target_connection,
                 ):
-                    raise SafetyDrillError("unsafe_database_copy")
-                source_connection.backup(target_connection)
-                if not held_source.paths_match_held_files():
-                    raise SafetyDrillError("database_copy_failed")
-                integrity = target_connection.execute(
-                    "PRAGMA integrity_check"
-                ).fetchone()
-                if integrity != ("ok",):
-                    raise SafetyDrillError("database_copy_failed")
-                target_connection.execute(
-                    "PRAGMA journal_mode=DELETE"
-                ).fetchone()
+                    if not source_binding.verified():
+                        raise SafetyDrillError("database_copy_failed")
+                    opened = os.stat(
+                        temporary_name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (expected.st_dev, expected.st_ino)
+                        or opened.st_nlink != 1
+                    ):
+                        raise SafetyDrillError("unsafe_database_copy")
+                    source_connection.backup(target_connection)
+                    if not source_binding.verified():
+                        raise SafetyDrillError("database_copy_failed")
+                    integrity = target_connection.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()
+                    if integrity != ("ok",):
+                        raise SafetyDrillError("database_copy_failed")
+                    target_connection.execute(
+                        "PRAGMA journal_mode=DELETE"
+                    ).fetchone()
             if held_source.fingerprint() != source_before:
                 raise SafetyDrillError("database_copy_failed")
         except SafetyDrillError:
@@ -704,6 +961,7 @@ def _validate_credentialed_paper(
     secrets: Secrets,
 ) -> None:
     from ..broker.alpaca import AlpacaBroker
+    from ..broker.base import BrokerSubmissionRejected
     from alpaca.trading.client import TradingClient
 
     if (
@@ -730,6 +988,11 @@ def _validate_credentialed_paper(
         or endpoint.fragment
     ):
         raise SafetyDrillError("unsafe_configuration")
+    try:
+        broker.arm_paper_only_mutations()
+        broker.validate_armed_paper_target()
+    except BrokerSubmissionRejected:
+        raise SafetyDrillError("unsafe_configuration") from None
 
 
 def _open_order_manifest(broker: BrokerClient) -> frozenset[str]:
@@ -942,6 +1205,52 @@ def _resolve_tagged_terminal(
     return None
 
 
+def _verified_initial_exposure(
+    container,
+    *,
+    before_positions: dict[str, Decimal],
+    initial_client_id: str,
+    tag: str,
+    symbol: str,
+) -> tuple[OrderResult, Decimal] | None:
+    """Read terminal order, exact fills, then the matching account manifest."""
+    initial = _resolve_tagged_terminal(
+        container,
+        client_order_id=initial_client_id,
+        symbol=symbol,
+        tag=tag,
+    )
+    if initial is None:
+        return None
+    attributed, signed_exposure = _attributed_signed_fill(
+        container.broker,
+        initial,
+        client_order_id=initial_client_id,
+        symbol=symbol,
+        expected_side=OrderSide.BUY,
+    )
+    expected_delta = {symbol: signed_exposure} if signed_exposure else {}
+    current_positions = _position_manifest(container.broker)
+    if (
+        not attributed
+        or _position_delta(before_positions, current_positions)
+        != expected_delta
+    ):
+        return None
+    return initial, signed_exposure
+
+
+def _same_terminal_fill(left: OrderResult, right: OrderResult) -> bool:
+    return (
+        right.broker_order_id == left.broker_order_id
+        and right.idempotency_key == left.idempotency_key
+        and right.ticker == left.ticker
+        and right.status is left.status
+        and right.filled_qty == left.filled_qty
+        and right.avg_fill_price == left.avg_fill_price
+    )
+
+
 def _compensate_drill_fill(
     container,
     *,
@@ -951,35 +1260,18 @@ def _compensate_drill_fill(
 ) -> bool:
     """Flatten only exact, tagged broker fills with an exact manifest delta."""
     initial_client_id = f"{tag}-crash"
-    current_positions = _position_manifest(container.broker)
     if container.broker.get_order_by_client_id(initial_client_id) is None:
-        return current_positions == before_positions
-    initial = _resolve_tagged_terminal(
+        return _position_manifest(container.broker) == before_positions
+    verified = _verified_initial_exposure(
         container,
-        client_order_id=initial_client_id,
-        symbol=symbol,
+        before_positions=before_positions,
+        initial_client_id=initial_client_id,
         tag=tag,
-    )
-    if initial is None:
-        return False
-    attributed, signed_exposure = _attributed_signed_fill(
-        container.broker,
-        initial,
-        client_order_id=initial_client_id,
         symbol=symbol,
-        expected_side=OrderSide.BUY,
     )
-    expected_delta = (
-        {symbol: signed_exposure}
-        if signed_exposure
-        else {}
-    )
-    if (
-        not attributed
-        or _position_delta(before_positions, current_positions)
-        != expected_delta
-    ):
+    if verified is None:
         return False
+    initial, signed_exposure = verified
     if signed_exposure == 0:
         return True
     side = (
@@ -1000,6 +1292,19 @@ def _compensate_drill_fill(
         request_id=f"{tag}-compensate-propose",
     )
     if proposal["status"] != OrderStatus.PROPOSED.value:
+        return False
+    reverified = _verified_initial_exposure(
+        container,
+        before_positions=before_positions,
+        initial_client_id=initial_client_id,
+        tag=tag,
+        symbol=symbol,
+    )
+    if (
+        reverified is None
+        or reverified[1] != signed_exposure
+        or not _same_terminal_fill(initial, reverified[0])
+    ):
         return False
     approved = container.service.approve_order(
         proposal["order_id"],
@@ -1643,17 +1948,9 @@ def run_safety_drill(
             if reconciliation_clean
             else "reconciliation:unconfirmed"
         )
-        if credentialed_paper:
-            details.append(
-                "alpaca_paper:passed"
-                if reconciliation_clean
-                else "alpaca_paper:unconfirmed"
-            )
     except Exception:
         reconciliation_clean = False
         details.append("reconciliation:dependency_failed")
-        if credentialed_paper:
-            details.append("alpaca_paper:unconfirmed")
     details.insert(
         1,
         "schema:current" if schema_current else "schema:not_current",
@@ -1667,6 +1964,18 @@ def run_safety_drill(
         breakers_persisted,
         reconciliation_clean,
     )
+    paper_target_confirmed = not credentialed_paper
+    if credentialed_paper:
+        try:
+            _validate_credentialed_paper(broker, primary_secrets)
+            paper_target_confirmed = True
+        except Exception:
+            paper_target_confirmed = False
+        details.append(
+            "alpaca_paper:passed"
+            if all(gates) and paper_target_confirmed
+            else "alpaca_paper:unconfirmed"
+        )
     return SafetyDrillReport(
         schema_current=schema_current,
         auth_fail_closed=auth_fail_closed,
@@ -1674,7 +1983,7 @@ def run_safety_drill(
         oco_single_terminal=oco_single_terminal,
         breakers_persisted=breakers_persisted,
         reconciliation_clean=reconciliation_clean,
-        safe=all(gates),
+        safe=all(gates) and paper_target_confirmed,
         details=tuple(details),
     )
 
