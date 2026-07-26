@@ -127,6 +127,7 @@ class MockBroker(BrokerClient):
             idempotency_key=order.idempotency_key,
             broker_order_id=broker_id,
             status=OrderStatus.SUBMITTED,
+            ticker=order.ticker,
         )
         self._orders_by_key[order.idempotency_key] = result
         self._orders_by_id[broker_id] = result
@@ -166,6 +167,7 @@ class MockBroker(BrokerClient):
             status=OrderStatus.CANCELED,
             filled_qty=result.filled_qty,
             avg_fill_price=result.avg_fill_price,
+            ticker=result.ticker,
         )
         self._orders_by_id[order_id] = canceled
         self._orders_by_key[result.idempotency_key] = canceled

@@ -505,8 +505,98 @@ def test_preflight_app_secret_quality_is_independent_of_provider_credentials():
     from trading_assistant import preflight
 
     assert preflight._app_secret_quality(Secrets(app_api_token="short")).status == "FAIL"
-    result = preflight._app_secret_quality(Secrets(app_api_token="x" * 32))
+    assert (
+        preflight._app_secret_quality(
+            Secrets(app_api_token="x" * 32)
+        ).status
+        == "FAIL"
+    )
+    assert (
+        preflight._app_secret_quality(
+            Secrets(app_api_token="placeholder-token-" * 2)
+        ).status
+        == "FAIL"
+    )
+    result = preflight._app_secret_quality(
+        Secrets(app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5")
+    )
     assert result.status == "PASS"
+
+
+def test_preflight_needs_me_is_not_ready_and_nonzero(
+    app_config,
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant import preflight
+
+    monkeypatch.setattr(preflight, "load_config", lambda *_args: app_config)
+    monkeypatch.setattr(
+        preflight,
+        "_config_parses",
+        lambda: preflight.Result("config", preflight.PASS),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_paper_only",
+        lambda _config: preflight.Result("paper", preflight.PASS),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_dangerous_switches_off",
+        lambda _config, _secrets: preflight.Result(
+            "switches",
+            preflight.PASS,
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_app_secret_quality",
+        lambda _secrets: preflight.Result("secret", preflight.PASS),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_alpaca",
+        lambda _secrets: (
+            preflight.Result("alpaca", preflight.NEEDS),
+            preflight.Result("clock", preflight.NEEDS),
+            preflight.Result("data", preflight.NEEDS),
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_db",
+        lambda _secrets: (
+            preflight.Result("schema", preflight.PASS),
+            preflight.Result("wal", preflight.PASS),
+            preflight.Result("breakers", preflight.PASS),
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_llm_provider_configured",
+        lambda _config, _secrets: preflight.Result(
+            "llm",
+            preflight.NEEDS,
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_notification_configuration",
+        lambda _config, _secrets: preflight.Result(
+            "notifications",
+            preflight.SKIP,
+        ),
+    )
+
+    result = preflight._run(
+        Secrets(app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5")
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "=> NOT READY" in output
+    assert "=> READY\n" not in output
 
 
 def test_preflight_llm_check_is_configuration_only_and_never_calls_provider(

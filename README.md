@@ -102,8 +102,9 @@ uv run python -m trading_assistant.daemon.main
 uv run python -m trading_assistant.ops.paper_drill
 
 # Exercise migration, response-loss recovery, OCO, breakers, and reconciliation
-# offline against an explicit online SQLite copy:
-safety_dir="$(mktemp -d)"
+# offline against an explicit online SQLite copy (the source is opened mode=ro):
+safety_stage="$(mktemp -d)"
+safety_dir="$(cd "$safety_stage" && pwd -P)"
 uv run python -m trading_assistant.ops.safety_drill \
   --database-copy "$safety_dir/release-safety.sqlite3" --mock
 
@@ -121,6 +122,14 @@ Operational details, verified backup/migration/restore commands, and the optiona
 credentialed Alpaca paper gate are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Paper trading is a simulation and does not
 establish that a strategy will be profitable in live markets.
+
+The mock gate is deterministic and broker-write-free. It exercises a real
+restart reconstruction, two independently constructed OCO repository
+contenders, breaker persistence, and reconciliation on the copy. Active WAL
+sources are supported when their regular `-wal` and `-shm` files already exist;
+the drill never creates, deletes, or recovers primary sidecars. Missing required
+credentials make preflight exit nonzero with `NOT READY`, not a conditional
+ready state.
 
 The checked-in operating profile is intentionally conservative:
 `trading.mode: paper`, autonomous pre-approved-rule execution OFF, broker bracket

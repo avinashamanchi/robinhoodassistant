@@ -2,8 +2,8 @@
 
     python -m trading_assistant.preflight
 
-Prints a PASS/FAIL/SKIP/NEEDS-ME table and exits non-zero on any FAIL. Run this
-before starting the app + daemon each day.
+Prints a PASS/FAIL/SKIP/NEEDS-ME table and exits non-zero on any FAIL or
+NEEDS-ME item. Run this before starting the app + daemon each day.
 """
 
 from __future__ import annotations
@@ -17,6 +17,16 @@ from .db.schema import SchemaOutOfDate
 
 PASS, FAIL, SKIP, NEEDS = "PASS", "FAIL", "SKIP", "NEEDS-ME"
 _EXAMPLE_TOKENS = {"", "sk-ant-xxxxxxxx"}
+_PLACEHOLDER_MARKERS = (
+    "changeme",
+    "example",
+    "placeholder",
+    "replace-me",
+    "replace_me",
+    "test-token",
+    "your-token",
+    "your_token",
+)
 
 
 @dataclass
@@ -69,11 +79,22 @@ def _dangerous_switches_off(config, secrets: Secrets) -> Result:
 
 
 def _app_secret_quality(secrets: Secrets) -> Result:
-    ok = len(secrets.app_api_token) >= 32
+    token = secrets.app_api_token.strip()
+    lowered = token.lower()
+    ok = (
+        len(token) >= 32
+        and token not in _EXAMPLE_TOKENS
+        and len(set(token)) >= 8
+        and not any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+    )
     return Result(
         "operator login secret quality",
         PASS if ok else FAIL,
-        "configured (>=32 characters)" if ok else "APP_API_TOKEN must be >=32 characters",
+        (
+            "configured (quality checks passed)"
+            if ok
+            else "APP_API_TOKEN must be >=32 characters and non-placeholder"
+        ),
     )
 
 
@@ -260,8 +281,17 @@ def _run(secrets: Secrets) -> int:
     print("-" * (width + 40))
     print(f"  {len(failed)} FAIL · {len(needs)} NEEDS-ME · "
           f"{sum(r.status == PASS for r in results)} PASS · {sum(r.status == SKIP for r in results)} SKIP")
-    print("  => " + ("READY" if not failed else "NOT READY — fix FAIL items") + "\n")
-    return 1 if failed else 0
+    not_ready = bool(failed or needs)
+    print(
+        "  => "
+        + (
+            "NOT READY — fix FAIL/NEEDS-ME items"
+            if not_ready
+            else "READY"
+        )
+        + "\n"
+    )
+    return 1 if not_ready else 0
 
 
 if __name__ == "__main__":

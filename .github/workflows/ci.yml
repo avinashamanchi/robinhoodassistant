@@ -39,11 +39,26 @@ jobs:
       - name: Migration and offline safety drill
         shell: bash
         run: |
-          ci_safety_dir="$(mktemp -d)"
+          ci_safety_stage="$(mktemp -d)"
+          ci_safety_dir="$(cd "$ci_safety_stage" && pwd -P)"
           trap 'rm -rf "$ci_safety_dir"' EXIT
           export DATABASE_URL="sqlite:///$ci_safety_dir/source.sqlite3"
           export APP_API_TOKEN="ci-safety-only-not-a-production-secret"
           uv run python -m trading_assistant.db.migrate upgrade
+          # The online-WAL path is covered with a held-open writer in pytest.
+          # This closed CI fixture uses DELETE so a read-only open need not
+          # create WAL/SHM sidecars beside the source.
+          export CI_SAFETY_DB="$ci_safety_dir/source.sqlite3"
+          uv run python - <<'PY'
+          import os
+          import sqlite3
+
+          with sqlite3.connect(os.environ["CI_SAFETY_DB"]) as connection:
+              connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+              assert connection.execute(
+                  "PRAGMA journal_mode=DELETE"
+              ).fetchone() == ("delete",)
+          PY
           uv run python -m trading_assistant.ops.safety_drill \
             --database-copy "$ci_safety_dir/drill.sqlite3" --mock
 

@@ -61,44 +61,81 @@ while a process has it open.
 The deterministic gate is offline. It uses SQLite's online backup API to create
 the explicit destination, upgrades and exercises only that copy, and refuses
 relative, existing, alias, symlink, hardlink, primary, non-SQLite, or in-memory
-destinations.
+destinations. It opens the primary through a quoted `file:` URI with `mode=ro`.
+Destination parents and staging are private, symlink-resistant, and published
+without overwrite.
+
+An active WAL source is supported when its regular `-wal` and `-shm` files
+already exist. The drill requires those sidecars rather than creating recovery
+or coordination state beside the primary; a closed WAL-mode source without
+them and a hot rollback journal fail closed. With an otherwise quiescent
+source, main-database and WAL inode/content plus schema/state remain unchanged.
+SQLite may update ephemeral SHM read marks while taking read locks, so SHM
+bytes and mtime are not logical-state evidence; its identity and presence must
+remain fixed. This does not claim byte stability against unrelated concurrent
+application writes. A release rehearsal must therefore use either a non-WAL
+source or a held-open WAL source with both regular sidecars; do not run it
+against a closed WAL-mode file whose sidecars have disappeared.
 
 ```bash
 uv run python scripts/check_release_safety.py
-safety_dir="$(mktemp -d)"
+safety_stage="$(mktemp -d)"
+safety_dir="$(cd "$safety_stage" && pwd -P)"
 uv run python -m trading_assistant.ops.safety_drill \
   --database-copy "$safety_dir/release-safety.sqlite3" --mock
 ```
 
 Require every report boolean and `"safe"` to be `true`. The drill proves, on the
-copy, current schema, fail-closed authentication, acceptance-unknown recovery
-without a duplicate broker submission, OCO single-terminal behavior, breaker
-persistence/reset across a fresh container, and clean reconciliation. Mock mode
-is deterministic, offline, and must leave the primary database byte/schema/state
-unchanged.
+copy, current schema and fail-closed authentication. It deliberately terminates
+the first submission path with a drill-only process-death exception after broker
+acceptance, leaves the persisted order `SUBMITTING`, disposes the first engine,
+constructs a new container from the copy, and reconciles by client ID while
+proving one broker submission. Two independent `RuleRepository` instances and
+bounded, non-daemon threads then compete for different OCO sibling terminal
+claims; exactly one must win. Repository writer-lock acquisition and both join
+phases are bounded, and no later gate runs until both workers have terminated.
+Breaker persistence/reset also crosses a fresh container, and final
+reconciliation must be clean. Mock mode is deterministic, offline, and
+broker-write-free outside its injected fake. CI uses a temporary non-WAL source;
+the focused online-copy test uses a held-open WAL source with real WAL/SHM.
 
 Credentialed mode is a separate, explicit paper-account mutation:
 
 ```bash
 uv run pytest tests/test_alpaca_paper_integration.py -v
-alpaca_safety_dir="$(mktemp -d)"
+alpaca_safety_stage="$(mktemp -d)"
+alpaca_safety_dir="$(cd "$alpaca_safety_stage" && pwd -P)"
 uv run python -m trading_assistant.ops.safety_drill \
   --database-copy "$alpaca_safety_dir/alpaca-paper-safety.sqlite3" \
   --alpaca-paper
 ```
 
-Run it only when valid Alpaca paper credentials are already configured. It
-snapshots pre-existing open-order IDs and exact position quantities, submits one
-uniquely tagged one-share non-marketable GTC limit through the normal persisted
-proposal, human approval, risk recheck, outbox, and submission service, then
-immediately cancels it. Ordinary equity orders retain their DAY default; the
-drill's whole quantity and GTC value avoid Alpaca's fractional-GTC restriction;
-the GTC value is explicit persisted order data, never inferred from its tag.
-If it fills, the drill compensates only the exact drill-created delta. It may
-clean up only its tagged state and passes only when all tagged orders are
-terminal, its net position delta is zero, and the pre-existing manifests are
-unchanged. Missing credentials are a skip, never a pass. If the result is
-unconfirmed, inspect Alpaca paper and keep trading blocked.
+Run it only while the equity market is open under the current risk configuration
+and valid Alpaca paper credentials are configured. Before copy or broker access,
+the gate derives an immutable execution target from the SDK client's actual
+`_sandbox` and `_base_url` and requires the exact official paper endpoint. Live,
+uninitialized, sandbox-false, or URL-overridden clients are refused.
+
+The gate snapshots pre-existing open-order IDs and exact position quantities,
+derives a limit strictly below the current ask and inside configured
+price-sanity bounds, and submits one uniquely tagged one-share GTC limit through
+the normal persisted proposal, human approval, risk recheck, outbox, and
+submission service. It immediately cancels the tagged order. Ordinary equity
+orders retain their DAY default; whole quantity plus explicitly persisted GTC
+avoids Alpaca's fractional-GTC restriction and is never inferred from a tag.
+
+If the order fills, compensation is allowed only when exact `BrokerFill` records
+for the tagged broker-order ID aggregate to broker cumulative `filled_qty` and
+the full position-manifest drift equals that signed exposure. Unrelated or
+masked drift blocks compensation. A tagged opposite exact-quantity order then
+uses the same human-gated service and must be boundedly reconciled to terminal
+fill truth. An outer cleanup path resolves stale `SUBMITTING` or
+`acceptance_unknown` local state, validates remote identity before cancellation,
+requires every tagged remote/read/cancel result to match the known drill symbol,
+isolates per-order provider failures so later tagged IDs are still attempted,
+and never touches a pre-existing ID. Any unavailable evidence, nonterminal
+compensation, or final-manifest mismatch remains unsafe. Missing credentials
+are a skip, never a pass.
 
 ## Daily preflight and startup
 
@@ -112,9 +149,11 @@ uv run python -m trading_assistant.daemon.main
 Preflight separately reports paper-only configuration, dangerous switches off,
 current schema, WAL, breaker state, operator-secret quality, Alpaca read
 dependencies, broker/local reconciliation, and the explicitly selected LLM
-provider. It may reconcile local truth using broker reads, but it never submits
-or cancels a broker order, calls an LLM, or sends an external notification.
-`FAIL` blocks startup. `NEEDS-ME` means required credentials are absent.
+provider. It is broker-write-free: it never submits or cancels a broker order,
+calls an LLM, or sends an external notification. It may update local
+reconciliation, audit, and breaker state while using broker reads as intentional
+startup repair. Both `FAIL` and `NEEDS-ME` print `NOT READY` and return nonzero;
+missing Alpaca or selected-LLM credentials can never produce `READY`.
 
 Open `http://127.0.0.1:8000`, log in with `APP_API_TOKEN`, and verify liveness and
 daemon freshness. Every non-liveness API route requires an opaque server-side

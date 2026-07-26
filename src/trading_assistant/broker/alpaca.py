@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Optional, TypeVar
@@ -77,6 +78,22 @@ _STATUS_MAP: dict[str, OrderStatus] = {
 
 
 log = logging.getLogger(__name__)
+_OFFICIAL_PAPER_TRADING_URL = "https://paper-api.alpaca.markets"
+
+
+@dataclass(frozen=True)
+class AlpacaExecutionTarget:
+    """Immutable execution capability derived from the actual SDK client."""
+
+    sandbox: bool
+    base_url: str
+
+    @property
+    def is_official_paper(self) -> bool:
+        return (
+            self.sandbox is True
+            and self.base_url == _OFFICIAL_PAPER_TRADING_URL
+        )
 
 # A long-running process keeps HTTP keep-alive sockets to Alpaca in a pool. When
 # the load balancer closes an idle socket, the NEXT request on it raises before a
@@ -186,6 +203,22 @@ class AlpacaBroker(BrokerClient):
         self._trading = trading_client
         self._data = data_client
         self._crypto_data = crypto_data_client
+        raw_sandbox = getattr(trading_client, "_sandbox", None)
+        raw_base_url = getattr(trading_client, "_base_url", None)
+        raw_base_url = getattr(raw_base_url, "value", raw_base_url)
+        self._execution_target = (
+            AlpacaExecutionTarget(
+                sandbox=raw_sandbox,
+                base_url=raw_base_url,
+            )
+            if type(raw_sandbox) is bool
+            and isinstance(raw_base_url, str)
+            else None
+        )
+
+    @property
+    def execution_target(self) -> AlpacaExecutionTarget | None:
+        return self._execution_target
 
     @classmethod
     def from_credentials(
