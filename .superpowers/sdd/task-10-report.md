@@ -6,13 +6,46 @@ Branch: `codex/safety-foundation`
 
 Original Task 10 base: `c876448df37b7d71aecfa110447e7b8c404e46aa`
 
-Correction-round review base: `7a42dd2142ae891512c677432b24e25a2c7b61e2`
+First correction review base:
+`7a42dd2142ae891512c677432b24e25a2c7b61e2`
+
+Second correction review base:
+`d7bf50ad4878dc4f54219eb2a8d25f5ef71ac362`
 
 ## Final result
 
 The deterministic release gate passes. The release remains Alpaca paper-only,
 human-approved, autoexecute-off, bracket-preference-off, one-attempt, and
 acceptance-unknown-no-retry. No credentialed provider pass is claimed.
+
+## Second review correction
+
+The second independent review found that credentialed evidence still trusted a
+construction-time target, compensation could begin without confirmed terminal
+truth for the original, and source fingerprinting was not descriptor-bound.
+The correction is test-first and fail-closed:
+
+- only the exact initialized `AlpacaBroker` plus exact SDK `TradingClient` can
+  enter credentialed mode;
+- the current SDK sandbox/base URL is dynamically re-derived at initial
+  validation and immediately before every submit/cancel mutation;
+- offline Alpaca-shaped doubles run only in mock mode and can never emit
+  `alpaca_paper:passed`;
+- compensation requires two stable identity-verified terminal observations of
+  the original; failed or unconfirmed cancellation submits no opposite order;
+- the source parent is securely traversed and held with directory descriptors,
+  group/world-writable source parents and source symlinks are refused, and
+  main/sidecar files are held with `O_NOFOLLOW` and `fstat`;
+- the source URI is `mode=ro&nofollow=1`, pathname-to-held-inode identity is
+  checked immediately before connect, immediately after connect, and after
+  backup, and held-file fingerprints must remain stable;
+- obvious periodic operator tokens now fail; successful preflight wording says
+  the check is basic format/placeholder validation, not entropy proof.
+
+The remaining threat boundary is explicit: no user-space sequence can prove
+immunity to a malicious process with the same OS principal repeatedly swapping
+paths between individual system calls. Release evidence requires no untrusted
+concurrent same-user process.
 
 ## Strict TDD correction evidence
 
@@ -95,19 +128,58 @@ missing `ops.safety_drill` module, split-preflight behavior, runtime
 `create_all`, missing static executable, persisted GTC, whole-share GTC, atomic
 no-overwrite publication, and an initial genuine coverage failure at `87.53%`.
 
+### Second correction RED
+
+The second correction reused the independent review reproducer and added
+focused behavior tests before completing production changes.
+
+```text
+uv run pytest -q tests/test_alpaca_broker.py tests/test_safety_drill.py tests/test_launch.py
+```
+
+Result: `13 failed`. Exact broker/SDK type enforcement correctly invalidated the
+old offline fake's credentialed claims, while those tests still incorrectly
+expected `alpaca_paper:passed`.
+
+```text
+uv run pytest -q tests/test_safety_drill.py -k 'source_beneath_symlink or final_source_symlink or writable_source_parent or main_replacement or sidecar_swap or held_main_identity' tests/test_launch.py::test_preflight_app_secret_quality_is_independent_of_provider_credentials
+```
+
+Result: four source-binding failures were observed: symlinked source traversal,
+final source-symlink resolution, writable source parent, and held-main identity
+mismatch were not yet refused. Main-path and WAL-sidecar replacement already
+failed closed through the retained fingerprint check.
+
+```text
+uv run pytest -q tests/test_launch.py::test_preflight_app_secret_quality_is_independent_of_provider_credentials
+```
+
+Result: `1 failed`; `01234567` repeated four times incorrectly passed.
+
+### Second correction GREEN
+
+```text
+uv run pytest -q tests/test_alpaca_broker.py tests/test_safety_drill.py tests/test_launch.py
+```
+
+Result: `212 passed, 1 warning`. The source race fixtures, dynamic target
+mutation checks, zero-write submit/cancel refusals, mock-only offline broker,
+stable-terminal compensation requirement, failed/unconfirmed-cancel cases,
+delayed later fill, and periodic-token check all pass.
+
 ## Full deterministic suite and genuine branch gate
 
 ```text
 uv run pytest
 ```
 
-Result: `1406 passed, 1 skipped, 1 warning in 118.52s`.
+Result: `1421 passed, 1 skipped, 1 warning in 116.72s`.
 
 ```text
 uv run pytest --cov=trading_assistant.risk --cov=trading_assistant.orders --cov=trading_assistant.rules --cov=trading_assistant.app.auth --cov-branch --cov-report=term-missing --cov-fail-under=90
 ```
 
-Result: `1406 passed, 1 skipped, 1 warning in 183.76s`.
+Result: `1421 passed, 1 skipped, 1 warning in 182.55s`.
 
 - Statements: `2834`
 - Missed statements: `209`
@@ -119,11 +191,13 @@ Result: `1406 passed, 1 skipped, 1 warning in 183.76s`.
 
 ## Copy, crash, concurrency, fill, and cleanup evidence
 
-- Credentialed mode validates an immutable target derived from the actual SDK
-  client's `_sandbox` and `_base_url`; only the exact official paper endpoint
-  passes. Live, uninitialized, sandbox-false, and URL-overridden targets fail
-  before copy or broker access.
-- The primary opens via a quoted `file:` URI with `mode=ro`, `uri=True`.
+- Credentialed mode requires the exact broker/SDK client types and dynamically
+  validates the current `_sandbox` and `_base_url` before every mutation; only
+  the exact official paper endpoint passes. Live, uninitialized, subclassed,
+  sandbox-false, and URL-overridden targets fail before broker mutation.
+- The primary and present sidecars are descriptor-held with `O_NOFOLLOW`,
+  `fstat`, safe-parent checks, and repeated pathname identity verification. It
+  opens via a quoted `file:` URI with `mode=ro&nofollow=1`, `uri=True`.
   Source writes through that connection fail. A normal active WAL database is
   supported when regular WAL and SHM sidecars already exist. Main/WAL
   inode/content and logical schema/state remain unchanged when no unrelated
@@ -141,10 +215,12 @@ Result: `1406 passed, 1 skipped, 1 warning in 183.76s`.
 - Two independent repositories compete in non-daemon threads for different OCO
   siblings. Writer acquisition and both joins are bounded; no later gate runs
   while either worker is alive.
-- Compensation requires exact tagged `BrokerFill` aggregation equal to broker
-  cumulative `filled_qty` and exact full-manifest drift. It uses the normal
-  persisted human-gated path, is reconciled to terminal truth, and must be
-  opposite/exact with tagged fills.
+- Compensation requires stable identity-verified terminal truth for the
+  original, exact tagged `BrokerFill` aggregation equal to broker cumulative
+  `filled_qty`, and exact full-manifest drift. Failed/unconfirmed cancellation
+  submits no compensation. Any compensation uses the normal persisted
+  human-gated path, is reconciled to terminal truth, and must be opposite/exact
+  with tagged fills.
 - Cleanup runs from the outer mutation `finally`, validates each tagged order
   against the known drill symbol, isolates provider failures per order, cancels
   stale-local but remotely validated tagged IDs, and never touches pre-existing
@@ -190,8 +266,10 @@ notification; it may perform local reconciliation/audit/breaker startup repair.
 preflight_exit=1
 ```
 
-Low-diversity and known-placeholder `APP_API_TOKEN` values fail. `READY` is
-impossible while Alpaca or the selected LLM credential is missing.
+Low-diversity, known-placeholder, and obvious periodic `APP_API_TOKEN` values
+fail. Passing is explicitly described as a basic format/placeholder check, not
+entropy proof. `READY` is impossible while Alpaca or the selected LLM
+credential is missing.
 
 ## Static, dependency, shell, and secret checks
 

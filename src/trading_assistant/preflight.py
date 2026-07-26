@@ -81,19 +81,27 @@ def _dangerous_switches_off(config, secrets: Secrets) -> Result:
 def _app_secret_quality(secrets: Secrets) -> Result:
     token = secrets.app_api_token.strip()
     lowered = token.lower()
+    periodic = any(
+        len(token) % period == 0
+        and token == token[:period] * (len(token) // period)
+        for period in range(1, min(16, len(token) // 2) + 1)
+    )
     ok = (
         len(token) >= 32
         and token not in _EXAMPLE_TOKENS
         and len(set(token)) >= 8
         and not any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+        and not periodic
     )
     return Result(
         "operator login secret quality",
         PASS if ok else FAIL,
         (
-            "configured (quality checks passed)"
+            "configured (basic format/placeholder checks passed; "
+            "not an entropy proof)"
             if ok
-            else "APP_API_TOKEN must be >=32 characters and non-placeholder"
+            else "APP_API_TOKEN must be >=32 characters, non-placeholder, "
+            "and non-periodic"
         ),
     )
 

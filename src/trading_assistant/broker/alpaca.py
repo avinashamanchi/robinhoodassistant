@@ -203,10 +203,14 @@ class AlpacaBroker(BrokerClient):
         self._trading = trading_client
         self._data = data_client
         self._crypto_data = crypto_data_client
-        raw_sandbox = getattr(trading_client, "_sandbox", None)
-        raw_base_url = getattr(trading_client, "_base_url", None)
+
+    @property
+    def execution_target(self) -> AlpacaExecutionTarget | None:
+        """Derive the capability from the SDK client at inspection time."""
+        raw_sandbox = getattr(self._trading, "_sandbox", None)
+        raw_base_url = getattr(self._trading, "_base_url", None)
         raw_base_url = getattr(raw_base_url, "value", raw_base_url)
-        self._execution_target = (
+        return (
             AlpacaExecutionTarget(
                 sandbox=raw_sandbox,
                 base_url=raw_base_url,
@@ -215,10 +219,6 @@ class AlpacaBroker(BrokerClient):
             and isinstance(raw_base_url, str)
             else None
         )
-
-    @property
-    def execution_target(self) -> AlpacaExecutionTarget | None:
-        return self._execution_target
 
     @classmethod
     def from_credentials(

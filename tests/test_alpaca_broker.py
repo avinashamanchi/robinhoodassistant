@@ -220,6 +220,21 @@ def test_execution_target_is_derived_from_actual_sdk_client_and_immutable():
         paper.execution_target.base_url = "https://api.alpaca.markets"
 
 
+def test_execution_target_reflects_current_sdk_client_state():
+    broker = AlpacaBroker.from_credentials(
+        "not-a-real-key",
+        "not-a-real-secret",
+        paper=True,
+    )
+
+    broker._trading._sandbox = False
+    broker._trading._base_url = "https://api.alpaca.markets"
+
+    assert broker.execution_target.sandbox is False
+    assert broker.execution_target.base_url == "https://api.alpaca.markets"
+    assert broker.execution_target.is_official_paper is False
+
+
 def test_get_quote_maps_snapshot():
     exchange_time = datetime(2026, 7, 23, 15, 4, tzinfo=timezone.utc)
     data = FakeData(

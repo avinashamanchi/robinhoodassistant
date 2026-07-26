@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from alpaca.trading.client import TradingClient
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import select, text
@@ -33,6 +34,8 @@ from trading_assistant.db.models import Fill, Order
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.ops.safety_drill import (
     SafetyDrillError,
+    _CrashAfterAcceptanceOnceBroker,
+    _DrillCrash,
     _cancel_validated_tagged_open,
     _online_copy,
     _validate_credentialed_paper,
@@ -410,6 +413,171 @@ def test_online_copy_fails_closed_on_hot_journal_without_recovery_writes(
     assert not destination.exists()
 
 
+def test_online_copy_refuses_source_beneath_symlink_component(tmp_path):
+    real_parent = tmp_path / "real-source"
+    linked_parent = tmp_path / "linked-source"
+    real_parent.mkdir(mode=0o700)
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    primary = real_parent / "primary.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+
+    with pytest.raises(SafetyDrillError) as caught:
+        _online_copy(linked_parent / primary.name, destination)
+
+    assert caught.value.code == "unsafe_primary_database"
+    assert not destination.exists()
+
+
+def test_safety_drill_refuses_final_source_symlink_without_resolving_it(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    linked_primary = tmp_path / "linked-primary.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+    linked_primary.symlink_to(primary)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{linked_primary}")
+    monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
+
+    with pytest.raises(SafetyDrillError) as caught:
+        run_safety_drill(
+            database_copy=destination,
+            config=_safe_config(app_config),
+            broker=MockBroker(prices={"AAPL": Decimal("100")}),
+        )
+
+    assert caught.value.code == "unsafe_primary_database"
+    assert not destination.exists()
+
+
+def test_online_copy_refuses_group_or_world_writable_source_parent(tmp_path):
+    source_parent = tmp_path / "writable-source"
+    source_parent.mkdir(mode=0o700)
+    primary = source_parent / "primary.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+    source_parent.chmod(0o777)
+    try:
+        with pytest.raises(SafetyDrillError) as caught:
+            _online_copy(primary, destination)
+    finally:
+        source_parent.chmod(0o700)
+
+    assert caught.value.code == "unsafe_primary_database"
+    assert not destination.exists()
+
+
+def test_online_copy_refuses_main_replacement_between_hold_and_connect(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    replacement = tmp_path / "replacement.db"
+    held_original = tmp_path / "held-original.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+    _upgrade_database(replacement)
+    real_connect = sqlite3.connect
+    replaced = False
+
+    def replace_before_source_connect(database, *args, **kwargs):
+        nonlocal replaced
+        raw = str(database)
+        if "mode=ro" in raw and not replaced:
+            primary.rename(held_original)
+            replacement.rename(primary)
+            replaced = True
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safety_drill_module.sqlite3,
+        "connect",
+        replace_before_source_connect,
+    )
+
+    with pytest.raises(SafetyDrillError) as caught:
+        _online_copy(primary, destination)
+
+    assert caught.value.code == "database_copy_failed"
+    assert replaced
+    assert not destination.exists()
+
+
+def test_online_copy_refuses_wal_sidecar_swap_during_source_connect(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+    writer = _open_wal_source(primary)
+    wal = primary.with_name(f"{primary.name}-wal")
+    held_wal = tmp_path / "held-primary.db-wal"
+    replacement_wal = tmp_path / "replacement-wal"
+    replacement_wal.write_bytes(wal.read_bytes())
+    real_connect = sqlite3.connect
+    replaced = False
+
+    def replace_before_source_connect(database, *args, **kwargs):
+        nonlocal replaced
+        raw = str(database)
+        if "mode=ro" in raw and not replaced:
+            wal.rename(held_wal)
+            replacement_wal.rename(wal)
+            replaced = True
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safety_drill_module.sqlite3,
+        "connect",
+        replace_before_source_connect,
+    )
+    try:
+        with pytest.raises(SafetyDrillError) as caught:
+            _online_copy(primary, destination)
+    finally:
+        writer.close()
+
+    assert caught.value.code == "database_copy_failed"
+    assert replaced
+    assert not destination.exists()
+
+
+def test_online_copy_refuses_held_main_identity_mismatch(tmp_path, monkeypatch):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "must-not-exist.db"
+    _upgrade_database(primary)
+    real_stat = os.stat
+    mismatched = False
+
+    def mismatched_main(path, *args, **kwargs):
+        nonlocal mismatched
+        result = real_stat(path, *args, **kwargs)
+        if (
+            path == primary.name
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+            and not mismatched
+        ):
+            values = list(result)
+            values[1] += 1
+            mismatched = True
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(safety_drill_module.os, "stat", mismatched_main)
+
+    with pytest.raises(SafetyDrillError) as caught:
+        _online_copy(primary, destination)
+
+    assert caught.value.code == "database_copy_failed"
+    assert mismatched
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize(
     "unsafe_update",
     [
@@ -483,15 +651,11 @@ def test_refuses_primary_aliases_and_existing_destination_without_changes(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{primary}")
-    symlink = tmp_path / "primary-symlink.db"
-    hardlink = tmp_path / "primary-hardlink.db"
-    symlink.symlink_to(primary)
-    os.link(primary, hardlink)
     existing = tmp_path / "existing.db"
     existing.write_bytes(b"operator evidence")
     before = _primary_manifest(primary)
 
-    for destination in (primary, symlink, hardlink, existing):
+    for destination in (primary, existing):
         prior = destination.read_bytes()
         with pytest.raises(SafetyDrillError) as caught:
             run_safety_drill(
@@ -501,6 +665,26 @@ def test_refuses_primary_aliases_and_existing_destination_without_changes(
             )
         assert caught.value.code == "unsafe_database_copy"
         assert destination.read_bytes() == prior
+
+    symlink = tmp_path / "primary-symlink.db"
+    symlink.symlink_to(primary)
+    with pytest.raises(SafetyDrillError) as caught:
+        run_safety_drill(
+            database_copy=symlink,
+            config=_safe_config(app_config),
+            broker=MockBroker(),
+        )
+    assert caught.value.code == "unsafe_database_copy"
+
+    hardlink = tmp_path / "primary-hardlink.db"
+    os.link(primary, hardlink)
+    with pytest.raises(SafetyDrillError) as caught:
+        run_safety_drill(
+            database_copy=hardlink,
+            config=_safe_config(app_config),
+            broker=MockBroker(),
+        )
+    assert caught.value.code == "unsafe_primary_database"
 
     assert _primary_manifest(primary) == before
 
@@ -804,6 +988,10 @@ class PaperStateBroker(AlpacaBroker):
         identity_base_failure: BaseException | None = None,
         delay_compensation_fill: bool = False,
         hold_compensation_open: bool = False,
+        partial_initial: bool = False,
+        fail_cancel: bool = False,
+        unconfirmed_cancel: bool = False,
+        fill_after_cancel_failure: bool = False,
     ) -> None:
         class OfflineOfficialPaperTarget:
             _sandbox = True
@@ -822,6 +1010,11 @@ class PaperStateBroker(AlpacaBroker):
         self.identity_base_failure = identity_base_failure
         self.delay_compensation_fill = delay_compensation_fill
         self.hold_compensation_open = hold_compensation_open
+        self.partial_initial = partial_initial
+        self.fail_cancel = fail_cancel
+        self.unconfirmed_cancel = unconfirmed_cancel
+        self.fill_after_cancel_failure = fill_after_cancel_failure
+        self.late_fill_applied = False
         self.on_identity_lookup = None
         self.submit_requests: list[OrderRequest] = []
         self.cancel_ids: list[str] = []
@@ -921,31 +1114,55 @@ class PaperStateBroker(AlpacaBroker):
             return existing
         self.submit_requests.append(order)
         broker_id = f"paper-drill-{len(self.submit_requests)}"
-        filled = (
+        fully_filled = (
             len(self.submit_requests) == 1
             and self.fill_initial
         ) or (
             len(self.submit_requests) > 1
             and not self.delay_compensation_fill
         )
-        status = OrderStatus.FILLED if filled else OrderStatus.SUBMITTED
-        filled_qty = order.qty if filled else Decimal("0")
+        partially_filled = (
+            len(self.submit_requests) == 1
+            and self.partial_initial
+        )
+        status = (
+            OrderStatus.FILLED
+            if fully_filled
+            else (
+                OrderStatus.PARTIALLY_FILLED
+                if partially_filled
+                else OrderStatus.SUBMITTED
+            )
+        )
+        filled_qty = (
+            order.qty
+            if fully_filled
+            else (
+                order.qty / Decimal("2")
+                if partially_filled and order.qty is not None
+                else Decimal("0")
+            )
+        )
         result = OrderResult(
             idempotency_key=order.idempotency_key,
             broker_order_id=broker_id,
             status=status,
             filled_qty=filled_qty or Decimal("0"),
-            avg_fill_price=Decimal("100") if filled else None,
+            avg_fill_price=(
+                Decimal("100")
+                if fully_filled or partially_filled
+                else None
+            ),
             ticker=order.ticker,
         )
         self._orders_by_id[broker_id] = result
         self._orders_by_key[order.idempotency_key] = result
-        if filled:
+        if fully_filled or partially_filled:
             assert order.qty is not None
             signed = (
-                order.qty
+                filled_qty
                 if order.side is OrderSide.BUY
-                else -order.qty
+                else -filled_qty
             )
             self._apply_position_delta(order.ticker, signed)
             if not (
@@ -958,7 +1175,7 @@ class PaperStateBroker(AlpacaBroker):
                         broker_order_id=broker_id,
                         ticker=order.ticker,
                         side=order.side.value,
-                        qty=order.qty,
+                        qty=filled_qty,
                         price=Decimal("100"),
                         filled_at=datetime.now(timezone.utc),
                     )
@@ -1068,8 +1285,47 @@ class PaperStateBroker(AlpacaBroker):
 
     def cancel_order(self, order_id: str) -> OrderResult:
         assert order_id not in {"paper-preexisting", "paper-history"}
-        self.cancel_ids.append(order_id)
         prior = self._orders_by_id[order_id]
+        if self.unconfirmed_cancel:
+            return prior
+        if self.fail_cancel:
+            if (
+                self.fill_after_cancel_failure
+                and not self.late_fill_applied
+                and prior.status is OrderStatus.PARTIALLY_FILLED
+            ):
+                request = next(
+                    request
+                    for request in self.submit_requests
+                    if request.idempotency_key == prior.idempotency_key
+                )
+                assert request.qty is not None
+                remaining = request.qty - prior.filled_qty
+                self._apply_position_delta(request.ticker, remaining)
+                self._fills.append(
+                    BrokerFill(
+                        broker_fill_id="paper-late-fill",
+                        broker_order_id=prior.broker_order_id,
+                        ticker=request.ticker,
+                        side=request.side.value,
+                        qty=remaining,
+                        price=Decimal("99"),
+                        filled_at=datetime.now(timezone.utc),
+                    )
+                )
+                filled = OrderResult(
+                    idempotency_key=prior.idempotency_key,
+                    broker_order_id=prior.broker_order_id,
+                    status=OrderStatus.FILLED,
+                    filled_qty=request.qty,
+                    avg_fill_price=Decimal("99.50"),
+                    ticker=request.ticker,
+                )
+                self._orders_by_id[order_id] = filled
+                self._orders_by_key[prior.idempotency_key] = filled
+                self.late_fill_applied = True
+            raise RuntimeError("injected cancellation failure")
+        self.cancel_ids.append(order_id)
         canceled = OrderResult(
             idempotency_key=prior.idempotency_key,
             broker_order_id=prior.broker_order_id,
@@ -1147,6 +1403,11 @@ def _credentialed_environment(monkeypatch, primary: Path) -> None:
     )
 
 
+def _local_drill_environment(monkeypatch, primary: Path) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{primary}")
+    monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
+
+
 @pytest.mark.parametrize(
     ("sandbox", "base_url"),
     [
@@ -1162,26 +1423,29 @@ def test_credentialed_mode_refuses_unverified_execution_target_before_copy_or_ac
     sandbox,
     base_url,
 ):
-    class TargetClient:
-        _sandbox = sandbox
-        _base_url = base_url
-
-    class RefusalBroker(AlpacaBroker):
-        accesses = 0
-
-        def __init__(self):
-            super().__init__(TargetClient(), object())
-
-        def get_open_orders(self):
-            self.accesses += 1
-            pytest.fail("unsafe target reached broker access")
-
     primary = tmp_path / "primary.db"
     destination = tmp_path / "must-not-exist.db"
     _upgrade_database(primary)
     _credentialed_environment(monkeypatch, primary)
     before = _primary_manifest(primary)
-    broker = RefusalBroker()
+    broker = AlpacaBroker(
+        TradingClient(
+            "paper-key-present",
+            "paper-secret-present",
+            paper=True,
+        ),
+        object(),
+    )
+    broker._trading._sandbox = sandbox
+    broker._trading._base_url = base_url
+    accesses = 0
+
+    def forbid_access():
+        nonlocal accesses
+        accesses += 1
+        pytest.fail("unsafe target reached broker access")
+
+    monkeypatch.setattr(broker, "get_open_orders", forbid_access)
 
     with pytest.raises(SafetyDrillError) as caught:
         run_safety_drill(
@@ -1193,7 +1457,7 @@ def test_credentialed_mode_refuses_unverified_execution_target_before_copy_or_ac
         )
 
     assert caught.value.code == "unsafe_configuration"
-    assert broker.accesses == 0
+    assert accesses == 0
     assert not destination.exists()
     assert _primary_manifest(primary) == before
 
@@ -1212,7 +1476,198 @@ def test_credentialed_validation_refuses_uninitialized_alpaca_broker(monkeypatch
     assert caught.value.code == "unsafe_configuration"
 
 
-def test_credentialed_mode_preserves_preexisting_manifest_and_cleans_tagged_order(
+def test_credentialed_validation_rejects_post_construction_live_target_mutation(
+    monkeypatch,
+):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+    broker = AlpacaBroker(
+        TradingClient(
+            "paper-key-present",
+            "paper-secret-present",
+            paper=True,
+        ),
+        object(),
+    )
+    secrets = Secrets()
+    _validate_credentialed_paper(broker, secrets)
+
+    broker._trading._sandbox = False
+    broker._trading._base_url = "https://api.alpaca.markets"
+
+    with pytest.raises(SafetyDrillError) as caught:
+        _validate_credentialed_paper(broker, secrets)
+
+    assert caught.value.code == "unsafe_configuration"
+
+
+def test_credentialed_validation_requires_exact_broker_and_trading_client_types(
+    monkeypatch,
+):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+
+    class AlpacaBrokerSubclass(AlpacaBroker):
+        pass
+
+    class TradingClientSubclass(TradingClient):
+        pass
+
+    candidates = (
+        AlpacaBrokerSubclass(
+            TradingClient(
+                "paper-key-present",
+                "paper-secret-present",
+                paper=True,
+            ),
+            object(),
+        ),
+        AlpacaBroker(
+            TradingClientSubclass(
+                "paper-key-present",
+                "paper-secret-present",
+                paper=True,
+            ),
+            object(),
+        ),
+    )
+
+    for broker in candidates:
+        with pytest.raises(SafetyDrillError) as caught:
+            _validate_credentialed_paper(broker, Secrets())
+        assert caught.value.code == "unsafe_configuration"
+
+
+@pytest.mark.parametrize("operation", ["submit", "cancel"])
+def test_credentialed_wrapper_revalidates_target_immediately_before_mutation(
+    monkeypatch,
+    operation,
+):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+    broker = AlpacaBroker(
+        TradingClient(
+            "paper-key-present",
+            "paper-secret-present",
+            paper=True,
+        ),
+        object(),
+    )
+    secrets = Secrets()
+    _validate_credentialed_paper(broker, secrets)
+    writes: list[str] = []
+
+    def submit_spy(order):
+        writes.append("submit")
+        return OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id="paper-order",
+            status=OrderStatus.SUBMITTED,
+            ticker=order.ticker,
+        )
+
+    def cancel_spy(order_id):
+        writes.append("cancel")
+        return OrderResult(
+            idempotency_key="safety-drill-test-crash",
+            broker_order_id=order_id,
+            status=OrderStatus.CANCELED,
+            ticker="AAPL",
+        )
+
+    monkeypatch.setattr(broker, "submit_order", submit_spy)
+    monkeypatch.setattr(broker, "cancel_order", cancel_spy)
+    wrapped = _CrashAfterAcceptanceOnceBroker(
+        broker,
+        before_broker_mutation=lambda: _validate_credentialed_paper(
+            broker,
+            secrets,
+        ),
+    )
+    broker._trading._sandbox = False
+    broker._trading._base_url = "https://api.alpaca.markets"
+
+    with pytest.raises(SafetyDrillError) as caught:
+        if operation == "submit":
+            wrapped.submit_order(
+                OrderRequest(
+                    ticker="AAPL",
+                    side=OrderSide.BUY,
+                    order_type=OrderType.LIMIT,
+                    qty=Decimal("1"),
+                    limit_price=Decimal("96"),
+                    time_in_force=OrderTimeInForce.GTC,
+                    idempotency_key="safety-drill-test-crash",
+                )
+            )
+        else:
+            wrapped.cancel_order("paper-order")
+
+    assert caught.value.code == "unsafe_configuration"
+    assert writes == []
+
+
+def test_credentialed_wrapper_revalidates_each_submission(monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
+    broker = AlpacaBroker(
+        TradingClient(
+            "paper-key-present",
+            "paper-secret-present",
+            paper=True,
+        ),
+        object(),
+    )
+    secrets = Secrets()
+    writes: list[str] = []
+
+    def submit_spy(order):
+        writes.append(order.idempotency_key)
+        return OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=f"paper-{len(writes)}",
+            status=OrderStatus.SUBMITTED,
+            ticker=order.ticker,
+        )
+
+    monkeypatch.setattr(broker, "submit_order", submit_spy)
+    wrapped = _CrashAfterAcceptanceOnceBroker(
+        broker,
+        before_broker_mutation=lambda: _validate_credentialed_paper(
+            broker,
+            secrets,
+        ),
+    )
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        qty=Decimal("1"),
+        limit_price=Decimal("96"),
+        time_in_force=OrderTimeInForce.GTC,
+        idempotency_key="safety-drill-test-crash",
+    )
+
+    with pytest.raises(_DrillCrash):
+        wrapped.submit_order(request)
+    broker._trading._sandbox = False
+    broker._trading._base_url = "https://api.alpaca.markets"
+
+    with pytest.raises(SafetyDrillError):
+        wrapped.submit_order(
+            OrderRequest(
+                ticker="AAPL",
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                qty=Decimal("1"),
+                idempotency_key="safety-drill-test-compensate",
+            )
+        )
+
+    assert writes == ["safety-drill-test-crash"]
+
+
+def test_mock_mode_preserves_preexisting_manifest_and_cleans_tagged_order(
     tmp_path,
     app_config,
     monkeypatch,
@@ -1220,25 +1675,27 @@ def test_credentialed_mode_preserves_preexisting_manifest_and_cleans_tagged_orde
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker()
 
     report = run_safety_drill(
         database_copy=tmp_path / "alpaca-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
     assert report.safe
-    assert "alpaca_paper:passed" in report.details
+    assert "mode:mock" in report.details
+    assert not any(
+        detail.startswith("alpaca_paper:") for detail in report.details
+    )
     assert len(broker.submit_requests) == 1
     submitted = broker.submit_requests[0]
     assert submitted.order_type is OrderType.LIMIT
-    assert submitted.time_in_force is OrderTimeInForce.GTC
-    assert submitted.qty == Decimal("1")
-    assert submitted.qty == submitted.qty.to_integral_value()
+    assert submitted.time_in_force is OrderTimeInForce.DAY
+    assert submitted.qty == Decimal("0.013021")
     assert submitted.limit_price == Decimal("96.00")
     assert submitted.idempotency_key.startswith("safety-drill-")
     copied_engine = create_db_engine(f"sqlite:///{tmp_path / 'alpaca-copy.db'}")
@@ -1248,9 +1705,7 @@ def test_credentialed_mode_preserves_preexisting_manifest_and_cleans_tagged_orde
                 Order.idempotency_key == submitted.idempotency_key
             )
         )
-        assert json.loads(persisted.submission_payload_json) == {
-            "time_in_force": "gtc"
-        }
+        assert json.loads(persisted.submission_payload_json) == {}
     copied_engine.dispose()
     assert broker.cancel_ids == ["paper-drill-1"]
     assert {
@@ -1261,7 +1716,7 @@ def test_credentialed_mode_preserves_preexisting_manifest_and_cleans_tagged_orde
     ]
 
 
-def test_credentialed_mode_compensates_only_its_adverse_fill(
+def test_mock_mode_compensates_only_its_adverse_fill(
     tmp_path,
     app_config,
     monkeypatch,
@@ -1269,19 +1724,21 @@ def test_credentialed_mode_compensates_only_its_adverse_fill(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(fill_initial=True)
 
     report = run_safety_drill(
         database_copy=tmp_path / "alpaca-fill-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
     assert report.safe
-    assert "alpaca_paper:passed" in report.details
+    assert not any(
+        detail.startswith("alpaca_paper:") for detail in report.details
+    )
     assert len(broker.submit_requests) == 2
     initial, compensation = broker.submit_requests
     assert initial.side is OrderSide.BUY
@@ -1308,13 +1765,11 @@ def test_credentialed_mode_compensates_only_its_adverse_fill(
         for fill in broker.get_fill_activities()
         if fill.broker_order_id == compensation_result.broker_order_id
     ]
-    assert sum((fill.qty for fill in initial_fills), Decimal("0")) == Decimal(
-        "1"
-    )
+    assert sum((fill.qty for fill in initial_fills), Decimal("0")) == initial.qty
     assert sum(
         (fill.qty for fill in compensation_fills),
         Decimal("0"),
-    ) == Decimal("1")
+    ) == initial.qty
     assert {fill.side for fill in initial_fills} == {OrderSide.BUY.value}
     assert {fill.side for fill in compensation_fills} == {
         OrderSide.SELL.value
@@ -1330,7 +1785,7 @@ def test_compensation_is_boundedly_reconciled_to_terminal_broker_truth(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(
         fill_initial=True,
         delay_compensation_fill=True,
@@ -1340,7 +1795,7 @@ def test_compensation_is_boundedly_reconciled_to_terminal_broker_truth(
         database_copy=tmp_path / "delayed-compensation-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1364,7 +1819,7 @@ def test_nonterminal_compensation_is_canceled_but_never_claimed_safe(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(
         fill_initial=True,
         delay_compensation_fill=True,
@@ -1375,7 +1830,7 @@ def test_nonterminal_compensation_is_canceled_but_never_claimed_safe(
         database_copy=tmp_path / "nonterminal-compensation-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1393,10 +1848,56 @@ def test_nonterminal_compensation_is_canceled_but_never_claimed_safe(
 
 
 @pytest.mark.parametrize(
+    "broker_options",
+    [
+        {"fail_cancel": True},
+        {"unconfirmed_cancel": True},
+        {"fail_cancel": True, "fill_after_cancel_failure": True},
+    ],
+)
+def test_unconfirmed_partially_filled_original_is_never_compensated(
+    tmp_path,
+    app_config,
+    monkeypatch,
+    broker_options,
+):
+    primary = tmp_path / "primary.db"
+    _upgrade_database(primary)
+    _seed_preexisting_paper_order(primary)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{primary}")
+    monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
+    broker = PaperStateBroker(
+        partial_initial=True,
+        **broker_options,
+    )
+
+    report = run_safety_drill(
+        database_copy=tmp_path / "unconfirmed-partial-copy.db",
+        config=_safe_config(app_config),
+        broker=broker,
+        credentialed_paper=False,
+        clock=FakeClock(is_open=True),
+    )
+
+    assert report.safe is False
+    assert report.crash_recovered_without_duplicate is False
+    assert len(broker.submit_requests) == 1
+    assert not any(
+        request.idempotency_key.endswith("-compensate")
+        for request in broker.submit_requests
+    )
+    if broker_options.get("fill_after_cancel_failure"):
+        assert broker.late_fill_applied
+        assert broker.get_order_by_client_id(
+            broker.submit_requests[0].idempotency_key
+        ).status is OrderStatus.FILLED
+
+
+@pytest.mark.parametrize(
     "concurrent_delta",
     [Decimal("1"), Decimal("-1")],
 )
-def test_credentialed_mode_refuses_unrelated_or_masked_position_drift_before_compensation(
+def test_mock_mode_refuses_unrelated_or_masked_position_drift_before_compensation(
     tmp_path,
     app_config,
     monkeypatch,
@@ -1405,7 +1906,7 @@ def test_credentialed_mode_refuses_unrelated_or_masked_position_drift_before_com
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(
         fill_initial=True,
         concurrent_position_delta=concurrent_delta,
@@ -1415,7 +1916,7 @@ def test_credentialed_mode_refuses_unrelated_or_masked_position_drift_before_com
         database_copy=tmp_path / "concurrent-drift-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1429,7 +1930,7 @@ def test_credentialed_mode_refuses_unrelated_or_masked_position_drift_before_com
     assert broker.cancel_ids == []
 
 
-def test_credentialed_mode_requires_exact_initial_fill_activity_before_compensation(
+def test_mock_mode_requires_exact_initial_fill_activity_before_compensation(
     tmp_path,
     app_config,
     monkeypatch,
@@ -1437,7 +1938,7 @@ def test_credentialed_mode_requires_exact_initial_fill_activity_before_compensat
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(
         fill_initial=True,
         omit_initial_fill_record=True,
@@ -1447,7 +1948,7 @@ def test_credentialed_mode_requires_exact_initial_fill_activity_before_compensat
         database_copy=tmp_path / "missing-fill-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1464,7 +1965,7 @@ def test_compensation_reconciliation_failure_restores_position_but_never_passes(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(
         fill_initial=True,
         fail_fill_read_after_submissions=2,
@@ -1474,7 +1975,7 @@ def test_compensation_reconciliation_failure_restores_position_but_never_passes(
         database_copy=tmp_path / "compensation-reconcile-failure.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1500,14 +2001,14 @@ def test_cleanup_cancels_validated_tagged_remote_while_local_acceptance_is_stale
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(identity_failures=2)
 
     report = run_safety_drill(
         database_copy=tmp_path / "stale-local-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1622,7 +2123,7 @@ def test_outer_cleanup_runs_for_base_exception_after_broker_mutation(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(identity_base_failure=InjectedAbort())
 
     with pytest.raises(InjectedAbort):
@@ -1630,7 +2131,7 @@ def test_outer_cleanup_runs_for_base_exception_after_broker_mutation(
             database_copy=tmp_path / "base-exception-copy.db",
             config=_safe_config(app_config),
             broker=broker,
-            credentialed_paper=True,
+            credentialed_paper=False,
             clock=FakeClock(is_open=True),
         )
 
@@ -1640,7 +2141,7 @@ def test_outer_cleanup_runs_for_base_exception_after_broker_mutation(
     } == {"paper-preexisting"}
 
 
-def test_credentialed_mode_refuses_quote_without_nonmarketable_sane_limit(
+def test_mock_mode_refuses_quote_without_nonmarketable_sane_limit(
     tmp_path,
     app_config,
     monkeypatch,
@@ -1648,14 +2149,14 @@ def test_credentialed_mode_refuses_quote_without_nonmarketable_sane_limit(
     primary = tmp_path / "primary.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker(quote_ask=Decimal("94"))
 
     report = run_safety_drill(
         database_copy=tmp_path / "divergent-book-copy.db",
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1673,7 +2174,7 @@ def test_crash_gate_disposes_and_reconstructs_before_identity_reconciliation(
     destination = tmp_path / "restart-copy.db"
     _upgrade_database(primary)
     _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
+    _local_drill_environment(monkeypatch, primary)
     broker = PaperStateBroker()
     real_build = safety_drill_module.build_test_container
     containers = []
@@ -1716,7 +2217,7 @@ def test_crash_gate_disposes_and_reconstructs_before_identity_reconciliation(
         database_copy=destination,
         config=_safe_config(app_config),
         broker=broker,
-        credentialed_paper=True,
+        credentialed_paper=False,
         clock=FakeClock(is_open=True),
     )
 
@@ -1858,7 +2359,22 @@ def test_credentialed_mode_refuses_missing_keys_or_nonpaper_endpoint_before_copy
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{primary}")
     monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
     destination = tmp_path / "must-not-exist.db"
-    broker = PaperStateBroker()
+    broker = AlpacaBroker(
+        TradingClient(
+            "paper-key-present",
+            "paper-secret-present",
+            paper=True,
+        ),
+        object(),
+    )
+    accesses = 0
+
+    def forbid_access():
+        nonlocal accesses
+        accesses += 1
+        pytest.fail("failed validation reached broker access")
+
+    monkeypatch.setattr(broker, "get_open_orders", forbid_access)
 
     with pytest.raises(SafetyDrillError) as missing:
         run_safety_drill(
@@ -1870,7 +2386,7 @@ def test_credentialed_mode_refuses_missing_keys_or_nonpaper_endpoint_before_copy
         )
     assert missing.value.code == "credentials_unavailable"
     assert not destination.exists()
-    assert broker.submit_requests == []
+    assert accesses == 0
 
     monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
@@ -1888,4 +2404,4 @@ def test_credentialed_mode_refuses_missing_keys_or_nonpaper_endpoint_before_copy
         )
     assert endpoint.value.code == "unsafe_configuration"
     assert not destination.exists()
-    assert broker.submit_requests == []
+    assert accesses == 0

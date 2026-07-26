@@ -15,9 +15,12 @@ cp .env.example .env
 openssl rand -hex 32
 ```
 
-Put the generated value in `APP_API_TOKEN`. Configure the selected LLM provider
-key and Alpaca paper credentials in `.env`; never commit or paste credentials
-into logs or reports. Keep these committed settings unchanged:
+Put the generated value in `APP_API_TOKEN`. Preflight rejects common
+placeholders, low-diversity values, and obvious repeated patterns, but this is
+only a basic format check—not proof of entropy. Generate the value rather than
+inventing it. Configure the selected LLM provider key and Alpaca paper
+credentials in `.env`; never commit or paste credentials into logs or reports.
+Keep these committed settings unchanged:
 
 ```yaml
 trading:
@@ -61,9 +64,13 @@ while a process has it open.
 The deterministic gate is offline. It uses SQLite's online backup API to create
 the explicit destination, upgrades and exercises only that copy, and refuses
 relative, existing, alias, symlink, hardlink, primary, non-SQLite, or in-memory
-destinations. It opens the primary through a quoted `file:` URI with `mode=ro`.
-Destination parents and staging are private, symlink-resistant, and published
-without overwrite.
+destinations. It holds the primary and every present SQLite sidecar through
+directory-relative `O_NOFOLLOW` descriptors, rejects a group/world-writable
+source directory, and opens the verified pathname through a quoted `file:` URI
+with `mode=ro&nofollow=1`. Pathname-to-inode identity is checked before
+connection, after connection, and after backup; held main/WAL/journal
+fingerprints are checked before and after. Destination parents and staging are
+private, symlink-resistant, and published without overwrite.
 
 An active WAL source is supported when its regular `-wal` and `-shm` files
 already exist. The drill requires those sidecars rather than creating recovery
@@ -76,6 +83,12 @@ remain fixed. This does not claim byte stability against unrelated concurrent
 application writes. A release rehearsal must therefore use either a non-WAL
 source or a held-open WAL source with both regular sidecars; do not run it
 against a closed WAL-mode file whose sidecars have disappeared.
+
+These controls close pathname, symlink, hardlink, and ordinary replacement
+races. They do not claim protection from a malicious process running
+concurrently as the same OS user that can repeatedly swap a pathname between
+individual system calls. Stop untrusted same-user processes before collecting
+release evidence.
 
 ```bash
 uv run python scripts/check_release_safety.py
@@ -112,9 +125,13 @@ uv run python -m trading_assistant.ops.safety_drill \
 
 Run it only while the equity market is open under the current risk configuration
 and valid Alpaca paper credentials are configured. Before copy or broker access,
-the gate derives an immutable execution target from the SDK client's actual
-`_sandbox` and `_base_url` and requires the exact official paper endpoint. Live,
-uninitialized, sandbox-false, or URL-overridden clients are refused.
+the gate requires the exact `AlpacaBroker` and exact initialized SDK
+`TradingClient`, dynamically re-derives the execution target from the client's
+current `_sandbox` and `_base_url`, and requires the exact official paper
+endpoint. It repeats that validation immediately before every submit or cancel,
+including compensation. Live, uninitialized, subclassed, sandbox-false, or
+URL-overridden clients are refused. Offline doubles can exercise mock behavior
+only and can never produce `alpaca_paper:passed`.
 
 The gate snapshots pre-existing open-order IDs and exact position quantities,
 derives a limit strictly below the current ask and inside configured
@@ -127,7 +144,10 @@ avoids Alpaca's fractional-GTC restriction and is never inferred from a tag.
 If the order fills, compensation is allowed only when exact `BrokerFill` records
 for the tagged broker-order ID aggregate to broker cumulative `filled_qty` and
 the full position-manifest drift equals that signed exposure. Unrelated or
-masked drift blocks compensation. A tagged opposite exact-quantity order then
+masked drift blocks compensation. The original must first be identity-verified
+terminal with two stable cumulative-fill observations. If cancellation is
+failed or unconfirmed, compensation is not submitted and the drill remains
+unsafe for operator intervention. A tagged opposite exact-quantity order then
 uses the same human-gated service and must be boundedly reconciled to terminal
 fill truth. An outer cleanup path resolves stale `SUBMITTING` or
 `acceptance_unknown` local state, validates remote identity before cancellation,

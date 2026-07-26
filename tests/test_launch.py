@@ -517,10 +517,17 @@ def test_preflight_app_secret_quality_is_independent_of_provider_credentials():
         ).status
         == "FAIL"
     )
+    assert (
+        preflight._app_secret_quality(
+            Secrets(app_api_token="01234567" * 4)
+        ).status
+        == "FAIL"
+    )
     result = preflight._app_secret_quality(
         Secrets(app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5")
     )
     assert result.status == "PASS"
+    assert "basic format/placeholder checks" in result.detail
 
 
 def test_preflight_needs_me_is_not_ready_and_nonzero(

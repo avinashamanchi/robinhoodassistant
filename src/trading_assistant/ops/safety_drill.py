@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
@@ -90,8 +90,14 @@ class _DrillCrash(BaseException):
 class _CrashAfterAcceptanceOnceBroker(BrokerClient):
     """Crash once after delegation accepts, before local result persistence."""
 
-    def __init__(self, broker: BrokerClient) -> None:
+    def __init__(
+        self,
+        broker: BrokerClient,
+        *,
+        before_broker_mutation: Callable[[], None] | None = None,
+    ) -> None:
         self._broker = broker
+        self._before_broker_mutation = before_broker_mutation
         self.reconciliation_key = broker.reconciliation_key
         self.submit_calls = 0
         self._lose_next_acceptance = True
@@ -110,6 +116,8 @@ class _CrashAfterAcceptanceOnceBroker(BrokerClient):
         return [] if reader is None else reader(after)
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
+        if self._before_broker_mutation is not None:
+            self._before_broker_mutation()
         self.submit_calls += 1
         result = self._broker.submit_order(order)
         if self._lose_next_acceptance:
@@ -127,6 +135,8 @@ class _CrashAfterAcceptanceOnceBroker(BrokerClient):
         return self._broker.get_order_status(order_id)
 
     def cancel_order(self, order_id: str):
+        if self._before_broker_mutation is not None:
+            self._before_broker_mutation()
         return self._broker.cancel_order(order_id)
 
 
@@ -186,6 +196,210 @@ def _bounded_rule_repository(session_factory, *, owner: str) -> RuleRepository:
     return repository
 
 
+@dataclass
+class _HeldDatabaseSource:
+    path: Path
+    parent_fd: int
+    file_fds: dict[str, int | None]
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+        )
+
+    @staticmethod
+    def _valid_regular(metadata: os.stat_result) -> bool:
+        return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+
+    def _name(self, suffix: str) -> str:
+        return f"{self.path.name}{suffix}"
+
+    def paths_match_held_files(self) -> bool:
+        """Check both the held parent and the current absolute pathname."""
+        for suffix, descriptor in self.file_fds.items():
+            name = self._name(suffix)
+            absolute = self.path.with_name(name)
+            if descriptor is None:
+                for path, kwargs in (
+                    (
+                        name,
+                        {
+                            "dir_fd": self.parent_fd,
+                            "follow_symlinks": False,
+                        },
+                    ),
+                    (absolute, {"follow_symlinks": False}),
+                ):
+                    try:
+                        os.stat(path, **kwargs)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        return False
+                    return False
+                continue
+
+            held = os.fstat(descriptor)
+            if not self._valid_regular(held):
+                return False
+            for path, kwargs in (
+                (
+                    name,
+                    {
+                        "dir_fd": self.parent_fd,
+                        "follow_symlinks": False,
+                    },
+                ),
+                (absolute, {"follow_symlinks": False}),
+            ):
+                try:
+                    observed = os.stat(path, **kwargs)
+                except OSError:
+                    return False
+                if (
+                    not self._valid_regular(observed)
+                    or self._identity(observed) != self._identity(held)
+                ):
+                    return False
+        return True
+
+    def fingerprint(self) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+        files: list[tuple[str, tuple[Any, ...]]] = []
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            descriptor = self.file_fds[suffix]
+            if descriptor is None:
+                files.append((suffix, ()))
+                continue
+            before = os.fstat(descriptor)
+            if not self._valid_regular(before):
+                raise SafetyDrillError("database_copy_failed")
+            identity = self._identity(before)
+            if suffix == "-shm":
+                # WAL readers may update ephemeral read marks in SHM. Preserve
+                # its inode and link identity without treating those read marks
+                # as logical database state.
+                files.append((suffix, identity))
+                continue
+            digest = hashlib.sha256()
+            offset = 0
+            while True:
+                chunk = os.pread(descriptor, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                offset += len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                self._identity(after) != identity
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise SafetyDrillError("database_copy_failed")
+            files.append(
+                (
+                    suffix,
+                    identity
+                    + (
+                        after.st_size,
+                        after.st_mtime_ns,
+                        digest.digest(),
+                    ),
+                )
+            )
+        return tuple(files)
+
+@contextmanager
+def _hold_database_source(source: Path):
+    if (
+        not source.is_absolute()
+        or not source.name
+        or any(part in {".", ".."} for part in source.parts)
+    ):
+        raise SafetyDrillError("unsafe_primary_database")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open("/", directory_flags)
+    except OSError:
+        raise SafetyDrillError("unsafe_primary_database") from None
+    descriptors: dict[str, int | None] = {}
+    try:
+        for component in source.parent.parts[1:]:
+            try:
+                next_fd = os.open(
+                    component,
+                    directory_flags | nofollow,
+                    dir_fd=parent_fd,
+                )
+            except OSError:
+                raise SafetyDrillError("unsafe_primary_database") from None
+            os.close(parent_fd)
+            parent_fd = next_fd
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        ):
+            raise SafetyDrillError("unsafe_primary_database")
+
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            name = f"{source.name}{suffix}"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                if suffix == "":
+                    raise SafetyDrillError("unsafe_primary_database") from None
+                descriptors[suffix] = None
+                continue
+            except OSError:
+                code = (
+                    "unsafe_primary_database"
+                    if suffix == ""
+                    else "database_copy_failed"
+                )
+                raise SafetyDrillError(code) from None
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                os.close(descriptor)
+                code = (
+                    "unsafe_primary_database"
+                    if suffix == ""
+                    else "database_copy_failed"
+                )
+                raise SafetyDrillError(code)
+            descriptors[suffix] = descriptor
+
+        held = _HeldDatabaseSource(source, parent_fd, descriptors)
+        if os.pread(descriptors[""], 16, 0) != b"SQLite format 3\x00":
+            raise SafetyDrillError("invalid_primary_database")
+        if not held.paths_match_held_files():
+            raise SafetyDrillError("database_copy_failed")
+        yield held
+    finally:
+        for descriptor in descriptors.values():
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
+
 def _database_source(database_url: str) -> Path:
     try:
         url = make_url(database_url)
@@ -197,20 +411,19 @@ def _database_source(database_url: str) -> Path:
         or url.database == ":memory:"
     ):
         raise SafetyDrillError("unsafe_primary_database")
-    source = Path(url.database).expanduser().resolve()
-    if not source.is_file():
-        raise SafetyDrillError("unsafe_primary_database")
-    try:
-        with source.open("rb") as handle:
-            header = handle.read(16)
-    except OSError:
-        raise SafetyDrillError("unsafe_primary_database") from None
-    if header != b"SQLite format 3\x00":
-        raise SafetyDrillError("invalid_primary_database")
-    return source
+    return Path(os.path.abspath(Path(url.database).expanduser()))
 
 
 def _online_copy(source: Path, destination: Path) -> Path:
+    with _hold_database_source(source) as held_source:
+        return _online_copy_from_held(held_source, destination)
+
+
+def _online_copy_from_held(
+    held_source: _HeldDatabaseSource,
+    destination: Path,
+) -> Path:
+    source = held_source.path
     if (
         not destination.is_absolute()
         or not destination.name
@@ -220,56 +433,9 @@ def _online_copy(source: Path, destination: Path) -> Path:
     if destination == source:
         raise SafetyDrillError("unsafe_database_copy")
 
-    def source_fingerprint() -> tuple[tuple[str, tuple[Any, ...]], ...]:
-        files: list[tuple[str, tuple[Any, ...]]] = []
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            candidate = source.with_name(f"{source.name}{suffix}")
-            try:
-                metadata = os.lstat(candidate)
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise SafetyDrillError("database_copy_failed")
-                identity = (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                    metadata.st_mode,
-                    metadata.st_nlink,
-                )
-                if suffix == "-shm":
-                    # WAL readers may update ephemeral read marks in SHM.
-                    # Its regular-file identity and presence must remain fixed,
-                    # but SHM bytes/mtime are not logical database state.
-                    files.append((suffix, identity))
-                else:
-                    digest = hashlib.sha256()
-                    with candidate.open("rb") as handle:
-                        for chunk in iter(
-                            lambda: handle.read(1024 * 1024),
-                            b"",
-                        ):
-                            digest.update(chunk)
-                    files.append(
-                        (
-                            suffix,
-                            identity
-                            + (
-                                metadata.st_size,
-                                metadata.st_mtime_ns,
-                                digest.digest(),
-                            ),
-                        )
-                    )
-            except FileNotFoundError:
-                files.append((suffix, ()))
-        return tuple(files)
-
-    source_before = source_fingerprint()
+    source_before = held_source.fingerprint()
     source_files = dict(source_before)
-    try:
-        with source.open("rb") as source_handle:
-            source_handle.seek(18)
-            journal_versions = source_handle.read(2)
-    except OSError:
-        raise SafetyDrillError("database_copy_failed") from None
+    journal_versions = os.pread(held_source.file_fds[""], 2, 18)
     wal_format = journal_versions == b"\x02\x02"
     if (
         source_files["-wal"]
@@ -359,7 +525,9 @@ def _online_copy(source: Path, destination: Path) -> Path:
             raise SafetyDrillError("unsafe_database_copy")
 
         temporary = destination.with_name(temporary_name)
-        source_uri = f"file:{quote(str(source), safe='/')}?mode=ro"
+        source_uri = (
+            f"file:{quote(str(source), safe='/')}?mode=ro&nofollow=1"
+        )
         temporary_uri = (
             f"file:{quote(str(temporary), safe='/')}?mode=rw&nofollow=1"
         )
@@ -376,6 +544,8 @@ def _online_copy(source: Path, destination: Path) -> Path:
                 or before_connect.st_nlink != 1
             ):
                 raise SafetyDrillError("unsafe_database_copy")
+            if not held_source.paths_match_held_files():
+                raise SafetyDrillError("database_copy_failed")
             with (
                 sqlite3.connect(
                     source_uri,
@@ -383,6 +553,8 @@ def _online_copy(source: Path, destination: Path) -> Path:
                 ) as source_connection,
                 sqlite3.connect(temporary_uri, uri=True) as target_connection,
             ):
+                if not held_source.paths_match_held_files():
+                    raise SafetyDrillError("database_copy_failed")
                 opened = os.stat(
                     temporary_name,
                     dir_fd=parent_fd,
@@ -396,6 +568,8 @@ def _online_copy(source: Path, destination: Path) -> Path:
                 ):
                     raise SafetyDrillError("unsafe_database_copy")
                 source_connection.backup(target_connection)
+                if not held_source.paths_match_held_files():
+                    raise SafetyDrillError("database_copy_failed")
                 integrity = target_connection.execute(
                     "PRAGMA integrity_check"
                 ).fetchone()
@@ -404,7 +578,7 @@ def _online_copy(source: Path, destination: Path) -> Path:
                 target_connection.execute(
                     "PRAGMA journal_mode=DELETE"
                 ).fetchone()
-            if source_fingerprint() != source_before:
+            if held_source.fingerprint() != source_before:
                 raise SafetyDrillError("database_copy_failed")
         except SafetyDrillError:
             raise
@@ -530,8 +704,12 @@ def _validate_credentialed_paper(
     secrets: Secrets,
 ) -> None:
     from ..broker.alpaca import AlpacaBroker
+    from alpaca.trading.client import TradingClient
 
-    if not isinstance(broker, AlpacaBroker):
+    if (
+        type(broker) is not AlpacaBroker
+        or type(getattr(broker, "_trading", None)) is not TradingClient
+    ):
         raise SafetyDrillError("unsafe_configuration")
     target = getattr(broker, "execution_target", None)
     if target is None or target.is_official_paper is not True:
@@ -705,13 +883,14 @@ def _resolve_tagged_terminal(
     tag: str,
     attempts: int = 5,
 ) -> OrderResult | None:
-    """Bound broker reads and require identity-preserving terminal truth."""
+    """Bound reads and require two matching identity-preserving terminal views."""
     terminal = {
         OrderStatus.FILLED,
         OrderStatus.CANCELED,
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
     }
+    prior_terminal: OrderResult | None = None
     for attempt in range(attempts):
         by_client = container.broker.get_order_by_client_id(client_order_id)
         if (
@@ -747,7 +926,19 @@ def _resolve_tagged_terminal(
         if sync["failed"] != 0:
             return None
         if observed.status in terminal:
-            return observed
+            if (
+                prior_terminal is not None
+                and observed.broker_order_id
+                == prior_terminal.broker_order_id
+                and observed.status is prior_terminal.status
+                and observed.filled_qty == prior_terminal.filled_qty
+                and observed.avg_fill_price
+                == prior_terminal.avg_fill_price
+            ):
+                return observed
+            prior_terminal = observed
+        else:
+            prior_terminal = None
     return None
 
 
@@ -760,10 +951,17 @@ def _compensate_drill_fill(
 ) -> bool:
     """Flatten only exact, tagged broker fills with an exact manifest delta."""
     initial_client_id = f"{tag}-crash"
-    initial = container.broker.get_order_by_client_id(initial_client_id)
     current_positions = _position_manifest(container.broker)
-    if initial is None:
+    if container.broker.get_order_by_client_id(initial_client_id) is None:
         return current_positions == before_positions
+    initial = _resolve_tagged_terminal(
+        container,
+        client_order_id=initial_client_id,
+        symbol=symbol,
+        tag=tag,
+    )
+    if initial is None:
+        return False
     attributed, signed_exposure = _attributed_signed_fill(
         container.broker,
         initial,
@@ -837,6 +1035,20 @@ def _compensate_drill_fill(
         not compensation_attributed
         or compensation_signed != -signed_exposure
         or compensation.filled_qty != compensation_qty
+    ):
+        return False
+    final_initial = _resolve_tagged_terminal(
+        container,
+        client_order_id=initial_client_id,
+        symbol=symbol,
+        tag=tag,
+    )
+    if (
+        final_initial is None
+        or final_initial.broker_order_id != initial.broker_order_id
+        or final_initial.status is not initial.status
+        or final_initial.filled_qty != initial.filled_qty
+        or final_initial.avg_fill_price != initial.avg_fill_price
     ):
         return False
     final_sync = _reconcile_drill_orders(container, tag, "post-compensation")
@@ -947,12 +1159,13 @@ def _best_effort_cleanup(
         confirmed = False
     compensated = False
     try:
-        compensated = _compensate_drill_fill(
-            container,
-            before_positions=before_positions,
-            tag=tag,
-            symbol=symbol,
-        )
+        if confirmed:
+            compensated = _compensate_drill_fill(
+                container,
+                before_positions=before_positions,
+                tag=tag,
+                symbol=symbol,
+            )
     except Exception:
         compensated = False
     finally:
@@ -1013,7 +1226,17 @@ def run_safety_drill(
             ),
         }
     )
-    crash_broker = _CrashAfterAcceptanceOnceBroker(broker)
+    crash_broker = _CrashAfterAcceptanceOnceBroker(
+        broker,
+        before_broker_mutation=(
+            lambda: _validate_credentialed_paper(
+                broker,
+                primary_secrets,
+            )
+            if credentialed_paper
+            else None
+        ),
+    )
     container = build_test_container(
         config,
         drill_secrets,
