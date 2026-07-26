@@ -18,6 +18,7 @@ from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
     OrderStatus,
+    OrderTimeInForce,
     OrderType,
     order_result_identity_error,
 )
@@ -51,6 +52,21 @@ class SubmissionResult:
 
 def order_to_request(order: Order) -> OrderRequest:
     """Construct the broker request solely from validated persisted columns."""
+    try:
+        payload = json.loads(order.submission_payload_json)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid simple submission payload")
+        raw_time_in_force = payload.get(
+            "time_in_force",
+            OrderTimeInForce.DAY.value,
+        )
+        if set(payload) - {"time_in_force"}:
+            if order.submission_kind == "simple":
+                raise ValueError("invalid simple submission payload")
+            raw_time_in_force = OrderTimeInForce.DAY.value
+        time_in_force = OrderTimeInForce(raw_time_in_force)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("invalid order time in force") from exc
     return OrderRequest(
         ticker=order.ticker,
         side=OrderSide(order.side),
@@ -59,6 +75,7 @@ def order_to_request(order: Order) -> OrderRequest:
         qty=order.qty,
         notional=order.notional,
         limit_price=order.limit_price,
+        time_in_force=time_in_force,
     )
 
 

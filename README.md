@@ -1,11 +1,12 @@
 # Trading Assistant
 
 An LLM-driven agentic trading assistant (Alpaca broker, Model Context Protocol).
-**Human-gated, risk-enforced, paper-first.** The LLM proposes; a human approves;
+**Human-gated, risk-enforced, paper-only.** The LLM proposes; a human approves;
 a deterministic risk engine is the final authority on every order.
 
-> ⚠️ Educational / paper-trading project. Live trading is OFF by default and
-> requires a double-lock (config flag **and** an environment confirmation string).
+> ⚠️ This release rejects live and non-Alpaca production configuration. Passing
+> its safety drills does not prove profitability, authorize live trading, or
+> guarantee returns.
 
 ## Status
 
@@ -77,13 +78,15 @@ crashes, gap-through-stop fills, whipsaw position limits, stale-data halts,
 independent crypto/equity kill switches, stale-approval rejection, and duplicate-
 fill idempotency.
 
-## Quickstart (Phase 1)
+## Quickstart
 
 ```bash
 uv venv --python 3.11
-uv pip install -e '.' pytest pytest-cov pyyaml
-cp .env.example .env      # fill in when you reach Phase 2
-uv run pytest             # run the suite
+uv sync --all-extras --dev
+cp .env.example .env
+openssl rand -hex 32      # use as APP_API_TOKEN
+uv run python -m trading_assistant.db.migrate upgrade
+uv run pytest
 ```
 
 ## Running
@@ -98,6 +101,12 @@ uv run python -m trading_assistant.daemon.main
 # Verify Alpaca's full paper order path with one tiny submit/cancel:
 uv run python -m trading_assistant.ops.paper_drill
 
+# Exercise migration, response-loss recovery, OCO, breakers, and reconciliation
+# offline against an explicit online SQLite copy:
+safety_dir="$(mktemp -d)"
+uv run python -m trading_assistant.ops.safety_drill \
+  --database-copy "$safety_dir/release-safety.sqlite3" --mock
+
 # Install API + daemon + watchdog + nightly online backup on macOS:
 ./scripts/launchd/install.sh
 ```
@@ -108,7 +117,8 @@ duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 positions to local truth and logs drift, and the daily-loss kill switch trips
 per asset class (`enforce_daily_loss_limits`).
 
-Operational details and daily checks are in
+Operational details, verified backup/migration/restore commands, and the optional
+credentialed Alpaca paper gate are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Paper trading is a simulation and does not
 establish that a strategy will be profitable in live markets.
 
@@ -124,13 +134,13 @@ The agent/analyst run on a pluggable backend (`llm/`): set `llm.provider` to
 `anthropic`, `gemini`, or `groq`. Runtime cross-provider fallback is prohibited:
 a provider change requires an explicit configuration edit and process restart, so
 the same financial context is never silently sent to a second vendor.
-Install with `uv pip install -e '.[llm]'` (google-genai + groq). Keys:
+Install with `uv sync --all-extras --dev`. Keys:
 `GEMINI_API_KEY` / `GROQ_API_KEY` / `ANTHROPIC_API_KEY` in `.env`.
 
 Historical bars come from Alpaca, **MarketStack** (equities EOD/splits/dividends —
 `MARKETSTACK_API_KEY`, cached to parquet since the free tier is ~100 req/month), or
 **CoinGecko** (crypto OHLCV, **no key required** — the recommended crypto source).
-`uv pip install -e '.[marketdata]'`.
+The same supported-extra install includes the market-data clients.
 
 The abstract read-only external-account protocol and deterministic mock remain for
 portfolio tests. No unofficial Robinhood login library or production factory path
@@ -139,10 +149,12 @@ is shipped.
 ## Safety model
 
 1. This safety-foundation runtime is paper-only and rejects live mode at startup.
-2. The LLM only ever produces `PROPOSED` orders. Execution needs human approval
-   (or an explicitly pre-approved rule).
+2. The LLM only ever produces `PROPOSED` orders. Execution needs human approval;
+   autonomous pre-approved-rule execution is disabled in the release profile.
 3. The risk engine runs on every order and cannot be bypassed.
 4. Everything dangerous defaults OFF.
+5. Every production runtime role writes redacted, owner-only, bounded rotating
+   logs under `logs/`.
 
 Configuration lives in `config.yaml` (risk limits, non-secret) and `.env`
 (secrets, gitignored — see `.env.example`).

@@ -28,6 +28,7 @@ from .broker.models import (
     OrderRequest,
     OrderSide,
     OrderStatus,
+    OrderTimeInForce,
     OrderType,
     PortfolioSnapshot,
 )
@@ -60,7 +61,7 @@ from .orders.safety_state import (
     read_persisted_safety_truth,
     unknown_persisted_safety_truth,
 )
-from .orders.submission import OrderSubmissionService
+from .orders.submission import OrderSubmissionService, order_to_request
 from .risk.breakers import BreakerScope, BreakerService, trip_in_session
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
@@ -327,6 +328,7 @@ class TradingService:
         limit_price: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         *,
+        time_in_force: str = OrderTimeInForce.DAY.value,
         actor: str,
         reason: str,
         request_id: str,
@@ -369,6 +371,7 @@ class TradingService:
             qty=Decimal(qty) if qty is not None else None,
             notional=Decimal(notional) if notional is not None else None,
             limit_price=Decimal(limit_price) if limit_price is not None else None,
+            time_in_force=OrderTimeInForce(time_in_force.lower()),
         )
 
         ac = self._asset_class(order_req.ticker)
@@ -388,6 +391,18 @@ class TradingService:
                 notional=order_req.notional,
                 limit_price=order_req.limit_price,
                 status=OrderStatus.PROPOSED.value,
+                submission_payload_json=(
+                    json.dumps(
+                        {
+                            "time_in_force": (
+                                order_req.time_in_force.value
+                            )
+                        },
+                        sort_keys=True,
+                    )
+                    if order_req.time_in_force is not OrderTimeInForce.DAY
+                    else "{}"
+                ),
             )
             s.add(order)
             s.flush()
@@ -438,15 +453,7 @@ class TradingService:
 
     # ── execution (human-gated) ────────────────────────────────
     def _order_request_from(self, order: Order) -> OrderRequest:
-        return OrderRequest(
-            ticker=order.ticker,
-            side=OrderSide(order.side),
-            order_type=OrderType(order.order_type),
-            idempotency_key=order.idempotency_key,
-            qty=order.qty,
-            notional=order.notional,
-            limit_price=order.limit_price,
-        )
+        return order_to_request(order)
 
     def approve_order(
         self,

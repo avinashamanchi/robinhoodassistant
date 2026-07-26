@@ -31,6 +31,7 @@ RUNTIME_ROLES = frozenset(
         "mcp",
         "preflight",
         "paper-drill",
+        "safety-drill",
         "watchdog",
         "backup",
     }

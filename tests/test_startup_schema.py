@@ -64,6 +64,15 @@ def test_production_roots_never_call_create_all(source):
     assert "create_all" not in Path(source).read_text(encoding="utf-8")
 
 
+def test_runtime_package_never_calls_create_all():
+    offenders = [
+        str(path)
+        for path in Path("src/trading_assistant").rglob("*.py")
+        if "Base.metadata.create_all(" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
+
+
 def test_api_startup_fails_on_0004_without_mutating_schema_and_upgrade_preserves_latches(
     tmp_path,
     monkeypatch,
@@ -145,10 +154,12 @@ def test_preflight_reports_outdated_schema_without_mutating_it(tmp_path):
     engine, url = _revision_0004(tmp_path, "preflight-0004.db")
     before = set(inspect(engine).get_table_names())
 
-    wal, breakers = _db(SimpleNamespace(database_url=url))
+    schema, wal, breakers = _db(SimpleNamespace(database_url=url))
 
+    assert schema.status == FAIL
     assert wal.status == FAIL
     assert breakers.status == FAIL
+    assert schema.detail == "schema_out_of_date"
     assert wal.detail == "schema_out_of_date"
     assert set(inspect(engine).get_table_names()) == before
     assert "circuit_breaker_state" not in before

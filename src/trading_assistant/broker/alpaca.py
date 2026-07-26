@@ -51,6 +51,7 @@ from .models import (
     OrderResult,
     OrderSide,
     OrderStatus,
+    OrderTimeInForce,
     OrderType,
     Position,
     Quote,
@@ -442,7 +443,10 @@ class AlpacaBroker(BrokerClient):
             side=side,
             time_in_force=(
                 TimeInForce.GTC
-                if AssetClass.for_symbol(order.ticker) is AssetClass.CRYPTO
+                if (
+                    AssetClass.for_symbol(order.ticker) is AssetClass.CRYPTO
+                    or order.time_in_force is OrderTimeInForce.GTC
+                )
                 else TimeInForce.DAY
             ),
             client_order_id=order.idempotency_key,

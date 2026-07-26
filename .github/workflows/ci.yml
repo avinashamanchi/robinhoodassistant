@@ -19,17 +19,33 @@ jobs:
       - name: Set up Python 3.11
         run: uv python install 3.11
 
-      - name: Install (with all extras)
-        run: uv pip install --system -e '.[broker,mcp,app,analysis,external,llm,marketdata]' pytest pytest-cov pyyaml httpx
+      - name: Install supported dependencies
+        run: uv sync --all-extras --dev
 
-      - name: Full test suite + stress
-        run: pytest -p no:cacheprovider --cov=trading_assistant --cov-report=term-missing --cov-report=xml
+      - name: Full deterministic test suite
+        run: uv run pytest
 
-      - name: Coverage gate — risk/ >= 85%
-        run: coverage report --include='*/risk/*' --fail-under=85
+      - name: Combined safety branch coverage >= 90%
+        run: |
+          uv run pytest --cov=trading_assistant.risk \
+            --cov=trading_assistant.orders \
+            --cov=trading_assistant.rules \
+            --cov=trading_assistant.app.auth \
+            --cov-branch --cov-fail-under=90
 
-      - name: Coverage gate — approval path (service) >= 85%
-        run: coverage report --include='*/service.py' --fail-under=85
+      - name: Static release-safety checks
+        run: uv run python scripts/check_release_safety.py
+
+      - name: Migration and offline safety drill
+        shell: bash
+        run: |
+          ci_safety_dir="$(mktemp -d)"
+          trap 'rm -rf "$ci_safety_dir"' EXIT
+          export DATABASE_URL="sqlite:///$ci_safety_dir/source.sqlite3"
+          export APP_API_TOKEN="ci-safety-only-not-a-production-secret"
+          uv run python -m trading_assistant.db.migrate upgrade
+          uv run python -m trading_assistant.ops.safety_drill \
+            --database-copy "$ci_safety_dir/drill.sqlite3" --mock
 
   secret-scan:
     runs-on: ubuntu-latest

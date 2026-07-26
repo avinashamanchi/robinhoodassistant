@@ -473,19 +473,90 @@ def test_http_mutation_provenance_matrix(
     assert receipt.latency_ms >= 0
 
 
-# ── B3 preflight helpers (keyless) ──────────────────────────────
-def test_preflight_config_and_live_checks(app_config):
+# ── B3 preflight helpers (keyless and read-only) ────────────────
+def test_preflight_reports_paper_only_and_dangerous_switches_separately(
+    app_config,
+):
     from trading_assistant import preflight
+    from trading_assistant.config import BrokerKind
 
     assert preflight._config_parses().status == "PASS"
-    assert preflight._live_off(app_config, Secrets()).status == "PASS"
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    assert preflight._paper_only(config).status == "PASS"
+    assert preflight._dangerous_switches_off(config, Secrets()).status == "PASS"
+
+    unsafe = config.model_copy(
+        update={
+            "features": config.features.model_copy(
+                update={"auto_execute_preapproved_rules": True}
+            )
+        }
+    )
+    assert preflight._dangerous_switches_off(unsafe, Secrets()).status == "FAIL"
 
 
-def test_preflight_env_flags_missing_token():
+def test_preflight_app_secret_quality_is_independent_of_provider_credentials():
     from trading_assistant import preflight
 
-    r = preflight._env_present(Secrets(app_api_token="short"))
-    assert r.status == "FAIL" and "APP_API_TOKEN" in r.detail
+    assert preflight._app_secret_quality(Secrets(app_api_token="short")).status == "FAIL"
+    result = preflight._app_secret_quality(Secrets(app_api_token="x" * 32))
+    assert result.status == "PASS"
+
+
+def test_preflight_llm_check_is_configuration_only_and_never_calls_provider(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import preflight
+    from trading_assistant.llm import factory
+
+    monkeypatch.setattr(
+        factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: pytest.fail("preflight made an LLM call"),
+    )
+
+    configured = preflight._llm_provider_configured(
+        app_config,
+        Secrets(gemini_api_key="configured"),
+    )
+    missing = preflight._llm_provider_configured(app_config, Secrets())
+
+    assert configured.status == "PASS"
+    assert configured.detail == "provider=gemini"
+    assert missing.status == "NEEDS-ME"
+
+
+def test_preflight_notification_check_never_sends_message(app_config, monkeypatch):
+    from trading_assistant import preflight
+    from trading_assistant.notifications.telegram import TelegramNotifier
+
+    monkeypatch.setattr(
+        TelegramNotifier,
+        "send",
+        lambda *_args, **_kwargs: pytest.fail("preflight sent a notification"),
+    )
+    enabled = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"telegram_notifications": True}
+            )
+        }
+    )
+
+    result = preflight._notification_configuration(
+        enabled,
+        Secrets(telegram_bot_token="configured", telegram_chat_id="configured"),
+    )
+
+    assert result.status == "PASS"
+    assert result.detail == "enabled; no message sent"
 
 
 def test_preflight_reconciliation_reports_position_drift(make_service):

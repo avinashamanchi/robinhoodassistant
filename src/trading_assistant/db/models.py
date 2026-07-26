@@ -589,7 +589,3 @@ def approve_proposed(
             result_code=OrderStatus.APPROVAL_RECORDED.value,
         )
     )
-
-
-def create_all(engine) -> None:
-    Base.metadata.create_all(engine)

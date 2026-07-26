@@ -22,6 +22,7 @@ from trading_assistant.broker.models import (
     OrderRequest,
     OrderSide,
     OrderStatus,
+    OrderTimeInForce,
     OrderType,
 )
 from trading_assistant.orders.snapshot import PortfolioSnapshotService
@@ -743,6 +744,33 @@ def test_submit_market_order_builds_request_and_maps_result():
     assert trading.last_request.time_in_force is TimeInForce.DAY
     assert result.broker_order_id == "brk-1"
     assert result.status is OrderStatus.SUBMITTED  # "new" -> SUBMITTED
+
+
+def test_submit_equity_limit_defaults_to_day_but_explicit_gtc_is_preserved():
+    day_trading = FakeTrading()
+    gtc_trading = FakeTrading()
+
+    AlpacaBroker(day_trading, FakeData({})).submit_order(
+        _order(
+            key="ordinary-limit",
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("96"),
+        )
+    )
+    AlpacaBroker(gtc_trading, FakeData({})).submit_order(
+        OrderRequest(
+            ticker="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            idempotency_key="explicit-gtc-limit",
+            qty=Decimal("1"),
+            limit_price=Decimal("96"),
+            time_in_force=OrderTimeInForce.GTC,
+        )
+    )
+
+    assert day_trading.last_request.time_in_force is TimeInForce.DAY
+    assert gtc_trading.last_request.time_in_force is TimeInForce.GTC
 
 
 def test_submit_order_preserves_malformed_broker_truth_and_broker_id():

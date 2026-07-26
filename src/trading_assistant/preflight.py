@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from uuid import uuid4
 
-from .config import Secrets, TradingMode, load_config
+from .config import BrokerKind, Secrets, TradingMode, load_config
 from .db.schema import SchemaOutOfDate
 
 PASS, FAIL, SKIP, NEEDS = "PASS", "FAIL", "SKIP", "NEEDS-ME"
@@ -39,21 +39,42 @@ def _config_parses() -> Result:
         return Result("config.yaml parses", FAIL, _safe_exception_code(e))
 
 
-def _env_present(secrets: Secrets) -> Result:
-    missing = []
-    if not secrets.app_api_token or len(secrets.app_api_token) < 32:
-        missing.append("APP_API_TOKEN (>=32 hex; openssl rand -hex 32)")
-    if not (secrets.gemini_api_key or secrets.groq_api_key or secrets.anthropic_api_key):
-        missing.append("an LLM key (GEMINI/GROQ/ANTHROPIC)")
-    if not (secrets.alpaca_api_key and secrets.alpaca_secret_key):
-        missing.append("ALPACA_API_KEY/SECRET")
-    return Result("required .env values present", FAIL if missing else PASS, ", ".join(missing))
+def _paper_only(config) -> Result:
+    ok = (
+        config.trading.mode is TradingMode.PAPER
+        and config.trading.broker is BrokerKind.ALPACA
+    )
+    return Result(
+        "paper-only Alpaca configuration",
+        PASS if ok else FAIL,
+        f"mode={config.trading.mode.value} broker={config.trading.broker.value}",
+    )
 
 
-def _live_off(config, secrets: Secrets) -> Result:
-    ok = config.trading.mode is TradingMode.PAPER and not secrets.live_trading_confirm
-    return Result("live trading OFF (double-lock)", PASS if ok else FAIL,
-                  f"mode={config.trading.mode.value} confirm_set={bool(secrets.live_trading_confirm)}")
+def _dangerous_switches_off(config, secrets: Secrets) -> Result:
+    enabled = []
+    if config.features.auto_execute_preapproved_rules:
+        enabled.append("autoexecute")
+    if config.execution.prefer_bracket_orders:
+        enabled.append("brackets")
+    if config.llm.fallback_provider is not None:
+        enabled.append("llm_fallback")
+    if secrets.live_trading_confirm:
+        enabled.append("live_confirmation")
+    return Result(
+        "dangerous switches OFF",
+        FAIL if enabled else PASS,
+        "all disabled" if not enabled else "enabled=" + ",".join(enabled),
+    )
+
+
+def _app_secret_quality(secrets: Secrets) -> Result:
+    ok = len(secrets.app_api_token) >= 32
+    return Result(
+        "operator login secret quality",
+        PASS if ok else FAIL,
+        "configured (>=32 characters)" if ok else "APP_API_TOKEN must be >=32 characters",
+    )
 
 
 def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
@@ -78,7 +99,7 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
                 Result("data reachable", FAIL, err))
 
 
-def _db(secrets: Secrets) -> tuple[Result, Result]:
+def _db(secrets: Secrets) -> tuple[Result, Result, Result]:
     try:
         from sqlalchemy import text
 
@@ -87,6 +108,7 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
 
         engine = create_db_engine(secrets.database_url)
         require_current_schema(engine)
+        schema = Result("database schema current", PASS)
         with engine.connect() as c:
             mode = c.execute(text("PRAGMA journal_mode")).scalar()
         wal = Result("DB WAL mode", PASS if str(mode).lower() == "wal" else FAIL, f"journal_mode={mode}")
@@ -101,16 +123,21 @@ def _db(secrets: Secrets) -> tuple[Result, Result]:
             ]
         ks = Result("kill switches", PASS if not tripped else FAIL,
                     "all clear" if not tripped else f"TRIPPED: {tripped} (reset before trading)")
-        return wal, ks
+        return schema, wal, ks
     except SchemaOutOfDate:
         err = "schema_out_of_date"
         return (
+            Result("database schema current", FAIL, err),
             Result("DB WAL mode", FAIL, err),
             Result("kill switches", FAIL, err),
         )
     except Exception as e:
         err = _safe_exception_code(e)
-        return Result("DB WAL mode", FAIL, err), Result("kill switches", FAIL, err)
+        return (
+            Result("database schema current", FAIL, err),
+            Result("DB WAL mode", FAIL, err),
+            Result("kill switches", FAIL, err),
+        )
 
 
 def _reconciliation(service) -> Result:
@@ -160,32 +187,37 @@ def _build_service(config, secrets: Secrets):
     ).service
 
 
-def _llm(config, secrets: Secrets) -> Result:
-    if not (secrets.gemini_api_key or secrets.groq_api_key or secrets.anthropic_api_key):
-        return Result("LLM provider ping", NEEDS, "set an LLM key, then re-run")
-    try:
-        from .llm.factory import build_llm_backend
-
-        backend = build_llm_backend(config, secrets)
-        resp = backend.create(system="Reply with the single word OK.",
-                              messages=[{"role": "user", "content": "ping"}], tools=[])
-        text = "".join(getattr(b, "text", "") for b in getattr(resp, "content", []))
+def _llm_provider_configured(config, secrets: Secrets) -> Result:
+    provider_keys = {
+        "anthropic": secrets.anthropic_api_key,
+        "gemini": secrets.gemini_api_key,
+        "groq": secrets.groq_api_key,
+    }
+    provider = config.llm.provider
+    if provider not in provider_keys:
+        return Result("configured LLM provider", FAIL, "unsupported provider")
+    if not provider_keys[provider]:
         return Result(
-            f"LLM ping ({config.llm.provider})",
-            PASS,
-            text.strip()[:20],
+            "configured LLM provider",
+            NEEDS,
+            f"set credentials for provider={provider}",
         )
-    except Exception as e:
-        return Result("LLM provider ping", FAIL, _safe_exception_code(e))
+    return Result("configured LLM provider", PASS, f"provider={provider}")
 
 
-def _telegram(config, secrets: Secrets) -> Result:
+def _notification_configuration(config, secrets: Secrets) -> Result:
     if not config.features.telegram_notifications:
-        return Result("Telegram", SKIP, "disabled")
-    from .notifications.telegram import TelegramNotifier
-
-    ok = TelegramNotifier(True, secrets.telegram_bot_token, secrets.telegram_chat_id).send("preflight test ✅")
-    return Result("Telegram test message", PASS if ok else FAIL)
+        return Result("notification configuration", SKIP, "disabled; no message sent")
+    configured = bool(secrets.telegram_bot_token and secrets.telegram_chat_id)
+    return Result(
+        "notification configuration",
+        PASS if configured else FAIL,
+        (
+            "enabled; no message sent"
+            if configured
+            else "enabled but credentials missing; no message sent"
+        ),
+    )
 
 
 def run() -> int:
@@ -198,7 +230,12 @@ def run() -> int:
 
 def _run(secrets: Secrets) -> int:
     config = load_config("config.yaml")
-    results = [_config_parses(), _env_present(secrets), _live_off(config, secrets)]
+    results = [
+        _config_parses(),
+        _paper_only(config),
+        _dangerous_switches_off(config, secrets),
+        _app_secret_quality(secrets),
+    ]
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))
     if secrets.alpaca_api_key and secrets.alpaca_secret_key:
@@ -211,8 +248,8 @@ def _run(secrets: Secrets) -> int:
                 "set ALPACA keys, then re-run",
             )
         )
-    results.append(_llm(config, secrets))
-    results.append(_telegram(config, secrets))
+    results.append(_llm_provider_configured(config, secrets))
+    results.append(_notification_configuration(config, secrets))
 
     width = max(len(r.name) for r in results)
     print("\nPREFLIGHT\n" + "-" * (width + 40))

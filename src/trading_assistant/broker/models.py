@@ -40,6 +40,11 @@ class OrderType(str, enum.Enum):
     LIMIT = "limit"
 
 
+class OrderTimeInForce(str, enum.Enum):
+    DAY = "day"
+    GTC = "gtc"
+
+
 class OrderStatus(str, enum.Enum):
     """Lifecycle statuses. Transition rules live in db.models.OrderStateMachine (A4)."""
 
@@ -157,8 +162,11 @@ class OrderRequest:
     qty: Optional[Decimal] = None
     notional: Optional[Decimal] = None
     limit_price: Optional[Decimal] = None
+    time_in_force: OrderTimeInForce = OrderTimeInForce.DAY
 
     def __post_init__(self) -> None:
+        if not isinstance(self.time_in_force, OrderTimeInForce):
+            raise ValueError("time_in_force must be an OrderTimeInForce")
         if (self.qty is None) == (self.notional is None):
             raise ValueError("OrderRequest requires exactly one of qty or notional")
         if self.qty is not None and self.qty <= 0:

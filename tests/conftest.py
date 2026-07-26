@@ -11,7 +11,7 @@ import pytest
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
 from trading_assistant.config import AppConfig, BrokerKind, RiskConfig, load_config
-from trading_assistant.db.models import create_all
+from trading_assistant.db.models import Base
 from trading_assistant.db.session import create_db_engine, make_session_factory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -60,7 +60,7 @@ def db_url(tmp_path) -> str:
 @pytest.fixture
 def engine(db_url):
     eng = create_db_engine(db_url)
-    create_all(eng)
+    Base.metadata.create_all(eng)
     return eng
 
 
