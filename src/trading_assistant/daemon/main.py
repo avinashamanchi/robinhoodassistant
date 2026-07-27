@@ -43,8 +43,19 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
 
-        analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
-                       suppress_ranging=config.analyst.suppress_ranging)
+        analyst = Analyst(
+            build_llm_backend(
+                config,
+                secrets,
+                provider_budget=container.provider_budget,
+                category="analysis",
+            ),
+            max_tokens=config.llm.max_tokens,
+            suppress_ranging=config.analyst.suppress_ranging,
+            max_attempts=(
+                config.security.provider_budget.max_structured_attempts
+            ),
+        )
         planning = PlanningService(service, analyst, build_live_feature_provider(config, secrets), secrets)
         universe = config.screener.universe or config.risk.ticker_allowlist
         screen_source = build_screen_source([s.upper() for s in universe], secrets)
@@ -72,6 +83,9 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
         shadow=shadow,
         digest_source=screen_source,
         rule_worker=container.rule_worker,
+        rate_limiter=container.rate_limiter,
+        leases=container.leases,
+        provider_budget=container.provider_budget,
     )
 
 

@@ -227,6 +227,10 @@ class ProviderBudgetService:
         )
         self._clock = clock
 
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
     def reserve(
         self,
         *,

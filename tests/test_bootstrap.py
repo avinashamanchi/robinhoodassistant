@@ -9,6 +9,10 @@ from decimal import Decimal
 import pytest
 
 from trading_assistant.app.auth import SessionAuth
+from trading_assistant.app.limits import (
+    ConcurrencyLeaseService,
+    DurableRateLimiter,
+)
 from trading_assistant.app.main import create_app
 from trading_assistant.broker.alpaca import AlpacaBroker
 from trading_assistant.broker.base import BrokerSubmissionRejected
@@ -23,6 +27,7 @@ from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.models import StartupReconciliationState
 from trading_assistant.db.schema import SchemaOutOfDate
 from trading_assistant.db.session import create_db_engine
+from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
 from trading_assistant.operations import AuditRecorder, OperationsService
 from trading_assistant.orders.startup import StartupReconciliationFailed
 from trading_assistant.risk.clock import FakeClock
@@ -49,11 +54,25 @@ def _alpaca_config(config):
 
 def _injected_container(service, secrets):
     audit = AuditRecorder(service.session_factory)
+    configured = service.config.security.provider_budget
+    provider_budget = ProviderBudgetService(
+        service.session_factory,
+        BudgetLimits(
+            calls=configured.daily_calls,
+            input_tokens=configured.daily_input_tokens,
+            output_tokens=configured.daily_output_tokens,
+            reservation_ttl_seconds=configured.reservation_ttl_seconds,
+        ),
+        prices=configured.prices,
+    )
     return SimpleNamespace(
         config=service.config,
         secrets=secrets,
         service=service,
         session_factory=service.session_factory,
+        rate_limiter=DurableRateLimiter(service.session_factory),
+        leases=ConcurrencyLeaseService(service.session_factory),
+        provider_budget=provider_budget,
         session_auth=SessionAuth(
             service.session_factory,
             application_secret=secrets.app_api_token,
@@ -321,6 +340,9 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
     assert app.state.session_auth is container.session_auth
     assert app.state.audit is container.audit
     assert app.state.operations is container.operations
+    assert app.state.rate_limiter is container.rate_limiter
+    assert app.state.leases is container.leases
+    assert app.state.provider_budget is container.provider_budget
 
 
 def test_automatic_planning_and_screen_use_exact_injected_secrets(
@@ -346,6 +368,7 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
     class StubAnalyst:
         def __init__(self, backend, **kwargs):
             seen.append(("analyst_backend", backend))
+            seen.append(("analyst_max_attempts", kwargs["max_attempts"]))
 
     class StubPlanning:
         def __init__(self, supplied_service, analyst, provider, supplied_secrets):
@@ -360,10 +383,13 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
     monkeypatch.setattr(
         llm_factory,
         "build_llm_backend",
-        lambda config, supplied: seen.append(
-            ("backend_secrets", supplied)
-        )
-        or object(),
+        lambda config, supplied, *, provider_budget, category: seen.extend(
+            [
+                ("backend_secrets", supplied),
+                ("backend_budget", provider_budget),
+                ("backend_category", category),
+            ]
+        ) or object(),
     )
     monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
     monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
@@ -416,6 +442,12 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
         "screen_secrets",
     ):
         assert (label, secrets) in seen
+    assert ("backend_budget", container.provider_budget) in seen
+    assert ("backend_category", "analysis") in seen
+    assert (
+        "analyst_max_attempts",
+        service.config.security.provider_budget.max_structured_attempts,
+    ) in seen
 
 
 def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
@@ -439,10 +471,14 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
     secrets = Secrets(app_api_token="runtime-role-secret")
     observed: list[tuple[object, object, str | None]] = []
     secret_reads = 0
+    policy_container = _injected_container(service, secrets)
     container = SimpleNamespace(
         service=service,
         rule_worker=SimpleNamespace(notifier=None),
         audit=AuditRecorder(service.session_factory),
+        rate_limiter=policy_container.rate_limiter,
+        leases=policy_container.leases,
+        provider_budget=policy_container.provider_budget,
     )
 
     def capture_container(*args, **kwargs):
@@ -501,6 +537,324 @@ def test_application_container_reuses_exact_trading_service_components(
     assert container.rule_worker.service is container.service
     assert container.rule_worker.repository is container.service.rule_repository
     assert container.session_auth.session_factory is container.session_factory
+
+
+def test_application_container_shares_exact_policy_services_and_config(
+    tmp_path,
+    app_config,
+):
+    from trading_assistant.app.limits import (
+        ConcurrencyLeaseService,
+        DurableRateLimiter,
+    )
+    from trading_assistant.bootstrap import build_test_container
+    from trading_assistant.llm.budget import ProviderBudgetService
+
+    container = build_test_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
+    )
+    configured = app_config.security.provider_budget
+
+    assert isinstance(container.rate_limiter, DurableRateLimiter)
+    assert isinstance(container.leases, ConcurrencyLeaseService)
+    assert isinstance(container.provider_budget, ProviderBudgetService)
+    assert container.rate_limiter.session_factory is container.session_factory
+    assert container.leases.session_factory is container.session_factory
+    assert (
+        container.provider_budget.session_factory
+        is container.session_factory
+    )
+    assert container.provider_budget.limits == BudgetLimits(
+        calls=configured.daily_calls,
+        input_tokens=configured.daily_input_tokens,
+        output_tokens=configured.daily_output_tokens,
+        reservation_ttl_seconds=configured.reservation_ttl_seconds,
+    )
+    price_status = container.provider_budget.status(
+        app_config.llm.provider,
+        model=app_config.llm.gemini_model,
+    )
+    assert price_status.price_model == app_config.llm.gemini_model
+    assert container.operations.rate_limiter is container.rate_limiter
+    assert container.operations.leases is container.leases
+    assert container.operations.provider_budget is container.provider_budget
+    assert container.rule_worker.rate_limiter is container.rate_limiter
+    assert container.rule_worker.leases is container.leases
+    assert (
+        container.rule_worker.provider_budget
+        is container.provider_budget
+    )
+
+
+def test_container_constructs_each_policy_service_once_and_app_reuses_it(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    constructions = {
+        "rate_limiter": 0,
+        "leases": 0,
+        "provider_budget": 0,
+    }
+
+    class CountingRateLimiter(DurableRateLimiter):
+        def __init__(self, session_factory):
+            constructions["rate_limiter"] += 1
+            super().__init__(session_factory)
+
+    class CountingLeases(ConcurrencyLeaseService):
+        def __init__(self, session_factory):
+            constructions["leases"] += 1
+            super().__init__(session_factory)
+
+    class CountingProviderBudget(ProviderBudgetService):
+        def __init__(self, *args, **kwargs):
+            constructions["provider_budget"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        bootstrap,
+        "DurableRateLimiter",
+        CountingRateLimiter,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "ConcurrencyLeaseService",
+        CountingLeases,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "ProviderBudgetService",
+        CountingProviderBudget,
+    )
+    container = bootstrap.build_test_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
+    )
+
+    app = create_app(
+        container=container,
+        agent=_StubAgent(),
+        planning=None,
+    )
+
+    assert constructions == {
+        "rate_limiter": 1,
+        "leases": 1,
+        "provider_budget": 1,
+    }
+    assert app.state.rate_limiter is container.rate_limiter
+    assert app.state.leases is container.leases
+    assert app.state.provider_budget is container.provider_budget
+
+
+def test_app_agent_uses_shared_chat_budget_and_configured_turn_ceiling(
+    make_service,
+    monkeypatch,
+):
+    import trading_assistant.app.main as app_main
+    from trading_assistant.llm import factory as llm_factory
+
+    service = make_service()
+    container = _injected_container(
+        service,
+        Secrets(app_api_token="agent-budget-secret"),
+    )
+    backend = object()
+    seen = []
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda config, secrets, *, provider_budget, category: seen.append(
+            (config, secrets, provider_budget, category)
+        ) or backend,
+    )
+
+    agent = app_main._build_agent(container)
+
+    assert agent.backend is backend
+    assert agent.max_turns == (
+        service.config.security.provider_budget.max_chat_tool_turns
+    )
+    assert seen == [
+        (
+            service.config,
+            container.secrets,
+            container.provider_budget,
+            "chat",
+        )
+    ]
+
+
+def test_automatic_planning_requires_shared_container_before_backend_build(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant.llm import factory as llm_factory
+
+    constructed = []
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: constructed.append(True) or object(),
+    )
+    secrets = Secrets(app_api_token="no-container-budget-secret")
+
+    with pytest.raises(RuntimeError, match="shared ApplicationContainer"):
+        create_app(
+            service=make_service(),
+            agent=_StubAgent(),
+            runtime_secrets=secrets,
+            api_token=secrets.app_api_token,
+        )
+
+    assert constructed == []
+
+
+def test_daemon_shadow_uses_shared_analysis_budget_and_attempt_ceiling(
+    app_config,
+    make_service,
+    monkeypatch,
+):
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import live_features
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.llm import factory as llm_factory
+
+    service = make_service()
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            )
+        }
+    )
+    secrets = Secrets(app_api_token="daemon-budget-secret")
+    container = _injected_container(service, secrets)
+    container.rule_worker = SimpleNamespace(notifier=None)
+    seen = []
+
+    class StubAnalyst:
+        def __init__(self, backend, **kwargs):
+            seen.extend(
+                [
+                    ("analyst_backend", backend),
+                    ("analyst_max_attempts", kwargs["max_attempts"]),
+                ]
+            )
+
+    class StubPlanning:
+        def __init__(self, *args):
+            seen.append(("planning_args", args))
+
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda cfg, supplied, *, provider_budget, category: seen.append(
+            (
+                "backend",
+                cfg,
+                supplied,
+                provider_budget,
+                category,
+            )
+        ) or object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+    monkeypatch.setattr(
+        live_features,
+        "build_live_feature_provider",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        live_features,
+        "build_screen_source",
+        lambda *_args: object(),
+    )
+
+    monitor = daemon_main._build_monitor(config, secrets)
+
+    assert (
+        "backend",
+        config,
+        secrets,
+        container.provider_budget,
+        "analysis",
+    ) in seen
+    assert (
+        "analyst_max_attempts",
+        config.security.provider_budget.max_structured_attempts,
+    ) in seen
+    assert monitor.rate_limiter is container.rate_limiter
+    assert monitor.leases is container.leases
+    assert monitor.provider_budget is container.provider_budget
+
+
+def test_validation_analyst_uses_analysis_budget_and_attempt_ceiling(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    import trading_assistant.validate_analyst as validation
+
+    secrets = Secrets(app_api_token="validation-budget-secret")
+    provider_budget = ProviderBudgetService(
+        session_factory,
+        BudgetLimits(
+            calls=100,
+            input_tokens=1_000_000,
+            output_tokens=200_000,
+        ),
+        prices=app_config.security.provider_budget.prices,
+    )
+    backend = object()
+    seen = []
+    monkeypatch.setattr(
+        validation,
+        "build_llm_backend",
+        lambda cfg, supplied, *, provider_budget, category: seen.append(
+            (cfg, supplied, provider_budget, category)
+        ) or backend,
+    )
+
+    analyst = validation._build_analyst(
+        app_config,
+        secrets,
+        provider_budget,
+    )
+
+    assert analyst.backend is backend
+    assert analyst.max_attempts == (
+        app_config.security.provider_budget.max_structured_attempts
+    )
+    assert seen == [
+        (
+            app_config,
+            secrets,
+            provider_budget,
+            "analysis",
+        )
+    ]
 
 
 @pytest.mark.parametrize(

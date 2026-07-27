@@ -39,6 +39,9 @@ class RuleWorker:
         max_quote_age_seconds: float = 60.0,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         quote_reader: Callable[[str], object] | None = None,
+        rate_limiter=None,
+        leases=None,
+        provider_budget=None,
     ) -> None:
         self.service = service
         self.repository = repository
@@ -47,6 +50,9 @@ class RuleWorker:
         self.max_quote_age_seconds = max_quote_age_seconds
         self.now = now
         self.quote_reader = quote_reader or service.broker.get_quote
+        self.rate_limiter = rate_limiter
+        self.leases = leases
+        self.provider_budget = provider_budget
 
     def tick(
         self,

@@ -27,7 +27,15 @@ def _backend(inp):
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t1", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[block])
 
     return B()
@@ -43,7 +51,7 @@ _VALID = {
 
 
 def test_analyst_returns_structured_report():
-    analyst = Analyst(_backend(_VALID))
+    analyst = Analyst(_backend(_VALID), max_attempts=2)
     report = analyst.analyze(_feat(rsi_14=28))
     assert report.action is AnalystAction.BUY
     assert report.symbol == "AAPL"
@@ -53,28 +61,42 @@ def test_analyst_returns_structured_report():
 def test_missing_cited_concepts_rejected():
     bad = dict(_VALID, cited_concepts=[])
     with pytest.raises(ValidationError):
-        Analyst(_backend(bad)).analyze(_feat())
+        Analyst(_backend(bad), max_attempts=2).analyze(_feat())
 
 
 def test_earnings_in_horizon_must_be_addressed():
-    analyst = Analyst(_backend(_VALID))  # _VALID has no earnings_note
+    analyst = Analyst(
+        _backend(_VALID),
+        max_attempts=2,
+    )  # _VALID has no earnings_note
     with pytest.raises(ValueError):
         analyst.analyze(_feat(days_to_next_earnings=5))
 
 
 def test_earnings_addressed_passes():
     inp = dict(_VALID, earnings_note="Earnings in 5d — reducing size to accept gap risk.")
-    report = Analyst(_backend(inp)).analyze(_feat(days_to_next_earnings=5))
+    report = Analyst(
+        _backend(inp),
+        max_attempts=2,
+    ).analyze(_feat(days_to_next_earnings=5))
     assert report.earnings_note is not None
 
 
 def test_no_tool_call_raises():
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[SimpleNamespace(type="text", text="no")])
 
     with pytest.raises(ValueError):
-        Analyst(B()).analyze(_feat())
+        Analyst(B(), max_attempts=2).analyze(_feat())
 
 
 @pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
@@ -82,10 +104,49 @@ def test_analyst_types_backend_outage_without_exposing_provider_text(method):
     marker = "provider-analyst-secret"
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             raise RuntimeError(marker)
 
     with pytest.raises(RequiredDependencyUnavailable) as failure:
-        getattr(Analyst(B()), method)(_feat())
+        getattr(Analyst(B(), max_attempts=2), method)(_feat())
 
     assert marker not in str(failure.value)
+
+
+def test_analyst_uses_one_configured_structured_attempt_and_request_id():
+    class InvalidPlanBackend:
+        def __init__(self):
+            self.request_ids: list[str] = []
+
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
+            self.request_ids.append(request_id)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="invalid")]
+            )
+
+    backend = InvalidPlanBackend()
+    analyst = Analyst(backend, max_attempts=1)
+
+    with pytest.raises(ValueError, match="remained invalid"):
+        analyst.analyze_plan(
+            _feat(),
+            request_id="configured-structured-attempt",
+        )
+
+    assert backend.request_ids == ["configured-structured-attempt"]

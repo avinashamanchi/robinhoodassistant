@@ -35,10 +35,18 @@ def _analyst(action="buy") -> Analyst:
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[block])
 
-    return Analyst(B())
+    return Analyst(B(), max_attempts=2)
 
 
 def test_trigger_mode_limits_calls():

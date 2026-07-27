@@ -111,7 +111,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
 
 class LLMBackend(Protocol):
     def create(
-        self, *, system: str, messages: list[dict], tools: list[dict]
+        self,
+        *,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        request_id: str,
     ) -> Any: ...
 
 
@@ -193,8 +198,15 @@ class Agent:
         session_factory: sessionmaker[Session],
         model: str,
         max_tokens: int,
-        max_turns: int = 8,
+        *,
+        max_turns: int,
     ) -> None:
+        if (
+            not isinstance(max_turns, int)
+            or isinstance(max_turns, bool)
+            or max_turns <= 0
+        ):
+            raise ValueError("max_turns must be a positive integer")
         self.backend = backend
         self.router = ToolRouter(service)
         self.session_factory = session_factory
@@ -222,7 +234,10 @@ class Agent:
         for _ in range(self.max_turns):
             try:
                 resp = self.backend.create(
-                    system=SYSTEM_PROMPT, messages=messages, tools=TOOL_SPECS
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=TOOL_SPECS,
+                    request_id=request_id,
                 )
             except Exception:  # noqa: BLE001 — never 500 the chat endpoint on an LLM error
                 log.error("chat backend failed code=llm_backend_failed")

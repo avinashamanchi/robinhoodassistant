@@ -8,6 +8,7 @@ import pytest
 
 from trading_assistant.llm.base import from_openai, to_gemini_contents, to_openai
 from trading_assistant.llm.anthropic_backend import AnthropicBackend
+from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
 from trading_assistant.llm.gemini_backend import GeminiBackend
 from trading_assistant.llm.gemini_backend import from_gemini, _sanitize_schema
 from trading_assistant.llm.groq_backend import GroqBackend
@@ -257,6 +258,7 @@ def test_anthropic_accepts_request_id_without_sending_it_to_sdk(monkeypatch):
 # ── explicit provider selection ────────────────────────────────
 def test_configured_cross_provider_fallback_is_rejected_without_construction(
     app_config,
+    session_factory,
     monkeypatch,
 ):
     from trading_assistant.config import Secrets
@@ -277,13 +279,26 @@ def test_configured_cross_provider_fallback_is_rejected_without_construction(
     )
 
     with pytest.raises(RuntimeError, match="cross-provider"):
-        factory.build_llm_backend(configured, Secrets())
+        factory.build_llm_backend(
+            configured,
+            Secrets(),
+            provider_budget=ProviderBudgetService(
+                session_factory,
+                BudgetLimits(
+                    calls=10,
+                    input_tokens=100_000,
+                    output_tokens=10_000,
+                ),
+            ),
+            category="chat",
+        )
 
     assert providers == []
 
 
 def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
     app_config,
+    session_factory,
     monkeypatch,
 ):
     from trading_assistant.config import Secrets
@@ -306,10 +321,27 @@ def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
             )
         }
     )
-    backend = factory.build_llm_backend(configured, Secrets())
+    backend = factory.build_llm_backend(
+        configured,
+        Secrets(),
+        provider_budget=ProviderBudgetService(
+            session_factory,
+            BudgetLimits(
+                calls=10,
+                input_tokens=100_000,
+                output_tokens=10_000,
+            ),
+        ),
+        category="chat",
+    )
 
     with pytest.raises(RuntimeError, match="primary unavailable"):
-        backend.create(system="", messages=[], tools=[])
+        backend.create(
+            system="system",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            request_id="primary-failure",
+        )
 
     assert providers == [configured.llm.provider]
 

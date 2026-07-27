@@ -15,9 +15,20 @@ _LOG = logging.getLogger(__name__)
 
 
 class OperationsService:
-    def __init__(self, service, audit: AuditRecorder | None = None) -> None:
+    def __init__(
+        self,
+        service,
+        audit: AuditRecorder | None = None,
+        *,
+        rate_limiter=None,
+        leases=None,
+        provider_budget=None,
+    ) -> None:
         self.service = service
         self.audit = audit or AuditRecorder(service.session_factory)
+        self.rate_limiter = rate_limiter
+        self.leases = leases
+        self.provider_budget = provider_budget
 
     def _record_best_effort(
         self,

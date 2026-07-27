@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .app.auth import SessionAuth
+from .app.limits import ConcurrencyLeaseService, DurableRateLimiter
 from .broker.base import BrokerClient
 from .broker.factory import build_broker, build_clock
 from .config import (
@@ -27,6 +28,7 @@ from .logging import (
     configure_runtime_logging,
     register_all_secrets,
 )
+from .llm.budget import BudgetLimits, ProviderBudgetService
 from .notifications.base import NullNotifier
 from .orders.application import OrderApplicationService
 from .orders.reconciliation import ReconciliationService
@@ -50,6 +52,9 @@ class ApplicationContainer:
     secrets: Secrets
     engine: Engine
     session_factory: sessionmaker[Session]
+    rate_limiter: DurableRateLimiter
+    leases: ConcurrencyLeaseService
+    provider_budget: ProviderBudgetService
     broker: BrokerClient
     service: TradingService
     snapshot_service: PortfolioSnapshotService
@@ -119,6 +124,23 @@ def _arm_production_paper_broker(broker: BrokerClient) -> None:
     broker.validate_armed_paper_target()
 
 
+def build_provider_budget_service(
+    config: AppConfig,
+    session_factory: sessionmaker[Session],
+) -> ProviderBudgetService:
+    configured = config.security.provider_budget
+    return ProviderBudgetService(
+        session_factory,
+        BudgetLimits(
+            calls=configured.daily_calls,
+            input_tokens=configured.daily_input_tokens,
+            output_tokens=configured.daily_output_tokens,
+            reservation_ttl_seconds=configured.reservation_ttl_seconds,
+        ),
+        prices=configured.prices,
+    )
+
+
 def build_container(
     config: AppConfig | None = None,
     secrets: Secrets | None = None,
@@ -163,6 +185,13 @@ def _build_container(
         secrets,
         runtime_role=runtime_role,
     )
+    session_factory = runtime.session_factory
+    rate_limiter = DurableRateLimiter(session_factory)
+    leases = ConcurrencyLeaseService(session_factory)
+    provider_budget = build_provider_budget_service(
+        config,
+        session_factory,
+    )
 
     production_broker = broker is None
     if broker is None:
@@ -172,7 +201,7 @@ def _build_container(
         clock = build_clock(config, secrets)
     service = TradingService(
         broker,
-        runtime.session_factory,
+        session_factory,
         config,
         clock,
         external_source=None,
@@ -201,9 +230,12 @@ def _build_container(
             lambda: broker.get_quote(symbol),
             RetryPolicy(),
         ),
+        rate_limiter=rate_limiter,
+        leases=leases,
+        provider_budget=provider_budget,
     )
     session_auth = SessionAuth(
-        runtime.session_factory,
+        session_factory,
         application_secret=secrets.app_api_token,
         ttl=timedelta(hours=config.security.session_hours),
         reauthentication_window=timedelta(
@@ -211,13 +243,22 @@ def _build_container(
         ),
         cookie_secure=config.security.cookie_secure,
     )
-    audit = AuditRecorder(runtime.session_factory)
-    operations = OperationsService(service, audit)
+    audit = AuditRecorder(session_factory)
+    operations = OperationsService(
+        service,
+        audit,
+        rate_limiter=rate_limiter,
+        leases=leases,
+        provider_budget=provider_budget,
+    )
     return ApplicationContainer(
         config=config,
         secrets=secrets,
         engine=runtime.engine,
-        session_factory=runtime.session_factory,
+        session_factory=session_factory,
+        rate_limiter=rate_limiter,
+        leases=leases,
+        provider_budget=provider_budget,
         broker=broker,
         service=service,
         snapshot_service=service.snapshot_service,

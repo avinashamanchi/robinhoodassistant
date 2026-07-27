@@ -78,8 +78,16 @@ def _plan():
 class _StubAnalyst:
     def __init__(self, plan):
         self.plan = plan
+        self.request_ids: list[str | None] = []
 
-    def analyze_plan(self, features, held_symbols=None, news=None):
+    def analyze_plan(
+        self,
+        features,
+        held_symbols=None,
+        news=None,
+        request_id=None,
+    ):
+        self.request_ids.append(request_id)
         return self.plan
 
 
@@ -118,6 +126,28 @@ def test_analyze_stores_sized_plan(make_service):
     assert out["plan_id"] > 0
     assert out["sized"]["direction"] == "long"
     assert Decimal(out["sized"]["total_shares"]) > 0
+
+
+def test_planning_passes_boundary_request_id_to_each_structured_attempt(
+    make_service,
+):
+    service = make_service()
+    analyst = _StubAnalyst(_plan())
+    planning = PlanningService(
+        service,
+        analyst,
+        _provider,
+        Secrets(),
+    )
+
+    planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="propagate request identity",
+        request_id="planning-budget-request",
+    )
+
+    assert analyst.request_ids == ["planning-budget-request"]
 
 
 def test_live_feature_provider_types_primary_market_data_outage(

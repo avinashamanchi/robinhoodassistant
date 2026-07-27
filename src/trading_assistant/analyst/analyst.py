@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
+from uuid import uuid4
 
 from ..dependencies import RequiredDependencyUnavailable
 from ..signals.models import MarketFeatures
@@ -21,8 +22,6 @@ _PLAYBOOK = (Path(__file__).resolve().parent.parent / "signals" / "playbook.md")
 )
 
 EARNINGS_HORIZON_DAYS = 21
-PLAN_MAX_ATTEMPTS = 2
-
 SYSTEM_PREAMBLE = (
     "You are a disciplined trading analyst. You are given deterministic, "
     "pre-computed market features — you INTERPRET them, you never recompute or "
@@ -140,6 +139,7 @@ class LLMBackend(Protocol):
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str,
     ) -> Any: ...
 
 
@@ -147,7 +147,17 @@ class Analyst:
     def __init__(
         self, backend: LLMBackend, model: str = "", max_tokens: int = 1024,
         suppress_ranging: bool = False,
+        *,
+        max_attempts: int,
     ) -> None:
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts <= 0
+        ):
+            raise ValueError(
+                "max_attempts must be a positive integer"
+            )
         self.backend = backend
         self.model = model
         self.max_tokens = max_tokens
@@ -155,6 +165,15 @@ class Analyst:
         # directional trades in directionless markets. Deterministic, not a number
         # we curve-fit: HOLD/NO_TRADE when the regime is RANGING.
         self.suppress_ranging = suppress_ranging
+        self.max_attempts = max_attempts
+
+    @staticmethod
+    def _request_id(request_id: str | None) -> str:
+        if request_id is None:
+            return uuid4().hex
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("analyst request_id must be non-empty")
+        return request_id.strip()
 
     def _prompt(self, features: MarketFeatures, held_symbols: list[str]) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
@@ -175,13 +194,19 @@ class Analyst:
             raise RequiredDependencyUnavailable from None
 
     def analyze(
-        self, features: MarketFeatures, held_symbols: Optional[list[str]] = None
+        self,
+        features: MarketFeatures,
+        held_symbols: Optional[list[str]] = None,
+        *,
+        request_id: str | None = None,
     ) -> AnalysisReport:
+        budget_request_id = self._request_id(request_id)
         resp = self._create(
             system=SYSTEM_PREAMBLE,
             messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
             tools=[SUBMIT_TOOL],
             tool_choice="any",   # structured output is mandatory for the analyst
+            request_id=budget_request_id,
         )
         report = self._parse(resp, features)
         self._enforce_quality(report, features)
@@ -202,6 +227,7 @@ class Analyst:
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
         news: Optional[list[str]] = None,
+        request_id: str | None = None,
     ):
         """Produce a full TradePlan (scenarios, invalidation, entry ladder, exits)."""
         from decimal import Decimal
@@ -217,7 +243,8 @@ class Analyst:
             user = user + "\n\n" + format_news_context(news)
 
         validation_error: ValueError | None = None
-        for attempt in range(PLAN_MAX_ATTEMPTS):
+        budget_request_id = self._request_id(request_id)
+        for _ in range(self.max_attempts):
             prompt = user
             if validation_error is not None:
                 summary = str(validation_error)[:1200]
@@ -232,6 +259,7 @@ class Analyst:
                 messages=[{"role": "user", "content": prompt}],
                 tools=[SUBMIT_PLAN_TOOL],
                 tool_choice="any",   # the plan tool call is mandatory
+                request_id=budget_request_id,
             )
             try:
                 block = next(
@@ -255,7 +283,8 @@ class Analyst:
                 validation_error = exc
 
         raise ValueError(
-            "analyst plan remained invalid after one repair attempt"
+            "analyst plan remained invalid after "
+            f"{self.max_attempts} structured attempts"
         ) from validation_error
 
     def _apply_regime_filter(self, report, features: MarketFeatures):

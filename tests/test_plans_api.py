@@ -135,7 +135,13 @@ def _plan():
 
 
 class _StubAnalyst:
-    def analyze_plan(self, features, held_symbols=None, news=None):
+    def analyze_plan(
+        self,
+        features,
+        held_symbols=None,
+        news=None,
+        request_id=None,
+    ):
         return _plan()
 
 
@@ -148,19 +154,48 @@ def test_planning_startup_internal_failure_is_not_hidden(
     make_service,
     monkeypatch,
 ):
+    from trading_assistant.llm import factory as llm_factory
+    from trading_assistant.llm.budget import (
+        BudgetLimits,
+        ProviderBudgetService,
+    )
+
     marker = "internal-planning-startup-secret"
 
     def fail_planning_init(self, *args, **kwargs):
         raise RuntimeError(marker)
 
     monkeypatch.setattr(PlanningService, "__init__", fail_planning_init)
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    service = make_service()
+    secrets = Secrets(app_api_token=TOKEN)
+    configured = service.config.security.provider_budget
+    container = SimpleNamespace(
+        config=service.config,
+        secrets=secrets,
+        service=service,
+        provider_budget=ProviderBudgetService(
+            service.session_factory,
+            BudgetLimits(
+                calls=configured.daily_calls,
+                input_tokens=configured.daily_input_tokens,
+                output_tokens=configured.daily_output_tokens,
+                reservation_ttl_seconds=(
+                    configured.reservation_ttl_seconds
+                ),
+            ),
+            prices=configured.prices,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match=marker):
         create_app(
-            service=make_service(),
+            container=container,
             agent=_StubAgent(),
-            api_token=TOKEN,
-            runtime_secrets=Secrets(app_api_token=TOKEN),
         )
 
 

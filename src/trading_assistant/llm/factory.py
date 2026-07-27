@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from ..config import AppConfig, Secrets
+from .base import BudgetedLLMBackend
 from .budget import (
     AnthropicInputEstimator,
     GeminiInputEstimator,
     GroqInputEstimator,
+    ProviderBudgetExceeded,
+    ProviderBudgetService,
     ProviderBudgetUnavailable,
     ProviderInputEstimator,
 )
 
+_ALLOWED_CATEGORIES = frozenset(
+    {"chat", "analysis", "untrusted", "backtest"}
+)
 
 _PROVIDER_INPUT_ESTIMATORS: dict[str, ProviderInputEstimator] = {
     "anthropic": AnthropicInputEstimator(),
@@ -62,10 +68,51 @@ def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
     raise ValueError(f"unknown LLM provider: {provider}")
 
 
-def build_llm_backend(config: AppConfig, secrets: Secrets):
+class _DisabledBacktestBackend:
+    def create(self, **_kwargs):
+        raise ProviderBudgetExceeded("LLM backtests are disabled")
+
+
+def _require_category(category: str) -> str:
+    if (
+        not isinstance(category, str)
+        or category not in _ALLOWED_CATEGORIES
+    ):
+        raise ValueError(
+            "category must be one of: analysis, backtest, chat, untrusted"
+        )
+    return category
+
+
+def build_llm_backend(
+    config: AppConfig,
+    secrets: Secrets,
+    *,
+    provider_budget: ProviderBudgetService,
+    category: str,
+):
+    category = _require_category(category)
     if config.llm.fallback_provider is not None:
         raise RuntimeError(
             "automatic cross-provider LLM fallback is disabled"
         )
-    resolve_input_estimator(config.llm.provider)
-    return _make_backend(config.llm.provider, config, secrets)
+    if not isinstance(provider_budget, ProviderBudgetService):
+        raise TypeError(
+            "provider_budget must be a ProviderBudgetService"
+        )
+    if (
+        category == "backtest"
+        and not config.security.provider_budget.backtest_llm_enabled
+    ):
+        return _DisabledBacktestBackend()
+    provider = config.llm.provider
+    estimator = resolve_input_estimator(provider)
+    delegate = _make_backend(provider, config, secrets)
+    return BudgetedLLMBackend(
+        delegate,
+        provider_budget,
+        provider=provider,
+        category=category,
+        max_output_tokens=config.llm.max_tokens,
+        estimator=estimator,
+    )

@@ -156,6 +156,7 @@ def test_each_supported_provider_estimator_covers_complete_utf8_payload(provider
 
 def test_missing_estimator_denies_before_provider_construction(
     app_config,
+    session_factory,
     monkeypatch,
 ):
     from trading_assistant.llm import factory
@@ -170,7 +171,12 @@ def test_missing_estimator_denies_before_provider_construction(
     )
 
     with pytest.raises(ProviderBudgetUnavailable, match="estimator"):
-        factory.build_llm_backend(app_config, Secrets())
+        factory.build_llm_backend(
+            app_config,
+            Secrets(),
+            provider_budget=_service(session_factory),
+            category="analysis",
+        )
 
     assert constructed == []
 

@@ -35,16 +35,33 @@ class ScriptedBackend:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.request_ids: list[str] = []
 
-    def create(self, *, system, messages, tools, tool_choice=None):
+    def create(
+        self,
+        *,
+        system,
+        messages,
+        tools,
+        tool_choice=None,
+        request_id,
+    ):
         self.calls += 1
+        self.request_ids.append(request_id)
         return self._responses.pop(0)
 
 
-def _agent(make_service, responses):
+def _agent(make_service, responses, *, max_turns=8):
     svc = make_service()
     backend = ScriptedBackend(responses)
-    return Agent(backend, svc, svc.session_factory, model="mock", max_tokens=100), svc
+    return Agent(
+        backend,
+        svc,
+        svc.session_factory,
+        model="mock",
+        max_tokens=100,
+        max_turns=max_turns,
+    ), svc
 
 
 def _chat(agent, message):
@@ -68,6 +85,10 @@ def test_agent_calls_tool_then_replies(make_service):
     assert out["reply"] == "AAPL is trading at 100."
     assert out["tool_calls"][0]["name"] == "get_market_data"
     assert out["tool_calls"][0]["output"]["last"] == "100"
+    assert agent.backend.request_ids == [
+        "agent-test-request",
+        "agent-test-request",
+    ]
 
 
 def test_agent_proposes_order_but_does_not_execute(make_service):
@@ -212,11 +233,26 @@ def test_agent_records_decision(make_service):
 def test_agent_chat_survives_backend_error(make_service, caplog):
     """An LLM/provider error must not 500 the chat endpoint — return a graceful reply."""
     class BoomBackend:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             raise RuntimeError("provider exploded")
 
     svc = make_service()
-    agent = Agent(BoomBackend(), svc, svc.session_factory, model="mock", max_tokens=100)
+    agent = Agent(
+        BoomBackend(),
+        svc,
+        svc.session_factory,
+        model="mock",
+        max_tokens=100,
+        max_turns=8,
+    )
     out = _chat(agent, "hi")
     assert out["tool_calls"] == []
     assert "couldn't complete" in out["reply"].lower()
@@ -232,8 +268,7 @@ def test_agent_stops_at_max_turns(make_service):
         _resp("tool_use", [_tool(f"t{i}", "get_account_summary", {})])
         for i in range(20)
     ]
-    agent, svc = _agent(make_service, responses)
-    agent.max_turns = 3
+    agent, svc = _agent(make_service, responses, max_turns=3)
     out = _chat(agent, "loop forever")
     assert agent.backend.calls == 3
     assert out["reply"] == ""  # never produced final text, but returned cleanly

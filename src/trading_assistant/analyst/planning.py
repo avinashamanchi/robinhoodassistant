@@ -71,7 +71,11 @@ class PlanningService:
             )
         features = self.feature_provider(symbol)
         held = [p["ticker"] for p in self.service.get_external_positions().get("positions", [])]
-        plan = self.analyst.analyze_plan(features, held_symbols=held)
+        plan = self.analyst.analyze_plan(
+            features,
+            held_symbols=held,
+            request_id=request_id,
+        )
 
         ac = AssetClass.for_symbol(symbol)
         with self.service.session_factory() as s:

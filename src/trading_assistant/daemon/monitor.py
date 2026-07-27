@@ -44,6 +44,9 @@ class Monitor:
         shadow=None,
         digest_source=None,
         rule_worker=None,
+        rate_limiter=None,
+        leases=None,
+        provider_budget=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
@@ -59,12 +62,18 @@ class Monitor:
         self._last_daily = None              # date of last daily-tasks run
         self._core_task: Optional[asyncio.Task[Any]] = None
         self._daily_task: Optional[asyncio.Task[Any]] = None
+        self.rate_limiter = rate_limiter
+        self.leases = leases
+        self.provider_budget = provider_budget
         self.rule_worker = rule_worker or RuleWorker(
             service,
             service.rule_repository,
             service.rule_application,
             self.notifier,
             max_quote_age_seconds=max_quote_age_seconds,
+            rate_limiter=rate_limiter,
+            leases=leases,
+            provider_budget=provider_budget,
         )
 
     # ── one evaluation pass (synchronous, testable) ────────────

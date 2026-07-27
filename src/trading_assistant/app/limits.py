@@ -136,6 +136,10 @@ class DurableRateLimiter:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
 
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
     def consume_pair(
         self,
         spec: LimitSpec,
@@ -344,6 +348,10 @@ class DurableRateLimiter:
 class ConcurrencyLeaseService:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
+
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
 
     def acquire(
         self,

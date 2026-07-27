@@ -90,10 +90,10 @@ def test_create_app_complete_explicit_injection_never_reads_ambient_secrets(
     assert app.state.runtime_secrets is None
 
 
-def test_create_app_outside_container_requires_explicit_secrets_for_auto_planning(
+def test_create_app_outside_container_requires_shared_container_for_auto_planning(
     make_service,
 ):
-    with pytest.raises(RuntimeError, match="explicit Secrets"):
+    with pytest.raises(RuntimeError, match="shared ApplicationContainer"):
         create_app(
             service=make_service(),
             agent=_Agent(),
@@ -101,77 +101,30 @@ def test_create_app_outside_container_requires_explicit_secrets_for_auto_plannin
         )
 
 
-def test_create_app_auto_planning_uses_exact_explicit_runtime_secrets(
+def test_explicit_runtime_secrets_cannot_bypass_shared_planning_budget(
     make_service,
     monkeypatch,
 ):
-    from trading_assistant.analyst import analyst as analyst_module
-    from trading_assistant.analyst import live_features
-    from trading_assistant.analyst import planning as planning_module
     from trading_assistant.llm import factory as llm_factory
 
     secrets = Secrets(app_api_token="explicit-planning-token")
-    observed = []
-
-    class StubAnalyst:
-        def __init__(self, backend, **_kwargs):
-            observed.append(("analyst_backend", backend))
-
-    class StubPlanning:
-        def __init__(
-            self,
-            service,
-            analyst,
-            feature_provider,
-            supplied_secrets,
-        ):
-            observed.extend(
-                [
-                    ("service", service),
-                    ("feature_provider", feature_provider),
-                    ("secrets", supplied_secrets),
-                ]
-            )
-
-    backend = object()
-    feature_provider = object()
+    constructed = []
     monkeypatch.setattr(
         llm_factory,
         "build_llm_backend",
-        lambda _config, supplied: (
-            observed.append(("backend_secrets", supplied))
-            or backend
-        ),
-    )
-    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
-    monkeypatch.setattr(
-        live_features,
-        "build_live_feature_provider",
-        lambda _config, supplied: (
-            observed.append(("feature_secrets", supplied))
-            or feature_provider
-        ),
-    )
-    monkeypatch.setattr(
-        planning_module,
-        "PlanningService",
-        StubPlanning,
+        lambda *_args, **_kwargs: constructed.append(True) or object(),
     )
     service = make_service()
 
-    app = create_app(
-        service=service,
-        agent=_Agent(),
-        api_token=secrets.app_api_token,
-        runtime_secrets=secrets,
-    )
+    with pytest.raises(RuntimeError, match="shared ApplicationContainer"):
+        create_app(
+            service=service,
+            agent=_Agent(),
+            api_token=secrets.app_api_token,
+            runtime_secrets=secrets,
+        )
 
-    assert app.state.runtime_secrets is secrets
-    assert ("service", service) in observed
-    assert ("analyst_backend", backend) in observed
-    assert ("feature_provider", feature_provider) in observed
-    for label in ("backend_secrets", "feature_secrets", "secrets"):
-        assert (label, secrets) in observed
+    assert constructed == []
 
 
 def test_automatic_app_root_logs_post_container_startup_failure(

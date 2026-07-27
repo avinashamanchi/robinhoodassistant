@@ -25,6 +25,22 @@ from .llm.factory import build_llm_backend
 COST_CONFIRM_USD = 5.0
 
 
+def _build_analyst(config, secrets, provider_budget) -> Analyst:
+    return Analyst(
+        build_llm_backend(
+            config,
+            secrets,
+            provider_budget=provider_budget,
+            category="analysis",
+        ),
+        max_tokens=config.llm.max_tokens,
+        suppress_ranging=config.analyst.suppress_ranging,
+        max_attempts=(
+            config.security.provider_budget.max_structured_attempts
+        ),
+    )
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--max-calls", type=int, default=300)
@@ -56,8 +72,17 @@ def run(argv=None) -> int:
         print(f"Estimate exceeds ${COST_CONFIRM_USD}. Re-run with --yes to proceed.")
         return 2
 
-    analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
-                       suppress_ranging=config.analyst.suppress_ranging)
+    from . import bootstrap
+
+    runtime = bootstrap.prepare_database_runtime(
+        secrets,
+        runtime_role="validate-analyst",
+    )
+    provider_budget = bootstrap.build_provider_budget_service(
+        config,
+        runtime.session_factory,
+    )
+    analyst = _build_analyst(config, secrets, provider_budget)
     print("Running analyst over the holdout (this makes real LLM calls)...")
     report = analyst_accuracy(source, symbols, analyst, run_cfg, start=start, end=end)
     print(json.dumps(report, indent=2))

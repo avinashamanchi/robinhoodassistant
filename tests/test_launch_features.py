@@ -61,7 +61,13 @@ class _StubAnalyst:
     def __init__(self, plan):
         self.plan = plan
 
-    def analyze_plan(self, features, held_symbols=None, news=None):
+    def analyze_plan(
+        self,
+        features,
+        held_symbols=None,
+        news=None,
+        request_id=None,
+    ):
         return self.plan
 
 
@@ -598,10 +604,18 @@ def _analyst(action="buy", conf=0.8):
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[block])
 
-    return Analyst(B())
+    return Analyst(B(), max_attempts=2)
 
 
 def test_accuracy_report_shape(make_service):

@@ -223,7 +223,12 @@ def _build_agent(container) -> Agent:
     from ..llm.factory import build_llm_backend
 
     config = container.config
-    backend = build_llm_backend(config, container.secrets)
+    backend = build_llm_backend(
+        config,
+        container.secrets,
+        provider_budget=container.provider_budget,
+        category="chat",
+    )
     model_label = getattr(
         config.llm,
         f"{config.llm.provider}_model",
@@ -235,6 +240,9 @@ def _build_agent(container) -> Agent:
         container.session_factory,
         model_label,
         config.llm.max_tokens,
+        max_turns=(
+            config.security.provider_budget.max_chat_tool_turns
+        ),
     )
     return agent
 
@@ -318,9 +326,9 @@ def _create_app(
         raise RuntimeError(
             "service and agent must be injected together"
         )
-    if planning is _AUTO_PLANNING and runtime_secrets is None:
+    if planning is _AUTO_PLANNING and container is None:
         raise RuntimeError(
-            "automatic planning outside a container requires explicit Secrets"
+            "automatic planning requires a shared ApplicationContainer"
         )
     from ..logging import register_secret
 
@@ -352,9 +360,18 @@ def _create_app(
             from ..llm.factory import build_llm_backend
 
             analyst = Analyst(
-                build_llm_backend(service.config, runtime_secrets),
+                build_llm_backend(
+                    service.config,
+                    runtime_secrets,
+                    provider_budget=container.provider_budget,
+                    category="analysis",
+                ),
                 max_tokens=service.config.llm.max_tokens,
                 suppress_ranging=service.config.analyst.suppress_ranging,
+                max_attempts=(
+                    service.config.security.provider_budget
+                    .max_structured_attempts
+                ),
             )
             planning = PlanningService(
                 service,
@@ -390,6 +407,15 @@ def _create_app(
     app.state.planning = planning
     app.state.runtime_secrets = runtime_secrets
     app.state.operator_secret = api_token
+    app.state.rate_limiter = (
+        container.rate_limiter if container is not None else None
+    )
+    app.state.leases = (
+        container.leases if container is not None else None
+    )
+    app.state.provider_budget = (
+        container.provider_budget if container is not None else None
+    )
     app.state.login_rate = login_rate
     app.state.account_cache = account_cache
 
