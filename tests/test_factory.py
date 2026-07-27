@@ -104,6 +104,34 @@ def _provider_budget(app_config, session_factory):
     )
 
 
+def test_llm_factory_exposes_neither_raw_constructor_nor_delegate(
+    app_config,
+    session_factory,
+    patch_selected_llm_backend,
+):
+    from trading_assistant.llm import factory
+
+    raw_backend = object()
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: raw_backend,
+    )
+
+    backend = factory.build_llm_backend(
+        app_config,
+        Secrets(),
+        provider_budget=_provider_budget(
+            app_config,
+            session_factory,
+        ),
+        category="analysis",
+    )
+
+    assert not hasattr(factory, "_make_backend")
+    assert not hasattr(backend, "delegate")
+    assert not hasattr(backend, "_delegate")
+
+
 @pytest.mark.parametrize(
     "category",
     ["chat", "analysis", "untrusted", "backtest"],
@@ -111,7 +139,7 @@ def _provider_budget(app_config, session_factory):
 def test_llm_factory_wraps_selected_provider_exactly_once(
     app_config,
     session_factory,
-    monkeypatch,
+    patch_selected_llm_backend,
     category,
 ):
     from trading_assistant.llm import factory
@@ -130,11 +158,10 @@ def test_llm_factory_wraps_selected_provider_exactly_once(
         )
     raw_backend = object()
     constructed: list[str] = []
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: (
-            constructed.append(provider) or raw_backend
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: (
+            constructed.append(app_config.llm.provider) or raw_backend
         ),
     )
     provider_budget = _provider_budget(app_config, session_factory)
@@ -147,8 +174,8 @@ def test_llm_factory_wraps_selected_provider_exactly_once(
     )
 
     assert isinstance(backend, BudgetedLLMBackend)
-    assert backend.delegate is raw_backend
-    assert not isinstance(backend.delegate, BudgetedLLMBackend)
+    assert not hasattr(backend, "delegate")
+    assert not hasattr(backend, "_delegate")
     assert backend.budgets is provider_budget
     assert backend.category == category
     assert constructed == [app_config.llm.provider]
@@ -159,6 +186,7 @@ def test_llm_factory_rejects_non_allowlisted_category_before_construction(
     app_config,
     session_factory,
     monkeypatch,
+    patch_selected_llm_backend,
     category,
 ):
     from trading_assistant.llm import factory
@@ -170,10 +198,11 @@ def test_llm_factory_rejects_non_allowlisted_category_before_construction(
         "resolve_input_estimator",
         lambda provider: estimator_calls.append(provider) or object(),
     )
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: raw_calls.append(provider) or object(),
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: (
+            raw_calls.append(app_config.llm.provider) or object()
+        ),
     )
 
     with pytest.raises(ValueError, match="category"):
@@ -195,6 +224,7 @@ def test_disabled_backtest_backend_denies_without_delegate_or_estimator(
     app_config,
     session_factory,
     monkeypatch,
+    patch_selected_llm_backend,
 ):
     from trading_assistant.llm import factory
     from trading_assistant.llm.budget import ProviderBudgetExceeded
@@ -206,10 +236,11 @@ def test_disabled_backtest_backend_denies_without_delegate_or_estimator(
         "resolve_input_estimator",
         lambda provider: estimator_calls.append(provider) or object(),
     )
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: raw_calls.append(provider) or object(),
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: (
+            raw_calls.append(app_config.llm.provider) or object()
+        ),
     )
 
     backend = factory.build_llm_backend(

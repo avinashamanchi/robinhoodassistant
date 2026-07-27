@@ -49,39 +49,6 @@ def selected_llm_model(config: AppConfig) -> str:
         raise ValueError(f"unknown LLM provider: {provider}") from None
 
 
-def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
-    llm = config.llm
-    model = selected_llm_model(config)
-    if provider == "anthropic":
-        from .anthropic_backend import AnthropicBackend
-
-        return AnthropicBackend(
-            secrets.anthropic_api_key,
-            model,
-            llm.max_tokens,
-            timeout_seconds=llm.request_timeout_seconds,
-        )
-    if provider == "gemini":
-        from .gemini_backend import GeminiBackend
-
-        return GeminiBackend(
-            secrets.gemini_api_key,
-            model,
-            llm.max_tokens,
-            timeout_seconds=llm.request_timeout_seconds,
-        )
-    if provider == "groq":
-        from .groq_backend import GroqBackend
-
-        return GroqBackend(
-            secrets.groq_api_key,
-            model,
-            llm.max_tokens,
-            timeout_seconds=llm.request_timeout_seconds,
-        )
-    raise ValueError(f"unknown LLM provider: {provider}")
-
-
 class _DisabledBacktestBackend:
     def create(self, **_kwargs):
         raise ProviderBudgetExceeded("LLM backtests are disabled")
@@ -121,7 +88,37 @@ def build_llm_backend(
         return _DisabledBacktestBackend()
     provider = config.llm.provider
     estimator = resolve_input_estimator(provider)
-    delegate = _make_backend(provider, config, secrets)
+    llm = config.llm
+    model = selected_llm_model(config)
+    if provider == "anthropic":
+        from .anthropic_backend import AnthropicBackend
+
+        delegate = AnthropicBackend(
+            secrets.anthropic_api_key,
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
+    elif provider == "gemini":
+        from .gemini_backend import GeminiBackend
+
+        delegate = GeminiBackend(
+            secrets.gemini_api_key,
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
+    elif provider == "groq":
+        from .groq_backend import GroqBackend
+
+        delegate = GroqBackend(
+            secrets.groq_api_key,
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+        )
+    else:
+        raise ValueError(f"unknown LLM provider: {provider}")
     return BudgetedLLMBackend(
         delegate,
         provider_budget,

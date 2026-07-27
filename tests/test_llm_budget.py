@@ -158,16 +158,18 @@ def test_missing_estimator_denies_before_provider_construction(
     app_config,
     session_factory,
     monkeypatch,
+    patch_selected_llm_backend,
 ):
     from trading_assistant.llm import factory
 
     constructed: list[str] = []
     provider = app_config.llm.provider
     monkeypatch.delitem(factory._PROVIDER_INPUT_ESTIMATORS, provider)
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda selected, *_args: constructed.append(selected) or object(),
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: (
+            constructed.append(provider) or object()
+        ),
     )
 
     with pytest.raises(ProviderBudgetUnavailable, match="estimator"):

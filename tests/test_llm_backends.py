@@ -259,23 +259,24 @@ def test_anthropic_accepts_request_id_without_sending_it_to_sdk(monkeypatch):
 def test_configured_cross_provider_fallback_is_rejected_without_construction(
     app_config,
     session_factory,
-    monkeypatch,
+    patch_selected_llm_backend,
 ):
     from trading_assistant.config import Secrets
     from trading_assistant.llm import factory
 
-    providers: list[str] = []
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: providers.append(provider) or object(),
-    )
     configured = app_config.model_copy(
         update={
             "llm": app_config.llm.model_copy(
                 update={"fallback_provider": "groq"}
             )
         }
+    )
+    providers: list[str] = []
+    patch_selected_llm_backend(
+        configured,
+        lambda *_args, **_kwargs: (
+            providers.append(configured.llm.provider) or object()
+        ),
     )
 
     with pytest.raises(RuntimeError, match="cross-provider"):
@@ -299,7 +300,7 @@ def test_configured_cross_provider_fallback_is_rejected_without_construction(
 def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
     app_config,
     session_factory,
-    monkeypatch,
+    patch_selected_llm_backend,
 ):
     from trading_assistant.config import Secrets
     from trading_assistant.llm import factory
@@ -308,18 +309,19 @@ def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
         def create(self, **_kwargs):
             raise RuntimeError("primary unavailable")
 
-    providers: list[str] = []
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: providers.append(provider) or Primary(),
-    )
     configured = app_config.model_copy(
         update={
             "llm": app_config.llm.model_copy(
                 update={"fallback_provider": None}
             )
         }
+    )
+    providers: list[str] = []
+    patch_selected_llm_backend(
+        configured,
+        lambda *_args, **_kwargs: (
+            providers.append(configured.llm.provider) or Primary()
+        ),
     )
     backend = factory.build_llm_backend(
         configured,

@@ -168,6 +168,85 @@ def test_release_static_gate_rejects_negative_fixtures(
     [
         (
             "src/trading_assistant/app/main.py",
+            "app.mount('/plugin', plugin)\n",
+            "non-allowlisted route mount: "
+            "src/trading_assistant/app/main.py:1",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "app.add_api_route('/imperative', endpoint, methods=['GET'])\n",
+            "imperative HTTP route registration: "
+            "src/trading_assistant/app/main.py:1",
+        ),
+        (
+            "src/trading_assistant/app/routers/unsafe.py",
+            "@router.websocket('/socket')\n"
+            "async def socket(websocket):\n"
+            "    return None\n",
+            "websocket route registration: "
+            "src/trading_assistant/app/routers/unsafe.py:2",
+        ),
+        (
+            "src/trading_assistant/app/routers/unsafe.py",
+            "router.add_websocket_route('/socket', endpoint)\n",
+            "websocket route registration: "
+            "src/trading_assistant/app/routers/unsafe.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_llm.py",
+            "from trading_assistant.llm.factory import _make_backend\n"
+            "_make_backend(provider, config, secrets)\n",
+            "raw LLM factory helper reference outside factory: "
+            "src/trading_assistant/unsafe_llm.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_llm.py",
+            "backend = build_llm_backend(config, secrets)\n"
+            "backend.delegate.create()\n",
+            "direct LLM delegate access outside wrapper: "
+            "src/trading_assistant/unsafe_llm.py:2",
+        ),
+        (
+            "src/trading_assistant/llm/factory.py",
+            "def _make_backend(provider, config, secrets):\n"
+            "    return object()\n",
+            "raw LLM constructor helper exposed by factory: "
+            "src/trading_assistant/llm/factory.py:1",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_final_review_escape_paths(
+    tmp_path,
+    relative_path,
+    source,
+    expected,
+):
+    root = _static_fixture(tmp_path)
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected"),
+    [
+        (
+            "src/trading_assistant/app/main.py",
             "@app.get('/covered')\n"
             "def covered():\n"
             "    return None\n\n"

@@ -141,6 +141,69 @@ def test_duplicate_and_unclassified_routes_fail_inventory_validation():
         validate_route_inventory(app)
 
 
+def test_route_inventory_rejects_mounts_websockets_and_imperative_routes():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    child = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.mount("/plugin", child)
+    app.add_api_route(
+        "/imperative",
+        lambda: {"unsafe": True},
+        methods=["GET"],
+    )
+
+    @app.websocket("/socket")
+    async def socket(_websocket):
+        return None
+
+    registry = RoutePolicyRegistry(())
+    app.state.route_policy_registry = registry
+
+    assert registry.unclassified(app) == [
+        ("GET", "/imperative"),
+        ("MOUNT", "/plugin"),
+        ("WEBSOCKET", "/socket"),
+    ]
+    with pytest.raises(
+        RuntimeError,
+        match=r"MOUNT.*plugin.*WEBSOCKET.*socket",
+    ):
+        validate_route_inventory(app)
+
+
+def test_matched_route_added_without_policy_fails_closed(make_service):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="late-route-policy-secret",
+        planning=None,
+    )
+    calls = 0
+
+    def late_route():
+        nonlocal calls
+        calls += 1
+        return {"unsafe": True}
+
+    app.add_api_route(
+        "/late-unclassified",
+        late_route,
+        methods=["GET"],
+    )
+    response = TestClient(app).get("/late-unclassified")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "route_policy_missing"
+    assert calls == 0
+
+
 def test_route_resolution_uses_exact_fastapi_match(make_service):
     app = create_app(
         service=make_service(),

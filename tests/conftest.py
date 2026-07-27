@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import importlib
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,23 @@ def app_config() -> AppConfig:
             "max_position_per_ticker": 2000,
         }),
     })
+
+
+@pytest.fixture
+def patch_selected_llm_backend(monkeypatch):
+    def _patch(config: AppConfig, constructor) -> None:
+        provider = config.llm.provider
+        class_name = {
+            "anthropic": "AnthropicBackend",
+            "gemini": "GeminiBackend",
+            "groq": "GroqBackend",
+        }[provider]
+        module = importlib.import_module(
+            f"trading_assistant.llm.{provider}_backend"
+        )
+        monkeypatch.setattr(module, class_name, constructor)
+
+    return _patch
 
 
 @pytest.fixture

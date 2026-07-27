@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Match, Mount
+from starlette.routing import Match, Mount, WebSocketRoute
 
 from trading_assistant.db.models import PanicReceipt, utcnow
 
@@ -74,6 +74,10 @@ class RoutePolicy:
 class ResolvedRoute:
     policy: RoutePolicy
     path_params: dict[str, str]
+
+
+class _RoutePolicyMissing(RuntimeError):
+    """A concrete application route matched without a registered policy."""
 
 
 @dataclass(frozen=True)
@@ -399,7 +403,9 @@ class RoutePolicyRegistry:
             )
             policy = self._by_key.get((policy_method, template))
             if policy is None:
-                return None
+                raise _RoutePolicyMissing(
+                    f"{method.upper()} {template or path}"
+                )
             return ResolvedRoute(
                 policy=policy,
                 path_params={
@@ -440,10 +446,18 @@ class RoutePolicyRegistry:
             if isinstance(route, Mount):
                 if route.path == "/static":
                     route_keys.add(("GET", "/static/{path:path}"))
+                else:
+                    route_keys.add(("MOUNT", route.path))
                 continue
             path = getattr(route, "path", None)
             methods = getattr(route, "methods", None)
-            if path is None or methods is None:
+            if path is None:
+                continue
+            if isinstance(route, WebSocketRoute):
+                route_keys.add(("WEBSOCKET", path))
+                continue
+            if methods is None:
+                route_keys.add(("ROUTE", path))
                 continue
             route_keys.update((method.upper(), path) for method in methods)
         return sorted(route_keys - policy_keys)
@@ -1339,11 +1353,21 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 request,
                 ApiError("not_found", 404, "Route not found"),
             )
-        resolved = registry.resolve(
-            app,
-            request.method,
-            request.url.path,
-        )
+        try:
+            resolved = registry.resolve(
+                app,
+                request.method,
+                request.url.path,
+            )
+        except _RoutePolicyMissing:
+            return _policy_error_response(
+                request,
+                ApiError(
+                    "route_policy_missing",
+                    503,
+                    "Request route policy is unavailable",
+                ),
+            )
         if resolved is None:
             return await call_next(request)
         policy = resolved.policy

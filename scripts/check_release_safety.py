@@ -267,6 +267,10 @@ _ROUTE_DECORATOR_METHODS = {
     "trace": "TRACE",
 }
 _GENERIC_ROUTE_DECORATORS = {"api_route", "route"}
+_WEBSOCKET_ROUTE_DECORATORS = {"websocket", "websocket_route"}
+_IMPERATIVE_HTTP_REGISTRATIONS = {"add_api_route", "add_route"}
+_IMPERATIVE_WEBSOCKET_REGISTRATIONS = {"add_websocket_route"}
+_ROUTE_MOUNT_REGISTRATIONS = {"mount"}
 _NON_ROUTE_DECORATORS = {"field_validator", "model_validator", "wraps"}
 _LLM_BACKEND_CLASSES = {
     "AnthropicBackend",
@@ -287,6 +291,15 @@ _LLM_BACKEND_ALLOWED_PATHS = {
     "src/trading_assistant/llm/anthropic_backend.py",
     "src/trading_assistant/llm/gemini_backend.py",
     "src/trading_assistant/llm/groq_backend.py",
+}
+_LLM_FACTORY_PATH = "src/trading_assistant/llm/factory.py"
+_LLM_WRAPPER_PATH = "src/trading_assistant/llm/base.py"
+_RAW_LLM_FACTORY_HELPERS = {"_make_backend"}
+_DIRECT_LLM_DELEGATE_ATTRIBUTES = {
+    "delegate",
+    "_delegate",
+    "__delegate",
+    "_BudgetedLLMBackend__delegate",
 }
 
 
@@ -343,7 +356,9 @@ def _route_decorator_aliases(
         key=lambda node: (node.lineno, node.col_offset),
     )
     route_decorators = (
-        set(_ROUTE_DECORATOR_METHODS) | _GENERIC_ROUTE_DECORATORS
+        set(_ROUTE_DECORATOR_METHODS)
+        | _GENERIC_ROUTE_DECORATORS
+        | _WEBSOCKET_ROUTE_DECORATORS
     )
     for node in assignments:
         targets = (
@@ -408,6 +423,7 @@ def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
             if decorator_name not in (
                 set(_ROUTE_DECORATOR_METHODS)
                 | _GENERIC_ROUTE_DECORATORS
+                | _WEBSOCKET_ROUTE_DECORATORS
                 | _NON_ROUTE_DECORATORS
             ):
                 _fail(
@@ -415,6 +431,11 @@ def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
                 )
             if decorator_name in _NON_ROUTE_DECORATORS:
                 continue
+            if decorator_name in _WEBSOCKET_ROUTE_DECORATORS:
+                _fail(
+                    f"websocket route registration: "
+                    f"{relative}:{node.lineno}"
+                )
             method = _ROUTE_DECORATOR_METHODS.get(decorator_name)
             if method is None and decorator_name not in _GENERIC_ROUTE_DECORATORS:
                 continue
@@ -457,16 +478,106 @@ def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
     return routes
 
 
+def _is_registered_call(
+    node: ast.Call,
+    methods: set[str],
+    aliases: set[str],
+) -> bool:
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in methods
+    ) or (
+        isinstance(node.func, ast.Name)
+        and node.func.id in aliases
+    ) or _getattr_call(
+        node.func,
+        methods,
+        dynamic=True,
+    )
+
+
+def _check_imperative_route_registrations(root: Path) -> None:
+    runtime = root / "src" / "trading_assistant"
+    for path in sorted(runtime.rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        http_aliases = _call_aliases(
+            tree,
+            _IMPERATIVE_HTTP_REGISTRATIONS,
+            dynamic_getattr=True,
+        )
+        websocket_aliases = _call_aliases(
+            tree,
+            _IMPERATIVE_WEBSOCKET_REGISTRATIONS,
+            dynamic_getattr=True,
+        )
+        mount_aliases = _call_aliases(
+            tree,
+            _ROUTE_MOUNT_REGISTRATIONS,
+            dynamic_getattr=True,
+        )
+        for node in sorted(
+            (
+                candidate
+                for candidate in ast.walk(tree)
+                if isinstance(candidate, ast.Call)
+            ),
+            key=lambda candidate: (
+                candidate.lineno,
+                candidate.col_offset,
+            ),
+        ):
+            if _is_registered_call(
+                node,
+                _IMPERATIVE_HTTP_REGISTRATIONS,
+                http_aliases,
+            ):
+                _fail(
+                    f"imperative HTTP route registration: "
+                    f"{relative}:{node.lineno}"
+                )
+            if _is_registered_call(
+                node,
+                _IMPERATIVE_WEBSOCKET_REGISTRATIONS,
+                websocket_aliases,
+            ):
+                _fail(
+                    f"websocket route registration: "
+                    f"{relative}:{node.lineno}"
+                )
+            if not _is_registered_call(
+                node,
+                _ROUTE_MOUNT_REGISTRATIONS,
+                mount_aliases,
+            ):
+                continue
+            mount_path = node.args[0] if node.args else None
+            if (
+                isinstance(mount_path, ast.Constant)
+                and mount_path.value == "/static"
+            ):
+                continue
+            _fail(
+                f"non-allowlisted route mount: "
+                f"{relative}:{node.lineno}"
+            )
+
+
 def _check_route_policy_inventory(root: Path) -> None:
     app = root / "src" / "trading_assistant" / "app"
     route_files = [app / "main.py", *sorted((app / "routers").glob("*.py"))]
     policies = _literal_route_policies(root)
+    decorated_routes = {
+        route
+        for path in route_files
+        if path.exists()
+        for route in _decorated_routes(path, root)
+    }
+    _check_imperative_route_registrations(root)
     missing = sorted(
         {
             route
-            for path in route_files
-            if path.exists()
-            for route in _decorated_routes(path, root)
+            for route in decorated_routes
             if route not in policies
         }
     )
@@ -522,6 +633,86 @@ def _global_backend_lookup(node: ast.AST) -> bool:
     ):
         return False
     return lookup.value.func.id in {"globals", "locals"}
+
+
+def _check_llm_escape_paths(root: Path) -> None:
+    runtime = root / "src" / "trading_assistant"
+    helper_references: list[str] = []
+    delegate_references: list[str] = []
+    for path in sorted(runtime.rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        if relative == _LLM_FACTORY_PATH:
+            exposed = next(
+                (
+                    node
+                    for node in tree.body
+                    if isinstance(
+                        node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    and node.name in _RAW_LLM_FACTORY_HELPERS
+                ),
+                None,
+            )
+            if exposed is not None:
+                _fail(
+                    f"raw LLM constructor helper exposed by factory: "
+                    f"{relative}:{exposed.lineno}"
+                )
+        else:
+            for node in ast.walk(tree):
+                location = (
+                    f"{relative}:{node.lineno}"
+                    if hasattr(node, "lineno")
+                    else None
+                )
+                if location is None:
+                    continue
+                if isinstance(node, ast.ImportFrom) and any(
+                    imported.name in _RAW_LLM_FACTORY_HELPERS
+                    for imported in node.names
+                ):
+                    helper_references.append(location)
+                elif (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.id in _RAW_LLM_FACTORY_HELPERS
+                ) or (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.attr in _RAW_LLM_FACTORY_HELPERS
+                ) or _getattr_call(
+                    node,
+                    _RAW_LLM_FACTORY_HELPERS,
+                    dynamic=False,
+                ):
+                    helper_references.append(location)
+        if relative in {_LLM_FACTORY_PATH, _LLM_WRAPPER_PATH}:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr in _DIRECT_LLM_DELEGATE_ATTRIBUTES
+            ) or _getattr_call(
+                node,
+                _DIRECT_LLM_DELEGATE_ATTRIBUTES,
+                dynamic=False,
+            ):
+                delegate_references.append(
+                    f"{relative}:{node.lineno}"
+                )
+    if helper_references:
+        _fail(
+            "raw LLM factory helper reference outside factory: "
+            + ", ".join(sorted(set(helper_references)))
+        )
+    if delegate_references:
+        _fail(
+            "direct LLM delegate access outside wrapper: "
+            + ", ".join(sorted(set(delegate_references)))
+        )
 
 
 def _check_llm_construction_paths(root: Path) -> None:
@@ -694,6 +885,7 @@ def main(argv: list[str] | None = None) -> int:
         _check_browser_sources,
         _check_no_unofficial_robinhood_dependency,
         _check_route_policy_inventory,
+        _check_llm_escape_paths,
         _check_llm_construction_paths,
         _check_no_deleted_rate_limiter_import,
         _check_no_tracked_secret_files,

@@ -814,6 +814,7 @@ def test_validation_analyst_default_off_uses_disabled_backtest_without_construct
     app_config,
     session_factory,
     monkeypatch,
+    patch_selected_llm_backend,
 ):
     import trading_assistant.validate_analyst as validation
     from trading_assistant.llm import factory
@@ -836,10 +837,11 @@ def test_validation_analyst_default_off_uses_disabled_backtest_without_construct
         "resolve_input_estimator",
         lambda provider: estimator_calls.append(provider) or object(),
     )
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: raw_calls.append(provider) or object(),
+    patch_selected_llm_backend(
+        app_config,
+        lambda *_args, **_kwargs: (
+            raw_calls.append(app_config.llm.provider) or object()
+        ),
     )
 
     analyst = validation._build_analyst(
@@ -866,10 +868,9 @@ def test_validation_analyst_default_off_uses_disabled_backtest_without_construct
 def test_validation_analyst_enabled_wraps_backtest_exactly_once(
     app_config,
     session_factory,
-    monkeypatch,
+    patch_selected_llm_backend,
 ):
     import trading_assistant.validate_analyst as validation
-    from trading_assistant.llm import factory
     from trading_assistant.llm.base import BudgetedLLMBackend
 
     configured = app_config.security.provider_budget
@@ -894,10 +895,11 @@ def test_validation_analyst_enabled_wraps_backtest_exactly_once(
     )
     raw_backend = object()
     raw_calls = []
-    monkeypatch.setattr(
-        factory,
-        "_make_backend",
-        lambda provider, *_args: raw_calls.append(provider) or raw_backend,
+    patch_selected_llm_backend(
+        enabled_config,
+        lambda *_args, **_kwargs: (
+            raw_calls.append(enabled_config.llm.provider) or raw_backend
+        ),
     )
 
     analyst = validation._build_analyst(
@@ -907,7 +909,8 @@ def test_validation_analyst_enabled_wraps_backtest_exactly_once(
     )
 
     assert isinstance(analyst.backend, BudgetedLLMBackend)
-    assert analyst.backend.delegate is raw_backend
+    assert not hasattr(analyst.backend, "delegate")
+    assert not hasattr(analyst.backend, "_delegate")
     assert analyst.backend.budgets is provider_budget
     assert analyst.backend.category == "backtest"
     assert raw_calls == [enabled_config.llm.provider]

@@ -83,7 +83,7 @@ class BudgetedLLMBackend:
             from .factory import resolve_input_estimator
 
             estimator = resolve_input_estimator(provider)
-        self.delegate = delegate
+        self.__delegate = delegate
         self.budgets = budgets
         self.provider = provider
         self.category = category
@@ -120,7 +120,7 @@ class BudgetedLLMBackend:
         )
         self.budgets.mark_started(reservation.reservation_id)
         try:
-            response = self.delegate.create(
+            response = self.__delegate.create(
                 system=system,
                 messages=messages,
                 tools=tools,
