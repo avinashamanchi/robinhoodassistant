@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
 
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import OrderStatus, Position
+from trading_assistant.broker.models import (
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+)
+from trading_assistant.assets import AssetClass
 from trading_assistant.db.models import (
     AuditEvent,
     Order,
@@ -17,6 +26,12 @@ from trading_assistant.db.models import (
     RuleGroup,
 )
 from trading_assistant.risk.clock import FakeClock
+from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.engine import (
+    BreakerTripIntent,
+    RiskEngine,
+    RiskResult,
+)
 from trading_assistant.service import TradingService
 
 
@@ -72,6 +87,141 @@ def test_propose_creates_pending_and_does_not_execute(app_config, session_factor
     open_orders = svc.get_open_orders()
     assert len(open_orders) == 1
     assert open_orders[0]["status"] == "proposed"
+
+
+def test_proposal_risk_fault_persists_scoped_data_breaker(
+    app_config,
+    session_factory,
+):
+    class StaleQuoteBroker(SpyBroker):
+        def get_quote(self, ticker):
+            quote = super().get_quote(ticker)
+            stale_at = datetime.now(timezone.utc) - timedelta(
+                minutes=5
+            )
+            return replace(
+                quote,
+                as_of=stale_at,
+                book_as_of=stale_at,
+                trade_as_of=stale_at,
+            )
+
+    svc = _service(
+        app_config,
+        session_factory,
+        broker=StaleQuoteBroker(),
+    )
+
+    result = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_context("persist proposal data fault"),
+    )
+
+    assert result["status"] == OrderStatus.REJECTED.value
+    assert svc.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+
+
+def test_execution_risk_fault_persists_before_submission_returns(
+    app_config,
+    session_factory,
+):
+    svc = _service(app_config, session_factory)
+    proposal = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        **_context("execution breaker proposal"),
+    )
+    scope = BreakerScope.loss(AssetClass.EQUITY)
+    svc.order_submission._risk_check = lambda *_args: RiskResult(
+        approved=False,
+        reasons=["daily total-loss limit reached"],
+        breaker_trips=(
+            BreakerTripIntent(
+                scope,
+                "daily total-loss limit reached",
+            ),
+        ),
+    )
+
+    result = svc.approve_order(
+        proposal["order_id"],
+        actor="operator:test",
+        reason="persist execution breaker before return",
+        request_id="service-execution-breaker",
+    )
+
+    assert result["status"] == OrderStatus.REJECTED.value
+    assert svc.breakers.is_tripped(scope)
+    assert svc.broker.submit_calls == 0
+
+
+def test_reduce_only_execution_latches_breach_and_still_reduces(
+    app_config,
+    session_factory,
+    make_snapshot,
+):
+    broker = SpyBroker()
+    broker._positions["AAPL"] = Position(
+        "AAPL",
+        Decimal("5"),
+        Decimal("100"),
+        Decimal("100"),
+    )
+    svc = _service(
+        app_config,
+        session_factory,
+        broker=broker,
+    )
+    proposal = svc.propose_order(
+        "AAPL",
+        "sell",
+        "market",
+        qty="1",
+        **_context("reduce-only breaker proposal"),
+    )
+    scope = BreakerScope.loss(AssetClass.EQUITY)
+    risk = RiskEngine(app_config.risk).check(
+        OrderRequest(
+            ticker="AAPL",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            idempotency_key="real-reduce-only-risk",
+            qty=Decimal("1"),
+        ),
+        make_snapshot(
+            prices={"AAPL": Decimal("100")},
+            positions=[
+                Position(
+                    "AAPL",
+                    Decimal("5"),
+                    Decimal("100"),
+                    Decimal("100"),
+                )
+            ],
+            realized_pnl_today=Decimal("-10000"),
+        ),
+    )
+    assert risk.approved
+    assert risk.bypassed_breakers == (scope.key,)
+    svc.order_submission._risk_check = lambda *_args: risk
+
+    result = svc.approve_order(
+        proposal["order_id"],
+        actor="operator:test",
+        reason="reduce exposure while latching loss breaker",
+        request_id="service-reduce-only-breaker",
+    )
+
+    assert result["status"] == OrderStatus.SUBMITTED.value
+    assert svc.breakers.is_tripped(scope)
+    assert broker.submit_calls == 1
 
 
 def test_get_open_orders_includes_every_nonterminal_outbox_state(
@@ -322,6 +472,93 @@ def test_cancel_rule_keeps_group_active_until_processing_sibling_is_canceled(
         assert second_rule.state == "canceled"
         assert group.state == "canceled"
         assert group.version == initial_version + 1
+
+
+def test_cancel_rule_can_cancel_fill_activated_pending_rule_and_group(
+    app_config,
+    session_factory,
+):
+    svc = _service(app_config, session_factory)
+    rule_id = svc.rule_application.create_rule(
+        {
+            "ticker": "AAPL",
+            "kind": "stop",
+            "condition": {
+                "type": "price",
+                "direction": "below",
+                "price": "90",
+            },
+            "action": {
+                "side": "sell",
+                "order_type": "market",
+                "qty": "1",
+            },
+            "activation": "on_entry_fill",
+        },
+        **_context("pending exit rule"),
+    )
+
+    result = svc.cancel_rule(
+        rule_id,
+        **_context("cancel pending exit rule"),
+    )
+
+    assert result["canceled"] is True
+    with session_factory() as session:
+        rule = session.get(Rule, rule_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == "canceled"
+        assert group.state == "canceled"
+
+
+def test_existing_group_rejects_mixed_persisted_activation_policy(
+    app_config,
+    session_factory,
+):
+    svc = _service(app_config, session_factory)
+    immediate = {
+        "ticker": "AAPL",
+        "kind": "price",
+        "condition": {
+            "type": "price",
+            "direction": "above",
+            "price": "110",
+        },
+        "action": {
+            "side": "buy",
+            "order_type": "market",
+            "qty": "1",
+        },
+        "group_key": "persisted-activation-policy",
+    }
+    svc.rule_application.create_rule(
+        immediate,
+        **_context("create immediate activation group"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="persisted activation policy",
+    ):
+        svc.rule_application.create_rule(
+            {
+                "ticker": "AAPL",
+                "kind": "stop",
+                "condition": {
+                    "type": "price",
+                    "direction": "below",
+                    "price": "90",
+                },
+                "action": {
+                    "side": "sell",
+                    "order_type": "market",
+                    "qty": "1",
+                },
+                "group_key": "persisted-activation-policy",
+                "activation": "on_entry_fill",
+            },
+            **_context("reject mixed activation group"),
+        )
 
 
 @pytest.mark.parametrize("terminal_state", ["triggered", "failed"])

@@ -49,6 +49,37 @@ def test_trigger_creates_proposal_and_notifies(make_service):
     assert audit.request_id
 
 
+def test_rule_risk_fault_persists_scoped_breaker_atomically(
+    make_service,
+):
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.risk.breakers import BreakerScope
+    from trading_assistant.risk.engine import (
+        BreakerTripIntent,
+        RiskResult,
+    )
+
+    svc = make_service()
+    _rule(svc, {"price_below": 175})
+    scope = BreakerScope.data(AssetClass.EQUITY)
+    svc._risk_for(AssetClass.EQUITY).check = (
+        lambda *_args, **_kwargs: RiskResult(
+            approved=False,
+            reasons=["quote is stale"],
+            breaker_trips=(
+                BreakerTripIntent(scope, "quote is stale"),
+            ),
+        )
+    )
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "rejected"
+    assert svc.breakers.is_tripped(scope)
+    assert svc.broker.submit_calls == 0
+
+
 def test_rule_is_one_shot(make_service):
     svc = make_service()
     _rule(svc, {"price_below": 175})

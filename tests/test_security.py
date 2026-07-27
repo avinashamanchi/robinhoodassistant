@@ -350,7 +350,7 @@ def test_authenticated_session_and_csrf_allow_mutation(
         "/killswitch/reset",
         headers={"X-CSRF-Token": csrf},
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "authenticated health review",
             "expected_generation": observed.generation,
         },
@@ -2395,7 +2395,7 @@ _HEALTH_DOM_SETUP = r"""
       "status-region",
       "receipt-panel",
     ]);
-    elements["breaker-scope"].value = "equity";
+    elements["breaker-scope"].value = "";
     const emptyUnsafeLocalState = () => ({
       live_or_unknown_order_ids: [],
       latched_order_ids: [],
@@ -2436,6 +2436,12 @@ _HEALTH_DOM_SETUP = r"""
     });
     const validHealth = (generation = 7) => {
       const observedAt = new Date().toISOString();
+      const activeBreakers = [{
+        scope: "loss:equity",
+        kind: "loss",
+        target: "equity",
+        generation,
+      }];
       return {
         broker: "Alpaca",
         mode: "paper",
@@ -2451,14 +2457,10 @@ _HEALTH_DOM_SETUP = r"""
           equity: generation,
           crypto: 3,
         },
+        active_breakers: activeBreakers,
         safety: safetyTruth({
           observedAt,
-          activeBreakers: [{
-            scope: "loss:equity",
-            kind: "loss",
-            target: "equity",
-            generation,
-          }],
+          activeBreakers,
         }),
       };
     };
@@ -2707,6 +2709,7 @@ def test_safety_banner_rehydrates_persisted_unsafe_truth_in_new_document(
         health.killswitch_generation = {{equity: 0, crypto: 0}};
         health.safety = {safety_expression};
         health.safety.observed_at = health.observed_at;
+        health.active_breakers = health.safety.active_breakers;
         globalThis.__api = (path) => {{
           if (path === "/health") return Promise.resolve(health);
           throw new Error(`unexpected API path ${{path}}`);
@@ -2743,6 +2746,7 @@ def test_safety_banner_hides_only_for_complete_locally_clear_truth():
         const health = validHealth();
         health.killswitch = {equity: false, crypto: false};
         health.killswitch_generation = {equity: 0, crypto: 0};
+        health.active_breakers = [];
         health.safety = safetyTruth({
           observedAt: health.observed_at,
           state: "locally_clear",
@@ -2792,7 +2796,7 @@ def test_breaker_reset_invalidates_health_before_refresh_result():
           }
           if (path === "/killswitch/reset") {
             return Promise.resolve({
-              asset_class: "equity",
+              scope: "loss:equity",
               generation: 13,
               tripped: false,
             });
@@ -2834,9 +2838,11 @@ def test_console_javascript_requires_truthful_approval_panic_and_scoped_reset():
     assert "remote_enumeration" in text
     assert "safe === true" in text
     assert "everything halted" not in text.lower()
-    assert 'const breakerScopes = ["equity", "crypto"]' in text
+    assert 'const assetClasses = ["equity", "crypto"]' in text
     assert "expected_generation" in text
-    assert "asset_class: proof.scope" in text
+    assert "scope: proof.scope" in text
+    assert "health.active_breakers" in text
+    assert "breakerScopeIsCanonical" in text
     assert '"/killswitch/reset"' in text
 
 

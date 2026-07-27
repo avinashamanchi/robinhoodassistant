@@ -306,6 +306,26 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
         reason="create active unsafe rule",
         request_id="panic-active-rule-setup",
     )
+    pending_rule_id = service.rule_application.create_rule(
+        {
+            "ticker": "AAPL",
+            "kind": "stop",
+            "condition": {
+                "type": "price",
+                "direction": "below",
+                "price": "80",
+            },
+            "action": {
+                "side": "sell",
+                "order_type": "market",
+                "qty": "1",
+            },
+            "activation": "on_entry_fill",
+        },
+        actor="operator:panic-enumeration",
+        reason="create pending unsafe rule",
+        request_id="panic-pending-rule-setup",
+    )
     latched = service.create_conditional_rule(
         "MSFT",
         {"price_below": "300"},
@@ -316,8 +336,10 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
     )
     with service.session_factory() as session:
         active_rule = session.get(Rule, active["rule_id"])
+        pending_rule = session.get(Rule, pending_rule_id)
         latched_rule = session.get(Rule, latched["rule_id"])
         active_group_id = active_rule.group_id
+        pending_group_id = pending_rule.group_id
         latched_group_id = latched_rule.group_id
         latched_rule.state = "canceled"
         latched_group = session.get(RuleGroup, latched_group_id)
@@ -358,12 +380,12 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
     assert receipt["safe"] is False
     assert receipt["local_enumeration"] == "confirmed"
     assert receipt["confirmed_canceled"] == []
-    assert receipt["unsafe_local_state"]["active_rule_ids"] == [
-        active["rule_id"]
-    ]
+    assert set(
+        receipt["unsafe_local_state"]["active_rule_ids"]
+    ) == {active["rule_id"], pending_rule_id}
     assert set(
         receipt["unsafe_local_state"]["unsafe_rule_group_ids"]
-    ) == {active_group_id, latched_group_id}
+    ) == {active_group_id, pending_group_id, latched_group_id}
 
 
 def test_panic_local_enumeration_marks_partial_query_failure_unknown(
@@ -3851,7 +3873,13 @@ def test_synchronous_loss_stays_incomplete_until_exact_fill_reconciliation(
     )
     submission = _submit(service.order_submission, order_id)
 
-    assert submission.status is synchronous_status
+    assert submission.status is OrderStatus.ACCEPTANCE_UNKNOWN
+    assert service.breakers.is_tripped(
+        BreakerScope.broker_drift()
+    )
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    )
     incomplete = service.snapshot_service.assemble_for_execution("AAPL")
     assert incomplete.realized_pnl_today == Decimal("0")
     assert incomplete.broker_reconciled is False
@@ -4064,11 +4092,7 @@ def test_fill_and_cursor_roll_back_together_on_commit_failure(make_service):
     session_type = service.session_factory.class_
 
     def fail_after_flush(session):
-        if any(
-            isinstance(row, db_models.ReconciliationCursor)
-            for row in session.new
-        ):
-            session.flush()
+        if session.info.get("reconciliation_mutation_context"):
             raise RuntimeError("forced commit failure")
 
     event.listen(session_type, "before_commit", fail_after_flush)

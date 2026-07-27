@@ -385,7 +385,7 @@ def test_http_mutation_provenance_matrix(
         )
         body.update(
             {
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "expected_generation": (
                     tripped.generation
                     if success

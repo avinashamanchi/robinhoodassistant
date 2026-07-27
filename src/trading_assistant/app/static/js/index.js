@@ -8,7 +8,7 @@ import {
 } from "/static/js/auth.js";
 
 const byId = (id) => document.getElementById(id);
-const breakerScopes = ["equity", "crypto"];
+const assetClasses = ["equity", "crypto"];
 const unsafeLocalIdFields = [
   "live_or_unknown_order_ids",
   "latched_order_ids",
@@ -709,7 +709,7 @@ async function submitPanic(event) {
 function selectedBreakerProof() {
   const scope = byId("breaker-scope").value;
   if (
-    !breakerScopes.includes(scope)
+    !scope
     || !latestHealth
     || latestHealth.requestToken !== healthRequestSequence
     || Date.now() - latestHealth.receivedAt > HEALTH_OBSERVATION_MAX_AGE_MS
@@ -717,23 +717,24 @@ function selectedBreakerProof() {
     return null;
   }
   const health = latestHealth.payload;
-  const generation = health.killswitch_generation[scope];
-  const tripped = health.killswitch[scope] === true;
+  const breaker = health.active_breakers.find(
+    (item) => item.scope === scope,
+  );
   const healthComplete = (
     health.db_ok === true
     && health.daemon_alive === true
   );
   if (
-    !tripped
-    || !Number.isSafeInteger(generation)
-    || generation <= 0
+    !breaker
+    || !Number.isSafeInteger(breaker.generation)
+    || breaker.generation <= 0
     || !healthComplete
   ) {
     return null;
   }
   return {
     scope,
-    generation,
+    generation: breaker.generation,
     requestToken: latestHealth.requestToken,
   };
 }
@@ -744,9 +745,12 @@ function updateBreakerReset() {
     && latestHealth.requestToken === healthRequestSequence
     ? latestHealth.payload
     : null;
-  const generation = health
-    ? health.killswitch_generation[scope]
+  const breaker = health
+    ? health.active_breakers.find(
+      (item) => item.scope === scope,
+    )
     : null;
+  const generation = breaker ? breaker.generation : null;
   byId("breaker-generation").textContent = (
     Number.isSafeInteger(generation) && generation > 0
       ? String(generation)
@@ -768,12 +772,17 @@ function updateBreakerReset() {
 
 function renderUnknownHealth() {
   latestHealth = null;
+  const scopeSelect = byId("breaker-scope");
+  clear(scopeSelect);
+  const scopeOption = node("option", "Waiting for verified health…");
+  scopeOption.value = "";
+  scopeSelect.appendChild(scopeOption);
   byId("truth-broker").textContent = "Unknown";
   byId("truth-mode").textContent = "Unknown";
   setState(byId("truth-database"), "Unknown", "caution");
   setState(byId("truth-daemon"), "Unknown", "caution");
   setState(byId("truth-safety"), "Unknown", "caution");
-  breakerScopes.forEach((scope) => {
+  assetClasses.forEach((scope) => {
     setState(
       byId(`truth-${scope}-breaker`),
       "Unknown",
@@ -810,13 +819,19 @@ function isCanonicalIdList(value) {
 
 function breakerScopeIsCanonical(breaker) {
   if (
-    ["loss", "drawdown", "data", "liquidity"].includes(
+    ["loss", "drawdown", "data"].includes(
       breaker.kind,
     )
   ) {
     return (
-      breaker.target.length > 0
+      assetClasses.includes(breaker.target)
       && breaker.scope === `${breaker.kind}:${breaker.target}`
+    );
+  }
+  if (breaker.kind === "liquidity") {
+    return (
+      /^[A-Z0-9][A-Z0-9./_-]{0,31}$/.test(breaker.target)
+      && breaker.scope === `liquidity:${breaker.target}`
     );
   }
   if (
@@ -907,7 +922,7 @@ function safetyPayloadIsComplete(health) {
     return false;
   }
 
-  for (const scope of breakerScopes) {
+  for (const scope of assetClasses) {
     const activeGeneration = activeScopes.get(`loss:${scope}`);
     if (
       health.killswitch[scope] !== (
@@ -943,6 +958,10 @@ function healthPayloadIsComplete(health) {
     || typeof health.killswitch !== "object"
     || !health.killswitch_generation
     || typeof health.killswitch_generation !== "object"
+    || !Array.isArray(health.active_breakers)
+    || !health.safety
+    || typeof health.safety !== "object"
+    || !Array.isArray(health.safety.active_breakers)
   ) {
     return false;
   }
@@ -956,7 +975,7 @@ function healthPayloadIsComplete(health) {
   ) {
     return false;
   }
-  for (const scope of breakerScopes) {
+  for (const scope of assetClasses) {
     if (
       typeof health.killswitch[scope] !== "boolean"
       || !Number.isSafeInteger(health.killswitch_generation[scope])
@@ -966,6 +985,33 @@ function healthPayloadIsComplete(health) {
     }
   }
   if (typeof health.observed_at !== "string") {
+    return false;
+  }
+  const topLevelBreakers = new Map();
+  for (const breaker of health.active_breakers) {
+    if (
+      !breakerScopeIsCanonical(breaker)
+      || !Number.isSafeInteger(breaker.generation)
+      || breaker.generation <= 0
+      || topLevelBreakers.has(breaker.scope)
+    ) {
+      return false;
+    }
+    topLevelBreakers.set(breaker.scope, breaker.generation);
+  }
+  const safetyBreakers = new Map(
+    health.safety.active_breakers.map(
+      (breaker) => [breaker.scope, breaker.generation],
+    ),
+  );
+  if (
+    topLevelBreakers.size !== safetyBreakers.size
+    || [...topLevelBreakers].some(
+      ([scope, generation]) => (
+        safetyBreakers.get(scope) !== generation
+      ),
+    )
+  ) {
     return false;
   }
   const observedAt = Date.parse(health.observed_at);
@@ -1041,7 +1087,7 @@ function renderHealth(health) {
   } else {
     setState(byId("truth-daemon"), "Stale or absent", "caution");
   }
-  breakerScopes.forEach((scope) => {
+  assetClasses.forEach((scope) => {
     const tripped = health.killswitch[scope];
     const generation = health.killswitch_generation[scope];
     setState(
@@ -1050,6 +1096,32 @@ function renderHealth(health) {
       tripped ? "alarm" : "verified",
     );
   });
+  const scopeSelect = byId("breaker-scope");
+  const selectedScope = scopeSelect.value;
+  clear(scopeSelect);
+  if (health.active_breakers.length === 0) {
+    const option = node("option", "No active breakers");
+    option.value = "";
+    scopeSelect.appendChild(option);
+  } else {
+    health.active_breakers.forEach((breaker) => {
+      const option = node(
+        "option",
+        `${breaker.scope} · gen ${breaker.generation}`,
+      );
+      option.value = breaker.scope;
+      scopeSelect.appendChild(option);
+    });
+    if (
+      health.active_breakers.some(
+        (breaker) => breaker.scope === selectedScope,
+      )
+    ) {
+      scopeSelect.value = selectedScope;
+    } else {
+      scopeSelect.value = health.active_breakers[0].scope;
+    }
+  }
   renderSafetyTruth(health.safety);
   updateBreakerReset();
 }
@@ -1075,7 +1147,7 @@ async function submitBreakerReset(event) {
   invalidateHealthObservation();
   try {
     const result = await api("/killswitch/reset", jsonPost({
-      asset_class: proof.scope,
+      scope: proof.scope,
       reason,
       expected_generation: proof.generation,
     }));
@@ -1083,7 +1155,7 @@ async function submitBreakerReset(event) {
       `${proof.scope} breaker reset`,
       "The server accepted the scoped reset after fresh health checks.",
       [
-        ["Scope", readable(result.asset_class)],
+        ["Scope", readable(result.scope)],
         ["Observed generation", String(proof.generation)],
         ["Result generation", readable(result.generation)],
         ["Tripped", result.tripped === true ? "Yes" : "No"],

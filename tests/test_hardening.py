@@ -19,6 +19,9 @@ from trading_assistant.db.models import (
     Fill,
     Order,
 )
+from trading_assistant.dependencies import (
+    RequiredDependencyUnavailable,
+)
 from trading_assistant.risk.breakers import BreakerScope
 
 
@@ -418,7 +421,7 @@ def test_cancel_race_records_broker_fill_instead_of_claiming_canceled(make_servi
     )
 
     assert result["status"] == "filled"
-    assert "not canceled" in result["error"]
+    assert "exact fill confirmation" in result["error"]
     assert svc.get_order_status(oid)["status"] == "filled"
 
 
@@ -525,17 +528,18 @@ def test_killswitch_drill(make_service):
     assert blocked["status"] == "rejected"
     assert any("circuit breaker" in r for r in blocked["risk_reasons"])
 
-    # Resetting the persisted breaker does not erase the complete loss snapshot.
-    # Risk remains blocked until the account is genuinely back within limits.
+    # These deliberately direct, order-less fills cannot satisfy broker/fill
+    # health proof. Reset must fail closed rather than clearing the breaker.
     observed = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
     assert observed is not None
-    svc.reset_killswitch(
-        AssetClass.EQUITY,
-        actor="operator:test",
-        reason="manual drill health reviewed",
-        expected_generation=observed.generation,
-        request_id="hardening-breaker-reset",
-    )
+    with pytest.raises(RequiredDependencyUnavailable):
+        svc.reset_killswitch(
+            AssetClass.EQUITY,
+            actor="operator:test",
+            reason="manual drill health reviewed",
+            expected_generation=observed.generation,
+            request_id="hardening-breaker-reset",
+        )
     still_blocked = svc.propose_order(
         "AAPL",
         "buy",
@@ -546,7 +550,10 @@ def test_killswitch_drill(make_service):
         request_id="hardening-post-reset-proposal",
     )
     assert still_blocked["status"] == "rejected"
-    assert "daily total-loss limit reached" in still_blocked["risk_reasons"]
+    assert any(
+        "circuit breaker" in reason
+        for reason in still_blocked["risk_reasons"]
+    )
 
 
 def test_operational_trip_all_uses_process_safe_global_breaker(make_service):

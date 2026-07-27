@@ -419,7 +419,9 @@ def test_only_definitive_broker_rejection_becomes_rejected(make_service):
     }
 
 
-def test_immediate_broker_fill_persists_truthfully(make_service):
+def test_immediate_broker_fill_returns_unknown_until_exact_activity(
+    make_service,
+):
     class FilledBroker(MockBroker):
         def submit_order(self, order):
             accepted = super().submit_order(order)
@@ -441,7 +443,7 @@ def test_immediate_broker_fill_persists_truthfully(make_service):
 
     result = _submit(svc.order_submission, order_id)
 
-    assert result.status is OrderStatus.FILLED
+    assert result.status is OrderStatus.ACCEPTANCE_UNKNOWN
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.status == OrderStatus.FILLED.value

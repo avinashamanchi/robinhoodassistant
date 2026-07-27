@@ -158,6 +158,7 @@ class OrderRepository:
         now: datetime,
         breaker_scope_keys: tuple[str, ...],
         *,
+        breaker_trips=(),
         actor: str,
         reason: str,
         request_id: str,
@@ -170,6 +171,16 @@ class OrderRepository:
         if not scope_keys or any(not key for key in scope_keys):
             raise ValueError("submission claim requires stable breaker scope keys")
         with self.session_factory() as session:
+            for intent in breaker_trips:
+                trip_in_session(
+                    session,
+                    intent.scope,
+                    intent.reason,
+                    actor,
+                    request_id=request_id,
+                    now=now,
+                    audit_reason=reason,
+                )
             result = session.execute(
                 update(Order)
                 .where(
@@ -194,7 +205,10 @@ class OrderRepository:
                 )
             )
             if result.rowcount != 1:
-                session.rollback()
+                if breaker_trips:
+                    session.commit()
+                else:
+                    session.rollback()
                 return False
             source_rule_group_id = session.scalar(
                 select(Proposal.source_rule_group_id).where(
@@ -769,6 +783,7 @@ class OrderRepository:
         reasons: tuple[str, ...],
         now: datetime,
         *,
+        breaker_trips=(),
         actor: str,
         reason: str,
         request_id: str,
@@ -800,6 +815,16 @@ class OrderRepository:
                     reason="execution-time: " + "; ".join(reasons),
                 )
             )
+            for intent in breaker_trips:
+                trip_in_session(
+                    session,
+                    intent.scope,
+                    intent.reason,
+                    actor,
+                    request_id=request_id,
+                    now=now,
+                    audit_reason=reason,
+                )
             _audit_order_mutation(
                 session,
                 order_id=order_id,

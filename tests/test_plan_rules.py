@@ -12,7 +12,7 @@ from sqlalchemy import select
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.daemon import rules_engine
 from trading_assistant.daemon.monitor import Monitor
-from trading_assistant.db.models import Order, Rule
+from trading_assistant.db.models import Order, Rule, TradePlanRow
 from trading_assistant.notifications.base import NullNotifier
 
 
@@ -26,6 +26,21 @@ def _add_rule(svc, **kw):
     )
     deadline = kw.pop("deadline", None)
     assert not kw
+    if plan_id is not None:
+        with svc.session_factory() as session:
+            if session.get(TradePlanRow, plan_id) is None:
+                session.add(
+                    TradePlanRow(
+                        id=plan_id,
+                        symbol=ticker,
+                        action="buy",
+                        status="approved",
+                        paper_only=True,
+                        plan_json="{}",
+                        sized_json="{}",
+                    )
+                )
+                session.commit()
     if kind == "time":
         condition = {"type": "time", "deadline": deadline.isoformat()}
     result = svc.create_conditional_rule(
@@ -106,8 +121,8 @@ def test_unrepresentable_runtime_hwm_cannot_corrupt_restart(make_service):
         )
 
 
-# ── OCO: a stop firing cancels the plan's siblings ──────────────
-def test_oco_cancels_siblings_atomically(make_service):
+# ── Plan exits settle only from broker-confirmed execution ──────
+def test_plan_stop_proposal_preserves_sibling_protection(make_service):
     from trading_assistant.broker.mock import MockBroker
     from trading_assistant.broker.models import Position
 
@@ -126,14 +141,15 @@ def test_oco_cancels_siblings_atomically(make_service):
 
     svc.broker.set_price("AAPL", Decimal("85"))            # only the stop's condition is true
     acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
-    assert len(acted) == 1 and acted[0]["oco_canceled"] == 2
+    assert len(acted) == 1 and acted[0]["oco_canceled"] == 0
     assert acted[0]["executed"] is None
     assert broker._orders_by_key == {}
 
     with svc.session_factory() as s:
         states = {r.kind: r.state for r in s.execute(select(Rule)).scalars()}
-    assert states["stop"] == "triggered"
-    assert states["entry"] == "canceled" and states["target"] == "canceled"
+    assert states["stop"] == "processing"
+    assert states["entry"] == "active"
+    assert states["target"] == "active"
 
 
 def test_full_exit_is_capped_to_unreserved_live_position(make_service):

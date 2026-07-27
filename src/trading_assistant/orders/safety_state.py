@@ -373,7 +373,7 @@ def _enumerate_unsafe_local_state_in_session(
         "active_rules",
         select(Rule.id)
         .where(
-            Rule.state.in_(("active", "processing"))
+            Rule.state.in_(("pending", "active", "processing"))
         )
         .order_by(Rule.id),
     )
@@ -382,7 +382,7 @@ def _enumerate_unsafe_local_state_in_session(
         select(RuleGroup.id)
         .where(
             or_(
-                RuleGroup.state == "active",
+                RuleGroup.state.in_(("pending", "active")),
                 RuleGroup.reconciliation_required.is_(True),
             )
         )

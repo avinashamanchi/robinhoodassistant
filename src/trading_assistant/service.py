@@ -17,10 +17,10 @@ import json
 import logging
 import uuid
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .broker.base import BrokerClient
@@ -43,10 +43,14 @@ from .db.models import (
     Order,
     OrderStateMachine,
     NONTERMINAL_STATES,
+    PLAN_CANCEL_INDETERMINATE,
+    PLAN_CANCEL_REQUESTED,
+    PLAN_CANCEL_SETTLED,
     Proposal,
     RiskEvent,
     Rule,
     RuleGroup,
+    TERMINAL_STATES,
     fill_has_trusted_identity,
     utcnow,
 )
@@ -89,7 +93,8 @@ _EXIT_RESERVATION_STATUSES = (
     OrderStatus.PARTIALLY_FILLED.value,
 )
 
-_RESUMABLE_RULE_STATES = ("active", "processing")
+_RESUMABLE_RULE_STATES = ("pending", "active", "processing")
+_RESUMABLE_RULE_GROUP_STATES = ("pending", "active")
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +191,12 @@ class TradingService:
         )
         self.rule_application = RuleApplicationService(
             self, self.rule_repository
+        )
+        self.order_submission.reconcile_immediate_fill = (
+            self._reconcile_immediate_submission_fill
+        )
+        self.order_submission.validate_plan_exit = (
+            self._validate_plan_exit_submission
         )
 
     def _audit_dependency_failure(
@@ -442,6 +453,15 @@ class TradingService:
             # but never change the outcome.
             for warning in result.warnings:
                 s.add(RiskEvent(order_id=order.id, event_type="warning", reason=warning))
+            for intent in result.breaker_trips:
+                trip_in_session(
+                    s,
+                    intent.scope,
+                    intent.reason,
+                    actor,
+                    request_id=request_id,
+                    audit_reason=reason,
+                )
             s.add(
                 AuditEvent(
                     actor=actor,
@@ -795,6 +815,10 @@ class TradingService:
                         else 0
                     ),
                 },
+                "active_breakers": [
+                    breaker.as_active_dict()
+                    for breaker in safety.active_breakers
+                ],
                 "safety": safety.as_dict(),
             }
             if not safety.complete:
@@ -859,63 +883,285 @@ class TradingService:
             audit_reason=reason,
         )
 
-    @staticmethod
-    def _reset_health_complete(snapshot: PortfolioSnapshot) -> bool:
-        daily_total = (
-            snapshot.realized_pnl_today
-            + snapshot.unrealized_pnl_today
+    def _reset_symbols(
+        self,
+        asset_class: AssetClass,
+    ) -> list[str]:
+        config = (
+            self.config.crypto_risk or self.config.risk
+            if asset_class is AssetClass.CRYPTO
+            else self.config.risk
         )
-        return (
-            snapshot.daily_pnl_complete is True
-            and snapshot.broker_reconciled is True
-            and snapshot.account_complete is True
-            and snapshot.pending_exposure_complete is True
-            and snapshot.quote_fresh is True
-            and snapshot.market_clock_complete is True
-            and daily_total.is_finite()
-            and snapshot.account_equity.is_finite()
-            and snapshot.account_equity > 0
+        return sorted(
+            {
+                symbol.upper()
+                for symbol in config.ticker_allowlist
+                if self._asset_class(symbol) is asset_class
+            }
         )
+
+    def _reset_snapshot(
+        self,
+        symbols: list[str],
+        asset_class: AssetClass,
+    ) -> PortfolioSnapshot:
+        if not symbols:
+            raise RequiredDependencyUnavailable
+        if len(symbols) == 1:
+            return self.snapshot_service.assemble_for_execution(
+                symbols[0]
+            )
+        with self.session_factory() as session:
+            return self.assemble_snapshot(
+                session,
+                symbols,
+                asset_class,
+                required_dependencies=True,
+            )
+
+    def _collect_scope_reset_health(
+        self,
+        scope: BreakerScope,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        if scope.kind.value in {"loss", "drawdown", "data"}:
+            asset_class = AssetClass(scope.target)
+            symbols = self._reset_symbols(asset_class)
+            snapshot = self._reset_snapshot(
+                (
+                    symbols
+                    if scope.kind.value == "data"
+                    else symbols[:1]
+                ),
+                asset_class,
+            )
+            base = {
+                "captured_at": snapshot.as_of.isoformat(),
+                "asset_class": asset_class.value,
+                "symbols": symbols,
+                "broker_reconciled": snapshot.broker_reconciled,
+            }
+            if scope.kind.value == "data":
+                quotes_valid = (
+                    snapshot.quote_fresh is True
+                    and set(symbols).issubset(snapshot.quotes)
+                    and all(
+                        snapshot.quotes[symbol].is_valid
+                        for symbol in symbols
+                    )
+                )
+                if not quotes_valid:
+                    raise RequiredDependencyUnavailable
+                return {
+                    **base,
+                    "quote_fresh": True,
+                    "quote_count": len(symbols),
+                }
+            if scope.kind.value == "loss":
+                daily_total = (
+                    snapshot.realized_pnl_today
+                    + snapshot.unrealized_pnl_today
+                )
+                config = (
+                    self.config.crypto_risk or self.config.risk
+                    if asset_class is AssetClass.CRYPTO
+                    else self.config.risk
+                )
+                healthy = (
+                    snapshot.daily_pnl_complete is True
+                    and snapshot.broker_reconciled is True
+                    and snapshot.account_complete is True
+                    and snapshot.pending_exposure_complete is True
+                    and snapshot.quote_fresh is True
+                    and snapshot.market_clock_complete is True
+                    and daily_total.is_finite()
+                    and snapshot.realized_pnl_today.is_finite()
+                    and daily_total
+                    > -Decimal(str(config.max_daily_total_loss))
+                    and snapshot.realized_pnl_today
+                    > -Decimal(
+                        str(config.daily_realized_loss_limit)
+                    )
+                )
+                if not healthy:
+                    raise RequiredDependencyUnavailable
+                return {
+                    **base,
+                    "daily_pnl_complete": True,
+                    "daily_total_pnl": str(daily_total),
+                    "realized_pnl_today": str(
+                        snapshot.realized_pnl_today
+                    ),
+                    "account_equity": str(
+                        snapshot.account_equity
+                    ),
+                    "quote_fresh": snapshot.quote_fresh,
+                }
+            config = (
+                self.config.crypto_risk or self.config.risk
+                if asset_class is AssetClass.CRYPTO
+                else self.config.risk
+            )
+            drawdown = (
+                (
+                    snapshot.account_high_water_mark
+                    - snapshot.account_equity
+                )
+                / snapshot.account_high_water_mark
+                * Decimal(100)
+                if (
+                    snapshot.account_complete
+                    and snapshot.account_high_water_mark > 0
+                )
+                else Decimal("Infinity")
+            )
+            if (
+                not snapshot.account_complete
+                or not snapshot.broker_reconciled
+                or not drawdown.is_finite()
+                or drawdown
+                >= Decimal(
+                    str(config.max_account_drawdown_pct)
+                )
+            ):
+                raise RequiredDependencyUnavailable
+            return {
+                **base,
+                "account_equity": str(snapshot.account_equity),
+                "account_high_water_mark": str(
+                    snapshot.account_high_water_mark
+                ),
+                "drawdown_pct": str(drawdown),
+            }
+
+        if scope.kind.value == "liquidity":
+            symbol = scope.target
+            asset_class = self._asset_class(symbol)
+            config = (
+                self.config.crypto_risk or self.config.risk
+                if asset_class is AssetClass.CRYPTO
+                else self.config.risk
+            )
+            if symbol not in {
+                item.upper() for item in config.ticker_allowlist
+            }:
+                raise RequiredDependencyUnavailable
+            snapshot = self._reset_snapshot(
+                [symbol],
+                asset_class,
+            )
+            spread = snapshot.spread_pct_by_ticker.get(symbol)
+            if (
+                not snapshot.quote_fresh
+                or not snapshot.broker_reconciled
+                or spread is None
+                or not spread.is_finite()
+                or spread
+                > Decimal(str(config.max_spread_pct))
+            ):
+                raise RequiredDependencyUnavailable
+            return {
+                "captured_at": snapshot.as_of.isoformat(),
+                "symbol": symbol,
+                "quote_fresh": True,
+                "spread_pct": str(spread),
+                "broker_reconciled": True,
+            }
+
+        order_report = self.sync_open_orders(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        position_report = self.reconcile_positions(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        clean_reconciliation = (
+            order_report["failed"] == 0
+            and order_report["plan_order_cancel_failures"] == 0
+            and not order_report["broker_drift"]
+            and position_report["reconciled"] is True
+            and not position_report["drift"]
+        )
+        if not clean_reconciliation:
+            raise RequiredDependencyUnavailable
+        if scope.kind.value == "broker_drift":
+            return {
+                "captured_at": utcnow().isoformat(),
+                "order_reconciliation": "clean",
+                "position_reconciliation": "clean",
+            }
+
+        try:
+            remote_open_orders = self.broker.get_open_orders()
+        except Exception:
+            raise RequiredDependencyUnavailable from None
+        safety = read_persisted_safety_truth(
+            self.session_factory
+        )
+        unsafe = safety.unsafe_local_state.as_dict()
+        unsafe_ids = [
+            value
+            for key, value in unsafe.items()
+            if key != "enumeration" and isinstance(value, list)
+        ]
+        other_active = [
+            breaker.scope
+            for breaker in safety.active_breakers
+            if breaker.scope != scope.key
+        ]
+        if (
+            remote_open_orders
+            or not safety.complete
+            or safety.unsafe_local_state.enumeration
+            != "confirmed"
+            or any(unsafe_ids)
+            or other_active
+        ):
+            raise RequiredDependencyUnavailable
+        return {
+            "captured_at": safety.observed_at.isoformat(),
+            "remote_open_orders": 0,
+            "local_enumeration": "confirmed",
+            "other_active_breakers": [],
+            "order_reconciliation": "clean",
+            "position_reconciliation": "clean",
+        }
 
     def reset_killswitch(
         self,
-        asset_class: AssetClass | str,
+        scope: BreakerScope | AssetClass | str,
         *,
         actor: str,
         reason: str,
         expected_generation: int,
         request_id: str,
     ) -> dict[str, Any]:
-        ac = (
-            asset_class
-            if isinstance(asset_class, AssetClass)
-            else AssetClass(asset_class)
+        parsed_scope = (
+            scope
+            if isinstance(scope, BreakerScope)
+            else (
+                BreakerScope.loss(scope)
+                if isinstance(scope, AssetClass)
+                else BreakerScope.parse(scope)
+            )
         )
         actor, reason, request_id = _require_mutation_context(
             actor,
             reason,
             request_id,
         )
-        risk_config = (
-            self.config.crypto_risk or self.config.risk
-            if ac is AssetClass.CRYPTO
-            else self.config.risk
-        )
-        probe_symbol = next(
-            (
-                symbol
-                for symbol in risk_config.ticker_allowlist
-                if self._asset_class(symbol) is ac
-            ),
-            None,
-        )
-        if probe_symbol is None:
-            raise RuntimeError(
-                f"no configured {ac.value} symbol for fresh breaker health"
-            )
         try:
-            snapshot = self.snapshot_service.assemble_for_execution(
-                probe_symbol
+            prior_health = self._collect_scope_reset_health(
+                parsed_scope,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
             )
         except RequiredDependencyUnavailable:
             self._audit_dependency_failure(
@@ -924,43 +1170,16 @@ class TradingService:
                 request_id=request_id,
                 action="circuit_breaker.reset",
                 target_type="circuit_breaker",
-                target_id=BreakerScope.loss(ac).key,
+                target_id=parsed_scope.key,
                 detail={
-                    "asset_class": ac.value,
+                    "scope": parsed_scope.key,
                     "expected_generation": expected_generation,
                     "stage": "health_collection",
                 },
             )
             raise RequiredDependencyUnavailable from None
-        if not self._reset_health_complete(snapshot):
-            self._audit_dependency_failure(
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-                action="circuit_breaker.reset",
-                target_type="circuit_breaker",
-                target_id=BreakerScope.loss(ac).key,
-                detail={
-                    "asset_class": ac.value,
-                    "expected_generation": expected_generation,
-                    "stage": "health_validation",
-                },
-            )
-            raise RequiredDependencyUnavailable
-        prior_health = {
-            "captured_at": snapshot.as_of.isoformat(),
-            "daily_pnl_complete": snapshot.daily_pnl_complete,
-            "daily_total_pnl": str(
-                snapshot.realized_pnl_today
-                + snapshot.unrealized_pnl_today
-            ),
-            "broker_reconciled": snapshot.broker_reconciled,
-            "account_equity": str(snapshot.account_equity),
-            "quote_fresh": snapshot.quote_fresh,
-            "active_breakers": sorted(snapshot.active_breakers),
-        }
         state = self.breakers.reset(
-            BreakerScope.loss(ac),
+            parsed_scope,
             actor=actor,
             reason=reason,
             prior_health=prior_health,
@@ -969,7 +1188,15 @@ class TradingService:
         )
         return {
             "killswitch": "reset",
-            "asset_class": ac.value,
+            "scope": parsed_scope.key,
+            "kind": parsed_scope.kind.value,
+            "target": parsed_scope.target,
+            "asset_class": (
+                parsed_scope.target
+                if parsed_scope.kind.value
+                in {"loss", "drawdown", "data"}
+                else None
+            ),
             "tripped": state.tripped,
             "generation": state.generation,
         }
@@ -1085,6 +1312,15 @@ class TradingService:
                 )
             if order_sync.get("failed", 0) and not faults:
                 faults.append("broker order reconciliation failed")
+            remaining_plan_cancels = order_sync.get(
+                "remaining_plan_cancel_intents",
+                [],
+            )
+            if remaining_plan_cancels:
+                faults.append(
+                    "unresolved plan cancellation intents "
+                    f"{remaining_plan_cancels}"
+                )
             if faults:
                 failure = " | ".join(str(fault) for fault in faults[:3])
                 self.startup_reconciliation.fail(
@@ -1151,6 +1387,76 @@ class TradingService:
                 detail={"stage": "broker_order_sync"},
             )
             raise RequiredDependencyUnavailable from None
+        before_cancellation = (
+            self.rule_repository.refresh_fill_activated_rules(
+                now=utcnow(),
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+        )
+        plan_cancellation = (
+            self._cancel_plan_orders_after_exit_fill(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+        )
+        after_cancellation = self.rule_repository.refresh_fill_activated_rules(
+            now=utcnow(),
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        remaining_plan_cancel_intents = (
+            self.rule_repository.plan_cancellation_intent_order_ids()
+        )
+        plan_cancel_failures = max(
+            plan_cancellation["failed"],
+            len(remaining_plan_cancel_intents),
+        )
+        result["exit_groups_activated"] = (
+            before_cancellation.groups_activated
+            + after_cancellation.groups_activated
+        )
+        result["exit_rules_activated"] = (
+            before_cancellation.rules_activated
+            + after_cancellation.rules_activated
+        )
+        result["exit_rules_resized"] = (
+            before_cancellation.rules_resized
+            + after_cancellation.rules_resized
+        )
+        result["plan_rules_settled"] = (
+            before_cancellation.rules_settled
+            + after_cancellation.rules_settled
+        )
+        result["plans_completed"] = (
+            before_cancellation.plans_completed
+            + after_cancellation.plans_completed
+        )
+        result["plan_orders_canceled"] = plan_cancellation[
+            "canceled"
+        ]
+        result["plan_order_cancel_failures"] = plan_cancel_failures
+        result["remaining_plan_cancel_intents"] = (
+            remaining_plan_cancel_intents
+        )
+        result["failed"] += plan_cancel_failures
+        if plan_cancel_failures:
+            self.breakers.trip(
+                BreakerScope.broker_drift(),
+                (
+                    "plan cancellation remains unresolved for orders "
+                    + ",".join(
+                        str(order_id)
+                        for order_id in remaining_plan_cancel_intents
+                    )
+                ),
+                actor,
+                request_id=request_id,
+                audit_reason=reason,
+            )
         with self.session_factory() as session:
             session.add(
                 AuditEvent(
@@ -1181,6 +1487,231 @@ class TradingService:
             )
             session.commit()
         return result
+
+    def _validate_plan_exit_submission(
+        self,
+        order_id: int,
+        request: OrderRequest,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> str | None:
+        try:
+            positions = {
+                position.ticker.upper(): position
+                for position in self.broker.get_positions()
+            }
+            position = positions.get(request.ticker.upper())
+            broker_position_qty = (
+                position.qty
+                if position is not None
+                else Decimal(0)
+            )
+        except Exception:
+            error = "plan allocation broker truth is unavailable"
+            self.breakers.trip(
+                BreakerScope.broker_drift(),
+                error,
+                actor,
+                request_id=request_id,
+                audit_reason=reason,
+            )
+            return error
+        error = self.rule_repository.validate_plan_exit_submission(
+            order_id,
+            request.qty,
+            broker_position_qty,
+        )
+        if error in {
+            "plan has negative trusted residual quantity",
+            "plan allocation cannot be proven from reconciled fill truth",
+            "plan allocation exceeds reconciled broker position",
+        }:
+            self.breakers.trip(
+                BreakerScope.broker_drift(),
+                error,
+                actor,
+                request_id=request_id,
+                audit_reason=reason,
+            )
+        if error is not None:
+            return error
+        if self.rule_repository.is_plan_exit_order(order_id):
+            return None
+        allocated, allocation_exact = (
+            self.rule_repository.plan_allocation_truth(
+                request.ticker,
+                request.side.value,
+            )
+        )
+        if not allocation_exact:
+            error = (
+                "plan allocation cannot be proven from "
+                "reconciled fill truth"
+            )
+            self.breakers.trip(
+                BreakerScope.broker_drift(),
+                error,
+                actor,
+                request_id=request_id,
+                audit_reason=reason,
+            )
+            return error
+        if allocated <= 0:
+            return None
+        if request.qty is not None:
+            requested_qty = request.qty
+        else:
+            try:
+                quote = self.broker.get_quote(request.ticker)
+                if not quote.is_valid:
+                    raise ValueError
+                requested_qty = request.notional / quote.last
+            except Exception:
+                error = "plan allocation broker truth is unavailable"
+                self.breakers.trip(
+                    BreakerScope.broker_drift(),
+                    error,
+                    actor,
+                    request_id=request_id,
+                    audit_reason=reason,
+                )
+                return error
+        reducible = (
+            max(broker_position_qty, Decimal(0))
+            if request.side is OrderSide.SELL
+            else max(-broker_position_qty, Decimal(0))
+        )
+        if reducible > 0 and requested_qty > max(
+            reducible - allocated,
+            Decimal(0),
+        ):
+            return "order would consume plan-allocated position"
+        return None
+
+    def _reconcile_immediate_submission_fill(
+        self,
+        order_id: int,
+        reported_filled_qty: Decimal,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> bool:
+        """Require exact fill truth and activated plan exits before returning."""
+        failure_reason = (
+            f"immediate fill for order {order_id} was not exactly "
+            "reconciled before submission returned"
+        )
+        try:
+            report = self.sync_open_orders(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            with self.session_factory() as session:
+                order = session.get(Order, order_id)
+                exact_qty = session.scalar(
+                    select(func.coalesce(func.sum(Fill.qty), 0)).where(
+                        Fill.order_id == order_id,
+                        Fill.reconciliation_state == "trusted",
+                        Fill.broker_fill_id.is_not(None),
+                        Fill.broker_fill_id != "",
+                    )
+                )
+                proposal = session.scalar(
+                    select(Proposal).where(
+                        Proposal.order_id == order_id
+                    )
+                )
+                source_rule = (
+                    session.get(Rule, proposal.source_rule_id)
+                    if proposal is not None
+                    and proposal.source_rule_id is not None
+                    else None
+                )
+                protection_ready = True
+                if (
+                    source_rule is not None
+                    and source_rule.plan_id is not None
+                    and source_rule.kind == "entry"
+                ):
+                    truth = (
+                        self.rule_repository.plan_execution_truth(
+                            source_rule.plan_id
+                        )
+                    )
+                    downside_rules = list(
+                        session.scalars(
+                            select(Rule)
+                            .join(
+                                RuleGroup,
+                                RuleGroup.id == Rule.group_id,
+                            )
+                            .where(
+                                Rule.plan_id == source_rule.plan_id,
+                                Rule.kind.in_(
+                                    {"stop", "trailing"}
+                                ),
+                                Rule.state == "active",
+                                RuleGroup.state == "active",
+                                RuleGroup.reconciliation_required.is_(
+                                    False
+                                ),
+                            )
+                        ).all()
+                    )
+                    protected_qty = Decimal(0)
+                    for downside_rule in downside_rules:
+                        try:
+                            action = json.loads(
+                                downside_rule.action_json
+                            )
+                            qty = Decimal(str(action.get("qty")))
+                        except (
+                            json.JSONDecodeError,
+                            InvalidOperation,
+                            TypeError,
+                            ValueError,
+                        ):
+                            qty = Decimal(0)
+                        protected_qty = max(protected_qty, qty)
+                    protection_ready = bool(
+                        truth.residual_qty > 0
+                        and not truth.reconciliation_required
+                        and not truth.unresolved_order_ids
+                        and protected_qty >= truth.residual_qty
+                    )
+                confirmed = bool(
+                    order is not None
+                    and order.acceptance_state
+                    != FILL_RECONCILIATION_REQUIRED
+                    and Decimal(str(exact_qty))
+                    == reported_filled_qty
+                    and report["failed"] == 0
+                    and report["plan_order_cancel_failures"] == 0
+                    and protection_ready
+                )
+        except Exception:
+            confirmed = False
+        if confirmed:
+            return True
+        self.breakers.trip(
+            BreakerScope.broker_drift(),
+            failure_reason,
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
+        )
+        self.breakers.trip(
+            BreakerScope.operator_global(),
+            failure_reason,
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
+        )
+        return False
 
     def cancel_live_order(
         self,
@@ -1229,6 +1760,349 @@ class TradingService:
                 session.commit()
             return result
 
+    @staticmethod
+    def _record_plan_cancel_state(
+        session: Session,
+        order: Order,
+        state: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        now,
+    ) -> None:
+        if state not in {
+            PLAN_CANCEL_REQUESTED,
+            PLAN_CANCEL_INDETERMINATE,
+            PLAN_CANCEL_SETTLED,
+        }:
+            raise ValueError("invalid durable plan cancellation state")
+        if order.plan_cancel_state == state:
+            return
+        order.plan_cancel_state = state
+        order.updated_at = now
+        order.version += 1
+        session.add(
+            AuditEvent(
+                actor=actor,
+                action="order.plan_cancel_intent",
+                target_type="order",
+                target_id=str(order.id),
+                request_id=request_id,
+                reason=reason,
+                result_code=state,
+                created_at=now,
+            )
+        )
+
+    @serialized_writer
+    def quiesce_trade_plan_orders(
+        self,
+        plan_id: int,
+        *,
+        entry_only: bool = False,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, int]:
+        """Make every plan-linked order terminal before rule cancellation."""
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
+        canceled = 0
+        failed = 0
+        order_ids = (
+            self.rule_repository.plan_entry_nonterminal_order_ids(
+                plan_id
+            )
+            if entry_only
+            else self.rule_repository.plan_nonterminal_order_ids(
+                plan_id
+            )
+        )
+        for order_id in order_ids:
+            with self.session_factory() as session:
+                order = session.get(Order, order_id)
+                if order is None:
+                    failed += 1
+                    continue
+                current = OrderStatus(order.status)
+                if current in {
+                    OrderStatus.PROPOSED,
+                    OrderStatus.APPROVAL_RECORDED,
+                }:
+                    target = (
+                        OrderStatus.CANCELED
+                        if current is OrderStatus.PROPOSED
+                        else OrderStatus.REJECTED
+                    )
+                    OrderStateMachine.transition(order, target)
+                    order.last_error_code = "plan_cancel"
+                    self._record_plan_cancel_state(
+                        session,
+                        order,
+                        PLAN_CANCEL_SETTLED,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                        now=utcnow(),
+                    )
+                    session.add(
+                        AuditEvent(
+                            actor=actor,
+                            action="order.plan_cancel",
+                            target_type="order",
+                            target_id=str(order_id),
+                            request_id=request_id,
+                            reason=reason,
+                            result_code=target.value,
+                        )
+                    )
+                    session.commit()
+                    canceled += 1
+                    continue
+                if current not in {
+                    OrderStatus.SUBMITTED,
+                    OrderStatus.PARTIALLY_FILLED,
+                }:
+                    if order.plan_cancel_state not in {
+                        PLAN_CANCEL_REQUESTED,
+                        PLAN_CANCEL_INDETERMINATE,
+                    }:
+                        self._record_plan_cancel_state(
+                            session,
+                            order,
+                            PLAN_CANCEL_REQUESTED,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            now=utcnow(),
+                        )
+                    trip_in_session(
+                        session,
+                        BreakerScope.broker_drift(),
+                        (
+                            f"plan {plan_id} cancellation found "
+                            f"indeterminate order {order_id} in "
+                            f"state {current.value}"
+                        ),
+                        actor,
+                        request_id=request_id,
+                        audit_reason=reason,
+                    )
+                    session.commit()
+                    failed += 1
+                    continue
+                order.last_error_code = "plan_cancel"
+                if order.plan_cancel_state not in {
+                    PLAN_CANCEL_REQUESTED,
+                    PLAN_CANCEL_INDETERMINATE,
+                }:
+                    self._record_plan_cancel_state(
+                        session,
+                        order,
+                        PLAN_CANCEL_REQUESTED,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                        now=utcnow(),
+                    )
+                session.add(
+                    AuditEvent(
+                        actor=actor,
+                        action="order.plan_broker_cancel",
+                        target_type="order",
+                        target_id=str(order_id),
+                        request_id=request_id,
+                        reason=reason,
+                        result_code="requested",
+                    )
+                )
+                session.commit()
+            outcome = self._cancel_live_order_under_writer(
+                order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                settle_plan_lifecycle=False,
+            )
+            if "error" in outcome:
+                self.breakers.trip(
+                    BreakerScope.broker_drift(),
+                    (
+                        f"plan {plan_id} cancellation remains "
+                        f"unresolved for order {order_id}"
+                    ),
+                    actor,
+                    request_id=request_id,
+                    audit_reason=reason,
+                )
+                failed += 1
+            else:
+                canceled += 1
+        remaining = len(
+            (
+                self.rule_repository.plan_entry_nonterminal_order_ids(
+                    plan_id
+                )
+                if entry_only
+                else self.rule_repository.plan_nonterminal_order_ids(
+                    plan_id
+                )
+            )
+        )
+        return {
+            "canceled": canceled,
+            # Every still-live row has already contributed to ``failed`` when
+            # its local or broker cancellation could not be confirmed. Keep
+            # the count cardinal rather than double-counting those rows.
+            "failed": max(failed, remaining),
+            "remaining": remaining,
+        }
+
+    @serialized_writer
+    def _cancel_plan_orders_after_exit_fill(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, int]:
+        """Cancel broker-live entries/siblings before a filled exit closes a plan."""
+        canceled = 0
+        failed = 0
+        seen: set[int] = set()
+        while True:
+            candidates = [
+                order_id
+                for order_id in sorted(
+                    set(
+                        self.rule_repository
+                        .plan_order_ids_requiring_broker_cancel()
+                    )
+                    | set(
+                        self.rule_repository
+                        .plan_cancellation_intent_order_ids()
+                    )
+                )
+                if order_id not in seen
+            ]
+            if not candidates:
+                break
+            for order_id in candidates:
+                seen.add(order_id)
+                with self.session_factory() as session:
+                    order = session.get(Order, order_id)
+                    if order is None:
+                        failed += 1
+                        continue
+                    current = OrderStatus(order.status)
+                    if (
+                        current in TERMINAL_STATES
+                        and order.acceptance_state
+                        != FILL_RECONCILIATION_REQUIRED
+                    ):
+                        self._record_plan_cancel_state(
+                            session,
+                            order,
+                            PLAN_CANCEL_SETTLED,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            now=utcnow(),
+                        )
+                        session.commit()
+                        canceled += 1
+                        continue
+                    if current not in {
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                    }:
+                        if order.plan_cancel_state not in {
+                            PLAN_CANCEL_REQUESTED,
+                            PLAN_CANCEL_INDETERMINATE,
+                        }:
+                            self._record_plan_cancel_state(
+                                session,
+                                order,
+                                PLAN_CANCEL_REQUESTED,
+                                actor=actor,
+                                reason=reason,
+                                request_id=request_id,
+                                now=utcnow(),
+                            )
+                        trip_in_session(
+                            session,
+                            BreakerScope.broker_drift(),
+                            (
+                                "plan exit requires cancellation of "
+                                f"indeterminate order {order_id} in "
+                                f"state {current.value}"
+                            ),
+                            actor,
+                            request_id=request_id,
+                            audit_reason=reason,
+                        )
+                        session.commit()
+                        failed += 1
+                        continue
+                    if order.last_error_code not in {
+                        "plan_cancel",
+                        "plan_exit_entry_cancel",
+                    }:
+                        order.last_error_code = (
+                            "plan_exit_entry_cancel"
+                        )
+                    if order.plan_cancel_state not in {
+                        PLAN_CANCEL_REQUESTED,
+                        PLAN_CANCEL_INDETERMINATE,
+                    }:
+                        self._record_plan_cancel_state(
+                            session,
+                            order,
+                            PLAN_CANCEL_REQUESTED,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            now=utcnow(),
+                        )
+                    session.add(
+                        AuditEvent(
+                            actor=actor,
+                            action="order.plan_broker_cancel",
+                            target_type="order",
+                            target_id=str(order_id),
+                            request_id=request_id,
+                            reason=reason,
+                            result_code="requested",
+                        )
+                    )
+                    session.commit()
+                outcome = self._cancel_live_order_under_writer(
+                    order_id,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    settle_plan_lifecycle=False,
+                )
+                if "error" in outcome:
+                    self.breakers.trip(
+                        BreakerScope.broker_drift(),
+                        (
+                            "plan exit cancellation remains "
+                            f"unresolved for order {order_id}"
+                        ),
+                        actor,
+                        request_id=request_id,
+                        audit_reason=reason,
+                    )
+                    failed += 1
+                else:
+                    canceled += 1
+        return {"canceled": canceled, "failed": failed}
+
     def _cancel_live_order_under_writer(
         self,
         order_id: int,
@@ -1236,6 +2110,7 @@ class TradingService:
         actor: str,
         reason: str,
         request_id: str,
+        settle_plan_lifecycle: bool = True,
     ) -> dict[str, Any]:
         with self.session_factory() as s:
             order = s.get(Order, order_id)
@@ -1293,8 +2168,22 @@ class TradingService:
                         FILL_RECONCILIATION_REQUIRED
                     )
                     order.last_error_code = "indeterminate_cancel"
-                    order.updated_at = now
-                    order.version += 1
+                    if order.plan_cancel_state in {
+                        PLAN_CANCEL_REQUESTED,
+                        PLAN_CANCEL_INDETERMINATE,
+                    }:
+                        self._record_plan_cancel_state(
+                            session,
+                            order,
+                            PLAN_CANCEL_INDETERMINATE,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            now=now,
+                        )
+                    else:
+                        order.updated_at = now
+                        order.version += 1
                     session.add(
                         AuditEvent(
                             actor=actor,
@@ -1323,22 +2212,78 @@ class TradingService:
                     "error": "broker cancellation could not be confirmed",
                 }
         broker_status = broker_result.status
-        sync = self.sync_open_orders(
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
+        if settle_plan_lifecycle:
+            sync = self.sync_open_orders(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+        else:
+            sync = self.serialize_reconciliation_report(
+                self.reconciliation.reconcile(
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
         current = self.get_order_status(order_id)
+        with self.session_factory() as session:
+            current_row = session.get(Order, order_id)
+            exact_fill_truth_confirmed = bool(
+                current_row is not None
+                and current_row.acceptance_state
+                != FILL_RECONCILIATION_REQUIRED
+            )
+            terminal_exact = bool(
+                current_row is not None
+                and OrderStatus(current_row.status)
+                in TERMINAL_STATES
+                and exact_fill_truth_confirmed
+            )
+            plan_cancel_settled = bool(
+                terminal_exact
+                and current_row is not None
+                and current_row.plan_cancel_state
+                in {
+                    PLAN_CANCEL_REQUESTED,
+                    PLAN_CANCEL_INDETERMINATE,
+                }
+            )
+            if plan_cancel_settled:
+                self._record_plan_cancel_state(
+                    session,
+                    current_row,
+                    PLAN_CANCEL_SETTLED,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    now=utcnow(),
+                )
+                session.commit()
         if (
             broker_status is OrderStatus.CANCELED
             and current is not None
             and current["status"] == OrderStatus.CANCELED.value
+            and exact_fill_truth_confirmed
+        ):
+            return {"order_id": order_id, "status": current["status"]}
+        if (
+            plan_cancel_settled
+            and not settle_plan_lifecycle
+            and current is not None
         ):
             return {"order_id": order_id, "status": current["status"]}
         return {
             "order_id": order_id,
             "status": current["status"] if current else None,
-            "error": f"broker order was not canceled; reported {broker_status.value}",
+            "error": (
+                "broker cancellation lacks exact fill confirmation"
+                if not exact_fill_truth_confirmed
+                else (
+                    "broker order was not canceled; reported "
+                    f"{broker_status.value}"
+                )
+            ),
             "sync": sync,
         }
 
@@ -1957,6 +2902,12 @@ class TradingService:
             rule = s.get(Rule, rule_id)
             if rule is None:
                 return {"rule_id": rule_id, "canceled": False, "error": "not found"}
+            if rule.plan_id is not None:
+                return {
+                    "rule_id": rule_id,
+                    "canceled": False,
+                    "error": "plan_rule_requires_plan_cancel",
+                }
             if rule.state not in _RESUMABLE_RULE_STATES:
                 return {
                     "rule_id": rule_id,
@@ -1970,7 +2921,7 @@ class TradingService:
                     "canceled": False,
                     "error": "rule group not found",
                 }
-            if group.state != "active":
+            if group.state not in _RESUMABLE_RULE_GROUP_STATES:
                 return {
                     "rule_id": rule_id,
                     "canceled": False,
@@ -1984,7 +2935,9 @@ class TradingService:
                     Rule.state.in_(_RESUMABLE_RULE_STATES),
                     Rule.group_id.in_(
                         select(RuleGroup.id).where(
-                            RuleGroup.state == "active"
+                            RuleGroup.state.in_(
+                                _RESUMABLE_RULE_GROUP_STATES
+                            )
                         )
                     ),
                 )
@@ -2010,7 +2963,9 @@ class TradingService:
                     update(RuleGroup)
                     .where(
                         RuleGroup.id == rule.group_id,
-                        RuleGroup.state == "active",
+                        RuleGroup.state.in_(
+                            _RESUMABLE_RULE_GROUP_STATES
+                        ),
                     )
                     .values(
                         state="canceled",
@@ -2079,4 +3034,6 @@ class TradingService:
             "action": json.loads(r.action_json),
             "state": r.state,
             "pre_approved": r.pre_approved,
+            "activation": r.activation,
+            "terminal_on_trigger": r.terminal_on_trigger,
         }

@@ -205,6 +205,15 @@ class Order(Base):
         UTCDateTime(), nullable=True
     )
     last_error_code: Mapped[str] = mapped_column(String(64), default="")
+    # Durable plan-order cancellation intent. Error classification is kept in
+    # ``last_error_code`` so an indeterminate broker response can never erase
+    # the retry obligation.
+    plan_cancel_state: Mapped[str] = mapped_column(
+        String(16),
+        default="none",
+        server_default="none",
+        index=True,
+    )
     version: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
@@ -219,6 +228,10 @@ FILL_RECONCILIATION_REQUIRED = "fill_reconcile_required"
 FILL_RECONCILIATION_TRUSTED = "trusted"
 FILL_RECONCILIATION_QUARANTINED = "quarantined"
 FILL_RECONCILIATION_SUPERSEDED = "superseded"
+PLAN_CANCEL_NONE = "none"
+PLAN_CANCEL_REQUESTED = "requested"
+PLAN_CANCEL_INDETERMINATE = "indeterminate"
+PLAN_CANCEL_SETTLED = "settled"
 
 
 class AuditEvent(Base):
@@ -263,6 +276,10 @@ class Proposal(Base):
     source_rule_group_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("rule_groups.id"), nullable=True, index=True
     )
+    source_rule_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("rules.id"), nullable=True, index=True
+    )
+    plan_generation: Mapped[int] = mapped_column(default=0)
     reasoning: Mapped[str] = mapped_column(Text, default="")
     ttl_minutes: Mapped[int] = mapped_column(default=15)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
@@ -316,6 +333,12 @@ class Rule(Base):
     hwm: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
     deadline: Mapped[Optional[datetime]] = mapped_column(UTCDateTime(), nullable=True)
     pre_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    activation: Mapped[str] = mapped_column(
+        String(20), default="immediate"
+    )
+    terminal_on_trigger: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )
 
 
 class LLMDecision(Base):
@@ -442,11 +465,18 @@ class TradePlanRow(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     action: Mapped[str] = mapped_column(String(10))
-    status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed|approved|canceled
+    status: Mapped[str] = mapped_column(String(24), default="proposed")
     paper_only: Mapped[bool] = mapped_column(Boolean, default=True)
     shadow: Mapped[bool] = mapped_column(Boolean, default=False)  # D1 shadow-mode plan
     plan_json: Mapped[str] = mapped_column(Text)      # full TradePlan
     sized_json: Mapped[str] = mapped_column(Text)     # SizedTradePlan
+    entry_filled_qty: Mapped[Decimal] = mapped_column(
+        Numeric(20, 6), default=Decimal(0)
+    )
+    exit_filled_qty: Mapped[Decimal] = mapped_column(
+        Numeric(20, 6), default=Decimal(0)
+    )
+    residual_generation: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 

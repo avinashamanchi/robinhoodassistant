@@ -483,6 +483,9 @@ def test_execution_rejects_stale_quote(risk_config, make_snapshot):
     result = RiskEngine(risk_config).check(order(), snapshot)
 
     assert "quote is stale" in result.reasons
+    assert {trip.scope for trip in result.breaker_trips} == {
+        BreakerScope.data(AssetClass.EQUITY)
+    }
 
 
 def test_execution_rejects_insufficient_buying_power(risk_config, make_snapshot):
@@ -720,6 +723,9 @@ def test_execution_rejects_daily_total_loss(risk_config, make_snapshot):
     result = RiskEngine(risk_config).check(order(), snapshot)
 
     assert "daily total-loss limit reached" in result.reasons
+    assert {trip.scope for trip in result.breaker_trips} == {
+        BreakerScope.loss(AssetClass.EQUITY)
+    }
 
 
 def test_execution_rejects_account_drawdown(risk_config, make_snapshot):
@@ -732,6 +738,9 @@ def test_execution_rejects_account_drawdown(risk_config, make_snapshot):
     result = RiskEngine(risk_config).check(order(), snapshot)
 
     assert "account drawdown limit reached" in result.reasons
+    assert {trip.scope for trip in result.breaker_trips} == {
+        BreakerScope.drawdown(AssetClass.EQUITY)
+    }
 
 
 def test_execution_rejects_wide_spread(risk_config, make_snapshot):
@@ -743,6 +752,9 @@ def test_execution_rejects_wide_spread(risk_config, make_snapshot):
     result = RiskEngine(risk_config).check(order(), snapshot)
 
     assert "spread exceeds configured maximum" in result.reasons
+    assert {trip.scope for trip in result.breaker_trips} == {
+        BreakerScope.liquidity("AAPL")
+    }
 
 
 def test_execution_rejects_sell_above_unreserved_position(

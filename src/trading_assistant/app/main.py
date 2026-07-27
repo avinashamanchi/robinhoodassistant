@@ -23,12 +23,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ..assets import AssetClass
 from ..broker.models import OrderStatus
 from ..config import Secrets, load_config
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
+from ..risk.breakers import BreakerScope
 from ..operations import (
     AuditRecorder,
     OperationsService,
@@ -161,9 +161,14 @@ class PanicIn(BaseModel):
 class KillSwitchResetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asset_class: AssetClass = AssetClass.EQUITY
+    scope: str
     reason: str
     expected_generation: int = Field(gt=0)
+
+    @field_validator("scope")
+    @classmethod
+    def scope_must_be_canonical(cls, value: str) -> str:
+        return BreakerScope.parse(value).key
 
     @field_validator("reason")
     @classmethod
@@ -594,11 +599,11 @@ def _create_app(
             body.reason,
             "http.breaker_reset",
             "circuit_breaker",
-            body.asset_class.value,
+            body.scope,
         )
         try:
             return app.state.operations.reset_breaker(
-                body.asset_class,
+                body.scope,
                 expected_generation=body.expected_generation,
                 context=context,
             )

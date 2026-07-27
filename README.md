@@ -23,8 +23,10 @@ Built in phases (see `docs/superpowers/specs/`):
   startup reconciliation, kill-switch drill.
 - **Phase 8 ✅** — the decision layer: full `TradePlan` (bear/base/bull scenarios,
   invalidation, entry ladder, exits), deterministic sizing, exit rule types
-  (trailing/time stops, OCO), approved-plan → human-gated rule proposals,
-  deterministic screener, `/analyze` + plans/screener UI, optional Alpaca news.
+  (trailing/time stops, progressive OCO), independent entry tranches, exits
+  activated and resized only from trusted entry fills, approved-plan →
+  human-gated rule proposals, deterministic screener, `/analyze` +
+  plans/screener UI, optional Alpaca news.
 - **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
   cited + regime-conditioned, earnings-aware), scorecard grading vs realized
   forward returns, and a 50-graded-calls promotion gate (advice only — never
@@ -116,7 +118,14 @@ Order lifecycle is hardened: partial fills advance PARTIALLY_FILLED → FILLED,
 duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 /orders/{id}/cancel` cancels live orders, `POST /reconcile` compares broker
 positions to local truth and logs drift, and the daily-loss kill switch trips
-per asset class (`enforce_daily_loss_limits`).
+per asset class (`enforce_daily_loss_limits`). Plan exits are keyed to a
+monotonic residual generation rather than timestamps: a delayed fill makes
+every older exit intent stale and forces broker-confirmed cancellation before a
+replacement. Plan-owned rules cannot be canceled through the generic rule API;
+use the plan cancellation workflow, which refuses to abandon confirmed
+quantity. Plan-order cancellation intent is persisted independently from broker
+error codes, retried after restart, and keeps startup plus the daemon fail-closed
+until terminal broker and fill truth are confirmed.
 
 Operational details, verified backup/migration/restore commands, and the optional
 credentialed Alpaca paper gate are in
@@ -164,6 +173,11 @@ is shipped.
 4. Everything dangerous defaults OFF.
 5. Every production runtime role writes redacted, owner-only, bounded rotating
    logs under `logs/`.
+
+A narrowly proven reduce-only order may pass only active loss, drawdown, and
+operator-global scopes so an open position can be made smaller. The observed
+breach is still persisted atomically. Data, liquidity, broker-drift, stale-fill,
+and allocation failures always remain blocking.
 
 Configuration lives in `config.yaml` (risk limits, non-secret) and `.env`
 (secrets, gitignored — see `.env.example`).

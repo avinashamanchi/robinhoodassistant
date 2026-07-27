@@ -103,6 +103,8 @@ class OrderSubmissionService:
         snapshot_service,
         risk_for_symbol: Callable[[str], object],
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        reconcile_immediate_fill: Callable[..., bool] | None = None,
+        validate_plan_exit: Callable[..., str | None] | None = None,
     ) -> None:
         self.repository = repository
         self.session_factory = session_factory
@@ -110,6 +112,8 @@ class OrderSubmissionService:
         self.snapshot_service = snapshot_service
         self.risk_for_symbol = risk_for_symbol
         self.now = now
+        self.reconcile_immediate_fill = reconcile_immediate_fill
+        self.validate_plan_exit = validate_plan_exit
         self.submission_barrier = SubmissionBarrier(session_factory)
 
     def _risk_check(
@@ -178,6 +182,7 @@ class OrderSubmissionService:
                         order_id,
                         reasons,
                         now,
+                        breaker_trips=risk.breaker_trips,
                         actor=actor,
                         reason=reason,
                         request_id=request_id,
@@ -187,6 +192,31 @@ class OrderSubmissionService:
                         OrderStatus.REJECTED,
                         risk_reasons=reasons,
                     )
+                if self.validate_plan_exit is not None:
+                    plan_error = self.validate_plan_exit(
+                        order_id,
+                        request,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                    if plan_error is not None:
+                        reasons = (
+                            f"plan execution guard: {plan_error}",
+                        )
+                        self.repository.record_pre_submission_rejection(
+                            order_id,
+                            reasons,
+                            now,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                        )
+                        return SubmissionResult(
+                            order_id,
+                            OrderStatus.REJECTED,
+                            risk_reasons=reasons,
+                        )
 
                 # A risk writer that announced itself after snapshot assembly
                 # makes this evaluation stale. Release the main lock so the
@@ -198,14 +228,17 @@ class OrderSubmissionService:
 
                     claim_now = self.now()
                     breaker_scope_keys = tuple(
-                        scope.key for scope in relevant_scopes_for_symbol(
+                        scope.key
+                        for scope in relevant_scopes_for_symbol(
                             request.ticker
                         )
+                        if scope.key not in risk.bypassed_breakers
                     )
                     if not self.repository.claim_submission(
                         order_id,
                         claim_now,
                         breaker_scope_keys,
+                        breaker_trips=risk.breaker_trips,
                         actor=actor,
                         reason=reason,
                         request_id=request_id,
@@ -318,6 +351,26 @@ class OrderSubmissionService:
                         reason=reason,
                         request_id=request_id,
                     )
+                    if (
+                        status
+                        in {
+                            OrderStatus.PARTIALLY_FILLED,
+                            OrderStatus.FILLED,
+                        }
+                        and self.reconcile_immediate_fill is not None
+                        and not self.reconcile_immediate_fill(
+                            order_id,
+                            broker_result.filled_qty,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                        )
+                    ):
+                        return SubmissionResult(
+                            order_id,
+                            OrderStatus.ACCEPTANCE_UNKNOWN,
+                            broker_result.broker_order_id,
+                        )
                     return SubmissionResult(
                         order_id,
                         persisted_status,

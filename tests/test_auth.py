@@ -310,7 +310,7 @@ def test_mutation_requires_csrf(authenticated_client):
         request_id="auth-killswitch-drill",
     )
     body = {
-        "asset_class": "equity",
+        "scope": "loss:equity",
         "reason": "drill complete",
         "expected_generation": observed.generation,
     }
@@ -362,7 +362,7 @@ def test_each_non_login_mutation_rejects_missing_csrf(
         (
             "/killswitch/reset",
             {
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "reason": "reviewed",
                 "expected_generation": 1,
             },

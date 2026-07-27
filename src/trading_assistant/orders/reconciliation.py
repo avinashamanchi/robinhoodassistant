@@ -258,6 +258,17 @@ def _commit_reconciliation_mutations(
 ) -> None:
     """Commit reconciliation writes under an exact transaction context."""
     _bind_reconciliation_context(session, actor, reason, request_id)
+    from trading_assistant.rules.repository import (
+        reconcile_plan_lifecycle_in_session,
+    )
+
+    reconcile_plan_lifecycle_in_session(
+        session,
+        now=datetime.now(timezone.utc),
+        actor=actor,
+        reason=reason,
+        request_id=request_id,
+    )
     session.commit()
 
 
@@ -1704,12 +1715,18 @@ class ReconciliationService:
         with self.session_factory() as session:
             rule_ids = session.scalars(
                 select(Rule.id)
-                .where(Rule.state.in_(("active", "processing")))
+                .where(
+                    Rule.state.in_(
+                        ("pending", "active", "processing")
+                    )
+                )
                 .order_by(Rule.id)
             ).all()
             group_ids = session.scalars(
                 select(RuleGroup.id)
-                .where(RuleGroup.state == "active")
+                .where(
+                    RuleGroup.state.in_(("pending", "active"))
+                )
                 .order_by(RuleGroup.id)
             ).all()
             for rule_id in rule_ids:

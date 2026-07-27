@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from ..assets import AssetClass
 from .audit import AuditRecorder, MutationContext
 from .health import (
     OperationalHealthReport,
@@ -66,13 +65,13 @@ class OperationsService:
 
     def reset_breaker(
         self,
-        asset_class: AssetClass | str,
+        scope: str,
         *,
         expected_generation: int,
         context: MutationContext,
     ) -> dict[str, object]:
         result = self.service.reset_killswitch(
-            asset_class,
+            scope,
             actor=context.actor,
             reason=context.reason,
             expected_generation=expected_generation,
@@ -82,7 +81,7 @@ class OperationsService:
             context,
             "operations.breaker_reset",
             "circuit_breaker",
-            str(result["asset_class"]),
+            str(result["scope"]),
             "reset",
             {"generation": result["generation"]},
         )

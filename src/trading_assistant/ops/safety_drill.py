@@ -1464,10 +1464,11 @@ def _compensate_drill_fill(
         )
     finally:
         disarm_invariant(compensation_client_id)
-    if approved["status"] in {
+    approval_reconciliation_uncertain = approved["status"] in {
         OrderStatus.SUBMITTING.value,
         OrderStatus.ACCEPTANCE_UNKNOWN.value,
-    }:
+    }
+    if approval_reconciliation_uncertain:
         container.reconciliation.reconcile_unknown(
             actor="operator:safety-drill",
             reason="resolve safety drill compensation by client identity",
@@ -1510,7 +1511,8 @@ def _compensate_drill_fill(
         return False
     final_sync = _reconcile_drill_orders(container, tag, "post-compensation")
     return (
-        final_sync["failed"] == 0
+        not approval_reconciliation_uncertain
+        and final_sync["failed"] == 0
         and _position_manifest(container.broker) == before_positions
     )
 

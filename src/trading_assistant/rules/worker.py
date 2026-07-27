@@ -64,6 +64,12 @@ class RuleWorker:
             )
         outcomes: list[RuleOutcome] = []
         quotes: dict[str, object] = {}
+        self.repository.expire_stale_proposals(
+            now=self.now(),
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
         for group_id in self.repository.active_group_ids():
             tick_now = self.now()
             lease = self.repository.lease_group(

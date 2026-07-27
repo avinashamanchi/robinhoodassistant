@@ -2841,3 +2841,32 @@ After Task 10:
 8. Confirm paper mode and both autonomous switches remain off.
 9. Record deterministic test counts, coverage, migration rehearsal, and
    credentialed Alpaca paper results in the completion report.
+
+## Post-review amendment: fill-activated plan protection
+
+The original single-group plan decomposition was rejected during broad review:
+one entry trigger could terminalize the group and cancel every remaining entry
+and exit. The implemented amendment gives each entry tranche an independent
+group and stores all exits in a pending protective group. Trusted reconciled
+entry fills activate and resize exits; intermediate targets preserve the
+remaining stop/trailing/time rules, while a terminal exit closes the remaining
+plan groups. Migration `20260724_0009` persists these semantics and refuses a
+lossy downgrade when specialized state exists.
+
+The hostile follow-up review added four more invariants. Every plan proposal is
+stamped with the current residual generation, and any later trusted fill makes
+older intents stale regardless of event timestamps. Generic rule cancellation
+cannot mutate plan-owned protection. Passive TTL expiration re-arms protective
+rules without waiting for an approval request. Finally, a terminal plan that
+receives a late trusted entry fill moves to `protection_required`, re-arms
+downside rules, and durably trips broker-drift plus operator-global breakers.
+Execution additionally proves that aggregate plan residuals do not exceed the
+reconciled broker position.
+
+The second hostile pass found that broker cancellation failure was not included
+in startup/daemon failure state and that `last_error_code` could erase the only
+retry marker. Migration `20260726_0010` adds an independent durable cancellation
+state. Requested and indeterminate plan cancellations are retried on restart;
+ordinary reconciliation reports them as failures, trips broker drift, and keeps
+startup plus daemon rule evaluation blocked until terminal broker and exact fill
+truth settle the intent.

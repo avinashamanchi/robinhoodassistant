@@ -21,6 +21,7 @@ from sqlalchemy import select, update
 from ..assets import AssetClass
 from ..config import live_trading_enabled
 from ..db.models import AuditEvent, TradePlanRow, utcnow
+from ..dependencies import RequiredDependencyUnavailable
 from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
@@ -236,9 +237,9 @@ class PlanningService:
         exit_side = "sell" if is_long else "buy"
         total = Decimal(sized["total_shares"])
         rules: list[RuleCommand] = []
-        group_key = f"plan-{plan_id}"
+        exit_group_key = f"plan-{plan_id}-exits"
 
-        for t in sized["tranches"]:
+        for index, t in enumerate(sized["tranches"], start=1):
             shares = Decimal(t["shares"])
             if shares <= 0:
                 continue
@@ -257,16 +258,26 @@ class PlanningService:
                             "order_type": "market",
                             "qty": shares,
                         },
-                        "group_key": group_key,
+                        "group_key": f"plan-{plan_id}-entry-{index}",
                         "fraction": t["fraction"],
                     }
                 )
             )
 
+        cumulative_fraction = Decimal(0)
+        allocated_target_qty = Decimal(0)
         for tgt in plan.exit_plan.targets:
-            qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
+            fraction = Decimal(str(tgt.fraction_to_sell))
+            cumulative_fraction += fraction
+            terminal_on_trigger = cumulative_fraction >= Decimal(1)
+            qty = (
+                total - allocated_target_qty
+                if terminal_on_trigger
+                else _floor(fraction * total)
+            )
             if qty <= 0:
                 continue
+            allocated_target_qty += qty
             rules.append(
                 RuleCommand.model_validate(
                     {
@@ -282,7 +293,10 @@ class PlanningService:
                             "order_type": "market",
                             "qty": qty,
                         },
-                        "group_key": group_key,
+                        "group_key": exit_group_key,
+                        "fraction": fraction,
+                        "activation": "on_entry_fill",
+                        "terminal_on_trigger": terminal_on_trigger,
                     }
                 )
             )
@@ -302,7 +316,9 @@ class PlanningService:
                         "order_type": "market",
                         "qty": total,
                     },
-                    "group_key": group_key,
+                    "group_key": exit_group_key,
+                    "fraction": Decimal(1),
+                    "activation": "on_entry_fill",
                 }
             )
         )
@@ -322,7 +338,9 @@ class PlanningService:
                             "order_type": "market",
                             "qty": total,
                         },
-                        "group_key": group_key,
+                        "group_key": exit_group_key,
+                        "fraction": Decimal(1),
+                        "activation": "on_entry_fill",
                     }
                 )
             )
@@ -343,7 +361,9 @@ class PlanningService:
                             "order_type": "market",
                             "qty": total,
                         },
-                        "group_key": group_key,
+                        "group_key": exit_group_key,
+                        "fraction": Decimal(1),
+                        "activation": "on_entry_fill",
                     }
                 )
             )
@@ -366,13 +386,75 @@ class PlanningService:
                 "plan cancellation actor, reason, and request_id "
                 "must be non-empty"
             )
-        result = self.service.rule_repository.cancel_plan(
-            plan_id,
-            now=utcnow(),
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
+        with self.service.submission_barrier.hold_writer():
+            blocker = (
+                self.service.rule_repository.plan_cancellation_blocker(
+                    plan_id,
+                    now=utcnow(),
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
+            if (
+                blocker is not None
+                and blocker.error == "reconciliation_required"
+            ):
+                try:
+                    self.service.sync_open_orders(
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                except RequiredDependencyUnavailable:
+                    return {
+                        "plan_id": plan_id,
+                        "status": blocker.status,
+                        "rules_canceled": 0,
+                        "error": "order_cancel_unconfirmed",
+                    }
+                blocker = (
+                    self.service.rule_repository.plan_cancellation_blocker(
+                        plan_id,
+                        now=utcnow(),
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                )
+            if blocker is not None:
+                if blocker.error == "not_found":
+                    return {"error": "not found"}
+                return {
+                    "plan_id": plan_id,
+                    "status": blocker.status,
+                    "rules_canceled": 0,
+                    "error": blocker.error,
+                }
+            quiesced = self.service.quiesce_trade_plan_orders(
+                plan_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            if quiesced["failed"]:
+                with self.service.session_factory() as session:
+                    plan = session.get(TradePlanRow, plan_id)
+                return {
+                    "plan_id": plan_id,
+                    "status": (
+                        plan.status if plan is not None else "unknown"
+                    ),
+                    "rules_canceled": 0,
+                    "error": "order_cancel_unconfirmed",
+                }
+            result = self.service.rule_repository.cancel_plan(
+                plan_id,
+                now=utcnow(),
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
         if result.error == "not_found":
             return {"error": "not found"}
         response = {

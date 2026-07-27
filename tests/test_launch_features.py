@@ -210,7 +210,13 @@ def test_explicit_bracket_preference_still_creates_human_gated_rules(make_servic
             select(Order).where(Order.idempotency_key == f"plan-{pid}-bracket-entry")
         ).scalars().all()
     assert {"entry", "target", "stop"} <= {rule.kind for rule in rules}
-    assert all(rule.state == "active" and not rule.pre_approved for rule in rules)
+    assert {
+        rule.state for rule in rules if rule.kind == "entry"
+    } == {"active"}
+    assert {
+        rule.state for rule in rules if rule.kind != "entry"
+    } == {"pending"}
+    assert all(not rule.pre_approved for rule in rules)
     assert bracket_orders == []
 
 

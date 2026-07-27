@@ -24,10 +24,12 @@ from trading_assistant.db.models import (
     RiskEvent,
     Rule,
     RuleGroup,
+    TradePlanRow,
 )
 from trading_assistant.risk.submission_barrier import (
     serialized_writer,
 )
+from trading_assistant.risk.breakers import trip_in_session
 
 from .models import (
     normalize_computed_order_decimal,
@@ -37,7 +39,11 @@ from .models import (
     RuleOutcome,
     RuleState,
 )
-from .repository import RuleGroupLease, RuleRepository
+from .repository import (
+    reconcile_plan_lifecycle_in_session,
+    RuleGroupLease,
+    RuleRepository,
+)
 
 if TYPE_CHECKING:
     from trading_assistant.service import TradingService
@@ -117,16 +123,33 @@ class RuleApplicationService:
 
         generated_group_key = f"rule-{uuid.uuid4().hex}"
         groups: dict[str, RuleGroup] = {}
+        group_activation: dict[str, str] = {}
         rows: list[Rule] = []
         for command in validated:
             group_key = command.group_key or generated_group_key
+            prior_activation = group_activation.setdefault(
+                group_key,
+                command.activation,
+            )
+            if prior_activation != command.activation:
+                raise ValueError(
+                    f"rule group {group_key!r} mixes activation policies"
+                )
+            desired_group_state = (
+                RuleState.PENDING.value
+                if command.activation == "on_entry_fill"
+                else RuleState.ACTIVE.value
+            )
             group = groups.get(group_key)
             if group is None:
                 group = session.scalar(
                     select(RuleGroup).where(RuleGroup.group_key == group_key)
                 )
                 if group is None:
-                    group = RuleGroup(group_key=group_key)
+                    group = RuleGroup(
+                        group_key=group_key,
+                        state=desired_group_state,
+                    )
                     session.add(group)
                     session.flush()
                     session.add(
@@ -140,9 +163,20 @@ class RuleApplicationService:
                             result_code=group.state,
                         )
                     )
-                elif group.state != RuleState.ACTIVE.value:
+                elif (
+                    command.activation == "immediate"
+                    and group.state != RuleState.ACTIVE.value
+                ) or (
+                    command.activation == "on_entry_fill"
+                    and group.state
+                    not in {
+                        RuleState.PENDING.value,
+                        RuleState.ACTIVE.value,
+                    }
+                ):
                     raise ValueError(
-                        f"rule group {group_key!r} is not active"
+                        f"rule group {group_key!r} cannot accept "
+                        f"{command.activation!r} rules"
                     )
                 existing_plan_ids = set(
                     session.scalars(
@@ -154,6 +188,22 @@ class RuleApplicationService:
                 if existing_plan_ids and existing_plan_ids != {plan_id}:
                     raise ValueError(
                         f"rule group {group_key!r} has different plan ownership"
+                    )
+                existing_activations = set(
+                    session.scalars(
+                        select(Rule.activation)
+                        .where(Rule.group_id == group.id)
+                        .distinct()
+                    ).all()
+                )
+                if (
+                    existing_activations
+                    and existing_activations
+                    != {command.activation}
+                ):
+                    raise ValueError(
+                        f"rule group {group_key!r} has a different "
+                        "persisted activation policy"
                     )
                 groups[group_key] = group
 
@@ -168,7 +218,14 @@ class RuleApplicationService:
                 action_json=json.dumps(
                     payload["action"], separators=(",", ":"), sort_keys=True
                 ),
-                state=RuleState.ACTIVE.value,
+                state=(
+                    RuleState.PENDING.value
+                    if (
+                        command.activation == "on_entry_fill"
+                        and group.state == RuleState.PENDING.value
+                    )
+                    else RuleState.ACTIVE.value
+                ),
                 plan_id=plan_id,
                 kind=command.kind.value,
                 fraction=command.fraction,
@@ -179,6 +236,8 @@ class RuleApplicationService:
                     else None
                 ),
                 pre_approved=command.pre_approved,
+                activation=command.activation,
+                terminal_on_trigger=command.terminal_on_trigger,
             )
             session.add(row)
             session.flush()
@@ -233,6 +292,37 @@ class RuleApplicationService:
         if stored.command != validated:
             raise ValueError("rule command does not match validated persisted payload")
 
+        if (
+            stored.plan_id is not None
+            and validated.kind
+            in {
+                RuleKind.TARGET,
+                RuleKind.STOP,
+                RuleKind.TRAILING,
+                RuleKind.TIME,
+            }
+        ):
+            quiesced = self.service.quiesce_trade_plan_orders(
+                stored.plan_id,
+                entry_only=True,
+                actor=actor,
+                reason=operation_reason,
+                request_id=request_id,
+            )
+            if quiesced["failed"]:
+                self.repository.release_group(
+                    lease,
+                    now=now,
+                    actor=actor,
+                    reason=operation_reason,
+                    request_id=request_id,
+                )
+                return RuleOutcome(
+                    group_id=lease.group_id,
+                    rule_id=rule_id,
+                    error="entry_order_cancel_unconfirmed",
+                )
+
         action = self._bounded_action(validated, reference_price)
         if action is None:
             self.repository.release_group(
@@ -248,11 +338,29 @@ class RuleApplicationService:
                 error="no unreserved position to exit",
             )
 
+        attempt = 1
+        if stored.plan_id is not None:
+            with self.service.session_factory() as attempt_session:
+                attempt = (
+                    attempt_session.scalar(
+                        select(func.count())
+                        .select_from(Proposal)
+                        .where(Proposal.source_rule_id == rule_id)
+                    )
+                    or 0
+                ) + 1
+        base_idempotency_key = (
+            f"rule-group-{lease.group_id}-rule-{rule_id}"
+        )
         request = OrderRequest(
             ticker=validated.ticker,
             side=OrderSide(action.side),
             order_type=OrderType(action.order_type),
-            idempotency_key=f"rule-group-{lease.group_id}",
+            idempotency_key=(
+                base_idempotency_key
+                if attempt == 1
+                else f"{base_idempotency_key}-attempt-{attempt}"
+            ),
             qty=action.qty,
             notional=action.notional,
             limit_price=action.limit_price,
@@ -290,24 +398,75 @@ class RuleApplicationService:
                     Rule.group_id == lease.group_id,
                     Rule.id != rule_id,
                     Rule.state.in_(
-                        (RuleState.ACTIVE.value, RuleState.PROCESSING.value)
+                        (
+                            RuleState.PENDING.value,
+                            RuleState.ACTIVE.value,
+                            RuleState.PROCESSING.value,
+                        )
                     ),
                 )
             )
             terminal_state = (
                 RuleState.FAILED if risk.rejected else RuleState.TRIGGERED
             )
-            if not self.repository.claim_terminal(
-                lease,
-                rule_id,
-                now=now,
-                terminal_state=terminal_state,
-                high_water_mark=high_water_mark,
-                session=session,
-                actor=actor,
-                reason=operation_reason,
-                request_id=request_id,
-            ):
+            if stored.plan_id is not None:
+                terminal_group = False
+                claimed = self.repository.claim_proposal(
+                    lease,
+                    rule_id,
+                    now=now,
+                    high_water_mark=high_water_mark,
+                    session=session,
+                    actor=actor,
+                    reason=operation_reason,
+                    request_id=request_id,
+                )
+            else:
+                exit_kind = validated.kind in {
+                    RuleKind.TARGET,
+                    RuleKind.STOP,
+                    RuleKind.TRAILING,
+                    RuleKind.TIME,
+                }
+                terminal_group = (
+                    validated.terminal_on_trigger
+                    and (not risk.rejected or not exit_kind)
+                )
+                claimed = (
+                    self.repository.claim_terminal(
+                        lease,
+                        rule_id,
+                        now=now,
+                        terminal_state=terminal_state,
+                        high_water_mark=high_water_mark,
+                        session=session,
+                        actor=actor,
+                        reason=operation_reason,
+                        request_id=request_id,
+                    )
+                    if terminal_group
+                    else self.repository.claim_progress(
+                        lease,
+                        rule_id,
+                        now=now,
+                        rule_state=terminal_state,
+                        high_water_mark=high_water_mark,
+                        session=session,
+                        actor=actor,
+                        reason=operation_reason,
+                        request_id=request_id,
+                    )
+                )
+            if not claimed:
+                session.rollback()
+                if stored.plan_id is not None:
+                    self.repository.release_group(
+                        lease,
+                        now=now,
+                        actor=actor,
+                        reason=operation_reason,
+                        request_id=request_id,
+                    )
                 return RuleOutcome(
                     group_id=lease.group_id,
                     rule_id=rule_id,
@@ -336,10 +495,23 @@ class RuleApplicationService:
                 else self.service.config.risk
             )
             ttl = (risk_config or self.service.config.risk).proposal_ttl_minutes
+            plan_generation = 0
+            if stored.plan_id is not None:
+                plan = session.get(TradePlanRow, stored.plan_id)
+                if plan is None:
+                    session.rollback()
+                    return RuleOutcome(
+                        group_id=lease.group_id,
+                        rule_id=rule_id,
+                        error="plan_not_found",
+                    )
+                plan_generation = plan.residual_generation
             session.add(
                 Proposal(
                     order_id=order.id,
                     source_rule_group_id=lease.group_id,
+                    source_rule_id=rule_id,
+                    plan_generation=plan_generation,
                     ttl_minutes=ttl,
                     created_at=now,
                     expires_at=now + timedelta(minutes=ttl),
@@ -361,6 +533,16 @@ class RuleApplicationService:
                         reason=warning,
                     )
                 )
+            for intent in risk.breaker_trips:
+                trip_in_session(
+                    session,
+                    intent.scope,
+                    intent.reason,
+                    actor,
+                    request_id=request_id,
+                    now=now,
+                    audit_reason=operation_reason,
+                )
             session.add(
                 AuditEvent(
                     actor=actor,
@@ -381,6 +563,14 @@ class RuleApplicationService:
                     ),
                 )
             )
+            if stored.plan_id is not None:
+                reconcile_plan_lifecycle_in_session(
+                    session,
+                    now=now,
+                    actor=actor,
+                    reason=operation_reason,
+                    request_id=request_id,
+                )
             session.commit()
             proposal = {
                 "order_id": order.id,
@@ -397,7 +587,11 @@ class RuleApplicationService:
             group_id=lease.group_id,
             rule_id=rule_id,
             proposal=proposal,
-            oco_canceled=int(sibling_count or 0),
+            oco_canceled=(
+                int(sibling_count or 0)
+                if terminal_group and stored.plan_id is None
+                else 0
+            ),
         )
 
     def _bounded_action(

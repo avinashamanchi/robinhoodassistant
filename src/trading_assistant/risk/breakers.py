@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -58,6 +59,59 @@ class BreakerScope:
     @classmethod
     def operator_global(cls) -> "BreakerScope":
         return cls(BreakerKind.OPERATOR_GLOBAL)
+
+    @classmethod
+    def parse(cls, value: str) -> "BreakerScope":
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        ):
+            raise ValueError("breaker scope must be a canonical key")
+        if value in {
+            BreakerKind.BROKER_DRIFT.value,
+            BreakerKind.OPERATOR_GLOBAL.value,
+        }:
+            return cls(BreakerKind(value))
+        kind_text, separator, target = value.partition(":")
+        if not separator or not target or ":" in target:
+            raise ValueError("breaker scope must be a canonical key")
+        try:
+            kind = BreakerKind(kind_text)
+        except ValueError as exc:
+            raise ValueError(
+                "breaker scope must be a canonical key"
+            ) from exc
+        if kind in {
+            BreakerKind.DATA,
+            BreakerKind.LOSS,
+            BreakerKind.DRAWDOWN,
+        }:
+            if target not in {
+                AssetClass.EQUITY.value,
+                AssetClass.CRYPTO.value,
+            }:
+                raise ValueError(
+                    "breaker scope must target an asset class"
+                )
+        elif kind is BreakerKind.LIQUIDITY:
+            if (
+                target != target.upper()
+                or re.fullmatch(
+                    r"[A-Z0-9][A-Z0-9./_-]{0,31}",
+                    target,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "breaker scope must target a canonical symbol"
+                )
+        else:
+            raise ValueError("breaker scope must be a canonical key")
+        scope = cls(kind, target)
+        if scope.key != value:
+            raise ValueError("breaker scope must be a canonical key")
+        return scope
 
 
 @dataclass(frozen=True)

@@ -16,6 +16,8 @@ from trading_assistant.broker.models import (
     Position,
     Quote,
 )
+from trading_assistant.assets import AssetClass
+from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import RiskEngine
 
 
@@ -304,6 +306,126 @@ def test_killswitch_blocks_everything(risk_config, make_snapshot):
     assert any("circuit breaker" in r for r in result.reasons)
 
 
+def test_reduce_only_exit_bypasses_only_loss_drawdown_and_operator(
+    risk_config,
+    make_snapshot,
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("10"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ],
+    )
+    snapshot = replace(
+        snapshot,
+        active_breakers=frozenset(
+            {
+                "operator_global",
+                "loss:equity",
+                "drawdown:equity",
+            }
+        ),
+    )
+
+    result = RiskEngine(risk_config).check(
+        _order(side=OrderSide.SELL, qty="5"),
+        snapshot,
+    )
+
+    assert result.approved is True
+    assert result.bypassed_breakers == (
+        "drawdown:equity",
+        "loss:equity",
+        "operator_global",
+    )
+
+    data_blocked = RiskEngine(risk_config).check(
+        _order(side=OrderSide.SELL, qty="5"),
+        replace(
+            snapshot,
+            active_breakers=(
+                snapshot.active_breakers
+                | frozenset({"data:equity"})
+            ),
+        ),
+    )
+    assert data_blocked.rejected
+    assert "active circuit breaker: data:equity" in data_blocked.reasons
+
+
+def test_reduce_only_exit_latches_new_loss_and_drawdown_breaches(
+    risk_config,
+    make_snapshot,
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("10"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ],
+        realized_pnl_today=Decimal("-10000"),
+        account_equity=Decimal("50000"),
+        account_high_water_mark=Decimal("100000"),
+    )
+
+    result = RiskEngine(risk_config).check(
+        _order(side=OrderSide.SELL, qty="5"),
+        snapshot,
+    )
+
+    assert result.approved is True
+    assert {
+        intent.scope.key for intent in result.breaker_trips
+    } == {"loss:equity", "drawdown:equity"}
+    assert result.bypassed_breakers == (
+        "drawdown:equity",
+        "loss:equity",
+    )
+
+
+def test_reduce_only_short_cover_gets_the_same_narrow_bypass(
+    risk_config,
+    make_snapshot,
+):
+    snapshot = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("-10"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ],
+    )
+    snapshot = replace(
+        snapshot,
+        active_breakers=frozenset(
+            {"operator_global", "loss:equity"}
+        ),
+    )
+
+    result = RiskEngine(risk_config).check(
+        _order(side=OrderSide.BUY, qty="5"),
+        snapshot,
+    )
+
+    assert result.approved is True
+    assert result.bypassed_breakers == (
+        "loss:equity",
+        "operator_global",
+    )
+
+
 def test_missing_quote_fails_closed(risk_config, make_snapshot):
     """No market data for the ticker -> reject (fail closed), never size blindly."""
     engine = RiskEngine(risk_config)
@@ -346,6 +468,9 @@ def test_quantity_buy_rejects_non_positive_or_non_finite_last_before_arithmetic(
 
     assert result.rejected
     assert "quote for AAPL is invalid" in result.reasons
+    assert {trip.scope for trip in result.breaker_trips} == {
+        BreakerScope.data(AssetClass.EQUITY)
+    }
 
 
 def test_notional_sell_rejects_zero_last_instead_of_dividing_by_zero(

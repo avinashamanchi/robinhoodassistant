@@ -51,10 +51,22 @@ uv run python -m trading_assistant.db.migrate status
 
 Proceed only when integrity reports `ok` and migration status reports current.
 Backups are standalone SQLite files with owner-only permissions. Migrations
-`0001` through `0008` are the frozen release history. Migration `0008` adds
+`0001` through `0010` are the frozen release history. Migration `0008` adds
 the durable process-start broker-reconciliation generation latch; a runtime
 cannot submit until the newest generation has reconciled orders, fills, open
-orders, positions, and local state.
+orders, positions, and local state. Migration `0009` records fill-activated
+plan exits and progressive targets. Protective exits remain pending until a
+trusted broker fill confirms an entry, then are sized from confirmed filled
+quantity. The same migration adds a monotonic plan residual generation; delayed
+fills invalidate and cancel every older live exit intent without relying on
+broker timestamps. It conservatively refuses any legacy plan-linked proposal,
+because the older schema cannot prove which rule owned its fills. Downgrade
+refuses while specialized state exists because dropping it would silently
+remove protection semantics.
+Migration `0010` separates durable plan-order cancellation intent from transient
+broker error classification. Requested or indeterminate cancellation survives a
+restart and prevents startup readiness and daemon rule evaluation until the
+order is terminal and exact fill truth has reconciled.
 
 To recover from a bad migration, stop the app, daemon, and watchdog first. Verify
 the chosen backup again, move the failed database and any `-wal`/`-shm` sidecars
@@ -256,6 +268,20 @@ An active relevant scope blocks submission. Reset only the investigated scope,
 using its current generation, a reason, recent reauthentication, and confirmed
 healthy evidence. A reset conflict means state changed; refresh and reassess.
 Resetting one scope never clears another.
+
+The sole submission exception is a freshly rechecked reduce-only order. It may
+ignore only `loss:<asset>`, `drawdown:<asset>`, and `operator_global` for that
+one claim, while atomically persisting any newly observed breach. It can never
+ignore `data:*`, `liquidity:*`, or `broker_drift`. A plan exit additionally
+requires exact trusted residual-generation and aggregate broker-position
+allocation proof.
+Unrelated manual reductions may consume only broker quantity left after exact
+plan residual allocation; they cannot consume plan-owned shares.
+
+Plan proposal TTLs are swept by the rule worker even when nobody opens the
+approval screen. An expired protective proposal becomes `EXPIRED`, its rule is
+re-armed with a new idempotency attempt, and the operator-global breaker remains
+latched for review. Direct `cancel_rule` is forbidden for plan-owned rules.
 
 ## Panic truth
 

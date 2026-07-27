@@ -1125,7 +1125,7 @@ def test_killswitch_reset_endpoint(client):
     response = c.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "account and broker checks are healthy",
             "expected_generation": observed.generation,
         },
@@ -1157,6 +1157,226 @@ def test_killswitch_reset_endpoint(client):
     assert "compatibility_facade" not in health
 
 
+def test_breaker_reset_accepts_exact_data_scope_and_health_lists_it(
+    client,
+):
+    c, service, _ = client
+    for symbol in service._reset_symbols(AssetClass.EQUITY):
+        service.broker.set_price(symbol, Decimal("100"))
+    observed = service.breakers.trip(
+        BreakerScope.data(AssetClass.EQUITY),
+        reason="stale equity feed drill",
+        actor="daemon:test",
+        request_id="api-data-breaker-trip",
+    )
+
+    health = c.get("/health").json()
+    assert {
+        item["scope"] for item in health["active_breakers"]
+    } >= {"data:equity"}
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "data:equity",
+            "reason": "all configured equity quotes are fresh",
+            "expected_generation": observed.generation,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["scope"] == "data:equity"
+    assert response.json()["tripped"] is False
+
+
+def test_breaker_reset_rejects_noncanonical_or_legacy_scope_body(
+    client,
+):
+    c, _service, _ = client
+
+    noncanonical = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:aapl",
+            "reason": "invalid lowercase scope",
+            "expected_generation": 1,
+        },
+    )
+    legacy = c.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "legacy reset body",
+            "expected_generation": 1,
+        },
+    )
+
+    assert noncanonical.status_code == 422
+    assert legacy.status_code == 422
+
+
+def test_liquidity_reset_requires_exact_symbol_spread_recovery(
+    client,
+):
+    c, service, _ = client
+    observed = service.breakers.trip(
+        BreakerScope.liquidity("AAPL"),
+        reason="wide spread drill",
+        actor="daemon:test",
+        request_id="api-liquidity-breaker-trip",
+    )
+    original_quote = service.broker.get_quote
+
+    def wide_quote(ticker):
+        quote = original_quote(ticker)
+        return replace(
+            quote,
+            bid=Decimal("90"),
+            ask=Decimal("110"),
+        )
+
+    service.broker.get_quote = wide_quote
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:AAPL",
+            "reason": "attempt while spread remains wide",
+            "expected_generation": observed.generation,
+        },
+    )
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(
+        BreakerScope.liquidity("AAPL")
+    )
+
+    service.broker.get_quote = original_quote
+    recovered = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:AAPL",
+            "reason": "AAPL spread normalized",
+            "expected_generation": observed.generation,
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["scope"] == "liquidity:AAPL"
+
+
+def test_drawdown_reset_requires_recovered_account_equity(client):
+    c, service, _ = client
+    service.snapshot_service.assemble_for_execution("AAPL")
+    service.broker._buying_power = Decimal("80000")
+    observed = service.breakers.trip(
+        BreakerScope.drawdown(AssetClass.EQUITY),
+        reason="drawdown drill",
+        actor="daemon:test",
+        request_id="api-drawdown-breaker-trip",
+    )
+
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "drawdown:equity",
+            "reason": "attempt before equity recovery",
+            "expected_generation": observed.generation,
+        },
+    )
+
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(
+        BreakerScope.drawdown(AssetClass.EQUITY)
+    )
+
+    service.broker._buying_power = Decimal("100000")
+    recovered = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "drawdown:equity",
+            "reason": "account equity recovered",
+            "expected_generation": observed.generation,
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["scope"] == "drawdown:equity"
+
+
+def test_broker_drift_reset_requires_clean_reconciliation(client):
+    c, service, _ = client
+    scope = BreakerScope.broker_drift()
+    observed = service.breakers.trip(
+        scope,
+        reason="broker drift drill",
+        actor="reconciler:test",
+        request_id="api-broker-drift-trip",
+    )
+
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "broker_drift",
+            "reason": "broker and local state reconciled",
+            "expected_generation": observed.generation,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["scope"] == "broker_drift"
+    assert service.breakers.is_tripped(scope) is False
+
+
+def test_operator_global_reset_refuses_while_other_breaker_is_active(
+    client,
+):
+    c, service, _ = client
+    for symbol in service._reset_symbols(AssetClass.EQUITY):
+        service.broker.set_price(symbol, Decimal("100"))
+    data_scope = BreakerScope.data(AssetClass.EQUITY)
+    data_state = service.breakers.trip(
+        data_scope,
+        reason="data dependency drill",
+        actor="daemon:test",
+        request_id="api-operator-data-trip",
+    )
+    operator_scope = BreakerScope.operator_global()
+    operator_state = service.breakers.trip(
+        operator_scope,
+        reason="operator global drill",
+        actor="operator:test",
+        request_id="api-operator-global-trip",
+    )
+
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "operator_global",
+            "reason": "attempt while another breaker remains active",
+            "expected_generation": operator_state.generation,
+        },
+    )
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(operator_scope)
+
+    data_reset = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "data:equity",
+            "reason": "all equity quotes recovered",
+            "expected_generation": data_state.generation,
+        },
+    )
+    assert data_reset.status_code == 200, data_reset.text
+
+    operator_reset = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "operator_global",
+            "reason": "all other breakers and broker state are clear",
+            "expected_generation": operator_state.generation,
+        },
+    )
+    assert operator_reset.status_code == 200, operator_reset.text
+    assert service.breakers.is_tripped(operator_scope) is False
+
+
 def test_killswitch_reset_returns_conflict_for_stale_generation(client):
     c, svc, _ = client
     observed = svc.breakers.trip(
@@ -1175,7 +1395,7 @@ def test_killswitch_reset_returns_conflict_for_stale_generation(client):
     response = c.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "stale operator reset",
             "expected_generation": observed.generation,
         },
@@ -1237,7 +1457,7 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
     response = client.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "verify dependency health before reset",
             "expected_generation": observed.generation,
         },
@@ -1302,7 +1522,7 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
     response = client.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": reason,
             "expected_generation": observed.generation,
         },
@@ -1344,7 +1564,7 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
         BreakerScope.loss(AssetClass.EQUITY).key,
         json.dumps(
             {
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "expected_generation": observed.generation,
                 "stage": "health_collection",
             },
@@ -1416,7 +1636,7 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
         response = client.post(
             "/killswitch/reset",
             json={
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "reason": reason,
                 "expected_generation": observed.generation,
             },
@@ -1547,7 +1767,7 @@ def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider
         response = client.post(
             "/killswitch/reset",
             json={
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "reason": reason,
                 "expected_generation": observed.generation,
             },
@@ -1661,7 +1881,7 @@ def test_operator_workflows_use_exact_calendar_observation_across_clock_race(
         response = client.post(
             "/killswitch/reset",
             json={
-                "asset_class": "equity",
+                "scope": "loss:equity",
                 "reason": "reset at exact pre-close observation",
                 "expected_generation": observed_breaker.generation,
             },
@@ -1728,7 +1948,7 @@ def test_killswitch_reset_rejects_every_incomplete_health_field(
     response = client.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": f"reject incomplete {incomplete_field}",
             "expected_generation": observed.generation,
         },
@@ -1787,7 +2007,7 @@ def test_reset_snapshot_internal_failure_is_500_without_dependency_audit(
     response = client.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "reset internal failure probe",
             "expected_generation": observed.generation,
         },
@@ -1836,7 +2056,7 @@ def test_unexpected_mutation_exception_remains_hardened_internal_error(
     response = client.post(
         "/killswitch/reset",
         json={
-            "asset_class": "equity",
+            "scope": "loss:equity",
             "reason": "unexpected failure classification probe",
             "expected_generation": 1,
         },

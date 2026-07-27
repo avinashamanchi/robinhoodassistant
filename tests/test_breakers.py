@@ -28,6 +28,41 @@ def test_breaker_scopes_have_stable_targeted_keys():
     assert BreakerScope.operator_global().key == "operator_global"
 
 
+@pytest.mark.parametrize(
+    "scope",
+    [
+        BreakerScope.data(AssetClass.EQUITY),
+        BreakerScope.loss(AssetClass.CRYPTO),
+        BreakerScope.drawdown(AssetClass.EQUITY),
+        BreakerScope.liquidity("AAPL"),
+        BreakerScope.broker_drift(),
+        BreakerScope.operator_global(),
+    ],
+)
+def test_breaker_scope_parser_accepts_only_canonical_keys(scope):
+    assert BreakerScope.parse(scope.key) == scope
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        " loss:equity",
+        "loss:EQUITY",
+        "loss",
+        "loss:aapl",
+        "data:AAPL",
+        "liquidity:aapl",
+        "liquidity:",
+        "broker_drift:any",
+        "unknown:equity",
+    ],
+)
+def test_breaker_scope_parser_rejects_noncanonical_keys(raw):
+    with pytest.raises(ValueError, match="breaker scope"):
+        BreakerScope.parse(raw)
+
+
 def test_scoped_breakers_persist_and_reset_independently(session_factory):
     service = BreakerService(session_factory)
     data_scope = BreakerScope.data(AssetClass.EQUITY)

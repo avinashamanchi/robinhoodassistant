@@ -27,6 +27,7 @@ class RuleKind(str, Enum):
 
 
 class RuleState(str, Enum):
+    PENDING = "pending"
     ACTIVE = "active"
     PROCESSING = "processing"
     TRIGGERED = "triggered"
@@ -139,6 +140,8 @@ class RuleCommand(BaseModel):
         decimal_places=6,
     )
     high_water_mark: PersistedHighWaterMark | None = None
+    activation: Literal["immediate", "on_entry_fill"] = "immediate"
+    terminal_on_trigger: bool = True
 
     @field_validator("ticker")
     @classmethod
@@ -177,6 +180,23 @@ class RuleCommand(BaseModel):
             raise ValueError(
                 f"condition type {self.condition.type!r} is invalid for "
                 f"rule kind {self.kind.value!r}"
+            )
+        if (
+            self.activation == "on_entry_fill"
+            and self.kind
+            not in {
+                RuleKind.TARGET,
+                RuleKind.STOP,
+                RuleKind.TRAILING,
+                RuleKind.TIME,
+            }
+        ):
+            raise ValueError(
+                "only exit rules may activate from confirmed entry fills"
+            )
+        if not self.terminal_on_trigger and self.kind is not RuleKind.TARGET:
+            raise ValueError(
+                "only an intermediate target may be nonterminal"
             )
         return self
 

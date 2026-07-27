@@ -14,7 +14,13 @@ from trading_assistant.broker.models import (
     OrderResult,
     OrderStatus,
 )
-from trading_assistant.db.models import Fill, Order, ReconciliationCursor
+from trading_assistant.db.models import (
+    Fill,
+    Order,
+    ReconciliationCursor,
+    Rule,
+    RuleGroup,
+)
 from trading_assistant.db.migrate import adopt_existing, upgrade
 from trading_assistant.db.schema import SchemaOutOfDate, require_current_schema
 from trading_assistant.db.session import (
@@ -96,6 +102,464 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     )
     assert "auth_sessions" in inspect(engine).get_table_names()
     assert "alembic_version" in inspect(engine).get_table_names()
+    rule_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("rules")
+    }
+    assert {"activation", "terminal_on_trigger"} <= rule_columns
+    proposal_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("proposals")
+    }
+    assert {"source_rule_id", "plan_generation"} <= proposal_columns
+    plan_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("trade_plans")
+    }
+    assert {
+        "entry_filled_qty",
+        "exit_filled_qty",
+        "residual_generation",
+    } <= plan_columns
+    order_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("orders")
+    }
+    assert "plan_cancel_state" in order_columns
+    order_indexes = {
+        index["name"]: index
+        for index in inspect(engine).get_indexes("orders")
+    }
+    assert (
+        order_indexes["ix_orders_plan_cancel_state"]["unique"]
+        == 0
+    )
+
+
+def test_fill_activated_upgrade_refuses_active_legacy_plan(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "active-legacy-plan.db",
+        "20260724_0008",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(id,symbol,action,status,paper_only,shadow,plan_json,"
+                "sized_json,created_at) VALUES "
+                "(1,'AAPL','buy','approved',1,0,'{}','{}',"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rule_groups "
+                "(id,group_key,state,version,reconciliation_required,"
+                "created_at,updated_at) VALUES "
+                "(1,'legacy-plan-1','active',0,0,"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rules "
+                "(id,group_id,payload_version,ticker,condition_json,"
+                "action_json,state,created_at,plan_id,kind,"
+                "pre_approved) VALUES "
+                "(1,1,1,'AAPL','{\"type\":\"price\","
+                "\"direction\":\"below\",\"price\":\"99\"}',"
+                "'{\"side\":\"buy\",\"order_type\":\"market\","
+                "\"qty\":\"1\"}','active',CURRENT_TIMESTAMP,1,"
+                "'entry',0)"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="active legacy plans",
+    ):
+        command.upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0008"
+    assert "activation" not in {
+        column["name"]
+        for column in inspect(engine).get_columns("rules")
+    }
+
+
+def test_fill_activated_upgrade_refuses_terminalized_legacy_plan_order(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "terminalized-legacy-plan-order.db",
+        "20260724_0008",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(id,symbol,action,status,paper_only,shadow,plan_json,"
+                "sized_json,created_at) VALUES "
+                "(1,'AAPL','buy','approved',1,0,'{}','{}',"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rule_groups "
+                "(id,group_key,state,version,reconciliation_required,"
+                "created_at,updated_at) VALUES "
+                "(1,'legacy-terminalized-plan','triggered',0,0,"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rules "
+                "(id,group_id,payload_version,ticker,condition_json,"
+                "action_json,state,created_at,plan_id,kind,"
+                "pre_approved) VALUES "
+                "(1,1,1,'AAPL','{\"type\":\"price\","
+                "\"direction\":\"below\",\"price\":\"99\"}',"
+                "'{\"side\":\"buy\",\"order_type\":\"market\","
+                "\"qty\":\"1\"}','triggered',CURRENT_TIMESTAMP,1,"
+                "'entry',0)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO orders "
+                "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                "broker_order_id,created_at,updated_at,approval_reason,"
+                "submission_kind,submission_payload_json,"
+                "submission_attempt,acceptance_state,last_error_code,"
+                "version) VALUES "
+                "(1,'legacy-terminalized-order','AAPL','buy','market',"
+                "1,'submitted','legacy-broker-order',"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'','simple','{}',"
+                "1,'submitted','',0)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO proposals "
+                "(order_id,source_rule_group_id,reasoning,ttl_minutes,"
+                "created_at,expires_at) VALUES "
+                "(1,1,'legacy plan proposal',15,CURRENT_TIMESTAMP,"
+                "'2026-08-01 12:00:00')"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy plans",
+    ):
+        command.upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0008"
+
+
+def test_fill_activated_upgrade_refuses_canceled_plan_with_legacy_fill(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "canceled-legacy-plan-fill.db",
+        "20260724_0008",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(id,symbol,action,status,paper_only,shadow,plan_json,"
+                "sized_json,created_at) VALUES "
+                "(1,'AAPL','buy','canceled',1,0,'{}','{}',"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rule_groups "
+                "(id,group_key,state,version,reconciliation_required,"
+                "created_at,updated_at) VALUES "
+                "(1,'legacy-canceled-plan','canceled',0,0,"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rules "
+                "(id,group_id,payload_version,ticker,condition_json,"
+                "action_json,state,created_at,plan_id,kind,"
+                "pre_approved) VALUES "
+                "(1,1,1,'AAPL','{\"type\":\"price\","
+                "\"direction\":\"below\",\"price\":\"99\"}',"
+                "'{\"side\":\"buy\",\"order_type\":\"market\","
+                "\"qty\":\"1\"}','canceled',CURRENT_TIMESTAMP,1,"
+                "'entry',0)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO orders "
+                "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                "broker_order_id,created_at,updated_at,approval_reason,"
+                "submission_kind,submission_payload_json,"
+                "submission_attempt,acceptance_state,last_error_code,"
+                "version) VALUES "
+                "(1,'legacy-canceled-filled-entry','AAPL','buy',"
+                "'market',1,'filled','legacy-canceled-broker-order',"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'','simple','{}',"
+                "1,'accepted','',0)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO proposals "
+                "(order_id,source_rule_group_id,reasoning,ttl_minutes,"
+                "created_at,expires_at) VALUES "
+                "(1,1,'legacy canceled plan fill',15,"
+                "CURRENT_TIMESTAMP,'2026-08-01 12:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO fills "
+                "(order_id,ticker,side,qty,price,broker_fill_id,"
+                "filled_at) VALUES "
+                "(1,'AAPL','buy',1,98,'legacy-canceled-fill',"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="legacy plans"):
+        command.upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0008"
+
+
+def test_fill_activated_rule_downgrade_refuses_to_remove_protection(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "fill-activated-rules.db",
+        "head",
+    )
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        group = RuleGroup(
+            group_key="pending-protective-exits",
+            state="pending",
+        )
+        session.add(group)
+        session.flush()
+        session.add(
+            Rule(
+                group_id=group.id,
+                ticker="AAPL",
+                condition_json=json.dumps(
+                    {
+                        "type": "price",
+                        "direction": "below",
+                        "price": "90",
+                    }
+                ),
+                action_json=json.dumps(
+                    {
+                        "side": "sell",
+                        "order_type": "market",
+                        "qty": "1",
+                    }
+                ),
+                state="pending",
+                kind="stop",
+                activation="on_entry_fill",
+                terminal_on_trigger=True,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(
+        RuntimeError,
+        match="fill-activated plan protection",
+    ):
+        command.downgrade(cfg, "20260724_0008")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0009"
+    assert {
+        "activation",
+        "terminal_on_trigger",
+    } <= {
+        column["name"]
+        for column in inspect(engine).get_columns("rules")
+    }
+
+
+def test_plan_cancel_intent_downgrade_refuses_to_erase_retry_state(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "plan-cancel-intent.db",
+        "head",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO orders "
+                "(idempotency_key,ticker,side,order_type,status,"
+                "plan_cancel_state,created_at,updated_at,"
+                "approval_reason,submission_kind,"
+                "submission_payload_json,submission_attempt,"
+                "acceptance_state,last_error_code,version) VALUES "
+                "('durable-plan-cancel','AAPL','buy','market',"
+                "'submitted','requested',CURRENT_TIMESTAMP,"
+                "CURRENT_TIMESTAMP,'','simple','{}',1,'submitted',"
+                "'plan_cancel',0)"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable plan cancellation intent",
+    ):
+        command.downgrade(cfg, "20260724_0009")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260726_0010"
+        assert connection.scalar(
+            text(
+                "SELECT plan_cancel_state FROM orders "
+                "WHERE idempotency_key='durable-plan-cancel'"
+            )
+        ) == "requested"
+
+
+def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "plan-cancel-backfill.db",
+        "20260724_0009",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(id,symbol,action,status,paper_only,shadow,plan_json,"
+                "sized_json,created_at) VALUES "
+                "(1,'AAPL','buy','approved',1,0,'{}','{}',"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rule_groups "
+                "(id,group_key,state,version,reconciliation_required,"
+                "created_at,updated_at) VALUES "
+                "(1,'cancel-backfill','active',0,1,"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO rules "
+                "(id,group_id,payload_version,ticker,condition_json,"
+                "action_json,state,created_at,plan_id,kind,"
+                "pre_approved,activation,terminal_on_trigger) VALUES "
+                "(1,1,1,'AAPL','{\"type\":\"price\","
+                "\"direction\":\"below\",\"price\":\"99\"}',"
+                "'{\"side\":\"buy\",\"order_type\":\"market\","
+                "\"qty\":\"1\"}','processing',CURRENT_TIMESTAMP,1,"
+                "'entry',0,'immediate',1)"
+            )
+        )
+        for order_id, marker in enumerate(
+            (
+                "plan_cancel",
+                "plan_exit_entry_cancel",
+                "indeterminate_cancel",
+            ),
+            start=1,
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO orders "
+                    "(id,idempotency_key,ticker,side,order_type,qty,"
+                    "status,broker_order_id,created_at,updated_at,"
+                    "approval_reason,submission_kind,"
+                    "submission_payload_json,submission_attempt,"
+                    "acceptance_state,last_error_code,version) VALUES "
+                    "(:id,:key,'AAPL','buy','market',1,'submitted',"
+                    ":broker_id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'',"
+                    "'simple','{}',1,'submitted',:marker,0)"
+                ),
+                {
+                    "id": order_id,
+                    "key": f"plan-cancel-backfill-{order_id}",
+                    "broker_id": f"plan-cancel-broker-{order_id}",
+                    "marker": marker,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO proposals "
+                    "(order_id,source_rule_group_id,source_rule_id,"
+                    "reasoning,ttl_minutes,plan_generation,created_at,"
+                    "expires_at) VALUES "
+                    "(:id,1,1,'legacy cancellation intent',15,0,"
+                    "CURRENT_TIMESTAMP,'2026-08-01 12:00:00')"
+                ),
+                {"id": order_id},
+            )
+        connection.execute(
+            text(
+                "INSERT INTO orders "
+                "(id,idempotency_key,ticker,side,order_type,qty,status,"
+                "broker_order_id,created_at,updated_at,approval_reason,"
+                "submission_kind,submission_payload_json,"
+                "submission_attempt,acceptance_state,last_error_code,"
+                "version) VALUES "
+                "(4,'generic-indeterminate','AAPL','buy','market',1,"
+                "'submitted','generic-broker',CURRENT_TIMESTAMP,"
+                "CURRENT_TIMESTAMP,'','simple','{}',1,'submitted',"
+                "'indeterminate_cancel',0)"
+            )
+        )
+
+    command.upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        states = connection.execute(
+            text(
+                "SELECT id, plan_cancel_state FROM orders "
+                "ORDER BY id"
+            )
+        ).all()
+        version = connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        )
+    assert states == [
+        (1, "requested"),
+        (2, "requested"),
+        (3, "indeterminate"),
+        (4, "none"),
+    ]
+    assert version == "20260726_0010"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -131,7 +595,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260724_0008"
+        ) == "20260726_0010"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -172,7 +636,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260724_0008"
+    assert version == "20260726_0010"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")
@@ -950,6 +1414,10 @@ def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
                 "WHERE stream='fills'"
             )
         ) == 0
+    # Runtime code is only supported at the current schema. Preserve the
+    # point-in-time 0005 assertion above, then finish the upgrade before using
+    # current ORM models and reconciliation services.
+    command.upgrade(cfg, "head")
 
     exact_time = datetime(2026, 7, 20, 17, 0, tzinfo=timezone.utc)
     exact = BrokerFill(
