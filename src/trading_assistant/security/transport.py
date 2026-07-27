@@ -26,6 +26,19 @@ _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _FORWARDED_HEADERS = frozenset(
     {"forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"}
 )
+_BOUNDARY_SECURITY_HEADERS = (
+    (
+        b"content-security-policy",
+        (
+            b"default-src 'self'; script-src 'self'; style-src 'self'; "
+            b"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+            b"base-uri 'none'; form-action 'self'"
+        ),
+    ),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=()"),
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +57,10 @@ class TransportPolicy:
 
     @classmethod
     def production(cls, server, *, request_bounds=None) -> "TransportPolicy":
+        if server.secure_cookies is not True:
+            raise RuntimeError(
+                "server.secure_cookies must be true for production transport"
+            )
         origin = str(server.origin).rstrip("/")
         parsed = urlsplit(origin)
         if (
@@ -117,6 +134,10 @@ class TransportPolicy:
             raise RuntimeError("transport origin has no host")
         return host.lower()
 
+    def is_test_policy(self) -> bool:
+        """Only the fixed in-process policy may opt out of production TLS."""
+        return self == type(self).test()
+
 
 def _is_loopback_host(host: str) -> bool:
     normalized = host.strip().strip("[]").lower()
@@ -177,13 +198,13 @@ def _parse_host(value: bytes, *, expected_port: int) -> str | None:
     return host.lower()
 
 
-def _error_payload(code: str, message: str) -> bytes:
+def _error_payload(code: str, message: str, request_id: str) -> bytes:
     return json.dumps(
         {
             "error": {
                 "code": code,
                 "message": message,
-                "request_id": uuid4().hex,
+                "request_id": request_id,
             }
         },
         separators=(",", ":"),
@@ -197,7 +218,8 @@ async def _send_error(
     code: str,
     message: str,
 ) -> None:
-    payload = _error_payload(code, message)
+    request_id = uuid4().hex
+    payload = _error_payload(code, message, request_id)
     await send(
         {
             "type": "http.response.start",
@@ -207,6 +229,8 @@ async def _send_error(
                 (b"content-length", str(len(payload)).encode("ascii")),
                 (b"cache-control", b"no-store"),
                 (b"x-content-type-options", b"nosniff"),
+                (b"x-request-id", request_id.encode("ascii")),
+                *_BOUNDARY_SECURITY_HEADERS,
             ],
         }
     )
@@ -300,8 +324,7 @@ class TransportBoundaryMiddleware:
                 )
                 return
 
-        is_liveness = scope.get("path") == "/health/live"
-        if self.policy.require_https and scope.get("scheme") != "https" and not is_liveness:
+        if self.policy.require_https and scope.get("scheme") != "https":
             await _send_error(
                 send,
                 status=426,
@@ -392,15 +415,6 @@ class TransportBoundaryMiddleware:
             ):
                 headers = list(message.get("headers", ()))
                 headers.append((b"x-transport-degraded", b"test_transport"))
-                message = {**message, "headers": headers}
-            elif (
-                message["type"] == "http.response.start"
-                and self.policy.require_https
-                and scope.get("scheme") != "https"
-                and is_liveness
-            ):
-                headers = list(message.get("headers", ()))
-                headers.append((b"x-transport-degraded", b"https_required"))
                 message = {**message, "headers": headers}
             await send(message)
 

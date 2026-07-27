@@ -9,6 +9,7 @@ from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import update
@@ -366,12 +367,76 @@ def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
     assert restarted == []
 
 
+@pytest.mark.parametrize(
+    "health_url",
+    [
+        "http://localhost:8020/health/live",
+        "https://127.0.0.1:8020/health/live",
+        "https://localhost:8021/health/live",
+        "https://localhost:8020/health",
+        "https://user@localhost:8020/health/live",
+        "https://localhost:8020/health/live?probe=1",
+        "https://localhost:8020/health/live#fragment",
+    ],
+)
+def test_main_rejects_health_target_overrides_before_any_network_call(
+    monkeypatch,
+    health_url,
+):
+    """Watchdog liveness is a fixed, verified local URL rather than input."""
+    network_calls: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        watchdog,
+        "load_config",
+        lambda: SimpleNamespace(
+            daemon=SimpleNamespace(heartbeat_stale_seconds=180)
+        ),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout: network_calls.append((url, timeout)),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
+    )
+
+    with pytest.raises(SystemExit):
+        watchdog.main(["--health-url", health_url])
+
+    assert network_calls == []
+
+
+def test_fetch_health_uses_an_explicit_default_verified_tls_context(monkeypatch):
+    """The watchdog must never silently downgrade local certificate checks."""
+    verified_context = object()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        watchdog,
+        "ssl",
+        SimpleNamespace(create_default_context=lambda: verified_context),
+        raising=False,
+    )
+
+    def urlopen(url, timeout, *, context):
+        observed.update(url=url, timeout=timeout, context=context)
+        return BytesIO(b'{"alive":true,"database_reachable":true}')
+
+    monkeypatch.setattr(watchdog, "urlopen", urlopen)
+
+    assert watchdog.fetch_health("https://localhost:8020/health/live") == _LIVE
+    assert observed["url"] == "https://localhost:8020/health/live"
+    assert observed["context"] is verified_context
+
+
 def test_main_accepts_only_the_exact_liveness_json_contract(monkeypatch):
     restarted: list[str] = []
     monkeypatch.setattr(
         watchdog,
         "urlopen",
-        lambda url, timeout: BytesIO(
+        lambda url, timeout, *, context: BytesIO(
             b'{"alive":true,"database_reachable":true}'
         ),
     )
@@ -424,7 +489,7 @@ def test_main_malformed_liveness_body_restarts_app_without_crashing(
     monkeypatch.setattr(
         watchdog,
         "urlopen",
-        lambda url, timeout: BytesIO(body),
+        lambda url, timeout, *, context: BytesIO(body),
     )
     monkeypatch.setattr(
         watchdog,
@@ -451,7 +516,7 @@ def test_main_oversized_liveness_body_restarts_app_without_crashing(
     monkeypatch.setattr(
         watchdog,
         "urlopen",
-        lambda url, timeout: BytesIO(oversized),
+        lambda url, timeout, *, context: BytesIO(oversized),
     )
     monkeypatch.setattr(
         watchdog,
@@ -484,7 +549,7 @@ def test_fetch_health_decodes_text_and_rejects_nested_duplicate_members(
     monkeypatch.setattr(
         watchdog,
         "urlopen",
-        lambda url, timeout: BytesIO(body),
+        lambda url, timeout, *, context: BytesIO(body),
     )
 
     assert watchdog.fetch_health("https://localhost:8020/health/live") is None
@@ -817,9 +882,9 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
 
     assert (
         "emit_periodic com.trading.watchdog 60 "
-        '"$PY" -m trading_assistant.ops.watchdog '
-        "--health-url https://localhost:8020/health/live"
+        '"$PY" -m trading_assistant.ops.watchdog'
     ) in install
+    assert "--health-url" not in install
     assert "curl --fail --silent https://localhost:8020/health/live" in install
     assert "trading_assistant.ops.serve" in install
     assert "trading_assistant.ops.serve" in start

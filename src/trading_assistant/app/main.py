@@ -9,7 +9,6 @@ inside TradingService.approve_order.
 from __future__ import annotations
 
 from copy import deepcopy
-import ipaddress
 from datetime import date, timedelta
 from functools import wraps
 import inspect
@@ -291,16 +290,6 @@ def build_default_stack() -> tuple[TradingService, Agent]:
     return container.service, _build_agent(container)
 
 
-def _is_loopback_bind(host: str) -> bool:
-    normalized = host.strip().strip("[]").lower()
-    if normalized == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
-
-
 def _create_app(
     service: Optional[TradingService] = None,
     agent: Optional[Agent] = None,
@@ -368,22 +357,18 @@ def _create_app(
 
     register_secret(api_token)
     security_config = service.config.security
-    configured_bind = bind_host or (
-        service.config.server.bind_host
-    )
-    if (
-        not service.config.server.secure_cookies
-        and not _is_loopback_bind(configured_bind)
-    ):
-        raise RuntimeError(
-            "server.secure_cookies must be true for a non-loopback "
-            "server.bind_host"
-        )
     if transport_policy is None:
         transport_policy = TransportPolicy.production(
             service.config.server,
             request_bounds=service.config.security.request_bounds,
         )
+    if transport_policy.production_mode:
+        if service.config.server.secure_cookies is not True:
+            raise RuntimeError(
+                "server.secure_cookies must be true for production transport"
+            )
+    elif not transport_policy.is_test_policy():
+        raise RuntimeError("non-production transport is restricted to tests")
 
     _secrets_holder: dict = (
         {"s": runtime_secrets}
@@ -490,10 +475,6 @@ def _create_app(
         TrustedHostMiddleware,
         allowed_hosts=[transport_policy.canonical_host],
         www_redirect=False,
-    )
-    app.add_middleware(
-        TransportBoundaryMiddleware,
-        policy=transport_policy,
     )
     install_security(app)
     app.include_router(auth_router)
@@ -1178,6 +1159,13 @@ def _create_app(
     ) -> str:
         return (_STATIC / "backtests.html").read_text(encoding="utf-8")
 
+    # Starlette wraps middleware in reverse registration order. Register this
+    # last so transport denials precede response hardening, route policy,
+    # session/database access, and every route handler.
+    app.add_middleware(
+        TransportBoundaryMiddleware,
+        policy=transport_policy,
+    )
     return app
 
 

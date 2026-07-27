@@ -9,21 +9,16 @@ PROJECT="$(pwd -P)"
 PY="$PROJECT/.venv/bin/python"
 PID_FILE="$PROJECT/logs/app.pid"
 
-pid_belongs_to_app () {
-  local pid="$1"
-  local command
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  command="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$command" == *"$PY -m trading_assistant.ops.serve"* ]]
-}
+# shellcheck source=lib/app-process-identity.sh
+source "$PROJECT/scripts/lib/app-process-identity.sh"
+configure_process_identity "$PROJECT" "$PY" "$PID_FILE"
 
-if [[ -f "$PID_FILE" ]]; then
-  existing_pid="$(tr -d '[:space:]' < "$PID_FILE")"
-  if pid_belongs_to_app "$existing_pid"; then
-    echo "app already running (pid $existing_pid)"
+if [[ -e "$PID_FILE" || -L "$PID_FILE" ]]; then
+  if load_process_metadata && managed_process_matches_metadata; then
+    echo "app already running (pid $PROCESS_METADATA_PID)"
     exit 0
   fi
+  echo "replacing stale or malformed managed PID metadata" >&2
   rm -f "$PID_FILE"
 fi
 
@@ -37,11 +32,10 @@ chmod 700 logs
 echo "starting HTTPS app on https://localhost:8020"
 nohup "$PY" -m trading_assistant.ops.serve > /dev/null 2>&1 &
 app_pid="$!"
-if ! pid_belongs_to_app "$app_pid"; then
+if ! write_process_metadata "$app_pid"; then
   echo "app launcher exited before PID ownership could be confirmed" >&2
   exit 1
 fi
-printf '%s\n' "$app_pid" > "$PID_FILE"
 
 echo "Open  : https://localhost:8020"
 echo "Logs  : logs/app.runtime.log"

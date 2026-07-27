@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import ssl
 from numbers import Number
 import subprocess
 from typing import Any
@@ -20,6 +21,7 @@ from ..security.secrets import RuntimeSecrets, load_role_secrets
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
 _LAUNCHCTL_TIMEOUT_SECONDS = 10.0
+_LIVENESS_URL = "https://localhost:8020/health/live"
 _RESTART_ORDER = (
     ("app", "com.trading.app"),
     ("daemon", "com.trading.daemon"),
@@ -87,7 +89,11 @@ def fetch_health(
     url: str,
     timeout_seconds: float = 5.0,
 ) -> dict[str, bool] | None:
-    with urlopen(url, timeout=timeout_seconds) as response:  # noqa: S310 - local URL
+    with urlopen(
+        url,
+        timeout=timeout_seconds,
+        context=ssl.create_default_context(),
+    ) as response:  # noqa: S310 - fixed local HTTPS URL
         body = response.read(_MAX_LIVENESS_RESPONSE_BYTES + 1)
     if not isinstance(body, (bytes, bytearray)):
         return None
@@ -191,10 +197,6 @@ def restart_selected_components(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--health-url",
-        default="https://localhost:8020/health/live",
-    )
     parser.add_argument("--label", default="com.trading.daemon")
     parser.add_argument("--request-timeout", type=float, default=5.0)
     args = parser.parse_args(argv)
@@ -206,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     with runtime_startup("watchdog", secrets):
         try:
             api_health = fetch_health(
-                args.health_url,
+                _LIVENESS_URL,
                 args.request_timeout,
             )
         except Exception:

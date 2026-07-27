@@ -7,6 +7,9 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 import plistlib
+import os
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +26,238 @@ from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.operations import MutationContext, OperationsService
 from trading_assistant.operations.health import build_operational_health
 from trading_assistant.risk.breakers import BreakerScope
+
+
+def _managed_process_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Build a shell-only process fixture; its commands never inspect real PIDs."""
+    source_root = Path(__file__).resolve().parent.parent
+    repo = tmp_path / "managed-process-repo"
+    (repo / "scripts/lib").mkdir(parents=True)
+    (repo / "logs").mkdir()
+    (repo / ".venv/bin").mkdir(parents=True)
+    shutil.copy2(source_root / "scripts/stop.sh", repo / "scripts/stop.sh")
+    identity = source_root / "scripts/lib/app-process-identity.sh"
+    assert identity.is_file(), "start/stop require a shared structured identity helper"
+    shutil.copy2(identity, repo / "scripts/lib/app-process-identity.sh")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "ps").write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$*\" == *command=* ]]; then\n"
+        "  printf ' %s\\n' \"$IDENTITY_COMMAND\"\n"
+        "else\n"
+        "  printf ' %s\\n' \"$IDENTITY_START\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "lsof").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'p%s\\nfcwd\\nn%s\\n' \"$IDENTITY_PID\" \"$IDENTITY_CWD\"\n",
+        encoding="utf-8",
+    )
+    for command in (fake_bin / "ps", fake_bin / "lsof"):
+        command.chmod(0o700)
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text(
+        "kill() {\n"
+        "  if [[ \"$1\" == \"-0\" ]]; then return 0; fi\n"
+        "  printf '%s\\n' \"$*\" >> \"$IDENTITY_KILL_LOG\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    expected_argv = f"{repo}/.venv/bin/python -m trading_assistant.ops.serve"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BASH_ENV": str(bash_env),
+        "IDENTITY_PID": "4242",
+        "IDENTITY_COMMAND": expected_argv,
+        "IDENTITY_CWD": str(repo.resolve()),
+        "IDENTITY_START": "Sun Jul 27 10:00:00 2026",
+        "IDENTITY_KILL_LOG": str(tmp_path / "kill.log"),
+    }
+    return repo, environment
+
+
+def _write_pid_metadata(
+    repo: Path,
+    *,
+    pid: str = "4242",
+    start: str = "Sun Jul 27 10:00:00 2026",
+    cwd: str | None = None,
+    argv: str | None = None,
+    malformed: str | None = None,
+) -> None:
+    metadata = repo / "logs/app.pid"
+    if malformed is not None:
+        metadata.write_text(malformed, encoding="utf-8")
+        return
+    metadata.write_text(
+        "version=1\n"
+        f"pid={pid}\n"
+        f"start={start}\n"
+        f"cwd={cwd or repo.resolve()}\n"
+        f"argv={argv or f'{repo}/.venv/bin/python -m trading_assistant.ops.serve'}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd", "start", "metadata"),
+    [
+        (
+            "substring_impostor",
+            None,
+            None,
+            None,
+        ),
+        (None, "/unrelated/repository", None, None),
+        (None, None, "Sun Jul 27 10:01:00 2026", None),
+        (None, None, None, "pid=4242\n"),
+    ],
+    ids=("substring_impostor", "cwd_mismatch", "pid_reuse_start_mismatch", "malformed_metadata"),
+)
+def test_stop_refuses_any_non_matching_structured_process_identity(
+    tmp_path,
+    command,
+    cwd,
+    start,
+    metadata,
+):
+    """Stop must not signal a stale PID or a command that merely contains ours."""
+    repo, environment = _managed_process_repo(tmp_path)
+    if metadata is None:
+        # Legacy one-line PID data makes the former substring-only ownership
+        # check reach the fake process. The replacement must refuse it.
+        _write_pid_metadata(repo, malformed="4242\n")
+    else:
+        _write_pid_metadata(repo, malformed=metadata)
+    if command == "substring_impostor":
+        environment["IDENTITY_COMMAND"] = (
+            f"wrapper {environment['IDENTITY_COMMAND']} --help"
+        )
+    elif command is not None:
+        environment["IDENTITY_COMMAND"] = command
+    if cwd is not None:
+        environment["IDENTITY_CWD"] = cwd
+    if start is not None:
+        environment["IDENTITY_START"] = start
+
+    result = subprocess.run(
+        ["bash", "scripts/stop.sh"],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert not Path(environment["IDENTITY_KILL_LOG"]).exists()
+    assert (repo / "logs/app.pid").exists()
+
+
+@pytest.mark.parametrize(
+    ("cwd", "start"),
+    [
+        ("/unrelated/repository", "Sun Jul 27 10:00:00 2026"),
+        (None, "Sun Jul 27 10:01:00 2026"),
+    ],
+    ids=("cwd_mismatch", "pid_reuse_start_mismatch"),
+)
+def test_structured_identity_compares_recorded_cwd_and_start_before_signalling(
+    tmp_path,
+    cwd,
+    start,
+):
+    """Metadata must be compared field-by-field, not treated as a PID hint."""
+    repo, environment = _managed_process_repo(tmp_path)
+    _write_pid_metadata(repo)
+    if cwd is not None:
+        environment["IDENTITY_CWD"] = cwd
+    if start is not None:
+        environment["IDENTITY_START"] = start
+    helper = repo / "scripts/lib/app-process-identity.sh"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; configure_process_identity "$2" "$3" "$4"; '
+                'load_process_metadata && managed_process_matches_metadata'
+            ),
+            "bash",
+            str(helper),
+            str(repo.resolve()),
+            str(repo / ".venv/bin/python"),
+            str(repo / "logs/app.pid"),
+        ],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert not Path(environment["IDENTITY_KILL_LOG"]).exists()
+
+
+def test_stop_signals_only_the_exact_recorded_process_identity(tmp_path):
+    """A valid PID is signalled only after argv, cwd, and start identity match."""
+    repo, environment = _managed_process_repo(tmp_path)
+    _write_pid_metadata(repo)
+
+    result = subprocess.run(
+        ["bash", "scripts/stop.sh"],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert Path(environment["IDENTITY_KILL_LOG"]).read_text(encoding="utf-8") == "-TERM 4242\n"
+    assert not (repo / "logs/app.pid").exists()
+
+
+def test_start_metadata_is_atomic_and_records_exact_process_identity(tmp_path):
+    """Start records only the exact process identity it verified before writing."""
+    repo, environment = _managed_process_repo(tmp_path)
+    helper = repo / "scripts/lib/app-process-identity.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; configure_process_identity "$2" "$3" "$4"; '
+                'write_process_metadata 4242; cat "$4"'
+            ),
+            "bash",
+            str(helper),
+            str(repo.resolve()),
+            str(repo / ".venv/bin/python"),
+            str(repo / "logs/app.pid"),
+        ],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "version=1\n"
+        "pid=4242\n"
+        "start=Sun Jul 27 10:00:00 2026\n"
+        f"cwd={repo.resolve()}\n"
+        f"argv={repo}/.venv/bin/python -m trading_assistant.ops.serve\n"
+    )
+    assert list((repo / "logs").glob(".app.pid.*")) == []
 
 
 class _StubAgent:

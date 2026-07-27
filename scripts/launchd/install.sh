@@ -107,7 +107,7 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
 }
 
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
-emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog --health-url https://localhost:8020/health/live
+emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
 emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/backups" --retention-days 14
 
 sleep 6
