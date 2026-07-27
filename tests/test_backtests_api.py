@@ -448,6 +448,8 @@ def test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings(
 
     def completed_run(*args, **kwargs):
         observed["symbols"] = kwargs["symbols"]
+        observed["start_date"] = kwargs["start_date"]
+        observed["end_date"] = kwargs["end_date"]
         return 84, _report()
 
     monkeypatch.setattr(
@@ -473,6 +475,8 @@ def test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings(
 
     assert response.status_code == 200
     assert observed["symbols"] == symbols
+    assert observed["start_date"] == start
+    assert observed["end_date"] == start + timedelta(days=2_999)
 
 
 def test_backtest_timeout_persists_status_and_stops_before_later_provider_call(
@@ -537,6 +541,65 @@ def test_backtest_timeout_persists_status_and_stops_before_later_provider_call(
             result_code="timed_out",
         ).one()
     assert audit.request_id == "backtest-timeout"
+
+
+def test_backtest_deadline_crossing_during_persistence_reconciles_same_run(
+    session_factory,
+    monkeypatch,
+):
+    class StepClock:
+        expired = False
+
+        def __call__(self):
+            return 1_200.0 if self.expired else 0.0
+
+    clock = StepClock()
+    original_persist = runner.persist_report
+    persisted_ids: list[int] = []
+
+    def persist_then_cross_deadline(*args, **kwargs):
+        run_id = original_persist(*args, **kwargs)
+        persisted_ids.append(run_id)
+        clock.expired = True
+        return run_id
+
+    monkeypatch.setattr(
+        runner,
+        "persist_report",
+        persist_then_cross_deadline,
+    )
+    stop_event = threading.Event()
+
+    with pytest.raises(runner.BacktestTimedOut) as timeout:
+        runner.BacktestRunner(
+            session_factory,
+            runtime_seconds=1_200,
+            monotonic=clock,
+        ).run(
+            symbols=["TREND"],
+            actor="operator:test",
+            reason="deadline crossed during persistence",
+            request_id="backtest-persistence-timeout",
+            bars=5,
+            stop_event=stop_event,
+        )
+
+    assert stop_event.is_set()
+    assert timeout.value.run_id == persisted_ids[0]
+    with session_factory() as session:
+        runs = session.query(BacktestRun).all()
+        audits = session.query(AuditEvent).filter_by(
+            action="backtest.run",
+            request_id="backtest-persistence-timeout",
+        ).all()
+    assert [run.id for run in runs] == persisted_ids
+    assert json.loads(runs[0].config_json)["status"] == "timed_out"
+    assert len(audits) == 1
+    assert audits[0].target_id == str(persisted_ids[0])
+    assert audits[0].result_code == "timed_out"
+    assert json.loads(audits[0].detail_json)["stage"] == (
+        "post_persistence"
+    )
 
 
 def test_backtest_cancellation_checks_before_data_load(

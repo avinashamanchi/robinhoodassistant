@@ -64,11 +64,17 @@ def walk_forward(
     spy_symbol: Optional[str] = None,
     label: str = "baseline walk-forward",
     cancel_check: Callable[[], None] | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> tuple[EvaluationReport, HoldoutGuard]:
     backtest_config = backtest_config or BacktestConfig()
     if cancel_check is not None:
         cancel_check()
     timeline = source.timeline(symbols)
+    if start is not None:
+        timeline = [timestamp for timestamp in timeline if timestamp >= start]
+    if end is not None:
+        timeline = [timestamp for timestamp in timeline if timestamp <= end]
     guard = HoldoutGuard(timeline, holdout_months)
     dev, hold = guard.split(timeline)
 

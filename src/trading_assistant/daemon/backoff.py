@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeVar
 
 from ..app.limits import LimitSpec
+from ..assets import AssetClass
 from ..config import WindowLimitConfig
+from ..risk.breakers import BreakerScope
 
 _T = TypeVar("_T")
 RETRIABLE_READ_ERRORS = (TimeoutError, ConnectionError)
@@ -114,6 +116,27 @@ def scheduled_market_data_read(
         authorized_attempt,
         retry_policy,
         sleep=sleep,
+    )
+
+
+def trip_scheduled_market_data_breaker(
+    service,
+    symbol: str,
+    *,
+    actor: str,
+    request_id: str,
+    audit_reason: str,
+    now=None,
+):
+    """Persist the shared stale-data breaker for a denied scheduled read."""
+
+    return service.breakers.trip(
+        BreakerScope.data(AssetClass.for_symbol(symbol)),
+        "scheduled market data allowance unavailable",
+        actor,
+        request_id=request_id,
+        now=now,
+        audit_reason=audit_reason,
     )
 
 

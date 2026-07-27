@@ -234,3 +234,183 @@ Provenance:
 
 None within Task 9 scope. The scheduled market-data breaker intentionally
 requires manual, separately authorized recovery; this task adds no reset path.
+
+## Fix Round 1
+
+### Reviewer findings addressed
+
+1. `BacktestRunner` now checks the monotonic deadline again after
+   `persist_report()`. If persistence crosses the deadline, it atomically
+   changes that exact persisted run and its exact audit event to `timed_out`
+   in one immediate transaction before the API policy releases the durable
+   lease. It does not create a duplicate run or success audit.
+2. API `start_date` and `end_date` now reach source construction and
+   walk-forward evaluation. Synthetic replay creates one daily bar per
+   requested inclusive calendar day, and evaluation filters its timeline to
+   the same inclusive bounds before deriving development/holdout windows.
+   Engine views remain causally bounded at each replay timestamp.
+3. The actual `_build_monitor` shadow quote closure now treats scheduled-read
+   denial and limiter-store unavailability as stale-data failures and trips
+   the shared durable asset-class data breaker before returning `None`.
+   Both paths make zero `broker.get_quote()` calls. Execution-time quote reads
+   were not changed.
+
+### TDD evidence
+
+Focused RED command, run before production repair:
+
+```bash
+uv run pytest \
+  tests/test_backtests_api.py::test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings \
+  tests/test_backtests_api.py::test_backtest_deadline_crossing_during_persistence_reconciles_same_run \
+  tests/test_backtest_engine.py::test_synthetic_source_uses_requested_dates_inclusively \
+  tests/test_backtest_engine.py::test_replay_date_window_is_inclusive_without_future_bars \
+  tests/test_monitor.py::test_daemon_shadow_quote_denial_uses_durable_data_breaker \
+  -v
+```
+
+RED result:
+
+```text
+5 failed, 1 passed in 1.49s
+```
+
+The failures demonstrated the intended gaps: API dates were not forwarded,
+source construction did not accept the date window, persistence crossing the
+deadline returned success, and the two real daemon shadow-denial variants did
+not persist a data breaker. The pre-existing engine window seam passed.
+
+Focused GREEN command (unchanged from RED):
+
+```bash
+uv run pytest \
+  tests/test_backtests_api.py::test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings \
+  tests/test_backtests_api.py::test_backtest_deadline_crossing_during_persistence_reconciles_same_run \
+  tests/test_backtest_engine.py::test_synthetic_source_uses_requested_dates_inclusively \
+  tests/test_backtest_engine.py::test_replay_date_window_is_inclusive_without_future_bars \
+  tests/test_monitor.py::test_daemon_shadow_quote_denial_uses_durable_data_breaker \
+  -v
+```
+
+GREEN result:
+
+```text
+6 passed in 1.13s
+```
+
+Direct walk-forward inclusive-window coverage:
+
+```bash
+uv run pytest \
+  tests/test_backtest_evaluate.py::test_walk_forward_honors_requested_window_inclusively \
+  -v
+```
+
+Result:
+
+```text
+1 passed in 0.46s
+```
+
+### Covering verification
+
+Current-state backtest, monitor, and ops covering command:
+
+```bash
+uv run pytest tests/test_backtests_api.py tests/test_backtest_engine.py \
+  tests/test_backtest_evaluate.py tests/test_monitor.py tests/test_ops.py -v
+```
+
+Result:
+
+```text
+75 passed in 84.94s
+```
+
+Exact expanded Task 9 command from the brief:
+
+```bash
+uv run pytest tests/test_backtests_api.py tests/test_ops.py \
+  tests/test_monitor.py tests/test_submission_barrier.py \
+  tests/stress/test_stress_scenarios.py -v
+```
+
+Result:
+
+```text
+88 passed in 85.83s
+```
+
+Daemon-budget composition and execution-time quote regression command:
+
+```bash
+uv run pytest \
+  tests/test_bootstrap.py::test_daemon_shadow_uses_shared_analysis_budget_and_attempt_ceiling \
+  tests/test_execution_risk_snapshot.py::test_required_execution_quote_failure_raises_typed_dependency \
+  -v
+```
+
+Result:
+
+```text
+3 passed, 1 warning in 1.12s
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning.
+
+Final static checks:
+
+```bash
+uv run python -m compileall -q src tests
+git diff --check
+```
+
+Result: both exited `0` with no output.
+
+### Fix Round 1 changed files
+
+Production:
+
+- `src/trading_assistant/app/main.py`
+- `src/trading_assistant/backtest/evaluate.py`
+- `src/trading_assistant/backtest/runner.py`
+- `src/trading_assistant/daemon/backoff.py`
+- `src/trading_assistant/daemon/main.py`
+- `src/trading_assistant/rules/worker.py`
+
+Tests:
+
+- `tests/test_backtest_engine.py`
+- `tests/test_backtest_evaluate.py`
+- `tests/test_backtests_api.py`
+- `tests/test_monitor.py`
+
+Provenance:
+
+- `.superpowers/sdd/2026-07-27-policy-budget-foundation/task-9-report.md`
+
+### Fix Round 1 self-review
+
+- The post-persistence timeout path updates the same `BacktestRun` and exact
+  `backtest.run` audit identified by run ID and request ID. The run/audit
+  transition is one transaction and occurs before control returns to the
+  lease-owning API policy.
+- Date bounds are validated before source access, govern generated bar count,
+  and constrain walk-forward windows inclusively. A 1-day request now replays
+  one daily bar; a 3,000-day request replays 3,000 daily bars per symbol.
+- Cancellation checks remain before source/data access, every replay bar and
+  strategy call, and the optional LLM call. The new post-persistence check
+  closes the final success-return gap without detached work.
+- The daemon shadow quote closure uses the same durable stale-data breaker
+  transition as rule-worker scheduled reads. Denial/store-unavailable paths
+  call the limiter once and the broker zero times.
+- No execution submission quote path, order submission/cancellation, panic
+  receipt, breaker reset, app/daemon startup, external provider, broker, or
+  notification behavior was invoked or changed.
+- No ledger, migration, runbook, release-gate, or later-task file was edited.
+
+### Fix Round 1 residual concern
+
+None within the reviewer findings. As before, durable data-breaker recovery is
+intentionally outside Task 9 and requires separately authorized manual action.

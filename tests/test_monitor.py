@@ -15,6 +15,7 @@ from trading_assistant.app.limits import (
     LimitStoreUnavailable,
 )
 from trading_assistant.assets import AssetClass
+from trading_assistant.config import Secrets
 from trading_assistant.daemon.monitor import Monitor
 from trading_assistant.db.models import AuditEvent
 from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
@@ -359,6 +360,114 @@ def test_each_scheduled_retry_requires_a_fresh_durable_allowance():
     assert limiter.calls == 2
     assert provider_calls == 1
     assert delays == [0]
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["budget-denied", "store-unavailable"],
+)
+def test_daemon_shadow_quote_denial_uses_durable_data_breaker(
+    app_config,
+    make_service,
+    monkeypatch,
+    store_unavailable,
+):
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import live_features
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.llm import factory as llm_factory
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    class DenyingLimiter:
+        calls = 0
+
+        def consume_pair(self, spec, *, principal):
+            self.calls += 1
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "shadow scheduled limiter unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            )
+        }
+    )
+    service.config = config
+    limiter = DenyingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+    monkeypatch.setattr(
+        live_features,
+        "build_live_feature_provider",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        live_features,
+        "build_screen_source",
+        lambda *_args: object(),
+    )
+
+    monitor = daemon_main._build_monitor(
+        config,
+        Secrets(app_api_token="shadow-read-test-secret"),
+    )
+    price = monitor.shadow.price_lookup("AAPL")
+
+    assert price is None
+    assert limiter.calls == 1
+    assert broker.quote_calls == 0
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
 
 
 def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):

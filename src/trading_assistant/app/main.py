@@ -1134,6 +1134,8 @@ def _create_app(
                 runtime_seconds=runtime_seconds,
                 deadline=deadline,
                 stop_event=stop_event,
+                start_date=body.start_date,
+                end_date=body.end_date,
             )
         except BacktestTimedOut:
             raise ApiError(

@@ -12,13 +12,12 @@ from decimal import Decimal
 from typing import Callable
 
 from trading_assistant.app.limits import LimitStoreUnavailable
-from trading_assistant.assets import AssetClass
 from trading_assistant.daemon.backoff import (
     ScheduledMarketDataDenied,
     scheduled_market_data_read,
+    trip_scheduled_market_data_breaker,
 )
 from trading_assistant.notifications.base import Notifier, NullNotifier
-from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.staleness import is_stale
 
 from .application import RuleApplicationService
@@ -208,15 +207,13 @@ class RuleWorker:
                             outcome.proposal["order_id"],
                         )
             except (ScheduledMarketDataDenied, LimitStoreUnavailable):
-                self.service.breakers.trip(
-                    BreakerScope.data(
-                        AssetClass.for_symbol(command.ticker)
-                    ),
-                    "scheduled market data allowance unavailable",
-                    actor,
+                trip_scheduled_market_data_breaker(
+                    self.service,
+                    command.ticker,
+                    actor=actor,
                     request_id=request_id,
-                    now=tick_now,
                     audit_reason=reason,
+                    now=tick_now,
                 )
                 self.repository.release_group(
                     lease,

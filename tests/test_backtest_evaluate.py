@@ -18,6 +18,7 @@ from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.db.models import BacktestMetricRow, BacktestRun, HoldoutAccessLog
 from trading_assistant.signals.models import Regime
 from trading_assistant.strategies.breakout import Breakout
+from trading_assistant.strategies.base import hold
 from trading_assistant.strategies.rsi_reversion import RsiReversion
 from trading_assistant.strategies.sma_crossover import SmaCrossover
 
@@ -86,6 +87,30 @@ def test_walk_forward_reports_vs_buy_and_hold(session_factory):
     assert any("holdout" in a.context for a in guard.access_log)
     # Rendered table starts with the mandatory disclaimer.
     assert report.render_table().startswith(SIMULATED_LABEL)
+
+
+def test_walk_forward_honors_requested_window_inclusively():
+    source = DataSource({"AAPL": make_bars(10, seed=13)})
+    timeline = source.timeline(["AAPL"])
+    observed = []
+
+    class RecordingStrategy:
+        name = "recording"
+
+        def on_bar(self, features):
+            observed.append(features.as_of)
+            return hold()
+
+    walk_forward(
+        source,
+        ["AAPL"],
+        [RecordingStrategy],
+        holdout_months=12,
+        start=timeline[3],
+        end=timeline[5],
+    )
+
+    assert observed == timeline[3:6]
 
 
 def test_persist_report_writes_rows_and_audit(session_factory):

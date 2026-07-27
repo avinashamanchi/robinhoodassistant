@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import date, timezone
 from decimal import Decimal
 
 import pandas as pd
 import pytest
 
+import trading_assistant.backtest.runner as backtest_runner
 from trading_assistant.backtest.data import DataSource, LookaheadError
 from trading_assistant.backtest.engine import run_backtest
 from trading_assistant.backtest.sim_broker import SimBroker
@@ -268,3 +270,51 @@ def test_replay_checks_cancellation_before_each_data_access():
         )
 
     assert timeline_calls == 0
+
+
+def test_synthetic_source_uses_requested_dates_inclusively():
+    source = backtest_runner.build_synthetic_source(
+        ["TREND"],
+        start_date=date(2026, 1, 10),
+        end_date=date(2026, 1, 12),
+    )
+
+    timeline = source.timeline(["TREND"])
+
+    assert len(timeline) == 3
+    assert timeline[0].date() == date(2026, 1, 10)
+    assert timeline[-1].date() == date(2026, 1, 12)
+    assert all(ts.tzinfo == timezone.utc for ts in timeline)
+
+
+def test_replay_date_window_is_inclusive_without_future_bars():
+    source = DataSource({"AAPL": make_bars(5, seed=12)})
+    timeline = source.timeline(["AAPL"])
+    observed = []
+
+    class RecordingStrategy:
+        name = "recording"
+
+        def on_bar(self, features):
+            observed.append(features.as_of)
+            assert (
+                features.as_of
+                <= timeline[3]
+            )
+            return type(
+                "Signal",
+                (),
+                {"action": "hold", "size_hint": None},
+            )()
+
+    run_backtest(
+        RecordingStrategy(),
+        source,
+        "AAPL",
+        backtest_config=BacktestConfig(),
+        warmup=0,
+        start=timeline[1],
+        end=timeline[3],
+    )
+
+    assert observed == timeline[1:4]

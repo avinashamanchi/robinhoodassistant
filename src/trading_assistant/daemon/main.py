@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
 
+from ..app.limits import LimitStoreUnavailable
 from ..config import Secrets, load_config
 from ..notifications.base import build_notifier
-from .backoff import scheduled_market_data_read
+from .backoff import (
+    ScheduledMarketDataDenied,
+    scheduled_market_data_read,
+    trip_scheduled_market_data_breaker,
+)
 from .monitor import Monitor
 
 
@@ -70,6 +76,17 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
                     ),
                 )
                 return Decimal(str(quote.last))
+            except (ScheduledMarketDataDenied, LimitStoreUnavailable):
+                trip_scheduled_market_data_breaker(
+                    service,
+                    sym,
+                    actor="daemon:shadow",
+                    request_id=f"shadow-price:{uuid4().hex}",
+                    audit_reason=(
+                        "daemon scheduled shadow market data read"
+                    ),
+                )
+                return None
             except Exception:
                 return None
 
