@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..identity import canonical_request_id
 from .auth import (
     RecentAuthenticationRequired,
     SessionAuth,
@@ -19,7 +20,6 @@ from .auth import (
 )
 from .errors import ApiError
 
-_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 _IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,64}\Z")
 _LOG = logging.getLogger(__name__)
 
@@ -151,11 +151,12 @@ def install_security(app: FastAPI) -> None:
     @app.middleware("http")
     async def secure_response(request: Request, call_next):
         incoming_request_id = request.headers.get("X-Request-ID", "")
-        request.state.request_id = (
-            incoming_request_id
-            if _REQUEST_ID.fullmatch(incoming_request_id)
-            else uuid4().hex
-        )
+        try:
+            request.state.request_id = canonical_request_id(
+                incoming_request_id
+            )
+        except ValueError:
+            request.state.request_id = uuid4().hex
         idempotency_key = request.headers.get("Idempotency-Key", "")
         if idempotency_key and not _IDEMPOTENCY_KEY.fullmatch(
             idempotency_key

@@ -139,6 +139,22 @@ class StubAgent:
         return {"reply": f"echo: {message}", "tool_calls": []}
 
 
+class RequestIdentityCaptureBackend:
+    def __init__(self):
+        self.request_ids = []
+
+    def create(self, **kwargs):
+        self.request_ids.append(kwargs["request_id"])
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="captured")],
+            usage=SimpleNamespace(
+                input_tokens=1,
+                output_tokens=1,
+            ),
+        )
+
+
 @pytest.fixture
 def client(make_service, authenticate_client, with_limit):
     svc = make_service()
@@ -158,6 +174,29 @@ def client(make_service, authenticate_client, with_limit):
     test_client, csrf = authenticate_client(TestClient(app), TOKEN)
     test_client.headers.update({"X-CSRF-Token": csrf})
     return test_client, svc, agent
+
+
+def _identity_capture_client(make_service, authenticate_client):
+    from trading_assistant.app.agent import Agent
+
+    service = make_service()
+    backend = RequestIdentityCaptureBackend()
+    agent = Agent(
+        backend,
+        service,
+        service.session_factory,
+        model="capture-only",
+        max_tokens=10,
+        max_turns=2,
+    )
+    app = create_app(
+        service=service,
+        agent=agent,
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    return test_client, service, backend, csrf
 
 
 def _propose(svc, notional="100"):
@@ -3251,6 +3290,110 @@ def test_chat_and_rate_limit(client):
     r = c.post("/chat", json={"message": "third"})   # 3rd blocked
     assert r.status_code == 429
     assert agent.calls == 2
+
+
+def test_http_request_id_canonicalizes_once_for_response_audit_and_provider(
+    make_service,
+    authenticate_client,
+):
+    test_client, service, backend, csrf = _identity_capture_client(
+        make_service,
+        authenticate_client,
+    )
+    headers = {"X-CSRF-Token": csrf}
+
+    exact = test_client.post(
+        "/chat",
+        json={"message": "exact identity"},
+        headers={
+            **headers,
+            "X-Request-ID": "http.request:one",
+        },
+    )
+    spaced = test_client.post(
+        "/chat",
+        json={"message": "spaced identity"},
+        headers={
+            **headers,
+            "X-Request-ID": "  http.request:one  ",
+        },
+    )
+
+    assert exact.status_code == spaced.status_code == 200
+    assert exact.headers["X-Request-ID"] == "http.request:one"
+    assert spaced.headers["X-Request-ID"] == "http.request:one"
+    assert backend.request_ids == [
+        "http.request:one",
+        "http.request:one",
+    ]
+    with service.session_factory() as session:
+        audits = (
+            session.query(AuditEvent)
+            .filter_by(
+                action="http.chat",
+                request_id="http.request:one",
+            )
+            .all()
+        )
+    assert len(audits) == 2
+
+
+def test_invalid_http_request_id_generates_one_fallback_per_request(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    from trading_assistant.app import security
+    test_client, service, backend, csrf = _identity_capture_client(
+        make_service,
+        authenticate_client,
+    )
+    generated_values = iter(["a" * 32, "b" * 32])
+    generation_calls = []
+
+    def generated_uuid():
+        value = next(generated_values)
+        generation_calls.append(value)
+        return SimpleNamespace(hex=value)
+
+    monkeypatch.setattr(security, "uuid4", generated_uuid)
+    headers = {"X-CSRF-Token": csrf}
+
+    first = test_client.post(
+        "/chat",
+        json={"message": "invalid slash"},
+        headers={
+            **headers,
+            "X-Request-ID": "invalid/request",
+        },
+    )
+    second = test_client.post(
+        "/chat",
+        json={"message": "invalid inner space"},
+        headers={
+            **headers,
+            "X-Request-ID": "invalid request",
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert generation_calls == ["a" * 32, "b" * 32]
+    assert first.headers["X-Request-ID"] == "a" * 32
+    assert second.headers["X-Request-ID"] == "b" * 32
+    assert backend.request_ids == ["a" * 32, "b" * 32]
+    with service.session_factory() as session:
+        audits = (
+            session.query(AuditEvent)
+            .filter(
+                AuditEvent.action == "http.chat",
+                AuditEvent.request_id.in_(["a" * 32, "b" * 32]),
+            )
+            .all()
+        )
+    assert {audit.request_id for audit in audits} == {
+        "a" * 32,
+        "b" * 32,
+    }
 
 
 def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):

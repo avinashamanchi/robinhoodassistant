@@ -332,3 +332,168 @@ Tests:
 ### Concerns
 
 None.
+
+## Fix Round 2
+
+### Status
+
+Addressed every finding in `task-8-review-2.md` with RED-first tests. This
+section supersedes Fix Round 1 statements that identifiers are
+NFC-normalized: raw non-ASCII is now rejected before normalization or case
+conversion can occur.
+
+Commit subject:
+
+```text
+fix(identity): reject ambiguous raw identifiers
+```
+
+### Raw-input contract
+
+- The shared identity boundary first requires a string and scans the original
+  input without changing it.
+- Every non-ASCII code point and every ASCII control (`0x00-0x1f`, `0x7f`) is
+  rejected before trimming or case conversion.
+- Only outer ASCII SPACE (`0x20`) is eligible for trimming. Tabs, newlines,
+  NBSP, and other Unicode whitespace are never treated as equivalent spaces.
+- Request IDs remain case-preserving. Symbols uppercase and analyst versions
+  lowercase only after the raw input has passed the ASCII/control scan.
+- Kelvin sign, sharp-S, and dotless-I therefore cannot normalize or
+  case-expand into allowed ASCII identifiers.
+- The existing canonical length and character policies remain unchanged after
+  safe outer-space trimming.
+
+### HTTP request identity
+
+- Removed the separate `X-Request-ID` regex from the HTTP middleware.
+- Incoming headers now pass through `canonical_request_id()` before request
+  state is set.
+- Exact and outer-ASCII-space-equivalent valid headers produce the same
+  response, audit, and provider-attempt identity.
+- Invalid or missing headers generate one UUID fallback in the middleware.
+  Response hardening, API errors, audit recording, and provider delegation all
+  reuse that state value rather than generating replacements.
+- API tests use a real Agent with a capture-only backend and the local mock
+  service; no provider, network, or live broker call is made.
+
+### Task 10 scope correction
+
+- Removed Fix Round 1's partial raw-backend-construction check from
+  `scripts/check_release_safety.py`.
+- Removed its partial negative fixture from `tests/test_release_static.py`.
+- The complete construction gate remains deferred to Task 10.
+- The unreachable local `AnthropicBackend` remains deleted. A scoped Task 8
+  module assertion and source search confirm the app agent module does not
+  expose or define it.
+
+### Strict TDD evidence
+
+RED was captured before production changes:
+
+```bash
+.venv/bin/pytest -o addopts='' -q \
+  tests/test_identity.py \
+  tests/test_api.py::test_http_request_id_canonicalizes_once_for_response_audit_and_provider \
+  tests/test_api.py::test_invalid_http_request_id_generates_one_fallback_per_request \
+  tests/test_agent.py::test_agent_module_does_not_expose_a_raw_anthropic_backend
+```
+
+Result:
+
+```text
+21 failed, 9 passed, 1 warning in 1.50s
+```
+
+The 21 failures directly exposed unsafe pre-validation trimming,
+normalization/case expansion, and the split HTTP regex path. The passing cases
+were preservation evidence for already-rejected raw characters, one generated
+fallback per invalid request, and the already-deleted local backend.
+
+The same new contract plus the existing release gate passed after the minimal
+implementation:
+
+```text
+38 passed, 1 warning in 2.73s
+```
+
+Focused identity, Agent/Analyst/Planning, shadow, validation/bootstrap, HTTP
+security, provider budget, backtest, Task 6/7, and release-gate verification:
+
+```text
+826 passed, 1 warning in 111.88s
+```
+
+Full suite:
+
+```bash
+.venv/bin/pytest -o addopts='' -q
+```
+
+Result:
+
+```text
+2049 passed, 1 skipped, 1 warning in 269.31s
+```
+
+The skip and `websockets.legacy` deprecation warning are pre-existing.
+
+Final static, compilation, and diff checks:
+
+```bash
+.venv/bin/python scripts/check_release_safety.py
+.venv/bin/python -m compileall -q src tests scripts
+git diff --check
+```
+
+All exited `0`; the existing release script printed
+`release static checks: PASS`.
+
+Scoped source searches returned no Task 10 partial gate and no local app
+backend definition:
+
+```bash
+rg -n "_check_llm_backend_construction|raw LLM backend construction" \
+  scripts tests/test_release_static.py
+rg -n "class AnthropicBackend" src/trading_assistant/app
+```
+
+### Changed files in Fix Round 2
+
+Production:
+
+- `src/trading_assistant/identity.py`
+- `src/trading_assistant/app/security.py`
+
+Task 10 deferral:
+
+- `scripts/check_release_safety.py`
+- `tests/test_release_static.py`
+
+Tests:
+
+- `tests/test_identity.py`
+- `tests/test_agent.py`
+- `tests/test_api.py`
+
+Provenance:
+
+- `.superpowers/sdd/2026-07-27-policy-budget-foundation/task-8-report.md`
+
+### Self-review
+
+- Unsafe raw input cannot become valid through trimming, Unicode
+  normalization, or Unicode case conversion.
+- Valid outer ASCII spaces canonicalize consistently at direct and HTTP
+  boundaries.
+- Every HTTP request has one state identity reused by the response, audit, and
+  provider path; invalid headers consume exactly one UUID generation.
+- Request-ID length/character policy, per-attempt budget reservations, shadow
+  and validation identity, Task 5 response-cache hashing, and Task 6/7 safety
+  behavior remain covered.
+- No Task 9 or Task 10 runtime behavior was implemented.
+- No external provider, network, live broker, notification, order, or daemon
+  action was performed.
+
+### Concerns
+
+None.

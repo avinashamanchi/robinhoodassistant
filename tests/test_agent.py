@@ -201,6 +201,12 @@ def test_agent_accepts_full_safe_request_id_character_set_at_64_characters(
     assert agent.backend.request_ids == [request_id]
 
 
+def test_agent_module_does_not_expose_a_raw_anthropic_backend():
+    from trading_assistant.app import agent as agent_module
+
+    assert not hasattr(agent_module, "AnthropicBackend")
+
+
 def test_agent_proposes_order_but_does_not_execute(make_service):
     agent, svc = _agent(
         make_service,

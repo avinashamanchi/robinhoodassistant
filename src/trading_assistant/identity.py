@@ -1,10 +1,12 @@
 """Canonical durable identities shared by runtime provenance boundaries.
 
-Externally supplied request IDs are NFC-normalized and trimmed, but are never
-truncated or hashed. They must be 1-64 ASCII characters from
-``A-Z a-z 0-9 . _ : -``.
+Externally supplied request IDs are never truncated or hashed. Raw input must
+contain only printable ASCII; controls and non-ASCII are rejected before any
+transformation. Only outer ASCII SPACE characters are trimmed. Canonical IDs
+must be 1-64 characters from ``A-Z a-z 0-9 . _ : -``.
 
-Persisted market symbols use 1-16 uppercase characters from
+Persisted market symbols trim only outer ASCII SPACE and then use 1-16
+uppercase characters from
 ``A-Z 0-9 . _ : / -``. Analyst versions use 1-16 lowercase characters from
 ``a-z 0-9 . _ : -``. These policies match the existing database columns.
 """
@@ -12,7 +14,6 @@ Persisted market symbols use 1-16 uppercase characters from
 from __future__ import annotations
 
 import re
-import unicodedata
 from datetime import datetime, timezone
 
 
@@ -35,7 +36,13 @@ def _canonical_ascii(
 ) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    canonical = unicodedata.normalize("NFC", value).strip()
+    for character in value:
+        codepoint = ord(character)
+        if codepoint > 0x7F:
+            raise ValueError(f"{field} must contain only ASCII")
+        if codepoint < 0x20 or codepoint == 0x7F:
+            raise ValueError(f"{field} must not contain controls")
+    canonical = value.strip(" ")
     if case == "upper":
         canonical = canonical.upper()
     elif case == "lower":
