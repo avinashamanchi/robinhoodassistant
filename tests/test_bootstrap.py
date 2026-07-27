@@ -12,6 +12,8 @@ from trading_assistant.app.auth import SessionAuth
 from trading_assistant.app.limits import (
     ConcurrencyLeaseService,
     DurableRateLimiter,
+    LimitSpec,
+    LimitStoreUnavailable,
 )
 from trading_assistant.app.main import create_app
 from trading_assistant.broker.alpaca import AlpacaBroker
@@ -587,6 +589,109 @@ def test_application_container_shares_exact_policy_services_and_config(
         container.rule_worker.provider_budget
         is container.provider_budget
     )
+
+
+def test_container_runs_bounded_startup_pruning_and_exposes_posture(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    calls: list[tuple[str, int, object]] = []
+
+    class RecordingRateLimiter(DurableRateLimiter):
+        def prune_expired(self, now, limit=500):
+            calls.append(("rate_windows", limit, now))
+            return 3
+
+    class RecordingLeases(ConcurrencyLeaseService):
+        def prune_expired(self, now, limit=500):
+            calls.append(("leases", limit, now))
+            return 2
+
+    monkeypatch.setattr(
+        bootstrap,
+        "DurableRateLimiter",
+        RecordingRateLimiter,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "ConcurrencyLeaseService",
+        RecordingLeases,
+    )
+
+    container = bootstrap.build_test_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
+    )
+
+    assert [call[:2] for call in calls] == [
+        ("rate_windows", 500),
+        ("leases", 500),
+    ]
+    assert calls[0][2] == calls[1][2]
+    posture = container.policy_store_maintenance.posture().as_dict()
+    assert posture["status"] == "current"
+    assert posture["source"] == "startup"
+    assert posture["limit"] == 500
+    assert posture["rate_windows_deleted"] == 3
+    assert posture["leases_deleted"] == 2
+    assert posture["failed_stores"] == []
+    assert (
+        container.operations.health().as_dict()[
+            "policy_store_pruning"
+        ]
+        == posture
+    )
+
+
+def test_startup_pruning_failure_is_observable_without_policy_fallback(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    class UnavailableRatePruning(DurableRateLimiter):
+        def prune_expired(self, now, limit=500):
+            raise LimitStoreUnavailable("private prune failure")
+
+    monkeypatch.setattr(
+        bootstrap,
+        "DurableRateLimiter",
+        UnavailableRatePruning,
+    )
+    container = bootstrap.build_test_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
+    )
+
+    posture = container.policy_store_maintenance.posture().as_dict()
+    assert posture["status"] == "degraded"
+    assert posture["failed_stores"] == ["rate_windows"]
+    assert "private prune failure" not in str(posture)
+
+    spec = LimitSpec(
+        "startup-prune-failure",
+        principal_requests=1,
+        global_requests=1,
+        window_seconds=60,
+    )
+    first = container.rate_limiter.consume_pair(
+        spec,
+        principal="operator:test",
+    )
+    second = container.rate_limiter.consume_pair(
+        spec,
+        principal="operator:test",
+    )
+    assert first.allowed is True
+    assert second.allowed is False
 
 
 def test_container_constructs_each_policy_service_once_and_app_reuses_it(

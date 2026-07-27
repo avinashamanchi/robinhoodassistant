@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import trading_assistant.backtest.runner as runner
+from trading_assistant.app.limits import ConcurrencyLeaseService
 from trading_assistant.app.main import create_app
 from trading_assistant.db.models import (
     AuditEvent,
@@ -283,6 +284,18 @@ def test_expired_backtest_lease_is_reclaimed_with_exact_fence(
             )
         )
         session.commit()
+
+    ConcurrencyLeaseService(
+        service.session_factory
+    ).prune_expired(
+        utcnow(),
+        limit=500,
+    )
+    with service.session_factory() as session:
+        assert (
+            session.get(ConcurrencyLease, "backtest:global")
+            is not None
+        )
 
     calls = 0
 

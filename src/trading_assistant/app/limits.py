@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Literal
 
 from sqlalchemy import case, delete, or_, select, text, update
@@ -25,6 +27,7 @@ from trading_assistant.db.models import (
 
 UTC = timezone.utc
 _RELEASED_AT = datetime(1970, 1, 1, tzinfo=UTC)
+_LOG = logging.getLogger(__name__)
 
 
 class LimitStoreUnavailable(RuntimeError):
@@ -608,7 +611,12 @@ class ConcurrencyLeaseService:
         current = _as_utc(now)
         keys = (
             select(ConcurrencyLease.resource_key)
-            .where(ConcurrencyLease.expires_at <= current)
+            .where(
+                ConcurrencyLease.expires_at <= current,
+                ConcurrencyLease.resource_key.not_in(
+                    select(MutationInterlock.resource_key)
+                ),
+            )
             .order_by(
                 ConcurrencyLease.expires_at,
                 ConcurrencyLease.resource_key,
@@ -960,3 +968,117 @@ class MutationInterlockService:
             outcome_code=row.outcome_code,
             worker_finished_at=row.worker_finished_at,
         )
+
+
+@dataclass(frozen=True)
+class PruningPosture:
+    source: str
+    attempted_at: datetime | None
+    limit: int
+    rate_windows_deleted: int
+    leases_deleted: int
+    failed_stores: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": (
+                "not_run"
+                if self.attempted_at is None
+                else "degraded"
+                if self.failed_stores
+                else "current"
+            ),
+            "source": self.source,
+            "attempted_at": (
+                self.attempted_at.isoformat()
+                if self.attempted_at is not None
+                else None
+            ),
+            "limit": self.limit,
+            "rate_windows_deleted": self.rate_windows_deleted,
+            "leases_deleted": self.leases_deleted,
+            "failed_stores": list(self.failed_stores),
+        }
+
+
+class PolicyStoreMaintenance:
+    """Bounded cleanup with an observable, non-permissive failure posture."""
+
+    def __init__(
+        self,
+        rate_limiter: DurableRateLimiter,
+        leases: ConcurrencyLeaseService,
+    ) -> None:
+        self.rate_limiter = rate_limiter
+        self.leases = leases
+        self._lock = Lock()
+        self._posture = PruningPosture(
+            source="not_run",
+            attempted_at=None,
+            limit=0,
+            rate_windows_deleted=0,
+            leases_deleted=0,
+            failed_stores=(),
+        )
+
+    def prune_once(
+        self,
+        *,
+        source: str,
+        limit: int = 500,
+        now: datetime | None = None,
+    ) -> PruningPosture:
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("pruning source must be non-empty")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        current = _as_utc(now)
+        deleted = {
+            "rate_windows": 0,
+            "leases": 0,
+        }
+        failed: list[str] = []
+        try:
+            deleted["rate_windows"] = self.rate_limiter.prune_expired(
+                current,
+                limit=limit,
+            )
+        except LimitStoreUnavailable:
+            failed.append("rate_windows")
+        try:
+            deleted["leases"] = self.leases.prune_expired(
+                current,
+                limit=limit,
+            )
+        except LimitStoreUnavailable:
+            failed.append("leases")
+        posture = PruningPosture(
+            source=source,
+            attempted_at=current,
+            limit=limit,
+            rate_windows_deleted=deleted["rate_windows"],
+            leases_deleted=deleted["leases"],
+            failed_stores=tuple(failed),
+        )
+        with self._lock:
+            self._posture = posture
+        if failed:
+            _LOG.error(
+                "policy_store_pruning_degraded source=%s "
+                "failed_stores=%s",
+                source,
+                ",".join(failed),
+            )
+        else:
+            _LOG.info(
+                "policy_store_pruning_current source=%s "
+                "rate_windows_deleted=%d leases_deleted=%d",
+                source,
+                deleted["rate_windows"],
+                deleted["leases"],
+            )
+        return posture
+
+    def posture(self) -> PruningPosture:
+        with self._lock:
+            return self._posture

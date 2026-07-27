@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from ..app.limits import PolicyStoreMaintenance
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
 from ..operations import MutationContext
@@ -47,6 +48,7 @@ class Monitor:
         rate_limiter=None,
         leases=None,
         provider_budget=None,
+        policy_store_maintenance=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
@@ -65,6 +67,16 @@ class Monitor:
         self.rate_limiter = rate_limiter
         self.leases = leases
         self.provider_budget = provider_budget
+        self.policy_store_maintenance = policy_store_maintenance
+        if (
+            self.policy_store_maintenance is None
+            and rate_limiter is not None
+            and leases is not None
+        ):
+            self.policy_store_maintenance = PolicyStoreMaintenance(
+                rate_limiter,
+                leases,
+            )
         self.rule_worker = rule_worker or RuleWorker(
             service,
             service.rule_repository,
@@ -99,6 +111,12 @@ class Monitor:
             return {"ran": False}
         self._last_daily = today
         result: dict[str, Any] = {"ran": True}
+        if self.policy_store_maintenance is not None:
+            pruning = self.policy_store_maintenance.prune_once(
+                source="daily",
+                limit=500,
+            )
+            result["policy_store_pruning"] = pruning.as_dict()
         if self.shadow is not None:
             try:
                 result["shadow_graded"] = self.shadow.grade_due()

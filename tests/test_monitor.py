@@ -1032,6 +1032,44 @@ def test_daemon_loop_body_runs_clean(make_service):
     assert svc.health()["db_ok"] is True and svc.health()["daemon_alive"] is True
 
 
+def test_daily_tasks_run_bounded_policy_store_pruning_once_and_report_posture(
+    make_service,
+):
+    from datetime import date
+
+    calls = []
+
+    class Posture:
+        def as_dict(self):
+            return {
+                "status": "degraded",
+                "source": "daily",
+                "limit": 500,
+                "rate_windows_deleted": 0,
+                "leases_deleted": 4,
+                "failed_stores": ["rate_windows"],
+            }
+
+    class Maintenance:
+        def prune_once(self, *, source, limit):
+            calls.append((source, limit))
+            return Posture()
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        policy_store_maintenance=Maintenance(),
+    )
+    today = date(2026, 7, 27)
+
+    first = monitor.run_daily_tasks(today=today)
+    second = monitor.run_daily_tasks(today=today)
+
+    assert calls == [("daily", 500)]
+    assert first["policy_store_pruning"] == Posture().as_dict()
+    assert second == {"ran": False}
+
+
 def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
     daily_started = Event()
     daily_release = Event()

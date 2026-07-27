@@ -23,12 +23,14 @@ class OperationsService:
         rate_limiter=None,
         leases=None,
         provider_budget=None,
+        policy_store_maintenance=None,
     ) -> None:
         self.service = service
         self.audit = audit or AuditRecorder(service.session_factory)
         self.rate_limiter = rate_limiter
         self.leases = leases
         self.provider_budget = provider_budget
+        self.policy_store_maintenance = policy_store_maintenance
 
     def _record_best_effort(
         self,
@@ -99,7 +101,14 @@ class OperationsService:
         return result
 
     def health(self) -> OperationalHealthReport:
-        return build_operational_health(self.service)
+        report = build_operational_health(self.service)
+        if self.policy_store_maintenance is None:
+            return report
+        payload = report.as_dict()
+        payload["policy_store_pruning"] = (
+            self.policy_store_maintenance.posture().as_dict()
+        )
+        return OperationalHealthReport(payload)
 
     def liveness(self):
         return build_liveness(self.service.session_factory)

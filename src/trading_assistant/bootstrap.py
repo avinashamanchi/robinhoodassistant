@@ -10,7 +10,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .app.auth import SessionAuth
-from .app.limits import ConcurrencyLeaseService, DurableRateLimiter
+from .app.limits import (
+    ConcurrencyLeaseService,
+    DurableRateLimiter,
+    PolicyStoreMaintenance,
+)
 from .broker.base import BrokerClient
 from .broker.factory import build_broker, build_clock
 from .config import (
@@ -53,6 +57,7 @@ class ApplicationContainer:
     session_factory: sessionmaker[Session]
     rate_limiter: DurableRateLimiter
     leases: ConcurrencyLeaseService
+    policy_store_maintenance: PolicyStoreMaintenance
     provider_budget: ProviderBudgetService
     broker: BrokerClient
     service: TradingService
@@ -187,6 +192,14 @@ def _build_container(
     session_factory = runtime.session_factory
     rate_limiter = DurableRateLimiter(session_factory)
     leases = ConcurrencyLeaseService(session_factory)
+    policy_store_maintenance = PolicyStoreMaintenance(
+        rate_limiter,
+        leases,
+    )
+    policy_store_maintenance.prune_once(
+        source="startup",
+        limit=500,
+    )
     provider_budget = build_provider_budget_service(
         config,
         session_factory,
@@ -245,6 +258,7 @@ def _build_container(
         audit,
         rate_limiter=rate_limiter,
         leases=leases,
+        policy_store_maintenance=policy_store_maintenance,
         provider_budget=provider_budget,
     )
     return ApplicationContainer(
@@ -254,6 +268,7 @@ def _build_container(
         session_factory=session_factory,
         rate_limiter=rate_limiter,
         leases=leases,
+        policy_store_maintenance=policy_store_maintenance,
         provider_budget=provider_budget,
         broker=broker,
         service=service,

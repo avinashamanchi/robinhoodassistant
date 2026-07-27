@@ -136,6 +136,11 @@ def _build_monitor(
         rate_limiter=container.rate_limiter,
         leases=container.leases,
         provider_budget=container.provider_budget,
+        policy_store_maintenance=getattr(
+            container,
+            "policy_store_maintenance",
+            None,
+        ),
     )
 
 
