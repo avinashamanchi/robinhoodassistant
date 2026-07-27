@@ -38,10 +38,11 @@ def test_create_app_rejects_partial_explicit_injection_without_ambient_reads(
 
     monkeypatch.setattr(
         app_main,
-        "Secrets",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("ambient Secrets must not be read")
+        "load_role_secrets",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambient providers must not be read")
         ),
+        raising=False,
     )
     monkeypatch.setattr(
         app_main,
@@ -70,10 +71,11 @@ def test_create_app_complete_explicit_injection_never_reads_ambient_secrets(
     agent = _Agent()
     monkeypatch.setattr(
         app_main,
-        "Secrets",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("ambient Secrets must not be read")
+        "load_role_secrets",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambient providers must not be read")
         ),
+        raising=False,
     )
 
     app = create_app(
@@ -399,11 +401,17 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
     calls = {"secrets": 0}
     observed = []
 
-    def one_secrets():
+    def one_secrets(role, *, config):
         calls["secrets"] += 1
+        assert role == "watchdog"
         return secrets
 
-    monkeypatch.setattr(watchdog, "Secrets", one_secrets)
+    monkeypatch.setattr(
+        watchdog,
+        "load_role_secrets",
+        one_secrets,
+        raising=False,
+    )
     monkeypatch.setattr(
         watchdog,
         "load_config",
@@ -455,16 +463,23 @@ def test_daemon_main_logs_startup_reconciliation_failure_with_one_secret(
         async def run(self):
             raise RuntimeError(marker)
 
-    def one_secrets():
+    def one_secrets(role, *, config):
         nonlocal secret_reads
         secret_reads += 1
+        assert role == "daemon"
+        assert config is not None
         return secrets
 
     def build(supplied_config, supplied_secrets):
         observed.append((supplied_config, supplied_secrets))
         return ReconciliationFailureMonitor()
 
-    monkeypatch.setattr(daemon_main, "Secrets", one_secrets)
+    monkeypatch.setattr(
+        daemon_main,
+        "load_role_secrets",
+        one_secrets,
+        raising=False,
+    )
     monkeypatch.setattr(daemon_main, "load_config", lambda: config)
     monkeypatch.setattr(daemon_main, "_build_monitor", build)
     monkeypatch.chdir(tmp_path)
@@ -512,23 +527,31 @@ def test_utility_main_reuses_one_secret_and_role_log(
     calls = {"secrets": 0}
     observed = []
 
-    def one_secrets():
+    def one_secrets(role, *, config):
         calls["secrets"] += 1
+        assert role == runtime_role
         return secrets
 
-    monkeypatch.setattr(module, "Secrets", one_secrets)
+    monkeypatch.setattr(
+        module,
+        "load_role_secrets",
+        one_secrets,
+        raising=False,
+    )
+    config = SimpleNamespace()
+    monkeypatch.setattr(module, "load_config", lambda *_args: config)
     monkeypatch.chdir(tmp_path)
     if module_name == "preflight":
         monkeypatch.setattr(
             module,
             "_run",
-            lambda supplied: observed.append(supplied) or 0,
+            lambda supplied_config, supplied_secrets: (
+                observed.append((supplied_config, supplied_secrets)) or 0
+            ),
         )
         result = module.run()
     else:
-        config = SimpleNamespace()
         service = object()
-        monkeypatch.setattr(module, "load_config", lambda: config)
         monkeypatch.setattr(
             module,
             "build_paper_service",
@@ -553,10 +576,7 @@ def test_utility_main_reuses_one_secret_and_role_log(
 
     assert result == 0
     assert calls == {"secrets": 1}
-    if module_name == "preflight":
-        assert observed == [secrets]
-    else:
-        assert observed == [(config, secrets)]
+    assert observed == [(config, secrets)]
     assert (
         tmp_path / "logs" / f"{runtime_role}.runtime.log"
     ).exists()
@@ -577,11 +597,25 @@ def test_backup_main_reuses_one_secret_and_writes_role_log(
     )
     calls = {"secrets": 0}
 
-    def one_secrets():
+    config = SimpleNamespace()
+
+    def one_secrets(role, *, config):
         calls["secrets"] += 1
+        assert role == "backup"
         return secrets
 
-    monkeypatch.setattr(backup, "Secrets", one_secrets)
+    monkeypatch.setattr(
+        backup,
+        "load_config",
+        lambda: config,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup,
+        "load_role_secrets",
+        one_secrets,
+        raising=False,
+    )
     monkeypatch.setattr(
         backup,
         "backup_database",
@@ -596,6 +630,84 @@ def test_backup_main_reuses_one_secret_and_writes_role_log(
     ) == 0
     assert calls["secrets"] == 1
     assert (tmp_path / "logs" / "backup.runtime.log").exists()
+
+
+def test_migration_main_loads_one_role_secret_before_engine_construction(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate
+
+    secrets = Secrets(database_url="sqlite:///migration-role.db")
+    observed = []
+
+    def load(role, *, config, **_kwargs):
+        observed.append(("load", role, config))
+        return secrets
+
+    monkeypatch.setattr(migrate, "load_config", lambda: app_config, raising=False)
+    monkeypatch.setattr(
+        migrate,
+        "load_role_secrets",
+        load,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        migrate,
+        "create_db_engine",
+        lambda database_url: observed.append(
+            ("engine", database_url)
+        )
+        or object(),
+    )
+    monkeypatch.setattr(migrate, "_print_result", lambda *_args: None)
+    monkeypatch.setattr(migrate, "require_current_schema", lambda _engine: None)
+
+    assert migrate.main(["status"]) == 0
+    assert observed == [
+        ("load", "migration", app_config),
+        ("engine", secrets.database_url),
+    ]
+
+
+def test_safety_drill_main_passes_one_role_secret_into_offline_drill(
+    app_config,
+    monkeypatch,
+    tmp_path,
+):
+    from trading_assistant.ops import safety_drill
+
+    secrets = Secrets(database_url="sqlite:///safety-role.db")
+    observed = []
+
+    def load(role, *, config, **_kwargs):
+        observed.append(("load", role, config))
+        return secrets
+
+    monkeypatch.setattr(safety_drill, "load_config", lambda: app_config)
+    monkeypatch.setattr(
+        safety_drill,
+        "load_role_secrets",
+        load,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        safety_drill,
+        "run_safety_drill",
+        lambda **kwargs: (
+            observed.append(("run", kwargs["secrets"]))
+            or SimpleNamespace(safe=True, to_json=lambda: "{}")
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert safety_drill.main(
+        ["--database-copy", str(tmp_path / "copy.db"), "--mock"]
+    ) == 0
+    assert observed == [
+        ("load", "safety-drill", app_config),
+        ("run", secrets),
+    ]
 
 
 def test_launchd_installer_generates_only_bounded_stream_jobs(

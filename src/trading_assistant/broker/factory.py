@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..config import AppConfig, BrokerKind, Secrets
+from ..security.secrets import secret_value
 from .base import BrokerClient
 from .mock import MockBroker
 
@@ -14,8 +15,8 @@ def build_broker(config: AppConfig, secrets: Secrets) -> BrokerClient:
     from .alpaca import AlpacaBroker  # lazy: keeps mock-only installs SDK-free
 
     return AlpacaBroker.from_credentials(
-        secrets.alpaca_api_key,
-        secrets.alpaca_secret_key,
+        secret_value(secrets.alpaca_api_key),
+        secret_value(secrets.alpaca_secret_key),
         paper=True,
         timeout_seconds=config.trading.request_timeout_seconds,
     )
@@ -31,8 +32,8 @@ def build_clock(config: AppConfig, secrets: Secrets):
     from .alpaca import AlpacaClock
 
     return AlpacaClock.from_credentials(
-        secrets.alpaca_api_key,
-        secrets.alpaca_secret_key,
+        secret_value(secrets.alpaca_api_key),
+        secret_value(secrets.alpaca_secret_key),
         paper=True,
         timeout_seconds=config.trading.request_timeout_seconds,
     )

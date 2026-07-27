@@ -40,7 +40,6 @@ from ..broker.models import (
 from ..config import (
     AppConfig,
     BrokerKind,
-    Secrets,
     TradingMode,
     load_config,
 )
@@ -51,6 +50,13 @@ from ..db.session import create_db_engine
 from ..risk.breakers import BreakerScope
 from ..risk.clock import FakeClock
 from ..rules.repository import RuleRepository
+from ..security.secrets import (
+    EnvironmentSecretProvider,
+    RuntimeSecrets,
+    load_role_secrets,
+    secret_is_set,
+    secret_value,
+)
 
 
 _OCO_REPOSITORY_TIMEOUT_SECONDS = 2.0
@@ -731,9 +737,9 @@ def _hold_database_source(source: Path):
             pass
 
 
-def _database_source(database_url: str) -> Path:
+def _database_source(database_url) -> Path:
     try:
-        url = make_url(database_url)
+        url = make_url(secret_value(database_url))
     except Exception:
         raise SafetyDrillError("unsafe_primary_database") from None
     if (
@@ -1043,7 +1049,8 @@ def _validate_safe_config(config: AppConfig) -> None:
 
 def _validate_credentialed_paper(
     broker: BrokerClient,
-    secrets: Secrets,
+    secrets: RuntimeSecrets,
+    config: AppConfig,
 ) -> None:
     from ..broker.alpaca import AlpacaBroker
     from ..broker.base import BrokerSubmissionRejected
@@ -1057,11 +1064,14 @@ def _validate_credentialed_paper(
     target = getattr(broker, "execution_target", None)
     if target is None or target.is_official_paper is not True:
         raise SafetyDrillError("unsafe_configuration")
-    if not (secrets.alpaca_api_key and secrets.alpaca_secret_key):
+    if not (
+        secret_is_set(secrets.alpaca_api_key)
+        and secret_is_set(secrets.alpaca_secret_key)
+    ):
         raise SafetyDrillError("credentials_unavailable")
-    if secrets.live_trading_confirm:
+    if secret_is_set(secrets.live_trading_confirm):
         raise SafetyDrillError("unsafe_configuration")
-    endpoint = urlsplit(secrets.alpaca_paper_base_url)
+    endpoint = urlsplit(str(config.provider_origins.alpaca_trading))
     if (
         endpoint.scheme != "https"
         or endpoint.hostname != "paper-api.alpaca.markets"
@@ -1689,14 +1699,15 @@ def run_safety_drill(
     database_copy: str | Path,
     config: AppConfig,
     broker: BrokerClient,
+    secrets: RuntimeSecrets,
     credentialed_paper: bool = False,
     clock=None,
 ) -> SafetyDrillReport:
     """Copy the primary and derive every report gate from production behavior."""
     _validate_safe_config(config)
-    primary_secrets = Secrets()
+    primary_secrets = secrets
     if credentialed_paper:
-        _validate_credentialed_paper(broker, primary_secrets)
+        _validate_credentialed_paper(broker, primary_secrets, config)
         if clock is None:
             raise SafetyDrillError("unsafe_configuration")
     primary = _database_source(primary_secrets.database_url)
@@ -1715,8 +1726,9 @@ def run_safety_drill(
         update={
             "database_url": copy_url,
             "app_api_token": (
-                primary_secrets.app_api_token
-                or "task-10-safety-drill-local-operator"
+                secret_value(primary_secrets.app_api_token)
+                if secret_is_set(primary_secrets.app_api_token)
+                else "task-10-safety-drill-local-operator"
             ),
         }
     )
@@ -1726,6 +1738,7 @@ def run_safety_drill(
             lambda: _validate_credentialed_paper(
                 broker,
                 primary_secrets,
+                config,
             )
             if credentialed_paper
             else None
@@ -2147,7 +2160,11 @@ def run_safety_drill(
     paper_target_confirmed = not credentialed_paper
     if credentialed_paper:
         try:
-            _validate_credentialed_paper(broker, primary_secrets)
+            _validate_credentialed_paper(
+                broker,
+                primary_secrets,
+                config,
+            )
             paper_target_confirmed = True
         except Exception:
             paper_target_confirmed = False
@@ -2171,17 +2188,32 @@ def run_safety_drill(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-copy", type=Path, required=True)
+    parser.add_argument(
+        "--development-environment-secrets",
+        action="store_true",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--mock", action="store_true")
     mode.add_argument("--alpaca-paper", action="store_true")
     args = parser.parse_args(argv)
 
-    secrets = Secrets()
     from ..logging import runtime_startup
 
+    config = load_config()
+    if args.development_environment_secrets:
+        secrets = load_role_secrets(
+            "safety-drill",
+            config=config,
+            provider=EnvironmentSecretProvider(environ=os.environ),
+            allow_environment=True,
+        )
+    else:
+        secrets = load_role_secrets(
+            "safety-drill",
+            config=config,
+        )
     try:
         with runtime_startup("safety-drill", secrets):
-            config = load_config()
             if args.mock:
                 from ..broker.mock import MockBroker
 
@@ -2191,21 +2223,21 @@ def main(argv: list[str] | None = None) -> int:
                 clock = FakeClock(is_open=True)
             else:
                 if not (
-                    secrets.alpaca_api_key
-                    and secrets.alpaca_secret_key
+                    secret_is_set(secrets.alpaca_api_key)
+                    and secret_is_set(secrets.alpaca_secret_key)
                 ):
                     raise SafetyDrillError("credentials_unavailable")
                 from ..broker.alpaca import AlpacaBroker, AlpacaClock
 
                 broker = AlpacaBroker.from_credentials(
-                    secrets.alpaca_api_key,
-                    secrets.alpaca_secret_key,
+                    secret_value(secrets.alpaca_api_key),
+                    secret_value(secrets.alpaca_secret_key),
                     paper=True,
                     timeout_seconds=config.trading.request_timeout_seconds,
                 )
                 clock = AlpacaClock.from_credentials(
-                    secrets.alpaca_api_key,
-                    secrets.alpaca_secret_key,
+                    secret_value(secrets.alpaca_api_key),
+                    secret_value(secrets.alpaca_secret_key),
                     paper=True,
                     timeout_seconds=config.trading.request_timeout_seconds,
                 )
@@ -2213,6 +2245,7 @@ def main(argv: list[str] | None = None) -> int:
                 database_copy=args.database_copy,
                 config=config,
                 broker=broker,
+                secrets=secrets,
                 credentialed_paper=args.alpaca_paper,
                 clock=clock,
             )

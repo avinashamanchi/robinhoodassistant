@@ -25,8 +25,25 @@ from trading_assistant.ops.watchdog import (
     needs_restart,
     read_database_health,
 )
+from trading_assistant.security.secrets import RuntimeSecrets
 
 _LIVE = {"alive": True, "database_reachable": True}
+
+
+@pytest.fixture(autouse=True)
+def _inject_watchdog_runtime_secrets(monkeypatch):
+    injected = RuntimeSecrets(database_url="sqlite:///watchdog-test.db")
+    monkeypatch.setattr(
+        watchdog,
+        "load_role_secrets",
+        lambda role, *, config: (
+            injected
+            if role == "watchdog"
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected runtime role")
+            )
+        ),
+    )
 
 
 def test_watchdog_restarts_only_when_health_is_stale_or_broken():

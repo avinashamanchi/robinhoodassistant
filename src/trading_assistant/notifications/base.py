@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from ..security.secrets import secret_value
 
 class Notifier(Protocol):
     def send(self, message: str) -> bool: ...
@@ -35,6 +36,6 @@ def build_notifier(config, secrets) -> Notifier:
 
     return TelegramNotifier(
         enabled=True,
-        bot_token=secrets.telegram_bot_token,
-        chat_id=secrets.telegram_chat_id,
+        bot_token=secret_value(secrets.telegram_bot_token),
+        chat_id=secret_value(secrets.telegram_chat_id),
     )

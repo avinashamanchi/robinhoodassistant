@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..broker.models import OrderStatus
-from ..config import AppConfig, BrokerKind, Secrets, TradingMode, load_config
+from ..config import AppConfig, BrokerKind, TradingMode, load_config
+from ..security.secrets import RuntimeSecrets, load_role_secrets
 
 if TYPE_CHECKING:
     from ..service import TradingService
@@ -18,7 +19,10 @@ class PaperDrillError(RuntimeError):
     """The paper drill could not complete without weakening a safety guardrail."""
 
 
-def build_paper_service(config: AppConfig, secrets: Secrets) -> "TradingService":
+def build_paper_service(
+    config: AppConfig,
+    secrets: RuntimeSecrets,
+) -> "TradingService":
     from ..bootstrap import build_container
 
     return build_container(
@@ -135,11 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="AAPL")
     parser.add_argument("--notional", type=Decimal, default=Decimal("1.25"))
     args = parser.parse_args(argv)
-    secrets = Secrets()
     from ..logging import runtime_startup
 
+    config = load_config()
+    secrets = load_role_secrets("paper-drill", config=config)
     with runtime_startup("paper-drill", secrets):
-        config = load_config()
         result = run_paper_drill(
             config,
             build_paper_service(config, secrets),

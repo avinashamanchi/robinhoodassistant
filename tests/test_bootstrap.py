@@ -424,7 +424,7 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
     client = TestClient(app)
     login = client.post(
         "/auth/login",
-        json={"secret": secrets.app_api_token},
+        json={"secret": secrets.app_api_token.get_secret_value()},
     )
     assert login.status_code == 200
     csrf = client.get("/auth/session").json()["csrf_token"]
@@ -489,23 +489,25 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
         )
         return container
 
-    def one_secrets():
+    def one_secrets(role, *, config):
         nonlocal secret_reads
         secret_reads += 1
+        assert role in {"app", "daemon", "mcp"}
+        assert config is not None
         return secrets
 
     monkeypatch.setattr(bootstrap, "build_container", capture_container)
     monkeypatch.setattr(app_main, "load_config", lambda: config)
-    monkeypatch.setattr(app_main, "Secrets", one_secrets)
+    monkeypatch.setattr(app_main, "load_role_secrets", one_secrets)
     monkeypatch.setattr(daemon_main, "load_config", lambda: config)
-    monkeypatch.setattr(daemon_main, "Secrets", one_secrets)
+    monkeypatch.setattr(daemon_main, "load_role_secrets", one_secrets)
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
         lambda supplied_config, supplied_secrets: object(),
     )
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
-    monkeypatch.setattr(mcp_server, "Secrets", one_secrets)
+    monkeypatch.setattr(mcp_server, "load_role_secrets", one_secrets)
 
     assert app_main.build_default_container() is container
     assert daemon_main.build_monitor().service is service
@@ -1059,8 +1061,15 @@ def _capture_validation_runs(
     )
     monkeypatch.setattr(
         validation,
-        "Secrets",
-        lambda: Secrets(app_api_token="validation-run-secret"),
+        "load_role_secrets",
+        lambda role, *, config: (
+            Secrets(app_api_token="validation-run-secret")
+            if role == "validate-analyst"
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected validation role")
+            )
+        ),
+        raising=False,
     )
     monkeypatch.setattr(validation, "load_parquet", lambda _path: object())
     monkeypatch.setattr(

@@ -698,7 +698,8 @@ def _position_reconciliation_process(
                     agent=_ProcessStubAgent(),
                     planning=object(),
                     api_token="process-operator-secret",
-                )
+                ),
+                base_url="https://testserver",
             )
             login = client.post(
                 "/auth/login",

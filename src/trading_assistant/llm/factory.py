@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..config import AppConfig, Secrets
+from ..security.secrets import secret_value
 from .base import BudgetedLLMBackend
 from .budget import (
     AnthropicInputEstimator,
@@ -94,7 +95,7 @@ def build_llm_backend(
         from .anthropic_backend import AnthropicBackend
 
         delegate = AnthropicBackend(
-            secrets.anthropic_api_key,
+            secret_value(secrets.anthropic_api_key),
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
@@ -103,7 +104,7 @@ def build_llm_backend(
         from .gemini_backend import GeminiBackend
 
         delegate = GeminiBackend(
-            secrets.gemini_api_key,
+            secret_value(secrets.gemini_api_key),
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
@@ -112,7 +113,7 @@ def build_llm_backend(
         from .groq_backend import GroqBackend
 
         delegate = GroqBackend(
-            secrets.groq_api_key,
+            secret_value(secrets.groq_api_key),
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,

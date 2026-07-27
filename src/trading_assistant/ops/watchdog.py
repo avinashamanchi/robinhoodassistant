@@ -14,8 +14,9 @@ from urllib.request import urlopen
 
 from sqlalchemy import select
 
-from ..config import Secrets, load_config
+from ..config import load_config
 from ..db.models import Heartbeat, utcnow
+from ..security.secrets import RuntimeSecrets, load_role_secrets
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
 _LAUNCHCTL_TIMEOUT_SECONDS = 10.0
@@ -111,7 +112,7 @@ def fetch_health(
 def read_database_health(
     database_url: str | None = None,
     *,
-    secrets: Secrets | None = None,
+    secrets: RuntimeSecrets | None = None,
     runtime_role: str | None = None,
 ) -> dict[str, Any]:
     try:
@@ -121,10 +122,10 @@ def read_database_health(
             raise ValueError(
                 "database_url and secrets are mutually exclusive"
             )
-        effective_secrets = secrets or (
-            Secrets(database_url=database_url)
-            if database_url is not None
-            else Secrets()
+        if secrets is None and database_url is None:
+            raise ValueError("explicit RuntimeSecrets are required")
+        effective_secrets = secrets or RuntimeSecrets(
+            database_url=database_url
         )
         factory = prepare_database_runtime(
             effective_secrets,
@@ -198,11 +199,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request-timeout", type=float, default=5.0)
     args = parser.parse_args(argv)
 
-    secrets = Secrets()
     from ..logging import runtime_startup
 
+    config = load_config()
+    secrets = load_role_secrets("watchdog", config=config)
     with runtime_startup("watchdog", secrets):
-        config = load_config()
         try:
             api_health = fetch_health(
                 args.health_url,

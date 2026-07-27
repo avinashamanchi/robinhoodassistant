@@ -26,6 +26,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -33,7 +34,7 @@ from sqlalchemy import select
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..broker.models import OrderStatus
-from ..config import Secrets, load_config
+from ..config import load_config
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
@@ -44,6 +45,12 @@ from ..operations import (
     mark_http_mutation,
 )
 from ..service import TradingService
+from ..security.secrets import (
+    RuntimeSecrets,
+    load_role_secrets,
+    secret_is_set,
+    secrets_match,
+)
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
 from .errors import ApiError
@@ -234,13 +241,14 @@ class KillSwitchResetIn(BaseModel):
 
 
 def build_default_container():
-    secrets = Secrets()
     from .. import bootstrap
     from ..logging import runtime_startup
 
+    config = load_config()
+    secrets = load_role_secrets("app", config=config)
     with runtime_startup("app", secrets):
         return bootstrap.build_container(
-            load_config(),
+            config,
             secrets,
             runtime_role="app",
         )
@@ -295,9 +303,9 @@ def _create_app(
     *,
     container: "ApplicationContainer | None" = None,
     planning=_AUTO_PLANNING,
-    runtime_secrets: Secrets | None = None,
+    runtime_secrets: RuntimeSecrets | None = None,
     screen_source=None,
-    api_token: Optional[str] = None,
+    api_token: str | SecretStr | None = None,
     auth_now: Callable | None = None,
     bind_host: str | None = None,
 ) -> FastAPI:
@@ -324,10 +332,10 @@ def _create_app(
         runtime_secrets = container.secrets
         if api_token is None:
             api_token = runtime_secrets.app_api_token
-    if not api_token or not api_token.strip():
+    if api_token is None or not secret_is_set(api_token):
         raise RuntimeError("APP_API_TOKEN is required")
     if container is not None:
-        if api_token != container.secrets.app_api_token:
+        if not secrets_match(api_token, container.secrets.app_api_token):
             raise RuntimeError(
                 "container and operator authentication secret do not match"
             )
@@ -338,7 +346,7 @@ def _create_app(
             agent = _build_agent(container)
     elif (
         runtime_secrets is not None
-        and api_token != runtime_secrets.app_api_token
+        and not secrets_match(api_token, runtime_secrets.app_api_token)
     ):
         raise RuntimeError(
             "runtime Secrets and operator authentication secret do not match"
@@ -356,16 +364,15 @@ def _create_app(
     register_secret(api_token)
     security_config = service.config.security
     configured_bind = bind_host or (
-        runtime_secrets.app_host
-        if runtime_secrets is not None
-        else "127.0.0.1"
+        service.config.server.bind_host
     )
     if (
-        not security_config.cookie_secure
+        not service.config.server.secure_cookies
         and not _is_loopback_bind(configured_bind)
     ):
         raise RuntimeError(
-            "security.cookie_secure must be true for a non-loopback APP_HOST"
+            "server.secure_cookies must be true for a non-loopback "
+            "server.bind_host"
         )
 
     _secrets_holder: dict = (
@@ -447,7 +454,7 @@ def _create_app(
         "reauthentication_window": timedelta(
             minutes=security_config.reauthentication_minutes
         ),
-        "cookie_secure": security_config.cookie_secure,
+        "cookie_secure": service.config.server.secure_cookies,
     }
     if auth_now is not None:
         session_kwargs["now"] = auth_now

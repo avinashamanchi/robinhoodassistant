@@ -20,7 +20,6 @@ from .broker.factory import build_broker, build_clock
 from .config import (
     AppConfig,
     BrokerKind,
-    Secrets,
     TradingMode,
     load_config,
 )
@@ -40,6 +39,7 @@ from .orders.submission import OrderSubmissionService
 from .operations import AuditRecorder, OperationsService
 from .risk.breakers import BreakerService
 from .rules.worker import RuleWorker
+from .security.secrets import RuntimeSecrets, secret_is_set
 from .service import TradingService
 
 
@@ -52,7 +52,7 @@ class DatabaseRuntime:
 @dataclass(frozen=True)
 class ApplicationContainer:
     config: AppConfig
-    secrets: Secrets
+    secrets: RuntimeSecrets
     engine: Engine
     session_factory: sessionmaker[Session]
     rate_limiter: DurableRateLimiter
@@ -73,7 +73,7 @@ class ApplicationContainer:
 
 
 def prepare_database_runtime(
-    secrets: Secrets,
+    secrets: RuntimeSecrets,
     *,
     log_path=None,
     runtime_role: str | None = None,
@@ -95,8 +95,8 @@ def prepare_database_runtime(
     )
 
 
-def _guard_runtime(config: AppConfig, secrets: Secrets) -> None:
-    if not secrets.app_api_token or not secrets.app_api_token.strip():
+def _guard_runtime(config: AppConfig, secrets: RuntimeSecrets) -> None:
+    if not secret_is_set(secrets.app_api_token):
         raise RuntimeError("APP_API_TOKEN is required")
     if config.trading.mode is not TradingMode.PAPER:
         raise RuntimeError(
@@ -147,12 +147,15 @@ def build_provider_budget_service(
 
 def build_container(
     config: AppConfig | None = None,
-    secrets: Secrets | None = None,
+    secrets: RuntimeSecrets | None = None,
     *,
     runtime_role: str | None = None,
 ) -> ApplicationContainer:
     config = config or load_config()
-    secrets = secrets or Secrets()
+    if secrets is None:
+        raise RuntimeError(
+            "build_container requires explicit RuntimeSecrets"
+        )
     return _build_container(
         config,
         secrets,
@@ -162,7 +165,7 @@ def build_container(
 
 def build_test_container(
     config: AppConfig,
-    secrets: Secrets,
+    secrets: RuntimeSecrets,
     *,
     broker: BrokerClient,
     clock,
@@ -178,7 +181,7 @@ def build_test_container(
 
 def _build_container(
     config: AppConfig,
-    secrets: Secrets,
+    secrets: RuntimeSecrets,
     *,
     runtime_role: str | None = None,
     broker: BrokerClient | None = None,
@@ -250,7 +253,7 @@ def _build_container(
         reauthentication_window=timedelta(
             minutes=config.security.reauthentication_minutes
         ),
-        cookie_secure=config.security.cookie_secure,
+        cookie_secure=config.server.secure_cookies,
     )
     audit = AuditRecorder(session_factory)
     operations = OperationsService(

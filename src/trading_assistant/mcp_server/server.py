@@ -14,7 +14,8 @@ from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
-from ..config import Secrets, load_config
+from ..config import load_config
+from ..security.secrets import load_role_secrets
 from ..service import TradingService
 from ..operations import AuditRecorder, MutationContext
 
@@ -40,10 +41,11 @@ def build_default_container():
     from .. import bootstrap
     from ..logging import runtime_startup
 
-    secrets = Secrets()
+    config = load_config()
+    secrets = load_role_secrets("mcp", config=config)
     with runtime_startup("mcp", secrets):
         return bootstrap.build_container(
-            load_config(),
+            config,
             secrets,
             runtime_role="mcp",
         )

@@ -31,17 +31,21 @@ RUNTIME_ROLES = frozenset(
         "app",
         "daemon",
         "mcp",
+        "migration",
         "preflight",
         "paper-drill",
         "safety-drill",
+        "validate-analyst",
         "watchdog",
         "backup",
     }
 )
 
 
-def register_secret(value: str) -> None:
+def register_secret(value: str | SecretStr) -> None:
     """Register a concrete secret string so it is masked wherever it appears."""
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
     if value:
         _REGISTERED.add(value)
 
@@ -56,7 +60,12 @@ _SECRET_ATTRS = (
     "app_api_token",
     "alpaca_api_key",
     "alpaca_secret_key",
+    "database_url",
     "telegram_bot_token",
+    "telegram_chat_id",
+    "candidate_signing_key",
+    "backup_encryption_key",
+    "live_trading_confirm",
 )
 
 
@@ -68,6 +77,13 @@ def register_all_secrets(secrets) -> None:
             value = value.get_secret_value()
         if isinstance(value, str) and value:
             register_secret(value)
+    field_keys = getattr(secrets, "field_encryption_keys", {})
+    if isinstance(field_keys, dict) or hasattr(field_keys, "values"):
+        for value in field_keys.values():
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if isinstance(value, str) and value:
+                register_secret(value)
 
 
 def redact(message: str) -> str:

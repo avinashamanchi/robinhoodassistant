@@ -29,7 +29,7 @@ from trading_assistant.broker.models import (
     Position,
     Quote,
 )
-from trading_assistant.config import BrokerKind, Secrets, TradingMode
+from trading_assistant.config import BrokerKind, Secrets, TradingMode, load_config
 from trading_assistant.db.models import AuditEvent, Fill, Order
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.orders.submission import OrderSubmissionService
@@ -40,13 +40,14 @@ from trading_assistant.ops.safety_drill import (
     _cancel_validated_tagged_open,
     _compensate_drill_fill,
     _online_copy,
-    _validate_credentialed_paper,
+    _validate_credentialed_paper as _production_validate_credentialed_paper,
     main,
-    run_safety_drill,
+    run_safety_drill as _production_run_safety_drill,
 )
 import trading_assistant.ops.safety_drill as safety_drill_module
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.repository import RuleRepository
+from trading_assistant.security.secrets import RuntimeSecrets
 from trading_assistant.service import TradingService
 
 
@@ -72,6 +73,43 @@ def _safe_config(app_config):
                 update={"broker": BrokerKind.ALPACA}
             ),
         }
+    )
+
+
+def _runtime_secrets_from_test_environment(
+    base: RuntimeSecrets | None = None,
+) -> RuntimeSecrets:
+    values = {}
+    for env_name, field_name in (
+        ("DATABASE_URL", "database_url"),
+        ("APP_API_TOKEN", "app_api_token"),
+        ("ALPACA_API_KEY", "alpaca_api_key"),
+        ("ALPACA_SECRET_KEY", "alpaca_secret_key"),
+        ("LIVE_TRADING_CONFIRM", "live_trading_confirm"),
+    ):
+        value = os.environ.get(env_name)
+        if value is not None:
+            values[field_name] = value
+    return (base or RuntimeSecrets()).model_copy(update=values)
+
+
+def run_safety_drill(**kwargs):
+    kwargs.setdefault(
+        "secrets",
+        _runtime_secrets_from_test_environment(),
+    )
+    return _production_run_safety_drill(**kwargs)
+
+
+def _validate_credentialed_paper(
+    broker,
+    secrets,
+    config=None,
+):
+    return _production_validate_credentialed_paper(
+        broker,
+        _runtime_secrets_from_test_environment(secrets),
+        config or _safe_config(load_config()),
     )
 
 
@@ -1177,6 +1215,11 @@ def test_mock_cli_emits_machine_readable_safe_json(
     _upgrade_database(primary)
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{primary}")
     monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
+    monkeypatch.setattr(
+        safety_drill_module,
+        "load_role_secrets",
+        lambda role, *, config: _runtime_secrets_from_test_environment(),
+    )
 
     exit_code = main(
         [
@@ -1618,10 +1661,6 @@ def _credentialed_environment(monkeypatch, primary: Path) -> None:
     monkeypatch.setenv("APP_API_TOKEN", "task-10-test-operator-secret")
     monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
-    monkeypatch.setenv(
-        "ALPACA_PAPER_BASE_URL",
-        "https://paper-api.alpaca.markets",
-    )
 
 
 def _local_drill_environment(monkeypatch, primary: Path) -> None:
@@ -3155,14 +3194,17 @@ def test_credentialed_mode_refuses_missing_keys_or_nonpaper_endpoint_before_copy
 
     monkeypatch.setenv("ALPACA_API_KEY", "paper-key-present")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "paper-secret-present")
-    monkeypatch.setenv(
-        "ALPACA_PAPER_BASE_URL",
-        "https://api.alpaca.markets",
+    unsafe_config = _safe_config(app_config).model_copy(
+        update={
+            "provider_origins": app_config.provider_origins.model_copy(
+                update={"alpaca_trading": "https://api.alpaca.markets"}
+            )
+        }
     )
     with pytest.raises(SafetyDrillError) as endpoint:
         run_safety_drill(
             database_copy=destination,
-            config=_safe_config(app_config),
+            config=unsafe_config,
             broker=broker,
             credentialed_paper=True,
             clock=FakeClock(is_open=True),
@@ -3185,7 +3227,7 @@ def test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed(
     monkeypatch.setattr(
         safety_drill_module,
         "_validate_credentialed_paper",
-        lambda broker, secrets: None,
+        lambda broker, secrets, config: None,
     )
 
     report = run_safety_drill(

@@ -13,7 +13,11 @@ from alembic.config import Config
 from sqlalchemy import Engine, inspect
 from sqlalchemy.engine import make_url
 
-from trading_assistant.config import Secrets
+from trading_assistant.config import load_config
+from trading_assistant.security.secrets import (
+    EnvironmentSecretProvider,
+    load_role_secrets,
+)
 
 from .schema import SchemaOutOfDate, require_current_schema, schema_status
 from .session import create_db_engine
@@ -212,25 +216,46 @@ def _print_result(action: str, engine: Engine, backup: Path | None = None) -> No
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the trading assistant schema.")
+    parser.add_argument(
+        "--development-environment-secrets",
+        action="store_true",
+    )
     parser.add_argument("command", choices=("status", "adopt-existing", "upgrade"))
     args = parser.parse_args(argv)
-    engine = create_db_engine(Secrets().database_url)
+    config = load_config()
+    if args.development_environment_secrets:
+        provider = EnvironmentSecretProvider(environ=os.environ)
+        runtime_secrets = load_role_secrets(
+            "migration",
+            config=config,
+            provider=provider,
+            allow_environment=True,
+        )
+    else:
+        runtime_secrets = load_role_secrets(
+            "migration",
+            config=config,
+        )
+    engine = create_db_engine(runtime_secrets.database_url)
 
-    try:
-        if args.command == "status":
-            _print_result("status", engine)
-            require_current_schema(engine)
-        elif args.command == "adopt-existing":
-            backup = adopt_existing(engine)
-            _print_result("adopt-existing", engine, backup)
-            upgrade_backup = upgrade(engine)
-            _print_result("upgrade", engine, upgrade_backup)
-        else:
-            backup = upgrade(engine)
-            _print_result("upgrade", engine, backup)
-    except SchemaOutOfDate as exc:
-        print(exc, file=sys.stderr)
-        return 1
+    from trading_assistant.logging import runtime_startup
+
+    with runtime_startup("migration", runtime_secrets):
+        try:
+            if args.command == "status":
+                _print_result("status", engine)
+                require_current_schema(engine)
+            elif args.command == "adopt-existing":
+                backup = adopt_existing(engine)
+                _print_result("adopt-existing", engine, backup)
+                upgrade_backup = upgrade(engine)
+                _print_result("upgrade", engine, upgrade_backup)
+            else:
+                backup = upgrade(engine)
+                _print_result("upgrade", engine, backup)
+        except SchemaOutOfDate as exc:
+            print(exc, file=sys.stderr)
+            return 1
     return 0
 
 

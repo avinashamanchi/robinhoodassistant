@@ -387,7 +387,7 @@ def test_blocked_boundary_audit_does_not_delay_exact_liveness(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://test",
+            base_url="https://test",
         ) as client:
             login = await client.post(
                 "/auth/login",

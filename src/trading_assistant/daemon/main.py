@@ -9,8 +9,9 @@ import asyncio
 from uuid import uuid4
 
 from ..app.limits import LimitStoreUnavailable
-from ..config import Secrets, load_config
+from ..config import load_config
 from ..notifications.base import build_notifier
+from ..security.secrets import RuntimeSecrets, load_role_secrets
 from .backoff import (
     ScheduledMarketDataDenied,
     scheduled_market_data_read,
@@ -22,14 +23,15 @@ from .monitor import Monitor
 def build_monitor() -> Monitor:
     from ..logging import runtime_startup
 
-    secrets = Secrets()
+    config = load_config()
+    secrets = load_role_secrets("daemon", config=config)
     with runtime_startup("daemon", secrets):
-        return _build_monitor(load_config(), secrets)
+        return _build_monitor(config, secrets)
 
 
 def _build_monitor(
     config,
-    secrets: Secrets,
+    secrets: RuntimeSecrets,
     *,
     historical_alpaca_client_factory=None,
     historical_coingecko_http=None,
@@ -147,9 +149,10 @@ def _build_monitor(
 def main() -> None:
     from ..logging import runtime_startup
 
-    secrets = Secrets()
+    config = load_config()
+    secrets = load_role_secrets("daemon", config=config)
     with runtime_startup("daemon", secrets):
-        monitor = _build_monitor(load_config(), secrets)
+        monitor = _build_monitor(config, secrets)
         asyncio.run(monitor.run())
 
 

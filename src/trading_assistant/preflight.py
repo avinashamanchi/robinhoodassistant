@@ -12,21 +12,17 @@ import sys
 from dataclasses import dataclass
 from uuid import uuid4
 
-from .config import BrokerKind, Secrets, TradingMode, load_config
+from .config import BrokerKind, TradingMode, load_config
 from .db.schema import SchemaOutOfDate
+from .security.secrets import (
+    RuntimeSecrets,
+    app_secret_quality_ok,
+    load_role_secrets,
+    secret_is_set,
+    secret_value,
+)
 
 PASS, FAIL, SKIP, NEEDS = "PASS", "FAIL", "SKIP", "NEEDS-ME"
-_EXAMPLE_TOKENS = {"", "sk-ant-xxxxxxxx"}
-_PLACEHOLDER_MARKERS = (
-    "changeme",
-    "example",
-    "placeholder",
-    "replace-me",
-    "replace_me",
-    "test-token",
-    "your-token",
-    "your_token",
-)
 
 
 @dataclass
@@ -61,7 +57,10 @@ def _paper_only(config) -> Result:
     )
 
 
-def _dangerous_switches_off(config, secrets: Secrets) -> Result:
+def _dangerous_switches_off(
+    config,
+    secrets: RuntimeSecrets,
+) -> Result:
     enabled = []
     if config.features.auto_execute_preapproved_rules:
         enabled.append("autoexecute")
@@ -69,7 +68,7 @@ def _dangerous_switches_off(config, secrets: Secrets) -> Result:
         enabled.append("brackets")
     if config.llm.fallback_provider is not None:
         enabled.append("llm_fallback")
-    if secrets.live_trading_confirm:
+    if secret_is_set(secrets.live_trading_confirm):
         enabled.append("live_confirmation")
     return Result(
         "dangerous switches OFF",
@@ -78,21 +77,8 @@ def _dangerous_switches_off(config, secrets: Secrets) -> Result:
     )
 
 
-def _app_secret_quality(secrets: Secrets) -> Result:
-    token = secrets.app_api_token.strip()
-    lowered = token.lower()
-    periodic = any(
-        len(token) % period == 0
-        and token == token[:period] * (len(token) // period)
-        for period in range(1, min(16, len(token) // 2) + 1)
-    )
-    ok = (
-        len(token) >= 32
-        and token not in _EXAMPLE_TOKENS
-        and len(set(token)) >= 8
-        and not any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
-        and not periodic
-    )
+def _app_secret_quality(secrets: RuntimeSecrets) -> Result:
+    ok = app_secret_quality_ok(secrets.app_api_token)
     return Result(
         "operator login secret quality",
         PASS if ok else FAIL,
@@ -106,8 +92,13 @@ def _app_secret_quality(secrets: Secrets) -> Result:
     )
 
 
-def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
-    if not (secrets.alpaca_api_key and secrets.alpaca_secret_key):
+def _alpaca(
+    secrets: RuntimeSecrets,
+) -> tuple[Result, Result, Result]:
+    if not (
+        secret_is_set(secrets.alpaca_api_key)
+        and secret_is_set(secrets.alpaca_secret_key)
+    ):
         n = Result("Alpaca paper auth", NEEDS, "set ALPACA keys, then re-run")
         return n, Result("market clock reachable", NEEDS), Result("data bars reachable", NEEDS)
 
@@ -115,8 +106,8 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
         from .broker.alpaca import AlpacaBroker, AlpacaClock
 
         broker = AlpacaBroker.from_credentials(
-            secrets.alpaca_api_key,
-            secrets.alpaca_secret_key,
+            secret_value(secrets.alpaca_api_key),
+            secret_value(secrets.alpaca_secret_key),
             paper=True,
         )
     except Exception as exc:
@@ -159,8 +150,8 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
 
     try:
         clock_client = AlpacaClock.from_credentials(
-            secrets.alpaca_api_key,
-            secrets.alpaca_secret_key,
+            secret_value(secrets.alpaca_api_key),
+            secret_value(secrets.alpaca_secret_key),
             paper=True,
         )
         clock = Result(
@@ -178,7 +169,9 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
     return auth, clock, data
 
 
-def _db(secrets: Secrets) -> tuple[Result, Result, Result]:
+def _db(
+    secrets: RuntimeSecrets,
+) -> tuple[Result, Result, Result]:
     try:
         from sqlalchemy import text
 
@@ -256,7 +249,7 @@ def _reconciliation(service) -> Result:
         )
 
 
-def _build_service(config, secrets: Secrets):
+def _build_service(config, secrets: RuntimeSecrets):
     from .bootstrap import build_container
 
     return build_container(
@@ -266,7 +259,10 @@ def _build_service(config, secrets: Secrets):
     ).service
 
 
-def _llm_provider_configured(config, secrets: Secrets) -> Result:
+def _llm_provider_configured(
+    config,
+    secrets: RuntimeSecrets,
+) -> Result:
     provider_keys = {
         "anthropic": secrets.anthropic_api_key,
         "gemini": secrets.gemini_api_key,
@@ -275,7 +271,7 @@ def _llm_provider_configured(config, secrets: Secrets) -> Result:
     provider = config.llm.provider
     if provider not in provider_keys:
         return Result("configured LLM provider", FAIL, "unsupported provider")
-    if not provider_keys[provider]:
+    if not secret_is_set(provider_keys[provider]):
         return Result(
             "configured LLM provider",
             NEEDS,
@@ -284,10 +280,16 @@ def _llm_provider_configured(config, secrets: Secrets) -> Result:
     return Result("configured LLM provider", PASS, f"provider={provider}")
 
 
-def _notification_configuration(config, secrets: Secrets) -> Result:
+def _notification_configuration(
+    config,
+    secrets: RuntimeSecrets,
+) -> Result:
     if not config.features.telegram_notifications:
         return Result("notification configuration", SKIP, "disabled; no message sent")
-    configured = bool(secrets.telegram_bot_token and secrets.telegram_chat_id)
+    configured = (
+        secret_is_set(secrets.telegram_bot_token)
+        and secret_is_set(secrets.telegram_chat_id)
+    )
     return Result(
         "notification configuration",
         PASS if configured else FAIL,
@@ -300,15 +302,21 @@ def _notification_configuration(config, secrets: Secrets) -> Result:
 
 
 def run() -> int:
-    secrets = Secrets()
     from .logging import runtime_startup
 
-    with runtime_startup("preflight", secrets):
-        return _run(secrets)
-
-
-def _run(secrets: Secrets) -> int:
     config = load_config("config.yaml")
+    secrets = load_role_secrets("preflight", config=config)
+    with runtime_startup("preflight", secrets):
+        return _run(config, secrets)
+
+
+def _run(
+    config,
+    secrets: RuntimeSecrets | None = None,
+) -> int:
+    if secrets is None:
+        secrets = config
+        config = load_config("config.yaml")
     results = [
         _config_parses(),
         _paper_only(config),
@@ -317,7 +325,10 @@ def _run(secrets: Secrets) -> int:
     ]
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))
-    if secrets.alpaca_api_key and secrets.alpaca_secret_key:
+    if (
+        secret_is_set(secrets.alpaca_api_key)
+        and secret_is_set(secrets.alpaca_secret_key)
+    ):
         results.append(_reconciliation(_build_service(config, secrets)))
     else:
         results.append(

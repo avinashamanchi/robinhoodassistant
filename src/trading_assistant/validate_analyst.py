@@ -20,7 +20,7 @@ from .analyst.analyst import Analyst
 from .backtest.data import DataSource, cache_path, load_parquet
 from .backtest.holdout import HoldoutGuard
 from .backtest.llm_runner import LLMRunConfig, estimate_llm_calls
-from .config import Secrets, load_config
+from .config import load_config
 from .identity import (
     canonical_analyst_version,
     canonical_symbol,
@@ -28,6 +28,7 @@ from .identity import (
     canonical_utc_timestamp,
 )
 from .llm.factory import build_llm_backend, selected_llm_model
+from .security.secrets import load_role_secrets
 
 COST_CONFIRM_USD = 5.0
 
@@ -99,7 +100,10 @@ def run(argv=None) -> int:
     args = p.parse_args(argv)
 
     config = load_config("config.yaml")
-    secrets = Secrets()
+    secrets = load_role_secrets(
+        "validate-analyst",
+        config=config,
+    )
     configured_symbols = (
         [symbol for symbol in args.symbols.split(",") if symbol.strip()]
         or config.risk.ticker_allowlist

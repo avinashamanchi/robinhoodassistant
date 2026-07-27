@@ -101,7 +101,7 @@ def test_login_sets_http_only_same_site_cookie(client):
     assert "HttpOnly" in cookie
     assert "SameSite=strict" in cookie
     assert "Max-Age=" in cookie
-    assert "Secure" not in cookie
+    assert "Secure" in cookie
     assert response.json()["csrf_token"]
 
 
@@ -217,7 +217,8 @@ def test_session_and_csrf_share_versioned_secret_lifecycle_across_restarts(
     )
     first = TestClient(first_app)
     login = first.post("/auth/login", json={"secret": TOKEN})
-    token = first.cookies.get("trading_session")
+    cookie_name = first.app.state.session_auth.cookie_name()
+    token = first.cookies.get(cookie_name)
     csrf = login.json()["csrf_token"]
 
     same_key_app = create_app(
@@ -227,7 +228,7 @@ def test_session_and_csrf_share_versioned_secret_lifecycle_across_restarts(
         planning=None,
     )
     same_key = TestClient(same_key_app)
-    same_key.cookies.set("trading_session", token)
+    same_key.cookies.set(cookie_name, token)
 
     assert same_key.get("/positions").status_code == 200
     assert same_key.get("/auth/session").json()["csrf_token"] == csrf
@@ -247,7 +248,7 @@ def test_session_and_csrf_share_versioned_secret_lifecycle_across_restarts(
         planning=None,
     )
     rotated = TestClient(rotated_app)
-    rotated.cookies.set("trading_session", token)
+    rotated.cookies.set(cookie_name, token)
 
     for response in (
         rotated.get("/positions"),
@@ -266,8 +267,8 @@ def test_tls_cookie_uses_host_prefix_and_secure_flag(make_service):
     service = make_service()
     service.config = service.config.model_copy(
         update={
-            "security": service.config.security.model_copy(
-                update={"cookie_secure": True}
+            "server": service.config.server.model_copy(
+                update={"secure_cookies": True}
             )
         }
     )
@@ -289,9 +290,17 @@ def test_tls_cookie_uses_host_prefix_and_secure_flag(make_service):
 
 
 def test_insecure_cookie_rejects_non_loopback_bind(make_service):
-    with pytest.raises(RuntimeError, match="cookie_secure"):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "server": service.config.server.model_copy(
+                update={"secure_cookies": False}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="secure_cookies"):
         create_app(
-            service=make_service(),
+            service=service,
             agent=_StubAgent(),
             api_token=TOKEN,
             planning=None,

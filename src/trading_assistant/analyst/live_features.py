@@ -15,6 +15,7 @@ from uuid import uuid4
 from ..app.limits import LimitStoreUnavailable
 from ..assets import AssetClass
 from ..dependencies import RequiredDependencyUnavailable
+from ..security.secrets import secret_value
 from ..signals.features import build_features
 from ..signals.models import MarketFeatures
 
@@ -80,8 +81,8 @@ def _fetch_equity_df(
 
     return download_alpaca_bars(
         symbol,
-        secrets.alpaca_api_key,
-        secrets.alpaca_secret_key,
+        secret_value(secrets.alpaca_api_key),
+        secret_value(secrets.alpaca_secret_key),
         timeframe="1Day",
         years=years,
         cache_dir=cache_dir,

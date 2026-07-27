@@ -209,6 +209,21 @@ credentials are a skip, never a pass.
 
 ## Daily preflight and startup
 
+Runtime roles load their required secrets from the verified macOS Keychain
+backend; development environment loading is only available through explicit
+CLI opt-in. Use `python -m trading_assistant.ops.secrets audit` to report
+presence and validation metadata without printing values, and use
+`migrate-env` only with an exact-mode-`0600` regular `.env` file. Migration
+verifies each Keychain write and deliberately leaves the source file in place
+for an operator-controlled cleanup decision.
+
+`RuntimeSecrets` and `SecretStr` prevent routine serialization and accidental
+display, but Python cannot guarantee complete in-memory erasure: immutable
+strings and interpreter-managed copies may survive until garbage collection.
+The key loader wipes mutable decoded key buffers in `finally` blocks, limits
+plaintext unwrapping to trusted integration boundaries, and registers loaded
+values for redaction. Treat process memory and crash dumps as sensitive.
+
 ```bash
 uv run python -m trading_assistant.preflight
 uv run uvicorn trading_assistant.app.main:create_app \

@@ -9,9 +9,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
-from ..config import Secrets
+from ..config import load_config
+from ..security.secrets import load_role_secrets, secret_value
 
 _BACKUP_PREFIX = "trading-assistant-"
 _BACKUP_SUFFIX = ".sqlite3"
@@ -63,8 +65,8 @@ def backup_database(
     return target
 
 
-def database_path(database_url: str) -> Path:
-    url = make_url(database_url)
+def database_path(database_url: str | SecretStr) -> Path:
+    url = make_url(secret_value(database_url))
     if url.drivername != "sqlite" or not url.database or url.database == ":memory:":
         raise ValueError("backup supports only file-backed SQLite DATABASE_URL values")
     return Path(url.database)
@@ -75,9 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--destination", default="backups")
     parser.add_argument("--retention-days", type=int, default=14)
     args = parser.parse_args(argv)
-    secrets = Secrets()
     from ..logging import runtime_startup
 
+    config = load_config()
+    secrets = load_role_secrets("backup", config=config)
     with runtime_startup("backup", secrets):
         created = backup_database(
             database_path(secrets.database_url),

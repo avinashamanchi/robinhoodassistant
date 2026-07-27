@@ -87,7 +87,11 @@ def test_provider_exception_text_is_not_returned(make_service):
         api_token=TOKEN,
         planning=None,
     )
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(
+        app,
+        base_url="https://testserver",
+        raise_server_exceptions=False,
+    ) as client:
         login = client.post("/auth/login", json={"secret": TOKEN})
         csrf = login.json()["csrf_token"]
         response = client.post("/chat", json={"message": "hi"}, headers={"X-CSRF-Token": csrf})

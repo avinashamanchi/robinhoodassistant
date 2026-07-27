@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
 
+from pydantic import SecretStr
 from sqlalchemy import select
 
 from ..db.models import AuthSession, utcnow
+from ..security.secrets import secret_value
 from .errors import ApiError
 
 
@@ -99,12 +101,13 @@ class SessionAuth:
         self,
         session_factory,
         *,
-        application_secret: str,
+        application_secret: str | SecretStr,
         ttl: timedelta = timedelta(hours=8),
         reauthentication_window: timedelta = timedelta(minutes=5),
         cookie_secure: bool = False,
         now: Callable[[], datetime] = utcnow,
     ) -> None:
+        application_secret = secret_value(application_secret)
         if not application_secret or not application_secret.strip():
             raise RuntimeError("APP_API_TOKEN is required")
         self.session_factory = session_factory
@@ -129,9 +132,10 @@ class SessionAuth:
     def login(
         self,
         supplied_secret: str,
-        expected_secret: str,
+        expected_secret: str | SecretStr,
         actor: str = "operator:local",
     ) -> IssuedSession:
+        expected_secret = secret_value(expected_secret)
         if not expected_secret or not expected_secret.strip():
             raise RuntimeError("APP_API_TOKEN is required")
         if not hmac.compare_digest(expected_secret, self._application_secret):
@@ -208,8 +212,9 @@ class SessionAuth:
         self,
         token: str,
         supplied_secret: str,
-        expected_secret: str,
+        expected_secret: str | SecretStr,
     ) -> SessionPrincipal:
+        expected_secret = secret_value(expected_secret)
         principal = self.authenticate(token)
         if not expected_secret or not expected_secret.strip():
             raise RuntimeError("APP_API_TOKEN is required")

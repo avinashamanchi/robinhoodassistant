@@ -8,6 +8,7 @@ import importlib
 from pathlib import Path
 
 import pytest
+from starlette.testclient import TestClient as StarletteTestClient
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
@@ -23,6 +24,18 @@ from trading_assistant.db.session import create_db_engine, make_session_factory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_OPERATOR_TOKEN = "test-operator-secret"
+
+
+@pytest.fixture(autouse=True)
+def _default_test_clients_to_tls(monkeypatch):
+    """Match the strict production server config unless a test opts out."""
+    original_init = StarletteTestClient.__init__
+
+    def tls_init(self, *args, **kwargs):
+        kwargs.setdefault("base_url", "https://testserver")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(StarletteTestClient, "__init__", tls_init)
 
 
 @pytest.fixture
@@ -173,6 +186,8 @@ def authenticate_client(operator_token):
     """Log in through the real route and validate the persisted session."""
 
     def _authenticate(client, token: str | None = None):
+        if client.base_url.scheme == "http":
+            client.base_url = client.base_url.copy_with(scheme="https")
         login = client.post(
             "/auth/login",
             json={"secret": token or operator_token},
@@ -204,7 +219,7 @@ def authenticated_client(make_service, operator_token, authenticate_client):
         api_token=operator_token,
         planning=None,
     )
-    client = TestClient(app)
+    client = TestClient(app, base_url="https://localhost")
     client.trading_service = service
     return authenticate_client(client)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from pydantic import SecretStr
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,7 +21,11 @@ def _enable_sqlite_pragmas(dbapi_conn, _record) -> None:
     cursor.close()
 
 
-def create_db_engine(url: str = "sqlite:///./trading_assistant.db") -> Engine:
+def create_db_engine(
+    url: str | SecretStr = "sqlite:///./trading_assistant.db",
+) -> Engine:
+    if isinstance(url, SecretStr):
+        url = url.get_secret_value()
     connect_args = {}
     if url.startswith("sqlite"):
         # Allow the engine to be shared across threads (app + daemon).

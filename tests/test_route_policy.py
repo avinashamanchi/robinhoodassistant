@@ -1372,7 +1372,7 @@ def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
         try:
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://test",
+                base_url="https://test",
             ) as client:
                 login = await client.post(
                     "/auth/login",
@@ -1479,7 +1479,7 @@ def test_cancelled_request_consumes_real_sync_worker_failure(
         try:
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://test",
+                base_url="https://test",
             ) as client:
                 login = await client.post(
                     "/auth/login",
@@ -2154,7 +2154,7 @@ def test_blocked_durable_limiter_does_not_delay_exact_liveness(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://test",
+            base_url="https://test",
         ) as client:
             started_at = time.monotonic()
             login = asyncio.create_task(

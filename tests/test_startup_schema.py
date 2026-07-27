@@ -14,6 +14,7 @@ import trading_assistant.logging as app_logging
 from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.schema import SchemaOutOfDate
 from trading_assistant.db.session import create_db_engine
+from trading_assistant.security.secrets import RuntimeSecrets
 
 
 def _revision_0004(tmp_path, name="startup.db"):
@@ -41,8 +42,8 @@ def _patch_common_startup(monkeypatch, module, url):
     monkeypatch.setattr(module, "load_config", lambda: config)
     monkeypatch.setattr(
         module,
-        "Secrets",
-        lambda: SimpleNamespace(
+        "load_role_secrets",
+        lambda _role, *, config: RuntimeSecrets(
             database_url=url,
             app_api_token="startup-schema-test-secret",
         ),
