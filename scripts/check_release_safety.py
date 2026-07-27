@@ -278,6 +278,10 @@ _LLM_BACKEND_MODULES = {
     "gemini_backend",
     "groq_backend",
 }
+_LLM_BACKEND_MODULE_PATHS = {
+    f"trading_assistant.llm.{module}"
+    for module in _LLM_BACKEND_MODULES
+}
 _LLM_BACKEND_ALLOWED_PATHS = {
     "src/trading_assistant/llm/factory.py",
     "src/trading_assistant/llm/anthropic_backend.py",
@@ -472,20 +476,34 @@ def _check_route_policy_inventory(root: Path) -> None:
 
 
 def _is_llm_backend_module(module: str | None) -> bool:
+    return module in _LLM_BACKEND_MODULE_PATHS
+
+
+def _resolved_import_from_modules(
+    node: ast.ImportFrom,
+    path: Path,
+    source_root: Path,
+) -> tuple[str, ...]:
+    if node.level:
+        package = path.relative_to(source_root).parent.parts
+        if node.level > len(package):
+            return ()
+        keep = len(package) - node.level + 1
+        base = package[:keep]
+        if node.module is not None:
+            base += tuple(node.module.split("."))
+    elif node.module is not None:
+        base = tuple(node.module.split("."))
+    else:
+        return ()
+
     return (
-        isinstance(module, str)
-        and module.rsplit(".", 1)[-1] in _LLM_BACKEND_MODULES
-    )
-
-
-def _imports_llm_backend_from_parent(node: ast.ImportFrom) -> bool:
-    is_llm_parent = (
-        node.module == "trading_assistant.llm"
-        or (node.level > 0 and node.module == "llm")
-    )
-    return is_llm_parent and any(
-        imported.name in _LLM_BACKEND_MODULES
-        for imported in node.names
+        ".".join(base),
+        *(
+            ".".join((*base, imported.name))
+            for imported in node.names
+            if imported.name != "*"
+        ),
     )
 
 
@@ -507,7 +525,8 @@ def _global_backend_lookup(node: ast.AST) -> bool:
 
 
 def _check_llm_construction_paths(root: Path) -> None:
-    runtime = root / "src" / "trading_assistant"
+    source_root = root / "src"
+    runtime = source_root / "trading_assistant"
     wildcard_imports: list[str] = []
     module_imports: list[str] = []
     references: list[str] = []
@@ -533,9 +552,13 @@ def _check_llm_construction_paths(root: Path) -> None:
                 )
             ) or (
                 isinstance(node, ast.ImportFrom)
-                and (
-                    _is_llm_backend_module(node.module)
-                    or _imports_llm_backend_from_parent(node)
+                and any(
+                    _is_llm_backend_module(module)
+                    for module in _resolved_import_from_modules(
+                        node,
+                        path,
+                        source_root,
+                    )
                 )
             )
             if imported_module:
