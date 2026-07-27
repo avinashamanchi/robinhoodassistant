@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -37,6 +38,21 @@ class LimitSpec:
     principal_daily_requests: int | None = None
     global_daily_requests: int | None = None
 
+    def __post_init__(self) -> None:
+        values = (
+            ("principal_requests", self.principal_requests),
+            ("global_requests", self.global_requests),
+            ("window_seconds", self.window_seconds),
+            (
+                "principal_daily_requests",
+                self.principal_daily_requests,
+            ),
+            ("global_daily_requests", self.global_daily_requests),
+        )
+        for name, value in values:
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+
 
 @dataclass(frozen=True)
 class LimitDecision:
@@ -48,6 +64,12 @@ class LimitDecision:
 
 @dataclass(frozen=True)
 class LeaseDecision:
+    """Lease result.
+
+    ``generation`` is diagnostic only, not a fencing token. Bounded pruning
+    may delete an expired row, so a later acquisition may restart it at 1.
+    """
+
     acquired: bool
     owner: str
     expires_at: datetime
@@ -87,6 +109,21 @@ def _rollback_quietly(session: Session) -> None:
         pass
 
 
+@contextmanager
+def _store_session(session_factory: sessionmaker[Session]):
+    try:
+        with session_factory() as session:
+            try:
+                yield session
+            except (SQLAlchemyError, OSError):
+                _rollback_quietly(session)
+                raise
+    except (SQLAlchemyError, OSError) as exc:
+        raise LimitStoreUnavailable(
+            "durable limit store unavailable"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class _Bucket:
     key: str
@@ -109,37 +146,33 @@ class DurableRateLimiter:
         current = _as_utc(now)
         buckets = self._buckets(spec, principal, current)
 
-        with self._session_factory() as session:
-            try:
-                session.execute(text("BEGIN IMMEDIATE"))
-                consumed: list[tuple[int, datetime]] = []
-                for bucket in buckets:
-                    row = self._consume_bucket(
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            consumed: list[tuple[int, datetime]] = []
+            for bucket in buckets:
+                row = self._consume_bucket(
+                    session,
+                    policy_name=spec.name,
+                    bucket=bucket,
+                    now=current,
+                )
+                if row is None:
+                    session.rollback()
+                    return self._denied_decision(
                         session,
-                        policy_name=spec.name,
-                        bucket=bucket,
+                        buckets=buckets,
                         now=current,
                     )
-                    if row is None:
-                        session.rollback()
-                        return self._denied_decision(
-                            session,
-                            buckets=buckets,
-                            now=current,
-                        )
-                    consumed.append(
-                        (bucket.ceiling - row.hits, row.expires_at)
-                    )
-                session.commit()
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+                consumed.append(
+                    (bucket.ceiling - row.hits, row.expires_at)
+                )
+            session.commit()
 
-        remaining, reset_at = min(
-            consumed,
-            key=lambda item: (item[0], item[1]),
+        remaining = min(item[0] for item in consumed)
+        reset_at = max(
+            item[1]
+            for item in consumed
+            if item[0] == remaining
         )
         return LimitDecision(
             allowed=True,
@@ -297,21 +330,15 @@ class DurableRateLimiter:
             )
             .limit(limit)
         )
-        with self._session_factory() as session:
-            try:
-                session.execute(text("BEGIN IMMEDIATE"))
-                result = session.execute(
-                    delete(RateWindow).where(
-                        RateWindow.bucket_key.in_(keys)
-                    )
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            result = session.execute(
+                delete(RateWindow).where(
+                    RateWindow.bucket_key.in_(keys)
                 )
-                session.commit()
-                return result.rowcount
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+            )
+            session.commit()
+            return result.rowcount
 
 
 class ConcurrencyLeaseService:
@@ -326,6 +353,8 @@ class ConcurrencyLeaseService:
         ttl_seconds: int,
         now: datetime | None = None,
     ) -> LeaseDecision:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
         current = _as_utc(now)
         expires_at = current + timedelta(seconds=ttl_seconds)
         statement = sqlite_insert(ConcurrencyLease).values(
@@ -351,32 +380,26 @@ class ConcurrencyLeaseService:
             ConcurrencyLease.generation,
         )
 
-        with self._session_factory() as session:
-            try:
-                session.execute(text("BEGIN IMMEDIATE"))
-                row = session.execute(statement).one_or_none()
-                if row is None:
-                    session.rollback()
-                    observed = self._inspect(
-                        session,
-                        resource_key,
-                        current,
-                    )
-                    return LeaseDecision(
-                        acquired=False,
-                        owner=observed.owner,
-                        expires_at=observed.expires_at,
-                        generation=observed.generation,
-                        retry_after_seconds=(
-                            observed.retry_after_seconds
-                        ),
-                    )
-                session.commit()
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                session.rollback()
+                observed = self._inspect(
+                    session,
+                    resource_key,
+                    current,
+                )
+                return LeaseDecision(
+                    acquired=False,
+                    owner=observed.owner,
+                    expires_at=observed.expires_at,
+                    generation=observed.generation,
+                    retry_after_seconds=(
+                        observed.retry_after_seconds
+                    ),
+                )
+            session.commit()
 
         return LeaseDecision(
             acquired=True,
@@ -399,17 +422,11 @@ class ConcurrencyLeaseService:
                 generation=ConcurrencyLease.generation + 1,
             )
         )
-        with self._session_factory() as session:
-            try:
-                session.execute(text("BEGIN IMMEDIATE"))
-                result = session.execute(statement)
-                session.commit()
-                return result.rowcount == 1
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            result = session.execute(statement)
+            session.commit()
+            return result.rowcount == 1
 
     def inspect(
         self,
@@ -418,14 +435,8 @@ class ConcurrencyLeaseService:
         now: datetime | None = None,
     ) -> LeaseDecision:
         current = _as_utc(now)
-        with self._session_factory() as session:
-            try:
-                return self._inspect(session, resource_key, current)
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+        with _store_session(self._session_factory) as session:
+            return self._inspect(session, resource_key, current)
 
     @staticmethod
     def _inspect(
@@ -478,18 +489,12 @@ class ConcurrencyLeaseService:
             )
             .limit(limit)
         )
-        with self._session_factory() as session:
-            try:
-                session.execute(text("BEGIN IMMEDIATE"))
-                result = session.execute(
-                    delete(ConcurrencyLease).where(
-                        ConcurrencyLease.resource_key.in_(keys)
-                    )
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            result = session.execute(
+                delete(ConcurrencyLease).where(
+                    ConcurrencyLease.resource_key.in_(keys)
                 )
-                session.commit()
-                return result.rowcount
-            except (SQLAlchemyError, OSError) as exc:
-                _rollback_quietly(session)
-                raise LimitStoreUnavailable(
-                    "durable limit store unavailable"
-                ) from exc
+            )
+            session.commit()
+            return result.rowcount

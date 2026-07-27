@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event, func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from trading_assistant.app.limits import (
     ConcurrencyLeaseService,
@@ -32,6 +33,130 @@ def _shorten_sqlite_busy_timeout(engine) -> None:
         dbapi_connection.execute("PRAGMA busy_timeout=1")
 
     event.listen(engine, "checkout", set_short_timeout)
+
+
+class _CountingSessionFactory:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.delegate()
+
+
+class _LifecycleFailureContext:
+    def __init__(self, delegate, phase: str, error: Exception) -> None:
+        self.delegate = delegate
+        self.phase = phase
+        self.error = error
+
+    def __enter__(self):
+        if self.phase == "enter":
+            raise self.error
+        session = self.delegate.__enter__()
+        if self.phase == "body":
+            return _LifecycleFailureSession(session, self.error)
+        return session
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = self.delegate.__exit__(exc_type, exc_value, traceback)
+        if self.phase == "exit":
+            raise self.error
+        return result
+
+
+class _LifecycleFailureSession:
+    def __init__(self, delegate, error: Exception) -> None:
+        self.delegate = delegate
+        self.error = error
+
+    def execute(self, *_args, **_kwargs):
+        raise self.error
+
+    def __getattr__(self, name):
+        return getattr(self.delegate, name)
+
+
+class _LifecycleFailureFactory:
+    def __init__(self, delegate, phase: str, error: Exception) -> None:
+        self.delegate = delegate
+        self.phase = phase
+        self.error = error
+
+    def __call__(self):
+        if self.phase == "factory":
+            raise self.error
+        return _LifecycleFailureContext(
+            self.delegate(),
+            self.phase,
+            self.error,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("principal_requests", 0),
+        ("principal_requests", -1),
+        ("global_requests", 0),
+        ("global_requests", -1),
+        ("window_seconds", 0),
+        ("window_seconds", -1),
+        ("principal_daily_requests", 0),
+        ("principal_daily_requests", -1),
+        ("global_daily_requests", 0),
+        ("global_daily_requests", -1),
+    ],
+)
+def test_non_positive_limit_spec_is_rejected_before_session_or_write(
+    field,
+    value,
+    session_factory,
+):
+    values = {
+        "principal_requests": 2,
+        "global_requests": 3,
+        "window_seconds": 60,
+        "principal_daily_requests": 4,
+        "global_daily_requests": 5,
+    }
+    values[field] = value
+    counting_factory = _CountingSessionFactory(session_factory)
+    limiter = DurableRateLimiter(counting_factory)
+
+    with pytest.raises(ValueError):
+        spec = LimitSpec("invalid", **values)
+        limiter.consume_pair(spec, principal="operator", now=_at_noon())
+
+    assert counting_factory.calls == 0
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(RateWindow)
+        ) == 0
+
+
+@pytest.mark.parametrize("ttl_seconds", [0, -1])
+def test_non_positive_lease_ttl_is_rejected_before_session_or_write(
+    ttl_seconds,
+    session_factory,
+):
+    counting_factory = _CountingSessionFactory(session_factory)
+    service = ConcurrencyLeaseService(counting_factory)
+
+    with pytest.raises(ValueError):
+        service.acquire(
+            "invalid:lease",
+            owner="worker",
+            ttl_seconds=ttl_seconds,
+            now=_at_noon(),
+        )
+
+    assert counting_factory.calls == 0
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(ConcurrencyLease)
+        ) == 0
 
 
 def test_limit_survives_new_service_instance(session_factory):
@@ -76,7 +201,10 @@ def test_parallel_consumers_cannot_overspend(session_factory):
     assert sorted(results) == [False, True]
 
 
-def test_parallel_principals_cannot_exceed_global_window(session_factory):
+def test_parallel_principals_overlap_distinct_connections_and_serialize(
+    engine,
+    session_factory,
+):
     limiter_a = DurableRateLimiter(session_factory)
     limiter_b = DurableRateLimiter(session_factory)
     spec = LimitSpec(
@@ -85,22 +213,91 @@ def test_parallel_principals_cannot_exceed_global_window(session_factory):
         global_requests=1,
         window_seconds=60,
     )
-    barrier = threading.Barrier(2)
+    role = threading.local()
+    first_holds_write_lock = threading.Event()
+    second_attempted_begin = threading.Event()
+    release_first = threading.Event()
+    connection_ids: dict[str, int] = {}
 
-    def consume(args):
-        limiter, principal = args
-        barrier.wait()
+    def is_begin_immediate(statement: str) -> bool:
+        return statement.strip().upper() == "BEGIN IMMEDIATE"
+
+    def before_cursor_execute(
+        connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        if not is_begin_immediate(statement):
+            return
+        current_role = getattr(role, "name", "")
+        if not current_role:
+            return
+        connection_ids[current_role] = id(
+            connection.connection.driver_connection
+        )
+        if current_role == "second":
+            second_attempted_begin.set()
+            release_first.set()
+
+    def after_cursor_execute(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        if (
+            is_begin_immediate(statement)
+            and getattr(role, "name", "") == "first"
+        ):
+            first_holds_write_lock.set()
+            if not release_first.wait(timeout=5):
+                raise AssertionError(
+                    "second connection never attempted BEGIN IMMEDIATE"
+                )
+
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+
+    def consume(limiter, principal, current_role):
+        role.name = current_role
         return limiter.consume_pair(spec, principal=principal).allowed
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(
-            pool.map(
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
                 consume,
-                ((limiter_a, "operator-a"), (limiter_b, "operator-b")),
+                limiter_a,
+                "operator-a",
+                "first",
             )
+            assert first_holds_write_lock.wait(timeout=5)
+            second = pool.submit(
+                consume,
+                limiter_b,
+                "operator-b",
+                "second",
+            )
+            results = [first.result(timeout=10), second.result(timeout=10)]
+    finally:
+        event.remove(
+            engine,
+            "before_cursor_execute",
+            before_cursor_execute,
+        )
+        event.remove(
+            engine,
+            "after_cursor_execute",
+            after_cursor_execute,
         )
 
-    assert sorted(results) == [False, True]
+    assert second_attempted_begin.is_set()
+    assert connection_ids["first"] != connection_ids["second"]
+    assert results == [True, False]
 
 
 def test_global_denial_rolls_back_principal_increment(
@@ -199,6 +396,70 @@ def test_principal_and_global_daily_windows_survive_restart(session_factory):
         now=next_midnight,
     )
     assert next_day.allowed is True
+
+
+def test_successful_tied_bucket_uses_later_utc_day_reset(session_factory):
+    local_offset = timezone(timedelta(hours=5, minutes=30))
+    local_now = datetime(
+        2026,
+        7,
+        28,
+        1,
+        30,
+        tzinfo=local_offset,
+    )
+    spec = LimitSpec(
+        "tie-reset",
+        principal_requests=1,
+        global_requests=10,
+        window_seconds=60,
+        principal_daily_requests=1,
+    )
+
+    decision = DurableRateLimiter(session_factory).consume_pair(
+        spec,
+        principal="operator",
+        now=local_now,
+    )
+
+    assert decision.allowed is True
+    assert decision.remaining == 0
+    assert decision.reset_at == datetime(2026, 7, 28, tzinfo=UTC)
+
+
+def test_fractional_retry_rounds_up_without_truncating(session_factory):
+    started_at = datetime(
+        2026,
+        7,
+        27,
+        12,
+        0,
+        0,
+        100_000,
+        tzinfo=UTC,
+    )
+    spec = LimitSpec(
+        "fractional-retry",
+        principal_requests=1,
+        global_requests=1,
+        window_seconds=2,
+    )
+    limiter = DurableRateLimiter(session_factory)
+    assert limiter.consume_pair(
+        spec,
+        principal="operator",
+        now=started_at,
+    ).allowed
+
+    denied = limiter.consume_pair(
+        spec,
+        principal="operator",
+        now=started_at + timedelta(microseconds=999_999),
+    )
+
+    assert denied.allowed is False
+    assert denied.retry_after_seconds == 2
+    assert denied.reset_at == started_at + timedelta(seconds=2)
 
 
 def test_bucket_keys_are_sha256_hashes_without_raw_principal(session_factory):
@@ -386,6 +647,87 @@ def test_lease_lock_failure_is_store_unavailable(
         ttl_seconds=60,
         now=_at_noon(),
     ).acquired
+
+
+def _invoke_public_db_method(method_name: str, session_factory) -> None:
+    now = _at_noon()
+    if method_name == "consume_pair":
+        DurableRateLimiter(session_factory).consume_pair(
+            LimitSpec("lifecycle", 2, 2, 60),
+            principal="operator",
+            now=now,
+        )
+    elif method_name == "rate_prune":
+        DurableRateLimiter(session_factory).prune_expired(now)
+    elif method_name == "acquire":
+        ConcurrencyLeaseService(session_factory).acquire(
+            "lifecycle:lease",
+            owner="worker",
+            ttl_seconds=60,
+            now=now,
+        )
+    elif method_name == "release":
+        ConcurrencyLeaseService(session_factory).release(
+            "lifecycle:lease",
+            owner="worker",
+        )
+    elif method_name == "inspect":
+        ConcurrencyLeaseService(session_factory).inspect(
+            "lifecycle:lease",
+            now=now,
+        )
+    elif method_name == "lease_prune":
+        ConcurrencyLeaseService(session_factory).prune_expired(now)
+    else:
+        raise AssertionError(f"unknown method {method_name}")
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "consume_pair",
+        "rate_prune",
+        "acquire",
+        "release",
+        "inspect",
+        "lease_prune",
+    ],
+)
+@pytest.mark.parametrize(
+    ("phase", "error_type"),
+    [
+        ("factory", SQLAlchemyError),
+        ("enter", OSError),
+        ("body", OSError),
+        ("exit", SQLAlchemyError),
+    ],
+)
+def test_public_db_methods_normalize_entire_session_lifecycle(
+    method_name,
+    phase,
+    error_type,
+    session_factory,
+):
+    failing_factory = _LifecycleFailureFactory(
+        session_factory,
+        phase,
+        error_type(f"{phase} failed"),
+    )
+
+    with pytest.raises(LimitStoreUnavailable):
+        _invoke_public_db_method(method_name, failing_factory)
+
+
+def test_programmer_error_from_session_factory_is_not_normalized():
+    class ProgrammerErrorFactory:
+        def __call__(self):
+            raise TypeError("programmer error")
+
+    with pytest.raises(TypeError, match="programmer error"):
+        ConcurrencyLeaseService(ProgrammerErrorFactory()).inspect(
+            "programmer-error",
+            now=_at_noon(),
+        )
 
 
 def test_rate_window_pruning_is_bounded_and_preserves_live_rows(
