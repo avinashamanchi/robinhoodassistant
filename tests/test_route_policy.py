@@ -33,10 +33,12 @@ from trading_assistant.db.models import (
     AuditEvent,
     AuthSession,
     ConcurrencyLease,
+    MutationInterlock,
     PanicReceipt,
     RateWindow,
     utcnow,
 )
+from trading_assistant.risk.breakers import BreakerScope
 
 
 class _StubAgent:
@@ -385,11 +387,6 @@ def test_every_protected_policy_honors_a_nonexpiring_interlock(
                 "mutation_reconciliation_required",
                 "mutation_reconciliation_required",
             ),
-        ),
-        (
-            ("/killswitch/reset", "/panic"),
-            "paper-account:alpaca-paper",
-            ("mutation_reconciliation_required", "panic_incomplete"),
         ),
     ],
 )
@@ -764,7 +761,226 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
     )
     assert repeated.status_code == 200
     assert repeated.json() == receipt
-    assert calls == 1
+    assert calls == 2
+
+
+def test_successful_breaker_reset_invalidates_prior_panic_tenure(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-reset-tenure-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "panic-reset-tenure-secret"},
+    )
+    csrf = login.json()["csrf_token"]
+    scope = BreakerScope.operator_global()
+    pending_orders: list[str] = []
+    panic_generations: list[int] = []
+
+    def fake_panic(context):
+        tripped = service.breakers.trip(
+            scope,
+            "local fake panic",
+            context.actor,
+            request_id=context.request_id,
+        )
+        panic_generations.append(tripped.generation)
+        canceled = list(pending_orders)
+        pending_orders.clear()
+        return {
+            "safe": True,
+            "confirmed_canceled": canceled,
+            "unconfirmed_order_ids": [],
+        }
+
+    def fake_reset(
+        requested_scope,
+        *,
+        expected_generation,
+        context,
+    ):
+        reset = service.breakers.reset(
+            BreakerScope.parse(requested_scope),
+            context.actor,
+            context.reason,
+            {"local_state": "confirmed"},
+            expected_generation=expected_generation,
+            request_id=context.request_id,
+        )
+        return {
+            "killswitch": "reset",
+            "scope": requested_scope,
+            "tripped": reset.tripped,
+            "generation": reset.generation,
+        }
+
+    app.state.operations.panic = fake_panic
+    app.state.operations.reset_breaker = fake_reset
+
+    first = client.post(
+        "/panic",
+        json={"reason": "first local fake panic"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-before-reset",
+        },
+    )
+    reset = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": scope.key,
+            "reason": "verified local fake reset",
+            "expected_generation": panic_generations[-1],
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "reset-after-panic",
+        },
+    )
+    with service.session_factory() as session:
+        assert session.get(PanicReceipt, "alpaca-paper") is None
+    pending_orders.append("paper-order-after-reset")
+    second = client.post(
+        "/panic",
+        json={"reason": "second local fake panic"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-after-reset",
+        },
+    )
+
+    assert first.status_code == 200
+    assert reset.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["confirmed_canceled"] == [
+        "paper-order-after-reset"
+    ]
+    assert pending_orders == []
+    assert panic_generations == [1, 3]
+    assert service.broker.submit_calls == 0
+
+
+def test_reset_cleanup_uncertainty_does_not_disable_panic_after_lease_expiry(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(policy_module, "_LEASE_TTL_SECONDS", 1)
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="reset-cleanup-panic-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "reset-cleanup-panic-secret"},
+    )
+    csrf = login.json()["csrf_token"]
+    original_release = (
+        app.state.mutation_interlocks.release_settled
+    )
+    release_calls = 0
+    panic_calls = 0
+
+    def fail_first_cleanup(*args, **kwargs):
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            return False
+        return original_release(*args, **kwargs)
+
+    def fake_reset(_scope, *, expected_generation, context):
+        return {
+            "killswitch": "reset",
+            "scope": "operator_global",
+            "tripped": False,
+            "generation": expected_generation + 1,
+        }
+
+    def fake_panic(_context):
+        nonlocal panic_calls
+        panic_calls += 1
+        return {
+            "safe": True,
+            "confirmed_canceled": [],
+            "unconfirmed_order_ids": [],
+        }
+
+    app.state.mutation_interlocks.release_settled = fail_first_cleanup
+    app.state.operations.reset_breaker = fake_reset
+    app.state.operations.panic = fake_panic
+
+    reset = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "operator_global",
+            "reason": "successful reset with uncertain cleanup",
+            "expected_generation": 1,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "reset-cleanup-owner",
+        },
+    )
+    account_lease_key = (
+        "route:"
+        + hashlib.sha256(
+            b"paper-account:alpaca-paper"
+        ).hexdigest()
+        + ":0"
+    )
+    expiry_deadline = time.monotonic() + 2
+    while (
+        app.state.leases.inspect(account_lease_key).acquired
+        and time.monotonic() < expiry_deadline
+    ):
+        time.sleep(0.02)
+
+    with service.session_factory() as session:
+        reset_latch = session.scalar(
+            select(MutationInterlock).where(
+                MutationInterlock.operation == "breaker_reset"
+            )
+        )
+    assert reset.status_code == 200
+    assert reset_latch is not None
+    assert reset_latch.state == "uncertain"
+    assert reset_latch.worker_finished_at is not None
+    assert (
+        app.state.leases.inspect(account_lease_key).acquired
+        is False
+    )
+
+    panic = client.post(
+        "/panic",
+        json={"reason": "safety increase after reset cleanup loss"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-after-reset-cleanup",
+        },
+    )
+
+    assert panic.status_code == 200
+    assert panic.json()["safe"] is True
+    assert panic_calls == 1
+    assert service.broker.submit_calls == 0
+    with service.session_factory() as session:
+        remaining_reset = session.scalar(
+            select(MutationInterlock).where(
+                MutationInterlock.operation == "breaker_reset"
+            )
+        )
+    assert remaining_reset is not None
+    assert remaining_reset.state == "uncertain"
 
 
 def test_handler_longer_than_initial_lease_is_renewed_without_overlap(

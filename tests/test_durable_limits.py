@@ -19,6 +19,7 @@ from trading_assistant.app.limits import (
     LimitDecision,
     LimitSpec,
     LimitStoreUnavailable,
+    MutationInterlockService,
 )
 from trading_assistant.db.models import AuditEvent, ConcurrencyLease, RateWindow
 
@@ -1042,6 +1043,50 @@ def test_exact_unexpired_release_and_settled_clear_are_atomic(
     assert interlocks.inspect(claimed.resource_key) is None
     observed = leases.inspect(
         claimed.resource_key,
+        now=now + timedelta(seconds=1),
+    )
+    assert observed.acquired is False
+    assert observed.generation == lease.generation + 1
+
+
+def test_settled_interlock_can_release_distinct_serialization_lease_atomically(
+    session_factory,
+):
+    interlocks = MutationInterlockService(session_factory)
+    leases = ConcurrencyLeaseService(session_factory)
+    now = _at_noon()
+    lease_key = "route:" + "a" * 64 + ":0"
+    interlock_key = "route:" + "b" * 64 + ":0"
+    lease = leases.acquire(
+        lease_key,
+        owner="operation-specific-owner",
+        ttl_seconds=30,
+        now=now,
+    )
+    claimed = interlocks.claim(
+        interlock_key,
+        owner=lease.owner,
+        generation=lease.generation,
+        operation="panic",
+    )
+    assert interlocks.settle(
+        interlock_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="handler_completed",
+    )
+
+    assert interlocks.release_settled(
+        interlock_key,
+        lease_resource_key=lease_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        now=now + timedelta(seconds=1),
+    )
+
+    assert interlocks.inspect(interlock_key) is None
+    observed = leases.inspect(
+        lease_key,
         now=now + timedelta(seconds=1),
     )
     assert observed.acquired is False

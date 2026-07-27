@@ -98,6 +98,7 @@ class _LeaseHold:
     generation: int
     expires_at: datetime
     ttl_seconds: int = _DEFAULT_LEASE_TTL_SECONDS
+    interlock_key: str | None = None
 
 
 def _lease_ttl_seconds(policy: RoutePolicy) -> int:
@@ -558,6 +559,32 @@ def _resource_material(
     return f"principal:{policy.limit_name}:{limit_principal}"
 
 
+def _operation_interlock_key(
+    resolved: ResolvedRoute,
+    *,
+    lease_key: str,
+    limit_principal: str,
+    operation: str | None = None,
+) -> str:
+    policy = resolved.policy
+    selected_operation = operation or policy.mutation_operation
+    if (
+        policy.path not in {"/killswitch/reset", "/panic"}
+        or selected_operation not in {"breaker_reset", "panic"}
+    ):
+        return lease_key
+    material = (
+        f"{_resource_material(resolved, limit_principal=limit_principal)}"
+        f"\0mutation:{selected_operation}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"route:{digest}:0"
+
+
+def _hold_interlock_key(hold: _LeaseHold) -> str:
+    return hold.interlock_key or hold.resource_key
+
+
 def _reconciliation_control_key() -> str:
     digest = hashlib.sha256(
         b"reconciliation-control:alpaca-paper"
@@ -741,7 +768,11 @@ def _start_panic_receipt(
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             row = session.get(PanicReceipt, "alpaca-paper")
-            if row is not None and row.expires_at > now:
+            if (
+                row is not None
+                and row.expires_at > now
+                and row.state != "completed"
+            ):
                 session.rollback()
                 return _PanicClaim(
                     claimed=False,
@@ -1233,7 +1264,7 @@ async def _mark_interlock_uncertain(
     try:
         return await _offload(
             app.state.mutation_interlocks.mark_uncertain,
-            hold.resource_key,
+            _hold_interlock_key(hold),
             owner=hold.owner,
             generation=hold.generation,
             outcome_code=outcome_code,
@@ -1250,7 +1281,7 @@ async def _settle_and_release_interlock(
     try:
         settled = await _offload(
             app.state.mutation_interlocks.settle,
-            hold.resource_key,
+            _hold_interlock_key(hold),
             owner=hold.owner,
             generation=hold.generation,
             outcome_code="handler_completed",
@@ -1262,7 +1293,8 @@ async def _settle_and_release_interlock(
     try:
         released = await _offload(
             app.state.mutation_interlocks.release_settled,
-            hold.resource_key,
+            _hold_interlock_key(hold),
+            lease_resource_key=hold.resource_key,
             owner=hold.owner,
             generation=hold.generation,
         )
@@ -1380,6 +1412,11 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
             resolved,
             limit_principal=limit_principal,
         )
+        interlock_key = _operation_interlock_key(
+            resolved,
+            lease_key=lease_keys[0],
+            limit_principal=limit_principal,
+        )
         reconciliation_target: InterlockDecision | None = None
         if policy.requires_idempotency:
             try:
@@ -1395,10 +1432,81 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         )
                 existing_interlock = await _inspect_interlock(
                     app,
-                    lease_keys[0],
+                    interlock_key,
                 )
+                if policy.path in {"/killswitch/reset", "/panic"}:
+                    companion_operation = (
+                        "panic"
+                        if policy.path == "/killswitch/reset"
+                        else "breaker_reset"
+                    )
+                    companion_key = _operation_interlock_key(
+                        resolved,
+                        lease_key=lease_keys[0],
+                        limit_principal=limit_principal,
+                        operation=companion_operation,
+                    )
+                    companion_interlock = await _inspect_interlock(
+                        app,
+                        companion_key,
+                    )
+                    legacy_interlock = await _inspect_interlock(
+                        app,
+                        lease_keys[0],
+                    )
+                else:
+                    companion_interlock = None
+                    legacy_interlock = None
             except LimitStoreUnavailable:
                 return _policy_store_error_response(request)
+            if policy.path == "/killswitch/reset":
+                if companion_interlock is not None:
+                    return _interlock_denial_response(
+                        request,
+                        policy,
+                    )
+                if legacy_interlock is not None:
+                    if (
+                        legacy_interlock.operation == "breaker_reset"
+                        and existing_interlock is None
+                    ):
+                        existing_interlock = legacy_interlock
+                    elif legacy_interlock is not existing_interlock:
+                        return _interlock_denial_response(
+                            request,
+                            policy,
+                        )
+            elif policy.path == "/panic":
+                reset_blockers = [
+                    candidate
+                    for candidate in (
+                        companion_interlock,
+                        (
+                            legacy_interlock
+                            if legacy_interlock is not None
+                            and legacy_interlock.operation
+                            == "breaker_reset"
+                            else None
+                        ),
+                    )
+                    if candidate is not None
+                ]
+                if any(
+                    blocker.worker_finished_at is None
+                    for blocker in reset_blockers
+                ):
+                    return _panic_incomplete_response(request)
+                if legacy_interlock is not None:
+                    if (
+                        legacy_interlock.operation == "panic"
+                        and existing_interlock is None
+                    ):
+                        existing_interlock = legacy_interlock
+                    elif legacy_interlock.operation not in {
+                        "breaker_reset",
+                        "panic",
+                    }:
+                        return _panic_incomplete_response(request)
             if existing_interlock is not None:
                 if (
                     policy.path == "/backtests/run"
@@ -1476,22 +1584,12 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 ):
                     reconciliation_target = existing_interlock
                     lease_keys = [_reconciliation_control_key()]
+                    interlock_key = lease_keys[0]
                 else:
                     return _interlock_denial_response(
                         request,
                         policy,
                     )
-        if policy.concurrency_behavior == "coalesce_panic":
-            try:
-                existing = await _offload(_panic_snapshot, app)
-            except LimitStoreUnavailable:
-                return _policy_store_error_response(request)
-            if (
-                existing is not None
-                and existing.expires_at > utcnow()
-                and existing.state != "started"
-            ):
-                return _panic_response(request, existing)
         owner = uuid4().hex
         hold: _LeaseHold | None = None
         contentions: list[tuple[str, LeaseDecision]] = []
@@ -1511,6 +1609,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         generation=lease.generation,
                         expires_at=lease.expires_at,
                         ttl_seconds=ttl_seconds,
+                        interlock_key=interlock_key,
                     )
                     break
                 contentions.append((lease_key, lease))
@@ -1550,7 +1649,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
             try:
                 interlock = await _offload(
                     app.state.mutation_interlocks.claim,
-                    hold.resource_key,
+                    _hold_interlock_key(hold),
                     owner=hold.owner,
                     generation=hold.generation,
                     operation=policy.mutation_operation or "",

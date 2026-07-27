@@ -777,6 +777,7 @@ class MutationInterlockService:
         self,
         resource_key: str,
         *,
+        lease_resource_key: str | None = None,
         owner: str,
         generation: int,
         now: datetime | None = None,
@@ -788,13 +789,16 @@ class MutationInterlockService:
             owner=owner,
             generation=generation,
         )
+        lease_key = lease_resource_key or resource_key
+        if not lease_key or len(lease_key) > 128:
+            raise ValueError("invalid lease resource key")
         with _store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
             current = _as_utc(now)
             released = session.execute(
                 update(ConcurrencyLease)
                 .where(
-                    ConcurrencyLease.resource_key == resource_key,
+                    ConcurrencyLease.resource_key == lease_key,
                     ConcurrencyLease.owner == owner,
                     ConcurrencyLease.generation == generation,
                     ConcurrencyLease.expires_at > current,

@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import AssetClass
-from ..db.models import AuditEvent, CircuitBreakerState
+from ..db.models import AuditEvent, CircuitBreakerState, PanicReceipt
 from .submission_barrier import SubmissionBarrier
 
 
@@ -348,6 +348,12 @@ def reset_in_session(
         )
     row = session.get(CircuitBreakerState, scope.key)
     assert row is not None
+    session.execute(
+        delete(PanicReceipt).where(
+            PanicReceipt.account_scope == "alpaca-paper",
+            PanicReceipt.state == "completed",
+        )
+    )
     _audit(
         session,
         scope=scope,
