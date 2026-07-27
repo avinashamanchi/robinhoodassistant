@@ -63,6 +63,10 @@ from .orders.safety_state import (
     unknown_persisted_safety_truth,
 )
 from .orders.submission import OrderSubmissionService, order_to_request
+from .orders.startup import (
+    StartupReconciliationFailed,
+    StartupReconciliationGate,
+)
 from .risk.breakers import BreakerScope, BreakerService, trip_in_session
 from .risk.clock import CryptoClock, MarketClock
 from .risk.engine import RiskEngine
@@ -114,6 +118,8 @@ class TradingService:
         clock: MarketClock,
         crypto_clock: Optional[MarketClock] = None,
         external_source=None,
+        *,
+        require_startup_reconciliation: bool = False,
     ) -> None:
         self.broker = broker
         self.session_factory = session_factory
@@ -135,6 +141,11 @@ class TradingService:
         }
         self.submission_barrier = SubmissionBarrier(session_factory)
         self.breakers = BreakerService(session_factory)
+        self.startup_reconciliation = StartupReconciliationGate(
+            session_factory,
+            broker.reconciliation_key,
+            enabled=require_startup_reconciliation,
+        )
         self.snapshot_service = PortfolioSnapshotService(
             session_factory,
             broker,
@@ -146,6 +157,11 @@ class TradingService:
                 else self.config.risk
             ),
             self.breakers,
+            startup_reconciliation_key=(
+                broker.reconciliation_key
+                if require_startup_reconciliation
+                else None
+            ),
         )
         self.order_application = OrderApplicationService(session_factory)
         self.order_submission = OrderSubmissionService(
@@ -973,6 +989,135 @@ class TradingService:
             "failed": failed,
             "fills_repaired": 0,
         }
+
+    def require_startup_reconciliation(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> int:
+        """Invalidate prior process-start proof before a runtime can serve."""
+        return self.startup_reconciliation.require(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+
+    def reconcile_startup_epoch(
+        self,
+        generation: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Reconcile all broker truth and atomically unlock the newest epoch."""
+        actor, reason, request_id = _require_mutation_context(
+            actor,
+            reason,
+            request_id,
+        )
+        with self.submission_barrier.hold_writer():
+            target_generation = (
+                self.startup_reconciliation.current_generation()
+            )
+            if target_generation <= 0:
+                raise StartupReconciliationFailed(
+                    "startup reconciliation generation is missing"
+                )
+            if self.startup_reconciliation.is_current(
+                target_generation
+            ):
+                return {
+                    "ready": True,
+                    "generation": target_generation,
+                    "superseded_generation": (
+                        generation
+                        if generation != target_generation
+                        else None
+                    ),
+                }
+            evidence: dict[str, Any] = {
+                "requested_generation": generation,
+                "generation": target_generation,
+            }
+            try:
+                order_sync = self.sync_open_orders(
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                positions = self.reconcile_positions(
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            except RequiredDependencyUnavailable:
+                evidence["dependency"] = "unavailable"
+                failure = "required broker reconciliation dependency unavailable"
+                self.startup_reconciliation.fail(
+                    target_generation,
+                    failure,
+                    evidence=evidence,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                raise StartupReconciliationFailed(failure) from None
+
+            evidence.update(
+                {
+                    "order_sync": order_sync,
+                    "position_reconciliation": positions,
+                }
+            )
+            faults = list(order_sync.get("broker_drift", []))
+            unresolved = order_sync.get("unresolved_unknown", [])
+            if unresolved:
+                faults.append(
+                    f"unresolved acceptance orders {unresolved}"
+                )
+            if not positions.get("reconciled", False):
+                faults.append(
+                    "position reconciliation drift "
+                    f"{positions.get('drift', {})}"
+                )
+            if order_sync.get("failed", 0) and not faults:
+                faults.append("broker order reconciliation failed")
+            if faults:
+                failure = " | ".join(str(fault) for fault in faults[:3])
+                self.startup_reconciliation.fail(
+                    target_generation,
+                    failure,
+                    evidence=evidence,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                raise StartupReconciliationFailed(failure)
+
+            if not self.startup_reconciliation.complete(
+                target_generation,
+                evidence=evidence,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            ):
+                raise StartupReconciliationFailed(
+                    "startup reconciliation generation changed before commit"
+                )
+            return {
+                "ready": True,
+                "generation": target_generation,
+                "superseded_generation": (
+                    generation
+                    if generation != target_generation
+                    else None
+                ),
+                "order_sync": order_sync,
+                "position_reconciliation": positions,
+            }
 
     def sync_open_orders(
         self,

@@ -90,6 +90,10 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     require_current_schema(engine)
     assert "orders" in inspect(engine).get_table_names()
     assert "reconciliation_cursors" in inspect(engine).get_table_names()
+    assert (
+        "startup_reconciliation_state"
+        in inspect(engine).get_table_names()
+    )
     assert "auth_sessions" in inspect(engine).get_table_names()
     assert "alembic_version" in inspect(engine).get_table_names()
 
@@ -127,7 +131,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260724_0007"
+        ) == "20260724_0008"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -168,12 +172,50 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260724_0007"
+    assert version == "20260724_0008"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")
     }
     assert heartbeat_indexes["uq_heartbeats_source"]["unique"] == 1
+
+
+def test_startup_reconciliation_downgrade_refuses_to_drop_durable_state(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "startup-reconciliation.db",
+        "head",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO startup_reconciliation_state "
+                "(broker,generation,completed_generation,status,actor,"
+                "reason,request_id,evidence_json,started_at,completed_at,"
+                "updated_at) VALUES "
+                "('alpaca',2,1,'required','runtime:test','restart',"
+                "'startup-test','{}',CURRENT_TIMESTAMP,NULL,"
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable startup reconciliation state",
+    ):
+        command.downgrade(cfg, "20260724_0007")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT generation FROM startup_reconciliation_state "
+                "WHERE broker='alpaca'"
+            )
+        ) == 2
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260724_0008"
 
 
 def test_existing_unversioned_database_must_be_adopted(tmp_path):

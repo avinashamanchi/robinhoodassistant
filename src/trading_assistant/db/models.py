@@ -543,6 +543,32 @@ class ReconciliationCursor(Base):
     version: Mapped[int] = mapped_column(default=0)
 
 
+class StartupReconciliationState(Base):
+    """Durable proof that the newest process-start generation saw broker truth."""
+
+    __tablename__ = "startup_reconciliation_state"
+
+    broker: Mapped[str] = mapped_column(String(64), primary_key=True)
+    generation: Mapped[int] = mapped_column(default=0)
+    completed_generation: Mapped[int] = mapped_column(default=0)
+    status: Mapped[str] = mapped_column(
+        String(16), default="required", index=True
+    )
+    actor: Mapped[str] = mapped_column(String(128), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    request_id: Mapped[str] = mapped_column(String(64), default="")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    started_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utcnow
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utcnow
+    )
+
+
 # ── Atomic approval primitive (A5) ──────────────────────────────
 def approve_proposed(
     session: Session,

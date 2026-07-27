@@ -20,9 +20,11 @@ from trading_assistant.broker.models import (
 )
 from trading_assistant.config import BrokerKind, Secrets, TradingMode
 from trading_assistant.db.migrate import upgrade
+from trading_assistant.db.models import StartupReconciliationState
 from trading_assistant.db.schema import SchemaOutOfDate
 from trading_assistant.db.session import create_db_engine
 from trading_assistant.operations import AuditRecorder, OperationsService
+from trading_assistant.orders.startup import StartupReconciliationFailed
 from trading_assistant.risk.clock import FakeClock
 
 
@@ -74,6 +76,7 @@ class _MutationTradingClient:
         self.submit_calls = 0
         self.cancel_calls = 0
         self._orders: dict[str, SimpleNamespace] = {}
+        self.open_orders: list[SimpleNamespace] = []
 
     def submit_order(self, order_data):
         self.submit_calls += 1
@@ -96,6 +99,15 @@ class _MutationTradingClient:
 
     def get_order_by_id(self, order_id):
         return self._orders[order_id]
+
+    def get(self, _path, _data=None):
+        return []
+
+    def get_orders(self, filter=None):
+        return self.open_orders
+
+    def get_all_positions(self):
+        return []
 
 
 def _paper_alpaca_broker() -> tuple[AlpacaBroker, _MutationTradingClient]:
@@ -145,6 +157,14 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
         _alpaca_config(app_config),
         _migrated_secrets(tmp_path),
     )
+    with container.session_factory() as session:
+        startup = session.get(
+            StartupReconciliationState,
+            broker.reconciliation_key,
+        )
+        assert startup is not None
+        assert startup.status == "current"
+        assert startup.completed_generation == startup.generation
 
     submitted = container.broker.submit_order(_market_order("paper-submit"))
     bracket = container.broker.submit_bracket(
@@ -219,6 +239,45 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
             _alpaca_config(app_config),
             _migrated_secrets(tmp_path),
         )
+
+
+def test_production_container_refuses_to_serve_unknown_remote_open_order(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    broker, trading = _paper_alpaca_broker()
+    trading.open_orders.append(
+        SimpleNamespace(
+            id="remote-without-local-truth",
+            client_order_id="external-client-order",
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            symbol="AAPL",
+            asset_class=SimpleNamespace(value="us_equity"),
+        )
+    )
+    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda *_args: FakeClock(is_open=True),
+    )
+
+    with pytest.raises(
+        StartupReconciliationFailed,
+        match="remote open order",
+    ):
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
+        )
+
+    assert trading.submit_calls == 0
+    assert trading.cancel_calls == 0
 
 
 def test_create_app_builds_missing_agent_from_exact_injected_container(

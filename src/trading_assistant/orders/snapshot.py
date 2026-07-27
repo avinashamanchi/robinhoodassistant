@@ -32,6 +32,7 @@ from trading_assistant.db.models import (
     Fill,
     Order,
     RuleGroup,
+    StartupReconciliationState,
     fill_has_trusted_identity,
     fill_requires_reconciliation,
 )
@@ -73,6 +74,7 @@ class PortfolioSnapshotService:
         risk_config_for_asset: Callable[[AssetClass], RiskConfig] | None = None,
         breakers: BreakerService | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        startup_reconciliation_key: str | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.broker = broker
@@ -81,6 +83,7 @@ class PortfolioSnapshotService:
         self.risk_config_for_asset = risk_config_for_asset
         self.breakers = breakers or BreakerService(session_factory)
         self.now = now
+        self.startup_reconciliation_key = startup_reconciliation_key
         self.submission_barrier = SubmissionBarrier(session_factory)
 
     def assemble_for_execution(
@@ -642,8 +645,22 @@ class PortfolioSnapshotService:
                 is not None
                 or legacy_fill_reconciliation_required
             )
+            startup_reconciled = True
+            if self.startup_reconciliation_key is not None:
+                startup_state = session.get(
+                    StartupReconciliationState,
+                    self.startup_reconciliation_key,
+                )
+                startup_reconciled = (
+                    startup_state is not None
+                    and startup_state.generation > 0
+                    and startup_state.status == "current"
+                    and startup_state.completed_generation
+                    == startup_state.generation
+                )
             broker_reconciled = (
-                position_exposure_complete
+                startup_reconciled
+                and position_exposure_complete
                 and session.scalar(
                     select(Order.id)
                     .where(Order.status.in_(_UNRECONCILED_STATUSES))

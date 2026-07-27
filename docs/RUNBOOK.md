@@ -51,7 +51,10 @@ uv run python -m trading_assistant.db.migrate status
 
 Proceed only when integrity reports `ok` and migration status reports current.
 Backups are standalone SQLite files with owner-only permissions. Migrations
-`0001` through `0007` are the frozen release history.
+`0001` through `0008` are the frozen release history. Migration `0008` adds
+the durable process-start broker-reconciliation generation latch; a runtime
+cannot submit until the newest generation has reconciled orders, fills, open
+orders, positions, and local state.
 
 To recover from a bad migration, stop the app, daemon, and watchdog first. Verify
 the chosen backup again, move the failed database and any `-wal`/`-shm` sidecars

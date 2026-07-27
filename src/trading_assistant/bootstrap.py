@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from uuid import uuid4
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -163,6 +164,7 @@ def _build_container(
         runtime_role=runtime_role,
     )
 
+    production_broker = broker is None
     if broker is None:
         broker = build_broker(config, secrets)
         _arm_production_paper_broker(broker)
@@ -174,7 +176,21 @@ def _build_container(
         config,
         clock,
         external_source=None,
+        require_startup_reconciliation=production_broker,
     )
+    if production_broker:
+        startup_actor = f"runtime:{runtime_role or 'bootstrap'}"
+        generation = service.require_startup_reconciliation(
+            actor=startup_actor,
+            reason="production process startup requires fresh broker truth",
+            request_id=uuid4().hex,
+        )
+        service.reconcile_startup_epoch(
+            generation,
+            actor=startup_actor,
+            reason="production process startup broker reconciliation",
+            request_id=uuid4().hex,
+        )
     rule_worker = RuleWorker(
         service,
         service.rule_repository,
