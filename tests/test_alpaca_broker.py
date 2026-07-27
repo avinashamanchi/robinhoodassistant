@@ -13,7 +13,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus, TimeInForce
 
 from trading_assistant.assets import AssetClass
-from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock, _TimeoutSession
+from trading_assistant.broker.alpaca import AlpacaBroker, AlpacaClock
 from trading_assistant.broker.base import (
     BrokerAcceptanceUnknown,
     BrokerDataIntegrityError,
@@ -192,11 +192,6 @@ def test_execution_target_is_derived_from_actual_sdk_client_and_immutable():
         "not-a-real-secret",
         paper=True,
     )
-    live = AlpacaBroker.from_credentials(
-        "not-a-real-key",
-        "not-a-real-secret",
-        paper=False,
-    )
     overridden = AlpacaBroker(
         TradingClient(
             "not-a-real-key",
@@ -210,14 +205,59 @@ def test_execution_target_is_derived_from_actual_sdk_client_and_immutable():
     assert paper.execution_target.sandbox is True
     assert paper.execution_target.base_url == "https://paper-api.alpaca.markets"
     assert paper.execution_target.is_official_paper is True
-    assert live.execution_target.sandbox is False
-    assert live.execution_target.base_url == "https://api.alpaca.markets"
-    assert live.execution_target.is_official_paper is False
     assert overridden.execution_target.sandbox is True
     assert overridden.execution_target.base_url == "https://paper-proxy.invalid"
     assert overridden.execution_target.is_official_paper is False
     with pytest.raises((AttributeError, TypeError)):
         paper.execution_target.base_url = "https://api.alpaca.markets"
+
+
+def test_from_credentials_rejects_live_client_construction_before_any_io():
+    """Changing paper=False must never create an SDK client pointed at Alpaca live."""
+    with pytest.raises(ValueError, match="paper-only"):
+        AlpacaBroker.from_credentials(
+            "not-a-real-key",
+            "not-a-real-secret",
+            paper=False,
+        )
+
+
+def test_from_credentials_pins_paper_and_data_sdk_transports():
+    """A future SDK default or URL override cannot move Alpaca off committed origins."""
+    from trading_assistant.security.outbound import NoRedirectSession
+
+    broker = AlpacaBroker.from_credentials(
+        "not-a-real-key",
+        "not-a-real-secret",
+        paper=True,
+        timeout_seconds=7.5,
+    )
+
+    assert str(broker._trading._base_url) == "https://paper-api.alpaca.markets"
+    assert str(broker._data._base_url) == "https://data.alpaca.markets"
+    assert str(broker._crypto_data._base_url) == "https://data.alpaca.markets"
+    for client in (broker._trading, broker._data, broker._crypto_data):
+        assert isinstance(client._session, NoRedirectSession)
+        assert client._session._default_timeout == 7.5
+
+
+def test_alpaca_stream_factory_pins_only_committed_wss_origin():
+    """Changing the stream origin must fail before a connector can open a socket."""
+    from trading_assistant.broker.alpaca import build_alpaca_stream
+    from trading_assistant.security.outbound import OutboundOriginDenied
+
+    calls = []
+
+    def connector(url, **_kwargs):
+        calls.append(url)
+        return type("Handshake", (), {"status_code": 101})()
+
+    stream = build_alpaca_stream(connector)
+    stream.connect("wss://stream.data.alpaca.markets/v2/sip")
+    with pytest.raises(OutboundOriginDenied):
+        stream.connect("wss://stream.data.alpaca.markets.evil.test/v2/sip")
+
+    assert calls == ["wss://stream.data.alpaca.markets/v2/sip"]
 
 
 def test_execution_target_reflects_current_sdk_client_state():
@@ -1136,22 +1176,6 @@ def test_non_transient_error_is_not_retried():
     with pytest.raises(ValueError):
         broker.get_quote("AAPL")
     assert data.calls == 1               # not retried — only transient errors retry
-
-
-def test_timeout_session_applies_default_to_every_request(monkeypatch):
-    seen = {}
-
-    def fake_request(self, method, url, **kwargs):
-        seen.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(requests.Session, "request", fake_request)
-    session = _TimeoutSession(7.5)
-    session.request("GET", "https://example.test")
-    assert seen["timeout"] == 7.5
-
-    session.request("GET", "https://example.test", timeout=2)
-    assert seen["timeout"] == 2
 
 
 def test_alpaca_clock_maps():

@@ -7,10 +7,13 @@ import logging
 import re
 from typing import Any, Optional
 
+from ..security.outbound import OutboundPolicy, new_httpx_client
 from .base import LLMResponse, ToolUseBlock, from_openai
 from .payloads import build_groq_payload
 
 log = logging.getLogger(__name__)
+_GROQ_ORIGIN = "https://api.groq.com"
+_GROQ_POLICY = OutboundPolicy(_GROQ_ORIGIN)
 
 
 def _failed_generation(err: Exception) -> str:
@@ -78,7 +81,13 @@ class GroqBackend:
             from groq import Groq
 
             self._client = Groq(
-                api_key=self._api_key, timeout=self._timeout_seconds
+                api_key=self._api_key,
+                base_url=_GROQ_ORIGIN,
+                timeout=self._timeout_seconds,
+                http_client=new_httpx_client(
+                    _GROQ_POLICY,
+                    read_timeout=self._timeout_seconds,
+                ),
             )
         return self._client
 

@@ -19,7 +19,6 @@ from decimal import Decimal
 from threading import RLock
 from typing import Any, Callable, Optional, TypeVar
 
-import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import CryptoHistoricalDataClient
 from requests.exceptions import ConnectionError as ReqConnectionError
@@ -40,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass, canonicalize_broker_symbol
 from ..risk.clock import MarketClockObservation
+from ..security.outbound import PinnedWebSocket, OutboundPolicy, install_pinned_session
 from .base import (
     BrokerAcceptanceUnknown,
     BrokerClient,
@@ -80,6 +80,28 @@ _STATUS_MAP: dict[str, OrderStatus] = {
 
 log = logging.getLogger(__name__)
 _OFFICIAL_PAPER_TRADING_URL = "https://paper-api.alpaca.markets"
+_ALPACA_DATA_URL = "https://data.alpaca.markets"
+_ALPACA_STREAM_URL = "wss://stream.data.alpaca.markets"
+_PAPER_TRADING_POLICY = OutboundPolicy(_OFFICIAL_PAPER_TRADING_URL)
+_DATA_POLICY = OutboundPolicy(_ALPACA_DATA_URL)
+_STREAM_POLICY = OutboundPolicy(_ALPACA_STREAM_URL)
+
+
+def build_alpaca_stream(
+    connector: Any,
+    *,
+    open_timeout: float = 5.0,
+    ping_timeout: float = 30.0,
+    close_timeout: float = 5.0,
+) -> PinnedWebSocket:
+    """Build the optional Alpaca stream boundary without selecting a socket library."""
+    return PinnedWebSocket(
+        _STREAM_POLICY,
+        connector,
+        open_timeout=open_timeout,
+        ping_timeout=ping_timeout,
+        close_timeout=close_timeout,
+    )
 
 
 @dataclass(frozen=True)
@@ -105,20 +127,13 @@ _TRANSIENT = (ReqConnectionError, ReqTimeout)
 _T = TypeVar("_T")
 
 
-class _TimeoutSession(requests.Session):
-    """Requests session with a finite default timeout on every Alpaca SDK call."""
-
-    def __init__(self, timeout_seconds: float) -> None:
-        super().__init__()
-        self._default_timeout = timeout_seconds
-
-    def request(self, method: str, url: str, **kwargs: Any):
-        kwargs.setdefault("timeout", self._default_timeout)
-        return super().request(method, url, **kwargs)
-
-
-def _install_timeout(client: Any, timeout_seconds: float) -> None:
-    client._session = _TimeoutSession(timeout_seconds)
+def _install_timeout(
+    client: Any,
+    timeout_seconds: float,
+    policy: OutboundPolicy,
+) -> None:
+    """Pin an Alpaca SDK client to its committed origin and bounded transport."""
+    install_pinned_session(client, policy, read_timeout=timeout_seconds)
 
 
 def _retry(fn: Callable[..., _T], *args: Any, attempts: int = 3, base_delay: float = 0.3, **kwargs: Any) -> _T:
@@ -266,12 +281,27 @@ class AlpacaBroker(BrokerClient):
         paper: bool = True,
         timeout_seconds: float = 10.0,
     ) -> "AlpacaBroker":
-        trading = TradingClient(api_key, secret_key, paper=paper)
-        data = StockHistoricalDataClient(api_key, secret_key)
-        crypto_data = CryptoHistoricalDataClient(api_key, secret_key)
-        _install_timeout(trading, timeout_seconds)
-        _install_timeout(data, timeout_seconds)
-        _install_timeout(crypto_data, timeout_seconds)
+        if paper is not True:
+            raise ValueError("paper-only Alpaca client required")
+        trading = TradingClient(
+            api_key,
+            secret_key,
+            paper=True,
+            url_override=_OFFICIAL_PAPER_TRADING_URL,
+        )
+        data = StockHistoricalDataClient(
+            api_key,
+            secret_key,
+            url_override=_ALPACA_DATA_URL,
+        )
+        crypto_data = CryptoHistoricalDataClient(
+            api_key,
+            secret_key,
+            url_override=_ALPACA_DATA_URL,
+        )
+        _install_timeout(trading, timeout_seconds, _PAPER_TRADING_POLICY)
+        _install_timeout(data, timeout_seconds, _DATA_POLICY)
+        _install_timeout(crypto_data, timeout_seconds, _DATA_POLICY)
         return cls(trading, data, crypto_data)
 
     # ── market data ────────────────────────────────────────────
@@ -693,8 +723,15 @@ class AlpacaClock:
         paper: bool = True,
         timeout_seconds: float = 10.0,
     ) -> "AlpacaClock":
-        client = TradingClient(api_key, secret_key, paper=paper)
-        _install_timeout(client, timeout_seconds)
+        if paper is not True:
+            raise ValueError("paper-only Alpaca client required")
+        client = TradingClient(
+            api_key,
+            secret_key,
+            paper=True,
+            url_override=_OFFICIAL_PAPER_TRADING_URL,
+        )
+        _install_timeout(client, timeout_seconds, _PAPER_TRADING_POLICY)
         return cls(client)
 
     def is_open(self, at=None) -> bool:

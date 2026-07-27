@@ -14,32 +14,54 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from ..security.outbound import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    OutboundError,
+    OutboundPolicy,
+    OutboundRequestFailed,
+    new_httpx_client,
+    read_bounded_json,
+)
 from .data import cache_path, load_parquet
 
 BASE = "https://api.marketstack.com/v1"
+_ORIGIN_POLICY = OutboundPolicy("https://api.marketstack.com")
 
 
 class MarketStackClient:
     def __init__(
-        self, api_key: str, http: Any = None, cache_dir: str | Path = ".cache/bars"
+        self,
+        api_key: str,
+        http: Any = None,
+        cache_dir: str | Path = ".cache/bars",
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._api_key = api_key
         self._http = http
         self._cache_dir = cache_dir
+        self._max_response_bytes = max_response_bytes
 
     def _client(self):
         if self._http is None:
-            import httpx
-
-            self._http = httpx.Client(timeout=30.0)
+            self._http = new_httpx_client(_ORIGIN_POLICY, read_timeout=30.0)
         return self._http
 
     def _get(self, path: str, params: dict) -> dict:
-        resp = self._client().get(
-            f"{BASE}{path}", params={**params, "access_key": self._api_key}
-        )
-        resp.raise_for_status()
-        return resp.json()
+        url = f"{BASE}{path}"
+        request_params = {**params, "access_key": self._api_key}
+        _ORIGIN_POLICY.assert_url(url)
+        try:
+            with self._client().stream("GET", url, params=request_params) as resp:
+                _ORIGIN_POLICY.assert_response(resp)
+                resp.raise_for_status()
+                return read_bounded_json(
+                    resp,
+                    max_response_bytes=self._max_response_bytes,
+                )
+        except OutboundError:
+            raise
+        except Exception:
+            raise OutboundRequestFailed() from None
 
     # ── EOD bars -> OHLCV frame (cached) ───────────────────────
     def eod(self, symbol: str, limit: int = 1000, use_cache: bool = True) -> pd.DataFrame:

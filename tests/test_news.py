@@ -74,3 +74,25 @@ def test_prompt_injection_headline_does_not_change_plan():
     # and sizing (deterministic, downstream) is what would cap any "max-size" idea.
     assert plan.action.value == "buy"
     assert plan.entry_plan.tranches[0].fraction == 0.5
+
+
+def test_alpaca_news_constructs_only_a_pinned_data_client(monkeypatch):
+    """A NewsClient default/override must not choose an arbitrary Alpaca host."""
+    from alpaca.data.historical import news as alpaca_news
+    from trading_assistant.analyst.news import AlpacaNews
+    from trading_assistant.security.outbound import NoRedirectSession
+
+    seen = {}
+
+    class Client:
+        def __init__(self, api_key=None, secret_key=None, **kwargs):
+            seen["api_key"] = api_key
+            seen["secret_key"] = secret_key
+            seen.update(kwargs)
+            self._base_url = kwargs["url_override"]
+
+    monkeypatch.setattr(alpaca_news, "NewsClient", Client)
+    client = AlpacaNews("not-a-real-key", "not-a-real-secret")._get_client()
+
+    assert seen["url_override"] == "https://data.alpaca.markets"
+    assert isinstance(client._session, NoRedirectSession)

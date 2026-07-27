@@ -1230,3 +1230,48 @@ def test_sync_preserves_exact_incremental_activity_prices(make_service):
         )
         s.commit()
         assert svc._realized_pnl_today(s) == Decimal("30.000000")
+
+
+def test_telegram_uses_fixed_origin_and_redacts_token_bearing_failures(caplog):
+    """Changing the notifier base or logging transport errors would expose the bot token."""
+    from types import SimpleNamespace
+
+    from trading_assistant.notifications.telegram import TelegramNotifier
+
+    token = "test-only-token"
+
+    class HTTP:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return SimpleNamespace(
+                status_code=200,
+                request=SimpleNamespace(url=url),
+            )
+
+    http = HTTP()
+    notifier = TelegramNotifier(
+        enabled=True,
+        bot_token=token,
+        chat_id="test-chat",
+        http=http,
+    )
+
+    assert notifier.send("notification") is True
+    assert http.calls[0][0] == f"https://api.telegram.org/bot{token}/sendMessage"
+
+    class FailingHTTP:
+        def post(self, url, **_kwargs):
+            raise RuntimeError(f"failed for {url}")
+
+    with caplog.at_level("WARNING"):
+        assert TelegramNotifier(
+            enabled=True,
+            bot_token=token,
+            chat_id="test-chat",
+            http=FailingHTTP(),
+        ).send("notification") is False
+
+    assert token not in caplog.text

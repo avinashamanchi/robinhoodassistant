@@ -15,9 +15,18 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from ..security.outbound import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    OutboundError,
+    OutboundPolicy,
+    OutboundRequestFailed,
+    new_httpx_client,
+    read_bounded_json,
+)
 from .data import cache_path, load_parquet
 
 BASE = "https://api.coingecko.com/api/v3"
+_ORIGIN_POLICY = OutboundPolicy("https://api.coingecko.com")
 
 SYMBOL_TO_ID = {
     "BTC/USD": "bitcoin",
@@ -38,30 +47,37 @@ class CoinGeckoClient:
         http: Any = None,
         cache_dir: str | Path = ".cache/bars",
         attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._http = http
         self._cache_dir = cache_dir
         self._attempt_gate = attempt_gate
+        self._max_response_bytes = max_response_bytes
 
     def _client(self):
         if self._http is None:
-            import httpx
-
-            self._http = httpx.Client(timeout=30.0)
+            self._http = new_httpx_client(_ORIGIN_POLICY, read_timeout=30.0)
         return self._http
 
     def _get(self, path: str, params: dict) -> Any:
-        operation = lambda: self._client().get(
-            f"{BASE}{path}",
-            params=params,
-        )
-        resp = (
-            self._attempt_gate(operation)
-            if self._attempt_gate is not None
-            else operation()
-        )
-        resp.raise_for_status()
-        return resp.json()
+        url = f"{BASE}{path}"
+
+        def operation() -> Any:
+            _ORIGIN_POLICY.assert_url(url)
+            try:
+                with self._client().stream("GET", url, params=params) as resp:
+                    _ORIGIN_POLICY.assert_response(resp)
+                    resp.raise_for_status()
+                    return read_bounded_json(
+                        resp,
+                        max_response_bytes=self._max_response_bytes,
+                    )
+            except OutboundError:
+                raise
+            except Exception:
+                raise OutboundRequestFailed() from None
+
+        return self._attempt_gate(operation) if self._attempt_gate is not None else operation()
 
     def ohlc(self, symbol: str, days: int = 365) -> list:
         return self._get(

@@ -477,6 +477,8 @@ def test_production_daemon_builders_gate_every_historical_network_attempt(
     tmp_path,
 ):
     import pandas as pd
+    import json
+    from contextlib import nullcontext
 
     import trading_assistant.daemon.main as daemon_main
     from trading_assistant import bootstrap
@@ -516,8 +518,10 @@ def test_production_daemon_builders_gate_every_historical_network_attempt(
             return SimpleNamespace(df=frame.copy())
 
     class FakeResponse:
-        def __init__(self, payload):
+        def __init__(self, payload, url):
             self.payload = payload
+            self.headers = {}
+            self.request = SimpleNamespace(url=url)
 
         def raise_for_status(self):
             return None
@@ -525,18 +529,25 @@ def test_production_daemon_builders_gate_every_historical_network_attempt(
         def json(self):
             return self.payload
 
+        def iter_bytes(self):
+            yield json.dumps(self.payload).encode()
+
     class FakeCoinGeckoHTTP:
         def __init__(self):
             self.calls = 0
 
-        def get(self, url, params):
+        def stream(self, method, url, *, params):
             self.calls += 1
+            assert method == "GET"
             if url.endswith("/ohlc"):
-                return FakeResponse(
-                    [[1672790400000, 100, 101, 99, 100.5]]
+                return nullcontext(
+                    FakeResponse(
+                        [[1672790400000, 100, 101, 99, 100.5]],
+                        url,
+                    )
                 )
-            return FakeResponse(
-                {"total_volumes": [[1672790400000, 5000]]}
+            return nullcontext(
+                FakeResponse({"total_volumes": [[1672790400000, 5000]]}, url)
             )
 
     captured = {}

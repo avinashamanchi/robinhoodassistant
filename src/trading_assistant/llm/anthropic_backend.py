@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ..security.outbound import OutboundPolicy, new_httpx_client
 from .payloads import build_anthropic_payload
+
+
+_ANTHROPIC_ORIGIN = "https://api.anthropic.com"
+_ANTHROPIC_POLICY = OutboundPolicy(_ANTHROPIC_ORIGIN)
 
 
 class AnthropicBackend:
@@ -30,7 +35,12 @@ class AnthropicBackend:
 
             self._client = Anthropic(
                 api_key=self._api_key,
+                base_url=_ANTHROPIC_ORIGIN,
                 timeout=self._timeout_seconds,
+                http_client=new_httpx_client(
+                    _ANTHROPIC_POLICY,
+                    read_timeout=self._timeout_seconds,
+                ),
             )
         return self._client
 

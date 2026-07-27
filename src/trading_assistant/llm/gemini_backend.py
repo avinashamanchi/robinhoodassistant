@@ -8,11 +8,16 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ..security.outbound import OutboundPolicy, new_httpx_client
 from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
 from .payloads import (
     build_gemini_payload,
     sanitize_gemini_schema,
 )
+
+
+_GEMINI_ORIGIN = "https://generativelanguage.googleapis.com"
+_GEMINI_POLICY = OutboundPolicy(_GEMINI_ORIGIN)
 
 
 def _sanitize_schema(schema: Any) -> Any:
@@ -86,7 +91,12 @@ class GeminiBackend:
             self._client = genai.Client(
                 api_key=self._api_key,
                 http_options=types.HttpOptions(
-                    timeout=int(self._timeout_seconds * 1000)
+                    baseUrl=_GEMINI_ORIGIN,
+                    timeout=int(self._timeout_seconds * 1000),
+                    httpxClient=new_httpx_client(
+                        _GEMINI_POLICY,
+                        read_timeout=self._timeout_seconds,
+                    ),
                 ),
             )
         return self._client

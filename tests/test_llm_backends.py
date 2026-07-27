@@ -356,6 +356,10 @@ def test_groq_client_uses_configured_timeout(monkeypatch):
     backend = GroqBackend("key", "model", timeout_seconds=17)
     backend._get_client()
     assert seen["timeout"] == 17
+    assert seen["base_url"] == "https://api.groq.com"
+    assert seen["http_client"].follow_redirects is False
+    assert seen["http_client"].timeout.connect == 5.0
+    assert seen["http_client"].timeout.read == 17
 
 
 def test_anthropic_client_uses_configured_timeout(monkeypatch):
@@ -373,6 +377,10 @@ def test_anthropic_client_uses_configured_timeout(monkeypatch):
         timeout_seconds=19,
     )._get_client()
     assert seen["timeout"] == 19
+    assert seen["base_url"] == "https://api.anthropic.com"
+    assert seen["http_client"].follow_redirects is False
+    assert seen["http_client"].timeout.connect == 5.0
+    assert seen["http_client"].timeout.read == 19
 
 
 def test_gemini_client_uses_configured_timeout(monkeypatch):
@@ -385,3 +393,7 @@ def test_gemini_client_uses_configured_timeout(monkeypatch):
     )
     GeminiBackend("key", "model", timeout_seconds=23)._get_client()
     assert seen["http_options"].timeout == 23_000
+    assert seen["http_options"].base_url == "https://generativelanguage.googleapis.com"
+    assert seen["http_options"].httpx_client.follow_redirects is False
+    assert seen["http_options"].httpx_client.timeout.connect == 5.0
+    assert seen["http_options"].httpx_client.timeout.read == 23

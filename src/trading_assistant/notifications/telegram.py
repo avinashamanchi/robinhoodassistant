@@ -9,17 +9,33 @@ never break the trading path.
 from __future__ import annotations
 
 import logging
+from typing import Any
+
+from ..security.outbound import OutboundPolicy, new_httpx_client
 
 log = logging.getLogger(__name__)
 
-_API = "https://api.telegram.org/bot{token}/sendMessage"
+_API_ORIGIN = "https://api.telegram.org"
+_API_POLICY = OutboundPolicy(_API_ORIGIN)
 
 
 class TelegramNotifier:
-    def __init__(self, enabled: bool, bot_token: str = "", chat_id: str = "") -> None:
+    def __init__(
+        self,
+        enabled: bool,
+        bot_token: str = "",
+        chat_id: str = "",
+        http: Any = None,
+    ) -> None:
         self.enabled = enabled and bool(bot_token) and bool(chat_id)
         self._bot_token = bot_token
         self._chat_id = chat_id
+        self._http = http
+
+    def _client(self):
+        if self._http is None:
+            self._http = new_httpx_client(_API_POLICY, read_timeout=10.0)
+        return self._http
 
     def send(self, message: str) -> bool:
         """Return True if a message was dispatched, False if disabled or failed."""
@@ -27,13 +43,13 @@ class TelegramNotifier:
             log.debug("telegram disabled; dropping notification")
             return False
         try:
-            import httpx
-
-            resp = httpx.post(
-                _API.format(token=self._bot_token),
+            url = f"{_API_ORIGIN}/bot{self._bot_token}/sendMessage"
+            _API_POLICY.assert_url(url)
+            resp = self._client().post(
+                url,
                 json={"chat_id": self._chat_id, "text": message},
-                timeout=10.0,
             )
+            _API_POLICY.assert_response(resp)
             return resp.status_code == 200
         except Exception:  # never let a notification failure break trading
             log.warning("telegram send failed code=notification_failed")
