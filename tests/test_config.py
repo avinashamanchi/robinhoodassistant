@@ -18,6 +18,7 @@ from trading_assistant.config import (
     live_trading_enabled,
     load_config,
 )
+from trading_assistant.security.secrets import RuntimeSecrets
 
 VALID = """
 trading:
@@ -52,6 +53,8 @@ security:
         input_usd_per_million: 1.50
         output_usd_per_million: 7.50
         source_url: https://ai.google.dev/gemini-api/docs/latest-model
+encryption:
+  active_key_id: test-primary-key
 """
 
 FLOAT_RISK_LIMITS = (
@@ -108,7 +111,7 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     assert cfg.execution.prefer_bracket_orders is False
     assert cfg.security.session_hours == 8
     assert cfg.security.reauthentication_minutes == 5
-    assert cfg.security.cookie_secure is False
+    assert cfg.server.secure_cookies is True
 
 
 def test_deployed_config_keeps_automatic_execution_disabled():
@@ -119,7 +122,36 @@ def test_deployed_config_keeps_automatic_execution_disabled():
     assert cfg.execution.prefer_bracket_orders is False
     assert cfg.security.session_hours == 8
     assert cfg.security.reauthentication_minutes == 5
-    assert cfg.security.cookie_secure is False
+    assert cfg.server.secure_cookies is True
+
+
+def test_loopback_server_defaults_are_explicit(app_config):
+    assert app_config.server.bind_host == "127.0.0.1"
+    assert app_config.server.port == 8020
+    assert str(app_config.server.origin) == "https://localhost:8020"
+    assert app_config.server.allowed_hosts == [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    ]
+    assert app_config.integrations.webhooks_enabled is False
+    assert app_config.integrations.composio_enabled is False
+
+
+def test_runtime_secrets_never_include_bind_or_provider_urls():
+    names = set(RuntimeSecrets.model_fields)
+    assert "app_host" not in names
+    assert "app_port" not in names
+    assert "alpaca_paper_base_url" not in names
+
+
+def test_unknown_server_key_fails(tmp_path):
+    raw = yaml.safe_load(Path("config.yaml").read_text())
+    raw["server"]["trust_proxy_headers"] = True
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValidationError, match="trust_proxy_headers"):
+        load_config(path)
 
 
 def test_security_policy_defaults_are_explicit(app_config):

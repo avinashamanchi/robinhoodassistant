@@ -2,6 +2,37 @@
 # The risk section is the law: it is enforced on EVERY order, server-side,
 # regardless of what the LLM requested. Unknown keys here FAIL to load (A8).
 
+server:
+  bind_host: 127.0.0.1
+  port: 8020
+  origin: https://localhost:8020
+  allowed_hosts: [localhost, 127.0.0.1, "::1"]
+  tls_cert_path: .local/tls/localhost.pem
+  tls_key_path: .local/tls/localhost-key.pem
+  secure_cookies: true
+
+provider_origins:
+  alpaca_trading: https://paper-api.alpaca.markets
+  alpaca_data: https://data.alpaca.markets
+  alpaca_stream: wss://stream.data.alpaca.markets
+  anthropic: https://api.anthropic.com
+  gemini: https://generativelanguage.googleapis.com
+  groq: https://api.groq.com
+  telegram: https://api.telegram.org
+  marketstack: https://api.marketstack.com
+  coingecko: https://api.coingecko.com
+
+encryption:
+  required: true
+  schema_version: 1
+  active_key_id: local-primary-2026-07
+  retained_key_ids: []
+  backup_directory: .local/encrypted-backups
+
+integrations:
+  webhooks_enabled: false
+  composio_enabled: false
+
 trading:
   mode: paper              # paper | live  (live ALSO requires env confirmation)
   broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
@@ -67,7 +98,6 @@ execution:
 security:
   session_hours: 8
   reauthentication_minutes: 5
-  cookie_secure: false                    # loopback HTTP only; true for TLS/non-loopback
   rate_limits:
     login:
       requests: 5

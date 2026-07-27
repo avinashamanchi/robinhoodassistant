@@ -6,7 +6,7 @@ Two sources, deliberately separated:
   Parsed into pydantic models with ``extra="forbid"`` so a misspelled or unknown
   key raises at startup rather than being silently ignored (A8). A silently
   dropped risk limit is the worst failure mode this project has.
-* ``.env`` — secrets, loaded via pydantic-settings (:class:`Secrets`).
+* runtime secrets — supplied separately through a typed secret provider.
 
 Legacy live-mode fields remain parseable for configuration compatibility, but
 the safety-foundation production bootstrap and broker factory reject/ignore
@@ -19,7 +19,7 @@ import enum
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import (
@@ -30,7 +30,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .security.secrets import RuntimeSecrets
 
 LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
 
@@ -38,7 +39,44 @@ LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
 class _Strict(BaseModel):
     """Base for all YAML config models: unknown keys are a hard error (A8)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", url_preserve_empty_path=True)
+
+
+class ServerConfig(_Strict):
+    bind_host: Literal["127.0.0.1", "::1"] = "127.0.0.1"
+    port: int = Field(default=8020, ge=1024, le=65535)
+    origin: AnyUrl = "https://localhost:8020"
+    allowed_hosts: list[Literal["localhost", "127.0.0.1", "::1"]] = Field(
+        default_factory=lambda: ["localhost", "127.0.0.1", "::1"]
+    )
+    tls_cert_path: Path = Path(".local/tls/localhost.pem")
+    tls_key_path: Path = Path(".local/tls/localhost-key.pem")
+    secure_cookies: Literal[True] = True
+
+
+class ProviderOriginsConfig(_Strict):
+    alpaca_trading: AnyUrl = "https://paper-api.alpaca.markets"
+    alpaca_data: AnyUrl = "https://data.alpaca.markets"
+    alpaca_stream: AnyUrl = "wss://stream.data.alpaca.markets"
+    anthropic: AnyUrl = "https://api.anthropic.com"
+    gemini: AnyUrl = "https://generativelanguage.googleapis.com"
+    groq: AnyUrl = "https://api.groq.com"
+    telegram: AnyUrl = "https://api.telegram.org"
+    marketstack: AnyUrl = "https://api.marketstack.com"
+    coingecko: AnyUrl = "https://api.coingecko.com"
+
+
+class EncryptionConfig(_Strict):
+    required: Literal[True] = True
+    schema_version: Literal[1] = 1
+    active_key_id: str = Field(min_length=8, max_length=64)
+    retained_key_ids: list[str] = Field(default_factory=list)
+    backup_directory: Path = Path(".local/encrypted-backups")
+
+
+class IntegrationsConfig(_Strict):
+    webhooks_enabled: Literal[False] = False
+    composio_enabled: Literal[False] = False
 
 
 class TradingMode(str, enum.Enum):
@@ -185,7 +223,6 @@ class RequestBoundsConfig(_Strict):
 class SecurityConfig(_Strict):
     session_hours: int = Field(default=8, gt=0)
     reauthentication_minutes: int = Field(default=5, gt=0)
-    cookie_secure: bool = False
     rate_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
     provider_budget: ProviderBudgetConfig = Field(
         default_factory=ProviderBudgetConfig
@@ -255,6 +292,12 @@ class AnalystExtrasConfig(_Strict):
 
 
 class AppConfig(_Strict):
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    provider_origins: ProviderOriginsConfig = Field(
+        default_factory=ProviderOriginsConfig
+    )
+    encryption: EncryptionConfig
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     trading: TradingConfig
     risk: RiskConfig
     features: FeaturesConfig
@@ -289,28 +332,11 @@ class AppConfig(_Strict):
         return self
 
 
-class Secrets(BaseSettings):
-    """Secrets from the environment / ``.env``. Never logged (see logging.py)."""
+# Source/test compatibility only. Runtime entry points move to SecretProvider
+# in Task 2, after role-specific validation exists.
+Secrets = RuntimeSecrets
 
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
 
-    anthropic_api_key: str = ""
-    gemini_api_key: str = ""
-    groq_api_key: str = ""
-    openrouter_api_key: str = ""
-    marketstack_api_key: str = ""
-    app_api_token: str = ""       # Required operator login secret; never sent as API auth
-    alpaca_api_key: str = ""
-    alpaca_secret_key: str = ""
-    alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
-    live_trading_confirm: str = ""
-    database_url: str = "sqlite:///./trading_assistant.db"
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
-    app_host: str = "127.0.0.1"
-    app_port: int = 8000
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8)."""
     text = Path(path).read_text(encoding="utf-8")
@@ -318,9 +344,9 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     return AppConfig.model_validate(raw)
 
 
-def live_trading_enabled(config: AppConfig, secrets: Secrets) -> bool:
+def live_trading_enabled(config: AppConfig, secrets: RuntimeSecrets) -> bool:
     """Guardrail #1: both locks must be set, else we are NOT live."""
     return (
         config.trading.mode is TradingMode.LIVE
-        and secrets.live_trading_confirm == LIVE_CONFIRM_STRING
+        and secrets.live_trading_confirm.get_secret_value() == LIVE_CONFIRM_STRING
     )
