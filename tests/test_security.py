@@ -948,7 +948,7 @@ def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
         const calls = [];
         let firstActionAttempts = 0;
         globalThis.fetch = async (path, options = {}) => {
-          calls.push({ path, options });
+          calls.push({ path, options, headers: options.headers });
           if (path === "/auth/session") {
             return {
               status: 200,
@@ -1016,6 +1016,9 @@ def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
         if (firstActionCalls[0].options !== firstActionCalls[1].options) {
           throw new Error("recent-auth retry replaced internal options");
         }
+        if (firstActionCalls[0].headers !== firstActionCalls[1].headers) {
+          throw new Error("recent-auth retry replaced internal headers");
+        }
         if (
           firstCallerOptions.headers !== firstCallerHeaders
           || Object.hasOwn(firstCallerHeaders, "X-CSRF-Token")
@@ -1024,7 +1027,7 @@ def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
           throw new Error("jsonPost caller options were mutated");
         }
         for (const call of firstActionCalls) {
-          const headers = new Headers(call.options.headers);
+          const headers = new Headers(call.headers);
           if (
             headers.get("Content-Type") !== "application/json"
             || headers.get("X-CSRF-Token") !== "csrf-memory-only"
@@ -1041,7 +1044,7 @@ def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
         const secondActionCall = calls.find(
           (call) => call.path === "/approve/8",
         );
-        const secondHeaders = new Headers(secondActionCall.options.headers);
+        const secondHeaders = new Headers(secondActionCall.headers);
         if (secondActionCall.options === firstActionCalls[0].options) {
           throw new Error("new action reused the previous internal options");
         }
