@@ -201,7 +201,7 @@ def test_parallel_consumers_cannot_overspend(session_factory):
     assert sorted(results) == [False, True]
 
 
-def test_parallel_principals_overlap_distinct_connections_and_serialize(
+def test_parallel_principals_fail_closed_while_real_insert_holds_lock(
     engine,
     session_factory,
 ):
@@ -214,16 +214,38 @@ def test_parallel_principals_overlap_distinct_connections_and_serialize(
         window_seconds=60,
     )
     role = threading.local()
-    first_holds_write_lock = threading.Event()
+    holder_insert_executed = threading.Event()
     second_attempted_begin = threading.Event()
-    release_first = threading.Event()
+    release_holder = threading.Event()
     connection_ids: dict[str, int] = {}
+    busy_timeouts: dict[str, int] = {}
 
     def is_begin_immediate(statement: str) -> bool:
         return statement.strip().upper() == "BEGIN IMMEDIATE"
 
+    def is_rate_window_insert(statement: str) -> bool:
+        return statement.lstrip().upper().startswith(
+            "INSERT INTO RATE_WINDOWS"
+        )
+
+    def configure_checked_out_connection(
+        dbapi_connection,
+        _connection_record,
+        _connection_proxy,
+    ):
+        current_role = getattr(role, "name", "")
+        timeout_ms = 1 if current_role == "contender" else 5000
+        dbapi_connection.execute(
+            f"PRAGMA busy_timeout={timeout_ms}"
+        )
+        if current_role in {"holder", "contender"}:
+            connection_ids[current_role] = id(dbapi_connection)
+            busy_timeouts[current_role] = dbapi_connection.execute(
+                "PRAGMA busy_timeout"
+            ).fetchone()[0]
+
     def before_cursor_execute(
-        connection,
+        _connection,
         _cursor,
         statement,
         _parameters,
@@ -235,12 +257,8 @@ def test_parallel_principals_overlap_distinct_connections_and_serialize(
         current_role = getattr(role, "name", "")
         if not current_role:
             return
-        connection_ids[current_role] = id(
-            connection.connection.driver_connection
-        )
-        if current_role == "second":
+        if current_role == "contender":
             second_attempted_begin.set()
-            release_first.set()
 
     def after_cursor_execute(
         _connection,
@@ -251,15 +269,16 @@ def test_parallel_principals_overlap_distinct_connections_and_serialize(
         _executemany,
     ):
         if (
-            is_begin_immediate(statement)
-            and getattr(role, "name", "") == "first"
+            is_rate_window_insert(statement)
+            and getattr(role, "name", "") == "holder"
         ):
-            first_holds_write_lock.set()
-            if not release_first.wait(timeout=5):
+            holder_insert_executed.set()
+            if not release_holder.wait(timeout=5):
                 raise AssertionError(
-                    "second connection never attempted BEGIN IMMEDIATE"
+                    "holder was not released after contender attempt"
                 )
 
+    event.listen(engine, "checkout", configure_checked_out_connection)
     event.listen(engine, "before_cursor_execute", before_cursor_execute)
     event.listen(engine, "after_cursor_execute", after_cursor_execute)
 
@@ -269,21 +288,51 @@ def test_parallel_principals_overlap_distinct_connections_and_serialize(
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(
-                consume,
-                limiter_a,
-                "operator-a",
-                "first",
-            )
-            assert first_holds_write_lock.wait(timeout=5)
-            second = pool.submit(
-                consume,
-                limiter_b,
-                "operator-b",
-                "second",
-            )
-            results = [first.result(timeout=10), second.result(timeout=10)]
+            try:
+                holder = pool.submit(
+                    consume,
+                    limiter_a,
+                    "operator-a",
+                    "holder",
+                )
+                assert holder_insert_executed.wait(timeout=5)
+                contender = pool.submit(
+                    consume,
+                    limiter_b,
+                    "operator-b",
+                    "contender",
+                )
+                with pytest.raises(LimitStoreUnavailable):
+                    contender.result(timeout=5)
+            finally:
+                release_holder.set()
+            holder_allowed = holder.result(timeout=10)
+
+        role.name = "post_commit_retry"
+        post_commit_retry = DurableRateLimiter(
+            session_factory
+        ).consume_pair(
+            spec,
+            principal="operator-b",
+        )
+
+        role.name = "inspect"
+        with session_factory() as session:
+            persisted = {
+                window.bucket_key: window.hits
+                for window in session.scalars(
+                    select(RateWindow).where(
+                        RateWindow.policy_name == "broker_read"
+                    )
+                )
+            }
     finally:
+        release_holder.set()
+        event.remove(
+            engine,
+            "checkout",
+            configure_checked_out_connection,
+        )
         event.remove(
             engine,
             "before_cursor_execute",
@@ -295,9 +344,20 @@ def test_parallel_principals_overlap_distinct_connections_and_serialize(
             after_cursor_execute,
         )
 
+    expected_keys = {
+        hashlib.sha256(
+            b"broker_read\0principal_window\0operator-a"
+        ).hexdigest(),
+        hashlib.sha256(
+            b"broker_read\0global_window\0"
+        ).hexdigest(),
+    }
+    assert holder_allowed is True
     assert second_attempted_begin.is_set()
-    assert connection_ids["first"] != connection_ids["second"]
-    assert results == [True, False]
+    assert connection_ids["holder"] != connection_ids["contender"]
+    assert busy_timeouts == {"holder": 5000, "contender": 1}
+    assert persisted == {key: 1 for key in expected_keys}
+    assert post_commit_retry.allowed is False
 
 
 def test_global_denial_rolls_back_principal_increment(
