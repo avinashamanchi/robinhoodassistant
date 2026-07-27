@@ -67,6 +67,19 @@ def _static_fixture(tmp_path: Path) -> Path:
     root = tmp_path / "fixture"
     static = root / "src" / "trading_assistant" / "app" / "static"
     static.mkdir(parents=True)
+    app = static.parent
+    (app / "policy.py").write_text(
+        "ROUTE_POLICIES = (\n"
+        "    RoutePolicy('GET', '/covered', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    (app / "main.py").write_text(
+        "@app.get('/covered')\n"
+        "def covered():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
     (root / "config.yaml").write_text(
         yaml.safe_dump(
             {
@@ -117,6 +130,82 @@ def _static_fixture(tmp_path: Path) -> Path:
     ],
 )
 def test_release_static_gate_rejects_negative_fixtures(
+    tmp_path,
+    relative_path,
+    source,
+    expected,
+):
+    root = _static_fixture(tmp_path)
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected"),
+    [
+        (
+            "src/trading_assistant/app/main.py",
+            "@app.get('/covered')\n"
+            "def covered():\n"
+            "    return None\n\n"
+            "@app.post('/uncovered')\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "route missing from ROUTE_POLICIES: POST /uncovered",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "@app.get('/covered')\n"
+            "def covered():\n"
+            "    return None\n\n"
+            "@app.api_route('/uncovered', methods=['PUT', 'DELETE'])\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "route missing from ROUTE_POLICIES: DELETE /uncovered",
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "AnthropicBackend('key', 'model', 1)\n",
+            "raw LLM backend construction outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "GeminiBackend('key', 'model')\n",
+            "raw LLM backend construction outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "GroqBackend('key', 'model')\n",
+            "raw LLM backend construction outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_limiter.py",
+            "from trading_assistant.app.ratelimit import RateLimiter\n",
+            "deleted RateLimiter import: "
+            "src/trading_assistant/unsafe_limiter.py:1",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_policy_omission_fixtures(
     tmp_path,
     relative_path,
     source,

@@ -233,6 +233,36 @@ high-consequence actions require recent reauthentication (five minutes by
 default). The UI prompts again and never stores the operator secret, session, or
 CSRF token in `localStorage`. Logout revokes the server-side session.
 
+## Durable request and provider budgets
+
+Request-limit windows and concurrency state are durable: process restart does
+not reset a principal or global window. A `429 rate_limit_exceeded` response is
+a refusal, not a retry instruction. Its `Retry-After` header is the whole number
+of seconds until the applicable durable request window permits another attempt;
+wait at least that long and do not create parallel retries.
+
+Paid-model limits are also durable, provider-scoped, and reset at UTC midnight.
+Calls plus input and output token ceilings are charged before a provider
+attempt. If provider acceptance is unknown after the attempt starts, its
+reservation remains charged until durable reconciliation proves otherwise; do
+not retry merely because the response was lost.
+
+To inspect budget state without changing it, take the verified online backup
+described above and query the copy only:
+
+```bash
+sqlite3 "$backup_file" \
+  'SELECT provider, budget_day, calls_used, input_tokens_used, output_tokens_used, reconciliation_required, reconciliation_code FROM provider_budget_days ORDER BY budget_day DESC, provider;'
+sqlite3 "$backup_file" \
+  "SELECT provider, budget_day, category, request_id, state, input_reserved, output_reserved FROM provider_reservations WHERE state = 'unknown' ORDER BY created_at;"
+```
+
+Never edit `provider_budget_days` or `provider_reservations` counters manually.
+Reservations and aggregate counters are updated atomically; manual edits break
+their audit trail and can make metering unavailable or permit an unsafe budget
+decision. Preserve the copy and investigate reconciliation-required or unknown
+rows instead.
+
 ## Orders and acceptance-unknown recovery
 
 Every broker submission originates in `OrderSubmissionService`, after human
