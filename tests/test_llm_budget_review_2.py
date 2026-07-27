@@ -135,7 +135,7 @@ def test_unknown_tool_choice_stops_before_estimation_store_and_delegate(
             messages=[],
             tools=TOOLS,
             tool_choice=tool_choice,
-            request_id=f"unknown-tool-choice-{tool_choice}",
+            request_id="unknown-tool-choice",
         )
 
     assert estimator.calls == 0

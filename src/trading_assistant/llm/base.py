@@ -15,6 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..identity import canonical_request_id
 from .budget import (
     ProviderBudgetService,
     ProviderInputEstimator,
@@ -98,8 +99,7 @@ class BudgetedLLMBackend:
         tool_choice: str | None = None,
         request_id: str,
     ):
-        if not isinstance(request_id, str) or not request_id.strip():
-            raise ValueError("budgeted LLM calls require request_id")
+        request_id = canonical_request_id(request_id)
         validate_llm_payload(
             system=system,
             messages=messages,

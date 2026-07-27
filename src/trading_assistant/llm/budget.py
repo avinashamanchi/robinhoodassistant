@@ -19,6 +19,7 @@ from trading_assistant.db.models import (
     ProviderReservation,
     utcnow,
 )
+from trading_assistant.identity import canonical_request_id
 from .payloads import (
     build_anthropic_payload,
     build_gemini_payload,
@@ -243,7 +244,7 @@ class ProviderBudgetService:
     ) -> BudgetReservation:
         _require_text("provider", provider)
         _require_text("category", category)
-        _require_text("request_id", request_id)
+        request_id = canonical_request_id(request_id)
         _require_nonnegative_int("input_tokens", input_tokens)
         _require_nonnegative_int("output_tokens", output_tokens)
         current = _as_utc(now or self._clock())
@@ -758,6 +759,14 @@ class ProviderBudgetService:
     def _validate_reservation(
         reservation: ProviderReservation,
     ) -> None:
+        try:
+            stored_request_id = canonical_request_id(
+                reservation.request_id
+            )
+        except ValueError:
+            raise ProviderBudgetUnavailable(
+                "corrupt provider budget state"
+            ) from None
         actuals_valid = all(
             value is None
             or (type(value) is int and value >= 0)
@@ -785,8 +794,7 @@ class ProviderBudgetService:
             or not reservation.provider.strip()
             or not isinstance(reservation.category, str)
             or not reservation.category.strip()
-            or not isinstance(reservation.request_id, str)
-            or not reservation.request_id.strip()
+            or stored_request_id != reservation.request_id
             or type(reservation.budget_day) is not date
             or reservation.state not in _RESERVATION_STATES
             or type(reservation.input_reserved) is not int

@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..db.models import LLMDecision
+from ..identity import canonical_request_id
 from ..service import TradingService
 
 log = logging.getLogger(__name__)
@@ -224,8 +225,8 @@ class Agent:
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
-        request_id = request_id.strip()
-        if not actor or not reason or not request_id:
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
             raise ValueError(
                 "chat actor, reason, and request_id must be non-empty"
             )
@@ -303,23 +304,3 @@ class Agent:
                 )
             )
             s.commit()
-
-
-class AnthropicBackend:
-    """Real backend. Lazily constructs the Anthropic client so tests never need a key."""
-
-    def __init__(self, api_key: str, model: str, max_tokens: int) -> None:
-        from anthropic import Anthropic
-
-        self._client = Anthropic(api_key=api_key)
-        self._model = model
-        self._max_tokens = max_tokens
-
-    def create(self, *, system: str, messages: list[dict], tools: list[dict]) -> Any:
-        return self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=messages,
-            tools=tools,
-        )

@@ -24,13 +24,14 @@ import hashlib
 import json
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from ..analyst.analyst import Analyst
 from ..analyst.models import AnalysisReport, AnalystAction
 from ..analyst.scorecard import Scorecard, build_scorecard, grade
 from ..config import BacktestConfig
+from ..identity import canonical_symbol, canonical_utc_timestamp
 from ..signals.models import EventType, MarketFeatures
 from ..strategies.base import Signal, SignalAction, Strategy, hold
 from .data import DataSource
@@ -95,21 +96,7 @@ def _require_run_id(run_id: str) -> str:
 
 
 def _normalized_symbol(symbol: str) -> str:
-    return _normalized_text("symbol", symbol).upper()
-
-
-def _canonical_utc_timestamp(timestamp: datetime) -> str:
-    if (
-        not isinstance(timestamp, datetime)
-        or timestamp.tzinfo is None
-        or timestamp.utcoffset() is None
-    ):
-        raise ValueError("features.as_of must be timezone-aware")
-    return (
-        timestamp.astimezone(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    return canonical_symbol(symbol)
 
 
 def _decision_request_id(run_id: str, features: MarketFeatures) -> str:
@@ -117,7 +104,10 @@ def _decision_request_id(run_id: str, features: MarketFeatures) -> str:
         {
             "run_id": _require_run_id(run_id),
             "symbol": _normalized_symbol(features.symbol),
-            "timestamp": _canonical_utc_timestamp(features.as_of),
+            "timestamp": canonical_utc_timestamp(
+                features.as_of,
+                field="features.as_of",
+            ),
         },
         ensure_ascii=True,
         separators=(",", ":"),

@@ -28,6 +28,7 @@ from trading_assistant.backtest.llm_runner import LLMRunConfig
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import (
+    AnalysisReportRow,
     AuditEvent,
     Order,
     Proposal,
@@ -183,9 +184,16 @@ def test_shadow_request_identity_is_stable_per_persisted_daily_call(
 ):
     from trading_assistant import db
 
-    fixed_now = datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(db.models, "utcnow", lambda: fixed_now)
+    current_now = [datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)]
+    monkeypatch.setattr(db.models, "utcnow", lambda: current_now[0])
     svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": " V2 "}
+            )
+        }
+    )
     source = DataSource(
         {
             symbol: make_bars(300, seed=index)
@@ -203,6 +211,8 @@ def test_shadow_request_identity_is_stable_per_persisted_daily_call(
 
     first = CaptureFailurePlanning()
     second = CaptureFailurePlanning()
+    equivalent = CaptureFailurePlanning()
+    next_day = CaptureFailurePlanning()
     ShadowRunner(
         svc,
         first,
@@ -220,12 +230,45 @@ def test_shadow_request_identity_is_stable_per_persisted_daily_call(
 
     assert len(first.calls) == 2
     assert second.calls == first.calls
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": "v2"}
+            )
+        }
+    )
+    ShadowRunner(
+        svc,
+        equivalent,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    assert equivalent.calls == first.calls
+
+    current_now[0] += timedelta(days=1)
+    ShadowRunner(
+        svc,
+        next_day,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    assert [symbol for symbol, _request_id in next_day.calls] == [
+        symbol for symbol, _request_id in first.calls
+    ]
+    assert {
+        request_id for _symbol, request_id in next_day.calls
+    }.isdisjoint(
+        request_id for _symbol, request_id in first.calls
+    )
+
     assert len({request_id for _symbol, request_id in first.calls}) == 2
     for symbol, request_id in first.calls:
         material = json.dumps(
             {
-                "analyst_version": svc.config.analyst.version,
-                "scheduled_date": fixed_now.date().isoformat(),
+                "analyst_version": "v2",
+                "scheduled_date": "2026-07-27",
                 "symbol": symbol.upper(),
             },
             ensure_ascii=True,
@@ -241,6 +284,159 @@ def test_shadow_request_identity_is_stable_per_persisted_daily_call(
         )
         assert request_id == f"shadow:{digest}"
         assert len(request_id) <= 64
+
+
+def test_shadow_canonicalizes_identity_once_across_restart_and_persistence(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import db
+    from trading_assistant.analyst import shadow as shadow_module
+
+    fixed_now = datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(db.models, "utcnow", lambda: fixed_now)
+    candidates = [[{"symbol": " aapl "}], [{"symbol": "aApL"}]]
+    monkeypatch.setattr(
+        shadow_module.screener,
+        "screen_source",
+        lambda *_args, **_kwargs: candidates.pop(0),
+    )
+    svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": " V2 "}
+            )
+        }
+    )
+
+    class CaptureAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze_plan(
+            self,
+            features,
+            held_symbols=None,
+            news=None,
+            request_id=None,
+        ):
+            self.request_ids.append(request_id)
+            return _plan().model_copy(
+                update={"symbol": features.symbol, "as_of": features.as_of}
+            )
+
+    first_analyst = CaptureAnalyst()
+    first = ShadowRunner(
+        svc,
+        PlanningService(svc, first_analyst, _provider, Secrets()),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    plan_ids = first.run_once()
+
+    assert len(plan_ids) == 1
+    material = json.dumps(
+        {
+            "analyst_version": "v2",
+            "scheduled_date": "2026-07-27",
+            "symbol": "AAPL",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(material.encode("utf-8")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert first_analyst.request_ids == [f"shadow:{digest}"]
+    with svc.session_factory() as session:
+        plan_row = session.get(TradePlanRow, plan_ids[0])
+        report_row = session.execute(select(AnalysisReportRow)).scalar_one()
+        call = session.execute(select(ShadowCall)).scalar_one()
+        assert plan_row.symbol == "AAPL"
+        assert json.loads(plan_row.plan_json)["symbol"] == "AAPL"
+        assert report_row.symbol == "AAPL"
+        assert json.loads(report_row.report_json)["symbol"] == "AAPL"
+        assert report_row.analyst_version == "v2"
+        assert call.symbol == "AAPL"
+
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": "v2"}
+            )
+        }
+    )
+    restarted_analyst = CaptureAnalyst()
+    restarted = ShadowRunner(
+        svc,
+        PlanningService(svc, restarted_analyst, _provider, Secrets()),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    assert restarted.run_once() == []
+    assert restarted_analyst.request_ids == []
+
+
+@pytest.mark.parametrize(
+    ("symbol", "version"),
+    [
+        ("AAPL X", "v2"),
+        ("AAPL\nX", "v2"),
+        ("A" * 17, "v2"),
+        ("é", "v2"),
+        ("e\u0301", "v2"),
+        ("AAPL", "version two"),
+        ("AAPL", "v" * 17),
+        ("AAPL", "vérsion"),
+        ("AAPL", "ve\u0301rsion"),
+    ],
+)
+def test_shadow_rejects_invalid_identity_before_planning(
+    make_service,
+    monkeypatch,
+    symbol,
+    version,
+):
+    from trading_assistant.analyst import shadow as shadow_module
+
+    monkeypatch.setattr(
+        shadow_module.screener,
+        "screen_source",
+        lambda *_args, **_kwargs: [{"symbol": symbol}],
+    )
+    svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": version}
+            )
+        }
+    )
+
+    class NeverPlanning:
+        def analyze(self, *_args, **_kwargs):
+            raise AssertionError("planning must not run")
+
+    runner = ShadowRunner(
+        svc,
+        NeverPlanning(),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    with pytest.raises(ValueError):
+        runner.run_once()
 
 
 # ── D2 digest ───────────────────────────────────────────────────

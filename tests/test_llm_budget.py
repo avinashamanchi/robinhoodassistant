@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 
 from trading_assistant.config import ProviderPriceConfig, Secrets
 from trading_assistant.db.models import ProviderBudgetDay, ProviderReservation
@@ -309,6 +309,214 @@ def test_budgeted_backend_requires_explicit_request_id_before_store_or_delegate(
 
     assert counting_factory.calls == 0
     assert delegate.calls == []
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        None,
+        "",
+        " ",
+        "a" * 65,
+        "request id",
+        "request\nid",
+        "reque\u0301st",
+        "request-😀",
+    ],
+    ids=[
+        "non-string",
+        "empty",
+        "blank",
+        "too-long",
+        "internal-space",
+        "control",
+        "nfd-unicode",
+        "emoji",
+    ],
+)
+def test_budgeted_backend_rejects_noncanonical_request_id_before_work(
+    session_factory,
+    request_id,
+):
+    counting_factory = CountingSessionFactory(session_factory)
+    delegate = ScriptedBackend([])
+    estimator = Utf8ByteUpperBoundEstimator()
+    backend = BudgetedLLMBackend(
+        delegate,
+        _service(counting_factory),
+        provider="test",
+        category="analysis",
+        max_output_tokens=10,
+        estimator=estimator,
+    )
+
+    with pytest.raises(ValueError, match="request_id"):
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id=request_id,
+        )
+
+    assert counting_factory.calls == 0
+    assert delegate.calls == []
+
+
+def test_budgeted_backend_uses_one_canonical_id_for_delegate_and_reservation(
+    session_factory,
+):
+    delegate = ScriptedBackend([_response(1, 1)])
+    backend = BudgetedLLMBackend(
+        delegate,
+        _service(session_factory),
+        provider="test",
+        category="analysis",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+
+    backend.create(
+        system="s",
+        messages=[],
+        tools=[],
+        request_id="  request.canonical:one  ",
+    )
+
+    assert delegate.calls[0]["request_id"] == "request.canonical:one"
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.request_id == "request.canonical:one"
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        None,
+        "",
+        " ",
+        "a" * 65,
+        "request id",
+        "request\nid",
+        "reque\u0301st",
+        "request-😀",
+    ],
+    ids=[
+        "non-string",
+        "empty",
+        "blank",
+        "too-long",
+        "internal-space",
+        "control",
+        "nfd-unicode",
+        "emoji",
+    ],
+)
+def test_provider_budget_rejects_noncanonical_request_id_before_store(
+    session_factory,
+    request_id,
+):
+    counting_factory = CountingSessionFactory(session_factory)
+    service = _service(counting_factory)
+
+    with pytest.raises(ValueError, match="request_id"):
+        service.reserve(
+            provider="test",
+            category="analysis",
+            request_id=request_id,
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+    assert counting_factory.calls == 0
+
+
+def test_provider_budget_canonicalizes_equivalent_ids_but_charges_each_attempt(
+    session_factory,
+):
+    service = _service(session_factory)
+    first = service.reserve(
+        provider="test",
+        category="analysis",
+        request_id="  equivalent.request:id  ",
+        input_tokens=1,
+        output_tokens=1,
+    )
+    second = service.reserve(
+        provider="test",
+        category="analysis",
+        request_id="equivalent.request:id",
+        input_tokens=1,
+        output_tokens=1,
+    )
+
+    assert first.request_id == second.request_id == "equivalent.request:id"
+    assert first.reservation_id != second.reservation_id
+    with session_factory() as session:
+        reservations = session.scalars(
+            select(ProviderReservation).order_by(
+                ProviderReservation.reservation_id
+            )
+        ).all()
+        day = session.scalar(select(ProviderBudgetDay))
+    assert {row.request_id for row in reservations} == {
+        "equivalent.request:id"
+    }
+    assert day.calls_used == 2
+
+
+def test_provider_budget_accepts_64_but_rejects_65_character_request_id(
+    session_factory,
+):
+    service = _service(session_factory)
+    accepted = "r" * 64
+
+    reservation = service.reserve(
+        provider="test",
+        category="analysis",
+        request_id=accepted,
+        input_tokens=1,
+        output_tokens=1,
+    )
+    with pytest.raises(ValueError, match="request_id"):
+        service.reserve(
+            provider="test",
+            category="analysis",
+            request_id="r" * 65,
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+    assert reservation.request_id == accepted
+    assert service.status("test").calls_used == 1
+
+
+def test_provider_budget_reconciliation_rejects_noncanonical_stored_request_id(
+    session_factory,
+):
+    service = _service(session_factory)
+    reservation = service.reserve(
+        provider="test",
+        category="analysis",
+        request_id="canonical-stored-id",
+        input_tokens=1,
+        output_tokens=1,
+    )
+    with session_factory() as session:
+        session.execute(
+            text(
+                "UPDATE provider_reservations "
+                "SET request_id = ' noncanonical-stored-id ' "
+                "WHERE reservation_id = :reservation_id"
+            ),
+            {"reservation_id": reservation.reservation_id},
+        )
+        session.commit()
+
+    with pytest.raises(
+        ProviderBudgetUnavailable,
+        match="corrupt provider budget state",
+    ):
+        service.status("test")
 
 
 def test_mark_started_precedes_delegate_invocation(session_factory):

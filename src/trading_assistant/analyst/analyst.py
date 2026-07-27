@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from ..dependencies import RequiredDependencyUnavailable
+from ..identity import canonical_request_id
 from ..signals.models import MarketFeatures
 from .models import AnalysisReport
 
@@ -166,12 +167,6 @@ class Analyst:
         self.suppress_ranging = suppress_ranging
         self.max_attempts = max_attempts
 
-    @staticmethod
-    def _request_id(request_id: str | None) -> str:
-        if not isinstance(request_id, str) or not request_id.strip():
-            raise ValueError("analyst request_id must be non-empty")
-        return request_id.strip()
-
     def _prompt(self, features: MarketFeatures, held_symbols: list[str]) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
         # the analyst reasons over.
@@ -197,7 +192,7 @@ class Analyst:
         *,
         request_id: str,
     ) -> AnalysisReport:
-        budget_request_id = self._request_id(request_id)
+        budget_request_id = canonical_request_id(request_id)
         resp = self._create(
             system=SYSTEM_PREAMBLE,
             messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
@@ -241,7 +236,7 @@ class Analyst:
             user = user + "\n\n" + format_news_context(news)
 
         validation_error: ValueError | None = None
-        budget_request_id = self._request_id(request_id)
+        budget_request_id = canonical_request_id(request_id)
         for _ in range(self.max_attempts):
             prompt = user
             if validation_error is not None:

@@ -134,6 +134,73 @@ def test_agent_uses_one_normalized_request_id_for_provider_turns_and_audit(
     assert audit.request_id == "http-request-123"
 
 
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        None,
+        "",
+        " ",
+        "a" * 65,
+        "request id",
+        "request\nid",
+        "reque\u0301st",
+        "request-😀",
+    ],
+    ids=[
+        "non-string",
+        "empty",
+        "blank",
+        "too-long",
+        "internal-space",
+        "control",
+        "nfd-unicode",
+        "emoji",
+    ],
+)
+def test_agent_rejects_noncanonical_request_id_before_backend_or_audit(
+    make_service,
+    request_id,
+):
+    agent, svc = _agent(
+        make_service,
+        [_resp("end_turn", [_text("must not run")])],
+    )
+
+    with pytest.raises(ValueError, match="request_id"):
+        agent.chat(
+            "hello",
+            actor="operator:test",
+            reason="reject invalid request identity",
+            request_id=request_id,
+        )
+
+    assert agent.backend.calls == 0
+    with svc.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+
+
+def test_agent_accepts_full_safe_request_id_character_set_at_64_characters(
+    make_service,
+):
+    request_id = "AZaz09._:-" + ("r" * 54)
+    agent, _svc = _agent(
+        make_service,
+        [_resp("end_turn", [_text("ok")])],
+    )
+
+    _chat_result = agent.chat(
+        "hello",
+        actor="operator:test",
+        reason="accept maximum request identity",
+        request_id=request_id,
+    )
+
+    assert len(request_id) == 64
+    assert agent.backend.request_ids == [request_id]
+
+
 def test_agent_proposes_order_but_does_not_execute(make_service):
     agent, svc = _agent(
         make_service,

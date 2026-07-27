@@ -22,6 +22,7 @@ from ..assets import AssetClass
 from ..config import live_trading_enabled
 from ..db.models import AuditEvent, TradePlanRow, utcnow
 from ..dependencies import RequiredDependencyUnavailable
+from ..identity import canonical_request_id
 from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
@@ -64,8 +65,8 @@ class PlanningService:
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
-        request_id = request_id.strip()
-        if not actor or not reason or not request_id:
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
             raise ValueError(
                 "plan analysis actor, reason, and request_id must be non-empty"
             )
@@ -146,8 +147,8 @@ class PlanningService:
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
-        request_id = request_id.strip()
-        if not actor or not reason or not request_id:
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
             raise ValueError(
                 "approval actor, reason, and request_id must be non-empty"
             )
@@ -384,8 +385,8 @@ class PlanningService:
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
-        request_id = request_id.strip()
-        if not actor or not reason or not request_id:
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
             raise ValueError(
                 "plan cancellation actor, reason, and request_id "
                 "must be non-empty"

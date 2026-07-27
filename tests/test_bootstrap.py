@@ -913,41 +913,53 @@ def test_validation_analyst_enabled_wraps_backtest_exactly_once(
     assert raw_calls == [enabled_config.llm.provider]
 
 
-def test_validation_run_passes_deterministic_bounded_identity(
-    app_config,
-    session_factory,
+def _capture_validation_runs(
+    *,
     monkeypatch,
+    session_factory,
+    configs,
+    timelines,
+    argvs,
+    run_configs=None,
 ):
-    from datetime import datetime, timezone
-
     from trading_assistant import bootstrap
     import trading_assistant.validate_analyst as validation
 
-    timeline = [
-        datetime(2022, 1, 1, tzinfo=timezone.utc),
-        datetime(2022, 12, 31, tzinfo=timezone.utc),
-    ]
+    config_iter = iter(configs)
+    timeline_iter = iter(timelines)
 
     class StubSource:
+        def __init__(self, timeline):
+            self._timeline = timeline
+
         def timeline(self, _symbols):
-            return timeline
+            return self._timeline
 
     class StubGuard:
-        def __init__(self, _timeline, *, holdout_months):
+        def __init__(self, timeline, *, holdout_months):
             assert holdout_months == 12
+            self._timeline = timeline
 
         def split(self, _timeline):
-            return [], timeline
+            return [], self._timeline
 
-    secrets = Secrets(app_api_token="validation-run-secret")
     runtime = SimpleNamespace(session_factory=session_factory)
-    provider_budget = object()
-    analyst = object()
-    captured_run_ids = []
-    monkeypatch.setattr(validation, "load_config", lambda _path: app_config)
-    monkeypatch.setattr(validation, "Secrets", lambda: secrets)
+    monkeypatch.setattr(
+        validation,
+        "load_config",
+        lambda _path: next(config_iter),
+    )
+    monkeypatch.setattr(
+        validation,
+        "Secrets",
+        lambda: Secrets(app_api_token="validation-run-secret"),
+    )
     monkeypatch.setattr(validation, "load_parquet", lambda _path: object())
-    monkeypatch.setattr(validation, "DataSource", lambda _frames: StubSource())
+    monkeypatch.setattr(
+        validation,
+        "DataSource",
+        lambda _frames: StubSource(next(timeline_iter)),
+    )
     monkeypatch.setattr(validation, "HoldoutGuard", StubGuard)
     monkeypatch.setattr(
         validation,
@@ -962,51 +974,215 @@ def test_validation_run_passes_deterministic_bounded_identity(
     monkeypatch.setattr(
         bootstrap,
         "build_provider_budget_service",
-        lambda *_args, **_kwargs: provider_budget,
+        lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
         validation,
         "_build_analyst",
-        lambda *_args, **_kwargs: analyst,
+        lambda *_args, **_kwargs: object(),
     )
+    if run_configs is not None:
+        run_config_iter = iter(run_configs)
+        monkeypatch.setattr(
+            validation,
+            "LLMRunConfig",
+            lambda **_kwargs: next(run_config_iter),
+        )
 
-    def accuracy(*_args, **kwargs):
-        captured_run_ids.append(kwargs["run_id"])
+    captured = []
+
+    def accuracy(_source, symbols, _analyst, run_config, **kwargs):
+        captured.append(
+            {
+                "symbols": symbols,
+                "run_config": run_config,
+                **kwargs,
+            }
+        )
         return {"verdict": "validation complete"}
 
     monkeypatch.setattr(validation, "analyst_accuracy", accuracy)
+    for argv in argvs:
+        assert validation.run(argv) == 0
+    return captured
 
-    assert validation.run(["--symbols", "AAPL", "--yes"]) == 0
-    assert validation.run(["--symbols", "AAPL", "--yes"]) == 0
-    assert len(captured_run_ids) == 2
-    assert captured_run_ids[0] == captured_run_ids[1]
-    assert captured_run_ids[0].startswith("validation:")
-    assert len(captured_run_ids[0]) <= 64
+
+def test_validation_run_canonicalizes_equivalent_runtime_identity(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    first_config = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"version": " V2 "}
+            )
+        }
+    )
+    equivalent_config = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"version": "v2"}
+            )
+        }
+    )
+    pacific = timezone(-timedelta(hours=7))
+    timelines = [
+        [
+            datetime(2022, 1, 1, 1, 2, 3, 456789, tzinfo=pacific),
+            datetime(2022, 12, 31, 1, 2, 3, 456789, tzinfo=pacific),
+        ],
+        [
+            datetime(2022, 1, 1, 8, 2, 3, 456789, tzinfo=timezone.utc),
+            datetime(2022, 12, 31, 8, 2, 3, 456789, tzinfo=timezone.utc),
+        ],
+    ]
+
+    captured = _capture_validation_runs(
+        monkeypatch=monkeypatch,
+        session_factory=session_factory,
+        configs=[first_config, equivalent_config],
+        timelines=timelines,
+        argvs=[
+            ["--symbols", " aapl , msft ", "--yes"],
+            ["--symbols", "MSFT,AAPL", "--yes"],
+        ],
+    )
+
+    assert captured[0]["run_id"] == captured[1]["run_id"]
+    assert captured[0]["run_id"].startswith("validation:")
+    assert len(captured[0]["run_id"]) <= 64
+    assert captured[0]["symbols"] == captured[1]["symbols"] == [
+        "AAPL",
+        "MSFT",
+    ]
+    assert captured[0]["start"] == captured[1]["start"]
+    assert captured[0]["end"] == captured[1]["end"]
+    assert captured[0]["start"].tzinfo == timezone.utc
+    assert captured[0]["end"].tzinfo == timezone.utc
+
+
+def test_validation_run_identity_distinguishes_logical_runtime_changes(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    baseline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
+    ]
+    changed_time = [baseline[0], baseline[1] + timedelta(microseconds=1)]
+    changed_version = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"version": "v3"}
+            )
+        }
+    )
+    captured = _capture_validation_runs(
+        monkeypatch=monkeypatch,
+        session_factory=session_factory,
+        configs=[
+            app_config,
+            app_config,
+            changed_version,
+            app_config,
+        ],
+        timelines=[baseline, baseline, baseline, changed_time],
+        argvs=[
+            ["--symbols", "AAPL", "--yes"],
+            ["--symbols", "MSFT", "--yes"],
+            ["--symbols", "AAPL", "--yes"],
+            ["--symbols", "AAPL", "--yes"],
+        ],
+    )
+
+    identities = [item["run_id"] for item in captured]
+    assert len(set(identities)) == len(identities)
+
+
+def test_validation_run_rejects_naive_holdout_before_runtime_construction(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    from datetime import datetime
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _capture_validation_runs(
+            monkeypatch=monkeypatch,
+            session_factory=session_factory,
+            configs=[app_config],
+            timelines=[
+                [
+                    datetime(2022, 1, 1),
+                    datetime(2022, 12, 31),
+                ]
+            ],
+            argvs=[["--symbols", "AAPL", "--yes"]],
+        )
+
+
+@pytest.mark.parametrize(
+    ("symbols", "version"),
+    [
+        ("AAPL X", "v2"),
+        ("AAPL\nX", "v2"),
+        ("A" * 17, "v2"),
+        ("é", "v2"),
+        ("e\u0301", "v2"),
+        ("AAPL", "version two"),
+        ("AAPL", "v" * 17),
+        ("AAPL", "vérsion"),
+        ("AAPL", "ve\u0301rsion"),
+    ],
+)
+def test_validation_run_rejects_invalid_canonical_provenance(
+    app_config,
+    session_factory,
+    monkeypatch,
+    symbols,
+    version,
+):
+    from datetime import datetime, timezone
+
+    configured = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"version": version}
+            )
+        }
+    )
+    timeline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
+    ]
+
+    with pytest.raises(ValueError):
+        _capture_validation_runs(
+            monkeypatch=monkeypatch,
+            session_factory=session_factory,
+            configs=[configured],
+            timelines=[timeline],
+            argvs=[["--symbols", symbols, "--yes"]],
+        )
 
 
 def test_validation_run_identity_uses_actual_provider_and_selected_model(
     app_config,
+    session_factory,
+    monkeypatch,
 ):
     from datetime import datetime, timezone
 
-    import trading_assistant.validate_analyst as validation
-    from trading_assistant.backtest.llm_runner import LLMRunConfig
-
-    start = datetime(2022, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2022, 12, 31, tzinfo=timezone.utc)
-    run_config = LLMRunConfig(max_llm_calls=25, horizon_bars=7)
-
-    def identity(config, selected_run_config=run_config):
-        return validation._validation_run_id(
-            config=config,
-            symbols=["MSFT", "AAPL"],
-            start=start,
-            end=end,
-            run_config=selected_run_config,
-            analyst_version="v2",
-        )
-
-    baseline = identity(app_config)
+    timeline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
+    ]
     changed_actual_model = app_config.model_copy(
         update={
             "llm": app_config.llm.model_copy(
@@ -1028,42 +1204,56 @@ def test_validation_run_identity_uses_actual_provider_and_selected_model(
             )
         }
     )
+    captured = _capture_validation_runs(
+        monkeypatch=monkeypatch,
+        session_factory=session_factory,
+        configs=[
+            app_config,
+            changed_actual_model,
+            changed_provider,
+            changed_inactive_model,
+        ],
+        timelines=[timeline] * 4,
+        argvs=[["--symbols", "AAPL,MSFT", "--yes"]] * 4,
+    )
 
-    assert identity(changed_actual_model) != baseline
-    assert identity(changed_provider) != baseline
-    assert identity(changed_inactive_model) == baseline
+    baseline = captured[0]["run_id"]
+    assert captured[1]["run_id"] != baseline
+    assert captured[2]["run_id"] != baseline
+    assert captured[3]["run_id"] == baseline
 
 
 def test_validation_run_identity_ignores_unused_model_placeholders(
     app_config,
+    session_factory,
+    monkeypatch,
 ):
     from datetime import datetime, timezone
 
-    import trading_assistant.validate_analyst as validation
     from trading_assistant.backtest.llm_runner import LLMRunConfig
 
-    common = {
-        "config": app_config,
-        "symbols": ["AAPL", "MSFT"],
-        "start": datetime(2022, 1, 1, tzinfo=timezone.utc),
-        "end": datetime(2022, 12, 31, tzinfo=timezone.utc),
-        "analyst_version": "v2",
-    }
-    baseline = validation._validation_run_id(
-        **common,
-        run_config=LLMRunConfig(max_llm_calls=25, horizon_bars=7),
-    )
-    placeholders_changed = validation._validation_run_id(
-        **common,
-        run_config=LLMRunConfig(
-            max_llm_calls=25,
-            horizon_bars=7,
-            cheap_model="unused-cheap-placeholder",
-            full_model="unused-full-placeholder",
-        ),
+    timeline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
+    ]
+    captured = _capture_validation_runs(
+        monkeypatch=monkeypatch,
+        session_factory=session_factory,
+        configs=[app_config, app_config],
+        timelines=[timeline, timeline],
+        argvs=[["--symbols", "AAPL,MSFT", "--yes"]] * 2,
+        run_configs=[
+            LLMRunConfig(max_llm_calls=25, horizon_bars=7),
+            LLMRunConfig(
+                max_llm_calls=25,
+                horizon_bars=7,
+                cheap_model="unused-cheap-placeholder",
+                full_model="unused-full-placeholder",
+            ),
+        ],
     )
 
-    assert placeholders_changed == baseline
+    assert captured[0]["run_id"] == captured[1]["run_id"]
 
 
 @pytest.mark.parametrize(

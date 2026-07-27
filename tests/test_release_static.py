@@ -105,6 +105,12 @@ def _static_fixture(tmp_path: Path) -> Path:
             "broker submission",
         ),
         (
+            "src/trading_assistant/escape.py",
+            "from trading_assistant.llm.anthropic_backend import AnthropicBackend\n"
+            "AnthropicBackend('key', 'model', 10)\n",
+            "raw LLM backend construction",
+        ),
+        (
             "src/trading_assistant/app/static/index.html",
             "<input onfocus=\"steal()\">",
             "inline event handler",

@@ -154,10 +154,101 @@ def test_planning_passes_boundary_request_id_to_each_structured_attempt(
         "AAPL",
         actor="operator:test",
         reason="propagate request identity",
-        request_id="planning-budget-request",
+        request_id="  planning-budget-request  ",
     )
 
     assert analyst.request_ids == ["planning-budget-request"]
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        None,
+        "",
+        " ",
+        "a" * 65,
+        "request id",
+        "request\nid",
+        "reque\u0301st",
+        "request-😀",
+    ],
+    ids=[
+        "non-string",
+        "empty",
+        "blank",
+        "too-long",
+        "internal-space",
+        "control",
+        "nfd-unicode",
+        "emoji",
+    ],
+)
+def test_planning_rejects_noncanonical_request_id_before_feature_or_analyst(
+    make_service,
+    request_id,
+):
+    feature_calls: list[str] = []
+    analyst = _StubAnalyst(_plan())
+    planning = PlanningService(
+        make_service(),
+        analyst,
+        lambda symbol: feature_calls.append(symbol),
+        Secrets(),
+    )
+
+    with pytest.raises(ValueError, match="request_id"):
+        planning.analyze(
+            "AAPL",
+            actor="operator:test",
+            reason="reject invalid planning identity",
+            request_id=request_id,
+        )
+
+    assert feature_calls == []
+    assert analyst.request_ids == []
+
+
+@pytest.mark.parametrize("method", ["approve_plan", "cancel_plan"])
+@pytest.mark.parametrize(
+    "request_id",
+    ["a" * 65, "request id", "request\nid", "reque\u0301st"],
+    ids=["too-long", "internal-space", "control", "nfd-unicode"],
+)
+def test_plan_mutation_boundaries_reject_noncanonical_request_id_before_lookup(
+    make_service,
+    method,
+    request_id,
+):
+    planning = _planning(make_service())
+
+    with pytest.raises(ValueError, match="request_id"):
+        getattr(planning, method)(
+            999_999,
+            actor="operator:test",
+            reason="reject invalid plan mutation identity",
+            request_id=request_id,
+        )
+
+
+def test_planning_accepts_64_character_request_id(make_service):
+    request_id = "planning:" + ("p" * 55)
+    analyst = _StubAnalyst(_plan())
+    planning = PlanningService(
+        make_service(),
+        analyst,
+        _provider,
+        Secrets(),
+    )
+
+    planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="accept maximum planning identity",
+        request_id=request_id,
+    )
+
+    assert len(request_id) == 64
+    assert analyst.request_ids == [request_id]
 
 
 def test_planning_repair_attempts_share_parent_id_but_reserve_separately(

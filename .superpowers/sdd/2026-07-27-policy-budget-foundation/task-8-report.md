@@ -175,3 +175,160 @@ Provenance:
 ## Concerns
 
 None.
+
+## Fix Round 1
+
+### Status
+
+Addressed every finding in `task-8-review-1.md` with RED-first tests. The
+follow-up commit subject is:
+
+```text
+fix(llm): canonicalize durable request identity
+```
+
+### Canonical identity contracts
+
+- Added one shared `canonical_request_id()` boundary. It requires a string,
+  NFC-normalizes, trims surrounding whitespace, rejects blank values, enforces
+  the durable 64-character maximum, and admits only
+  `A-Z a-z 0-9 . _ : -`. It never truncates or hashes caller-supplied IDs.
+- Agent, Planning, Analyst, `BudgetedLLMBackend`, and
+  `ProviderBudgetService` all use that boundary before delegate or durable
+  work. The canonical value is reused for audit, provider delegation,
+  reservation, and reconciliation.
+- Stored provider reservations are required to already equal their canonical
+  form. Corrupt noncanonical rows fail closed during reconciliation/status
+  validation.
+- Equivalent canonical request IDs still consume one distinct reservation and
+  one daily call for every provider attempt. Canonicalization does not
+  deduplicate or weaken accounting.
+- Shadow symbols are NFC-normalized, trimmed, uppercased, limited to 16
+  characters, and restricted to `A-Z 0-9 . _ : / -`. Analyst versions are
+  NFC-normalized, trimmed, lowercased, limited to 16 characters, and restricted
+  to `a-z 0-9 . _ : -`.
+- Shadow canonicalizes its configured version and each screened symbol once,
+  then reuses those exact values for completed lookup, request hash material,
+  report/version persistence, shadow calls, and comparisons.
+- The Task 5 aware-datetime-to-fixed-microsecond-UTC-`Z` implementation moved
+  to the shared identity module. Backtest decision IDs still use it unchanged;
+  validation now rejects naive holdout timestamps and passes canonical UTC
+  datetimes downstream.
+- Validation canonicalizes and deduplicates symbols, canonicalizes the analyst
+  version, and derives one stable bounded ID for equivalent instants and
+  normalized inputs. Provider, selected model, symbol, version, or timestamp
+  changes remain identity-significant.
+
+### Runtime construction audit
+
+- Removed the unreachable local `AnthropicBackend` from `app/agent.py`.
+- Added an AST release check that rejects Anthropic, Gemini, or Groq backend
+  construction anywhere in runtime code except `llm/factory.py`.
+- Production search confirms the three raw constructor calls remain confined
+  to that factory.
+
+### Strict TDD evidence
+
+RED was captured before production changes with:
+
+```bash
+.venv/bin/pytest -q \
+  tests/test_agent.py tests/test_analyst.py tests/test_planning.py \
+  tests/test_llm_budget.py tests/test_launch_features.py \
+  tests/test_bootstrap.py tests/test_release_static.py
+```
+
+The command exited `1` with 63 intended failures. They showed noncanonical IDs
+reaching all five boundaries, shadow version/symbol drift across restart and
+persistence, raw/naive validation timestamps, and missing static enforcement.
+
+Final focused verification:
+
+```bash
+.venv/bin/pytest -o addopts='' -q \
+  tests/test_agent.py tests/test_analyst.py tests/test_analyst_v2.py \
+  tests/test_planning.py tests/test_launch_features.py \
+  tests/test_bootstrap.py tests/test_llm_runner.py \
+  tests/test_backtest_engine.py tests/test_backtest_evaluate.py \
+  tests/test_llm_budget.py tests/test_llm_budget_review.py \
+  tests/test_llm_budget_review_2.py tests/test_llm_budget_review_3.py \
+  tests/test_llm_backends.py tests/test_factory.py \
+  tests/test_release_static.py tests/test_route_policy.py \
+  tests/test_durable_limits.py
+```
+
+Result:
+
+```text
+562 passed, 1 warning in 96.15s
+```
+
+Full suite:
+
+```bash
+.venv/bin/pytest -o addopts='' -q
+```
+
+Result:
+
+```text
+2020 passed, 1 skipped, 1 warning in 268.52s
+```
+
+The warning is the pre-existing `websockets.legacy` deprecation warning.
+
+Additional final checks all exited `0`:
+
+```bash
+.venv/bin/python scripts/check_release_safety.py
+.venv/bin/python -m compileall -q src tests scripts
+git diff --check
+```
+
+### Changed files in Fix Round 1
+
+Production and release checks:
+
+- `scripts/check_release_safety.py`
+- `src/trading_assistant/identity.py`
+- `src/trading_assistant/app/agent.py`
+- `src/trading_assistant/analyst/analyst.py`
+- `src/trading_assistant/analyst/planning.py`
+- `src/trading_assistant/analyst/shadow.py`
+- `src/trading_assistant/backtest/llm_runner.py`
+- `src/trading_assistant/llm/base.py`
+- `src/trading_assistant/llm/budget.py`
+- `src/trading_assistant/validate_analyst.py`
+
+Tests:
+
+- `tests/test_agent.py`
+- `tests/test_analyst.py`
+- `tests/test_bootstrap.py`
+- `tests/test_launch_features.py`
+- `tests/test_llm_budget.py`
+- `tests/test_llm_budget_review_2.py`
+- `tests/test_planning.py`
+- `tests/test_release_static.py`
+
+### Self-review
+
+- Request IDs are canonical and bounded before every relevant delegate/store
+  boundary, and lower layers never manufacture replacement IDs.
+- Multi-turn chat, tool turns, structured repair, planning repair, spot-check,
+  and backtest attempts retain one parent identity while provider attempts are
+  reserved and reconciled independently.
+- Shadow and validation IDs are stable across equivalent normalized input and
+  restart, non-secret, bounded, and distinct for logical symbol/version/day/time
+  changes.
+- The Task 5 response-cache still hashes the exact prompt-visible payload and
+  still deliberately excludes only `recent_bars`; that function was not
+  changed.
+- Task 6/7 route-policy and durable-limit regressions are included in the
+  focused verification.
+- No Task 9 behavior was implemented. No provider, network, live broker,
+  notification, order, or daemon action was invoked.
+
+### Concerns
+
+None.

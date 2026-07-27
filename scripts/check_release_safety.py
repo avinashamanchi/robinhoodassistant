@@ -149,6 +149,54 @@ def _check_no_runtime_create_all(root: Path) -> None:
         _fail("runtime create_all calls: " + ", ".join(offenders))
 
 
+def _check_llm_backend_construction(root: Path) -> None:
+    runtime = root / "src" / "trading_assistant"
+    allowed = "src/trading_assistant/llm/factory.py"
+    backend_classes = {
+        "AnthropicBackend",
+        "GeminiBackend",
+        "GroqBackend",
+    }
+    offenders: list[str] = []
+    for path in runtime.rglob("*.py"):
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        aliases = _call_aliases(
+            tree,
+            backend_classes,
+            dynamic_getattr=False,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            direct = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in backend_classes
+            )
+            aliased = (
+                isinstance(node.func, ast.Name)
+                and (
+                    node.func.id in backend_classes
+                    or node.func.id in aliases
+                )
+            )
+            via_getattr = _getattr_call(
+                node.func,
+                backend_classes,
+                dynamic=False,
+            )
+            if (
+                (direct or aliased or via_getattr)
+                and relative != allowed
+            ):
+                offenders.append(f"{relative}:{node.lineno}")
+    if offenders:
+        _fail(
+            "raw LLM backend construction outside factory: "
+            + ", ".join(offenders)
+        )
+
+
 def _check_submission_paths(root: Path) -> None:
     runtime = root / "src" / "trading_assistant"
     allowed = {
@@ -279,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     checks = (
         _check_config,
         _check_no_runtime_create_all,
+        _check_llm_backend_construction,
         _check_submission_paths,
         _check_browser_sources,
         _check_no_unofficial_robinhood_dependency,

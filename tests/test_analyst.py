@@ -210,8 +210,28 @@ def test_analyst_requires_explicit_request_id_keyword(method):
 @pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
 @pytest.mark.parametrize(
     "request_id",
-    [None, "", " ", "\t"],
-    ids=["none", "empty", "space", "tab"],
+    [
+        None,
+        "",
+        " ",
+        "\t",
+        "a" * 65,
+        "request id",
+        "request\nid",
+        "reque\u0301st",
+        "request-😀",
+    ],
+    ids=[
+        "none",
+        "empty",
+        "space",
+        "tab",
+        "too-long",
+        "internal-space",
+        "control",
+        "nfd-unicode",
+        "emoji",
+    ],
 )
 def test_analyst_rejects_missing_request_id_before_backend(
     method,
@@ -240,3 +260,15 @@ def test_analyst_rejects_missing_request_id_before_backend(
         getattr(analyst, method)(_feat(), request_id=request_id)
 
     assert backend.calls == 0
+
+
+def test_analyst_accepts_64_character_request_id():
+    request_id = "analysis:" + ("a" * 55)
+    backend = _backend(_VALID)
+
+    Analyst(backend, max_attempts=2).analyze(
+        _feat(),
+        request_id=request_id,
+    )
+
+    assert len(request_id) == 64
