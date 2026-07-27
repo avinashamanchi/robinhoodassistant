@@ -422,6 +422,48 @@ def test_release_static_gate_rejects_fix_round_two_bypasses(
     assert expected in completed.stderr
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from trading_assistant.llm import groq_backend as provider\n"
+            "vars(provider)['GroqBackend']()\n",
+            "raw LLM backend module import outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "from .llm import gemini_backend as provider\n"
+            "vars(provider)['GeminiBackend']()\n",
+            "raw LLM backend module import outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_parent_provider_module_imports(
+    tmp_path,
+    source,
+    expected,
+):
+    root = _static_fixture(tmp_path)
+    target = root / "src" / "trading_assistant" / "unsafe_backend.py"
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
 @pytest.mark.parametrize("route_path", ("/covered/", "//covered"))
 def test_release_static_gate_accepts_exact_noncanonical_route_paths(
     tmp_path,

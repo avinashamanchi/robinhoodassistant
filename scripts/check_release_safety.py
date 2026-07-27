@@ -478,6 +478,17 @@ def _is_llm_backend_module(module: str | None) -> bool:
     )
 
 
+def _imports_llm_backend_from_parent(node: ast.ImportFrom) -> bool:
+    is_llm_parent = (
+        node.module == "trading_assistant.llm"
+        or (node.level > 0 and node.module == "llm")
+    )
+    return is_llm_parent and any(
+        imported.name in _LLM_BACKEND_MODULES
+        for imported in node.names
+    )
+
+
 def _global_backend_lookup(node: ast.AST) -> bool:
     if (
         not isinstance(node, ast.Call)
@@ -522,7 +533,10 @@ def _check_llm_construction_paths(root: Path) -> None:
                 )
             ) or (
                 isinstance(node, ast.ImportFrom)
-                and _is_llm_backend_module(node.module)
+                and (
+                    _is_llm_backend_module(node.module)
+                    or _imports_llm_backend_from_parent(node)
+                )
             )
             if imported_module:
                 module_imports.append(location)
