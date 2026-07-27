@@ -24,6 +24,7 @@ class AnthropicBackend:
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str = "",
     ) -> Any:
         kwargs: dict[str, Any] = dict(
             model=self._model,

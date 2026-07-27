@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading_assistant.llm.base import to_gemini_contents, to_openai
+from trading_assistant.llm.base import from_openai, to_gemini_contents, to_openai
+from trading_assistant.llm.anthropic_backend import AnthropicBackend
+from trading_assistant.llm.gemini_backend import GeminiBackend
 from trading_assistant.llm.gemini_backend import from_gemini, _sanitize_schema
 from trading_assistant.llm.groq_backend import GroqBackend
 
@@ -99,6 +101,7 @@ def test_groq_recovers_malformed_tool_call():
     assert out.stop_reason == "tool_use"
     assert out.content[0].name == "propose_order"
     assert out.content[0].input == {"order_type": "market", "qty": "1", "side": "buy", "ticker": "AAPL"}
+    assert out.usage is None
 
 
 def test_groq_unrecoverable_error_propagates():
@@ -116,6 +119,26 @@ def test_groq_text_normalized():
     out = _groq(resp).create(system="s", messages=[{"role": "user", "content": "hi"}], tools=[])
     assert out.stop_reason == "end_turn"
     assert out.content[0].type == "text" and out.content[0].text == "hello"
+
+
+def test_groq_accepts_request_id_without_sending_it_to_sdk():
+    resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content="hello", tool_calls=None,
+        ))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        model="llama",
+    )
+    backend = _groq(resp)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-groq",
+    )
+
+    assert "request_id" not in backend._client.chat.completions.last
 
 
 # ── Gemini translation ──────────────────────────────────────────
@@ -140,6 +163,22 @@ def test_from_gemini_text():
     )
     out = from_gemini(resp)
     assert out.stop_reason == "end_turn" and out.content[0].text == "hi there"
+    assert out.usage is None
+
+
+def test_from_openai_preserves_missing_usage():
+    resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content="hello",
+            tool_calls=None,
+        ))],
+        usage=None,
+        model="llama",
+    )
+
+    out = from_openai(resp)
+
+    assert out.usage is None
 
 
 def test_to_gemini_contents_maps_tool_result_name():
@@ -162,6 +201,57 @@ def test_sanitize_schema_collapses_union():
     schema = {"type": "object", "properties": {"note": {"type": ["string", "null"]}}}
     out = _sanitize_schema(schema)
     assert out["properties"]["note"]["type"] == "string"
+
+
+def test_gemini_accepts_request_id_without_sending_it_to_sdk():
+    class Models:
+        def __init__(self):
+            self.last = None
+
+        def generate_content(self, **kwargs):
+            self.last = kwargs
+            return SimpleNamespace(
+                candidates=[],
+                usage_metadata=None,
+                model_version="gemini",
+            )
+
+    client = SimpleNamespace(models=Models())
+    backend = GeminiBackend("key", "model", client=client)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-gemini",
+    )
+
+    assert "request_id" not in client.models.last
+
+
+def test_anthropic_accepts_request_id_without_sending_it_to_sdk(monkeypatch):
+    import anthropic
+
+    class Messages:
+        def __init__(self):
+            self.last = None
+
+        def create(self, **kwargs):
+            self.last = kwargs
+            return SimpleNamespace(content=[], usage=None)
+
+    client = SimpleNamespace(messages=Messages())
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    backend = AnthropicBackend("key", "model", 100)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-anthropic",
+    )
+
+    assert "request_id" not in client.messages.last
 
 
 # ── explicit provider selection ────────────────────────────────

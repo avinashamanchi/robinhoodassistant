@@ -51,9 +51,15 @@ def from_gemini(resp: Any) -> LLMResponse:
     return LLMResponse(
         content=blocks,
         stop_reason=stop,
-        usage=Usage(
-            input_tokens=getattr(meta, "prompt_token_count", 0) or 0,
-            output_tokens=getattr(meta, "candidates_token_count", 0) or 0,
+        usage=(
+            Usage(
+                input_tokens=getattr(meta, "prompt_token_count", 0) or 0,
+                output_tokens=(
+                    getattr(meta, "candidates_token_count", 0) or 0
+                ),
+            )
+            if meta is not None
+            else None
         ),
         model=getattr(resp, "model_version", ""),
     )
@@ -90,6 +96,7 @@ class GeminiBackend:
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str = "",
     ) -> LLMResponse:
         from google.genai import types
 

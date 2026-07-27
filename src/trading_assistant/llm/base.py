@@ -15,6 +15,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .budget import (
+    ProviderBudgetService,
+    ProviderInputEstimator,
+)
+
 
 # ── normalized response (what the agent/analyst consume) ────────
 @dataclass
@@ -41,8 +46,102 @@ class Usage:
 class LLMResponse:
     content: list = field(default_factory=list)
     stop_reason: str = "end_turn"
-    usage: Usage = field(default_factory=Usage)
+    usage: Usage | None = field(default_factory=Usage)
     model: str = ""
+
+
+class BudgetedLLMBackend:
+    """Reserve and settle durable provider budget around one raw attempt."""
+
+    def __init__(
+        self,
+        delegate,
+        budgets: ProviderBudgetService,
+        *,
+        provider: str,
+        category: str,
+        max_output_tokens: int,
+        estimator: ProviderInputEstimator | None = None,
+    ) -> None:
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("provider must be non-empty")
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("category must be non-empty")
+        if (
+            not isinstance(max_output_tokens, int)
+            or isinstance(max_output_tokens, bool)
+            or max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+        if estimator is None:
+            from .factory import resolve_input_estimator
+
+            estimator = resolve_input_estimator(provider)
+        self.delegate = delegate
+        self.budgets = budgets
+        self.provider = provider
+        self.category = category
+        self.max_output_tokens = max_output_tokens
+        self.estimator = estimator
+
+    def create(
+        self,
+        *,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str | None = None,
+        request_id: str = "",
+    ):
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("budgeted LLM calls require request_id")
+        input_reservation = self.estimator.estimate_upper_bound(
+            system=system,
+            messages=messages,
+            tools=tools,
+        )
+        reservation = self.budgets.reserve(
+            provider=self.provider,
+            category=self.category,
+            request_id=request_id,
+            input_tokens=input_reservation,
+            output_tokens=self.max_output_tokens,
+        )
+        self.budgets.mark_started(reservation.reservation_id)
+        try:
+            response = self.delegate.create(
+                system=system,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                request_id=request_id,
+            )
+        except Exception:
+            self.budgets.mark_unknown(reservation.reservation_id)
+            raise
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            self.budgets.mark_unknown(reservation.reservation_id)
+            return response
+        try:
+            input_tokens = int(
+                getattr(usage, "input_tokens", 0) or 0
+            )
+            output_tokens = int(
+                getattr(usage, "output_tokens", 0) or 0
+            )
+            if input_tokens < 0 or output_tokens < 0:
+                raise ValueError("provider usage must be non-negative")
+        except (TypeError, ValueError, OverflowError):
+            self.budgets.mark_unknown(reservation.reservation_id)
+            return response
+        self.budgets.settle(
+            reservation.reservation_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        return response
 
 
 # ── OpenAI / Groq translation ───────────────────────────────────
@@ -112,13 +211,21 @@ def from_openai(resp: Any) -> LLMResponse:
     else:
         blocks.append(TextBlock(text=msg.content or ""))
         stop = "end_turn"
-    usage = getattr(resp, "usage", None)
+    provider_usage = getattr(resp, "usage", None)
     return LLMResponse(
         content=blocks,
         stop_reason=stop,
-        usage=Usage(
-            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        usage=(
+            Usage(
+                input_tokens=(
+                    getattr(provider_usage, "prompt_tokens", 0) or 0
+                ),
+                output_tokens=(
+                    getattr(provider_usage, "completion_tokens", 0) or 0
+                ),
+            )
+            if provider_usage is not None
+            else None
         ),
         model=getattr(resp, "model", ""),
     )

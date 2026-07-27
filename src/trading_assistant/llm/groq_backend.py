@@ -53,6 +53,7 @@ def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
     return LLMResponse(
         content=[ToolUseBlock(id="groq-recovered", name=name, input=args)],
         stop_reason="tool_use",
+        usage=None,
     )
 
 
@@ -83,6 +84,7 @@ class GroqBackend:
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str = "",
     ) -> LLMResponse:
         oai_messages, oai_tools = to_openai(system, messages, tools)
         kwargs: dict[str, Any] = {
