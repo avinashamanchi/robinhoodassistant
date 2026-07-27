@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import ipaddress
-from datetime import timedelta
+from datetime import date, timedelta
 from functools import wraps
 import inspect
 from pathlib import Path
@@ -22,7 +22,13 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import select
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -132,7 +138,11 @@ class ChatIn(BaseModel):
 
 
 class BacktestRunIn(BaseModel):
-    symbols: list[str] = []
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(default_factory=list)
+    start_date: date | None = None
+    end_date: date | None = None
     reason: str
 
     @field_validator("reason")
@@ -141,6 +151,20 @@ class BacktestRunIn(BaseModel):
         if not value.strip():
             raise ValueError("reason must be non-empty")
         return value.strip()
+
+    @model_validator(mode="after")
+    def dates_must_form_an_ordered_pair(self):
+        if (self.start_date is None) != (self.end_date is None):
+            raise ValueError(
+                "start_date and end_date must be provided together"
+            )
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.end_date < self.start_date
+        ):
+            raise ValueError("end_date must not precede start_date")
+        return self
 
 
 class AnalyzeIn(BaseModel):
@@ -787,6 +811,7 @@ def _create_app(
         try:
             receipt = app.state.operations.panic(context)
         except Exception:
+            request.state.panic_owner_failed = True
             receipt = _panic_exception_receipt(service)
         if receipt.get("safe") is not True:
             raise ApiError(
@@ -1089,15 +1114,33 @@ def _create_app(
             "backtest",
             "new",
         )
-        from ..backtest.runner import run_synthetic_backtest
-
-        run_id, report = run_synthetic_backtest(
-            service.session_factory,
-            symbols=body.symbols or None,
-            actor=context.actor,
-            reason=context.reason,
-            request_id=context.request_id,
+        from ..backtest.runner import (
+            BacktestTimedOut,
+            run_synthetic_backtest,
         )
+
+        stop_event = threading.Event()
+        runtime_seconds = (
+            service.config.security.backtest_limits.runtime_seconds
+        )
+        deadline = time.monotonic() + runtime_seconds
+        try:
+            run_id, report = run_synthetic_backtest(
+                service.session_factory,
+                symbols=body.symbols or None,
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
+                runtime_seconds=runtime_seconds,
+                deadline=deadline,
+                stop_event=stop_event,
+            )
+        except BacktestTimedOut:
+            raise ApiError(
+                "backtest_timed_out",
+                504,
+                "Backtest runtime deadline exceeded",
+            ) from None
         return {"run_id": run_id, "report": report.to_dict()}
 
     @app.get("/backtests/{run_id}/report")
@@ -1145,6 +1188,8 @@ def create_app(*args, **kwargs) -> FastAPI:
 
 # ── backtest DB helpers ────────────────────────────────────────
 def _list_backtests(session_factory) -> list[dict]:
+    import json
+
     from sqlalchemy import select
 
     from ..db.models import BacktestRun
@@ -1155,6 +1200,10 @@ def _list_backtests(session_factory) -> list[dict]:
             {
                 "run_id": r.id,
                 "label": r.label,
+                "status": json.loads(r.config_json).get(
+                    "status",
+                    "succeeded",
+                ),
                 "created_at": r.created_at.isoformat(),
                 "holdout_start": r.holdout_start.isoformat() if r.holdout_start else None,
             }
@@ -1174,12 +1223,14 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
         run = s.get(BacktestRun, run_id)
         if run is None:
             return None
+        config = json.loads(run.config_json)
         rows = s.execute(
             select(BacktestMetricRow).where(BacktestMetricRow.run_id == run_id)
         ).scalars().all()
         return {
             "run_id": run.id,
             "label": run.label,
+            "status": config.get("status", "succeeded"),
             "holdout_start": run.holdout_start.isoformat() if run.holdout_start else None,
             "disclaimer": SIMULATED_LABEL,
             "rows": [json.loads(r.metrics_json) for r in rows],

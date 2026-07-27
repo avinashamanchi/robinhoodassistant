@@ -137,3 +137,134 @@ def test_sma_crossover_trades_and_is_deterministic():
     r2 = run_backtest(SmaCrossover(), source, "AAPL", backtest_config=BacktestConfig())
     assert r1.ending_equity == r2.ending_equity       # deterministic
     assert len(r1.equity_curve) == len(source.timeline(["AAPL"]))
+
+
+def test_replay_checks_cancellation_immediately_before_strategy_call(
+    monkeypatch,
+):
+    class CooperativeStop(RuntimeError):
+        pass
+
+    import trading_assistant.backtest.engine as engine
+
+    stopped = False
+    strategy_calls = 0
+    original_build_features = engine.build_features
+
+    def build_then_stop(*args, **kwargs):
+        nonlocal stopped
+        features = original_build_features(*args, **kwargs)
+        stopped = True
+        return features
+
+    def check():
+        if stopped:
+            raise CooperativeStop
+
+    class ProviderStrategy:
+        name = "provider_strategy"
+
+        def on_bar(self, features):
+            nonlocal strategy_calls
+            strategy_calls += 1
+            raise AssertionError(
+                "strategy/provider call happened after cancellation"
+            )
+
+    source = DataSource({"AAPL": make_bars(1, seed=9)})
+    monkeypatch.setattr(
+        engine,
+        "build_features",
+        build_then_stop,
+    )
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            ProviderStrategy(),
+            source,
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert strategy_calls == 0
+
+
+def test_replay_checks_cancellation_before_every_bar():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    strategy_calls = 0
+    stop = False
+
+    def check():
+        if stop:
+            raise CooperativeStop
+
+    class OneProviderCall:
+        name = "one_provider_call"
+
+        def on_bar(self, features):
+            nonlocal strategy_calls, stop
+            strategy_calls += 1
+            stop = True
+            return type(
+                "Signal",
+                (),
+                {"action": "hold", "size_hint": None},
+            )()
+
+    source = DataSource({"AAPL": make_bars(5, seed=10)})
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            OneProviderCall(),
+            source,
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert strategy_calls == 1
+
+
+def test_replay_checks_cancellation_before_each_data_access():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    stopped = False
+    timeline_calls = 0
+    source = DataSource({"AAPL": make_bars(5, seed=11)})
+
+    class CancelAfterFull:
+        def full(self, symbol):
+            nonlocal stopped
+            result = source.full(symbol)
+            stopped = True
+            return result
+
+        def timeline(self, symbols):
+            nonlocal timeline_calls
+            timeline_calls += 1
+            return source.timeline(symbols)
+
+        def view(self, as_of):
+            return source.view(as_of)
+
+    def check():
+        if stopped:
+            raise CooperativeStop
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            SmaCrossover(),
+            CancelAfterFull(),
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert timeline_calls == 0

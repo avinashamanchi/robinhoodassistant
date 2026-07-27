@@ -37,7 +37,10 @@ def _run_window(
     bounds: tuple[datetime, datetime],
     backtest_config: BacktestConfig,
     spy_symbol: Optional[str],
+    cancel_check: Callable[[], None] | None,
 ) -> Metrics:
+    if cancel_check is not None:
+        cancel_check()
     result = run_backtest(
         factory(),
         source,
@@ -46,6 +49,7 @@ def _run_window(
         spy_symbol=spy_symbol,
         start=bounds[0],
         end=bounds[1],
+        cancel_check=cancel_check,
     )
     return compute_metrics(result)
 
@@ -59,8 +63,11 @@ def walk_forward(
     holdout_months: int = 12,
     spy_symbol: Optional[str] = None,
     label: str = "baseline walk-forward",
+    cancel_check: Callable[[], None] | None = None,
 ) -> tuple[EvaluationReport, HoldoutGuard]:
     backtest_config = backtest_config or BacktestConfig()
+    if cancel_check is not None:
+        cancel_check()
     timeline = source.timeline(symbols)
     guard = HoldoutGuard(timeline, holdout_months)
     dev, hold = guard.split(timeline)
@@ -74,15 +81,31 @@ def walk_forward(
     report = EvaluationReport(holdout_start=guard.holdout_start, label=label)
     for symbol in symbols:
         for window, bounds in windows.items():
+            if cancel_check is not None:
+                cancel_check()
             if window == "holdout":
                 guard.evaluate_holdout(symbol)  # one-shot, logged
             benchmark = _run_window(
-                BuyAndHold, source, symbol, bounds, backtest_config, spy_symbol
+                BuyAndHold,
+                source,
+                symbol,
+                bounds,
+                backtest_config,
+                spy_symbol,
+                cancel_check,
             )
             for factory in strategy_factories:
                 metrics = _run_window(
-                    factory, source, symbol, bounds, backtest_config, spy_symbol
+                    factory,
+                    source,
+                    symbol,
+                    bounds,
+                    backtest_config,
+                    spy_symbol,
+                    cancel_check,
                 )
+                if cancel_check is not None:
+                    cancel_check()
                 report.rows.append(
                     ReportRow(
                         symbol=symbol,
@@ -117,7 +140,13 @@ def persist_report(
         run = BacktestRun(
             label=report.label,
             holdout_start=report.holdout_start,
-            config_json=json.dumps({"disclaimer": report.disclaimer}),
+            config_json=json.dumps(
+                {
+                    "disclaimer": report.disclaimer,
+                    "status": "succeeded",
+                },
+                sort_keys=True,
+            ),
         )
         s.add(run)
         s.flush()

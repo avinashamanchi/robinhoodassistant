@@ -9,7 +9,7 @@ import asyncio
 
 from ..config import Secrets, load_config
 from ..notifications.base import build_notifier
-from .backoff import RetryPolicy, retry_read
+from .backoff import scheduled_market_data_read
 from .monitor import Monitor
 
 
@@ -62,9 +62,12 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
 
         def _price(sym: str):
             try:
-                quote = retry_read(
+                quote = scheduled_market_data_read(
                     lambda: service.broker.get_quote(sym),
-                    RetryPolicy(),
+                    rate_limiter=container.rate_limiter,
+                    limit_config=(
+                        config.security.rate_limits.provider_read
+                    ),
                 )
                 return Decimal(str(quote.last))
             except Exception:

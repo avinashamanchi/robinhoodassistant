@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 import hashlib
 import json
@@ -36,7 +36,10 @@ from .limits import (
     MutationInterlockService,
 )
 
-_LEASE_TTL_SECONDS = 30
+_DEFAULT_LEASE_TTL_SECONDS = 30
+_LEASE_TTL_SECONDS = _DEFAULT_LEASE_TTL_SECONDS
+_PANIC_LEASE_TTL_SECONDS = 90
+_BACKTEST_LEASE_TTL_SECONDS = 1_500
 _LEASE_RENEW_INTERVAL_SECONDS = 10.0
 _PANIC_POLL_INITIAL_SECONDS = 0.025
 _PANIC_POLL_MAX_SECONDS = 0.25
@@ -94,6 +97,25 @@ class _LeaseHold:
     owner: str
     generation: int
     expires_at: datetime
+    ttl_seconds: int = _DEFAULT_LEASE_TTL_SECONDS
+
+
+def _lease_ttl_seconds(policy: RoutePolicy) -> int:
+    # Existing concurrency tests deliberately lower the shared TTL. Preserve
+    # that deterministic override while using task-specific production TTLs.
+    if _LEASE_TTL_SECONDS != _DEFAULT_LEASE_TTL_SECONDS:
+        return _LEASE_TTL_SECONDS
+    if policy.path == "/panic":
+        return _PANIC_LEASE_TTL_SECONDS
+    if policy.path == "/backtests/run":
+        return _BACKTEST_LEASE_TTL_SECONDS
+    return _DEFAULT_LEASE_TTL_SECONDS
+
+
+def _panic_lease_ttl_seconds() -> int:
+    if _LEASE_TTL_SECONDS != _DEFAULT_LEASE_TTL_SECONDS:
+        return _LEASE_TTL_SECONDS
+    return _PANIC_LEASE_TTL_SECONDS
 
 
 ROUTE_POLICIES = (
@@ -478,6 +500,8 @@ def _lease_keys(
     limit_principal: str,
 ) -> list[str]:
     policy = resolved.policy
+    if policy.path == "/backtests/run":
+        return ["backtest:global"]
     material = _resource_material(
         resolved,
         limit_principal=limit_principal,
@@ -553,6 +577,60 @@ def _interlock_denial_response(
             "mutation_reconciliation_required",
             409,
             "A previous mutation requires explicit reconciliation",
+        ),
+    )
+
+
+def _backtest_busy_response(request: Request):
+    return _policy_error_response(
+        request,
+        ApiError(
+            "backtest_busy",
+            409,
+            "A backtest is already in progress",
+        ),
+    )
+
+
+async def _backtest_bounds_response(
+    app: FastAPI,
+    request: Request,
+):
+    try:
+        payload = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    limits = app.state.trading_service.config.security.backtest_limits
+    symbols = payload.get("symbols", [])
+    exceeded = (
+        isinstance(symbols, list)
+        and len(symbols) > limits.max_symbols
+    )
+    start_value = payload.get("start_date")
+    end_value = payload.get("end_date")
+    if (
+        not exceeded
+        and isinstance(start_value, str)
+        and isinstance(end_value, str)
+    ):
+        try:
+            start_date = date.fromisoformat(start_value)
+            end_date = date.fromisoformat(end_value)
+        except ValueError:
+            pass
+        else:
+            inclusive_days = (end_date - start_date).days + 1
+            exceeded = inclusive_days > limits.max_calendar_days
+    if not exceeded:
+        return None
+    return _policy_error_response(
+        request,
+        ApiError(
+            "backtest_bounds_exceeded",
+            422,
+            "Backtest request exceeds configured bounds",
         ),
     )
 
@@ -770,7 +848,7 @@ def _mark_panic_uncertain(
     now = utcnow()
     block_until = max(
         expires_at,
-        now + timedelta(seconds=_LEASE_TTL_SECONDS),
+        now + timedelta(seconds=_panic_lease_ttl_seconds()),
     )
     try:
         with app.state.session_auth.session_factory() as session:
@@ -886,7 +964,15 @@ async def _wait_for_panic_receipt(
     observed: LeaseDecision,
 ):
     delay = _PANIC_POLL_INITIAL_SECONDS
+    loop = asyncio.get_running_loop()
+    wait_deadline = (
+        loop.time()
+        + app.state.trading_service.config.trading.request_timeout_seconds
+    )
     while True:
+        request_remaining = wait_deadline - loop.time()
+        if request_remaining <= 0:
+            return _panic_incomplete_response(request)
         try:
             snapshot = await _offload(_panic_snapshot, app)
         except LimitStoreUnavailable:
@@ -917,7 +1003,9 @@ async def _wait_for_panic_receipt(
         remaining = (current.expires_at - utcnow()).total_seconds()
         if remaining <= 0:
             return _panic_incomplete_response(request)
-        await asyncio.sleep(min(delay, remaining))
+        await asyncio.sleep(
+            min(delay, remaining, request_remaining)
+        )
         delay = min(delay * 2, _PANIC_POLL_MAX_SECONDS)
 
 
@@ -950,7 +1038,7 @@ async def _maintain_lease(
 ) -> Literal["lost", "store"] | None:
     interval = min(
         _LEASE_RENEW_INTERVAL_SECONDS,
-        max(0.01, _LEASE_TTL_SECONDS / 3),
+        max(0.01, hold.ttl_seconds / 3),
     )
     retry_delay = min(0.025, interval)
     while True:
@@ -969,7 +1057,7 @@ async def _maintain_lease(
                     hold.resource_key,
                     owner=hold.owner,
                     generation=hold.generation,
-                    ttl_seconds=_LEASE_TTL_SECONDS,
+                    ttl_seconds=hold.ttl_seconds,
                 )
             except LimitStoreUnavailable:
                 await asyncio.sleep(min(retry_delay, remaining))
@@ -1280,6 +1368,13 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 ),
                 headers=_rate_headers(app, policy, decision),
             )
+        if policy.path == "/backtests/run":
+            bounds_response = await _backtest_bounds_response(
+                app,
+                request,
+            )
+            if bounds_response is not None:
+                return bounds_response
         lease_keys = _lease_keys(
             app,
             resolved,
@@ -1306,7 +1401,47 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 return _policy_store_error_response(request)
             if existing_interlock is not None:
                 if (
-                    policy.concurrency_behavior == "coalesce_panic"
+                    policy.path == "/backtests/run"
+                    and existing_interlock.state == "active"
+                ):
+                    try:
+                        observed = await _offload(
+                            app.state.leases.inspect,
+                            lease_keys[0],
+                        )
+                    except LimitStoreUnavailable:
+                        return _policy_store_error_response(request)
+                    if (
+                        observed.acquired
+                        and observed.owner
+                        == existing_interlock.owner
+                        and observed.generation
+                        == existing_interlock.generation
+                    ):
+                        return _backtest_busy_response(request)
+                    if observed.acquired:
+                        return _interlock_denial_response(
+                            request,
+                            policy,
+                        )
+                    try:
+                        reclaimed = await _offload(
+                            app.state.mutation_interlocks.release_expired_backtest,
+                            lease_keys[0],
+                            owner=existing_interlock.owner,
+                            generation=existing_interlock.generation,
+                        )
+                    except LimitStoreUnavailable:
+                        return _policy_store_error_response(request)
+                    if not reclaimed:
+                        return _interlock_denial_response(
+                            request,
+                            policy,
+                        )
+                    existing_interlock = None
+                if (
+                    existing_interlock is not None
+                    and policy.concurrency_behavior == "coalesce_panic"
                     and existing_interlock.state == "active"
                 ):
                     try:
@@ -1330,7 +1465,9 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                             observed=observed,
                         )
                     return _panic_incomplete_response(request)
-                if (
+                if existing_interlock is None:
+                    pass
+                elif (
                     policy.path == "/reconcile"
                     and existing_interlock.operation
                     == "portfolio_reconcile"
@@ -1358,13 +1495,14 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         owner = uuid4().hex
         hold: _LeaseHold | None = None
         contentions: list[tuple[str, LeaseDecision]] = []
+        ttl_seconds = _lease_ttl_seconds(policy)
         try:
             for lease_key in lease_keys:
                 lease = await _offload(
                     app.state.leases.acquire,
                     lease_key,
                     owner=owner,
-                    ttl_seconds=_LEASE_TTL_SECONDS,
+                    ttl_seconds=ttl_seconds,
                 )
                 if lease.acquired:
                     hold = _LeaseHold(
@@ -1372,6 +1510,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         owner=lease.owner,
                         generation=lease.generation,
                         expires_at=lease.expires_at,
+                        ttl_seconds=ttl_seconds,
                     )
                     break
                 contentions.append((lease_key, lease))
@@ -1386,6 +1525,8 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     lease_key=lease_key,
                     observed=observed,
                 )
+            if policy.path == "/backtests/run":
+                return _backtest_busy_response(request)
             retry_after = min(
                 (
                     lease.retry_after_seconds
@@ -1514,6 +1655,15 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         if panic_request_id is not None:
             response, body = await _materialize_response(response)
             durable_response = _panic_payload(body)
+            receipt_response = (
+                None
+                if getattr(
+                    request.state,
+                    "panic_owner_failed",
+                    False,
+                )
+                else durable_response
+            )
             try:
                 if (
                     durable_response is None
@@ -1531,7 +1681,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         app,
                         panic_request_id,
                         lease_generation=hold.generation,
-                        response=durable_response,
+                        response=receipt_response,
                         expires_at=hold.expires_at,
                     )
             except LimitStoreUnavailable:

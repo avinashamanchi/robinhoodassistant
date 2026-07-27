@@ -22,7 +22,6 @@ from .config import (
 )
 from .db.schema import require_current_schema
 from .db.session import create_db_engine, make_session_factory
-from .daemon.backoff import RetryPolicy, retry_read
 from .logging import (
     configure_logging,
     configure_runtime_logging,
@@ -226,10 +225,7 @@ def _build_container(
         service.rule_application,
         NullNotifier(),
         max_quote_age_seconds=config.daemon.max_quote_age_seconds,
-        quote_reader=lambda symbol: retry_read(
-            lambda: broker.get_quote(symbol),
-            RetryPolicy(),
-        ),
+        quote_reader=broker.get_quote,
         rate_limiter=rate_limiter,
         leases=leases,
         provider_budget=provider_budget,

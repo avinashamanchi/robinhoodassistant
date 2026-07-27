@@ -265,6 +265,97 @@ def test_spot_check_records_disagreement():
         assert res.spot_check_disagreements >= 1
 
 
+def test_optional_llm_trigger_checks_cancellation_before_provider_call():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    provider_calls = 0
+
+    class ForbiddenAnalyst:
+        def analyze(self, features, *, request_id):
+            nonlocal provider_calls
+            provider_calls += 1
+            raise AssertionError(
+                "LLM provider called after cooperative cancellation"
+            )
+
+    def cancelled():
+        raise CooperativeStop
+
+    strategy = AnalystStrategy(
+        ForbiddenAnalyst(),
+        LLMRunConfig(),
+        run_id="cancel-before-llm-trigger",
+        cancel_check=cancelled,
+    )
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+
+    with pytest.raises(CooperativeStop):
+        strategy.on_bar(features)
+
+    assert provider_calls == 0
+
+
+def test_optional_spot_check_observes_cancellation_after_primary_call():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    primary_calls = 0
+    spot_check_calls = 0
+    cancelled = False
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.HOLD,
+        confidence=0.5,
+        thesis="hold",
+        cited_concepts=["Trend"],
+        regime_note="range",
+    )
+
+    class PrimaryAnalyst:
+        def analyze(self, features, *, request_id):
+            nonlocal primary_calls, cancelled
+            primary_calls += 1
+            cancelled = True
+            return report
+
+    class SpotCheckAnalyst:
+        def analyze(self, features, *, request_id):
+            nonlocal spot_check_calls
+            spot_check_calls += 1
+            return report
+
+    def check():
+        if cancelled:
+            raise CooperativeStop
+
+    strategy = AnalystStrategy(
+        PrimaryAnalyst(),
+        LLMRunConfig(spot_check_every=1),
+        full_analyst=SpotCheckAnalyst(),
+        run_id="cancel-before-spot-check",
+        cancel_check=check,
+    )
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+
+    with pytest.raises(CooperativeStop):
+        strategy.on_bar(features)
+
+    assert primary_calls == 1
+    assert spot_check_calls == 0
+
+
 def test_estimate_flags_over_budget():
     source = DataSource({"AAPL": make_bars(200, seed=3)})
     est = estimate_llm_calls(source, "AAPL", LLMRunConfig(max_llm_calls=0))

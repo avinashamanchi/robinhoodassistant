@@ -825,6 +825,44 @@ class MutationInterlockService:
             session.commit()
             return True
 
+    def release_expired_backtest(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Clear an abandoned backtest latch behind its exact expired lease."""
+
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            current = _as_utc(now)
+            lease = session.get(ConcurrencyLease, resource_key)
+            interlock = session.get(MutationInterlock, resource_key)
+            if (
+                lease is None
+                or lease.owner != owner
+                or lease.generation != generation
+                or lease.expires_at > current
+                or interlock is None
+                or interlock.owner != owner
+                or interlock.generation != generation
+                or interlock.operation != "backtest"
+                or interlock.state != "active"
+                or interlock.worker_finished_at is not None
+            ):
+                session.rollback()
+                return False
+            session.delete(interlock)
+            session.commit()
+            return True
+
     def reconcile_clear(
         self,
         resource_key: str,

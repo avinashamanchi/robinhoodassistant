@@ -25,7 +25,7 @@ import json
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from ..analyst.analyst import Analyst
 from ..analyst.models import AnalysisReport, AnalystAction
@@ -162,11 +162,13 @@ class AnalystStrategy(Strategy):
         full_analyst: Optional[Analyst] = None,
         *,
         run_id: str,
+        cancel_check: Callable[[], None] | None = None,
     ) -> None:
         self.analyst = analyst
         self.full_analyst = full_analyst
         self.config = config
         self.run_id = _require_run_id(run_id)
+        self.cancel_check = cancel_check
         self.cache = cache or ResponseCache()
         self.calls = 0
         self.spot_checks = 0
@@ -186,6 +188,8 @@ class AnalystStrategy(Strategy):
             raise BudgetExceeded(
                 f"exceeded max_llm_calls={self.config.max_llm_calls}"
             )
+        if self.cancel_check is not None:
+            self.cancel_check()
         # Count the ATTEMPT against the budget before making it — a failed call
         # still hits the provider, so the cap must be fail-closed (security).
         self.calls += 1
@@ -213,6 +217,8 @@ class AnalystStrategy(Strategy):
             or self.calls % self.config.spot_check_every != 0
         ):
             return
+        if self.cancel_check is not None:
+            self.cancel_check()
         self.spot_checks += 1
         full = self.full_analyst.analyze(
             features,
@@ -325,12 +331,14 @@ def run_llm_backtest(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     full_analyst: Optional[Analyst] = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> LLMBacktestResult:
     strategy = AnalystStrategy(
         analyst,
         run_config,
         full_analyst=full_analyst,
         run_id=run_id,
+        cancel_check=cancel_check,
     )
     engine_result = run_backtest(
         strategy,
@@ -340,6 +348,7 @@ def run_llm_backtest(
         spy_symbol=spy_symbol,
         start=start,
         end=end,
+        cancel_check=cancel_check,
     )
     scorecard = _grade_reports(source, symbol, strategy.reports, run_config.horizon_bars)
     return LLMBacktestResult(

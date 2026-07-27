@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
+from trading_assistant.app.limits import (
+    DurableRateLimiter,
+    LimitStoreUnavailable,
+)
+from trading_assistant.assets import AssetClass
 from trading_assistant.daemon.monitor import Monitor
 from trading_assistant.db.models import AuditEvent
 from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
+from trading_assistant.risk.breakers import BreakerScope
 
 
 def _rule(svc, cond, action=None):
@@ -177,6 +184,181 @@ def test_tick_fetches_one_quote_per_ticker_even_with_many_rules(make_service):
 
     assert len(acted) == 1
     assert broker.quote_calls == 1
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["budget-denied", "store-unavailable"],
+)
+def test_scheduled_market_data_denial_makes_zero_broker_calls(
+    make_service,
+    store_unavailable,
+):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+            self.submit_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+        def submit_order(self, order):
+            self.submit_calls += 1
+            return super().submit_order(order)
+
+    class DenyingLimiter:
+        calls: list[tuple[object, str]]
+
+        def __init__(self):
+            self.calls = []
+
+        def consume_pair(self, spec, *, principal):
+            self.calls.append((spec, principal))
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "scheduled limiter unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    _rule(service, {"price_below": 175})
+    broker.quote_calls = 0
+    limiter = DenyingLimiter()
+
+    outcomes = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=limiter,
+    ).tick()
+
+    assert broker.quote_calls == 0
+    assert len(limiter.calls) == 1
+    spec, principal = limiter.calls[0]
+    assert spec.name == "provider_read"
+    assert principal == "provider:alpaca:market-data"
+    assert outcomes[0]["error"] == "rule_evaluation_failed"
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+    assert service.broker.submit_calls == 0
+
+
+def test_scheduled_market_data_gate_survives_limiter_reconstruction(
+    make_service,
+):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.config import WindowLimitConfig
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+            self.submit_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+        def submit_order(self, order):
+            self.submit_calls += 1
+            return super().submit_order(order)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    current = service.config.security.rate_limits.provider_read
+    provider_read = WindowLimitConfig(
+        requests=1,
+        global_requests=current.global_requests,
+        window_seconds=current.window_seconds,
+        concurrency=current.concurrency,
+        daily_requests=current.daily_requests,
+        global_daily_requests=current.global_daily_requests,
+    )
+    rate_limits = service.config.security.rate_limits.model_copy(
+        update={"provider_read": provider_read}
+    )
+    security = service.config.security.model_copy(
+        update={"rate_limits": rate_limits}
+    )
+    service.config = service.config.model_copy(
+        update={"security": security}
+    )
+    _rule(service, {"price_below": 50})
+    broker.quote_calls = 0
+
+    first = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=DurableRateLimiter(service.session_factory),
+    ).tick()
+    second = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=DurableRateLimiter(service.session_factory),
+    ).tick()
+
+    assert first == []
+    assert second[0]["error"] == "rule_evaluation_failed"
+    assert broker.quote_calls == 1
+    assert service.broker.submit_calls == 0
+
+
+def test_each_scheduled_retry_requires_a_fresh_durable_allowance():
+    from trading_assistant.daemon.backoff import (
+        RetryPolicy,
+        ScheduledMarketDataDenied,
+        scheduled_market_data_read,
+    )
+    from trading_assistant.config import WindowLimitConfig
+
+    class AllowThenDeny:
+        calls = 0
+
+        def consume_pair(self, spec, *, principal):
+            self.calls += 1
+            return SimpleNamespace(allowed=self.calls == 1)
+
+    provider_calls = 0
+
+    def unavailable_provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        raise ConnectionError("scheduled provider unavailable")
+
+    limiter = AllowThenDeny()
+    delays: list[float] = []
+    limit = WindowLimitConfig(
+        requests=1,
+        global_requests=1,
+        window_seconds=60,
+        concurrency=1,
+    )
+
+    with pytest.raises(ScheduledMarketDataDenied):
+        scheduled_market_data_read(
+            unavailable_provider,
+            rate_limiter=limiter,
+            limit_config=limit,
+            retry_policy=RetryPolicy(
+                attempts=3,
+                base_seconds=0,
+                cap_seconds=0,
+                jitter_fraction=0,
+            ),
+            sleep=delays.append,
+        )
+
+    assert limiter.calls == 2
+    assert provider_calls == 1
+    assert delays == [0]
 
 
 def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):

@@ -12,8 +12,16 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeVar
 
+from ..app.limits import LimitSpec
+from ..config import WindowLimitConfig
+
 _T = TypeVar("_T")
 RETRIABLE_READ_ERRORS = (TimeoutError, ConnectionError)
+SCHEDULED_MARKET_DATA_PRINCIPAL = "provider:alpaca:market-data"
+
+
+class ScheduledMarketDataDenied(RuntimeError):
+    """The durable scheduled-read allowance was denied before provider I/O."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +76,45 @@ def retry_read(
                 )
             )
     raise RuntimeError("unreachable")
+
+
+def scheduled_market_data_read(
+    operation: Callable[[], _T],
+    *,
+    rate_limiter,
+    limit_config: WindowLimitConfig,
+    retry_policy: RetryPolicy = RetryPolicy(),
+    sleep: Callable[[float], object] = time.sleep,
+) -> _T:
+    """Require a durable allowance before every retryable provider attempt."""
+
+    if rate_limiter is None:
+        raise ValueError("scheduled market-data limiter is required")
+    spec = LimitSpec(
+        name="provider_read",
+        principal_requests=limit_config.requests,
+        global_requests=limit_config.global_requests,
+        window_seconds=limit_config.window_seconds,
+        principal_daily_requests=limit_config.daily_requests,
+        global_daily_requests=limit_config.global_daily_requests,
+    )
+
+    def authorized_attempt():
+        decision = rate_limiter.consume_pair(
+            spec,
+            principal=SCHEDULED_MARKET_DATA_PRINCIPAL,
+        )
+        if not decision.allowed:
+            raise ScheduledMarketDataDenied(
+                "scheduled market data allowance denied"
+            )
+        return operation()
+
+    return retry_read(
+        authorized_attempt,
+        retry_policy,
+        sleep=sleep,
+    )
 
 
 async def retry_async_read(

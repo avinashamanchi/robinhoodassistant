@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from ..assets import AssetClass
 from ..broker.models import (
@@ -89,6 +89,7 @@ def run_backtest(
     warmup: int = 2,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> BacktestResult:
     """Replay ``symbol``. If ``start``/``end`` are given, only bars in that window
     are traded and scored, but feature views still see all prior history (so a
@@ -98,28 +99,47 @@ def run_backtest(
     risk_config = risk_config or permissive_risk_config([symbol])
     engine_risk = RiskEngine(risk_config)
     broker = SimBroker(backtest_config, starting_cash)
+    if cancel_check is not None:
+        cancel_check()
     full = source.full(symbol)
+    if cancel_check is not None:
+        cancel_check()
+    timeline = source.timeline([symbol])
 
     result = BacktestResult(symbol=symbol, strategy=strategy.name, starting_equity=starting_cash)
 
-    for t in source.timeline([symbol]):
+    for t in timeline:
+        if cancel_check is not None:
+            cancel_check()
         if (start is not None and t < start) or (end is not None and t > end):
             continue
         # 1. Fill orders submitted at the previous bar, using THIS bar.
         if t in full.index:
             broker.process_bar(t, {symbol: full.loc[t]})
 
+        if cancel_check is not None:
+            cancel_check()
         view = source.view(t)
+        if cancel_check is not None:
+            cancel_check()
         hist = view.history(symbol, lookback=FEATURE_LOOKBACK)
 
         # 2. Decide on a fresh, bounded feature view (only data <= t).
         regime = None
         if len(hist) >= warmup:
-            spy_hist = (
-                view.history(spy_symbol, lookback=FEATURE_LOOKBACK) if spy_symbol else None
-            )
+            if spy_symbol:
+                if cancel_check is not None:
+                    cancel_check()
+                spy_hist = view.history(
+                    spy_symbol,
+                    lookback=FEATURE_LOOKBACK,
+                )
+            else:
+                spy_hist = None
             features = build_features(symbol, ac, hist, spy_df=spy_hist, as_of=t)
             regime = features.regime
+            if cancel_check is not None:
+                cancel_check()
             signal = strategy.on_bar(features)
             _act(engine_risk, broker, symbol, ac, signal.action, signal.size_hint)
 

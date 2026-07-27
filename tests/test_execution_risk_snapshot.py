@@ -173,10 +173,14 @@ def test_required_execution_quote_failure_raises_typed_dependency(
     failure,
 ):
     service = make_service()
+    quote_calls = 0
     if failure == "unavailable":
-        service.broker.get_quote = lambda _ticker: (_ for _ in ()).throw(
-            ConnectionError("provider quote unavailable")
-        )
+        def unavailable_quote(_ticker):
+            nonlocal quote_calls
+            quote_calls += 1
+            raise ConnectionError("provider quote unavailable")
+
+        service.broker.get_quote = unavailable_quote
     else:
         stale_at = datetime.now(timezone.utc) - timedelta(minutes=5)
         service.broker.get_quote = lambda _ticker: Quote(
@@ -193,6 +197,8 @@ def test_required_execution_quote_failure_raises_typed_dependency(
         service.snapshot_service.assemble_for_execution("AAPL")
 
     assert type(raised.value).__name__ == "RequiredQuoteUnavailable"
+    if failure == "unavailable":
+        assert quote_calls == 1
 
 
 @pytest.mark.parametrize(

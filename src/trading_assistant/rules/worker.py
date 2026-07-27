@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
 
+from trading_assistant.app.limits import LimitStoreUnavailable
+from trading_assistant.assets import AssetClass
+from trading_assistant.daemon.backoff import (
+    ScheduledMarketDataDenied,
+    scheduled_market_data_read,
+)
 from trading_assistant.notifications.base import Notifier, NullNotifier
+from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.staleness import is_stale
 
 from .application import RuleApplicationService
@@ -49,10 +56,25 @@ class RuleWorker:
         self.notifier = notifier or NullNotifier()
         self.max_quote_age_seconds = max_quote_age_seconds
         self.now = now
-        self.quote_reader = quote_reader or service.broker.get_quote
         self.rate_limiter = rate_limiter
         self.leases = leases
         self.provider_budget = provider_budget
+        base_quote_reader = quote_reader or service.broker.get_quote
+        if rate_limiter is None:
+            self.quote_reader = base_quote_reader
+        else:
+            provider_read = (
+                service.config.security.rate_limits.provider_read
+            )
+
+            def limited_quote_reader(symbol: str):
+                return scheduled_market_data_read(
+                    lambda: base_quote_reader(symbol),
+                    rate_limiter=rate_limiter,
+                    limit_config=provider_read,
+                )
+
+            self.quote_reader = limited_quote_reader
 
     def tick(
         self,
@@ -185,6 +207,41 @@ class RuleWorker:
                             "code=notification_failed proposal_id=%s",
                             outcome.proposal["order_id"],
                         )
+            except (ScheduledMarketDataDenied, LimitStoreUnavailable):
+                self.service.breakers.trip(
+                    BreakerScope.data(
+                        AssetClass.for_symbol(command.ticker)
+                    ),
+                    "scheduled market data allowance unavailable",
+                    actor,
+                    request_id=request_id,
+                    now=tick_now,
+                    audit_reason=reason,
+                )
+                self.repository.release_group(
+                    lease,
+                    now=tick_now,
+                    high_water_marks=high_water_marks,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                log.warning(
+                    "rule evaluation denied unavailable market data "
+                    "code=scheduled_market_data_denied group_id=%s",
+                    group_id,
+                )
+                outcomes.append(
+                    RuleOutcome(
+                        group_id=group_id,
+                        rule_id=(
+                            fired[0].id
+                            if fired is not None
+                            else stored.id
+                        ),
+                        error="rule_evaluation_failed",
+                    )
+                )
             except ValueError:
                 self.repository.release_group(
                     lease,
