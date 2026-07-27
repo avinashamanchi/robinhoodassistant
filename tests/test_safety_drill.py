@@ -347,6 +347,32 @@ def test_binding_open_failure_removes_exact_created_empty_private_directory(
     assert not tuple(tmp_path.glob(".safety-drill-db-*"))
 
 
+def test_binding_post_open_initialization_failure_removes_private_directory(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    real_fchmod = os.fchmod
+
+    def fail_binding_fchmod(descriptor, mode):
+        if mode == 0o700:
+            raise OSError("injected binding fchmod failure")
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(
+        safety_drill_module.os,
+        "fchmod",
+        fail_binding_fchmod,
+    )
+
+    with pytest.raises(SafetyDrillError):
+        _online_copy(primary, destination)
+
+    assert not tuple(tmp_path.glob(".safety-drill-db-*"))
+
+
 def test_binding_open_failure_never_deletes_replacement_directory(
     tmp_path,
     monkeypatch,

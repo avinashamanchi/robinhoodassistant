@@ -289,6 +289,11 @@ uv run pytest -q \
   position-manifest comparison, but does not re-enter the local writer/
   reconciliation path already held by `OrderSubmissionService`.
 - Final focused result: `229 passed, 1 warning`.
+- Final review minor: an injected `fchmod` failure after the private binding
+  directory opened initially left an empty alias directory. A new RED test
+  reproduced that residue; the cleanup now verifies both the held descriptor
+  and pathname against the exact created inode before removing it. The new test
+  and the three adjacent alias-cleanup/active-WAL tests pass.
 
 ## Full deterministic suite and genuine branch gate
 

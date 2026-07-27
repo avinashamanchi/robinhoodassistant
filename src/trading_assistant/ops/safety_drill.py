@@ -500,17 +500,14 @@ def _bind_database_source(held: _HeldDatabaseSource):
             )
             os.fchmod(directory_fd, 0o700)
         except OSError:
-            if (
-                directory_fd is None
-                and created_directory_identity is not None
-            ):
+            if created_directory_identity is not None:
                 try:
                     candidate = os.stat(
                         directory_name,
                         dir_fd=held.parent_fd,
                         follow_symlinks=False,
                     )
-                    if (
+                    exact_created_directory = (
                         stat.S_ISDIR(candidate.st_mode)
                         and stat.S_IMODE(candidate.st_mode) == 0o700
                         and (
@@ -518,13 +515,32 @@ def _bind_database_source(held: _HeldDatabaseSource):
                             candidate.st_ino,
                         )
                         == created_directory_identity
-                    ):
+                    )
+                    if directory_fd is not None:
+                        opened = os.fstat(directory_fd)
+                        exact_created_directory = (
+                            exact_created_directory
+                            and stat.S_ISDIR(opened.st_mode)
+                            and stat.S_IMODE(opened.st_mode) == 0o700
+                            and (
+                                opened.st_dev,
+                                opened.st_ino,
+                            )
+                            == created_directory_identity
+                        )
+                    if exact_created_directory:
                         os.rmdir(
                             directory_name,
                             dir_fd=held.parent_fd,
                         )
                 except OSError:
                     pass
+            if directory_fd is not None:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    pass
+                directory_fd = None
             raise SafetyDrillError("database_copy_failed") from None
         directory_metadata = os.fstat(directory_fd)
         if (
