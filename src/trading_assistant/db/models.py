@@ -621,6 +621,74 @@ class ConcurrencyLease(Base):
     generation: Mapped[int] = mapped_column(default=0)
 
 
+class MutationInterlock(Base):
+    """Non-expiring authority that fences one protected mutation resource."""
+
+    __tablename__ = "mutation_interlocks"
+    __table_args__ = (
+        CheckConstraint(
+            "generation >= 0",
+            name="ck_mutation_interlocks_generation_nonnegative",
+        ),
+        CheckConstraint(
+            "operation IN ("
+            "'order_approve','order_reject','breaker_reset','order_cancel',"
+            "'portfolio_reconcile','order_sync','panic','analysis',"
+            "'plan_approve','plan_cancel','proposal_batch','backtest'"
+            ")",
+            name="ck_mutation_interlocks_operation",
+        ),
+        CheckConstraint(
+            "outcome_code IN ("
+            "'','handler_completed','request_cancelled','handler_failed',"
+            "'lease_renewal_unproven','lease_ownership_lost',"
+            "'panic_settlement_unproven','lease_release_unproven',"
+            "'interlock_settlement_unproven'"
+            ")",
+            name="ck_mutation_interlocks_outcome",
+        ),
+        CheckConstraint(
+            "("
+            "state = 'active' AND outcome_code = '' "
+            "AND worker_finished_at IS NULL"
+            ") OR ("
+            "state = 'settled' AND outcome_code = 'handler_completed' "
+            "AND worker_finished_at IS NOT NULL"
+            ") OR ("
+            "state = 'uncertain' AND outcome_code NOT IN "
+            "('', 'handler_completed')"
+            ")",
+            name="ck_mutation_interlocks_state_lifecycle",
+        ),
+    )
+
+    resource_key: Mapped[str] = mapped_column(
+        String(128),
+        primary_key=True,
+    )
+    owner: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column()
+    operation: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(
+        String(16),
+        default="active",
+        index=True,
+    )
+    outcome_code: Mapped[str] = mapped_column(String(64), default="")
+    worker_finished_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utcnow,
+    )
+
+
 class ProviderBudgetDay(Base):
     __tablename__ = "provider_budget_days"
     __table_args__ = (
@@ -703,6 +771,10 @@ class PanicReceipt(Base):
 
     account_scope: Mapped[str] = mapped_column(String(64), primary_key=True)
     request_id: Mapped[str] = mapped_column(String(64), index=True)
+    lease_generation: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+    )
     state: Mapped[str] = mapped_column(String(16), index=True)
     response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ import pytest
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+import trading_assistant.app.limits as limits_module
 from trading_assistant.app.limits import (
     ConcurrencyLeaseService,
     DurableRateLimiter,
@@ -18,7 +20,7 @@ from trading_assistant.app.limits import (
     LimitSpec,
     LimitStoreUnavailable,
 )
-from trading_assistant.db.models import ConcurrencyLease, RateWindow
+from trading_assistant.db.models import AuditEvent, ConcurrencyLease, RateWindow
 
 
 UTC = timezone.utc
@@ -700,6 +702,280 @@ def test_stale_generation_cannot_renew_or_release_replacement_lease(
     assert observed.generation == replacement.generation
 
 
+@pytest.mark.parametrize("operation", ["renew", "release"])
+def test_lease_clock_is_observed_after_blocked_transaction_begins(
+    engine,
+    session_factory,
+    operation,
+):
+    service = ConcurrencyLeaseService(session_factory)
+    acquired = service.acquire(
+        f"route:blocked-{operation}",
+        owner="request-a",
+        ttl_seconds=1,
+    )
+    begin_attempted = threading.Event()
+
+    with engine.connect() as blocker:
+        blocker.exec_driver_sql("BEGIN IMMEDIATE")
+
+        def observe_begin(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            if statement == "BEGIN IMMEDIATE":
+                begin_attempted.set()
+
+        event.listen(engine, "before_cursor_execute", observe_begin)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                if operation == "renew":
+                    future = pool.submit(
+                        service.renew,
+                        f"route:blocked-{operation}",
+                        owner=acquired.owner,
+                        generation=acquired.generation,
+                        ttl_seconds=30,
+                    )
+                else:
+                    future = pool.submit(
+                        service.release,
+                        f"route:blocked-{operation}",
+                        owner=acquired.owner,
+                        generation=acquired.generation,
+                    )
+                assert begin_attempted.wait(timeout=2)
+                time.sleep(1.1)
+                blocker.rollback()
+                stale_result = future.result(timeout=2)
+        finally:
+            event.remove(engine, "before_cursor_execute", observe_begin)
+
+    if operation == "renew":
+        assert stale_result.acquired is False
+    else:
+        assert stale_result is False
+
+    replacement = service.acquire(
+        f"route:blocked-{operation}",
+        owner="request-b",
+        ttl_seconds=30,
+    )
+    assert replacement.acquired is True
+    assert service.release(
+        f"route:blocked-{operation}",
+        owner=acquired.owner,
+        generation=acquired.generation,
+    ) is False
+    observed = service.inspect(f"route:blocked-{operation}")
+    assert observed.acquired is True
+    assert observed.owner == replacement.owner
+    assert observed.generation == replacement.generation
+
+
+def test_nonexpiring_interlock_requires_exact_settlement_or_reconciliation(
+    session_factory,
+):
+    service_type = getattr(
+        limits_module,
+        "MutationInterlockService",
+        None,
+    )
+    assert service_type is not None
+    service = service_type(session_factory)
+
+    claimed = service.claim(
+        "route:" + "a" * 64 + ":0",
+        owner="internal-owner-a",
+        generation=7,
+        operation="order_approve",
+    )
+    denied = service.claim(
+        "route:" + "a" * 64 + ":0",
+        owner="internal-owner-b",
+        generation=8,
+        operation="order_approve",
+    )
+
+    assert claimed.acquired is True
+    assert denied.acquired is False
+    assert denied.owner == "internal-owner-a"
+    assert denied.generation == 7
+    assert service.mark_uncertain(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="lease_renewal_unproven",
+        worker_finished=False,
+    )
+    assert service.reconcile_clear(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        actor="operator:test",
+        request_id="reconcile-too-early",
+        evidence_code="broker_truth_reconciled",
+        worker_termination_proven=False,
+    ) is False
+    assert service.mark_uncertain(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="request_cancelled",
+        worker_finished=True,
+    )
+    assert service.reconcile_clear(
+        claimed.resource_key,
+        owner="stale-owner",
+        generation=claimed.generation,
+        actor="operator:test",
+        request_id="reconcile-stale-owner",
+        evidence_code="broker_truth_reconciled",
+        worker_termination_proven=True,
+    ) is False
+    assert service.reconcile_clear(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        actor="operator:test",
+        request_id="reconcile-exact-owner",
+        evidence_code="broker_truth_reconciled",
+        worker_termination_proven=False,
+    ) is True
+    assert service.inspect(claimed.resource_key) is None
+    with session_factory() as session:
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.request_id == "reconcile-exact-owner"
+            )
+        )
+        assert audit is not None
+        assert audit.action == "mutation_interlock.reconcile"
+        assert audit.result_code == "cleared"
+
+
+def test_settled_interlock_clears_only_with_exact_unexpired_release(
+    session_factory,
+):
+    service_type = getattr(
+        limits_module,
+        "MutationInterlockService",
+        None,
+    )
+    assert service_type is not None
+    interlocks = service_type(session_factory)
+    leases = ConcurrencyLeaseService(session_factory)
+    now = _at_noon()
+    resource_key = "route:" + "c" * 64 + ":0"
+    lease = leases.acquire(
+        resource_key,
+        owner="internal-settled-owner",
+        ttl_seconds=30,
+        now=now,
+    )
+    claimed = interlocks.claim(
+        resource_key,
+        owner=lease.owner,
+        generation=lease.generation,
+        operation="order_approve",
+    )
+    assert interlocks.settle(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="handler_completed",
+    )
+
+    assert interlocks.release_settled(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        now=now + timedelta(seconds=30),
+    ) is False
+    assert interlocks.inspect(claimed.resource_key) is not None
+    replacement = leases.acquire(
+        claimed.resource_key,
+        owner="replacement-owner",
+        ttl_seconds=30,
+        now=now + timedelta(seconds=30),
+    )
+    assert replacement.acquired is True
+    assert interlocks.release_settled(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        now=now + timedelta(seconds=31),
+    ) is False
+    observed = leases.inspect(
+        claimed.resource_key,
+        now=now + timedelta(seconds=31),
+    )
+    assert observed.owner == replacement.owner
+    assert interlocks.inspect(claimed.resource_key) is not None
+
+    assert interlocks.reconcile_clear(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        actor="operator:test",
+        request_id="reconcile-settled-release",
+        evidence_code="broker_truth_reconciled",
+        worker_termination_proven=False,
+    ) is True
+
+
+def test_exact_unexpired_release_and_settled_clear_are_atomic(
+    session_factory,
+):
+    service_type = getattr(
+        limits_module,
+        "MutationInterlockService",
+        None,
+    )
+    assert service_type is not None
+    interlocks = service_type(session_factory)
+    leases = ConcurrencyLeaseService(session_factory)
+    now = _at_noon()
+    resource_key = "route:" + "d" * 64 + ":0"
+    lease = leases.acquire(
+        resource_key,
+        owner="internal-clear-owner",
+        ttl_seconds=30,
+        now=now,
+    )
+    claimed = interlocks.claim(
+        resource_key,
+        owner=lease.owner,
+        generation=lease.generation,
+        operation="plan_cancel",
+    )
+    assert interlocks.settle(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="handler_completed",
+    )
+
+    assert interlocks.release_settled(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        now=now + timedelta(seconds=1),
+    ) is True
+
+    assert interlocks.inspect(claimed.resource_key) is None
+    observed = leases.inspect(
+        claimed.resource_key,
+        now=now + timedelta(seconds=1),
+    )
+    assert observed.acquired is False
+    assert observed.generation == lease.generation + 1
+
+
 def test_second_lease_owner_is_denied_until_expiry(session_factory):
     now = _at_noon()
     service = ConcurrencyLeaseService(session_factory)
@@ -746,6 +1022,7 @@ def test_lease_release_is_owner_guarded(session_factory):
         "panic:account",
         owner="owner-b",
         generation=acquired.generation,
+        now=now,
     ) is False
     assert service.acquire(
         "panic:account",
@@ -758,6 +1035,7 @@ def test_lease_release_is_owner_guarded(session_factory):
         "panic:account",
         owner="owner-a",
         generation=acquired.generation,
+        now=now,
     ) is True
     assert service.acquire(
         "panic:account",

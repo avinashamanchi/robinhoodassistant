@@ -3,18 +3,19 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+import hashlib
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
-from starlette.responses import JSONResponse
-from starlette.routing import request_response
 
+import trading_assistant.app.limits as limits_module
 from trading_assistant.app.main import create_app
 import trading_assistant.app.policy as policy_module
 from trading_assistant.app.policy import (
@@ -29,6 +30,7 @@ from trading_assistant.app.limits import (
     LimitStoreUnavailable,
 )
 from trading_assistant.db.models import (
+    AuditEvent,
     AuthSession,
     ConcurrencyLease,
     PanicReceipt,
@@ -300,6 +302,152 @@ def test_every_protected_policy_rejects_missing_or_invalid_idempotency(
     )
 
 
+@pytest.mark.parametrize(
+    ("path", "expected_status", "expected_code"),
+    [
+        ("/approve/123", 409, "mutation_reconciliation_required"),
+        ("/reject/123", 409, "mutation_reconciliation_required"),
+        ("/killswitch/reset", 409, "mutation_reconciliation_required"),
+        ("/orders/123/cancel", 409, "mutation_reconciliation_required"),
+        ("/reconcile", 409, "mutation_reconciliation_required"),
+        ("/sync", 409, "mutation_reconciliation_required"),
+        ("/panic", 503, "panic_incomplete"),
+        ("/analyze", 409, "mutation_reconciliation_required"),
+        ("/plans/123/approve", 409, "mutation_reconciliation_required"),
+        ("/plans/123/cancel", 409, "mutation_reconciliation_required"),
+        ("/propose", 409, "mutation_reconciliation_required"),
+        ("/backtests/run", 409, "mutation_reconciliation_required"),
+    ],
+)
+def test_every_protected_policy_honors_a_nonexpiring_interlock(
+    make_service,
+    path,
+    expected_status,
+    expected_code,
+):
+    class ExistingInterlock:
+        def inspect(self, _resource_key):
+            return SimpleNamespace(
+                acquired=False,
+                owner="internal-owner",
+                generation=9,
+                operation="POST protected",
+                state="uncertain",
+                outcome_code="reconciliation_required",
+                worker_finished_at=utcnow(),
+            )
+
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-interlock-matrix-secret",
+        planning=None,
+    )
+    app.state.mutation_interlocks = ExistingInterlock()
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-interlock-matrix-secret"},
+    )
+
+    denied = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": (
+                f"latched-{path.strip('/').replace('/', '-')}"
+            ),
+        },
+        json={},
+    )
+
+    assert denied.status_code == expected_status
+    assert denied.json()["error"]["code"] == expected_code
+    assert "Retry-After" not in denied.headers
+
+
+@pytest.mark.parametrize(
+    ("paths", "resource_material", "expected_codes"),
+    [
+        (
+            ("/approve/7", "/reject/7", "/orders/7/cancel"),
+            "order:7",
+            (
+                "mutation_reconciliation_required",
+                "mutation_reconciliation_required",
+                "mutation_reconciliation_required",
+            ),
+        ),
+        (
+            ("/plans/7/approve", "/plans/7/cancel"),
+            "plan:7",
+            (
+                "mutation_reconciliation_required",
+                "mutation_reconciliation_required",
+            ),
+        ),
+        (
+            ("/killswitch/reset", "/panic"),
+            "paper-account:alpaca-paper",
+            ("mutation_reconciliation_required", "panic_incomplete"),
+        ),
+    ],
+)
+def test_cross_route_mutations_share_one_domain_interlock(
+    make_service,
+    paths,
+    resource_material,
+    expected_codes,
+):
+    expected_key = (
+        "route:"
+        + hashlib.sha256(resource_material.encode("utf-8")).hexdigest()
+        + ":0"
+    )
+
+    class ExactDomainInterlock:
+        def inspect(self, resource_key):
+            if resource_key != expected_key:
+                return None
+            return SimpleNamespace(
+                acquired=False,
+                resource_key=resource_key,
+                owner="internal-cross-route-owner",
+                generation=17,
+                operation="order_approve",
+                state="uncertain",
+                outcome_code="lease_renewal_unproven",
+                worker_finished_at=utcnow(),
+            )
+
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-cross-scope-secret",
+        planning=None,
+    )
+    app.state.mutation_interlocks = ExactDomainInterlock()
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-cross-scope-secret"},
+    )
+
+    for index, (path, expected_code) in enumerate(
+        zip(paths, expected_codes, strict=True)
+    ):
+        denied = client.post(
+            path,
+            headers={
+                "X-CSRF-Token": login.json()["csrf_token"],
+                "Idempotency-Key": f"cross-route-{index}",
+            },
+            json={},
+        )
+        assert denied.json()["error"]["code"] == expected_code
+        assert "Retry-After" not in denied.headers
+
+
 def test_static_assets_reject_directories_and_traversal(make_service):
     app = create_app(
         service=make_service(),
@@ -547,6 +695,7 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
 
     app.state.operations.panic = blocking_panic
     original_acquire = app.state.leases.acquire
+    original_inspect = app.state.leases.inspect
     acquisition_count = 0
     acquisition_lock = threading.Lock()
     follower_attempted = threading.Event()
@@ -556,11 +705,16 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
         result = original_acquire(*args, **kwargs)
         with acquisition_lock:
             acquisition_count += 1
-            if acquisition_count == 2:
-                follower_attempted.set()
+        return result
+
+    def observed_inspect(*args, **kwargs):
+        result = original_inspect(*args, **kwargs)
+        if result.acquired:
+            follower_attempted.set()
         return result
 
     app.state.leases.acquire = observed_acquire
+    app.state.leases.inspect = observed_inspect
     owner_headers = {
         "X-CSRF-Token": csrf,
         "Idempotency-Key": "panic-owner",
@@ -593,6 +747,7 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
     assert follower_response.status_code == 200
     assert owner_response.json() == follower_response.json() == receipt
     assert calls == 1
+    assert acquisition_count == 1
     with service.session_factory() as session:
         durable = session.get(PanicReceipt, "alpaca-paper")
         assert durable is not None
@@ -707,7 +862,7 @@ def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
     assert agent.max_active == 1
 
 
-def test_lease_ownership_loss_is_reported_instead_of_handler_success(
+def test_real_sync_mutation_interlock_survives_renewal_failure_and_lease_expiry(
     make_service,
     monkeypatch,
 ):
@@ -720,77 +875,387 @@ def test_lease_ownership_loss_is_reported_instead_of_handler_success(
     monkeypatch.setattr(
         policy_module,
         "_LEASE_RENEW_INTERVAL_SECONDS",
-        0.01,
+        0.05,
         raising=False,
     )
+    service = _with_limit(
+        make_service(),
+        "approval",
+        requests=20,
+        global_requests=40,
+        window_seconds=1,
+        concurrency=1,
+    )
     app = create_app(
-        service=make_service(),
+        service=service,
         agent=_StubAgent(),
-        api_token="route-lost-lease-secret",
+        api_token="route-sync-interlock-secret",
         planning=None,
     )
+    owner_client = TestClient(app)
+    follower_client = TestClient(app)
+    login = owner_client.post(
+        "/auth/login",
+        json={"secret": "route-sync-interlock-secret"},
+    )
+    cookie_name = app.state.session_auth.cookie_name()
+    follower_client.cookies.set(
+        cookie_name,
+        owner_client.cookies.get(cookie_name),
+    )
+    csrf = login.json()["csrf_token"]
+    started = threading.Event()
+    release_worker = threading.Event()
+    renewal_attempted = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+    active = 0
+    max_active = 0
+    side_effects = 0
+
+    def blocking_approve(*_args, **_kwargs):
+        nonlocal calls, active, max_active, side_effects
+        with lock:
+            calls += 1
+            call_number = calls
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            if call_number == 1:
+                started.set()
+                assert release_worker.wait(timeout=5)
+            with lock:
+                side_effects += 1
+            return {"status": "submitted", "executed": True}
+        finally:
+            with lock:
+                active -= 1
+
+    service.approve_order = blocking_approve
+    delegate = app.state.leases
+    release_calls = 0
+
+    class RenewalUnavailableLeases:
+        def acquire(self, *args, **kwargs):
+            return delegate.acquire(*args, **kwargs)
+
+        def renew(self, *_args, **_kwargs):
+            renewal_attempted.set()
+            raise LimitStoreUnavailable("renewal store unavailable")
+
+        def release(self, *args, **kwargs):
+            nonlocal release_calls
+            release_calls += 1
+            return delegate.release(*args, **kwargs)
+
+        def inspect(self, *args, **kwargs):
+            return delegate.inspect(*args, **kwargs)
+
+    app.state.leases = RenewalUnavailableLeases()
+    headers = {
+        "X-CSRF-Token": csrf,
+        "Idempotency-Key": "sync-interlock-owner",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(
+            owner_client.post,
+            "/approve/7",
+            json={"reason": "real synchronous owner"},
+            headers=headers,
+        )
+        assert started.wait(timeout=5)
+        assert renewal_attempted.wait(timeout=5)
+        time.sleep(1.1)
+        try:
+            follower = follower_client.post(
+                "/approve/7",
+                json={"reason": "must remain interlocked"},
+                headers={
+                    "X-CSRF-Token": csrf,
+                    "Idempotency-Key": "sync-interlock-follower",
+                },
+            )
+        finally:
+            release_worker.set()
+        owner_response = owner.result(timeout=5)
+
+    assert owner_response.status_code == 200
+    assert follower.status_code == 409
+    assert (
+        follower.json()["error"]["code"]
+        == "mutation_reconciliation_required"
+    )
+    assert "Retry-After" not in follower.headers
+    assert max_active == 1
+    assert calls == side_effects == 1
+    assert release_calls == 0
+
+    still_latched = owner_client.post(
+        "/approve/7",
+        json={"reason": "cannot retry an uncertain outcome"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-interlock-after-finish",
+        },
+    )
+    assert still_latched.status_code == 409
+    assert (
+        still_latched.json()["error"]["code"]
+        == "mutation_reconciliation_required"
+    )
+
+
+def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.05,
+        raising=False,
+    )
+    service = _with_limit(
+        make_service(),
+        "approval",
+        requests=20,
+        global_requests=40,
+        window_seconds=1,
+        concurrency=1,
+    )
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-cancel-interlock-secret",
+        planning=None,
+    )
+    started = threading.Event()
+    release_worker = threading.Event()
+    renewal_attempted = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+    active = 0
+    max_active = 0
+    side_effects = 0
+
+    def blocking_approve(*_args, **_kwargs):
+        nonlocal calls, active, max_active, side_effects
+        with lock:
+            calls += 1
+            call_number = calls
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            if call_number == 1:
+                started.set()
+                assert release_worker.wait(timeout=5)
+            with lock:
+                side_effects += 1
+            return {"status": "submitted", "executed": True}
+        finally:
+            with lock:
+                active -= 1
+
+    service.approve_order = blocking_approve
+    delegate = app.state.leases
+
+    class RenewalUnavailableLeases:
+        def acquire(self, *args, **kwargs):
+            return delegate.acquire(*args, **kwargs)
+
+        def renew(self, *_args, **_kwargs):
+            renewal_attempted.set()
+            raise LimitStoreUnavailable("renewal store unavailable")
+
+        def release(self, *args, **kwargs):
+            return delegate.release(*args, **kwargs)
+
+        def inspect(self, *args, **kwargs):
+            return delegate.inspect(*args, **kwargs)
+
+    app.state.leases = RenewalUnavailableLeases()
+
+    async def exercise():
+        leaked: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: leaked.append(context)
+        )
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                login = await client.post(
+                    "/auth/login",
+                    json={"secret": "route-cancel-interlock-secret"},
+                )
+                csrf = login.json()["csrf_token"]
+                owner = asyncio.create_task(
+                    client.post(
+                        "/approve/7",
+                        json={"reason": "cancel transport, not worker"},
+                        headers={
+                            "X-CSRF-Token": csrf,
+                            "Idempotency-Key": "cancel-interlock-owner",
+                        },
+                    )
+                )
+                assert await asyncio.to_thread(started.wait, 5)
+                owner.cancel()
+                assert await asyncio.to_thread(
+                    renewal_attempted.wait,
+                    5,
+                )
+                await asyncio.sleep(1.1)
+                follower = await client.post(
+                    "/approve/7",
+                    json={"reason": "cannot replace canceled owner"},
+                    headers={
+                        "X-CSRF-Token": csrf,
+                        "Idempotency-Key": "cancel-interlock-follower",
+                    },
+                )
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+                await asyncio.sleep(0)
+                still_latched = await client.post(
+                    "/approve/7",
+                    json={"reason": "requires reconciliation"},
+                    headers={
+                        "X-CSRF-Token": csrf,
+                        "Idempotency-Key": "cancel-interlock-retry",
+                    },
+                )
+                return follower, still_latched, leaked
+        finally:
+            release_worker.set()
+            loop.set_exception_handler(previous_handler)
+
+    follower, still_latched, leaked = asyncio.run(exercise())
+
+    for response in (follower, still_latched):
+        assert response.status_code == 409
+        assert (
+            response.json()["error"]["code"]
+            == "mutation_reconciliation_required"
+        )
+        assert "Retry-After" not in response.headers
+    assert max_active == 1
+    assert calls == side_effects == 1
+    assert leaked == []
+
+
+@pytest.mark.parametrize("reconciled", [True, False])
+def test_reconcile_clears_only_after_proven_truth_and_atomic_audit(
+    make_service,
+    reconciled,
+):
+    service_type = getattr(
+        limits_module,
+        "MutationInterlockService",
+        None,
+    )
+    assert service_type is not None
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-reconcile-latch-secret",
+        planning=None,
+    )
+    interlocks = service_type(service.session_factory)
+    app.state.mutation_interlocks = interlocks
+    resource_key = (
+        "route:"
+        + hashlib.sha256(
+            b"portfolio:alpaca-paper"
+        ).hexdigest()
+        + ":0"
+    )
+    claimed = interlocks.claim(
+        resource_key,
+        owner="abandoned-reconcile-owner",
+        generation=5,
+        operation="portfolio_reconcile",
+    )
+    assert claimed.acquired is True
+    assert interlocks.mark_uncertain(
+        resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="request_cancelled",
+        worker_finished=True,
+    )
+
+    if not reconciled:
+        service.reconcile_positions = lambda **_kwargs: {
+            "reconciled": False,
+            "drift": {"AAPL": {"broker": "1", "local": "0"}},
+        }
+
     client = TestClient(app)
     login = client.post(
         "/auth/login",
-        json={"secret": "route-lost-lease-secret"},
+        json={"secret": "route-reconcile-latch-secret"},
     )
-    started = threading.Event()
-
-    async def delayed_chat(_request):
-        started.set()
-        await asyncio.sleep(0.2)
-        return JSONResponse({"reply": "unsafe overlap"})
-
-    chat_route = next(
-        route
-        for route in app.routes
-        if getattr(route, "path", None) == "/chat"
+    response = client.post(
+        "/reconcile",
+        json={"reason": "prove broker and domain truth"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": f"reconcile-proof-{reconciled}",
+        },
     )
-    chat_route.app = request_response(delayed_chat)
 
-    class LosingLeases:
-        def acquire(self, _resource_key, *, owner, ttl_seconds):
-            return LeaseDecision(
-                acquired=True,
-                owner=owner,
-                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
-                generation=7,
-                retry_after_seconds=0,
+    assert response.status_code == 200
+    assert response.json()["reconciled"] is reconciled
+    remaining = interlocks.inspect(resource_key)
+    with service.session_factory() as session:
+        reconciliation_audits = list(
+            session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action
+                    == "mutation_interlock.reconcile",
+                    AuditEvent.request_id
+                    == response.headers["X-Request-ID"],
+                )
             )
-
-        def renew(
-            self,
-            _resource_key,
-            *,
-            owner,
-            generation,
-            ttl_seconds,
-        ):
-            return LeaseDecision(
-                acquired=False,
-                owner="replacement-request",
-                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
-                generation=generation + 1,
-                retry_after_seconds=ttl_seconds,
-            )
-
-        def release(self, *_args, **_kwargs):
-            return False
-
-    app.state.leases = LosingLeases()
-    denied = client.post(
-        "/chat",
-        json={"message": "must be cancelled"},
-        headers={"X-CSRF-Token": login.json()["csrf_token"]},
-    )
-
-    assert started.wait(timeout=1)
-    assert denied.status_code == 503
-    assert denied.json()["error"]["code"] == "route_lease_lost"
+        )
+    if reconciled:
+        assert remaining is None
+        assert len(reconciliation_audits) == 1
+        assert reconciliation_audits[0].reason == (
+            "portfolio_truth_reconciled"
+        )
+        assert reconciliation_audits[0].result_code == "cleared"
+    else:
+        assert remaining is not None
+        assert remaining.state == "uncertain"
+        assert reconciliation_audits == []
 
 
+@pytest.mark.parametrize(
+    ("replacement_owner", "replacement_generation"),
+    [
+        ("owner-request-b", 42),
+        ("owner-request-a", 42),
+    ],
+)
 def test_panic_follower_never_accepts_replacement_owner_receipt(
     make_service,
+    replacement_owner,
+    replacement_generation,
 ):
     service = make_service()
     app = create_app(
@@ -818,6 +1283,7 @@ def test_panic_follower_never_accepts_replacement_owner_receipt(
             PanicReceipt(
                 account_scope="alpaca-paper",
                 request_id="owner-request-a",
+                lease_generation=41,
                 state="started",
                 response_json=None,
                 started_at=utcnow(),
@@ -872,7 +1338,8 @@ def test_panic_follower_never_accepts_replacement_owner_receipt(
         assert attempted.wait(timeout=5)
         with service.session_factory() as session:
             row = session.get(PanicReceipt, "alpaca-paper")
-            row.request_id = "owner-request-b"
+            row.request_id = replacement_owner
+            row.lease_generation = replacement_generation
             row.state = "completed"
             row.response_json = json.dumps(
                 {"safe": True, "owner": "request-b"}
@@ -1052,6 +1519,90 @@ def test_completed_panic_response_survives_settlement_failure_and_blocks_retry(
     assert calls == 1
 
 
+def test_panic_common_mode_receipt_failure_remains_latched_without_expiry(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.05,
+        raising=False,
+    )
+    service = _with_limit(
+        make_service(),
+        "panic",
+        requests=20,
+        global_requests=40,
+        window_seconds=1,
+        concurrency=1,
+    )
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-panic-common-store-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-panic-common-store-secret"},
+    )
+    calls = 0
+    receipt = {"safe": True, "owner": "common-store-failure"}
+
+    def panic(_context):
+        nonlocal calls
+        calls += 1
+        return receipt
+
+    def fail_receipt_store(*_args, **_kwargs):
+        raise LimitStoreUnavailable("coupled receipt store unavailable")
+
+    app.state.operations.panic = panic
+    monkeypatch.setattr(
+        policy_module,
+        "_finish_panic_receipt",
+        fail_receipt_store,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_mark_panic_uncertain",
+        fail_receipt_store,
+    )
+
+    first = client.post(
+        "/panic",
+        json={"reason": "panic common-mode store failure"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": "panic-common-store-owner",
+        },
+    )
+    time.sleep(1.1)
+    retry = client.post(
+        "/panic",
+        json={"reason": "must not duplicate broker panic"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": "panic-common-store-retry",
+        },
+    )
+
+    assert first.status_code == 200
+    assert first.json() == receipt
+    assert retry.status_code == 503
+    assert retry.json()["error"]["code"] == "panic_incomplete"
+    assert "Retry-After" not in retry.headers
+    assert calls == 1
+
+
 @pytest.mark.parametrize("release_failure", ["false", "exception"])
 def test_completed_panic_response_survives_release_failure_and_blocks_retry(
     make_service,
@@ -1069,24 +1620,12 @@ def test_completed_panic_response_survives_release_failure_and_blocks_retry(
         "/auth/login",
         json={"secret": "route-panic-release-secret"},
     )
-    delegate = app.state.leases
+    def fail_atomic_release(*_args, **_kwargs):
+        if release_failure == "exception":
+            raise LimitStoreUnavailable("release failed")
+        return False
 
-    class FailingReleaseLeases:
-        def acquire(self, *args, **kwargs):
-            return delegate.acquire(*args, **kwargs)
-
-        def renew(self, *args, **kwargs):
-            return delegate.renew(*args, **kwargs)
-
-        def inspect(self, *args, **kwargs):
-            return delegate.inspect(*args, **kwargs)
-
-        def release(self, *_args, **_kwargs):
-            if release_failure == "exception":
-                raise LimitStoreUnavailable("release failed")
-            return False
-
-    app.state.leases = FailingReleaseLeases()
+    app.state.mutation_interlocks.release_settled = fail_atomic_release
     calls = 0
     receipt = {"safe": True, "owner": "release-failure"}
 

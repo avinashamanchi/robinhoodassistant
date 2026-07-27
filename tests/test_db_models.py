@@ -11,6 +11,7 @@ import pytest
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import (
     AuthSession,
+    Base,
     ConcurrencyLease,
     Fill,
     Order,
@@ -162,6 +163,25 @@ def test_policy_rows_round_trip(session_factory):
         ).calls_used == 1
         assert session.get(ProviderReservation, "reservation-1").state == "reserved"
         assert session.get(PanicReceipt, "alpaca-paper").request_id == "request-1"
+
+
+def test_mutation_interlock_model_is_nonexpiring_and_fenced():
+    table = Base.metadata.tables["mutation_interlocks"]
+
+    assert {column.name for column in table.columns} == {
+        "resource_key",
+        "owner",
+        "generation",
+        "operation",
+        "state",
+        "outcome_code",
+        "worker_finished_at",
+        "created_at",
+        "updated_at",
+    }
+    assert "expires_at" not in table.columns
+    assert table.columns.resource_key.primary_key is True
+    assert table.columns.worker_finished_at.nullable is True
 
 
 def test_sqlite_database_and_sidecars_are_owner_only(tmp_path):

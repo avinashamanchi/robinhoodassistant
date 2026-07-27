@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from uuid import uuid4
@@ -177,7 +178,8 @@ def install_security(app: FastAPI) -> None:
         if receipt is not None:
             context, action, target_type, target_id = receipt
             try:
-                request.app.state.audit.record(
+                await asyncio.to_thread(
+                    request.app.state.audit.record,
                     context,
                     action,
                     target_type,

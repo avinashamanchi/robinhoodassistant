@@ -108,6 +108,7 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         "provider_budget_days",
         "provider_reservations",
         "panic_receipts",
+        "mutation_interlocks",
     } <= set(inspect(engine).get_table_names())
     assert "alembic_version" in inspect(engine).get_table_names()
     rule_columns = {
@@ -328,7 +329,13 @@ def test_panic_receipt_migration_rejects_outside_states(tmp_path, state):
 
 
 @pytest.mark.parametrize(
-    ("durable_state", "statement", "preserved_query", "expected_row"),
+    (
+        "durable_state",
+        "statement",
+        "preserved_query",
+        "expected_row",
+        "expected_revision",
+    ),
     [
         (
             "started provider reservation",
@@ -340,6 +347,7 @@ def test_panic_receipt_migration_rejects_outside_states(tmp_path, state):
             "SELECT reservation_id, state FROM provider_reservations "
             "WHERE reservation_id = 'started-reservation'",
             ("started-reservation", "started"),
+            "20260727_0011",
         ),
         (
             "unknown provider reservation",
@@ -351,6 +359,7 @@ def test_panic_receipt_migration_rejects_outside_states(tmp_path, state):
             "SELECT reservation_id, state FROM provider_reservations "
             "WHERE reservation_id = 'unknown-reservation'",
             ("unknown-reservation", "unknown"),
+            "20260727_0011",
         ),
         (
             "started panic receipt",
@@ -360,11 +369,17 @@ def test_panic_receipt_migration_rejects_outside_states(tmp_path, state):
             "SELECT account_scope, state FROM panic_receipts "
             "WHERE account_scope = 'started-panic'",
             ("started-panic", "started"),
+            "20260727_0012",
         ),
     ],
 )
 def test_policy_budget_downgrade_refuses_durable_inflight_state(
-    tmp_path, durable_state, statement, preserved_query, expected_row
+    tmp_path,
+    durable_state,
+    statement,
+    preserved_query,
+    expected_row,
+    expected_revision,
 ):
     engine, cfg = _engine_at_revision(
         tmp_path / f"{durable_state}.db", "head"
@@ -372,13 +387,16 @@ def test_policy_budget_downgrade_refuses_durable_inflight_state(
     with engine.begin() as connection:
         connection.execute(text(statement))
 
-    with pytest.raises(RuntimeError, match="inflight policy state"):
+    with pytest.raises(
+        RuntimeError,
+        match="inflight policy state|generation-bound panic receipt",
+    ):
         command.downgrade(cfg, "20260726_0010")
 
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0011"
+        ) == expected_revision
         assert {
             "rate_windows",
             "concurrency_leases",
@@ -387,6 +405,133 @@ def test_policy_budget_downgrade_refuses_durable_inflight_state(
             "panic_receipts",
         } <= set(inspect(engine).get_table_names())
         assert connection.execute(text(preserved_query)).one() == expected_row
+
+
+def test_mutation_interlock_upgrade_and_downgrade_preserve_latched_state(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "mutation-interlock.db",
+        "20260727_0011",
+    )
+    assert "mutation_interlocks" not in inspect(engine).get_table_names()
+
+    command.upgrade(cfg, "head")
+
+    assert "mutation_interlocks" in inspect(engine).get_table_names()
+    assert "lease_generation" in {
+        column["name"]
+        for column in inspect(engine).get_columns("panic_receipts")
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO mutation_interlocks "
+                    "(resource_key,owner,generation,operation,state,outcome_code,"
+                    "created_at,updated_at) VALUES "
+                    "(:resource_key,'internal-owner',7,"
+                    "'order_approve','uncertain','lease_renewal_unproven',"
+                    "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            {"resource_key": "route:" + "a" * 64 + ":0"},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable mutation interlock",
+    ):
+        command.downgrade(cfg, "20260727_0011")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0012"
+        assert connection.scalar(
+            text("SELECT count(*) FROM mutation_interlocks")
+        ) == 1
+
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM mutation_interlocks"))
+    command.downgrade(cfg, "20260727_0011")
+
+    assert "mutation_interlocks" not in inspect(engine).get_table_names()
+    assert "lease_generation" not in {
+        column["name"]
+        for column in inspect(engine).get_columns("panic_receipts")
+    }
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0011"
+
+
+@pytest.mark.parametrize(
+    (
+        "operation",
+        "generation",
+        "state",
+        "outcome_code",
+        "worker_finished_at",
+    ),
+    [
+        (
+            "order_approve",
+            1,
+            "active",
+            "handler_completed",
+            None,
+        ),
+        (
+            "order_approve",
+            1,
+            "active",
+            "",
+            datetime(2026, 7, 27, tzinfo=timezone.utc),
+        ),
+        ("order_approve", 1, "settled", "", None),
+        ("order_approve", 1, "uncertain", "", None),
+        ("order_approve", 1, "invalid", "", None),
+        ("user supplied operation", 1, "active", "", None),
+        ("order_approve", -1, "active", "", None),
+    ],
+)
+def test_mutation_interlock_constraints_reject_invalid_combinations(
+    tmp_path,
+    operation,
+    generation,
+    state,
+    outcome_code,
+    worker_finished_at,
+):
+    engine, _cfg = _engine_at_revision(
+        tmp_path
+        / (
+            "invalid-interlock-"
+            f"{abs(hash((operation, generation, state, outcome_code)))}.db"
+        ),
+        "head",
+    )
+
+    with engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO mutation_interlocks "
+                    "(resource_key,owner,generation,operation,state,"
+                    "outcome_code,worker_finished_at,created_at,updated_at) "
+                    "VALUES (:resource_key,'internal-owner',:generation,"
+                    ":operation,:state,:outcome_code,:worker_finished_at,"
+                    "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "resource_key": "route:" + "b" * 64 + ":0",
+                    "generation": generation,
+                    "operation": operation,
+                    "state": state,
+                    "outcome_code": outcome_code,
+                    "worker_finished_at": worker_finished_at,
+                },
+            )
 
 
 def test_fill_activated_upgrade_refuses_active_legacy_plan(
@@ -812,7 +957,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260727_0011"
+    assert version == "20260727_0012"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -848,7 +993,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0011"
+        ) == "20260727_0012"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -889,7 +1034,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260727_0011"
+    assert version == "20260727_0012"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")

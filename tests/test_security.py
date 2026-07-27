@@ -3,14 +3,18 @@ redaction (A3), daemon backoff + staleness (A4)."""
 
 from __future__ import annotations
 
+import asyncio
 from html.parser import HTMLParser
 import pathlib
 import subprocess
 import textwrap
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from random import Random
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -359,6 +363,64 @@ def test_authenticated_session_and_csrf_allow_mutation(
         },
     )
     assert r.status_code == 200 and r.json()["tripped"] is False
+
+
+def test_blocked_boundary_audit_does_not_delay_exact_liveness(
+    make_service,
+):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    blocked = threading.Event()
+    release = threading.Event()
+
+    class BlockingAudit:
+        def record(self, *_args, **_kwargs):
+            blocked.set()
+            release.wait(timeout=0.5)
+
+    app.state.audit = BlockingAudit()
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            login = await client.post(
+                "/auth/login",
+                json={"secret": TOKEN},
+            )
+            started_at = time.monotonic()
+            mutation = asyncio.create_task(
+                client.post(
+                    "/chat",
+                    json={"message": "boundary audit responsiveness"},
+                    headers={
+                        "X-CSRF-Token": login.json()["csrf_token"],
+                    },
+                )
+            )
+            assert await asyncio.to_thread(blocked.wait, 1)
+            try:
+                liveness = await asyncio.wait_for(
+                    client.get("/health/live"),
+                    timeout=0.2,
+                )
+                elapsed = time.monotonic() - started_at
+            finally:
+                release.set()
+            mutation_response = await mutation
+            return liveness, mutation_response, elapsed
+
+    liveness, mutation_response, elapsed = asyncio.run(exercise())
+
+    assert liveness.status_code == 200
+    assert mutation_response.status_code == 200
+    assert elapsed < 0.25
 
 
 def test_paid_analysis_and_backtest_endpoints_are_rate_limited(

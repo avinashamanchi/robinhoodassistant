@@ -752,11 +752,16 @@ def _create_app(
             "alpaca-paper",
         )
         try:
-            return service.reconcile_positions(
+            result = service.reconcile_positions(
                 actor=context.actor,
                 reason=context.reason,
                 request_id=context.request_id,
             )
+            if result.get("reconciled") is True:
+                request.state.mutation_reconciliation_proof = (
+                    "portfolio_truth_reconciled"
+                )
+            return result
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 

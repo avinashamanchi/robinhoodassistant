@@ -28,10 +28,12 @@ from .errors import ApiError
 from .limits import (
     ConcurrencyLeaseService,
     DurableRateLimiter,
+    InterlockDecision,
     LeaseDecision,
     LimitDecision,
     LimitSpec,
     LimitStoreUnavailable,
+    MutationInterlockService,
 )
 
 _LEASE_TTL_SECONDS = 30
@@ -62,6 +64,7 @@ class RoutePolicy:
     concurrency_scope: str = "principal"
     concurrency_behavior: Literal["reject", "coalesce_panic"] = "reject"
     target_param: str | None = None
+    mutation_operation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,7 @@ class ResolvedRoute:
 @dataclass(frozen=True)
 class _PanicSnapshot:
     request_id: str
+    lease_generation: int
     state: str
     response: dict[str, object] | None
     expires_at: datetime
@@ -127,6 +131,7 @@ ROUTE_POLICIES = (
         broker_read=True,
         concurrency_scope="target",
         target_param="order_id",
+        mutation_operation="order_approve",
     ),
     RoutePolicy(
         "POST",
@@ -137,6 +142,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         concurrency_scope="target",
         target_param="order_id",
+        mutation_operation="order_reject",
     ),
     RoutePolicy(
         "GET",
@@ -161,6 +167,7 @@ ROUTE_POLICIES = (
         requires_idempotency=True,
         audit_mutation=True,
         concurrency_scope="account",
+        mutation_operation="breaker_reset",
     ),
     RoutePolicy(
         "POST",
@@ -171,6 +178,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         concurrency_scope="target",
         target_param="order_id",
+        mutation_operation="order_cancel",
     ),
     RoutePolicy(
         "POST",
@@ -180,6 +188,7 @@ ROUTE_POLICIES = (
         requires_idempotency=True,
         audit_mutation=True,
         broker_read=True,
+        mutation_operation="portfolio_reconcile",
     ),
     RoutePolicy(
         "POST",
@@ -189,6 +198,7 @@ ROUTE_POLICIES = (
         requires_idempotency=True,
         audit_mutation=True,
         broker_read=True,
+        mutation_operation="order_sync",
     ),
     RoutePolicy(
         "POST",
@@ -200,6 +210,7 @@ ROUTE_POLICIES = (
         broker_read=True,
         concurrency_scope="account",
         concurrency_behavior="coalesce_panic",
+        mutation_operation="panic",
     ),
     RoutePolicy(
         "GET",
@@ -216,6 +227,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         broker_read=True,
         provider_category="analysis",
+        mutation_operation="analysis",
     ),
     RoutePolicy("GET", "/plans", AuthLevel.SESSION, "session_read"),
     RoutePolicy("GET", "/plans/ui", AuthLevel.SESSION, "session_read"),
@@ -235,6 +247,7 @@ ROUTE_POLICIES = (
         broker_read=True,
         concurrency_scope="target",
         target_param="plan_id",
+        mutation_operation="plan_approve",
     ),
     RoutePolicy(
         "POST",
@@ -245,6 +258,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         concurrency_scope="target",
         target_param="plan_id",
+        mutation_operation="plan_cancel",
     ),
     RoutePolicy(
         "POST",
@@ -263,6 +277,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         provider_category="analysis",
         broker_read=True,
+        mutation_operation="proposal_batch",
     ),
     RoutePolicy(
         "GET",
@@ -292,6 +307,7 @@ ROUTE_POLICIES = (
         requires_idempotency=True,
         audit_mutation=True,
         provider_category="backtest",
+        mutation_operation="backtest",
     ),
     RoutePolicy(
         "GET",
@@ -462,22 +478,83 @@ def _lease_keys(
     limit_principal: str,
 ) -> list[str]:
     policy = resolved.policy
-    if policy.concurrency_scope == "target":
-        target = resolved.path_params.get(policy.target_param or "", "")
-        material = f"target:{policy.target_param}:{target}"
-    elif policy.concurrency_scope == "account":
-        material = "account:alpaca-paper"
-    else:
-        material = f"principal:{policy.limit_name}:{limit_principal}"
+    material = _resource_material(
+        resolved,
+        limit_principal=limit_principal,
+    )
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     configured = getattr(
         app.state.trading_service.config.security.rate_limits,
         policy.limit_name,
     )
+    concurrency = (
+        1
+        if policy.requires_idempotency
+        else configured.concurrency
+    )
     return [
         f"route:{digest}:{slot}"
-        for slot in range(configured.concurrency)
+        for slot in range(concurrency)
     ]
+
+
+def _resource_material(
+    resolved: ResolvedRoute,
+    *,
+    limit_principal: str,
+) -> str:
+    policy = resolved.policy
+    path = policy.path
+    if path in {
+        "/approve/{order_id}",
+        "/reject/{order_id}",
+        "/orders/{order_id}/cancel",
+    }:
+        return f"order:{resolved.path_params.get('order_id', '')}"
+    if path in {
+        "/plans/{plan_id}/approve",
+        "/plans/{plan_id}/cancel",
+    }:
+        return f"plan:{resolved.path_params.get('plan_id', '')}"
+    if path in {"/killswitch/reset", "/panic"}:
+        return "paper-account:alpaca-paper"
+    if path == "/reconcile":
+        return "portfolio:alpaca-paper"
+    if path == "/sync":
+        return "broker-orders:alpaca-paper"
+    if path in {"/analyze", "/propose"}:
+        return f"analysis:{limit_principal}"
+    if path == "/backtests/run":
+        return f"backtest:{limit_principal}"
+    if policy.concurrency_scope == "target":
+        target = resolved.path_params.get(policy.target_param or "", "")
+        return f"target:{policy.target_param}:{target}"
+    if policy.concurrency_scope == "account":
+        return "account:alpaca-paper"
+    return f"principal:{policy.limit_name}:{limit_principal}"
+
+
+def _reconciliation_control_key() -> str:
+    digest = hashlib.sha256(
+        b"reconciliation-control:alpaca-paper"
+    ).hexdigest()
+    return f"route:{digest}:0"
+
+
+def _interlock_denial_response(
+    request: Request,
+    policy: RoutePolicy,
+):
+    if policy.concurrency_behavior == "coalesce_panic":
+        return _panic_incomplete_response(request)
+    return _policy_error_response(
+        request,
+        ApiError(
+            "mutation_reconciliation_required",
+            409,
+            "A previous mutation requires explicit reconciliation",
+        ),
+    )
 
 
 def _policy_error_response(
@@ -557,6 +634,7 @@ def _snapshot_from_row(row: PanicReceipt) -> _PanicSnapshot:
     )
     return _PanicSnapshot(
         request_id=row.request_id,
+        lease_generation=row.lease_generation,
         state=row.state,
         response=payload,
         expires_at=row.expires_at,
@@ -577,6 +655,7 @@ def _panic_snapshot(app: FastAPI) -> _PanicSnapshot | None:
 def _start_panic_receipt(
     app: FastAPI,
     request_id: str,
+    lease_generation: int,
     expires_at: datetime,
 ) -> _PanicClaim:
     now = utcnow()
@@ -594,6 +673,7 @@ def _start_panic_receipt(
                 row = PanicReceipt(account_scope="alpaca-paper")
                 session.add(row)
             row.request_id = request_id
+            row.lease_generation = lease_generation
             row.state = "started"
             row.response_json = None
             row.started_at = now
@@ -613,6 +693,7 @@ def _start_panic_receipt(
 def _renew_panic_receipt(
     app: FastAPI,
     request_id: str,
+    lease_generation: int,
     expires_at: datetime,
 ) -> bool:
     try:
@@ -622,6 +703,7 @@ def _renew_panic_receipt(
             if (
                 row is None
                 or row.request_id != request_id
+                or row.lease_generation != lease_generation
                 or row.state != "started"
             ):
                 session.rollback()
@@ -639,6 +721,7 @@ def _finish_panic_receipt(
     app: FastAPI,
     request_id: str,
     *,
+    lease_generation: int,
     response: dict[str, object] | None,
     expires_at: datetime,
 ) -> None:
@@ -647,7 +730,11 @@ def _finish_panic_receipt(
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             row = session.get(PanicReceipt, "alpaca-paper")
-            if row is None or row.request_id != request_id:
+            if (
+                row is None
+                or row.request_id != request_id
+                or row.lease_generation != lease_generation
+            ):
                 raise LimitStoreUnavailable(
                     "durable panic receipt ownership changed"
                 )
@@ -676,6 +763,7 @@ def _mark_panic_uncertain(
     app: FastAPI,
     request_id: str,
     *,
+    lease_generation: int,
     response: dict[str, object] | None,
     expires_at: datetime,
 ) -> bool:
@@ -688,7 +776,11 @@ def _mark_panic_uncertain(
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             row = session.get(PanicReceipt, "alpaca-paper")
-            if row is None or row.request_id != request_id:
+            if (
+                row is None
+                or row.request_id != request_id
+                or row.lease_generation != lease_generation
+            ):
                 session.rollback()
                 return False
             row.state = "failed"
@@ -711,12 +803,20 @@ def _mark_panic_uncertain(
         ) from exc
 
 
-def _discard_panic_receipt(app: FastAPI, request_id: str) -> bool:
+def _discard_panic_receipt(
+    app: FastAPI,
+    request_id: str,
+    lease_generation: int,
+) -> bool:
     try:
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             row = session.get(PanicReceipt, "alpaca-paper")
-            if row is None or row.request_id != request_id:
+            if (
+                row is None
+                or row.request_id != request_id
+                or row.lease_generation != lease_generation
+            ):
                 session.rollback()
                 return False
             session.delete(row)
@@ -793,7 +893,10 @@ async def _wait_for_panic_receipt(
             return _policy_store_error_response(request)
         if (
             snapshot is not None
-            and snapshot.request_id != observed.owner
+            and (
+                snapshot.request_id != observed.owner
+                or snapshot.lease_generation != observed.generation
+            )
         ):
             return _panic_incomplete_response(request)
         if snapshot is not None and snapshot.state != "started":
@@ -849,41 +952,78 @@ async def _maintain_lease(
         _LEASE_RENEW_INTERVAL_SECONDS,
         max(0.01, _LEASE_TTL_SECONDS / 3),
     )
+    retry_delay = min(0.025, interval)
     while True:
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
             return None
         except TimeoutError:
             pass
-        try:
-            renewed = await _offload(
-                app.state.leases.renew,
-                hold.resource_key,
-                owner=hold.owner,
-                generation=hold.generation,
-                ttl_seconds=_LEASE_TTL_SECONDS,
-            )
-        except LimitStoreUnavailable:
-            return "store"
-        if (
-            not renewed.acquired
-            or renewed.owner != hold.owner
-            or renewed.generation != hold.generation
-        ):
-            return "lost"
-        hold.expires_at = renewed.expires_at
-        if panic_request_id is not None:
+        while True:
+            remaining = (hold.expires_at - utcnow()).total_seconds()
+            if remaining <= 0:
+                return "store"
             try:
-                receipt_renewed = await _offload(
-                    _renew_panic_receipt,
-                    app,
-                    panic_request_id,
-                    renewed.expires_at,
+                renewed = await _offload(
+                    app.state.leases.renew,
+                    hold.resource_key,
+                    owner=hold.owner,
+                    generation=hold.generation,
+                    ttl_seconds=_LEASE_TTL_SECONDS,
                 )
             except LimitStoreUnavailable:
-                return "store"
-            if not receipt_renewed:
+                await asyncio.sleep(min(retry_delay, remaining))
+                retry_delay = min(
+                    retry_delay * 2,
+                    _PANIC_POLL_MAX_SECONDS,
+                )
+                continue
+            if (
+                not renewed.acquired
+                or renewed.owner != hold.owner
+                or renewed.generation != hold.generation
+            ):
                 return "lost"
+            hold.expires_at = renewed.expires_at
+            if panic_request_id is not None:
+                try:
+                    receipt_renewed = await _offload(
+                        _renew_panic_receipt,
+                        app,
+                        panic_request_id,
+                        hold.generation,
+                        renewed.expires_at,
+                    )
+                except LimitStoreUnavailable:
+                    await asyncio.sleep(
+                        min(
+                            retry_delay,
+                            max(
+                                0.0,
+                                (
+                                    hold.expires_at - utcnow()
+                                ).total_seconds(),
+                            ),
+                        )
+                    )
+                    retry_delay = min(
+                        retry_delay * 2,
+                        _PANIC_POLL_MAX_SECONDS,
+                    )
+                    continue
+                if not receipt_renewed:
+                    return "lost"
+            retry_delay = min(0.025, interval)
+            break
+
+
+async def _await_task_shielded(task: asyncio.Task):
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
 
 
 async def _call_with_lease_renewal(
@@ -904,24 +1044,36 @@ async def _call_with_lease_renewal(
             panic_request_id=panic_request_id,
         )
     )
-    done, _pending = await asyncio.wait(
-        {handler, renewal},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if handler in done:
+    renewal_result: Literal["lost", "store"] | None = None
+    try:
+        done, _pending = await asyncio.wait(
+            {handler, renewal},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if renewal in done:
+            renewal_result = renewal.result()
+        response = await asyncio.shield(handler)
+    except asyncio.CancelledError:
+        try:
+            await _await_task_shielded(handler)
+        except BaseException:
+            pass
         stop.set()
         try:
-            response = await handler
-        finally:
-            renewal_result = await renewal
-        return response, renewal_result
-
-    renewal_result = await renewal
-    handler.cancel()
-    try:
-        response = await handler
-    except asyncio.CancelledError:
-        return None, renewal_result
+            await _await_task_shielded(renewal)
+        except BaseException:
+            pass
+        raise
+    except BaseException:
+        stop.set()
+        try:
+            await _await_task_shielded(renewal)
+        except BaseException:
+            pass
+        raise
+    stop.set()
+    if renewal_result is None:
+        renewal_result = await renewal
     return response, renewal_result
 
 
@@ -951,6 +1103,7 @@ async def _mark_panic_uncertain_quietly(
             _mark_panic_uncertain,
             app,
             request_id,
+            lease_generation=hold.generation,
             response=response,
             expires_at=hold.expires_at,
         )
@@ -978,6 +1131,64 @@ async def _release_lease(
         return False
 
 
+async def _mark_interlock_uncertain(
+    app: FastAPI,
+    hold: _LeaseHold,
+    *,
+    outcome_code: str,
+    worker_finished: bool,
+) -> bool:
+    try:
+        return await _offload(
+            app.state.mutation_interlocks.mark_uncertain,
+            hold.resource_key,
+            owner=hold.owner,
+            generation=hold.generation,
+            outcome_code=outcome_code,
+            worker_finished=worker_finished,
+        )
+    except LimitStoreUnavailable:
+        return False
+
+
+async def _settle_and_release_interlock(
+    app: FastAPI,
+    hold: _LeaseHold,
+) -> Literal["settle", "release"] | None:
+    try:
+        settled = await _offload(
+            app.state.mutation_interlocks.settle,
+            hold.resource_key,
+            owner=hold.owner,
+            generation=hold.generation,
+            outcome_code="handler_completed",
+        )
+    except LimitStoreUnavailable:
+        return "settle"
+    if not settled:
+        return "settle"
+    try:
+        released = await _offload(
+            app.state.mutation_interlocks.release_settled,
+            hold.resource_key,
+            owner=hold.owner,
+            generation=hold.generation,
+        )
+    except LimitStoreUnavailable:
+        return "release"
+    return None if released else "release"
+
+
+async def _inspect_interlock(
+    app: FastAPI,
+    resource_key: str,
+) -> InterlockDecision | None:
+    return await _offload(
+        app.state.mutation_interlocks.inspect,
+        resource_key,
+    )
+
+
 def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
     registry = RoutePolicyRegistry()
     app.state.route_policy_registry = registry
@@ -987,6 +1198,10 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         )
     if getattr(app.state, "leases", None) is None:
         app.state.leases = ConcurrencyLeaseService(
+            app.state.session_auth.session_factory
+        )
+    if getattr(app.state, "mutation_interlocks", None) is None:
+        app.state.mutation_interlocks = MutationInterlockService(
             app.state.session_auth.session_factory
         )
 
@@ -1061,6 +1276,70 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 ),
                 headers=_rate_headers(app, policy, decision),
             )
+        lease_keys = _lease_keys(
+            app,
+            resolved,
+            limit_principal=limit_principal,
+        )
+        reconciliation_target: InterlockDecision | None = None
+        if policy.requires_idempotency:
+            try:
+                if policy.path == "/reconcile":
+                    control = await _inspect_interlock(
+                        app,
+                        _reconciliation_control_key(),
+                    )
+                    if control is not None:
+                        return _interlock_denial_response(
+                            request,
+                            policy,
+                        )
+                existing_interlock = await _inspect_interlock(
+                    app,
+                    lease_keys[0],
+                )
+            except LimitStoreUnavailable:
+                return _policy_store_error_response(request)
+            if existing_interlock is not None:
+                if (
+                    policy.concurrency_behavior == "coalesce_panic"
+                    and existing_interlock.state == "active"
+                ):
+                    try:
+                        observed = await _offload(
+                            app.state.leases.inspect,
+                            lease_keys[0],
+                        )
+                    except LimitStoreUnavailable:
+                        return _policy_store_error_response(request)
+                    if (
+                        observed.acquired
+                        and observed.owner
+                        == existing_interlock.owner
+                        and observed.generation
+                        == existing_interlock.generation
+                    ):
+                        return await _wait_for_panic_receipt(
+                            app,
+                            request,
+                            lease_key=lease_keys[0],
+                            observed=observed,
+                        )
+                    return _panic_incomplete_response(request)
+                if (
+                    policy.path == "/reconcile"
+                    and existing_interlock.operation
+                    == "portfolio_reconcile"
+                    and existing_interlock.worker_finished_at
+                    is not None
+                ):
+                    reconciliation_target = existing_interlock
+                    lease_keys = [_reconciliation_control_key()]
+                else:
+                    return _interlock_denial_response(
+                        request,
+                        policy,
+                    )
         if policy.concurrency_behavior == "coalesce_panic":
             try:
                 existing = await _offload(_panic_snapshot, app)
@@ -1076,11 +1355,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         hold: _LeaseHold | None = None
         contentions: list[tuple[str, LeaseDecision]] = []
         try:
-            for lease_key in _lease_keys(
-                app,
-                resolved,
-                limit_principal=limit_principal,
-            ):
+            for lease_key in lease_keys:
                 lease = await _offload(
                     app.state.leases.acquire,
                     lease_key,
@@ -1126,6 +1401,21 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 ),
                 headers=headers,
             )
+        if policy.requires_idempotency:
+            try:
+                interlock = await _offload(
+                    app.state.mutation_interlocks.claim,
+                    hold.resource_key,
+                    owner=hold.owner,
+                    generation=hold.generation,
+                    operation=policy.mutation_operation or "",
+                )
+            except (LimitStoreUnavailable, ValueError):
+                await _release_lease(app, hold)
+                return _policy_store_error_response(request)
+            if not interlock.acquired:
+                await _release_lease(app, hold)
+                return _interlock_denial_response(request, policy)
         panic_request_id = (
             owner
             if policy.concurrency_behavior == "coalesce_panic"
@@ -1137,13 +1427,24 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     _start_panic_receipt,
                     app,
                     panic_request_id,
+                    hold.generation,
                     hold.expires_at,
                 )
             except LimitStoreUnavailable:
-                await _release_lease(app, hold)
+                await _mark_interlock_uncertain(
+                    app,
+                    hold,
+                    outcome_code="panic_settlement_unproven",
+                    worker_finished=True,
+                )
                 return _policy_store_error_response(request)
             if not claim.claimed:
-                await _release_lease(app, hold)
+                await _mark_interlock_uncertain(
+                    app,
+                    hold,
+                    outcome_code="panic_settlement_unproven",
+                    worker_finished=True,
+                )
                 if claim.snapshot.state != "started":
                     return _panic_response(request, claim.snapshot)
                 return _panic_incomplete_response(request)
@@ -1156,7 +1457,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 hold,
                 panic_request_id=panic_request_id,
             )
-        except BaseException:
+        except BaseException as exc:
             if panic_request_id is not None:
                 await _mark_panic_uncertain_quietly(
                     app,
@@ -1164,10 +1465,22 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     panic_request_id,
                     None,
                 )
-            await _release_lease(app, hold)
+            if policy.requires_idempotency:
+                await _mark_interlock_uncertain(
+                    app,
+                    hold,
+                    outcome_code=(
+                        "request_cancelled"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "handler_failed"
+                    ),
+                    worker_finished=True,
+                )
+            else:
+                await _release_lease(app, hold)
             raise
 
-        if response is None:
+        if renewal_failure is not None:
             if panic_request_id is not None:
                 await _mark_panic_uncertain_quietly(
                     app,
@@ -1175,17 +1488,22 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     panic_request_id,
                     None,
                 )
-            await _release_lease(app, hold)
-            if renewal_failure == "store":
-                return _policy_store_error_response(request)
-            return _policy_error_response(
-                request,
-                ApiError(
-                    "route_lease_lost",
-                    503,
-                    "Request lease ownership was lost",
-                ),
+            if policy.requires_idempotency:
+                await _mark_interlock_uncertain(
+                    app,
+                    hold,
+                    outcome_code=(
+                        "lease_renewal_unproven"
+                        if renewal_failure == "store"
+                        else "lease_ownership_lost"
+                    ),
+                    worker_finished=True,
+                )
+            _LOG.error(
+                "route_lease_renewal_uncertain request_id=%s",
+                request.state.request_id,
             )
+            return response
 
         durable_response = None
         settlement_succeeded = True
@@ -1201,12 +1519,14 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         _discard_panic_receipt,
                         app,
                         panic_request_id,
+                        hold.generation,
                     )
                 else:
                     await _offload(
                         _finish_panic_receipt,
                         app,
                         panic_request_id,
+                        lease_generation=hold.generation,
                         response=durable_response,
                         expires_at=hold.expires_at,
                     )
@@ -1219,21 +1539,73 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     panic_request_id,
                     durable_response,
                 )
-
-        released = await _release_lease(app, hold)
-        cleanup_uncertain = renewal_failure is not None or not released
-        if cleanup_uncertain:
-            if panic_request_id is not None:
-                await _mark_panic_uncertain_quietly(
+                await _mark_interlock_uncertain(
                     app,
                     hold,
-                    panic_request_id,
-                    durable_response,
+                    outcome_code="panic_settlement_unproven",
+                    worker_finished=True,
                 )
-            _LOG.error(
-                "route_lease_cleanup_uncertain request_id=%s",
-                request.state.request_id,
+                return response
+
+        if reconciliation_target is not None:
+            proof = getattr(
+                request.state,
+                "mutation_reconciliation_proof",
+                None,
             )
+            if proof == "portfolio_truth_reconciled":
+                try:
+                    await _offload(
+                        app.state.mutation_interlocks.reconcile_clear,
+                        reconciliation_target.resource_key,
+                        owner=reconciliation_target.owner,
+                        generation=reconciliation_target.generation,
+                        actor=principal.actor,
+                        request_id=request.state.request_id,
+                        evidence_code=proof,
+                        worker_termination_proven=False,
+                    )
+                except LimitStoreUnavailable:
+                    _LOG.error(
+                        "mutation_reconciliation_store_unavailable "
+                        "request_id=%s",
+                        request.state.request_id,
+                    )
+
+        if policy.requires_idempotency:
+            cleanup_failure = await _settle_and_release_interlock(
+                app,
+                hold,
+            )
+            if cleanup_failure is not None:
+                await _mark_interlock_uncertain(
+                    app,
+                    hold,
+                    outcome_code=(
+                        "interlock_settlement_unproven"
+                        if cleanup_failure == "settle"
+                        else "lease_release_unproven"
+                    ),
+                    worker_finished=True,
+                )
+                if panic_request_id is not None:
+                    await _mark_panic_uncertain_quietly(
+                        app,
+                        hold,
+                        panic_request_id,
+                        durable_response,
+                    )
+                _LOG.error(
+                    "route_interlock_cleanup_uncertain request_id=%s",
+                    request.state.request_id,
+                )
+        else:
+            released = await _release_lease(app, hold)
+            if not released:
+                _LOG.error(
+                    "route_lease_cleanup_uncertain request_id=%s",
+                    request.state.request_id,
+                )
         return response
 
     app.router.add_event_handler(

@@ -15,7 +15,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from trading_assistant.db.models import (
+    AuditEvent,
     ConcurrencyLease,
+    MutationInterlock,
     RateWindow,
     utcnow,
 )
@@ -77,6 +79,54 @@ class LeaseDecision:
     expires_at: datetime
     generation: int
     retry_after_seconds: int
+
+
+@dataclass(frozen=True)
+class InterlockDecision:
+    acquired: bool
+    resource_key: str
+    owner: str
+    generation: int
+    operation: str
+    state: str
+    outcome_code: str
+    worker_finished_at: datetime | None
+
+
+_MUTATION_OPERATIONS = frozenset(
+    {
+        "order_approve",
+        "order_reject",
+        "breaker_reset",
+        "order_cancel",
+        "portfolio_reconcile",
+        "order_sync",
+        "panic",
+        "analysis",
+        "plan_approve",
+        "plan_cancel",
+        "proposal_batch",
+        "backtest",
+    }
+)
+_UNCERTAIN_OUTCOMES = frozenset(
+    {
+        "request_cancelled",
+        "handler_failed",
+        "lease_renewal_unproven",
+        "lease_ownership_lost",
+        "panic_settlement_unproven",
+        "lease_release_unproven",
+        "interlock_settlement_unproven",
+    }
+)
+_RECONCILIATION_EVIDENCE = frozenset(
+    {
+        "broker_truth_reconciled",
+        "portfolio_truth_reconciled",
+        "domain_truth_reconciled",
+    }
+)
 
 
 def _bucket_key(
@@ -430,25 +480,25 @@ class ConcurrencyLeaseService:
     ) -> LeaseDecision:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
-        current = _as_utc(now)
-        expires_at = current + timedelta(seconds=ttl_seconds)
-        statement = (
-            update(ConcurrencyLease)
-            .where(
-                ConcurrencyLease.resource_key == resource_key,
-                ConcurrencyLease.owner == owner,
-                ConcurrencyLease.generation == generation,
-                ConcurrencyLease.expires_at > current,
-            )
-            .values(expires_at=expires_at)
-            .returning(
-                ConcurrencyLease.owner,
-                ConcurrencyLease.expires_at,
-                ConcurrencyLease.generation,
-            )
-        )
         with _store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
+            current = _as_utc(now)
+            expires_at = current + timedelta(seconds=ttl_seconds)
+            statement = (
+                update(ConcurrencyLease)
+                .where(
+                    ConcurrencyLease.resource_key == resource_key,
+                    ConcurrencyLease.owner == owner,
+                    ConcurrencyLease.generation == generation,
+                    ConcurrencyLease.expires_at > current,
+                )
+                .values(expires_at=expires_at)
+                .returning(
+                    ConcurrencyLease.owner,
+                    ConcurrencyLease.expires_at,
+                    ConcurrencyLease.generation,
+                )
+            )
             row = session.execute(statement).one_or_none()
             if row is None:
                 session.rollback()
@@ -481,22 +531,25 @@ class ConcurrencyLeaseService:
         *,
         owner: str,
         generation: int,
+        now: datetime | None = None,
     ) -> bool:
-        statement = (
-            update(ConcurrencyLease)
-            .where(
-                ConcurrencyLease.resource_key == resource_key,
-                ConcurrencyLease.owner == owner,
-                ConcurrencyLease.generation == generation,
-            )
-            .values(
-                owner="",
-                expires_at=_RELEASED_AT,
-                generation=ConcurrencyLease.generation + 1,
-            )
-        )
         with _store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
+            current = _as_utc(now)
+            statement = (
+                update(ConcurrencyLease)
+                .where(
+                    ConcurrencyLease.resource_key == resource_key,
+                    ConcurrencyLease.owner == owner,
+                    ConcurrencyLease.generation == generation,
+                    ConcurrencyLease.expires_at > current,
+                )
+                .values(
+                    owner="",
+                    expires_at=_RELEASED_AT,
+                    generation=ConcurrencyLease.generation + 1,
+                )
+            )
             result = session.execute(statement)
             session.commit()
             return result.rowcount == 1
@@ -571,3 +624,297 @@ class ConcurrencyLeaseService:
             )
             session.commit()
             return result.rowcount
+
+
+class MutationInterlockService:
+    """Durable, non-expiring fence for a protected domain mutation."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
+    def claim(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        operation: str,
+    ) -> InterlockDecision:
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        if operation not in _MUTATION_OPERATIONS:
+            raise ValueError("unsupported mutation operation")
+
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            statement = (
+                sqlite_insert(MutationInterlock)
+                .values(
+                    resource_key=resource_key,
+                    owner=owner,
+                    generation=generation,
+                    operation=operation,
+                    state="active",
+                    outcome_code="",
+                    worker_finished_at=None,
+                    created_at=utcnow(),
+                    updated_at=utcnow(),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[MutationInterlock.resource_key]
+                )
+                .returning(MutationInterlock.resource_key)
+            )
+            inserted = session.execute(statement).one_or_none()
+            if inserted is None:
+                existing = session.get(MutationInterlock, resource_key)
+                session.rollback()
+                if existing is None:
+                    raise LimitStoreUnavailable(
+                        "durable interlock conflict could not be observed"
+                    )
+                return self._decision(existing, acquired=False)
+            created = session.get(MutationInterlock, resource_key)
+            if created is None:
+                session.rollback()
+                raise LimitStoreUnavailable(
+                    "durable interlock insert could not be observed"
+                )
+            decision = self._decision(created, acquired=True)
+            session.commit()
+            return decision
+
+    def inspect(self, resource_key: str) -> InterlockDecision | None:
+        if not resource_key or len(resource_key) > 128:
+            raise ValueError("invalid interlock resource key")
+        with _store_session(self._session_factory) as session:
+            row = session.get(MutationInterlock, resource_key)
+            return (
+                None
+                if row is None
+                else self._decision(row, acquired=False)
+            )
+
+    def settle(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        outcome_code: str,
+    ) -> bool:
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        if outcome_code != "handler_completed":
+            raise ValueError("unsupported settled outcome")
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            current = utcnow()
+            result = session.execute(
+                update(MutationInterlock)
+                .where(
+                    MutationInterlock.resource_key == resource_key,
+                    MutationInterlock.owner == owner,
+                    MutationInterlock.generation == generation,
+                    MutationInterlock.state == "active",
+                )
+                .values(
+                    state="settled",
+                    outcome_code=outcome_code,
+                    worker_finished_at=current,
+                    updated_at=current,
+                )
+            )
+            session.commit()
+            return result.rowcount == 1
+
+    def mark_uncertain(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        outcome_code: str,
+        worker_finished: bool,
+    ) -> bool:
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        if outcome_code not in _UNCERTAIN_OUTCOMES:
+            raise ValueError("unsupported uncertain outcome")
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = session.get(MutationInterlock, resource_key)
+            if (
+                row is None
+                or row.owner != owner
+                or row.generation != generation
+            ):
+                session.rollback()
+                return False
+            current = utcnow()
+            row.state = "uncertain"
+            row.outcome_code = outcome_code
+            if worker_finished:
+                row.worker_finished_at = current
+            row.updated_at = current
+            session.commit()
+            return True
+
+    def release_settled(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically release an exact live lease and delete its settled latch."""
+
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            current = _as_utc(now)
+            released = session.execute(
+                update(ConcurrencyLease)
+                .where(
+                    ConcurrencyLease.resource_key == resource_key,
+                    ConcurrencyLease.owner == owner,
+                    ConcurrencyLease.generation == generation,
+                    ConcurrencyLease.expires_at > current,
+                )
+                .values(
+                    owner="",
+                    expires_at=_RELEASED_AT,
+                    generation=ConcurrencyLease.generation + 1,
+                )
+            )
+            if released.rowcount != 1:
+                session.rollback()
+                return False
+            cleared = session.execute(
+                delete(MutationInterlock).where(
+                    MutationInterlock.resource_key == resource_key,
+                    MutationInterlock.owner == owner,
+                    MutationInterlock.generation == generation,
+                    MutationInterlock.state == "settled",
+                    MutationInterlock.outcome_code
+                    == "handler_completed",
+                    MutationInterlock.worker_finished_at.is_not(None),
+                )
+            )
+            if cleared.rowcount != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
+    def reconcile_clear(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        actor: str,
+        request_id: str,
+        evidence_code: str,
+        worker_termination_proven: bool,
+    ) -> bool:
+        """Clear an exact latch with proven truth and an atomic audit event."""
+
+        self._validate_identity(
+            resource_key,
+            owner=owner,
+            generation=generation,
+        )
+        if evidence_code not in _RECONCILIATION_EVIDENCE:
+            raise ValueError("unsupported reconciliation evidence")
+        if (
+            not actor
+            or len(actor) > 128
+            or not request_id
+            or len(request_id) > 64
+        ):
+            raise ValueError("invalid reconciliation audit identity")
+
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = session.get(MutationInterlock, resource_key)
+            if (
+                row is None
+                or row.owner != owner
+                or row.generation != generation
+                or (
+                    row.worker_finished_at is None
+                    and not worker_termination_proven
+                )
+            ):
+                session.rollback()
+                return False
+            session.add(
+                AuditEvent(
+                    actor=actor,
+                    action="mutation_interlock.reconcile",
+                    target_type="mutation_interlock",
+                    target_id=hashlib.sha256(
+                        resource_key.encode("utf-8")
+                    ).hexdigest(),
+                    request_id=request_id,
+                    idempotency_key="",
+                    reason=evidence_code,
+                    result_code="cleared",
+                    latency_ms=0,
+                    detail_json="{}",
+                    created_at=utcnow(),
+                )
+            )
+            session.delete(row)
+            session.commit()
+            return True
+
+    @staticmethod
+    def _validate_identity(
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+    ) -> None:
+        if not resource_key or len(resource_key) > 128:
+            raise ValueError("invalid interlock resource key")
+        if not owner or len(owner) > 64:
+            raise ValueError("invalid interlock owner")
+        if generation < 0:
+            raise ValueError("invalid interlock generation")
+
+    @staticmethod
+    def _decision(
+        row: MutationInterlock,
+        *,
+        acquired: bool,
+    ) -> InterlockDecision:
+        return InterlockDecision(
+            acquired=acquired,
+            resource_key=row.resource_key,
+            owner=row.owner,
+            generation=row.generation,
+            operation=row.operation,
+            state=row.state,
+            outcome_code=row.outcome_code,
+            worker_finished_at=row.worker_finished_at,
+        )
