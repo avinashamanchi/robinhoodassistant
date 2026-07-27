@@ -23,6 +23,7 @@ from trading_assistant.backtest.llm_runner import (
 )
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.signals.models import (
+    Bar,
     EventTag,
     EventType,
     MarketFeatures,
@@ -115,6 +116,137 @@ def test_response_cache():
     cache.put("backtest:decision-one", feat, report)
     assert cache.get("backtest:decision-one", feat) is report
     assert cache.get("backtest:decision-two", feat) is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"days_to_next_earnings": 7},
+        {"adx_14": 24.5},
+        {
+            "external_holdings": [
+                {"ticker": "MSFT", "value": "1000", "source": "external"}
+            ]
+        },
+    ],
+    ids=["earnings", "adx", "external-holdings"],
+)
+def test_response_cache_misses_when_prompt_visible_omitted_field_changes(
+    update,
+):
+    cache = ResponseCache()
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+    )
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.HOLD,
+        confidence=0.5,
+        thesis="hold",
+        cited_concepts=["Trend"],
+        regime_note="range",
+    )
+    cache.put("backtest:prompt-visible", features, report)
+
+    changed = features.model_copy(update=update)
+
+    assert cache.get("backtest:prompt-visible", changed) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "before", "after"),
+    [
+        ("last_close", 100.001, 100.002),
+        ("rsi_14", 45.01, 45.02),
+        ("sma_50", 200.001, 200.002),
+    ],
+)
+def test_response_cache_misses_on_sub_rounding_prompt_value_change(
+    field,
+    before,
+    after,
+):
+    cache = ResponseCache()
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+    ).model_copy(update={field: before})
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.HOLD,
+        confidence=0.5,
+        thesis="hold",
+        cited_concepts=["Trend"],
+        regime_note="range",
+    )
+    cache.put("backtest:exact-numeric", features, report)
+
+    changed = features.model_copy(update={field: after})
+
+    assert cache.get("backtest:exact-numeric", changed) is None
+
+
+def test_response_cache_may_hit_when_only_recent_bars_change():
+    cache = ResponseCache()
+    first_bar = Bar(
+        ts=TS,
+        open=99.0,
+        high=101.0,
+        low=98.0,
+        close=100.0,
+        volume=1_000.0,
+    )
+    second_bar = Bar(
+        ts=TS,
+        open=90.0,
+        high=110.0,
+        low=80.0,
+        close=105.0,
+        volume=2_000.0,
+    )
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        recent_bars=[first_bar],
+    )
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.HOLD,
+        confidence=0.5,
+        thesis="hold",
+        cited_concepts=["Trend"],
+        regime_note="range",
+    )
+    cache.put("backtest:recent-bars-excluded", features, report)
+
+    changed = features.model_copy(update={"recent_bars": [second_bar]})
+
+    assert cache.get("backtest:recent-bars-excluded", changed) is report
+
+
+@pytest.mark.parametrize(
+    "non_finite",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_response_cache_rejects_non_finite_prompt_payload(non_finite):
+    cache = ResponseCache()
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        last_close=non_finite,
+    )
+
+    with pytest.raises(ValueError, match="finite JSON"):
+        cache.get("backtest:finite-json", features)
 
 
 def test_spot_check_records_disagreement():

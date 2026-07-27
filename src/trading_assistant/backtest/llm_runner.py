@@ -62,17 +62,23 @@ def _triggered(features: MarketFeatures, config: LLMRunConfig) -> bool:
 
 
 def _features_hash(features: MarketFeatures) -> str:
-    parts = (
-        _normalized_symbol(features.symbol),
-        _canonical_utc_timestamp(features.as_of),
-        round(features.last_close or 0, 2),
-        round(features.rsi_14 or 0, 1),
-        round(features.sma_50 or 0, 2),
-        round(features.sma_200 or 0, 2),
-        features.regime.value if features.regime else "none",
-        tuple(sorted(e.type.value for e in features.events)),
+    payload = features.model_dump(
+        mode="json",
+        exclude={"recent_bars"},
     )
-    return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+    try:
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except ValueError:
+        raise ValueError(
+            "MarketFeatures prompt payload must contain finite JSON"
+        ) from None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _normalized_text(field: str, value: str) -> str:

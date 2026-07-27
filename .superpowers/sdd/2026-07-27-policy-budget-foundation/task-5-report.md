@@ -506,3 +506,114 @@ Tests:
 ### Concerns
 
 None.
+
+## Fix round 3
+
+### Status
+
+Completed the single cache-fingerprint correction from
+`task-5-review-3.md`. This section supersedes Fix round 2's feature
+fingerprint description; stable decision/run identity remains unchanged.
+
+### Correction
+
+- Replaced the rounded, eight-field feature subset with the exact public
+  prompt-visible payload:
+
+  ```python
+  features.model_dump(mode="json", exclude={"recent_bars"})
+  ```
+
+- The payload is serialized as sorted-key compact JSON with
+  `allow_nan=False`, then hashed with full SHA-256.
+- The cache key remains the tuple of stable decision/run request ID and this
+  feature digest.
+- Every prompt-visible field and exact JSON numeric value now participates in
+  cache identity. `recent_bars` remains deliberately excluded because the
+  Analyst prompt excludes it.
+- NaN and positive or negative infinity fail closed before cache use or an
+  Analyst/provider attempt.
+
+### Strict TDD evidence
+
+Focused RED command:
+
+```bash
+uv run pytest -q \
+  tests/test_llm_runner.py::test_response_cache_misses_when_prompt_visible_omitted_field_changes \
+  tests/test_llm_runner.py::test_response_cache_misses_on_sub_rounding_prompt_value_change \
+  tests/test_llm_runner.py::test_response_cache_may_hit_when_only_recent_bars_change \
+  tests/test_llm_runner.py::test_response_cache_rejects_non_finite_prompt_payload
+```
+
+Result:
+
+```text
+9 failed, 1 passed
+```
+
+The three formerly omitted-field cases, three below-old-rounding numeric
+changes, and three non-finite cases exposed the old fingerprint. The
+`recent_bars`-only case passed, confirming the deliberate prompt exclusion
+before production changes.
+
+### GREEN verification
+
+Focused affected suite:
+
+```bash
+uv run pytest -q \
+  tests/test_llm_runner.py tests/test_analyst.py \
+  tests/test_analyst_v2.py tests/test_news.py \
+  tests/test_launch_features.py
+```
+
+Result:
+
+```text
+66 passed
+```
+
+Final full suite, run once after focused GREEN and self-review:
+
+```bash
+uv run pytest -q
+```
+
+Result:
+
+```text
+1840 passed, 1 skipped, 1 warning
+```
+
+The warning remains the pre-existing `websockets.legacy` deprecation warning.
+`git diff --check` also exited `0` with no output.
+
+### Changed files
+
+Production:
+
+- `src/trading_assistant/backtest/llm_runner.py`
+
+Tests:
+
+- `tests/test_llm_runner.py`
+
+### Self-review
+
+- Mutating `days_to_next_earnings`, `adx_14`, or `external_holdings`
+  independently causes a cache miss.
+- Changes below the former rounding thresholds for `last_close`, `rsi_14`,
+  and `sma_50` independently cause cache misses.
+- Changing only `recent_bars` may reuse the cached report because that field
+  is absent from the Analyst prompt.
+- The expectation never calls Analyst's private `_prompt()` builder and does
+  not duplicate a hand-maintained feature-field allowlist.
+- Stable canonical decision/run identity remains the other cache-key
+  component, preserving same-run hits and different-run misses.
+- No production app/daemon process, broker/provider/LLM call, notification,
+  breaker reset, or order action was performed.
+
+### Concerns
+
+None.
