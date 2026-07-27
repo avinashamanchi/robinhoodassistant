@@ -63,15 +63,22 @@ def test_private_runtime_artifacts_are_gitignored():
     assert "*.db.submission.lock*" in rules
 
 
-def _static_fixture(tmp_path: Path) -> Path:
+def _static_fixture(
+    tmp_path: Path,
+    *,
+    policy_source: str | None = None,
+) -> Path:
     root = tmp_path / "fixture"
     static = root / "src" / "trading_assistant" / "app" / "static"
     static.mkdir(parents=True)
     app = static.parent
     (app / "policy.py").write_text(
-        "ROUTE_POLICIES = (\n"
-        "    RoutePolicy('GET', '/covered', AuthLevel.PUBLIC, 'read'),\n"
-        ")\n",
+        policy_source
+        or (
+            "ROUTE_POLICIES = (\n"
+            "    RoutePolicy('GET', '/covered', AuthLevel.PUBLIC, 'read'),\n"
+            ")\n"
+        ),
         encoding="utf-8",
     )
     (app / "main.py").write_text(
@@ -182,19 +189,19 @@ def test_release_static_gate_rejects_negative_fixtures(
         (
             "src/trading_assistant/unsafe_backend.py",
             "AnthropicBackend('key', 'model', 1)\n",
-            "raw LLM backend construction outside factory: "
+            "raw LLM backend reference outside factory: "
             "src/trading_assistant/unsafe_backend.py:1",
         ),
         (
             "src/trading_assistant/unsafe_backend.py",
             "GeminiBackend('key', 'model')\n",
-            "raw LLM backend construction outside factory: "
+            "raw LLM backend reference outside factory: "
             "src/trading_assistant/unsafe_backend.py:1",
         ),
         (
             "src/trading_assistant/unsafe_backend.py",
             "GroqBackend('key', 'model')\n",
-            "raw LLM backend construction outside factory: "
+            "raw LLM backend reference outside factory: "
             "src/trading_assistant/unsafe_backend.py:1",
         ),
         (
@@ -230,3 +237,151 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
 
     assert completed.returncode == 1
     assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected", "policy_source"),
+    [
+        (
+            "src/trading_assistant/app/main.py",
+            "expose = app.post\n\n"
+            "@expose('/uncovered')\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "route missing from ROUTE_POLICIES: POST /uncovered",
+            None,
+        ),
+        (
+            "src/trading_assistant/app/routers/unsafe.py",
+            "@router.route('/uncovered', methods=['DELETE'])\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "route missing from ROUTE_POLICIES: DELETE /uncovered",
+            None,
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "@expose('/uncovered')\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "unresolved route decorator: "
+            "src/trading_assistant/app/main.py:2",
+            None,
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "@app.get('/covered')\n"
+            "def covered():\n"
+            "    return None\n",
+            "noncanonical route policy path: "
+            "src/trading_assistant/app/policy.py:2",
+            "ROUTE_POLICIES = (\n"
+            "    RoutePolicy('GET', 'covered', AuthLevel.PUBLIC, 'read'),\n"
+            ")\n",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "@app.get('//covered')\n"
+            "def covered():\n"
+            "    return None\n",
+            "noncanonical route decorator path: "
+            "src/trading_assistant/app/main.py:2",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "def make(ctor=GroqBackend):\n"
+            "    return ctor()\n",
+            "raw LLM backend reference outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "constructors = [GeminiBackend]\n"
+            "constructors[0]()\n",
+            "raw LLM backend reference outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "from trading_assistant.llm.anthropic_backend import AnthropicBackend\n",
+            "raw LLM backend reference outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_limiter.py",
+            "import trading_assistant.app.ratelimit as old\n"
+            "old.RateLimiter()\n",
+            "deleted RateLimiter module import: "
+            "src/trading_assistant/unsafe_limiter.py:1",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_limiter.py",
+            "value = RateLimiter\n",
+            "deleted RateLimiter reference: "
+            "src/trading_assistant/unsafe_limiter.py:1",
+            None,
+        ),
+        (
+            "src/trading_assistant/unsafe_limiter.py",
+            "old.RateLimiter()\n",
+            "deleted RateLimiter reference: "
+            "src/trading_assistant/unsafe_limiter.py:1",
+            None,
+        ),
+    ],
+)
+def test_release_static_gate_rejects_fix_round_one_bypasses(
+    tmp_path,
+    relative_path,
+    source,
+    expected,
+    policy_source,
+):
+    root = _static_fixture(tmp_path, policy_source=policy_source)
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
+def test_release_static_gate_ignores_backend_and_rate_limiter_text(tmp_path):
+    root = _static_fixture(tmp_path)
+    target = root / "src" / "trading_assistant" / "safe_text.py"
+    target.write_text(
+        "# GroqBackend RateLimiter\n"
+        "message = 'GeminiBackend and RateLimiter are text'\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
