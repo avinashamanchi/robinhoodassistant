@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import AnyUrl, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AnyUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
@@ -260,6 +267,26 @@ class AppConfig(_Strict):
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+
+    @model_validator(mode="after")
+    def _require_one_reviewed_price_for_selected_model(self) -> AppConfig:
+        selected_models = {
+            "anthropic": self.llm.model,
+            "gemini": self.llm.gemini_model,
+            "groq": self.llm.groq_model,
+        }
+        selected_model = selected_models.get(self.llm.provider)
+        matches = [
+            price
+            for key, price in self.security.provider_budget.prices.items()
+            if key.split(":", maxsplit=1)[0] == self.llm.provider
+            and price.model == selected_model
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "selected LLM provider/model must have exactly one reviewed price"
+            )
+        return self
 
 
 class Secrets(BaseSettings):

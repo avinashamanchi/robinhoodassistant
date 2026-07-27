@@ -36,11 +36,22 @@ features:
   auto_execute_preapproved_rules: false
   telegram_notifications: false
 llm:
+  provider: gemini
   model: claude-sonnet-4-6
+  gemini_model: gemini-3.6-flash
   max_tokens: 4096
 daemon:
   poll_interval_seconds: 15
   use_websocket: true
+security:
+  provider_budget:
+    prices:
+      "gemini:gemini-3.6-flash":
+        model: gemini-3.6-flash
+        effective_date: 2026-07-09
+        input_usd_per_million: 1.50
+        output_usd_per_million: 7.50
+        source_url: https://ai.google.dev/gemini-api/docs/latest-model
 """
 
 FLOAT_RISK_LIMITS = (
@@ -137,6 +148,29 @@ def test_typo_in_nested_rate_limit_fails(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValidationError, match="window_second"):
+        load_config(path)
+
+
+def test_selected_model_without_price_record_fails_to_load(tmp_path):
+    raw = yaml.safe_load(Path("config.yaml").read_text())
+    raw["llm"]["gemini_model"] = "gemini-3.6-pro"
+    path = tmp_path / "unpriced-model.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValidationError, match="exactly one reviewed price"):
+        load_config(path)
+
+
+def test_duplicate_price_records_for_selected_model_fail_to_load(tmp_path):
+    raw = yaml.safe_load(Path("config.yaml").read_text())
+    prices = raw["security"]["provider_budget"]["prices"]
+    prices["gemini:reviewed-duplicate"] = dict(
+        prices["gemini:gemini-3.6-flash"]
+    )
+    path = tmp_path / "duplicate-price.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValidationError, match="exactly one reviewed price"):
         load_config(path)
 
 
