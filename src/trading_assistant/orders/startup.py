@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import re
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,6 +18,9 @@ from ..risk.submission_barrier import SubmissionBarrier
 
 class StartupReconciliationFailed(RuntimeError):
     """The newest runtime generation could not prove broker/local agreement."""
+
+
+_FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{2,63}\Z")
 
 
 def _context(
@@ -175,7 +179,7 @@ class StartupReconciliationGate:
     def fail(
         self,
         generation: int,
-        failure: str,
+        failure_code: str,
         *,
         evidence: dict,
         actor: str,
@@ -184,13 +188,13 @@ class StartupReconciliationGate:
     ) -> bool:
         """Persist a failure without allowing stale work to relock newer proof."""
         actor, reason, request_id = _context(actor, reason, request_id)
-        failure = failure.strip()
-        if not failure:
-            raise ValueError("startup reconciliation failure must be non-empty")
+        failure_code = failure_code.strip()
+        if _FAILURE_CODE.fullmatch(failure_code) is None:
+            raise ValueError("startup reconciliation failure code is invalid")
         if not self.enabled:
             return False
         now = datetime.now(timezone.utc)
-        detail = {**evidence, "failure": failure}
+        detail = {**evidence, "failure_code": failure_code}
         encoded_evidence = json.dumps(detail, sort_keys=True)
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
@@ -207,7 +211,7 @@ class StartupReconciliationGate:
                     .values(
                         status="failed",
                         actor=actor,
-                        reason=failure,
+                        reason=failure_code,
                         request_id=request_id,
                         evidence_json=encoded_evidence,
                         completed_at=None,
@@ -231,6 +235,33 @@ class StartupReconciliationGate:
                 )
                 session.commit()
                 return True
+
+    def posture(self) -> dict[str, object]:
+        """Return fixed safety state without exposing broker/provider detail."""
+        if not self.enabled:
+            return {
+                "status": "not_required",
+                "generation": 0,
+                "completed_generation": 0,
+                "failure_code": None,
+            }
+        with self.session_factory() as session:
+            state = session.get(StartupReconciliationState, self.broker_key)
+            if state is None:
+                return {
+                    "status": "required",
+                    "generation": 0,
+                    "completed_generation": 0,
+                    "failure_code": None,
+                }
+            return {
+                "status": state.status,
+                "generation": state.generation,
+                "completed_generation": state.completed_generation,
+                "failure_code": (
+                    state.reason if state.status == "failed" else None
+                ),
+            }
 
     def current_generation(self) -> int:
         if not self.enabled:

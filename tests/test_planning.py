@@ -2343,7 +2343,7 @@ def test_unresolved_plan_cancel_retries_and_blocks_startup(
 
     with pytest.raises(
         StartupReconciliationFailed,
-        match="broker order reconciliation failed",
+        match="broker_reconciliation_failed",
     ):
         restarted.reconcile_startup_epoch(
             generation,

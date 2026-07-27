@@ -9,6 +9,7 @@
   </array>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>
   <key>Umask</key><integer>63</integer>
+  <key>Disabled</key><true/>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>

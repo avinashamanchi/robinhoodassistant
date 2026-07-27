@@ -1307,16 +1307,28 @@ class TradingService:
                 )
             except RequiredDependencyUnavailable:
                 evidence["dependency"] = "unavailable"
-                failure = "required broker reconciliation dependency unavailable"
+                failure_code = "broker_reconciliation_dependency_unavailable"
                 self.startup_reconciliation.fail(
                     target_generation,
-                    failure,
+                    failure_code,
                     evidence=evidence,
                     actor=actor,
                     reason=reason,
                     request_id=request_id,
                 )
-                raise StartupReconciliationFailed(failure) from None
+                raise StartupReconciliationFailed(failure_code) from None
+            except Exception:
+                self.startup_reconciliation.fail(
+                    target_generation,
+                    "broker_reconciliation_failed",
+                    evidence=evidence,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                raise StartupReconciliationFailed(
+                    "broker_reconciliation_failed"
+                ) from None
 
             evidence.update(
                 {
@@ -1347,16 +1359,17 @@ class TradingService:
                     f"{remaining_plan_cancels}"
                 )
             if faults:
-                failure = " | ".join(str(fault) for fault in faults[:3])
                 self.startup_reconciliation.fail(
                     target_generation,
-                    failure,
+                    "broker_reconciliation_failed",
                     evidence=evidence,
                     actor=actor,
                     reason=reason,
                     request_id=request_id,
                 )
-                raise StartupReconciliationFailed(failure)
+                raise StartupReconciliationFailed(
+                    "broker_reconciliation_failed"
+                )
 
             if not self.startup_reconciliation.complete(
                 target_generation,

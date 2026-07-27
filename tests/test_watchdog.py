@@ -362,7 +362,7 @@ def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
     )
 
     assert watchdog.main([]) == 0
-    assert observed_urls == ["http://127.0.0.1:8000/health/live"]
+    assert observed_urls == ["https://localhost:8020/health/live"]
     assert restarted == []
 
 
@@ -487,7 +487,7 @@ def test_fetch_health_decodes_text_and_rejects_nested_duplicate_members(
         lambda url, timeout: BytesIO(body),
     )
 
-    assert watchdog.fetch_health("http://127.0.0.1/health/live") is None
+    assert watchdog.fetch_health("https://localhost:8020/health/live") is None
     assert observed["value_type"] is str
     hook = observed["object_pairs_hook"]
     assert callable(hook)
@@ -584,7 +584,7 @@ def test_main_liveness_failure_restarts_app_only_and_sanitizes_error(
     )
 
     assert watchdog.main([]) == 1
-    assert observed_urls == ["http://127.0.0.1:8000/health/live"]
+    assert observed_urls == ["https://localhost:8020/health/live"]
     assert restarted == ["com.trading.app"]
     captured = capsys.readouterr()
     assert marker not in captured.out
@@ -818,10 +818,14 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
     assert (
         "emit_periodic com.trading.watchdog 60 "
         '"$PY" -m trading_assistant.ops.watchdog '
-        "--health-url http://127.0.0.1:8000/health/live"
+        "--health-url https://localhost:8020/health/live"
     ) in install
-    assert "curl -s http://127.0.0.1:8000/health/live" in install
-    assert "curl -s http://127.0.0.1:8000/health/live" in start
+    assert "curl --fail --silent https://localhost:8020/health/live" in install
+    assert "trading_assistant.ops.serve" in install
+    assert "trading_assistant.ops.serve" in start
+    assert "trading_assistant.daemon.main" not in start
+    assert "pkill" not in start
+    assert "pkill" not in Path("scripts/stop.sh").read_text(encoding="utf-8")
     assert "umask 077" in install
     assert "umask 077" in start
     assert "<key>Umask</key><integer>63</integer>" in install
@@ -841,11 +845,11 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
     assert "logs/app.runtime.log" in install
     assert "> /dev/null 2>&1" in start
     assert "logs/app.runtime.log" in start
-    assert "logs/daemon.runtime.log" in start
+    assert "logs/daemon.runtime.log" not in start
     assert "logs/app.log" not in start
     assert "logs/daemon.log" not in start
-    assert "http://127.0.0.1:8000/health " not in install
-    assert "http://127.0.0.1:8000/health " not in start
+    assert "http://127.0.0.1:8000" not in install
+    assert "http://127.0.0.1:8000" not in start
     assert "/tmp/trading-app.err" not in operations
     assert "./scripts/launchd/install.sh" in operations
     assert "<key>Umask</key><integer>63</integer>" in operations

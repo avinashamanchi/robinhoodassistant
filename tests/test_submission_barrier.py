@@ -699,7 +699,7 @@ def _position_reconciliation_process(
                     planning=object(),
                     api_token="process-operator-secret",
                 ),
-                base_url="https://testserver",
+                base_url="https://localhost:8020",
             )
             login = client.post(
                 "/auth/login",

@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--health-url",
-        default="http://127.0.0.1:8000/health/live",
+        default="https://localhost:8020/health/live",
     )
     parser.add_argument("--label", default="com.trading.daemon")
     parser.add_argument("--request-timeout", type=float, default=5.0)

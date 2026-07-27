@@ -89,7 +89,7 @@ def test_provider_exception_text_is_not_returned(make_service):
     )
     with TestClient(
         app,
-        base_url="https://testserver",
+        base_url="https://localhost:8020",
         raise_server_exceptions=False,
     ) as client:
         login = client.post("/auth/login", json={"secret": TOKEN})

@@ -69,7 +69,7 @@ def _default_test_clients_to_tls(monkeypatch):
     original_init = StarletteTestClient.__init__
 
     def tls_init(self, *args, **kwargs):
-        kwargs.setdefault("base_url", "https://testserver")
+        kwargs.setdefault("base_url", "https://localhost:8020")
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(StarletteTestClient, "__init__", tls_init)
@@ -256,7 +256,7 @@ def authenticated_client(make_service, operator_token, authenticate_client):
         api_token=operator_token,
         planning=None,
     )
-    client = TestClient(app, base_url="https://localhost")
+    client = TestClient(app, base_url="https://localhost:8020")
     client.trading_service = service
     return authenticate_client(client)
 

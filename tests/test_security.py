@@ -387,7 +387,7 @@ def test_blocked_boundary_audit_does_not_delay_exact_liveness(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="https://test",
+            base_url="https://localhost:8020",
         ) as client:
             login = await client.post(
                 "/auth/login",
@@ -515,46 +515,23 @@ def test_financial_get_endpoints_fail_closed(client):
     assert client.get("/log").status_code == 401
 
 
-def test_allowed_cors_preflight_has_security_headers_and_request_id(client):
+def test_cross_origin_preflight_is_rejected_without_cors_headers(client):
     response = client.options(
         "/approve/1",
         headers={
-            "Origin": "http://127.0.0.1:8000",
+            "Origin": "https://evil.example",
             "Access-Control-Request-Method": "POST",
             "Access-Control-Request-Headers": "x-csrf-token",
         },
     )
 
-    assert response.status_code == 200
-    assert (
-        response.headers["access-control-allow-origin"]
-        == "http://127.0.0.1:8000"
-    )
-    assert (
-        response.headers["access-control-allow-methods"]
-        == "GET, POST, OPTIONS"
-    )
-    assert {
-        value.strip().lower()
-        for value in response.headers[
-            "access-control-allow-headers"
-        ].split(",")
-    } == {
-        "accept",
-        "accept-language",
-        "content-language",
-        "content-type",
-        "idempotency-key",
-        "x-csrf-token",
-        "x-request-id",
-    }
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "origin_mismatch"
+    assert response.headers.get("access-control-allow-origin") is None
     assert response.headers.get("access-control-allow-credentials") is None
-    assert response.headers["Content-Security-Policy"]
-    assert response.headers["X-Request-ID"]
-    assert response.headers["Cache-Control"] == "no-store"
 
 
-def test_rejected_cors_preflight_has_stable_hardened_error(client):
+def test_foreign_origin_has_a_stable_perimeter_error(client):
     response = client.options(
         "/approve/1",
         headers={
@@ -567,20 +544,11 @@ def test_rejected_cors_preflight_has_stable_hardened_error(client):
     assert response.status_code == 403
     assert response.headers.get("access-control-allow-origin") is None
     assert response.headers.get("access-control-allow-credentials") is None
-    assert response.headers["Content-Security-Policy"]
-    assert response.headers["X-Request-ID"]
-    assert response.headers["Cache-Control"] == "no-store"
-    assert response.json() == {
-        "error": {
-            "code": "cors_rejected",
-            "message": "CORS preflight was rejected",
-            "request_id": response.headers["X-Request-ID"],
-        }
-    }
+    assert response.json()["error"]["code"] == "origin_mismatch"
 
 
-def test_allowed_cross_origin_response_grants_no_cookie_credentials(client):
-    origin = "http://localhost:8000"
+def test_cross_origin_authenticated_request_is_rejected_before_cookie_use(client):
+    origin = "https://evil.example"
     login = client.post(
         "/auth/login",
         json={"secret": TOKEN},
@@ -591,8 +559,9 @@ def test_allowed_cross_origin_response_grants_no_cookie_credentials(client):
 
     financial = client.get("/pending", headers={"Origin": origin})
 
-    assert financial.status_code == 200
-    assert financial.headers["access-control-allow-origin"] == origin
+    assert financial.status_code == 403
+    assert financial.json()["error"]["code"] == "origin_mismatch"
+    assert financial.headers.get("access-control-allow-origin") is None
     assert financial.headers.get("access-control-allow-credentials") is None
     assert financial.headers["Content-Security-Policy"]
     assert financial.headers["X-Request-ID"]

@@ -279,7 +279,7 @@ def test_tls_cookie_uses_host_prefix_and_secure_flag(make_service):
         planning=None,
         bind_host="trading.internal",
     )
-    client = TestClient(app, base_url="https://trading.internal")
+    client = TestClient(app, base_url="https://localhost:8020")
 
     response = client.post("/auth/login", json={"secret": TOKEN})
 

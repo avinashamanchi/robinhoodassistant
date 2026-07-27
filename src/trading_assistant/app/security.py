@@ -190,18 +190,4 @@ def install_security(app: FastAPI) -> None:
                     action,
                     context.request_id,
                 )
-        if (
-            request.method == "OPTIONS"
-            and request.headers.get("Origin")
-            and request.headers.get("Access-Control-Request-Method")
-            and response.status_code >= 400
-        ):
-            response = _error_response(
-                request,
-                ApiError(
-                    "cors_rejected",
-                    403,
-                    "CORS preflight was rejected",
-                ),
-            )
         return _harden_response(request, response)

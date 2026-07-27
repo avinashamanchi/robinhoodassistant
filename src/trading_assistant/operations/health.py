@@ -136,4 +136,7 @@ def build_operational_health(service) -> OperationalHealthReport:
             )
     payload["broker_contact_evidence_valid"] = contact_valid
     payload["reconciliation_age_seconds"] = reconciliation_age
+    payload["startup_reconciliation"] = (
+        service.startup_reconciliation.posture()
+    )
     return OperationalHealthReport(payload)

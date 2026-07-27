@@ -290,11 +290,97 @@ def test_production_container_refuses_to_serve_unknown_remote_open_order(
 
     with pytest.raises(
         StartupReconciliationFailed,
-        match="remote open order",
+        match="broker_reconciliation_failed",
     ):
         bootstrap.build_container(
             _alpaca_config(app_config),
             _migrated_secrets(tmp_path),
+        )
+
+    assert trading.submit_calls == 0
+    assert trading.cancel_calls == 0
+
+
+def test_app_container_serves_console_with_failed_startup_reconciliation(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    """Treating a broker failure as a structural failure would hide degraded safety state."""
+    from trading_assistant import bootstrap
+
+    broker, trading = _paper_alpaca_broker()
+    trading.open_orders.append(
+        SimpleNamespace(
+            id="remote-without-local-truth",
+            client_order_id="external-client-order",
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            symbol="AAPL",
+            asset_class=SimpleNamespace(value="us_equity"),
+        )
+    )
+    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda *_args: FakeClock(is_open=True),
+    )
+
+    container = bootstrap.build_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+        runtime_role="app",
+    )
+
+    with container.session_factory() as session:
+        state = session.get(
+            StartupReconciliationState,
+            broker.reconciliation_key,
+        )
+        assert state is not None
+        assert state.status == "failed"
+        assert state.completed_generation < state.generation
+    assert container.operations.health().as_dict()[
+        "startup_reconciliation"
+    ]["status"] == "failed"
+    assert trading.submit_calls == 0
+    assert trading.cancel_calls == 0
+
+
+def test_daemon_container_remains_fail_closed_on_startup_reconciliation_failure(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    """Letting the daemon continue after missing broker truth could resume automation."""
+    from trading_assistant import bootstrap
+
+    broker, trading = _paper_alpaca_broker()
+    trading.open_orders.append(
+        SimpleNamespace(
+            id="remote-without-local-truth",
+            client_order_id="external-client-order",
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            symbol="AAPL",
+            asset_class=SimpleNamespace(value="us_equity"),
+        )
+    )
+    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda *_args: FakeClock(is_open=True),
+    )
+
+    with pytest.raises(StartupReconciliationFailed):
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
+            runtime_role="daemon",
         )
 
     assert trading.submit_calls == 0

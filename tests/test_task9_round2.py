@@ -743,7 +743,6 @@ def test_launchd_installer_generates_only_bounded_stream_jobs(
     }
     assert set(plists) == {
         "com.trading.app",
-        "com.trading.daemon",
         "com.trading.watchdog",
         "com.trading.backup",
     }

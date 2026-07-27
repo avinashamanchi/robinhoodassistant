@@ -35,6 +35,39 @@ class Result:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class StructuralCheck:
+    """One local startup prerequisite, deliberately separate from broker preflight."""
+
+    name: str
+    status: str
+    code: str
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed"
+
+
+def structural_runtime_check(config, secrets: RuntimeSecrets) -> StructuralCheck:
+    """Validate only local config/secret invariants; never call a provider."""
+    if not app_secret_quality_ok(secrets.app_api_token):
+        return StructuralCheck("keychain", "blocked", "app_secret_quality_invalid")
+    if not (
+        config.trading.mode is TradingMode.PAPER
+        and config.trading.broker is BrokerKind.ALPACA
+    ):
+        return StructuralCheck("paper_configuration", "blocked", "paper_configuration_invalid")
+    if (
+        config.features.auto_execute_preapproved_rules
+        or config.execution.prefer_bracket_orders
+        or config.llm.fallback_provider is not None
+    ):
+        return StructuralCheck("disabled_integrations", "blocked", "unsafe_feature_enabled")
+    if config.integrations.webhooks_enabled or config.integrations.composio_enabled:
+        return StructuralCheck("disabled_integrations", "blocked", "integration_enabled")
+    return StructuralCheck("runtime_configuration", "passed", "ok")
+
+
 def _safe_exception_code(_exc: Exception) -> str:
     """Return a fixed code without exposing provider type or text."""
     return "dependency_failed"

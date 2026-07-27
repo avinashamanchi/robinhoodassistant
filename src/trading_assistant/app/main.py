@@ -19,7 +19,6 @@ import time
 from typing import TYPE_CHECKING, Callable, Optional
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import (
@@ -32,6 +31,7 @@ from pydantic import (
 )
 from sqlalchemy import select
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..broker.models import OrderStatus
 from ..config import load_config
@@ -50,6 +50,10 @@ from ..security.secrets import (
     load_role_secrets,
     secret_is_set,
     secrets_match,
+)
+from ..security.transport import (
+    TransportBoundaryMiddleware,
+    TransportPolicy,
 )
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
@@ -308,6 +312,7 @@ def _create_app(
     api_token: str | SecretStr | None = None,
     auth_now: Callable | None = None,
     bind_host: str | None = None,
+    transport_policy: TransportPolicy | None = None,
 ) -> FastAPI:
     if container is None and ((service is None) != (agent is None)):
         raise RuntimeError(
@@ -373,6 +378,11 @@ def _create_app(
         raise RuntimeError(
             "server.secure_cookies must be true for a non-loopback "
             "server.bind_host"
+        )
+    if transport_policy is None:
+        transport_policy = TransportPolicy.production(
+            service.config.server,
+            request_bounds=service.config.security.request_bounds,
         )
 
     _secrets_holder: dict = (
@@ -448,6 +458,7 @@ def _create_app(
         container.provider_budget if container is not None else None
     )
     app.state.account_cache = account_cache
+    app.state.transport_policy = transport_policy
 
     session_kwargs = {
         "ttl": timedelta(hours=security_config.session_hours),
@@ -473,17 +484,16 @@ def _create_app(
             service,
             app.state.audit,
         )
+    # TrustedHost is defense in depth after the boundary's RFC-aware IPv6
+    # parsing; it receives the canonical exact configured origin host.
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=[
-            "X-CSRF-Token",
-            "X-Request-ID",
-            "Idempotency-Key",
-            "Content-Type",
-        ],
+        TrustedHostMiddleware,
+        allowed_hosts=[transport_policy.canonical_host],
+        www_redirect=False,
+    )
+    app.add_middleware(
+        TransportBoundaryMiddleware,
+        policy=transport_policy,
     )
     install_security(app)
     app.include_router(auth_router)

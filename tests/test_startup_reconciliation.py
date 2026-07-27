@@ -114,7 +114,7 @@ def test_unknown_remote_open_order_cannot_look_reconciled_or_submit(
 
     with pytest.raises(
         StartupReconciliationFailed,
-        match="remote open order",
+        match="broker_reconciliation_failed",
     ):
         restarted.reconcile_startup_epoch(
             generation,
@@ -224,3 +224,34 @@ def test_new_process_generation_relocks_and_stale_completion_cannot_clear_it(
     assert second.startup_reconciliation.is_current(
         second_generation
     )
+
+
+def test_failed_startup_reconciliation_has_a_stable_public_posture(
+    app_config,
+    session_factory,
+):
+    """Exposing a raw broker error in posture would leak unstable provider detail."""
+    broker = CountingBroker()
+    service = _service(
+        broker,
+        session_factory,
+        app_config,
+        startup_required=True,
+    )
+    generation = service.require_startup_reconciliation(
+        **_context("stable-failure-posture")
+    )
+
+    service.startup_reconciliation.fail(
+        generation,
+        "broker_reconciliation_failed",
+        evidence={"provider_detail": "must not appear in posture"},
+        **_context("stable-failure-posture"),
+    )
+
+    assert service.startup_reconciliation.posture() == {
+        "status": "failed",
+        "generation": generation,
+        "completed_generation": 0,
+        "failure_code": "broker_reconciliation_failed",
+    }

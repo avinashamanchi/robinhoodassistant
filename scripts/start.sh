@@ -1,37 +1,48 @@
 #!/usr/bin/env bash
-# Start the trading assistant (paper). Runs preflight first and refuses to start
-# if it isn't READY. Starts the app + daemon in the background with logs.
+# Start only the loopback HTTPS operator console. The strict launcher performs
+# local structural checks before it constructs the application.
 set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."
 
-echo "== stopping any existing instances =="
-pkill -f "uvicorn trading_assistant.app.main" 2>/dev/null || true
-pkill -f "trading_assistant.daemon.main" 2>/dev/null || true
-sleep 1
+PROJECT="$(pwd -P)"
+PY="$PROJECT/.venv/bin/python"
+PID_FILE="$PROJECT/logs/app.pid"
 
-echo "== preflight =="
-if ! .venv/bin/python -m trading_assistant.preflight; then
-  echo ">> Preflight NOT READY — fix the FAIL items above. Not starting." >&2
+pid_belongs_to_app () {
+  local pid="$1"
+  local command
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  command="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$command" == *"$PY -m trading_assistant.ops.serve"* ]]
+}
+
+if [[ -f "$PID_FILE" ]]; then
+  existing_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+  if pid_belongs_to_app "$existing_pid"; then
+    echo "app already running (pid $existing_pid)"
+    exit 0
+  fi
+  rm -f "$PID_FILE"
+fi
+
+if [[ ! -x "$PY" ]]; then
+  echo "venv python not found at $PY (run 'uv sync' first)" >&2
   exit 1
 fi
 
 mkdir -p logs
 chmod 700 logs
-echo "== starting app on http://127.0.0.1:8000 =="
-nohup .venv/bin/python -m uvicorn trading_assistant.app.main:create_app \
-  --factory --host 127.0.0.1 --port 8000 > /dev/null 2>&1 &
-echo $! > logs/app.pid
+echo "starting HTTPS app on https://localhost:8020"
+nohup "$PY" -m trading_assistant.ops.serve > /dev/null 2>&1 &
+app_pid="$!"
+if ! pid_belongs_to_app "$app_pid"; then
+  echo "app launcher exited before PID ownership could be confirmed" >&2
+  exit 1
+fi
+printf '%s\n' "$app_pid" > "$PID_FILE"
 
-echo "== starting daemon (shadow mode) =="
-nohup .venv/bin/python -m trading_assistant.daemon.main > /dev/null 2>&1 &
-echo $! > logs/daemon.pid
-
-sleep 4
-echo "== health =="
-curl -s http://127.0.0.1:8000/health/live || echo "(app still warming up — check logs/app.runtime.log)"
-echo
-echo "Open  : http://127.0.0.1:8000"
-echo "Token : run  grep APP_API_TOKEN .env   and paste the value when the page asks"
-echo "Logs  : logs/app.runtime.log   logs/daemon.runtime.log"
+echo "Open  : https://localhost:8020"
+echo "Logs  : logs/app.runtime.log"
 echo "Stop  : ./scripts/stop.sh"

@@ -33,6 +33,7 @@ from .logging import (
 from .llm.budget import BudgetLimits, ProviderBudgetService
 from .notifications.base import NullNotifier
 from .orders.application import OrderApplicationService
+from .orders.startup import StartupReconciliationFailed
 from .orders.reconciliation import ReconciliationService
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.submission import OrderSubmissionService
@@ -229,12 +230,16 @@ def _build_container(
             reason="production process startup requires fresh broker truth",
             request_id=uuid4().hex,
         )
-        service.reconcile_startup_epoch(
-            generation,
-            actor=startup_actor,
-            reason="production process startup broker reconciliation",
-            request_id=uuid4().hex,
-        )
+        try:
+            service.reconcile_startup_epoch(
+                generation,
+                actor=startup_actor,
+                reason="production process startup broker reconciliation",
+                request_id=uuid4().hex,
+            )
+        except StartupReconciliationFailed:
+            if runtime_role != "app":
+                raise
     rule_worker = RuleWorker(
         service,
         service.rule_repository,

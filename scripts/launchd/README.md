@@ -1,7 +1,9 @@
 # launchd auto-start (macOS)
 
-Keeps the app + monitoring daemon alive without manual `start.sh`, runs a
-periodic watchdog, and creates a daily database backup.
+Keeps the loopback HTTPS app alive without manual `start.sh`, runs a periodic
+watchdog, and creates a daily database backup. The daemon is deliberately not
+installed by this app installer; launch it only through its explicit operator
+workflow after its own preflight.
 
 ## Install / update
 
@@ -23,8 +25,8 @@ machine where the repo is checked out and `.venv` exists (`uv sync`).
 
 | Label | Runs |
 |-------|------|
-| `com.trading.app` | `uvicorn ... --host 127.0.0.1 --port 8000` |
-| `com.trading.daemon` | `python -m trading_assistant.daemon.main` |
+| `com.trading.app` | `python -m trading_assistant.ops.serve` |
+| `com.trading.daemon` | Disabled by the app installer; explicit operator launch only |
 | `com.trading.watchdog` | watchdog every 60 seconds |
 | `com.trading.backup` | SQLite backup daily at 02:00 |
 
@@ -37,7 +39,7 @@ each process writes redacted, owner-only, bounded rotating output to its own
 
 ```bash
 launchctl list | grep com.trading                 # status + pid
-curl -s http://127.0.0.1:8000/health/live         # anonymous app liveness only
+curl --fail --silent https://localhost:8020/health/live # anonymous app liveness only
 tail -f logs/{app,daemon,watchdog,backup}.runtime.log # bounded logs
 
 # stop/start one until next login (bootout) then reload
