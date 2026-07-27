@@ -318,7 +318,10 @@ def test_mutation_requires_csrf(authenticated_client):
     missing = client.post("/killswitch/reset", json=body)
     accepted = client.post(
         "/killswitch/reset",
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "auth-killswitch-reset",
+        },
         json=body,
     )
 
@@ -427,12 +430,15 @@ def test_reauthentication_restores_high_consequence_access(
 
     assert reauth.status_code == 200
     assert (
-        client.post(
-            "/reconcile",
-            json={"reason": "reviewed positions"},
-            headers={"X-CSRF-Token": csrf},
-        ).status_code
-        == 200
+            client.post(
+                "/reconcile",
+                json={"reason": "reviewed positions"},
+                headers={
+                    "X-CSRF-Token": csrf,
+                    "Idempotency-Key": "auth-reconcile-after-reauth",
+                },
+            ).status_code
+            == 200
     )
 
 

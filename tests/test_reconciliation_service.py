@@ -372,7 +372,10 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
     response = client.post(
         "/panic",
         json={"reason": "fallback unsafe rule enumeration"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-rule-enumeration-fallback",
+        },
     )
 
     assert response.status_code == 503
@@ -432,7 +435,10 @@ def test_panic_local_enumeration_marks_partial_query_failure_unknown(
         response = client.post(
             "/panic",
             json={"reason": "partial local enumeration failure"},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "panic-partial-local-enumeration",
+            },
         )
     finally:
         event.remove(session_type, "do_orm_execute", fail_fill_query)

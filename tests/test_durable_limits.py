@@ -625,6 +625,81 @@ def test_same_lease_owner_renews_and_restart_observes_lease(session_factory):
     assert observed.generation == renewed.generation
 
 
+def test_fenced_lease_renewal_extends_only_the_observed_generation(
+    session_factory,
+):
+    now = _at_noon()
+    service = ConcurrencyLeaseService(session_factory)
+    first = service.acquire(
+        "route:long-handler",
+        owner="request-a",
+        ttl_seconds=30,
+        now=now,
+    )
+
+    renewed = service.renew(
+        "route:long-handler",
+        owner=first.owner,
+        generation=first.generation,
+        ttl_seconds=30,
+        now=now + timedelta(seconds=20),
+    )
+
+    assert renewed.acquired is True
+    assert renewed.owner == "request-a"
+    assert renewed.generation == first.generation
+    assert renewed.expires_at == now + timedelta(seconds=50)
+    assert service.acquire(
+        "route:long-handler",
+        owner="request-b",
+        ttl_seconds=30,
+        now=now + timedelta(seconds=31),
+    ).acquired is False
+
+
+def test_stale_generation_cannot_renew_or_release_replacement_lease(
+    session_factory,
+):
+    now = _at_noon()
+    service = ConcurrencyLeaseService(session_factory)
+    first = service.acquire(
+        "route:fenced",
+        owner="request-a",
+        ttl_seconds=10,
+        now=now,
+    )
+    replacement = service.acquire(
+        "route:fenced",
+        owner="request-b",
+        ttl_seconds=30,
+        now=now + timedelta(seconds=10),
+    )
+
+    stale_renewal = service.renew(
+        "route:fenced",
+        owner=first.owner,
+        generation=first.generation,
+        ttl_seconds=30,
+        now=now + timedelta(seconds=11),
+    )
+
+    assert stale_renewal.acquired is False
+    assert stale_renewal.owner == replacement.owner
+    assert stale_renewal.generation == replacement.generation
+    assert service.release(
+        "route:fenced",
+        owner=first.owner,
+        generation=first.generation,
+    ) is False
+    observed = service.inspect(
+        "route:fenced",
+        now=now + timedelta(seconds=11),
+    )
+    assert observed.acquired is True
+    assert observed.owner == replacement.owner
+    assert observed.generation == replacement.generation
+
+
 def test_second_lease_owner_is_denied_until_expiry(session_factory):
     now = _at_noon()
     service = ConcurrencyLeaseService(session_factory)
@@ -659,14 +734,19 @@ def test_second_lease_owner_is_denied_until_expiry(session_factory):
 def test_lease_release_is_owner_guarded(session_factory):
     now = _at_noon()
     service = ConcurrencyLeaseService(session_factory)
-    assert service.acquire(
+    acquired = service.acquire(
         "panic:account",
         owner="owner-a",
         ttl_seconds=60,
         now=now,
-    ).acquired
+    )
+    assert acquired.acquired
 
-    assert service.release("panic:account", owner="owner-b") is False
+    assert service.release(
+        "panic:account",
+        owner="owner-b",
+        generation=acquired.generation,
+    ) is False
     assert service.acquire(
         "panic:account",
         owner="owner-b",
@@ -674,7 +754,11 @@ def test_lease_release_is_owner_guarded(session_factory):
         now=now,
     ).acquired is False
 
-    assert service.release("panic:account", owner="owner-a") is True
+    assert service.release(
+        "panic:account",
+        owner="owner-a",
+        generation=acquired.generation,
+    ) is True
     assert service.acquire(
         "panic:account",
         owner="owner-b",
@@ -726,10 +810,19 @@ def _invoke_public_db_method(method_name: str, session_factory) -> None:
             ttl_seconds=60,
             now=now,
         )
+    elif method_name == "renew":
+        ConcurrencyLeaseService(session_factory).renew(
+            "lifecycle:lease",
+            owner="worker",
+            generation=1,
+            ttl_seconds=60,
+            now=now,
+        )
     elif method_name == "release":
         ConcurrencyLeaseService(session_factory).release(
             "lifecycle:lease",
             owner="worker",
+            generation=1,
         )
     elif method_name == "inspect":
         ConcurrencyLeaseService(session_factory).inspect(
@@ -748,6 +841,7 @@ def _invoke_public_db_method(method_name: str, session_factory) -> None:
         "consume_pair",
         "rate_prune",
         "acquire",
+        "renew",
         "release",
         "inspect",
         "lease_prune",

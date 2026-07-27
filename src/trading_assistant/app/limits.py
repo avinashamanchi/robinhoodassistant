@@ -64,10 +64,12 @@ class LimitDecision:
 
 @dataclass(frozen=True)
 class LeaseDecision:
-    """Lease result.
+    """Lease result with an owner-and-generation fencing token.
 
-    ``generation`` is diagnostic only, not a fencing token. Bounded pruning
-    may delete an expired row, so a later acquisition may restart it at 1.
+    Callers must use a unique owner for each lease tenure and present both
+    ``owner`` and ``generation`` when renewing or releasing it. Bounded
+    pruning may delete an expired row, so generation alone is not globally
+    unique.
     """
 
     acquired: bool
@@ -417,12 +419,75 @@ class ConcurrencyLeaseService:
             retry_after_seconds=0,
         )
 
-    def release(self, resource_key: str, *, owner: str) -> bool:
+    def renew(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> LeaseDecision:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        current = _as_utc(now)
+        expires_at = current + timedelta(seconds=ttl_seconds)
         statement = (
             update(ConcurrencyLease)
             .where(
                 ConcurrencyLease.resource_key == resource_key,
                 ConcurrencyLease.owner == owner,
+                ConcurrencyLease.generation == generation,
+                ConcurrencyLease.expires_at > current,
+            )
+            .values(expires_at=expires_at)
+            .returning(
+                ConcurrencyLease.owner,
+                ConcurrencyLease.expires_at,
+                ConcurrencyLease.generation,
+            )
+        )
+        with _store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                session.rollback()
+                observed = self._inspect(
+                    session,
+                    resource_key,
+                    current,
+                )
+                return LeaseDecision(
+                    acquired=False,
+                    owner=observed.owner,
+                    expires_at=observed.expires_at,
+                    generation=observed.generation,
+                    retry_after_seconds=(
+                        observed.retry_after_seconds
+                    ),
+                )
+            session.commit()
+        return LeaseDecision(
+            acquired=True,
+            owner=row.owner,
+            expires_at=row.expires_at,
+            generation=row.generation,
+            retry_after_seconds=0,
+        )
+
+    def release(
+        self,
+        resource_key: str,
+        *,
+        owner: str,
+        generation: int,
+    ) -> bool:
+        statement = (
+            update(ConcurrencyLease)
+            .where(
+                ConcurrencyLease.resource_key == resource_key,
+                ConcurrencyLease.owner == owner,
+                ConcurrencyLease.generation == generation,
             )
             .values(
                 owner="",

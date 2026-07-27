@@ -243,7 +243,9 @@ def test_pending_approve_flow(client):
     assert len(pending) == 1 and pending[0]["order_id"] == order_id
 
     approve_response = c.post(
-        f"/approve/{order_id}", json={"reason": "reviewed in API"}
+        f"/approve/{order_id}",
+        json={"reason": "reviewed in API"},
+        headers={"Idempotency-Key": "pending-approve-flow"},
     )
     approve = approve_response.json()
     assert approve["executed"] is True
@@ -450,8 +452,16 @@ def test_approval_confirmation_dependency_failure_is_hardened(
 def test_double_approve_returns_409(client):
     c, svc, _ = client
     order_id = _propose(svc)
-    assert c.post(f"/approve/{order_id}", json={"reason": "first review"}).status_code == 200
-    assert c.post(f"/approve/{order_id}", json={"reason": "duplicate review"}).status_code == 409
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": "first review"},
+        headers={"Idempotency-Key": "double-approve-first"},
+    ).status_code == 200
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": "duplicate review"},
+        headers={"Idempotency-Key": "double-approve-second"},
+    ).status_code == 409
 
 
 def test_expired_approval_returns_stable_409(client):
@@ -465,6 +475,7 @@ def test_expired_approval_returns_stable_409(client):
     response = c.post(
         f"/approve/{order_id}",
         json={"reason": "reviewed after proposal expiry"},
+        headers={"Idempotency-Key": "expired-approval"},
     )
 
     assert response.status_code == 409
@@ -480,19 +491,28 @@ def test_expired_approval_returns_stable_409(client):
 def test_approve_requires_non_empty_reason(client):
     c, svc, _ = client
     order_id = _propose(svc)
-    assert c.post(f"/approve/{order_id}", json={"reason": " "}).status_code == 422
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "approve-blank-reason"},
+    ).status_code == 422
 
 
 def test_reject_endpoint(client):
     c, svc, _ = client
     order_id = _propose(svc)
     assert (
-        c.post(f"/reject/{order_id}", json={"reason": " "}).status_code
+        c.post(
+            f"/reject/{order_id}",
+            json={"reason": " "},
+            headers={"Idempotency-Key": "reject-blank-reason"},
+        ).status_code
         == 422
     )
     response = c.post(
         f"/reject/{order_id}",
         json={"reason": "thesis invalidated"},
+        headers={"Idempotency-Key": "reject-order"},
     )
     assert response.json()["status"] == "rejected"
     with svc.session_factory() as session:
@@ -513,6 +533,7 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
         c.post(
             f"/approve/{order_id}",
             json={"reason": "approved before cancel drill"},
+            headers={"Idempotency-Key": "cancel-drill-approve"},
         ).status_code
         == 200
     )
@@ -521,12 +542,14 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
         c.post(
             f"/orders/{order_id}/cancel",
             json={"reason": " "},
+            headers={"Idempotency-Key": "cancel-blank-reason"},
         ).status_code
         == 422
     )
     response = c.post(
         f"/orders/{order_id}/cancel",
         json={"reason": "operator canceled stale intent"},
+        headers={"Idempotency-Key": "cancel-live-order"},
     )
 
     assert response.status_code == 200
@@ -563,7 +586,15 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
 def test_missing_mutation_target_has_stable_error(client, path, code):
     c, _, _ = client
 
-    response = c.post(path, json={"reason": "reviewed missing target"})
+    response = c.post(
+        path,
+        json={"reason": "reviewed missing target"},
+        headers={
+            "Idempotency-Key": (
+                f"missing-target-{path.strip('/').replace('/', '-')}"
+            )
+        },
+    )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == code
@@ -1146,7 +1177,10 @@ def test_approval_quote_outage_preserves_outbox_and_retries_safely(
     unavailable = client.post(
         f"/approve/{order_id}",
         json={"reason": "human reviewed before dependency outage"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-quote-outage",
+        },
     )
 
     _assert_dependency_unavailable(unavailable)
@@ -1182,7 +1216,10 @@ def test_approval_quote_outage_preserves_outbox_and_retries_safely(
     retried = client.post(
         f"/approve/{order_id}",
         json={"reason": "retry approved outbox after quote recovery"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-quote-retry",
+        },
     )
 
     assert retried.status_code == 200
@@ -1230,7 +1267,10 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
     unavailable = client.post(
         f"/approve/{order_id}",
         json={"reason": reason},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-clock-outage",
+        },
     )
 
     _assert_dependency_unavailable(unavailable)
@@ -1287,7 +1327,10 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
     retried = client.post(
         f"/approve/{order_id}",
         json={"reason": "retry approved outbox after clock recovery"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-clock-retry",
+        },
     )
 
     assert retried.status_code == 200
@@ -1335,7 +1378,10 @@ def test_approval_internal_failure_is_hardened_500_without_dependency_audit(
     response = client.post(
         f"/approve/{order_id}",
         json={"reason": "approval internal failure probe"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-internal-failure",
+        },
     )
 
     _assert_internal_error(response)
@@ -1371,6 +1417,7 @@ def test_killswitch_reset_endpoint(client):
             "reason": "account and broker checks are healthy",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-reset-endpoint"},
     )
 
     assert response.status_code == 200
@@ -1423,6 +1470,7 @@ def test_breaker_reset_accepts_exact_data_scope_and_health_lists_it(
             "reason": "all configured equity quotes are fresh",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-data-reset"},
     )
 
     assert response.status_code == 200, response.text
@@ -1442,6 +1490,7 @@ def test_breaker_reset_rejects_noncanonical_or_legacy_scope_body(
             "reason": "invalid lowercase scope",
             "expected_generation": 1,
         },
+        headers={"Idempotency-Key": "killswitch-noncanonical-scope"},
     )
     legacy = c.post(
         "/killswitch/reset",
@@ -1450,6 +1499,7 @@ def test_breaker_reset_rejects_noncanonical_or_legacy_scope_body(
             "reason": "legacy reset body",
             "expected_generation": 1,
         },
+        headers={"Idempotency-Key": "killswitch-legacy-body"},
     )
 
     assert noncanonical.status_code == 422
@@ -1484,6 +1534,7 @@ def test_liquidity_reset_requires_exact_symbol_spread_recovery(
             "reason": "attempt while spread remains wide",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-liquidity-blocked"},
     )
     assert blocked.status_code == 503
     assert service.breakers.is_tripped(
@@ -1498,6 +1549,7 @@ def test_liquidity_reset_requires_exact_symbol_spread_recovery(
             "reason": "AAPL spread normalized",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-liquidity-recovered"},
     )
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["scope"] == "liquidity:AAPL"
@@ -1521,6 +1573,7 @@ def test_drawdown_reset_requires_recovered_account_equity(client):
             "reason": "attempt before equity recovery",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-drawdown-blocked"},
     )
 
     assert blocked.status_code == 503
@@ -1536,6 +1589,7 @@ def test_drawdown_reset_requires_recovered_account_equity(client):
             "reason": "account equity recovered",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-drawdown-recovered"},
     )
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["scope"] == "drawdown:equity"
@@ -1558,6 +1612,7 @@ def test_broker_drift_reset_requires_clean_reconciliation(client):
             "reason": "broker and local state reconciled",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-broker-drift"},
     )
 
     assert response.status_code == 200, response.text
@@ -1593,6 +1648,7 @@ def test_operator_global_reset_refuses_while_other_breaker_is_active(
             "reason": "attempt while another breaker remains active",
             "expected_generation": operator_state.generation,
         },
+        headers={"Idempotency-Key": "killswitch-operator-blocked"},
     )
     assert blocked.status_code == 503
     assert service.breakers.is_tripped(operator_scope)
@@ -1604,6 +1660,7 @@ def test_operator_global_reset_refuses_while_other_breaker_is_active(
             "reason": "all equity quotes recovered",
             "expected_generation": data_state.generation,
         },
+        headers={"Idempotency-Key": "killswitch-operator-data-reset"},
     )
     assert data_reset.status_code == 200, data_reset.text
 
@@ -1614,6 +1671,7 @@ def test_operator_global_reset_refuses_while_other_breaker_is_active(
             "reason": "all other breakers and broker state are clear",
             "expected_generation": operator_state.generation,
         },
+        headers={"Idempotency-Key": "killswitch-operator-reset"},
     )
     assert operator_reset.status_code == 200, operator_reset.text
     assert service.breakers.is_tripped(operator_scope) is False
@@ -1641,6 +1699,7 @@ def test_killswitch_reset_returns_conflict_for_stale_generation(client):
             "reason": "stale operator reset",
             "expected_generation": observed.generation,
         },
+        headers={"Idempotency-Key": "killswitch-stale-generation"},
     )
 
     assert response.status_code == 409
@@ -1703,7 +1762,12 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
             "reason": "verify dependency health before reset",
             "expected_generation": observed.generation,
         },
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"killswitch-quote-failure-{quote_failure}"
+            ),
+        },
     )
 
     _assert_dependency_unavailable(response)
@@ -1768,7 +1832,10 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
             "reason": reason,
             "expected_generation": observed.generation,
         },
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-clock-outage",
+        },
     )
 
     _assert_dependency_unavailable(response)
@@ -1870,7 +1937,10 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
         response = client.post(
             f"/approve/{order_id}",
             json={"reason": reason},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-approve",
+            },
         )
         action = "order.submit"
     else:
@@ -1882,7 +1952,10 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
                 "reason": reason,
                 "expected_generation": observed.generation,
             },
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-reset",
+            },
         )
         action = "circuit_breaker.reset"
 
@@ -1937,7 +2010,10 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
         retry = client.post(
             f"/approve/{order_id}",
             json={"reason": "retry against truthful loss boundary"},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-approve-retry",
+            },
         )
         assert retry.status_code == 403
         assert retry.json()["error"]["code"] == "policy_denied"
@@ -2001,7 +2077,10 @@ def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider
         response = client.post(
             f"/approve/{order_id}",
             json={"reason": reason},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-approve",
+            },
         )
         action = "order.submit"
     else:
@@ -2013,7 +2092,10 @@ def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider
                 "reason": reason,
                 "expected_generation": observed.generation,
             },
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-reset",
+            },
         )
         action = "circuit_breaker.reset"
 
@@ -2054,7 +2136,10 @@ def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider
         retry = client.post(
             f"/approve/{order_id}",
             json={"reason": "retry after valid clock data"},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-approve-retry",
+            },
         )
         assert retry.status_code == 200
         assert retry.json()["status"] == OrderStatus.SUBMITTED.value
@@ -2116,7 +2201,10 @@ def test_operator_workflows_use_exact_calendar_observation_across_clock_race(
         response = client.post(
             f"/approve/{order_id}",
             json={"reason": "approve at exact pre-open observation"},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "calendar-race-approve",
+            },
         )
     else:
         assert observed_breaker is not None
@@ -2127,7 +2215,10 @@ def test_operator_workflows_use_exact_calendar_observation_across_clock_race(
                 "reason": "reset at exact pre-close observation",
                 "expected_generation": observed_breaker.generation,
             },
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "calendar-race-reset",
+            },
         )
 
     assert response.status_code == expected_status, response.text
@@ -2194,7 +2285,12 @@ def test_killswitch_reset_rejects_every_incomplete_health_field(
             "reason": f"reject incomplete {incomplete_field}",
             "expected_generation": observed.generation,
         },
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"killswitch-incomplete-{incomplete_field}"
+            ),
+        },
     )
 
     _assert_dependency_unavailable(response)
@@ -2253,7 +2349,10 @@ def test_reset_snapshot_internal_failure_is_500_without_dependency_audit(
             "reason": "reset internal failure probe",
             "expected_generation": observed.generation,
         },
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-snapshot-internal",
+        },
     )
 
     _assert_internal_error(response)
@@ -2302,7 +2401,10 @@ def test_unexpected_mutation_exception_remains_hardened_internal_error(
             "reason": "unexpected failure classification probe",
             "expected_generation": 1,
         },
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-unexpected-failure",
+        },
     )
 
     assert response.status_code == 500
@@ -2321,8 +2423,16 @@ def test_unexpected_mutation_exception_remains_hardened_internal_error(
 def test_panic_endpoint_supplies_actor_and_requires_reason(client):
     c, svc, _ = client
 
-    assert c.post("/panic", json={"reason": " "}).status_code == 422
-    response = c.post("/panic", json={"reason": "manual API drill"})
+    assert c.post(
+        "/panic",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "panic-blank-reason"},
+    ).status_code == 422
+    response = c.post(
+        "/panic",
+        json={"reason": "manual API drill"},
+        headers={"Idempotency-Key": "panic-manual-drill"},
+    )
 
     assert response.status_code == 200
     assert response.json()["safe"] is True
@@ -2376,7 +2486,10 @@ def test_unsafe_panic_returns_non_2xx_truthful_receipt(
     response = c.post(
         "/panic",
         json={"reason": "cancel all live orders"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-unsafe-cancel",
+        },
     )
 
     assert response.status_code == 503
@@ -2424,7 +2537,10 @@ def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
     response = c.post(
         "/panic",
         json={"reason": "dependency failure drill"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-dependency-failure",
+        },
     )
 
     assert response.status_code == 503
@@ -2470,7 +2586,10 @@ def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
     response = c.post(
         "/panic",
         json={"reason": "exception safety drill"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-exception-safety",
+        },
     )
 
     assert response.status_code == 503
@@ -2539,7 +2658,10 @@ def test_panic_exception_fallback_enumerates_every_local_live_unknown_order(
     response = client.post(
         "/panic",
         json={"reason": "enumerate local fail-closed truth"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-local-enumeration",
+        },
     )
 
     assert response.status_code == 503
@@ -2585,7 +2707,10 @@ def test_panic_exception_fallback_reports_unknown_local_enumeration_on_db_failur
     response = client.post(
         "/panic",
         json={"reason": "database enumeration failure drill"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-database-enumeration",
+        },
     )
 
     assert response.status_code == 503
@@ -2653,7 +2778,10 @@ def test_panic_rule_audit_failure_returns_unsafe_receipt_without_false_claim(
         response = client.post(
             "/panic",
             json={"reason": "panic audit failure drill"},
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "panic-rule-audit-failure",
+            },
         )
     finally:
         event.remove(
@@ -2678,10 +2806,15 @@ def test_panic_rule_audit_failure_returns_unsafe_receipt_without_false_claim(
 def test_reconcile_requires_reason_and_audits_operator_identity(client):
     c, svc, _ = client
 
-    assert c.post("/reconcile", json={"reason": " "}).status_code == 422
+    assert c.post(
+        "/reconcile",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "reconcile-blank-reason"},
+    ).status_code == 422
     response = c.post(
         "/reconcile",
         json={"reason": "reviewed broker and local positions"},
+        headers={"Idempotency-Key": "reconcile-operator"},
     )
 
     assert response.status_code == 200
@@ -2723,7 +2856,10 @@ def test_reconcile_dependency_outage_is_audited_hardened_503(
     response = client.post(
         "/reconcile",
         json={"reason": "verify broker positions after outage"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "reconcile-dependency-outage",
+        },
     )
 
     _assert_dependency_unavailable(response)
@@ -2751,10 +2887,15 @@ def test_reconcile_dependency_outage_is_audited_hardened_503(
 def test_sync_requires_reason_and_audits_operator_identity(client):
     c, svc, _ = client
 
-    assert c.post("/sync", json={"reason": " "}).status_code == 422
+    assert c.post(
+        "/sync",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "sync-blank-reason"},
+    ).status_code == 422
     response = c.post(
         "/sync",
         json={"reason": "manual broker status refresh"},
+        headers={"Idempotency-Key": "sync-operator"},
     )
 
     assert response.status_code == 200
@@ -2796,7 +2937,10 @@ def test_sync_dependency_outage_is_audited_hardened_503(
     response = client.post(
         "/sync",
         json={"reason": "manual sync dependency probe"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-dependency-outage",
+        },
     )
 
     _assert_dependency_unavailable(response)
@@ -2848,7 +2992,10 @@ def test_sync_cursor_conflict_is_stable_409_without_dependency_audit(
     approved = client.post(
         f"/approve/{order_id}",
         json={"reason": "approve cursor conflict probe"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-cursor-approve",
+        },
     )
     assert approved.status_code == 200
     broker.activity = BrokerFill(
@@ -2869,7 +3016,10 @@ def test_sync_cursor_conflict_is_stable_409_without_dependency_audit(
     response = client.post(
         "/sync",
         json={"reason": "cursor conflict probe"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-cursor-conflict",
+        },
     )
 
     assert response.status_code == 409
@@ -2921,7 +3071,10 @@ def test_sync_internal_failure_is_hardened_500_without_dependency_audit(
     response = client.post(
         "/sync",
         json={"reason": "sync internal failure probe"},
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-internal-failure",
+        },
     )
 
     _assert_internal_error(response)
@@ -2944,6 +3097,7 @@ def test_sync_sanitizes_provider_integrity_text_everywhere(
     approved = c.post(
         f"/approve/{order_id}",
         json={"reason": "approve provider sanitization probe"},
+        headers={"Idempotency-Key": "sync-sanitize-approve"},
     )
     assert approved.status_code == 200
     broker_order_id = approved.json()["broker_order_id"]
@@ -2966,6 +3120,7 @@ def test_sync_sanitizes_provider_integrity_text_everywhere(
     response = c.post(
         "/sync",
         json={"reason": "sanitize provider reconciliation failure"},
+        headers={"Idempotency-Key": "sync-sanitize-provider"},
     )
 
     assert response.status_code == 200

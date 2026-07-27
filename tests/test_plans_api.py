@@ -227,6 +227,7 @@ def test_analyze_and_plan_flow(client):
             "symbol": "AAPL",
             "reason": "review AAPL planning inputs",
         },
+        headers={"Idempotency-Key": "plan-flow-analyze"},
     )
     res = response.json()
     pid = res["plan_id"]
@@ -246,7 +247,9 @@ def test_analyze_and_plan_flow(client):
     assert detail["plan"]["action"] == "buy" and "sized" in detail
 
     approve_response = c.post(
-        f"/plans/{pid}/approve", json={"reason": "reviewed plan"}
+        f"/plans/{pid}/approve",
+        json={"reason": "reviewed plan"},
+        headers={"Idempotency-Key": "plan-flow-approve"},
     )
     approve = approve_response.json()
     # Single-target plan -> server-side bracket (0 daemon rules) OR rules armed.
@@ -263,7 +266,9 @@ def test_analyze_and_plan_flow(client):
     assert audit.request_id == approve_response.headers["X-Request-ID"]
 
     cancel_response = c.post(
-        f"/plans/{pid}/cancel", json={"reason": "review complete"}
+        f"/plans/{pid}/cancel",
+        json={"reason": "review complete"},
+        headers={"Idempotency-Key": "plan-flow-cancel"},
     )
     cancel = cancel_response.json()
     assert cancel["status"] == "canceled"
@@ -288,7 +293,15 @@ def test_analyze_and_plan_flow(client):
 def test_plan_persistence_routes_reject_blank_reason(client, path, body):
     c, _ = client
 
-    response = c.post(path, json=body)
+    response = c.post(
+        path,
+        json=body,
+        headers={
+            "Idempotency-Key": (
+                f"plan-blank-{path.strip('/').replace('/', '-')}"
+            )
+        },
+    )
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
@@ -304,6 +317,7 @@ def test_plan_cancel_missing_target_has_stable_error(client):
     response = c.post(
         "/plans/9999/cancel",
         json={"reason": "reviewed missing plan"},
+        headers={"Idempotency-Key": "plan-cancel-missing"},
     )
 
     assert response.status_code == 404
@@ -358,7 +372,12 @@ def test_screen_dependency_outage_returns_hardened_503(
     response = isolated.post(
         path,
         json=body,
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"screen-dependency-{path.strip('/')}"
+            ),
+        },
     )
 
     assert response.status_code == 503
@@ -414,7 +433,12 @@ def test_screen_internal_failure_remains_hardened_500(
     response = isolated.post(
         path,
         json=body,
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"screen-internal-{path.strip('/')}"
+            ),
+        },
     )
 
     assert response.status_code == 500
@@ -455,6 +479,7 @@ def test_propose_generates_plans(client):
     response = c.post(
         "/propose",
         json={"n": 3, "reason": "review screened candidates"},
+        headers={"Idempotency-Key": "propose-generate-plans"},
     )
     res = response.json()
     assert "proposed" in res and "UNPROVEN" in res["note"]
@@ -504,6 +529,7 @@ def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
     response = c.post(
         "/propose",
         json={"n": 2, "reason": "provider failure sanitization probe"},
+        headers={"Idempotency-Key": "propose-provider-failure"},
     )
 
     assert response.status_code == 200
@@ -573,6 +599,7 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
             "symbol": "AAPL",
             "reason": "provider failure plan probe",
         },
+        headers={"Idempotency-Key": "analyze-provider-failure"},
     )
 
     assert response.status_code == 503
@@ -634,7 +661,15 @@ def test_required_snapshot_clock_outage_preserves_route_contract_and_redacts_pro
 
     monkeypatch.setattr(svc.clock, clock_method, fail_clock)
 
-    response = c.post(path, json=body)
+    response = c.post(
+        path,
+        json=body,
+        headers={
+            "Idempotency-Key": (
+                f"planning-clock-outage-{path.strip('/')}"
+            )
+        },
+    )
 
     assert response.status_code == expected_status
     request_id = response.headers["X-Request-ID"]
@@ -741,7 +776,15 @@ def test_planning_workflows_reject_future_market_boundary_with_large_loss(
         ),
     )
 
-    response = c.post(path, json=body)
+    response = c.post(
+        path,
+        json=body,
+        headers={
+            "Idempotency-Key": (
+                f"planning-future-boundary-{path.strip('/')}"
+            )
+        },
+    )
 
     assert response.status_code == expected_status
     request_id = response.headers["X-Request-ID"]
@@ -833,7 +876,15 @@ def test_planning_workflows_reject_malformed_alpaca_calendar_and_redact_provider
         _malformed_alpaca_calendar_clock(raw_session_open, marker),
     )
 
-    response = c.post(path, json=body)
+    response = c.post(
+        path,
+        json=body,
+        headers={
+            "Idempotency-Key": (
+                f"planning-invalid-calendar-{path.strip('/')}"
+            )
+        },
+    )
 
     assert response.status_code == expected_status
     request_id = response.headers["X-Request-ID"]
@@ -908,7 +959,15 @@ def test_planning_workflows_use_calendar_not_later_post_close_state(
     clock, calls = _race_alpaca_clock(False)
     _install_equity_clock(svc, clock)
 
-    response = c.post(path, json=body)
+    response = c.post(
+        path,
+        json=body,
+        headers={
+            "Idempotency-Key": (
+                f"planning-calendar-race-{path.strip('/')}"
+            )
+        },
+    )
 
     assert response.status_code == 200
     assert calls == {
@@ -965,7 +1024,12 @@ def test_analysis_internal_failure_is_hardened_500_without_false_audit(
     response = isolated.post(
         path,
         json=body,
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"planning-internal-{path.strip('/')}"
+            ),
+        },
     )
 
     assert response.status_code == 500
@@ -1029,7 +1093,12 @@ def test_analysis_dependency_audit_failure_is_hardened_500(
     response = isolated.post(
         path,
         json=body,
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"planning-audit-{path.strip('/')}"
+            ),
+        },
     )
 
     assert response.status_code == 500
@@ -1089,7 +1158,12 @@ def test_plan_create_audit_failure_rolls_back_and_returns_500(
         response = isolated.post(
             path,
             json=body,
-            headers={"X-CSRF-Token": csrf},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": (
+                    f"planning-create-audit-{path.strip('/')}"
+                ),
+            },
         )
     finally:
         event.remove(

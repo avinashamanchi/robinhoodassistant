@@ -1,27 +1,39 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 import json
 import threading
+import time
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from starlette.responses import JSONResponse
+from starlette.routing import request_response
 
 from trading_assistant.app.main import create_app
+import trading_assistant.app.policy as policy_module
 from trading_assistant.app.policy import (
     AuthLevel,
     RoutePolicy,
     RoutePolicyRegistry,
     validate_route_inventory,
 )
-from trading_assistant.app.limits import LimitStoreUnavailable
+from trading_assistant.app.limits import (
+    LeaseDecision,
+    LimitDecision,
+    LimitStoreUnavailable,
+)
 from trading_assistant.db.models import (
     AuthSession,
     ConcurrencyLease,
     PanicReceipt,
     RateWindow,
+    utcnow,
 )
 
 
@@ -228,25 +240,36 @@ def test_authenticated_rate_principal_is_the_persisted_session(
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        "/approve/123",
+        "/reject/123",
+        "/killswitch/reset",
+        "/orders/123/cancel",
+        "/reconcile",
+        "/sync",
+        "/panic",
+        "/analyze",
+        "/plans/123/approve",
+        "/plans/123/cancel",
+        "/propose",
+        "/backtests/run",
+    ],
+)
+@pytest.mark.parametrize(
     ("idempotency_key", "expected_code"),
     [
         (None, "idempotency_key_required"),
         ("contains space", "invalid_idempotency_key"),
     ],
 )
-def test_idempotency_is_rejected_before_domain_mutation(
+def test_every_protected_policy_rejects_missing_or_invalid_idempotency(
     make_service,
+    path,
     idempotency_key,
     expected_code,
 ):
     service = make_service()
-    calls = []
-
-    def reject_order(*args, **kwargs):
-        calls.append((args, kwargs))
-        return {}
-
-    service.reject_order = reject_order
     app = create_app(
         service=service,
         agent=_StubAgent(),
@@ -259,17 +282,22 @@ def test_idempotency_is_rejected_before_domain_mutation(
         json={"secret": "route-idempotency-secret"},
     )
     headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-    headers["Idempotency-Key"] = idempotency_key or ""
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
 
     denied = client.post(
-        "/reject/123",
+        path,
         headers=headers,
-        json={"reason": "verify idempotency boundary"},
+        json={},
     )
 
     assert denied.status_code == 422
     assert denied.json()["error"]["code"] == expected_code
-    assert calls == []
+    assert (
+        app.state.route_policy_registry.resolve(app, "POST", path)
+        .policy.requires_idempotency
+        is True
+    )
 
 
 def test_static_assets_reject_directories_and_traversal(make_service):
@@ -283,7 +311,11 @@ def test_static_assets_reject_directories_and_traversal(make_service):
 
     assert client.get("/static/js/login.js").status_code == 200
     for path in (
+        "/static",
         "/static/",
+        "/static//js/login.js",
+        "/static/js//login.js",
+        "/static/js/%2flogin.js",
         "/static/js",
         "/static/js/",
         "/static/css/%2e%2e/js/login.js",
@@ -578,3 +610,570 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
     assert repeated.status_code == 200
     assert repeated.json() == receipt
     assert calls == 1
+
+
+def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.1,
+        raising=False,
+    )
+
+    class SlowAgent:
+        def __init__(self):
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.lock = threading.Lock()
+
+        def chat(self, message, **context):
+            with self.lock:
+                self.calls += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                call_number = self.calls
+            try:
+                if call_number == 1:
+                    self.started.set()
+                    assert self.release.wait(timeout=5)
+                return {"reply": message, "tool_calls": []}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    service = _with_limit(
+        make_service(),
+        "chat",
+        requests=20,
+        global_requests=40,
+        window_seconds=1,
+        concurrency=1,
+    )
+    agent = SlowAgent()
+    app = create_app(
+        service=service,
+        agent=agent,
+        api_token="route-long-lease-secret",
+        planning=None,
+    )
+    owner_client = TestClient(app)
+    follower_client = TestClient(app)
+    login = owner_client.post(
+        "/auth/login",
+        json={"secret": "route-long-lease-secret"},
+    )
+    cookie_name = app.state.session_auth.cookie_name()
+    follower_client.cookies.set(
+        cookie_name,
+        owner_client.cookies.get(cookie_name),
+    )
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(
+            owner_client.post,
+            "/chat",
+            json={"message": "slow owner"},
+            headers=headers,
+        )
+        assert agent.started.wait(timeout=5)
+        time.sleep(1.2)
+        try:
+            follower = follower_client.post(
+                "/chat",
+                json={"message": "must not overlap"},
+                headers=headers,
+            )
+        finally:
+            agent.release.set()
+        owner_response = owner.result(timeout=5)
+
+    assert owner_response.status_code == 200
+    assert follower.status_code == 409
+    assert follower.json()["error"]["code"] == "route_busy"
+    assert agent.calls == 1
+    assert agent.max_active == 1
+
+
+def test_lease_ownership_loss_is_reported_instead_of_handler_success(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+        raising=False,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-lost-lease-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-lost-lease-secret"},
+    )
+    started = threading.Event()
+
+    async def delayed_chat(_request):
+        started.set()
+        await asyncio.sleep(0.2)
+        return JSONResponse({"reply": "unsafe overlap"})
+
+    chat_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/chat"
+    )
+    chat_route.app = request_response(delayed_chat)
+
+    class LosingLeases:
+        def acquire(self, _resource_key, *, owner, ttl_seconds):
+            return LeaseDecision(
+                acquired=True,
+                owner=owner,
+                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+                generation=7,
+                retry_after_seconds=0,
+            )
+
+        def renew(
+            self,
+            _resource_key,
+            *,
+            owner,
+            generation,
+            ttl_seconds,
+        ):
+            return LeaseDecision(
+                acquired=False,
+                owner="replacement-request",
+                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+                generation=generation + 1,
+                retry_after_seconds=ttl_seconds,
+            )
+
+        def release(self, *_args, **_kwargs):
+            return False
+
+    app.state.leases = LosingLeases()
+    denied = client.post(
+        "/chat",
+        json={"message": "must be cancelled"},
+        headers={"X-CSRF-Token": login.json()["csrf_token"]},
+    )
+
+    assert started.wait(timeout=1)
+    assert denied.status_code == 503
+    assert denied.json()["error"]["code"] == "route_lease_lost"
+
+
+def test_panic_follower_never_accepts_replacement_owner_receipt(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-panic-owner-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-panic-owner-secret"},
+    )
+    panic_calls = 0
+
+    def should_not_execute(_context):
+        nonlocal panic_calls
+        panic_calls += 1
+        return {"safe": True}
+
+    app.state.operations.panic = should_not_execute
+    expires_at = utcnow() + timedelta(seconds=60)
+    with service.session_factory() as session:
+        session.add(
+            PanicReceipt(
+                account_scope="alpaca-paper",
+                request_id="owner-request-a",
+                state="started",
+                response_json=None,
+                started_at=utcnow(),
+                expires_at=expires_at,
+            )
+        )
+        session.commit()
+
+    attempted = threading.Event()
+    replaced = threading.Event()
+
+    class ReplacedLease:
+        def acquire(self, *_args, **_kwargs):
+            attempted.set()
+            return LeaseDecision(
+                acquired=False,
+                owner="owner-request-a",
+                expires_at=expires_at,
+                generation=41,
+                retry_after_seconds=60,
+            )
+
+        def inspect(self, *_args, **_kwargs):
+            if replaced.is_set():
+                return LeaseDecision(
+                    acquired=True,
+                    owner="owner-request-b",
+                    expires_at=utcnow() + timedelta(seconds=60),
+                    generation=42,
+                    retry_after_seconds=60,
+                )
+            return LeaseDecision(
+                acquired=True,
+                owner="owner-request-a",
+                expires_at=expires_at,
+                generation=41,
+                retry_after_seconds=60,
+            )
+
+    app.state.leases = ReplacedLease()
+    headers = {
+        "X-CSRF-Token": login.json()["csrf_token"],
+        "Idempotency-Key": "panic-pinned-follower",
+    }
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        follower = pool.submit(
+            client.post,
+            "/panic",
+            json={"reason": "follow exact owner"},
+            headers=headers,
+        )
+        assert attempted.wait(timeout=5)
+        with service.session_factory() as session:
+            row = session.get(PanicReceipt, "alpaca-paper")
+            row.request_id = "owner-request-b"
+            row.state = "completed"
+            row.response_json = json.dumps(
+                {"safe": True, "owner": "request-b"}
+            )
+            row.completed_at = utcnow()
+            row.expires_at = utcnow() + timedelta(seconds=60)
+            session.commit()
+        replaced.set()
+        response = follower.result(timeout=5)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "panic_incomplete"
+    assert response.json().get("owner") is None
+    assert panic_calls == 0
+
+
+def test_long_panic_keeps_one_lease_owner_and_executes_once(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.1,
+        raising=False,
+    )
+    service = _with_limit(
+        make_service(),
+        "panic",
+        requests=20,
+        global_requests=40,
+        window_seconds=1,
+        concurrency=1,
+    )
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-long-panic-secret",
+        planning=None,
+    )
+    owner_client = TestClient(app)
+    follower_client = TestClient(app)
+    login = owner_client.post(
+        "/auth/login",
+        json={"secret": "route-long-panic-secret"},
+    )
+    cookie_name = app.state.session_auth.cookie_name()
+    follower_client.cookies.set(
+        cookie_name,
+        owner_client.cookies.get(cookie_name),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def slow_panic(_context):
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"safe": True, "owner": "original"}
+
+    app.state.operations.panic = slow_panic
+    original_acquire = app.state.leases.acquire
+    acquired_owners: list[str] = []
+
+    def record_acquire(*args, **kwargs):
+        decision = original_acquire(*args, **kwargs)
+        if decision.acquired:
+            acquired_owners.append(decision.owner)
+        return decision
+
+    app.state.leases.acquire = record_acquire
+    owner_headers = {
+        "X-CSRF-Token": login.json()["csrf_token"],
+        "Idempotency-Key": "panic-long-owner",
+        "X-Request-ID": "shared-external-panic-id",
+    }
+    follower_headers = {
+        "X-CSRF-Token": login.json()["csrf_token"],
+        "Idempotency-Key": "panic-long-follower",
+        "X-Request-ID": "shared-external-panic-id",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(
+            owner_client.post,
+            "/panic",
+            json={"reason": "long owner"},
+            headers=owner_headers,
+        )
+        assert started.wait(timeout=5)
+        time.sleep(1.2)
+        follower = pool.submit(
+            follower_client.post,
+            "/panic",
+            json={"reason": "must follow original"},
+            headers=follower_headers,
+        )
+        time.sleep(0.1)
+        release.set()
+        owner_response = owner.result(timeout=5)
+        follower_response = follower.result(timeout=5)
+
+    assert owner_response.status_code == 200
+    assert follower_response.status_code == 200
+    assert owner_response.json() == follower_response.json()
+    assert calls == 1
+    assert len(acquired_owners) == 1
+
+
+def test_completed_panic_response_survives_settlement_failure_and_blocks_retry(
+    make_service,
+    monkeypatch,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-panic-settlement-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-panic-settlement-secret"},
+    )
+    calls = 0
+    receipt = {"safe": True, "owner": "settlement-failure"}
+
+    def panic(_context):
+        nonlocal calls
+        calls += 1
+        return receipt
+
+    def fail_settlement(*_args, **_kwargs):
+        raise LimitStoreUnavailable("settlement failed")
+
+    app.state.operations.panic = panic
+    monkeypatch.setattr(
+        policy_module,
+        "_finish_panic_receipt",
+        fail_settlement,
+    )
+    headers = {
+        "X-CSRF-Token": login.json()["csrf_token"],
+        "Idempotency-Key": "panic-settlement-owner",
+    }
+
+    completed = client.post(
+        "/panic",
+        json={"reason": "settlement fails after completion"},
+        headers=headers,
+    )
+
+    assert completed.status_code == 200
+    assert completed.json() == receipt
+    with service.session_factory() as session:
+        durable = session.get(PanicReceipt, "alpaca-paper")
+        assert durable.state == "failed"
+    retry = client.post(
+        "/panic",
+        json={"reason": "uncertain retry must not execute"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": "panic-settlement-retry",
+        },
+    )
+    assert retry.status_code == 503
+    assert retry.json()["error"]["code"] == "panic_incomplete"
+    assert calls == 1
+
+
+@pytest.mark.parametrize("release_failure", ["false", "exception"])
+def test_completed_panic_response_survives_release_failure_and_blocks_retry(
+    make_service,
+    release_failure,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-panic-release-secret",
+        planning=None,
+    )
+    client = TestClient(app)
+    login = client.post(
+        "/auth/login",
+        json={"secret": "route-panic-release-secret"},
+    )
+    delegate = app.state.leases
+
+    class FailingReleaseLeases:
+        def acquire(self, *args, **kwargs):
+            return delegate.acquire(*args, **kwargs)
+
+        def renew(self, *args, **kwargs):
+            return delegate.renew(*args, **kwargs)
+
+        def inspect(self, *args, **kwargs):
+            return delegate.inspect(*args, **kwargs)
+
+        def release(self, *_args, **_kwargs):
+            if release_failure == "exception":
+                raise LimitStoreUnavailable("release failed")
+            return False
+
+    app.state.leases = FailingReleaseLeases()
+    calls = 0
+    receipt = {"safe": True, "owner": "release-failure"}
+
+    def panic(_context):
+        nonlocal calls
+        calls += 1
+        return receipt
+
+    app.state.operations.panic = panic
+    completed = client.post(
+        "/panic",
+        json={"reason": "release fails after completion"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": f"panic-release-{release_failure}",
+        },
+    )
+
+    assert completed.status_code == 200
+    assert completed.json() == receipt
+    with service.session_factory() as session:
+        durable = session.get(PanicReceipt, "alpaca-paper")
+        assert durable.state == "failed"
+    retry = client.post(
+        "/panic",
+        json={"reason": "uncertain retry must not execute"},
+        headers={
+            "X-CSRF-Token": login.json()["csrf_token"],
+            "Idempotency-Key": f"panic-release-{release_failure}-retry",
+        },
+    )
+    assert retry.status_code == 503
+    assert retry.json()["error"]["code"] == "panic_incomplete"
+    assert calls == 1
+
+
+def test_blocked_durable_limiter_does_not_delay_exact_liveness(
+    make_service,
+):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-responsive-secret",
+        planning=None,
+    )
+    blocked = threading.Event()
+    release = threading.Event()
+
+    class BlockingLimiter:
+        def consume_pair(self, *_args, **_kwargs):
+            blocked.set()
+            release.wait(timeout=0.5)
+            now = utcnow()
+            return LimitDecision(
+                allowed=True,
+                remaining=1,
+                retry_after_seconds=0,
+                reset_at=now + timedelta(seconds=60),
+            )
+
+    app.state.rate_limiter = BlockingLimiter()
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            started_at = time.monotonic()
+            login = asyncio.create_task(
+                client.post(
+                    "/auth/login",
+                    json={"secret": "route-responsive-secret"},
+                )
+            )
+            assert await asyncio.to_thread(blocked.wait, 1)
+            liveness = await asyncio.wait_for(
+                client.get("/health/live"),
+                timeout=0.2,
+            )
+            elapsed = time.monotonic() - started_at
+            release.set()
+            login_response = await login
+            return liveness, login_response, elapsed
+
+    liveness, login_response, elapsed = asyncio.run(exercise())
+
+    assert liveness.status_code == 200
+    assert login_response.status_code == 200
+    assert elapsed < 0.25

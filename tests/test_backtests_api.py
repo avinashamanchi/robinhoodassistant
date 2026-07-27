@@ -96,6 +96,7 @@ def test_run_endpoint_persists(client, monkeypatch):
     response = c.post(
         "/backtests/run",
         json={"reason": "compare synthetic strategies"},
+        headers={"Idempotency-Key": "backtest-run-persist"},
     )
     res = response.json()
     assert "run_id" in res
@@ -116,7 +117,11 @@ def test_run_endpoint_persists(client, monkeypatch):
 def test_run_endpoint_rejects_blank_reason(client):
     c, _ = client
 
-    response = c.post("/backtests/run", json={"reason": " "})
+    response = c.post(
+        "/backtests/run",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "backtest-run-blank-reason"},
+    )
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
@@ -135,6 +140,7 @@ def test_failed_backtest_launch_is_sanitized_and_audited(
     response = c.post(
         "/backtests/run",
         json={"reason": "failure-path review"},
+        headers={"Idempotency-Key": "backtest-run-failure"},
     )
 
     assert response.status_code == 500
