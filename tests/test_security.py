@@ -348,7 +348,10 @@ def test_authenticated_session_and_csrf_allow_mutation(
     client, csrf = authenticate_client(client, TOKEN)
     r = client.post(
         "/killswitch/reset",
-        headers={"X-CSRF-Token": csrf},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "security-breaker-reset",
+        },
         json={
             "scope": "loss:equity",
             "reason": "authenticated health review",
@@ -375,22 +378,29 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
         backtest_rate=blocked,
     )
     limited, csrf = authenticate_client(TestClient(app), TOKEN)
-    headers = {"X-CSRF-Token": csrf}
-
     assert limited.post(
         "/analyze",
         json={"symbol": "AAPL", "reason": "rate limit test"},
-        headers=headers,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "security-rate-analyze",
+        },
     ).status_code == 429
     assert limited.post(
         "/propose",
         json={"n": 1, "reason": "rate limit test"},
-        headers=headers,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "security-rate-propose",
+        },
     ).status_code == 429
     assert limited.post(
         "/backtests/run",
         json={"symbols": [], "reason": "rate limit test"},
-        headers=headers,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "security-rate-backtest",
+        },
     ).status_code == 429
 
 

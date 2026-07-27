@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -16,6 +17,35 @@ from trading_assistant.db.session import create_db_engine, make_session_factory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_OPERATOR_TOKEN = "test-operator-secret"
+
+
+@pytest.fixture(autouse=True)
+def _default_test_idempotency_key(monkeypatch):
+    """Keep legacy handler tests focused past the new central boundary.
+
+    Explicit empty or invalid keys are preserved so policy rejection tests
+    still exercise the real missing/invalid behavior.
+    """
+    from fastapi.testclient import TestClient
+
+    original_request = TestClient.request
+
+    def request_with_idempotency(self, method, url, **kwargs):
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers = dict(kwargs.get("headers") or {})
+            if not any(
+                name.lower() == "idempotency-key"
+                for name in headers
+            ):
+                headers["Idempotency-Key"] = f"test-{uuid4().hex}"
+            kwargs["headers"] = headers
+        return original_request(self, method, url, **kwargs)
+
+    monkeypatch.setattr(
+        TestClient,
+        "request",
+        request_with_idempotency,
+    )
 
 
 @pytest.fixture

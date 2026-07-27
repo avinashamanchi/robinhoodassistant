@@ -113,6 +113,10 @@ def _harden_response(request: Request, response):
 
 
 def install_security(app: FastAPI) -> None:
+    from .policy import install_route_policy
+
+    install_route_policy(app)
+
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, exc: ApiError):
         return _error_response(request, exc)

@@ -707,7 +707,10 @@ def _position_reconciliation_process(
             csrf = client.get("/auth/session").json()["csrf_token"]
             response = client.post(
                 "/reconcile",
-                headers={"X-CSRF-Token": csrf},
+                headers={
+                    "X-CSRF-Token": csrf,
+                    "Idempotency-Key": "process-position-reconciliation",
+                },
                 json={"reason": "process drift review"},
             )
             response.raise_for_status()
