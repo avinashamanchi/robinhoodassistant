@@ -97,7 +97,13 @@ def validate_llm_payload(
     if type(tools) is not list:
         raise ValueError("tools must be a list")
     if tool_choice is not None:
-        _require_nonempty_string("tool_choice", tool_choice)
+        if type(tool_choice) is not str or tool_choice not in {
+            "auto",
+            "any",
+        }:
+            raise ValueError("tool_choice must be auto, any, or None")
+        if not tools:
+            raise ValueError("tool_choice requires non-empty tools")
     for index, message in enumerate(messages):
         if type(message) is not dict:
             raise ValueError(f"messages[{index}] must be a dictionary")
@@ -296,8 +302,11 @@ def build_anthropic_payload(
         "messages": messages,
         "tools": tools,
     }
-    if tools and (tool_choice == "any" or conservative_tool_choice):
-        payload["tool_choice"] = {"type": "any"}
+    selected_tool_choice = (
+        "any" if conservative_tool_choice else tool_choice
+    )
+    if selected_tool_choice is not None:
+        payload["tool_choice"] = {"type": selected_tool_choice}
     _validate_provider_payload(payload)
     return payload
 
@@ -319,10 +328,13 @@ def build_groq_payload(
     openai_messages, openai_tools = to_openai(system, messages, tools)
     payload: dict[str, Any] = {"messages": openai_messages}
     if openai_tools:
+        selected_tool_choice = (
+            "any" if conservative_tool_choice else tool_choice
+        )
         payload["tools"] = openai_tools
         payload["tool_choice"] = (
             "required"
-            if tool_choice == "any" or conservative_tool_choice
+            if selected_tool_choice == "any"
             else "auto"
         )
     _validate_provider_payload(payload)
@@ -360,11 +372,14 @@ def build_gemini_payload(
             else None
         ),
     }
-    if declarations and (
-        tool_choice == "any" or conservative_tool_choice
-    ):
+    selected_tool_choice = (
+        "any" if conservative_tool_choice else tool_choice
+    )
+    if declarations and selected_tool_choice is not None:
         payload["tool_config"] = {
-            "function_calling_config": {"mode": "ANY"}
+            "function_calling_config": {
+                "mode": selected_tool_choice.upper()
+            }
         }
     _validate_provider_payload(payload)
     return payload

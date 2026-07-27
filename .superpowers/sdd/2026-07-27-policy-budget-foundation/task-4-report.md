@@ -156,3 +156,69 @@ Focused GREEN:
   Factory work remains the minimal explicit estimator resolver only; Task 5
   shared-container and wrapper composition remains out of scope.
 - No unresolved Task 4 fix-round concern.
+
+## Fix round 2
+
+### Review items resolved
+
+- `tool_choice` now accepts only `None`, `auto`, or `any`. Any non-`None`
+  choice requires at least one tool, and all invalid cases fail before
+  estimation, durable-store access, SDK client use, or delegate invocation.
+- Shared provider builders explicitly translate `auto`/`any` as Anthropic
+  `auto`/`any`, Gemini `AUTO`/`ANY`, and Groq `auto`/`required`. The Gemini
+  adapter consumes the builder-selected mode instead of hard-coding `ANY`.
+- Every provider/day is reconciled against all of its reservation rows:
+  `reserved`, `started`, and `unknown` charge one call plus reserved tokens;
+  `settled` charges one call plus exact actual tokens; `released` charges zero.
+  Missing days, orphaned reservations, mismatched provider/day keys, and any
+  non-exact aggregate fail closed.
+- Reservation validation now includes created/expiry/start/settle chronology,
+  UTC budget-day agreement, and state-specific timestamp/actual presence.
+- Reserve-time cleanup validates the selected provider before releases and
+  affected provider aggregates afterward, then validates the freshly inserted
+  day/reservation before commit. Explicit global cleanup validates all
+  providers before mutation and each affected provider after mutation.
+- Start, settle, and unknown transitions load and validate reservation/day
+  pre-state under `BEGIN IMMEDIATE`, mutate only a legal state, flush, validate
+  post-state, and then commit. Settlement cannot conceal a pre-existing
+  undercount by adding larger actual usage. Status validates the complete
+  provider aggregate before returning.
+- Modified `src/trading_assistant/llm/budget.py`,
+  `src/trading_assistant/llm/payloads.py`, and
+  `src/trading_assistant/llm/gemini_backend.py`; added
+  `tests/test_llm_budget_review_2.py`.
+
+### Strict TDD evidence
+
+- Initial RED: `uv run pytest tests/test_llm_budget_review_2.py -v` collected
+  30 tests and produced `26 failed, 4 passed`. Invalid choices reached the
+  delegate/store, Anthropic and Gemini omitted `auto`, and relational
+  corruption authorized or mutated.
+- Adapter seam RED:
+  `uv run pytest
+  tests/test_llm_budget_review_2.py::test_gemini_adapter_preserves_translated_tool_choice -v`
+  produced `1 failed, 1 passed`, proving Gemini `auto` was sent as `ANY`.
+- Focused GREEN:
+  `uv run pytest tests/test_llm_budget_review_2.py
+  tests/test_llm_budget_review.py tests/test_llm_budget.py
+  tests/test_llm_backends.py tests/test_db_models.py -v` produced
+  `164 passed`.
+- Parallel reservation race: calls/input/output ceilings passed 20/20 repeated
+  runs, covering 60 real-SQLite concurrent-writer cases with exact aggregates
+  and no overspend.
+- Single final full suite: `uv run pytest` produced
+  `1778 passed, 1 skipped, 1 warning in 242.01s`; the warning remains the
+  pre-existing `websockets.legacy` deprecation warning.
+
+### Fix-round self-review and concerns
+
+- All budget mutations remain inside `BEGIN IMMEDIATE`; aggregate validation,
+  cleanup, transition arithmetic, and post-state validation are atomic.
+- Relational corruption blocks reserve, start, settle, unknown, release, and
+  status without clamping or partial mutation. Overruns remain fully charged
+  and continue to set durable reconciliation.
+- Reserve and transition checks scan only the target provider; explicit global
+  cleanup scans all providers because all are in mutation scope.
+- No migration, real provider call, process, notification, broker action, or
+  Task 5 composition was introduced.
+- No unresolved Task 4 fix-round concern.

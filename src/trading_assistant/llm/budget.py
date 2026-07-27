@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Protocol
 
-from sqlalchemy import or_, select, text, update
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -62,6 +62,14 @@ def _as_utc(value: datetime | None) -> datetime:
     if current.tzinfo is None:
         return current.replace(tzinfo=UTC)
     return current.astimezone(UTC)
+
+
+def _is_aware_datetime(value: Any) -> bool:
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() is not None
+    )
 
 
 def _rollback_quietly(session: Session) -> None:
@@ -235,8 +243,11 @@ class ProviderBudgetService:
 
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            self._assert_no_invalid_reservation_states(session)
-            self._release_expired_unstarted(session, current)
+            self._release_expired_unstarted(
+                session,
+                current,
+                provider=provider,
+            )
 
             unresolved = session.scalar(
                 select(ProviderBudgetDay)
@@ -305,6 +316,8 @@ class ProviderBudgetService:
                     ),
                 )
             )
+            session.flush()
+            self._validate_provider_aggregates(session, provider)
             session.commit()
 
         return BudgetReservation(
@@ -324,22 +337,34 @@ class ProviderBudgetService:
     ) -> None:
         _require_text("reservation_id", reservation_id)
         current = _as_utc(now or self._clock())
-        statement = (
-            update(ProviderReservation)
-            .where(
-                ProviderReservation.reservation_id == reservation_id,
-                ProviderReservation.state == "reserved",
-            )
-            .values(state="started", started_at=current)
-        )
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            result = session.execute(statement)
-            if result.rowcount != 1:
+            reservation = session.get(
+                ProviderReservation,
+                reservation_id,
+            )
+            if reservation is None:
                 session.rollback()
                 raise ProviderBudgetUnavailable(
                     "provider reservation cannot be started"
                 )
+            self._validate_reservation(reservation)
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
+            if reservation.state != "reserved":
+                session.rollback()
+                raise ProviderBudgetUnavailable(
+                    "provider reservation cannot be started"
+                )
+            reservation.state = "started"
+            reservation.started_at = current
+            session.flush()
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
             session.commit()
 
     def settle(
@@ -367,6 +392,10 @@ class ProviderBudgetService:
                     "provider reservation cannot be settled"
                 )
             self._validate_reservation(reservation)
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
             if reservation.state != "started":
                 session.rollback()
                 raise ProviderBudgetUnavailable(
@@ -381,7 +410,6 @@ class ProviderBudgetService:
                 raise ProviderBudgetUnavailable(
                     "provider budget day is unavailable"
                 )
-            self._validate_day(day)
 
             day.input_tokens_used = (
                 day.input_tokens_used
@@ -414,6 +442,11 @@ class ProviderBudgetService:
             reservation.output_actual = output_tokens
             reservation.state = "settled"
             reservation.settled_at = current
+            session.flush()
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
             session.commit()
 
     def mark_unknown(
@@ -421,29 +454,39 @@ class ProviderBudgetService:
         reservation_id: str,
     ) -> None:
         _require_text("reservation_id", reservation_id)
-        statement = (
-            update(ProviderReservation)
-            .where(
-                ProviderReservation.reservation_id == reservation_id,
-                ProviderReservation.state == "started",
-            )
-            .values(state="unknown")
-        )
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            result = session.execute(statement)
-            if result.rowcount != 1:
+            reservation = session.get(
+                ProviderReservation,
+                reservation_id,
+            )
+            if reservation is None:
                 session.rollback()
                 raise ProviderBudgetUnavailable(
                     "provider reservation cannot be marked unknown"
                 )
+            self._validate_reservation(reservation)
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
+            if reservation.state != "started":
+                session.rollback()
+                raise ProviderBudgetUnavailable(
+                    "provider reservation cannot be marked unknown"
+                )
+            reservation.state = "unknown"
+            session.flush()
+            self._validate_provider_aggregates(
+                session,
+                reservation.provider,
+            )
             session.commit()
 
     def release_expired_unstarted(self, now: datetime) -> int:
         current = _as_utc(now)
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            self._assert_no_invalid_reservation_states(session)
             released = self._release_expired_unstarted(
                 session,
                 current,
@@ -451,19 +494,30 @@ class ProviderBudgetService:
             session.commit()
             return released
 
-    @staticmethod
+    @classmethod
     def _release_expired_unstarted(
+        cls,
         session: Session,
         current: datetime,
+        *,
+        provider: str | None = None,
     ) -> int:
-        reservations = session.scalars(
-            select(ProviderReservation).where(
-                ProviderReservation.state == "reserved",
-                ProviderReservation.expires_at <= current,
+        if provider is None:
+            cls._validate_all_aggregates(session)
+        else:
+            cls._validate_provider_aggregates(session, provider)
+        statement = select(ProviderReservation).where(
+            ProviderReservation.state == "reserved",
+            ProviderReservation.expires_at <= current,
+        )
+        if provider is not None:
+            statement = statement.where(
+                ProviderReservation.provider == provider
             )
-        ).all()
+        reservations = session.scalars(statement).all()
+        affected_providers: set[str] = set()
         for reservation in reservations:
-            ProviderBudgetService._validate_reservation(reservation)
+            cls._validate_reservation(reservation)
             day = session.get(
                 ProviderBudgetDay,
                 (reservation.provider, reservation.budget_day),
@@ -472,20 +526,18 @@ class ProviderBudgetService:
                 raise ProviderBudgetUnavailable(
                     "provider budget day is unavailable"
                 )
-            ProviderBudgetService._validate_day(day)
-            if (
-                day.calls_used < 1
-                or day.input_tokens_used < reservation.input_reserved
-                or day.output_tokens_used < reservation.output_reserved
-            ):
-                raise ProviderBudgetUnavailable(
-                    "corrupt provider budget state"
-                )
             day.calls_used -= 1
             day.input_tokens_used -= reservation.input_reserved
             day.output_tokens_used -= reservation.output_reserved
             day.updated_at = current
             reservation.state = "released"
+            affected_providers.add(reservation.provider)
+        session.flush()
+        for affected_provider in affected_providers:
+            cls._validate_provider_aggregates(
+                session,
+                affected_provider,
+            )
         return len(reservations)
 
     def status(
@@ -500,6 +552,7 @@ class ProviderBudgetService:
             _require_text("model", model)
         budget_day = _as_utc(now or self._clock()).date()
         with _budget_store_session(self._session_factory) as session:
+            self._validate_provider_aggregates(session, provider)
             row = session.get(ProviderBudgetDay, (provider, budget_day))
             reconciliation = session.scalar(
                 select(ProviderBudgetDay)
@@ -510,11 +563,6 @@ class ProviderBudgetService:
                 .order_by(ProviderBudgetDay.budget_day)
                 .limit(1)
             )
-            if row is not None:
-                self._validate_day(row)
-            if reconciliation is not None:
-                self._validate_day(reconciliation)
-
         calls_used = row.calls_used if row is not None else 0
         input_used = row.input_tokens_used if row is not None else 0
         output_used = row.output_tokens_used if row is not None else 0
@@ -687,6 +735,7 @@ class ProviderBudgetService:
             or day.output_tokens_used < 0
             or type(day.reconciliation_required) is not bool
             or not isinstance(day.reconciliation_code, str)
+            or not _is_aware_datetime(day.updated_at)
         ):
             raise ProviderBudgetUnavailable(
                 "corrupt provider budget state"
@@ -710,6 +759,18 @@ class ProviderBudgetService:
                 reservation.output_actual,
             )
         )
+        timestamps_valid = (
+            _is_aware_datetime(reservation.created_at)
+            and _is_aware_datetime(reservation.expires_at)
+            and (
+                reservation.started_at is None
+                or _is_aware_datetime(reservation.started_at)
+            )
+            and (
+                reservation.settled_at is None
+                or _is_aware_datetime(reservation.settled_at)
+            )
+        )
         if (
             not isinstance(reservation.reservation_id, str)
             or not reservation.reservation_id.strip()
@@ -726,6 +787,28 @@ class ProviderBudgetService:
             or type(reservation.output_reserved) is not int
             or reservation.output_reserved < 0
             or not actuals_valid
+            or not timestamps_valid
+        ):
+            raise ProviderBudgetUnavailable(
+                "corrupt provider budget state"
+            )
+        created_at = _as_utc(reservation.created_at)
+        expires_at = _as_utc(reservation.expires_at)
+        if (
+            reservation.budget_day != created_at.date()
+            or expires_at <= created_at
+            or (
+                reservation.started_at is not None
+                and _as_utc(reservation.started_at) < created_at
+            )
+            or (
+                reservation.settled_at is not None
+                and (
+                    reservation.started_at is None
+                    or _as_utc(reservation.settled_at)
+                    < _as_utc(reservation.started_at)
+                )
+            )
         ):
             raise ProviderBudgetUnavailable(
                 "corrupt provider budget state"
@@ -767,27 +850,80 @@ class ProviderBudgetService:
                 "corrupt provider budget state"
             )
 
-    @staticmethod
-    def _assert_no_invalid_reservation_states(
+    @classmethod
+    def _validate_provider_aggregates(
+        cls,
         session: Session,
+        provider: str,
     ) -> None:
-        invalid = session.scalar(
-            select(ProviderReservation.reservation_id)
-            .where(
-                or_(
-                    ProviderReservation.state.is_(None),
-                    ProviderReservation.state.not_in(
-                        _RESERVATION_STATES
-                    ),
-                    ProviderReservation.input_reserved < 0,
-                    ProviderReservation.output_reserved < 0,
-                    ProviderReservation.input_actual < 0,
-                    ProviderReservation.output_actual < 0,
-                )
-            )
-            .limit(1)
-        )
-        if invalid is not None:
+        if not isinstance(provider, str) or not provider.strip():
             raise ProviderBudgetUnavailable(
                 "corrupt provider budget state"
             )
+        days = session.scalars(
+            select(ProviderBudgetDay).where(
+                ProviderBudgetDay.provider == provider
+            )
+        ).all()
+        reservations = session.scalars(
+            select(ProviderReservation).where(
+                ProviderReservation.provider == provider
+            )
+        ).all()
+        days_by_date: dict[date, ProviderBudgetDay] = {}
+        expected: dict[date, list[int]] = {}
+        for day in days:
+            cls._validate_day(day)
+            if day.provider != provider or day.budget_day in days_by_date:
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
+            days_by_date[day.budget_day] = day
+            expected[day.budget_day] = [0, 0, 0]
+
+        for reservation in reservations:
+            cls._validate_reservation(reservation)
+            day = days_by_date.get(reservation.budget_day)
+            if (
+                reservation.provider != provider
+                or day is None
+                or day.provider != reservation.provider
+                or day.budget_day != reservation.budget_day
+            ):
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
+            if reservation.state == "released":
+                continue
+            totals = expected[reservation.budget_day]
+            totals[0] += 1
+            if reservation.state == "settled":
+                totals[1] += reservation.input_actual
+                totals[2] += reservation.output_actual
+            else:
+                totals[1] += reservation.input_reserved
+                totals[2] += reservation.output_reserved
+
+        for budget_day, day in days_by_date.items():
+            totals = expected[budget_day]
+            if (
+                day.calls_used != totals[0]
+                or day.input_tokens_used != totals[1]
+                or day.output_tokens_used != totals[2]
+            ):
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
+
+    @classmethod
+    def _validate_all_aggregates(cls, session: Session) -> None:
+        providers = set(
+            session.scalars(select(ProviderBudgetDay.provider)).all()
+        )
+        providers.update(
+            session.scalars(
+                select(ProviderReservation.provider)
+            ).all()
+        )
+        for provider in providers:
+            cls._validate_provider_aggregates(session, provider)

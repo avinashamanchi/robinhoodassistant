@@ -127,11 +127,16 @@ class GeminiBackend:
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
         )
-        # "any" forces a function call so a 200 always carries structured output
-        # (Gemini otherwise sometimes replies in prose -> "did not submit a plan").
+        # Preserve the validated explicit mode. "any" forces a function call
+        # so a 200 always carries structured output.
         if "tool_config" in payload:
+            mode = payload["tool_config"]["function_calling_config"][
+                "mode"
+            ]
             cfg_kwargs["tool_config"] = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=mode
+                )
             )
         config = types.GenerateContentConfig(**cfg_kwargs)
         resp = self._get_client().models.generate_content(
