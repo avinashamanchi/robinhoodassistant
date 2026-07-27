@@ -74,8 +74,11 @@ with `mode=ro&nofollow=1`. This binds connection open to the original inodes
 even if the original pathname is swapped and restored. Controlled link counts
 and identities are checked during cleanup; cleanup failure is unsafe,
 unverified paths are never unlinked, and source link counts must return to
-baseline. Destination parents and staging are private, symlink-resistant, and
-published without overwrite.
+baseline. If creation succeeds but the private-directory open fails, cleanup
+removes only the still-empty `0700` directory whose inode matches the one just
+created; an unverified replacement is preserved and the drill fails closed.
+Destination parents and staging are private, symlink-resistant, and published
+without overwrite.
 
 An active WAL source is supported when its regular `-wal` and `-shm` files
 already exist. The drill requires those sidecars rather than creating recovery
@@ -156,20 +159,35 @@ If the order fills, compensation is allowed only when exact `BrokerFill` records
 for the tagged broker-order ID aggregate to broker cumulative `filled_qty` and
 the full position-manifest drift equals that signed exposure. The terminal,
 fill, and full-manifest evidence is collected after terminal checks and is
-repeated after the local compensation proposal is created, immediately before
-approval. Any intervening account delta or original status/fill change blocks
-approval, so no compensation order is submitted. The original must first be
-identity-verified terminal with two stable cumulative-fill observations. If
-cancellation is failed or unconfirmed, compensation is not submitted and the
-drill remains unsafe for operator intervention. A tagged opposite
-exact-quantity order then uses the same human-gated service and must be
-boundedly reconciled to terminal fill truth. An outer cleanup path resolves
-stale `SUBMITTING` or `acceptance_unknown` local state, validates remote
-identity before cancellation, requires every tagged remote/read/cancel result
-to match the known drill symbol, isolates per-order provider failures so later
-tagged IDs are still attempted,
-and never touches a pre-existing ID. Any unavailable evidence, nonterminal
-compensation, or final-manifest mismatch remains unsafe. The
+repeated after the local compensation proposal is created. A one-shot guard,
+keyed to that compensation client ID, repeats stable terminal, exact-fill, and
+full-manifest checks after execution-risk evaluation and immediately before the
+drill wrapper delegates to the broker. A changed invariant raises a
+deterministic rejection, records the local compensation `REJECTED`, and
+performs no broker submission. Post-proposal failures are also rejected through
+the normal service and audit path. The original must first be identity-verified
+terminal with two stable cumulative-fill observations. If cancellation is
+failed or unconfirmed, compensation is not submitted and the drill remains
+unsafe for operator intervention.
+
+This last check cannot make external account activity atomic with Alpaca order
+acceptance: another actor can still change the account after the callback and
+before or after provider acceptance. Final broker-order, fill, and full-position
+reconciliation remains authoritative; any mismatch keeps the drill unsafe and
+requires operator intervention.
+
+A tagged opposite exact-quantity order then uses the same human-gated service
+and must be boundedly reconciled to terminal fill truth. An outer cleanup path
+resolves stale `SUBMITTING` or `acceptance_unknown` local state, validates
+remote identity before cancellation, requires every tagged remote/read/cancel
+result to match the known drill symbol, isolates per-order provider failures so
+later tagged IDs are still considered, and never touches a pre-existing ID.
+Each tagged broker-order ID receives at most one cancel API attempt; after an
+exception or nonterminal response, later cleanup phases only read and reconcile
+that ID. A newly discovered tagged order may receive its own first cancel
+attempt. Tagged `PROPOSED` and `APPROVAL_RECORDED` rows are also unsafe final
+state. Any unavailable evidence, nonterminal compensation, or final-manifest
+mismatch remains unsafe. The
 `alpaca_paper:passed` label requires every report gate plus one final dynamic
 paper-target validation; clean reconciliation alone is insufficient. Missing
 credentials are a skip, never a pass.

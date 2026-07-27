@@ -30,8 +30,9 @@ from trading_assistant.broker.models import (
     Quote,
 )
 from trading_assistant.config import BrokerKind, Secrets, TradingMode
-from trading_assistant.db.models import Fill, Order
+from trading_assistant.db.models import AuditEvent, Fill, Order
 from trading_assistant.db.session import create_db_engine, make_session_factory
+from trading_assistant.orders.submission import OrderSubmissionService
 from trading_assistant.ops.safety_drill import (
     SafetyDrillError,
     _CrashAfterAcceptanceOnceBroker,
@@ -46,6 +47,7 @@ from trading_assistant.ops.safety_drill import (
 import trading_assistant.ops.safety_drill as safety_drill_module
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.repository import RuleRepository
+from trading_assistant.service import TradingService
 
 
 _PAPER_PREEXISTING_FILLED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -318,6 +320,81 @@ def test_active_wal_backup_opens_an_inode_bound_private_alias(
             "WHERE source = 'task-10-source-sentinel'"
         ).fetchone() == ("task-10-source-sentinel",)
     assert not tuple(primary.parent.glob(".safety-drill-db-*"))
+
+
+def test_binding_open_failure_removes_exact_created_empty_private_directory(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    real_open = os.open
+
+    def fail_binding_open(path, *args, **kwargs):
+        if (
+            isinstance(path, str)
+            and path.startswith(".safety-drill-db-")
+        ):
+            raise OSError("injected binding open failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(safety_drill_module.os, "open", fail_binding_open)
+
+    with pytest.raises(SafetyDrillError):
+        _online_copy(primary, destination)
+
+    assert not tuple(tmp_path.glob(".safety-drill-db-*"))
+
+
+def test_binding_open_failure_never_deletes_replacement_directory(
+    tmp_path,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    real_open = os.open
+    replacement_name = None
+    held_name = None
+
+    def replace_binding_then_fail(path, *args, **kwargs):
+        nonlocal replacement_name, held_name
+        if (
+            isinstance(path, str)
+            and path.startswith(".safety-drill-db-")
+            and replacement_name is None
+        ):
+            parent_fd = kwargs["dir_fd"]
+            replacement_name = path
+            held_name = f"{path}.held"
+            os.rename(
+                path,
+                held_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir(path, 0o700, dir_fd=parent_fd)
+            raise OSError("injected replacement before open failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safety_drill_module.os,
+        "open",
+        replace_binding_then_fail,
+    )
+
+    with pytest.raises(SafetyDrillError):
+        _online_copy(primary, destination)
+
+    assert replacement_name is not None
+    assert held_name is not None
+    replacement = tmp_path / replacement_name
+    held = tmp_path / held_name
+    assert replacement.is_dir()
+    assert held.is_dir()
+    replacement.rmdir()
+    held.rmdir()
 
 
 def test_online_copy_defeats_source_swap_open_restore_race(
@@ -1970,6 +2047,126 @@ def test_mock_mode_compensates_only_its_adverse_fill(
     assert compensation_result.broker_order_id in broker.status_ids
 
 
+def test_compensation_last_mile_guard_blocks_drift_after_execution_risk(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    copied = tmp_path / "last-mile-compensation-copy.db"
+    _upgrade_database(primary)
+    _seed_preexisting_paper_order(primary)
+    _local_drill_environment(monkeypatch, primary)
+    broker = PaperStateBroker(fill_initial=True)
+    original_risk_check = OrderSubmissionService._risk_check
+    drifted = False
+
+    def drift_after_execution_risk(self, request, order_id):
+        nonlocal drifted
+        result = original_risk_check(self, request, order_id)
+        if (
+            request.idempotency_key.endswith("-compensate")
+            and not drifted
+        ):
+            broker._apply_position_delta("AAPL", Decimal("1"))
+            drifted = True
+        return result
+
+    monkeypatch.setattr(
+        OrderSubmissionService,
+        "_risk_check",
+        drift_after_execution_risk,
+    )
+
+    report = run_safety_drill(
+        database_copy=copied,
+        config=_safe_config(app_config),
+        broker=broker,
+        credentialed_paper=False,
+        clock=FakeClock(is_open=True),
+    )
+
+    assert drifted
+    assert report.safe is False
+    assert len(broker.submit_requests) == 1
+    engine = create_db_engine(f"sqlite:///{copied}")
+    with make_session_factory(engine)() as session:
+        compensation = session.scalar(
+            select(Order).where(
+                Order.idempotency_key.like("%-compensate")
+            )
+        )
+        assert compensation is not None
+        assert compensation.status == OrderStatus.REJECTED.value
+        assert (
+            compensation.last_error_code
+            == "safety_drill_compensation_invariant_changed"
+        )
+    engine.dispose()
+
+
+def test_post_proposal_compensation_failure_uses_rejection_service_and_audit(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    copied = tmp_path / "post-proposal-rejection-copy.db"
+    _upgrade_database(primary)
+    _seed_preexisting_paper_order(primary)
+    _local_drill_environment(monkeypatch, primary)
+    broker = PaperStateBroker(fill_initial=True)
+    original_propose = TradingService.propose_order
+    drifted = False
+
+    def drift_after_compensation_proposal(self, *args, **kwargs):
+        nonlocal drifted
+        result = original_propose(self, *args, **kwargs)
+        if (
+            kwargs.get("idempotency_key", "").endswith("-compensate")
+            and not drifted
+        ):
+            broker._apply_position_delta("AAPL", Decimal("1"))
+            drifted = True
+        return result
+
+    monkeypatch.setattr(
+        TradingService,
+        "propose_order",
+        drift_after_compensation_proposal,
+    )
+
+    report = run_safety_drill(
+        database_copy=copied,
+        config=_safe_config(app_config),
+        broker=broker,
+        credentialed_paper=False,
+        clock=FakeClock(is_open=True),
+    )
+
+    assert drifted
+    assert report.safe is False
+    assert len(broker.submit_requests) == 1
+    engine = create_db_engine(f"sqlite:///{copied}")
+    with make_session_factory(engine)() as session:
+        compensation = session.scalar(
+            select(Order).where(
+                Order.idempotency_key.like("%-compensate")
+            )
+        )
+        assert compensation is not None
+        assert compensation.status == OrderStatus.REJECTED.value
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.reject",
+                AuditEvent.target_id == str(compensation.id),
+            )
+        )
+        assert audit is not None
+        assert audit.actor == "operator:safety-drill"
+    engine.dispose()
+
+
 def test_compensation_is_boundedly_reconciled_to_terminal_broker_truth(
     tmp_path,
     app_config,
@@ -2548,6 +2745,110 @@ def test_tagged_cleanup_isolates_provider_failure_per_order(failure_stage):
         symbol="AAPL",
     )
     assert "drill-second" in broker.canceled
+
+
+@pytest.mark.parametrize("cancel_outcome", ["exception", "nonterminal"])
+def test_best_effort_cleanup_never_retries_an_uncertain_cancel(cancel_outcome):
+    tag = "safety-drill-one-shot-cancel"
+    remote = OrderResult(
+        idempotency_key=f"{tag}-crash",
+        broker_order_id="drill-open",
+        status=OrderStatus.SUBMITTED,
+        ticker="AAPL",
+    )
+
+    class Broker:
+        cancel_attempts = 0
+
+        def get_open_orders(self):
+            return [remote]
+
+        def get_order_by_client_id(self, client_order_id):
+            assert client_order_id == remote.idempotency_key
+            return remote
+
+        def cancel_order(self, order_id):
+            assert order_id == remote.broker_order_id
+            self.cancel_attempts += 1
+            if cancel_outcome == "exception":
+                raise RuntimeError("injected unknown cancel acceptance")
+            return remote
+
+    class Reconciliation:
+        def reconcile_unknown(self, **kwargs):
+            return (0, ())
+
+    class Service:
+        def sync_open_orders(self, **kwargs):
+            return {"failed": 0}
+
+    broker = Broker()
+    container = type(
+        "Container",
+        (),
+        {
+            "broker": broker,
+            "reconciliation": Reconciliation(),
+            "service": Service(),
+        },
+    )()
+
+    assert not safety_drill_module._best_effort_cleanup(
+        container,
+        before_positions={},
+        tag=tag,
+        symbol="AAPL",
+    )
+    assert broker.cancel_attempts == 1
+
+
+def test_final_local_scan_treats_unapproved_tagged_orders_as_unsafe(
+    tmp_path,
+):
+    database = tmp_path / "unsafe-local-orders.db"
+    _upgrade_database(database)
+    engine = create_db_engine(f"sqlite:///{database}")
+    session_factory = make_session_factory(engine)
+    tag = "safety-drill-final-scan"
+    with session_factory() as session:
+        proposed = Order(
+            idempotency_key=f"{tag}-proposed",
+            ticker="AAPL",
+            side=OrderSide.BUY.value,
+            order_type=OrderType.LIMIT.value,
+            qty=Decimal("1"),
+            limit_price=Decimal("90"),
+            status=OrderStatus.PROPOSED.value,
+        )
+        approval_recorded = Order(
+            idempotency_key=f"{tag}-approval-recorded",
+            ticker="AAPL",
+            side=OrderSide.BUY.value,
+            order_type=OrderType.LIMIT.value,
+            qty=Decimal("1"),
+            limit_price=Decimal("90"),
+            status=OrderStatus.APPROVAL_RECORDED.value,
+        )
+        terminal = Order(
+            idempotency_key=f"{tag}-rejected",
+            ticker="AAPL",
+            side=OrderSide.BUY.value,
+            order_type=OrderType.LIMIT.value,
+            qty=Decimal("1"),
+            limit_price=Decimal("90"),
+            status=OrderStatus.REJECTED.value,
+        )
+        session.add_all((proposed, approval_recorded, terminal))
+        session.commit()
+        expected_ids = {proposed.id, approval_recorded.id}
+        finder = getattr(
+            safety_drill_module,
+            "_unsafe_tagged_local_order_ids",
+            lambda *_args, **_kwargs: (),
+        )
+
+        assert set(finder(session, tag)) == expected_ids
+    engine.dispose()
 
 
 def test_outer_cleanup_runs_for_base_exception_after_broker_mutation(

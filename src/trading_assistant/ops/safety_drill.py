@@ -26,7 +26,7 @@ from sqlalchemy.engine import make_url
 from ..app.auth import InvalidSession
 from ..assets import AssetClass
 from ..bootstrap import build_test_container
-from ..broker.base import BrokerClient
+from ..broker.base import BrokerClient, BrokerSubmissionRejected
 from ..broker.models import (
     OrderRequest,
     OrderResult,
@@ -101,6 +101,32 @@ class _CrashAfterAcceptanceOnceBroker(BrokerClient):
         self.reconciliation_key = broker.reconciliation_key
         self.submit_calls = 0
         self._lose_next_acceptance = True
+        self._submit_invariant_lock = threading.Lock()
+        self._submit_invariants: dict[str, Callable[[], None]] = {}
+
+    def arm_submit_invariant(
+        self,
+        client_order_id: str,
+        invariant: Callable[[], None],
+    ) -> None:
+        """Arm one callback consumed at the final pre-delegation boundary."""
+        if not client_order_id or not callable(invariant):
+            raise ValueError("submit invariant requires a client id and callback")
+        with self._submit_invariant_lock:
+            if client_order_id in self._submit_invariants:
+                raise RuntimeError("submit invariant is already armed")
+            self._submit_invariants[client_order_id] = invariant
+
+    def disarm_submit_invariant(self, client_order_id: str) -> None:
+        with self._submit_invariant_lock:
+            self._submit_invariants.pop(client_order_id, None)
+
+    def _consume_submit_invariant(
+        self,
+        client_order_id: str,
+    ) -> Callable[[], None] | None:
+        with self._submit_invariant_lock:
+            return self._submit_invariants.pop(client_order_id, None)
 
     def get_quote(self, ticker: str):
         return self._broker.get_quote(ticker)
@@ -118,6 +144,9 @@ class _CrashAfterAcceptanceOnceBroker(BrokerClient):
     def submit_order(self, order: OrderRequest) -> OrderResult:
         if self._before_broker_mutation is not None:
             self._before_broker_mutation()
+        invariant = self._consume_submit_invariant(order.idempotency_key)
+        if invariant is not None:
+            invariant()
         self.submit_calls += 1
         result = self._broker.submit_order(order)
         if self._lose_next_acceptance:
@@ -443,12 +472,27 @@ def _bind_database_source(held: _HeldDatabaseSource):
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_fd: int | None = None
+    created_directory_identity: tuple[int, int] | None = None
     linked_suffixes: set[str] = set()
     binding: _DatabaseSourceBinding | None = None
     cleanup_failed = False
     try:
         try:
             os.mkdir(directory_name, 0o700, dir_fd=held.parent_fd)
+            created_directory = os.stat(
+                directory_name,
+                dir_fd=held.parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(created_directory.st_mode)
+                or stat.S_IMODE(created_directory.st_mode) != 0o700
+            ):
+                raise OSError("unsafe private binding directory")
+            created_directory_identity = (
+                created_directory.st_dev,
+                created_directory.st_ino,
+            )
             directory_fd = os.open(
                 directory_name,
                 directory_flags | nofollow,
@@ -456,6 +500,31 @@ def _bind_database_source(held: _HeldDatabaseSource):
             )
             os.fchmod(directory_fd, 0o700)
         except OSError:
+            if (
+                directory_fd is None
+                and created_directory_identity is not None
+            ):
+                try:
+                    candidate = os.stat(
+                        directory_name,
+                        dir_fd=held.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISDIR(candidate.st_mode)
+                        and stat.S_IMODE(candidate.st_mode) == 0o700
+                        and (
+                            candidate.st_dev,
+                            candidate.st_ino,
+                        )
+                        == created_directory_identity
+                    ):
+                        os.rmdir(
+                            directory_name,
+                            dir_fd=held.parent_fd,
+                        )
+                except OSError:
+                    pass
             raise SafetyDrillError("database_copy_failed") from None
         directory_metadata = os.fstat(directory_fd)
         if (
@@ -1145,6 +1214,7 @@ def _resolve_tagged_terminal(
     symbol: str,
     tag: str,
     attempts: int = 5,
+    reconcile_local: bool = True,
 ) -> OrderResult | None:
     """Bound reads and require two matching identity-preserving terminal views."""
     terminal = {
@@ -1181,13 +1251,14 @@ def _resolve_tagged_terminal(
             or observed.broker_order_id != by_client.broker_order_id
         ):
             return None
-        sync = _reconcile_drill_orders(
-            container,
-            tag,
-            f"terminal-read-{attempt}",
-        )
-        if sync["failed"] != 0:
-            return None
+        if reconcile_local:
+            sync = _reconcile_drill_orders(
+                container,
+                tag,
+                f"terminal-read-{attempt}",
+            )
+            if sync["failed"] != 0:
+                return None
         if observed.status in terminal:
             if (
                 prior_terminal is not None
@@ -1212,6 +1283,7 @@ def _verified_initial_exposure(
     initial_client_id: str,
     tag: str,
     symbol: str,
+    reconcile_local: bool = True,
 ) -> tuple[OrderResult, Decimal] | None:
     """Read terminal order, exact fills, then the matching account manifest."""
     initial = _resolve_tagged_terminal(
@@ -1219,6 +1291,7 @@ def _verified_initial_exposure(
         client_order_id=initial_client_id,
         symbol=symbol,
         tag=tag,
+        reconcile_local=reconcile_local,
     )
     if initial is None:
         return None
@@ -1293,25 +1366,88 @@ def _compensate_drill_fill(
     )
     if proposal["status"] != OrderStatus.PROPOSED.value:
         return False
-    reverified = _verified_initial_exposure(
-        container,
-        before_positions=before_positions,
-        initial_client_id=initial_client_id,
-        tag=tag,
-        symbol=symbol,
-    )
+    try:
+        reverified = _verified_initial_exposure(
+            container,
+            before_positions=before_positions,
+            initial_client_id=initial_client_id,
+            tag=tag,
+            symbol=symbol,
+        )
+    except Exception:
+        reverified = None
     if (
         reverified is None
         or reverified[1] != signed_exposure
         or not _same_terminal_fill(initial, reverified[0])
     ):
+        try:
+            container.service.reject_order(
+                proposal["order_id"],
+                actor="operator:safety-drill",
+                reason=(
+                    "compensation invariant changed after proposal; "
+                    "do not submit"
+                ),
+                request_id=f"{tag}-compensate-reject",
+            )
+        except Exception:
+            pass
         return False
-    approved = container.service.approve_order(
-        proposal["order_id"],
-        actor="operator:safety-drill",
-        reason="human safety drill compensation approval",
-        request_id=f"{tag}-compensate-approve",
+    arm_invariant = getattr(
+        container.broker,
+        "arm_submit_invariant",
+        None,
     )
+    disarm_invariant = getattr(
+        container.broker,
+        "disarm_submit_invariant",
+        None,
+    )
+    if not callable(arm_invariant) or not callable(disarm_invariant):
+        try:
+            container.service.reject_order(
+                proposal["order_id"],
+                actor="operator:safety-drill",
+                reason="compensation submit guard is unavailable",
+                request_id=f"{tag}-compensate-guard-reject",
+            )
+        except Exception:
+            pass
+        return False
+
+    def verify_at_delegation_boundary() -> None:
+        current = _verified_initial_exposure(
+            container,
+            before_positions=before_positions,
+            initial_client_id=initial_client_id,
+            tag=tag,
+            symbol=symbol,
+            reconcile_local=False,
+        )
+        if (
+            current is None
+            or current[1] != signed_exposure
+            or not _same_terminal_fill(initial, current[0])
+        ):
+            raise BrokerSubmissionRejected(
+                "safety_drill_compensation_invariant_changed",
+                "safety drill compensation invariant changed",
+            )
+
+    try:
+        arm_invariant(
+            compensation_client_id,
+            verify_at_delegation_boundary,
+        )
+        approved = container.service.approve_order(
+            proposal["order_id"],
+            actor="operator:safety-drill",
+            reason="human safety drill compensation approval",
+            request_id=f"{tag}-compensate-approve",
+        )
+    finally:
+        disarm_invariant(compensation_client_id)
     if approved["status"] in {
         OrderStatus.SUBMITTING.value,
         OrderStatus.ACCEPTANCE_UNKNOWN.value,
@@ -1368,7 +1504,13 @@ def _cancel_validated_tagged_open(
     *,
     tag: str,
     symbol: str,
+    attempted_cancel_ids: set[str] | None = None,
 ) -> bool:
+    attempted_cancel_ids = (
+        attempted_cancel_ids
+        if attempted_cancel_ids is not None
+        else set()
+    )
     confirmed = True
     tagged_open = tuple(
         order
@@ -1411,6 +1553,10 @@ def _cancel_validated_tagged_open(
             ):
                 confirmed = False
                 continue
+            if remote.broker_order_id in attempted_cancel_ids:
+                confirmed = False
+                continue
+            attempted_cancel_ids.add(remote.broker_order_id)
             canceled = container.broker.cancel_order(
                 remote.broker_order_id
             )
@@ -1441,6 +1587,7 @@ def _best_effort_cleanup(
 ) -> bool:
     """Cancel/flatten only tagged state; never expose a provider exception."""
     confirmed = True
+    attempted_cancel_ids: set[str] = set()
     try:
         container.reconciliation.reconcile_unknown(
             actor="operator:safety-drill",
@@ -1455,6 +1602,7 @@ def _best_effort_cleanup(
                 container,
                 tag=tag,
                 symbol=symbol,
+                attempted_cancel_ids=attempted_cancel_ids,
             )
             and confirmed
         )
@@ -1479,6 +1627,7 @@ def _best_effort_cleanup(
                 container,
                 tag=tag,
                 symbol=symbol,
+                attempted_cancel_ids=attempted_cancel_ids,
             )
             final_sync = _reconcile_drill_orders(
                 container,
@@ -1493,6 +1642,28 @@ def _best_effort_cleanup(
         except Exception:
             confirmed = False
     return compensated and confirmed
+
+
+def _unsafe_tagged_local_order_ids(session, tag: str) -> tuple[int, ...]:
+    """Return every nonterminal local order owned by one drill tag."""
+    return tuple(
+        session.scalars(
+            select(Order.id).where(
+                Order.idempotency_key.like(f"{tag}%"),
+                Order.status.in_(
+                    (
+                        OrderStatus.PROPOSED.value,
+                        OrderStatus.APPROVAL_RECORDED.value,
+                        OrderStatus.APPROVED.value,
+                        OrderStatus.SUBMITTING.value,
+                        OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                        OrderStatus.SUBMITTED.value,
+                        OrderStatus.PARTIALLY_FILLED.value,
+                    )
+                ),
+            )
+        ).all()
+    )
 
 
 def run_safety_drill(
@@ -1906,19 +2077,10 @@ def run_safety_drill(
             request_id=f"{tag}-final-positions",
         )
         with restarted.session_factory() as session:
-            unsafe_local_orders = session.scalars(
-                select(Order.id).where(
-                    Order.idempotency_key.like(f"{tag}%"),
-                    Order.status.in_(
-                        (
-                            OrderStatus.SUBMITTING.value,
-                            OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                            OrderStatus.SUBMITTED.value,
-                            OrderStatus.PARTIALLY_FILLED.value,
-                        )
-                    ),
-                )
-            ).all()
+            unsafe_local_orders = _unsafe_tagged_local_order_ids(
+                session,
+                tag,
+            )
             active_breakers = session.scalars(
                 select(CircuitBreakerState.scope_key).where(
                     CircuitBreakerState.tripped.is_(True)

@@ -15,6 +15,9 @@ Second correction review base:
 Third correction review base:
 `a0c0106`
 
+Fourth correction review base:
+`0ee0a466e3efa9e91ad5061982868ed4fdca6eb0`
+
 ## Final result
 
 The deterministic release gate passes. The release remains Alpaca paper-only,
@@ -75,6 +78,39 @@ overclaims. The correction is test-first and fail-closed:
   source inode/content/mode/link counts must return to baseline;
 - `alpaca_paper:passed` now requires every report gate plus a final dynamic
   paper-target validation. Clean reconciliation alone cannot emit the label.
+
+## Fourth review correction
+
+The fourth independent review reproduced a last-mile compensation race and a
+duplicate uncertain-cancel attempt, plus three lifecycle and cleanup gaps. The
+correction is test-first and fail-closed:
+
+- `_CrashAfterAcceptanceOnceBroker` now supports a one-shot invariant keyed by
+  compensation client ID. It consumes the callback after execution-risk
+  evaluation and immediately before delegation to the inner broker;
+- the callback re-reads two stable terminal views, exact tagged fills, signed
+  exposure, and the complete position manifest. Changed evidence raises
+  `safety_drill_compensation_invariant_changed`; the normal submission service
+  records `REJECTED` and no broker write occurs;
+- post-proposal evidence failure explicitly rejects the persisted proposal
+  through `TradingService.reject_order`, preserving the normal audit trail.
+  Final reconciliation treats `PROPOSED`, `APPROVAL_RECORDED`, and every other
+  nonterminal tagged local status as unsafe;
+- cleanup shares one attempted-cancel set across both phases, adds each broker
+  ID before the first cancel call, and never retries that ID after an exception
+  or nonterminal result. A newly discovered tagged ID can still receive its own
+  first attempt;
+- bracket submission preserves deterministic `BrokerSubmissionRejected`
+  instead of relabeling it acceptance-unknown;
+- a private binding-directory open failure removes only the still-empty `0700`
+  directory matching the inode just created. A replacement directory is never
+  deleted.
+
+The compensation callback narrows but cannot eliminate the provider boundary:
+external account activity can occur after the final local check and before or
+after Alpaca acceptance. The drill therefore does not claim atomicity with the
+broker account. Final order, fill, and full-position reconciliation must still
+match or the result remains unsafe.
 
 ## Strict TDD correction evidence
 
@@ -223,19 +259,50 @@ The post-proposal initial-status reproduction is
 the terminal/fill equality recheck made that test fail; restoring it made the
 test pass.
 
+### Fourth correction RED, GREEN, and focused regression
+
+The eight-case reproduction covered bracket rejection typing, exact
+private-directory cleanup, replacement preservation, post-risk compensation
+drift, post-proposal rejection/audit, exception and nonterminal cancel
+outcomes, and the final local-status scan.
+
+```text
+uv run pytest -q \
+  tests/test_alpaca_broker.py::test_submit_bracket_preserves_deterministic_paper_guard_rejection \
+  tests/test_safety_drill.py::test_binding_open_failure_removes_exact_created_empty_private_directory \
+  tests/test_safety_drill.py::test_binding_open_failure_never_deletes_replacement_directory \
+  tests/test_safety_drill.py::test_compensation_last_mile_guard_blocks_drift_after_execution_risk \
+  tests/test_safety_drill.py::test_post_proposal_compensation_failure_uses_rejection_service_and_audit \
+  'tests/test_safety_drill.py::test_best_effort_cleanup_never_retries_an_uncertain_cancel[exception]' \
+  'tests/test_safety_drill.py::test_best_effort_cleanup_never_retries_an_uncertain_cancel[nonterminal]' \
+  tests/test_safety_drill.py::test_final_local_scan_treats_unapproved_tagged_orders_as_unsafe
+```
+
+- RED: `7 failed, 1 passed`. Replacement preservation was already safe; the
+  other seven cases reproduced the review gaps.
+- Initial GREEN: `8 passed, 1 warning`.
+- First 229-test focused regression: `225 passed, 4 failed, 1 warning`. The new
+  callback used local order reconciliation while the compensation row was
+  already `SUBMITTING`, so normal compensation was deterministically rejected.
+- Root-cause correction: the final callback still performs two direct broker
+  terminal observations, exact fill attribution, signed exposure, and full
+  position-manifest comparison, but does not re-enter the local writer/
+  reconciliation path already held by `OrderSubmissionService`.
+- Final focused result: `229 passed, 1 warning`.
+
 ## Full deterministic suite and genuine branch gate
 
 ```text
 uv run pytest
 ```
 
-Result: `1430 passed, 1 skipped, 1 warning in 119.62s`.
+Result: `1438 passed, 1 skipped, 1 warning in 118.14s`.
 
 ```text
 uv run pytest --cov=trading_assistant.risk --cov=trading_assistant.orders --cov=trading_assistant.rules --cov=trading_assistant.app.auth --cov-branch --cov-report=term-missing --cov-fail-under=90
 ```
 
-Result: `1430 passed, 1 skipped, 1 warning in 183.54s`.
+Result: `1438 passed, 1 skipped, 1 warning in 182.41s`.
 
 - Statements: `2834`
 - Missed statements: `209`
@@ -276,15 +343,21 @@ Result: `1430 passed, 1 skipped, 1 warning in 183.54s`.
 - Compensation requires stable identity-verified terminal truth for the
   original, exact tagged `BrokerFill` aggregation equal to broker cumulative
   `filled_qty`, and exact full-manifest drift after terminal reads. The same
-  terminal/fill/manifest evidence is repeated after proposal creation and
-  before approval. Failed/unconfirmed cancellation or intervening drift submits
-  no compensation. Any compensation uses the normal persisted human-gated
-  path, is reconciled to terminal truth, and must be opposite/exact with tagged
-  fills.
+  terminal/fill/manifest evidence is repeated after proposal creation and by a
+  one-shot client-ID guard after execution-risk evaluation, immediately before
+  broker delegation. Changed evidence becomes a deterministic local rejection
+  with zero broker writes. Failed/unconfirmed cancellation or intervening drift
+  submits no compensation. This is not atomic with external account activity
+  after the callback; final reconciliation must still match. Any compensation
+  uses the normal persisted human-gated path, is reconciled to terminal truth,
+  and must be opposite/exact with tagged fills.
 - Cleanup runs from the outer mutation `finally`, validates each tagged order
   against the known drill symbol, isolates provider failures per order, cancels
   stale-local but remotely validated tagged IDs, and never touches pre-existing
-  IDs. Unavailable evidence always keeps `safe` false.
+  IDs. Each broker ID receives at most one cancel API attempt across cleanup
+  phases; later phases only read/reconcile an uncertain attempt. Tagged
+  `PROPOSED` and `APPROVAL_RECORDED` rows are unsafe. Unavailable evidence
+  always keeps `safe` false.
 
 ## Migration rehearsal
 
@@ -306,7 +379,7 @@ source open in WAL mode with an uncheckpointed committed sentinel and existing
 regular WAL/SHM. No unrelated writes occurred during the copy.
 
 ```json
-{"active_wal_mock_exit": 0, "alias_residue": false, "safe": true, "source_files_restored": true}
+{"active_wal_mock_exit": 0, "alias_residue": false, "safe": true, "sentinel_preserved": true, "source_files_restored": true}
 ```
 
 The source contained an uncheckpointed committed sentinel, which the copied
@@ -344,7 +417,9 @@ credential is missing.
 - `git diff --check`: PASS.
 - The prior correction's verified Gitleaks `8.24.3` full-history/current-tree
   scans remain recorded, but no local Gitleaks binary was available for a fresh
-  third-correction scan. The deterministic tracked-secret/static checks pass.
+  fourth-correction scan. The deterministic tracked-secret/static checks pass,
+  including a boolean-only check that the previously exposed Composio key is
+  absent from tracked files.
 - CI retains `fetch-depth: 0` and `gitleaks/gitleaks-action@v2`.
 
 ## Warning triage

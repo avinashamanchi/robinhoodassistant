@@ -547,6 +547,8 @@ class AlpacaBroker(BrokerClient):
             return existing
         try:
             return self._submit_bracket_once(order, take_profit, stop_loss)
+        except BrokerSubmissionRejected:
+            raise
         except BrokerDataIntegrityError:
             raise
         except APIError as exc:

@@ -868,6 +868,27 @@ def test_submit_bracket_preserves_malformed_broker_truth_and_broker_id():
     assert exc_info.value.broker_order_id == "brk-malformed-bracket"
 
 
+def test_submit_bracket_preserves_deterministic_paper_guard_rejection():
+    trading = FakeTrading()
+    trading._sandbox = True
+    trading._base_url = "https://paper-api.alpaca.markets"
+    broker = AlpacaBroker(trading, FakeData({}))
+    broker.arm_paper_only_mutations()
+    trading._sandbox = False
+    trading._base_url = "https://api.alpaca.markets"
+    order = _order(
+        key="guarded-bracket",
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("100"),
+    )
+
+    with pytest.raises(BrokerSubmissionRejected) as exc_info:
+        broker.submit_bracket(order, Decimal("110"), Decimal("95"))
+
+    assert exc_info.value.stable_code == "unsafe_execution_target"
+    assert trading.submit_calls == 0
+
+
 def test_submit_crypto_order_uses_gtc_time_in_force():
     trading = FakeTrading()
     broker = AlpacaBroker(trading, FakeData({}), FakeCryptoData({}))
