@@ -1116,6 +1116,8 @@ def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
                     renewal_attempted.wait,
                     5,
                 )
+                await asyncio.sleep(0)
+                assert owner.done() is False
                 await asyncio.sleep(1.1)
                 follower = await client.post(
                     "/approve/7",
@@ -1153,6 +1155,187 @@ def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
         assert "Retry-After" not in response.headers
     assert max_active == 1
     assert calls == side_effects == 1
+    assert leaked == []
+
+
+def test_cancelled_request_consumes_real_sync_worker_failure(
+    make_service,
+):
+    service = _with_limit(
+        make_service(),
+        "approval",
+        requests=20,
+        global_requests=40,
+        concurrency=1,
+    )
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="route-cancel-worker-error-secret",
+        planning=None,
+    )
+    started = threading.Event()
+    release_worker = threading.Event()
+
+    def failing_approve(*_args, **_kwargs):
+        started.set()
+        assert release_worker.wait(timeout=5)
+        raise RuntimeError("real sync worker failed after cancellation")
+
+    service.approve_order = failing_approve
+    resource_key = (
+        "route:"
+        + hashlib.sha256(b"order:7").hexdigest()
+        + ":0"
+    )
+
+    async def exercise():
+        leaked: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: leaked.append(context)
+        )
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                login = await client.post(
+                    "/auth/login",
+                    json={"secret": "route-cancel-worker-error-secret"},
+                )
+                owner = asyncio.create_task(
+                    client.post(
+                        "/approve/7",
+                        json={"reason": "worker fails after cancellation"},
+                        headers={
+                            "X-CSRF-Token": login.json()["csrf_token"],
+                            "Idempotency-Key": (
+                                "cancel-worker-error-owner"
+                            ),
+                        },
+                    )
+                )
+                assert await asyncio.to_thread(started.wait, 5)
+                owner.cancel()
+                await asyncio.sleep(0)
+                assert owner.done() is False
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+                await asyncio.sleep(0)
+                return leaked
+        finally:
+            release_worker.set()
+            loop.set_exception_handler(previous_handler)
+
+    leaked = asyncio.run(exercise())
+    latch = app.state.mutation_interlocks.inspect(resource_key)
+
+    assert latch is not None
+    assert latch.state == "uncertain"
+    assert latch.outcome_code == "request_cancelled"
+    assert latch.worker_finished_at is not None
+    assert leaked == []
+
+
+def test_panic_receipt_renewal_store_loss_stops_without_renewing_again(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_TTL_SECONDS",
+        1,
+    )
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-receipt-renewal-secret",
+        planning=None,
+    )
+    renew_calls = 0
+    receipt_calls = 0
+    repeated_receipt_failure = threading.Event()
+    hold = policy_module._LeaseHold(
+        resource_key="route:" + "e" * 64 + ":0",
+        owner="internal-panic-owner",
+        generation=11,
+        expires_at=utcnow() + timedelta(seconds=1),
+    )
+
+    class SuccessfulLeaseRenewal:
+        def renew(self, *_args, **_kwargs):
+            nonlocal renew_calls
+            renew_calls += 1
+            return LeaseDecision(
+                acquired=True,
+                owner=hold.owner,
+                generation=hold.generation,
+                expires_at=utcnow() + timedelta(seconds=5),
+                retry_after_seconds=0,
+            )
+
+    def unavailable_receipt_store(*_args, **_kwargs):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        if receipt_calls >= 2:
+            repeated_receipt_failure.set()
+        raise LimitStoreUnavailable("receipt renewal unavailable")
+
+    app.state.leases = SuccessfulLeaseRenewal()
+    monkeypatch.setattr(
+        policy_module,
+        "_renew_panic_receipt",
+        unavailable_receipt_store,
+    )
+
+    async def exercise():
+        leaked: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: leaked.append(context)
+        )
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            policy_module._maintain_lease(
+                app,
+                hold,
+                stop,
+                panic_request_id="internal-panic-owner",
+            )
+        )
+        try:
+            assert await asyncio.to_thread(
+                repeated_receipt_failure.wait,
+                2,
+            )
+            stop.set()
+            result = await asyncio.wait_for(task, timeout=0.5)
+            await asyncio.sleep(0)
+            return result, leaked
+        finally:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+            loop.set_exception_handler(previous_handler)
+
+    result, leaked = asyncio.run(exercise())
+
+    assert result == "store"
+    assert renew_calls == 1
+    assert receipt_calls >= 2
     assert leaked == []
 
 

@@ -858,6 +858,78 @@ def test_nonexpiring_interlock_requires_exact_settlement_or_reconciliation(
         assert audit.result_code == "cleared"
 
 
+def test_reconciliation_audit_failure_rolls_back_exact_latch(
+    session_factory,
+):
+    service_type = getattr(
+        limits_module,
+        "MutationInterlockService",
+        None,
+    )
+    assert service_type is not None
+    service = service_type(session_factory)
+    claimed = service.claim(
+        "route:" + "b" * 64 + ":0",
+        owner="internal-reconcile-owner",
+        generation=13,
+        operation="portfolio_reconcile",
+    )
+    assert service.mark_uncertain(
+        claimed.resource_key,
+        owner=claimed.owner,
+        generation=claimed.generation,
+        outcome_code="request_cancelled",
+        worker_finished=True,
+    )
+    session_type = session_factory.class_
+
+    def fail_reconciliation_audit(session, _flush_context, _instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "mutation_interlock.reconcile"
+            for row in session.new
+        ):
+            raise SQLAlchemyError("forced reconciliation audit failure")
+
+    event.listen(
+        session_type,
+        "before_flush",
+        fail_reconciliation_audit,
+    )
+    try:
+        with pytest.raises(LimitStoreUnavailable):
+            service.reconcile_clear(
+                claimed.resource_key,
+                owner=claimed.owner,
+                generation=claimed.generation,
+                actor="operator:test",
+                request_id="reconcile-audit-rollback",
+                evidence_code="portfolio_truth_reconciled",
+                worker_termination_proven=False,
+            )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_reconciliation_audit,
+        )
+
+    remaining = service.inspect(claimed.resource_key)
+    assert remaining is not None
+    assert remaining.owner == claimed.owner
+    assert remaining.generation == claimed.generation
+    assert remaining.state == "uncertain"
+    assert remaining.outcome_code == "request_cancelled"
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id == "reconcile-audit-rollback"
+            )
+        ) == 0
+
+
 def test_settled_interlock_clears_only_with_exact_unexpired_release(
     session_factory,
 ):

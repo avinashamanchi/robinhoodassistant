@@ -984,35 +984,39 @@ async def _maintain_lease(
                 or renewed.generation != hold.generation
             ):
                 return "lost"
-            hold.expires_at = renewed.expires_at
             if panic_request_id is not None:
-                try:
-                    receipt_renewed = await _offload(
-                        _renew_panic_receipt,
-                        app,
-                        panic_request_id,
-                        hold.generation,
-                        renewed.expires_at,
-                    )
-                except LimitStoreUnavailable:
-                    await asyncio.sleep(
-                        min(
-                            retry_delay,
-                            max(
-                                0.0,
-                                (
-                                    hold.expires_at - utcnow()
-                                ).total_seconds(),
-                            ),
+                coherent_horizon = hold.expires_at
+                while True:
+                    remaining = (
+                        coherent_horizon - utcnow()
+                    ).total_seconds()
+                    if stop.is_set() or remaining <= 0:
+                        return "store"
+                    try:
+                        receipt_renewed = await _offload(
+                            _renew_panic_receipt,
+                            app,
+                            panic_request_id,
+                            hold.generation,
+                            renewed.expires_at,
                         )
-                    )
-                    retry_delay = min(
-                        retry_delay * 2,
-                        _PANIC_POLL_MAX_SECONDS,
-                    )
-                    continue
-                if not receipt_renewed:
-                    return "lost"
+                    except LimitStoreUnavailable:
+                        try:
+                            await asyncio.wait_for(
+                                stop.wait(),
+                                timeout=min(retry_delay, remaining),
+                            )
+                        except TimeoutError:
+                            retry_delay = min(
+                                retry_delay * 2,
+                                _PANIC_POLL_MAX_SECONDS,
+                            )
+                            continue
+                        return "store"
+                    if not receipt_renewed:
+                        return "lost"
+                    break
+            hold.expires_at = renewed.expires_at
             retry_delay = min(0.025, interval)
             break
 
