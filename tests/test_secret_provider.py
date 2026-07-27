@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import hashlib
 import inspect
 import json
@@ -519,7 +520,8 @@ def test_repository_guard_blocks_uninjected_default_keychain():
 def test_environment_provider_parses_only_the_injected_mapping():
     encryption = _encryption_config()
     provider = EnvironmentSecretProvider(
-        environ=_environment(encryption)
+        environ=_environment(encryption),
+        encryption=encryption,
     )
 
     loaded = provider.load(encryption=encryption)
@@ -531,6 +533,77 @@ def test_environment_provider_parses_only_the_injected_mapping():
         ].get_secret_value()
         == _key(f"field-encryption:{encryption.active_key_id}")
     )
+
+
+def test_environment_provider_retains_structured_secrets_not_raw_field_key_json():
+    encryption = _encryption_config(
+        retained=("local-retained-2026-06",)
+    )
+    environment = _environment(encryption)
+    raw_field_keys = environment["FIELD_ENCRYPTION_KEYS_JSON"]
+
+    provider = EnvironmentSecretProvider(
+        environ=environment,
+        encryption=encryption,
+    )
+    loaded = provider.load(encryption=encryption)
+
+    assert tuple(loaded.field_encryption_keys) == (
+        "local-primary-2026-07",
+        "local-retained-2026-06",
+    )
+    assert raw_field_keys not in repr(provider.__dict__)
+    assert "FIELD_ENCRYPTION_KEYS_JSON" not in repr(provider.__dict__)
+
+
+@pytest.mark.parametrize(
+    "nested_key",
+    [
+        pytest.param("COMPOSIO_API_KEY", id="composio"),
+        pytest.param("unrelated-key-2026", id="unrelated"),
+    ],
+)
+def test_environment_provider_rejects_unknown_nested_field_key_without_retention(
+    capsys,
+    nested_key,
+):
+    encryption = _encryption_config()
+    marker = "nested-field-key-marker-must-not-be-retained"
+    environment = _environment(encryption)
+    nested = json.loads(environment["FIELD_ENCRYPTION_KEYS_JSON"])
+    nested[nested_key] = marker
+    environment["FIELD_ENCRYPTION_KEYS_JSON"] = json.dumps(nested)
+
+    with pytest.raises(SecretValidationError) as captured:
+        EnvironmentSecretProvider(
+            environ=environment,
+            encryption=encryption,
+        )
+
+    assert captured.value.stable_code == "unexpected_key_id"
+    assert marker not in str(captured.value)
+    assert marker not in capsys.readouterr().out
+
+
+def test_environment_provider_rejects_composio_nested_key_even_if_configured(
+    capsys,
+):
+    encryption = EncryptionConfig(active_key_id="COMPOSIO_ACTIVE_KEY")
+    marker = "configured-composio-marker-must-not-be-retained"
+    environment = _environment(encryption)
+    environment["FIELD_ENCRYPTION_KEYS_JSON"] = json.dumps(
+        {"COMPOSIO_ACTIVE_KEY": marker}
+    )
+
+    with pytest.raises(SecretValidationError) as captured:
+        EnvironmentSecretProvider(
+            environ=environment,
+            encryption=encryption,
+        )
+
+    assert captured.value.stable_code == "unexpected_key_id"
+    assert marker not in str(captured.value)
+    assert marker not in capsys.readouterr().out
 
 
 def test_noncanonical_base64_pad_bits_cannot_bypass_known_example_rejection():
@@ -558,12 +631,15 @@ def test_environment_provider_drops_composio_and_unknown_entries_without_retenti
         "UNRELATED_SECRET": marker,
     }
 
-    provider = EnvironmentSecretProvider(environ=environment)
+    provider = EnvironmentSecretProvider(
+        environ=environment,
+        encryption=encryption,
+    )
     loaded = provider.load(encryption=encryption)
 
     assert loaded.alpaca_api_key.get_secret_value() == "paper-key"
-    assert "COMPOSIO_API_KEY" not in provider._environ
-    assert "UNRELATED_SECRET" not in provider._environ
+    assert "COMPOSIO_API_KEY" not in repr(provider.__dict__)
+    assert "UNRELATED_SECRET" not in repr(provider.__dict__)
     assert marker not in repr(provider.__dict__)
     assert marker not in capsys.readouterr().out
 
@@ -600,15 +676,17 @@ def test_migration_prompt_collection_drops_unallowlisted_input_without_retention
         "UNRELATED_SECRET": marker,
     }
 
-    collected = secret_ops._prompt_for_migration_values(
+    loaded = secret_ops._prompt_for_migration_values(
         environment,
         config=app_config,
         prompt=lambda _prompt: pytest.fail("unexpected prompt"),
     )
 
-    assert "COMPOSIO_API_KEY" not in collected
-    assert "UNRELATED_SECRET" not in collected
-    assert marker not in repr(collected)
+    assert isinstance(loaded, RuntimeSecrets)
+    assert "COMPOSIO_API_KEY" not in repr(loaded)
+    assert "UNRELATED_SECRET" not in repr(loaded)
+    assert environment["FIELD_ENCRYPTION_KEYS_JSON"] not in repr(loaded)
+    assert marker not in repr(loaded)
     assert marker not in capsys.readouterr().out
 
 
@@ -625,7 +703,8 @@ def test_production_roles_reject_environment_provider(
             role,
             config=app_config,
             provider=EnvironmentSecretProvider(
-                environ=_environment(app_config.encryption)
+                environ=_environment(app_config.encryption),
+                encryption=app_config.encryption,
             ),
         )
 
@@ -799,13 +878,50 @@ def test_migrate_env_verifies_keychain_without_printing_or_mutating_values(
     assert backend.values["app_api_token"] == environment["APP_API_TOKEN"]
 
 
-def test_audit_and_set_commands_report_metadata_only(
+@pytest.mark.parametrize(
+    "nested_key",
+    [
+        pytest.param("COMPOSIO_API_KEY", id="composio"),
+        pytest.param("unrelated-key-2026", id="unrelated"),
+    ],
+)
+def test_migrate_env_rejects_unknown_nested_field_key_without_writes_or_leaks(
+    app_config,
+    capsys,
+    nested_key,
+    tmp_path,
+):
+    marker = "nested-migration-marker-must-not-be-retained"
+    environment = _environment(app_config.encryption)
+    nested = json.loads(environment["FIELD_ENCRYPTION_KEYS_JSON"])
+    nested[nested_key] = marker
+    environment["FIELD_ENCRYPTION_KEYS_JSON"] = json.dumps(nested)
+    env_file = _private_env_file(tmp_path, environment)
+    backend = _FakeMacOSKeyring(
+        _account_values(app_config.encryption)
+    )
+
+    with pytest.raises(SecretValidationError) as captured:
+        secret_ops.main(
+            ["migrate-env", "--env-file", str(env_file)],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: pytest.fail("unexpected prompt"),
+        )
+
+    assert captured.value.stable_code == "unexpected_key_id"
+    assert backend.set_calls == []
+    assert backend.delete_calls == []
+    assert marker not in str(captured.value)
+    assert marker not in capsys.readouterr().out
+
+
+def test_audit_validates_current_app_role_and_reports_current_timestamp_only(
     app_config,
     capsys,
 ):
     values = _account_values(app_config.encryption)
     backend = _FakeMacOSKeyring(values)
-    replacement = "replacement-operator-secret-A7v9qL2mN4pR6tU8"
 
     assert secret_ops.main(
         ["audit"],
@@ -816,10 +932,26 @@ def test_audit_and_set_commands_report_metadata_only(
     assert "provider: macos-keychain" in audit_output
     assert f"active-key-id: {app_config.encryption.active_key_id}" in audit_output
     assert "audit-read: complete" in audit_output
-    assert "role-validation: passed" in audit_output
-    assert "key-validation: passed" in audit_output
-    assert "last-successful-role-load: never" in audit_output
+    assert "current-app-role-validation: passed" in audit_output
+    timestamp_line = next(
+        line
+        for line in audit_output.splitlines()
+        if line.startswith("current-app-role-validation-at: ")
+    )
+    timestamp = timestamp_line.split(": ", maxsplit=1)[1]
+    assert datetime.fromisoformat(timestamp).tzinfo is not None
+    assert "historical-role-load: unavailable" in audit_output
+    assert "last-successful-role-load" not in audit_output
     assert values["app_api_token"] not in audit_output
+
+
+def test_set_command_reports_metadata_only(
+    app_config,
+    capsys,
+):
+    values = _account_values(app_config.encryption)
+    backend = _FakeMacOSKeyring(values)
+    replacement = "replacement-operator-secret-A7v9qL2mN4pR6tU8"
 
     assert secret_ops.main(
         ["set", "app_api_token"],
@@ -1066,9 +1198,15 @@ def test_set_encryption_key_rejects_material_shared_with_candidate(
             ),
             id="shared",
         ),
+        pytest.param(
+            lambda values, config: values.pop(
+                f"field-encryption/{config.encryption.active_key_id}"
+            ),
+            id="missing",
+        ),
     ],
 )
-def test_audit_separates_raw_presence_from_failed_key_validation(
+def test_audit_blocks_current_role_validation_without_success_timestamp(
     app_config,
     capsys,
     mutate,
@@ -1084,10 +1222,14 @@ def test_audit_separates_raw_presence_from_failed_key_validation(
 
     output = capsys.readouterr().out
     assert "audit-read: complete" in output
-    assert "role-validation: passed" in output
-    assert "key-validation: failed" in output
-    assert "last-successful-role-load: never" in output
-    assert values["candidate_signing_key"] not in output
+    assert "current-app-role-validation: blocked" in output
+    assert "current-app-role-validation-at: unavailable" in output
+    assert "historical-role-load: unavailable" in output
+    assert "current-app-role-validation: passed" not in output
+    assert "last-successful-role-load" not in output
+    candidate = values.get("candidate_signing_key")
+    if candidate is not None:
+        assert candidate not in output
 
 
 def test_preflight_partial_keychain_prints_needs_without_external_checks(

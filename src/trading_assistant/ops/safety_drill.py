@@ -2206,7 +2206,10 @@ def main(argv: list[str] | None = None) -> int:
         secrets = load_role_secrets(
             "safety-drill",
             config=config,
-            provider=EnvironmentSecretProvider(environ=os.environ),
+            provider=EnvironmentSecretProvider(
+                environ=os.environ,
+                encryption=config.encryption,
+            ),
             allow_environment=True,
         )
     else:

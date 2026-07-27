@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import hmac
-import json
 import os
 from pathlib import Path
 import stat
@@ -15,19 +14,21 @@ from ..config import AppConfig, load_config
 from ..logging import register_all_secrets
 from ..security.secrets import (
     KEYCHAIN_SERVICE,
-    EnvironmentSecretProvider,
     KeyringBackend,
     MacOSKeychainSecretProvider,
     RuntimeSecrets,
+    SecretBoundaryError,
     SecretUnavailable,
     SecretValidationError,
     _ENVIRONMENT_SECRET_NAMES,
     _SIMPLE_SECRET_FIELDS,
     _configured_key_ids,
+    _parse_environment_field_keys,
     _required_fields,
     _validate_key_material,
     _validate_required_fields,
     app_secret_quality_ok,
+    load_role_secrets,
     secret_is_set,
     secret_value,
     validate_base64_key,
@@ -110,11 +111,10 @@ def _prompt_for_migration_values(
     *,
     config: AppConfig,
     prompt: Prompt,
-) -> dict[str, str]:
+) -> RuntimeSecrets:
     collected = {
-        name: value
-        for name, value in environ.items()
-        if name in _ENVIRONMENT_SECRET_NAMES
+        field_name: environ.get(field_name.upper(), "")
+        for field_name in _SIMPLE_SECRET_FIELDS
     }
     required = {
         *_required_fields("app", config),
@@ -122,34 +122,21 @@ def _prompt_for_migration_values(
         "backup_encryption_key",
     }
     for field_name in _SIMPLE_SECRET_FIELDS:
-        env_name = field_name.upper()
-        if field_name in required and not collected.get(env_name, ""):
-            collected[env_name] = prompt(f"{field_name}: ")
+        if field_name in required and not collected.get(field_name, ""):
+            collected[field_name] = prompt(f"{field_name}: ")
 
-    raw_field_keys = collected.get("FIELD_ENCRYPTION_KEYS_JSON", "")
-    if raw_field_keys:
-        try:
-            parsed = json.loads(raw_field_keys)
-        except (TypeError, ValueError):
-            raise SecretUnavailable(
-                "field_encryption_keys",
-                "invalid_json",
-            ) from None
-        if not isinstance(parsed, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in parsed.items()
-        ):
-            raise SecretUnavailable(
-                "field_encryption_keys",
-                "invalid_json",
-            )
-    else:
-        parsed = {}
+    parsed = _parse_environment_field_keys(
+        environ.get("FIELD_ENCRYPTION_KEYS_JSON", ""),
+        encryption=config.encryption,
+        allow_missing=True,
+    )
     for key_id in _configured_key_ids(config.encryption):
         if not parsed.get(key_id):
             parsed[key_id] = prompt(f"field-encryption/{key_id}: ")
-    collected["FIELD_ENCRYPTION_KEYS_JSON"] = json.dumps(parsed)
-    return collected
+    return RuntimeSecrets(
+        **collected,
+        field_encryption_keys=parsed,
+    )
 
 
 def _store_and_verify(
@@ -333,13 +320,10 @@ def _migrate_env(
     provider: MacOSKeychainSecretProvider,
     prompt: Prompt,
 ) -> int:
-    environ = _prompt_for_migration_values(
+    loaded = _prompt_for_migration_values(
         _read_private_env(migration_path),
         config=config,
         prompt=prompt,
-    )
-    loaded = EnvironmentSecretProvider(environ=environ).load(
-        encryption=config.encryption
     )
     register_all_secrets(loaded)
     _validate_required_fields("app", config, loaded)
@@ -371,11 +355,18 @@ def _audit(
     provider: MacOSKeychainSecretProvider,
 ) -> int:
     presence = provider.read_presence(encryption=config.encryption)
-    loaded: RuntimeSecrets | None
     try:
-        loaded = provider.load(encryption=config.encryption)
-    except SecretUnavailable:
-        loaded = None
+        load_role_secrets(
+            "app",
+            config=config,
+            provider=provider,
+        )
+    except SecretBoundaryError:
+        current_validation = "blocked"
+        current_validation_at = None
+    else:
+        current_validation = "passed"
+        current_validation_at = provider.last_successful_role_load_at
 
     print(f"provider: {provider.provider_name}")
     print(
@@ -396,32 +387,17 @@ def _audit(
     print(f"active-key-id: {config.encryption.active_key_id}")
     retained = ",".join(config.encryption.retained_key_ids) or "none"
     print(f"retained-key-ids: {retained}")
-
-    role_status = "unavailable"
-    key_status = "unavailable"
-    if loaded is not None:
-        register_all_secrets(loaded)
-        try:
-            _validate_required_fields("app", config, loaded)
-        except SecretValidationError:
-            role_status = "failed"
-        else:
-            role_status = "passed"
-        try:
-            _validate_key_material(config, loaded)
-        except SecretValidationError:
-            key_status = "failed"
-        else:
-            key_status = "passed"
-    print(f"role-validation: {role_status}")
-    print(f"key-validation: {key_status}")
-
-    loaded_at = provider.last_successful_role_load_at
+    print(f"current-app-role-validation: {current_validation}")
     print(
-        "last-successful-role-load: "
-        + (loaded_at.isoformat() if loaded_at is not None else "never")
+        "current-app-role-validation-at: "
+        + (
+            current_validation_at.isoformat()
+            if current_validation_at is not None
+            else "unavailable"
+        )
     )
-    return 0 if (role_status, key_status) == ("passed", "passed") else 1
+    print("historical-role-load: unavailable (not persisted)")
+    return 0 if current_validation == "passed" else 1
 
 
 def _set_simple_secret(

@@ -418,65 +418,96 @@ class MacOSKeychainSecretProvider:
         return MappingProxyType(presence)
 
 
-class EnvironmentSecretProvider:
-    """Parse an explicitly injected development/test environment mapping."""
-
-    provider_name = "environment-development"
-
-    def __init__(self, *, environ: Mapping[str, str]) -> None:
-        if not isinstance(environ, Mapping):
-            raise TypeError("environ must be an explicitly injected mapping")
-        self._environ = MappingProxyType(
-            {
-                name: value
-                for name, value in environ.items()
-                if name in _ENVIRONMENT_SECRET_NAMES
-            }
+def _parse_environment_field_keys(
+    raw_field_keys: str,
+    *,
+    encryption: EncryptionConfig,
+    allow_missing: bool = False,
+) -> dict[str, str]:
+    try:
+        parsed = (
+            json.loads(raw_field_keys)
+            if raw_field_keys
+            else {}
         )
-        self.last_successful_role_load_at: datetime | None = None
-
-    def load(self, *, encryption: EncryptionConfig) -> RuntimeSecrets:
-        values = {
-            field_name: self._environ.get(field_name.upper(), "")
-            for field_name in _SIMPLE_SECRET_FIELDS
-        }
-        raw_field_keys = self._environ.get(
-            "FIELD_ENCRYPTION_KEYS_JSON",
-            "",
+    except (TypeError, ValueError):
+        raise SecretUnavailable(
+            "field_encryption_keys",
+            "invalid_json",
+        ) from None
+    if not isinstance(parsed, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in parsed.items()
+    ):
+        raise SecretUnavailable(
+            "field_encryption_keys",
+            "invalid_json",
         )
-        try:
-            parsed_field_keys = (
-                json.loads(raw_field_keys)
-                if raw_field_keys
-                else {}
+
+    expected_ids = _configured_key_ids(encryption)
+    try:
+        if (
+            any(
+                key.upper().startswith("COMPOSIO_")
+                for key in parsed
             )
-        except (TypeError, ValueError):
-            raise SecretUnavailable(
-                "field_encryption_keys",
-                "invalid_json",
-            ) from None
-        if not isinstance(parsed_field_keys, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in parsed_field_keys.items()
+            or set(parsed).difference(expected_ids)
         ):
-            raise SecretUnavailable(
+            raise SecretValidationError(
                 "field_encryption_keys",
-                "invalid_json",
+                "unexpected_key_id",
+                "field encryption key JSON contains an unexpected key ID",
             )
         field_keys: dict[str, str] = {}
-        for key_id in _configured_key_ids(encryption):
-            value = parsed_field_keys.get(key_id)
-            if value is None or not value:
+        for key_id in expected_ids:
+            value = parsed.get(key_id)
+            if not value:
+                if allow_missing:
+                    continue
                 raise SecretUnavailable(
                     f"field-encryption/{key_id}",
                     "missing",
                 )
             field_keys[key_id] = value
-        loaded = RuntimeSecrets(
-            **values,
-            field_encryption_keys=field_keys,
+        return field_keys
+    finally:
+        parsed.clear()
+
+
+class EnvironmentSecretProvider:
+    """Parse an explicitly injected development/test environment mapping."""
+
+    provider_name = "environment-development"
+
+    def __init__(
+        self,
+        *,
+        environ: Mapping[str, str],
+        encryption: EncryptionConfig,
+    ) -> None:
+        if not isinstance(environ, Mapping):
+            raise TypeError("environ must be an explicitly injected mapping")
+        self._configured_key_ids = _configured_key_ids(encryption)
+        self._loaded = RuntimeSecrets(
+            **{
+                field_name: environ.get(field_name.upper(), "")
+                for field_name in _SIMPLE_SECRET_FIELDS
+            },
+            field_encryption_keys=_parse_environment_field_keys(
+                environ.get("FIELD_ENCRYPTION_KEYS_JSON", ""),
+                encryption=encryption,
+            ),
         )
-        return loaded
+        self.last_successful_role_load_at: datetime | None = None
+
+    def load(self, *, encryption: EncryptionConfig) -> RuntimeSecrets:
+        if _configured_key_ids(encryption) != self._configured_key_ids:
+            raise SecretValidationError(
+                "field_encryption_keys",
+                "configuration_mismatch",
+                "environment provider encryption configuration changed",
+            )
+        return self._loaded
 
 
 def app_secret_quality_ok(value: str | SecretStr) -> bool:

@@ -224,7 +224,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config()
     if args.development_environment_secrets:
-        provider = EnvironmentSecretProvider(environ=os.environ)
+        provider = EnvironmentSecretProvider(
+            environ=os.environ,
+            encryption=config.encryption,
+        )
         runtime_secrets = load_role_secrets(
             "migration",
             config=config,
