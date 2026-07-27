@@ -15,7 +15,10 @@ from uuid import uuid4
 from .config import BrokerKind, TradingMode, load_config
 from .db.schema import SchemaOutOfDate
 from .security.secrets import (
+    MacOSKeychainSecretProvider,
     RuntimeSecrets,
+    SecretBoundaryError,
+    SecretProvider,
     app_secret_quality_ok,
     load_role_secrets,
     secret_is_set,
@@ -301,11 +304,164 @@ def _notification_configuration(
     )
 
 
-def run() -> int:
+def _print_results(results: list[Result]) -> int:
+    width = max(len(result.name) for result in results)
+    print("\nPREFLIGHT\n" + "-" * (width + 40))
+    for result in results:
+        print(
+            f"  {result.status:8} {result.name:<{width}}  "
+            f"{result.detail}"
+        )
+    failed = [result for result in results if result.status == FAIL]
+    needs = [result for result in results if result.status == NEEDS]
+    print("-" * (width + 40))
+    print(
+        f"  {len(failed)} FAIL · {len(needs)} NEEDS-ME · "
+        f"{sum(result.status == PASS for result in results)} PASS · "
+        f"{sum(result.status == SKIP for result in results)} SKIP"
+    )
+    not_ready = bool(failed or needs)
+    print(
+        "  => "
+        + (
+            "NOT READY — fix FAIL/NEEDS-ME items"
+            if not_ready
+            else "READY"
+        )
+        + "\n"
+    )
+    return 1 if not_ready else 0
+
+
+def _run_partial_keychain(
+    config,
+    presence,
+) -> int:
+    required_accounts = {
+        "app_api_token",
+        "alpaca_api_key",
+        "alpaca_secret_key",
+        "database_url",
+        "candidate_signing_key",
+        "backup_encryption_key",
+        {
+            "anthropic": "anthropic_api_key",
+            "gemini": "gemini_api_key",
+            "groq": "groq_api_key",
+        }.get(config.llm.provider, "unsupported_llm_provider"),
+        *(
+            f"field-encryption/{key_id}"
+            for key_id in (
+                config.encryption.active_key_id,
+                *config.encryption.retained_key_ids,
+            )
+        ),
+    }
+    missing = sorted(
+        account
+        for account in required_accounts
+        if presence.get(account) is False
+    )
+    unavailable = sorted(
+        account
+        for account in required_accounts
+        if presence.get(account) is None
+    )
+    if missing:
+        role_detail = "missing=" + ",".join(missing)
+    elif unavailable:
+        role_detail = "unavailable=" + ",".join(unavailable)
+    else:
+        role_detail = "present material failed role validation"
+
+    dangerous = []
+    if config.features.auto_execute_preapproved_rules:
+        dangerous.append("autoexecute")
+    if config.execution.prefer_bracket_orders:
+        dangerous.append("brackets")
+    if config.llm.fallback_provider is not None:
+        dangerous.append("llm_fallback")
+    if presence.get("live_trading_confirm") is True:
+        dangerous.append("live_confirmation")
+
+    results = [
+        _config_parses(),
+        _paper_only(config),
+        Result("runtime secret role validation", NEEDS, role_detail),
+        Result(
+            "dangerous switches OFF",
+            FAIL if dangerous else PASS,
+            (
+                "all disabled"
+                if not dangerous
+                else "enabled=" + ",".join(dangerous)
+            ),
+        ),
+        Result(
+            "operator login secret quality",
+            NEEDS,
+            "role validation incomplete; value not displayed",
+        ),
+        Result(
+            "Alpaca paper auth",
+            NEEDS,
+            "role validation incomplete; no broker call",
+        ),
+        Result("market clock reachable", NEEDS, "no broker call"),
+        Result("data bars reachable", NEEDS, "no provider call"),
+        Result("database schema current", NEEDS, "no database call"),
+        Result("DB WAL mode", NEEDS, "no database call"),
+        Result("kill switches", NEEDS, "no database call"),
+        Result(
+            "broker/local reconciliation",
+            NEEDS,
+            "role validation incomplete; no broker call",
+        ),
+        Result(
+            "configured LLM provider",
+            NEEDS,
+            f"provider={config.llm.provider}; no provider call",
+        ),
+        (
+            Result(
+                "notification configuration",
+                NEEDS,
+                "enabled; role validation incomplete; no message sent",
+            )
+            if config.features.telegram_notifications
+            else Result(
+                "notification configuration",
+                SKIP,
+                "disabled; no message sent",
+            )
+        ),
+    ]
+    return _print_results(results)
+
+
+def run(*, provider: SecretProvider | None = None) -> int:
     from .logging import runtime_startup
 
     config = load_config("config.yaml")
-    secrets = load_role_secrets("preflight", config=config)
+    try:
+        if provider is None:
+            secrets = load_role_secrets("preflight", config=config)
+        else:
+            secrets = load_role_secrets(
+                "preflight",
+                config=config,
+                provider=provider,
+            )
+    except SecretBoundaryError:
+        selected = (
+            provider
+            if isinstance(provider, MacOSKeychainSecretProvider)
+            else MacOSKeychainSecretProvider()
+        )
+        return _run_partial_keychain(
+            config,
+            selected.read_presence(encryption=config.encryption),
+        )
     with runtime_startup("preflight", secrets):
         return _run(config, secrets)
 
@@ -341,26 +497,7 @@ def _run(
     results.append(_llm_provider_configured(config, secrets))
     results.append(_notification_configuration(config, secrets))
 
-    width = max(len(r.name) for r in results)
-    print("\nPREFLIGHT\n" + "-" * (width + 40))
-    for r in results:
-        print(f"  {r.status:8} {r.name:<{width}}  {r.detail}")
-    failed = [r for r in results if r.status == FAIL]
-    needs = [r for r in results if r.status == NEEDS]
-    print("-" * (width + 40))
-    print(f"  {len(failed)} FAIL · {len(needs)} NEEDS-ME · "
-          f"{sum(r.status == PASS for r in results)} PASS · {sum(r.status == SKIP for r in results)} SKIP")
-    not_ready = bool(failed or needs)
-    print(
-        "  => "
-        + (
-            "NOT READY — fix FAIL/NEEDS-ME items"
-            if not_ready
-            else "READY"
-        )
-        + "\n"
-    )
-    return 1 if not_ready else 0
+    return _print_results(results)
 
 
 if __name__ == "__main__":

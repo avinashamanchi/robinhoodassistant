@@ -102,12 +102,22 @@ _LLM_ROLES = frozenset(
     {"app", "daemon", "preflight", "validate-analyst"}
 )
 _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
+_KNOWN_EXAMPLE_KEY_MATERIAL = (
+    bytes(32),
+    b"A" * 32,
+    b"0" * 32,
+    bytes(range(32)),
+)
 _KNOWN_EXAMPLE_KEYS = frozenset(
     {
-        base64.b64encode(bytes(32)).decode(),
-        base64.b64encode(b"A" * 32).decode(),
-        base64.b64encode(b"0" * 32).decode(),
-        base64.b64encode(bytes(range(32))).decode(),
+        base64.b64encode(material).decode()
+        for material in _KNOWN_EXAMPLE_KEY_MATERIAL
+    }
+)
+_ENVIRONMENT_SECRET_NAMES = frozenset(
+    {
+        *(field_name.upper() for field_name in _SIMPLE_SECRET_FIELDS),
+        "FIELD_ENCRYPTION_KEYS_JSON",
     }
 )
 _PLACEHOLDER_MARKERS = (
@@ -275,12 +285,6 @@ def validate_base64_key(
 ) -> bytearray:
     """Decode one exact 32-byte Base64 key into mutable validation storage."""
     encoded = secret_value(value)
-    if reject_known_examples and encoded in _KNOWN_EXAMPLE_KEYS:
-        raise SecretValidationError(
-            field_name,
-            "known_example",
-            f"{field_name} must not use a known example value",
-        )
     try:
         decoded = bytearray(
             base64.b64decode(
@@ -294,6 +298,15 @@ def validate_base64_key(
             "invalid_base64",
             f"{field_name} must be a 32-byte Base64 key",
         ) from None
+    canonical = base64.b64encode(bytes(decoded)).decode("ascii")
+    if not hmac.compare_digest(encoded, canonical):
+        for index in range(len(decoded)):
+            decoded[index] = 0
+        raise SecretValidationError(
+            field_name,
+            "invalid_base64",
+            f"{field_name} must use canonical Base64 encoding",
+        )
     if len(decoded) != 32:
         for index in range(len(decoded)):
             decoded[index] = 0
@@ -301,6 +314,20 @@ def validate_base64_key(
             field_name,
             "invalid_length",
             f"{field_name} must be a 32-byte Base64 key",
+        )
+    if reject_known_examples and (
+        encoded in _KNOWN_EXAMPLE_KEYS
+        or any(
+            hmac.compare_digest(decoded, known)
+            for known in _KNOWN_EXAMPLE_KEY_MATERIAL
+        )
+    ):
+        for index in range(len(decoded)):
+            decoded[index] = 0
+        raise SecretValidationError(
+            field_name,
+            "known_example",
+            f"{field_name} must not use a known example value",
         )
     return decoded
 
@@ -337,7 +364,7 @@ class MacOSKeychainSecretProvider:
             if backend is not None
             else _default_keyring_backend()
         )
-        self.last_successful_load_at: datetime | None = None
+        self.last_successful_role_load_at: datetime | None = None
 
     def _get(self, account: str) -> str | None:
         try:
@@ -364,8 +391,31 @@ class MacOSKeychainSecretProvider:
             **values,
             field_encryption_keys=field_keys,
         )
-        self.last_successful_load_at = datetime.now(timezone.utc)
         return loaded
+
+    def read_presence(
+        self,
+        *,
+        encryption: EncryptionConfig,
+    ) -> Mapping[str, bool | None]:
+        presence: dict[str, bool | None] = {}
+        for account in (
+            *_SIMPLE_SECRET_FIELDS,
+            *(
+                f"field-encryption/{key_id}"
+                for key_id in _configured_key_ids(encryption)
+            ),
+        ):
+            try:
+                value = self.backend.get_password(
+                    KEYCHAIN_SERVICE,
+                    account,
+                )
+            except Exception:
+                presence[account] = None
+            else:
+                presence[account] = bool(value)
+        return MappingProxyType(presence)
 
 
 class EnvironmentSecretProvider:
@@ -376,8 +426,14 @@ class EnvironmentSecretProvider:
     def __init__(self, *, environ: Mapping[str, str]) -> None:
         if not isinstance(environ, Mapping):
             raise TypeError("environ must be an explicitly injected mapping")
-        self._environ = MappingProxyType(dict(environ))
-        self.last_successful_load_at: datetime | None = None
+        self._environ = MappingProxyType(
+            {
+                name: value
+                for name, value in environ.items()
+                if name in _ENVIRONMENT_SECRET_NAMES
+            }
+        )
+        self.last_successful_role_load_at: datetime | None = None
 
     def load(self, *, encryption: EncryptionConfig) -> RuntimeSecrets:
         values = {
@@ -420,7 +476,6 @@ class EnvironmentSecretProvider:
             **values,
             field_encryption_keys=field_keys,
         )
-        self.last_successful_load_at = datetime.now(timezone.utc)
         return loaded
 
 
@@ -598,4 +653,6 @@ def load_role_secrets(
     register_all_secrets(loaded)
     _validate_required_fields(role, config, loaded)
     _validate_key_material(config, loaded)
+    if hasattr(selected, "last_successful_role_load_at"):
+        selected.last_successful_role_load_at = datetime.now(timezone.utc)
     return loaded

@@ -1722,16 +1722,18 @@ def run_safety_drill(
     finally:
         copy_engine.dispose()
 
-    drill_secrets = primary_secrets.model_copy(
-        update={
+    drill_values = primary_secrets.model_dump()
+    drill_values.update(
+        {
             "database_url": copy_url,
             "app_api_token": (
-                secret_value(primary_secrets.app_api_token)
+                primary_secrets.app_api_token
                 if secret_is_set(primary_secrets.app_api_token)
                 else "task-10-safety-drill-local-operator"
             ),
         }
     )
+    drill_secrets = RuntimeSecrets.model_validate(drill_values)
     crash_broker = _CrashAfterAcceptanceOnceBroker(
         broker,
         before_broker_mutation=(

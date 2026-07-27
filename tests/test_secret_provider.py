@@ -11,10 +11,15 @@ from pathlib import Path
 import subprocess
 
 import pytest
-from pydantic import ValidationError
+from keyring.backends.chainer import ChainerBackend
+from keyring.backends.fail import Keyring as FailKeyring
+from keyring.backends.null import Keyring as NullKeyring
+from pydantic import SecretStr, ValidationError
 
-from trading_assistant.config import EncryptionConfig
+from trading_assistant.config import BrokerKind, EncryptionConfig
 from trading_assistant.ops import secrets as secret_ops
+from trading_assistant import preflight
+import trading_assistant.security.secrets as secret_module
 from trading_assistant.security.secrets import (
     EnvironmentSecretProvider,
     MacOSKeychainSecretProvider,
@@ -25,7 +30,10 @@ from trading_assistant.security.secrets import (
     UnsafeKeyringBackend,
     UnsafeSecretProvider,
     load_role_secrets,
+    validate_base64_key,
 )
+
+_ORIGINAL_DEFAULT_KEYRING_BACKEND = secret_module._default_keyring_backend
 
 
 _SIMPLE_ACCOUNTS = (
@@ -53,6 +61,8 @@ _PRODUCTION_ROLES = (
     "watchdog",
     "paper-drill",
     "safety-drill",
+    "backup",
+    "validate-analyst",
 )
 _SERVICE = "io.local.trading-assistant"
 
@@ -150,6 +160,195 @@ class _FakeMacOSKeyring:
         if self.failure is not None:
             raise self.failure
         self.values.pop(username, None)
+
+
+class _FailOnceAfterWriteKeyring(_FakeMacOSKeyring):
+    def __init__(
+        self,
+        values: dict[str, str],
+        *,
+        fail_at_write: int,
+    ) -> None:
+        super().__init__(values)
+        self.fail_at_write = fail_at_write
+        self.write_attempts = 0
+        self.failed = False
+
+    def set_password(
+        self,
+        service: str,
+        username: str,
+        password: str,
+    ) -> None:
+        self.write_attempts += 1
+        self.set_calls.append((service, username, password))
+        self.values[username] = password
+        if (
+            not self.failed
+            and self.write_attempts == self.fail_at_write
+        ):
+            self.failed = True
+            raise RuntimeError("injected write failure with secret marker")
+
+
+class _FailOnceDuringVerificationKeyring(_FakeMacOSKeyring):
+    def __init__(
+        self,
+        values: dict[str, str],
+        *,
+        account: str,
+    ) -> None:
+        super().__init__(values)
+        self.account = account
+        self.written = False
+        self.failed = False
+
+    def set_password(
+        self,
+        service: str,
+        username: str,
+        password: str,
+    ) -> None:
+        super().set_password(service, username, password)
+        if username == self.account:
+            self.written = True
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self.get_calls.append((service, username))
+        if (
+            username == self.account
+            and self.written
+            and not self.failed
+        ):
+            self.failed = True
+            raise RuntimeError("injected verification failure with marker")
+        return self.values.get(username)
+
+
+class _CorruptOnceAfterVerificationKeyring(_FakeMacOSKeyring):
+    def __init__(
+        self,
+        values: dict[str, str],
+        *,
+        account: str,
+        corrupt_value: str,
+    ) -> None:
+        super().__init__(values)
+        self.account = account
+        self.corrupt_value = corrupt_value
+        self.written = False
+        self.corrupted = False
+
+    def set_password(
+        self,
+        service: str,
+        username: str,
+        password: str,
+    ) -> None:
+        super().set_password(service, username, password)
+        if username == self.account:
+            self.written = True
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self.get_calls.append((service, username))
+        value = self.values.get(username)
+        if (
+            username == self.account
+            and self.written
+            and not self.corrupted
+        ):
+            self.corrupted = True
+            self.values[username] = self.corrupt_value
+        return value
+
+
+class _CorruptOtherAccountAfterVerificationKeyring(_FakeMacOSKeyring):
+    def __init__(
+        self,
+        values: dict[str, str],
+        *,
+        trigger_account: str,
+        corrupt_account: str,
+        corrupt_value: str,
+    ) -> None:
+        super().__init__(values)
+        self.trigger_account = trigger_account
+        self.corrupt_account = corrupt_account
+        self.corrupt_value = corrupt_value
+        self.trigger_written = False
+        self.trigger_verified = False
+        self.corrupted = False
+
+    def set_password(
+        self,
+        service: str,
+        username: str,
+        password: str,
+    ) -> None:
+        super().set_password(service, username, password)
+        if username == self.trigger_account:
+            self.trigger_written = True
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self.get_calls.append((service, username))
+        if (
+            username == self.trigger_account
+            and self.trigger_written
+            and not self.trigger_verified
+        ):
+            self.trigger_verified = True
+        elif (
+            username == self.corrupt_account
+            and self.trigger_verified
+            and not self.corrupted
+        ):
+            self.corrupted = True
+            return self.corrupt_value
+        return self.values.get(username)
+
+
+def _replacement_environment(
+    encryption: EncryptionConfig,
+) -> dict[str, str]:
+    values = {
+        "ANTHROPIC_API_KEY": "replacement-anthropic",
+        "GEMINI_API_KEY": "replacement-gemini",
+        "GROQ_API_KEY": "replacement-groq",
+        "OPENROUTER_API_KEY": "replacement-openrouter",
+        "MARKETSTACK_API_KEY": "replacement-marketstack",
+        "APP_API_TOKEN": "Q8!vN3#mR7$pL2&tX9-zC5_kW4sD6gH1",
+        "ALPACA_API_KEY": "replacement-paper-key",
+        "ALPACA_SECRET_KEY": "replacement-paper-secret",
+        "DATABASE_URL": "sqlite:///replacement-role.db",
+        "TELEGRAM_BOT_TOKEN": "replacement-telegram-bot",
+        "TELEGRAM_CHAT_ID": "replacement-telegram-chat",
+        "CANDIDATE_SIGNING_KEY": _key("replacement-candidate"),
+        "BACKUP_ENCRYPTION_KEY": _key("replacement-backup"),
+        "LIVE_TRADING_CONFIRM": "",
+    }
+    values["FIELD_ENCRYPTION_KEYS_JSON"] = json.dumps(
+        {
+            key_id: _key(f"replacement-field:{key_id}")
+            for key_id in (
+                encryption.active_key_id,
+                *encryption.retained_key_ids,
+            )
+        }
+    )
+    return values
+
+
+def _private_env_file(
+    tmp_path: Path,
+    environment: dict[str, str],
+) -> Path:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "".join(f"{name}={value}\n" for name, value in environment.items()),
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    return env_file
 
 
 class _StaticSecretProvider:
@@ -278,19 +477,42 @@ def test_default_keychain_provider_refuses_non_macos(monkeypatch):
     monkeypatch.setattr(platform, "system", lambda: "Linux")
 
     with pytest.raises(UnsafeKeyringBackend, match="macOS"):
-        MacOSKeychainSecretProvider()
+        _ORIGINAL_DEFAULT_KEYRING_BACKEND()
 
 
-def test_default_keychain_provider_rejects_non_native_selected_backend(
+class _PlaintextBackend:
+    pass
+
+
+@pytest.mark.parametrize(
+    "selected_backend",
+    [
+        pytest.param(object.__new__(FailKeyring), id="fail"),
+        pytest.param(object.__new__(NullKeyring), id="null"),
+        pytest.param(_PlaintextBackend(), id="plaintext"),
+        pytest.param(object.__new__(ChainerBackend), id="chainer"),
+    ],
+)
+def test_default_keychain_provider_rejects_each_unsafe_backend_family(
     monkeypatch,
+    selected_backend,
 ):
     import keyring
     import platform
 
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(keyring, "get_keyring", object)
+    monkeypatch.setattr(
+        keyring,
+        "get_keyring",
+        lambda: selected_backend,
+    )
 
     with pytest.raises(UnsafeKeyringBackend, match="macOS"):
+        _ORIGINAL_DEFAULT_KEYRING_BACKEND()
+
+
+def test_repository_guard_blocks_uninjected_default_keychain():
+    with pytest.raises(AssertionError, match="must inject"):
         MacOSKeychainSecretProvider()
 
 
@@ -309,6 +531,85 @@ def test_environment_provider_parses_only_the_injected_mapping():
         ].get_secret_value()
         == _key(f"field-encryption:{encryption.active_key_id}")
     )
+
+
+def test_noncanonical_base64_pad_bits_cannot_bypass_known_example_rejection():
+    canonical = base64.b64encode(bytes(32)).decode()
+    noncanonical = canonical[:-2] + "B="
+    assert base64.b64decode(noncanonical) == bytes(32)
+
+    with pytest.raises(SecretValidationError) as captured:
+        validate_base64_key("candidate_signing_key", noncanonical)
+
+    assert captured.value.stable_code in {
+        "invalid_base64",
+        "known_example",
+    }
+
+
+def test_environment_provider_drops_composio_and_unknown_entries_without_retention(
+    capsys,
+):
+    encryption = _encryption_config()
+    marker = "compromised-composio-marker-must-not-be-retained"
+    environment = {
+        **_environment(encryption),
+        "COMPOSIO_API_KEY": marker,
+        "UNRELATED_SECRET": marker,
+    }
+
+    provider = EnvironmentSecretProvider(environ=environment)
+    loaded = provider.load(encryption=encryption)
+
+    assert loaded.alpaca_api_key.get_secret_value() == "paper-key"
+    assert "COMPOSIO_API_KEY" not in provider._environ
+    assert "UNRELATED_SECRET" not in provider._environ
+    assert marker not in repr(provider.__dict__)
+    assert marker not in capsys.readouterr().out
+
+
+def test_private_env_reader_drops_composio_without_returning_or_printing_it(
+    capsys,
+    tmp_path,
+):
+    marker = "compromised-composio-file-marker"
+    env_file = _private_env_file(
+        tmp_path,
+        {
+            "APP_API_TOKEN": "allowed-operator-value",
+            "COMPOSIO_API_KEY": marker,
+            "UNRELATED_SECRET": marker,
+        },
+    )
+
+    loaded = secret_ops._read_private_env(env_file)
+
+    assert loaded == {"APP_API_TOKEN": "allowed-operator-value"}
+    assert marker not in repr(loaded)
+    assert marker not in capsys.readouterr().out
+
+
+def test_migration_prompt_collection_drops_unallowlisted_input_without_retention(
+    app_config,
+    capsys,
+):
+    marker = "compromised-prompt-input-marker"
+    environment = {
+        **_environment(app_config.encryption),
+        "COMPOSIO_API_KEY": marker,
+        "UNRELATED_SECRET": marker,
+    }
+
+    collected = secret_ops._prompt_for_migration_values(
+        environment,
+        config=app_config,
+        prompt=lambda _prompt: pytest.fail("unexpected prompt"),
+    )
+
+    assert "COMPOSIO_API_KEY" not in collected
+    assert "UNRELATED_SECRET" not in collected
+    assert marker not in repr(collected)
+    assert marker not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("role", _PRODUCTION_ROLES)
@@ -514,7 +815,10 @@ def test_audit_and_set_commands_report_metadata_only(
     audit_output = capsys.readouterr().out
     assert "provider: macos-keychain" in audit_output
     assert f"active-key-id: {app_config.encryption.active_key_id}" in audit_output
-    assert "last-successful-load:" in audit_output
+    assert "audit-read: complete" in audit_output
+    assert "role-validation: passed" in audit_output
+    assert "key-validation: passed" in audit_output
+    assert "last-successful-role-load: never" in audit_output
     assert values["app_api_token"] not in audit_output
 
     assert secret_ops.main(
@@ -546,3 +850,281 @@ def test_set_encryption_key_rejects_malformed_material_without_writing(
         )
 
     assert backend.set_calls == []
+
+
+@pytest.mark.parametrize("failure_index", range(1, 15))
+def test_migrate_env_rolls_back_failure_at_every_write_and_retries_safely(
+    app_config,
+    capsys,
+    failure_index,
+    tmp_path,
+):
+    original = _account_values(app_config.encryption)
+    environment = _replacement_environment(app_config.encryption)
+    env_file = _private_env_file(tmp_path, environment)
+    backend = _FailOnceAfterWriteKeyring(
+        original,
+        fail_at_write=failure_index,
+    )
+
+    with pytest.raises(SecretUnavailable):
+        secret_ops.main(
+            ["migrate-env", "--env-file", str(env_file)],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: pytest.fail("unexpected prompt"),
+        )
+
+    failed_output = capsys.readouterr().out
+    assert "stored verified" not in failed_output
+    assert backend.values == original
+
+    assert secret_ops.main(
+        ["migrate-env", "--env-file", str(env_file)],
+        backend=backend,
+        config=app_config,
+        prompt=lambda _prompt: pytest.fail("unexpected prompt"),
+    ) == 0
+
+    parsed_field_keys = json.loads(
+        environment["FIELD_ENCRYPTION_KEYS_JSON"]
+    )
+    for account in _SIMPLE_ACCOUNTS:
+        value = environment.get(account.upper(), "")
+        if value:
+            assert backend.values[account] == value
+    for key_id, value in parsed_field_keys.items():
+        assert backend.values[f"field-encryption/{key_id}"] == value
+
+
+def test_set_rolls_back_new_account_after_verification_failure_and_retries(
+    app_config,
+    capsys,
+):
+    original = _account_values(app_config.encryption)
+    original.pop("marketstack_api_key")
+    backend = _FailOnceDuringVerificationKeyring(
+        original,
+        account="marketstack_api_key",
+    )
+    replacement = "replacement-marketstack-key"
+
+    with pytest.raises(SecretUnavailable):
+        secret_ops.main(
+            ["set", "marketstack_api_key"],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: replacement,
+        )
+
+    assert "marketstack_api_key" not in backend.values
+    assert (
+        _SERVICE,
+        "marketstack_api_key",
+    ) in backend.delete_calls
+    assert "stored verified" not in capsys.readouterr().out
+
+    assert secret_ops.main(
+        ["set", "marketstack_api_key"],
+        backend=backend,
+        config=app_config,
+        prompt=lambda _prompt: replacement,
+    ) == 0
+    assert backend.values["marketstack_api_key"] == replacement
+
+
+def test_set_rolls_back_postwrite_global_validation_failure_and_retries(
+    app_config,
+    capsys,
+):
+    original = _account_values(app_config.encryption)
+    backend = _CorruptOtherAccountAfterVerificationKeyring(
+        original,
+        trigger_account="marketstack_api_key",
+        corrupt_account="candidate_signing_key",
+        corrupt_value=original["backup_encryption_key"],
+    )
+    replacement = "replacement-marketstack-key"
+
+    with pytest.raises(SecretValidationError, match="distinct"):
+        secret_ops.main(
+            ["set", "marketstack_api_key"],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: replacement,
+        )
+
+    assert backend.values == original
+    assert "stored verified" not in capsys.readouterr().out
+
+    assert secret_ops.main(
+        ["set", "marketstack_api_key"],
+        backend=backend,
+        config=app_config,
+        prompt=lambda _prompt: replacement,
+    ) == 0
+    assert backend.values["marketstack_api_key"] == replacement
+
+
+def test_set_rolls_back_postwrite_value_mismatch_even_when_still_valid(
+    app_config,
+    capsys,
+):
+    original = _account_values(app_config.encryption)
+    backend = _CorruptOnceAfterVerificationKeyring(
+        original,
+        account="candidate_signing_key",
+        corrupt_value=_key("unexpected-but-valid-candidate"),
+    )
+    replacement = _key("intended-candidate-replacement")
+
+    with pytest.raises(SecretUnavailable):
+        secret_ops.main(
+            ["set", "candidate_signing_key"],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: replacement,
+        )
+
+    assert backend.values == original
+    assert "stored verified" not in capsys.readouterr().out
+
+
+def test_set_rejects_update_when_complete_role_state_is_invalid(
+    app_config,
+):
+    values = _account_values(app_config.encryption)
+    values.pop("backup_encryption_key")
+    backend = _FakeMacOSKeyring(values)
+
+    with pytest.raises(SecretValidationError):
+        secret_ops.main(
+            ["set", "marketstack_api_key"],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: "replacement-marketstack",
+        )
+
+    assert backend.set_calls == []
+    assert backend.values == values
+
+
+def test_set_rejects_live_confirmation_that_invalidates_paper_role(
+    app_config,
+):
+    values = _account_values(app_config.encryption)
+    backend = _FakeMacOSKeyring(values)
+
+    with pytest.raises(SecretValidationError, match="paper"):
+        secret_ops.main(
+            ["set", "live_trading_confirm"],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: "ENABLE_LIVE_TRADING",
+        )
+
+    assert backend.set_calls == []
+    assert backend.values == values
+
+
+def test_set_encryption_key_rejects_material_shared_with_candidate(
+    app_config,
+):
+    values = _account_values(app_config.encryption)
+    backend = _FakeMacOSKeyring(values)
+    before = dict(values)
+
+    with pytest.raises(SecretValidationError, match="distinct"):
+        secret_ops.main(
+            [
+                "set-encryption-key",
+                app_config.encryption.active_key_id,
+            ],
+            backend=backend,
+            config=app_config,
+            prompt=lambda _prompt: values["candidate_signing_key"],
+        )
+
+    assert backend.set_calls == []
+    assert backend.values == before
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda values, config: values.__setitem__(
+                "candidate_signing_key",
+                "not-valid-base64",
+            ),
+            id="malformed",
+        ),
+        pytest.param(
+            lambda values, config: values.__setitem__(
+                f"field-encryption/{config.encryption.active_key_id}",
+                values["candidate_signing_key"],
+            ),
+            id="shared",
+        ),
+    ],
+)
+def test_audit_separates_raw_presence_from_failed_key_validation(
+    app_config,
+    capsys,
+    mutate,
+):
+    values = _account_values(app_config.encryption)
+    mutate(values, app_config)
+
+    assert secret_ops.main(
+        ["audit"],
+        backend=_FakeMacOSKeyring(values),
+        config=app_config,
+    ) == 1
+
+    output = capsys.readouterr().out
+    assert "audit-read: complete" in output
+    assert "role-validation: passed" in output
+    assert "key-validation: failed" in output
+    assert "last-successful-role-load: never" in output
+    assert values["candidate_signing_key"] not in output
+
+
+def test_preflight_partial_keychain_prints_needs_without_external_checks(
+    app_config,
+    capsys,
+    monkeypatch,
+):
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    values = _account_values(config.encryption)
+    marker = values["anthropic_api_key"]
+    values.pop("app_api_token")
+    values.pop("alpaca_secret_key")
+    provider = MacOSKeychainSecretProvider(
+        backend=_FakeMacOSKeyring(values)
+    )
+
+    monkeypatch.setattr(preflight, "load_config", lambda *_args: config)
+
+    def forbidden_external_check(*_args, **_kwargs):
+        raise AssertionError("partial preflight must not call dependencies")
+
+    monkeypatch.setattr(preflight, "_alpaca", forbidden_external_check)
+    monkeypatch.setattr(preflight, "_db", forbidden_external_check)
+    monkeypatch.setattr(preflight, "_build_service", forbidden_external_check)
+
+    assert preflight.run(provider=provider) == 1
+
+    output = capsys.readouterr().out
+    assert "runtime secret role validation" in output
+    assert "NEEDS-ME" in output
+    assert "Alpaca paper auth" in output
+    assert "NOT READY" in output
+    assert marker not in output
+    assert provider.last_successful_role_load_at is None

@@ -21,9 +21,46 @@ from trading_assistant.config import (
 )
 from trading_assistant.db.models import Base
 from trading_assistant.db.session import create_db_engine, make_session_factory
+import trading_assistant.security.secrets as secret_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_OPERATOR_TOKEN = "test-operator-secret"
+
+
+@pytest.fixture(autouse=True)
+def _forbid_uninjected_native_keychain(monkeypatch):
+    """Fail before default backend selection can inspect the real Keychain."""
+
+    import keyring
+    from keyring.backends.macOS import Keyring as NativeMacOSKeyring
+
+    def forbidden_backend(*_args, **_kwargs):
+        raise AssertionError(
+            "tests must inject a fake KeyringBackend or RuntimeSecrets"
+        )
+
+    monkeypatch.setattr(
+        secret_module,
+        "_default_keyring_backend",
+        forbidden_backend,
+    )
+    for operation in (
+        "get_keyring",
+        "get_password",
+        "set_password",
+        "delete_password",
+    ):
+        monkeypatch.setattr(keyring, operation, forbidden_backend)
+    for operation in (
+        "get_password",
+        "set_password",
+        "delete_password",
+    ):
+        monkeypatch.setattr(
+            NativeMacOSKeyring,
+            operation,
+            forbidden_backend,
+        )
 
 
 @pytest.fixture(autouse=True)

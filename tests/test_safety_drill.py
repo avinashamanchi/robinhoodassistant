@@ -13,6 +13,7 @@ import pytest
 from alpaca.trading.client import TradingClient
 from alembic import command
 from alembic.config import Config
+from pydantic import SecretStr
 from sqlalchemy import select, text
 
 from trading_assistant.broker.alpaca import AlpacaBroker
@@ -74,6 +75,51 @@ def _safe_config(app_config):
             ),
         }
     )
+
+
+def test_drill_copy_secrets_preserve_secretstr_masking(
+    app_config,
+    monkeypatch,
+    tmp_path,
+):
+    primary = tmp_path / "primary.db"
+    destination = tmp_path / "copy.db"
+    _upgrade_database(primary)
+    original_token = "safety-drill-secretstr-marker"
+    captured = []
+
+    class CapturedDrillSecrets(RuntimeError):
+        pass
+
+    def capture_container(_config, secrets, **_kwargs):
+        captured.append(secrets)
+        raise CapturedDrillSecrets
+
+    monkeypatch.setattr(
+        safety_drill_module,
+        "build_test_container",
+        capture_container,
+    )
+
+    with pytest.raises(CapturedDrillSecrets):
+        _production_run_safety_drill(
+            database_copy=destination,
+            config=_safe_config(app_config),
+            broker=MockBroker(prices={"AAPL": Decimal("100")}),
+            secrets=RuntimeSecrets(
+                database_url=f"sqlite:///{primary}",
+                app_api_token=original_token,
+            ),
+        )
+
+    drill_secrets = captured[0]
+    assert isinstance(drill_secrets.database_url, SecretStr)
+    assert isinstance(drill_secrets.app_api_token, SecretStr)
+    dumped = drill_secrets.model_dump(mode="json")
+    assert dumped["database_url"] == "**********"
+    assert dumped["app_api_token"] == "**********"
+    assert original_token not in repr(drill_secrets)
+    assert str(destination) not in repr(drill_secrets)
 
 
 def _runtime_secrets_from_test_environment(
