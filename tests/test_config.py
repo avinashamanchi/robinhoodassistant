@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import textwrap
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from trading_assistant.config import (
     LIVE_CONFIRM_STRING,
     Secrets,
     TradingMode,
+    WindowLimitConfig,
     live_trading_enabled,
     load_config,
 )
@@ -106,6 +109,35 @@ def test_deployed_config_keeps_automatic_execution_disabled():
     assert cfg.security.session_hours == 8
     assert cfg.security.reauthentication_minutes == 5
     assert cfg.security.cookie_secure is False
+
+
+def test_security_policy_defaults_are_explicit(app_config):
+    security = app_config.security
+    assert security.rate_limits.login == WindowLimitConfig(
+        requests=5, global_requests=20, window_seconds=900, concurrency=2
+    )
+    assert security.rate_limits.backtest.daily_requests == 6
+    assert security.rate_limits.backtest.global_daily_requests == 6
+    assert security.provider_budget.daily_calls == 100
+    assert security.provider_budget.daily_input_tokens == 1_000_000
+    assert security.provider_budget.daily_output_tokens == 200_000
+    assert security.provider_budget.max_chat_tool_turns == 8
+    assert security.provider_budget.max_structured_attempts == 2
+    price = security.provider_budget.prices["gemini:gemini-3.6-flash"]
+    assert price.input_usd_per_million == Decimal("1.50")
+    assert price.output_usd_per_million == Decimal("7.50")
+    assert app_config.llm.gemini_model == "gemini-3.6-flash"
+    assert security.backtest_limits.runtime_seconds == 1_200
+    assert security.request_bounds.default_body_bytes == 16_384
+
+
+def test_typo_in_nested_rate_limit_fails(tmp_path):
+    raw = yaml.safe_load(Path("config.yaml").read_text())
+    raw["security"]["rate_limits"]["chat"]["window_second"] = 600
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValidationError, match="window_second"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(

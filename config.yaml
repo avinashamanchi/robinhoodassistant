@@ -68,12 +68,114 @@ security:
   session_hours: 8
   reauthentication_minutes: 5
   cookie_secure: false                    # loopback HTTP only; true for TLS/non-loopback
+  rate_limits:
+    login:
+      requests: 5
+      global_requests: 20
+      window_seconds: 900
+      concurrency: 2
+      daily_requests: null
+      global_daily_requests: null
+    session_read:
+      requests: 120
+      global_requests: 240
+      window_seconds: 60
+      concurrency: 16
+      daily_requests: null
+      global_daily_requests: null
+    broker_read:
+      requests: 30
+      global_requests: 60
+      window_seconds: 60
+      concurrency: 4
+      daily_requests: null
+      global_daily_requests: null
+    mutation:
+      requests: 20
+      global_requests: 40
+      window_seconds: 60
+      concurrency: 4
+      daily_requests: null
+      global_daily_requests: null
+    approval:
+      requests: 10
+      global_requests: 20
+      window_seconds: 300
+      concurrency: 1
+      daily_requests: null
+      global_daily_requests: null
+    privileged:
+      requests: 5
+      global_requests: 10
+      window_seconds: 300
+      concurrency: 1
+      daily_requests: null
+      global_daily_requests: null
+    chat:
+      requests: 10
+      global_requests: 20
+      window_seconds: 600
+      concurrency: 1
+      daily_requests: null
+      global_daily_requests: null
+    analysis:
+      requests: 5
+      global_requests: 10
+      window_seconds: 600
+      concurrency: 1
+      daily_requests: null
+      global_daily_requests: null
+    backtest:
+      requests: 2
+      global_requests: 6
+      window_seconds: 3600
+      concurrency: 1
+      daily_requests: 6
+      global_daily_requests: 6
+    provider_read:
+      requests: 180
+      global_requests: 240
+      window_seconds: 60
+      concurrency: 8
+      daily_requests: null
+      global_daily_requests: null
+    panic:
+      requests: 60
+      global_requests: 120
+      window_seconds: 60
+      concurrency: 1
+      daily_requests: null
+      global_daily_requests: null
+  provider_budget:
+    daily_calls: 100
+    daily_input_tokens: 1000000
+    daily_output_tokens: 200000
+    reservation_ttl_seconds: 300
+    max_chat_tool_turns: 8
+    max_structured_attempts: 2
+    backtest_llm_enabled: false
+    prices:
+      "gemini:gemini-3.6-flash":
+        model: gemini-3.6-flash
+        effective_date: 2026-07-09
+        input_usd_per_million: 1.50
+        output_usd_per_million: 7.50
+        source_url: https://ai.google.dev/gemini-api/docs/latest-model
+  backtest_limits:
+    runtime_seconds: 1200
+    max_symbols: 20
+    max_calendar_days: 3000
+  request_bounds:
+    default_body_bytes: 16384
+    chat_body_bytes: 32768
+    max_header_count: 64
+    max_header_bytes: 16384
 
 llm:
   provider: gemini            # anthropic | gemini | groq
   fallback_provider: null     # cross-provider runtime fallback is prohibited
   model: claude-sonnet-4-6    # used only when provider=anthropic
-  gemini_model: gemini-flash-latest
+  gemini_model: gemini-3.6-flash
   groq_model: llama-3.3-70b-versatile
   max_tokens: 4096
   request_timeout_seconds: 45

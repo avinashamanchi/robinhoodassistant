@@ -16,11 +16,13 @@ them: this release is hard-locked to Alpaca paper trading.
 from __future__ import annotations
 
 import enum
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AnyUrl, BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
@@ -89,10 +91,104 @@ class ExecutionConfig(_Strict):
     prefer_bracket_orders: bool = False  # disabled until paper concurrency review
 
 
+class WindowLimitConfig(_Strict):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    requests: int = Field(gt=0)
+    global_requests: int = Field(gt=0)
+    window_seconds: int = Field(gt=0)
+    concurrency: int = Field(default=1, gt=0)
+    daily_requests: Optional[int] = Field(default=None, gt=0)
+    global_daily_requests: Optional[int] = Field(default=None, gt=0)
+
+
+class RateLimitsConfig(_Strict):
+    login: WindowLimitConfig = WindowLimitConfig(
+        requests=5, global_requests=20, window_seconds=900, concurrency=2
+    )
+    session_read: WindowLimitConfig = WindowLimitConfig(
+        requests=120, global_requests=240, window_seconds=60, concurrency=16
+    )
+    broker_read: WindowLimitConfig = WindowLimitConfig(
+        requests=30, global_requests=60, window_seconds=60, concurrency=4
+    )
+    mutation: WindowLimitConfig = WindowLimitConfig(
+        requests=20, global_requests=40, window_seconds=60, concurrency=4
+    )
+    approval: WindowLimitConfig = WindowLimitConfig(
+        requests=10, global_requests=20, window_seconds=300, concurrency=1
+    )
+    privileged: WindowLimitConfig = WindowLimitConfig(
+        requests=5, global_requests=10, window_seconds=300, concurrency=1
+    )
+    chat: WindowLimitConfig = WindowLimitConfig(
+        requests=10, global_requests=20, window_seconds=600, concurrency=1
+    )
+    analysis: WindowLimitConfig = WindowLimitConfig(
+        requests=5, global_requests=10, window_seconds=600, concurrency=1
+    )
+    backtest: WindowLimitConfig = WindowLimitConfig(
+        requests=2,
+        global_requests=6,
+        window_seconds=3600,
+        concurrency=1,
+        daily_requests=6,
+        global_daily_requests=6,
+    )
+    provider_read: WindowLimitConfig = WindowLimitConfig(
+        requests=180, global_requests=240, window_seconds=60, concurrency=8
+    )
+    panic: WindowLimitConfig = WindowLimitConfig(
+        requests=60, global_requests=120, window_seconds=60, concurrency=1
+    )
+
+
+class ProviderPriceConfig(_Strict):
+    model: str
+    effective_date: date
+    input_usd_per_million: Decimal = Field(ge=0)
+    output_usd_per_million: Decimal = Field(ge=0)
+    source_url: AnyUrl
+
+
+class ProviderBudgetConfig(_Strict):
+    daily_calls: int = Field(default=100, gt=0)
+    daily_input_tokens: int = Field(default=1_000_000, gt=0)
+    daily_output_tokens: int = Field(default=200_000, gt=0)
+    reservation_ttl_seconds: int = Field(default=300, gt=0)
+    max_chat_tool_turns: int = Field(default=8, gt=0, le=8)
+    max_structured_attempts: int = Field(default=2, gt=0, le=2)
+    backtest_llm_enabled: bool = False
+    prices: dict[str, ProviderPriceConfig] = Field(default_factory=dict)
+
+
+class BacktestLimitConfig(_Strict):
+    runtime_seconds: int = Field(default=1_200, gt=0, le=1_200)
+    max_symbols: int = Field(default=20, gt=0)
+    max_calendar_days: int = Field(default=3_000, gt=0)
+
+
+class RequestBoundsConfig(_Strict):
+    default_body_bytes: int = Field(default=16_384, gt=0)
+    chat_body_bytes: int = Field(default=32_768, gt=0)
+    max_header_count: int = Field(default=64, gt=0)
+    max_header_bytes: int = Field(default=16_384, gt=0)
+
+
 class SecurityConfig(_Strict):
     session_hours: int = Field(default=8, gt=0)
     reauthentication_minutes: int = Field(default=5, gt=0)
     cookie_secure: bool = False
+    rate_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
+    provider_budget: ProviderBudgetConfig = Field(
+        default_factory=ProviderBudgetConfig
+    )
+    backtest_limits: BacktestLimitConfig = Field(
+        default_factory=BacktestLimitConfig
+    )
+    request_bounds: RequestBoundsConfig = Field(
+        default_factory=RequestBoundsConfig
+    )
 
 
 class LLMConfig(_Strict):
@@ -102,7 +198,7 @@ class LLMConfig(_Strict):
     # Retained as an explicit null-only compatibility field. Bootstrap and the
     # factory reject non-null values so financial context never crosses vendors.
     fallback_provider: Optional[str] = None
-    gemini_model: str = "gemini-flash-latest"
+    gemini_model: str = "gemini-3.6-flash"
     groq_model: str = "llama-3.3-70b-versatile"
     request_timeout_seconds: float = Field(default=45.0, gt=0)
 
