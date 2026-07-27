@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_serializer,
+    field_validator,
+)
 
 if TYPE_CHECKING:
     from ..config import EncryptionConfig
@@ -13,7 +22,7 @@ if TYPE_CHECKING:
 class RuntimeSecrets(BaseModel):
     """Secret values after an explicit provider has loaded and validated them."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
 
     anthropic_api_key: SecretStr = SecretStr("")
     gemini_api_key: SecretStr = SecretStr("")
@@ -27,9 +36,22 @@ class RuntimeSecrets(BaseModel):
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: SecretStr = SecretStr("")
     candidate_signing_key: SecretStr = SecretStr("")
-    field_encryption_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    field_encryption_keys: Mapping[str, SecretStr] = Field(default_factory=dict)
     backup_encryption_key: SecretStr = SecretStr("")
     live_trading_confirm: SecretStr = SecretStr("")
+
+    @field_validator("field_encryption_keys")
+    @classmethod
+    def _freeze_field_encryption_keys(
+        cls, value: Mapping[str, SecretStr]
+    ) -> Mapping[str, SecretStr]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("field_encryption_keys")
+    def _serialize_field_encryption_keys(
+        self, value: Mapping[str, SecretStr]
+    ) -> dict[str, SecretStr]:
+        return dict(value)
 
 
 @runtime_checkable

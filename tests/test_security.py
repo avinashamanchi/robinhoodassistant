@@ -3534,6 +3534,26 @@ def test_new_secrets_redacted():
         assert leaked not in out
 
 
+def test_registered_runtime_secret_is_redacted_from_captured_logs(caplog):
+    import logging
+
+    from trading_assistant.config import Secrets
+    from trading_assistant.logging import RedactionFilter, register_all_secrets
+
+    marker = "injected-runtime-redaction-marker"
+    redaction_filter = RedactionFilter()
+    caplog.handler.addFilter(redaction_filter)
+    try:
+        register_all_secrets(Secrets(app_api_token=marker))
+
+        logging.getLogger("trading_assistant.test").warning("opaque=%s", marker)
+
+        assert marker not in caplog.text
+        assert "***REDACTED***" in caplog.text
+    finally:
+        caplog.handler.removeFilter(redaction_filter)
+
+
 # ── A4: backoff + staleness gate ────────────────────────────────
 def test_backoff_grows_and_caps():
     from trading_assistant.daemon.backoff import next_delay

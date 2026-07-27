@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import AnyUrl, ValidationError
 
 from trading_assistant.config import (
     LIVE_CONFIRM_STRING,
+    ProviderOriginsConfig,
     Secrets,
+    ServerConfig,
     TradingMode,
     WindowLimitConfig,
     live_trading_enabled,
@@ -136,6 +138,49 @@ def test_loopback_server_defaults_are_explicit(app_config):
     ]
     assert app_config.integrations.webhooks_enabled is False
     assert app_config.integrations.composio_enabled is False
+
+
+def test_default_urls_are_validated_and_serialize_without_warnings():
+    server = ServerConfig()
+    origins = ProviderOriginsConfig()
+    expected_origins = {
+        "alpaca_trading": "https://paper-api.alpaca.markets",
+        "alpaca_data": "https://data.alpaca.markets",
+        "alpaca_stream": "wss://stream.data.alpaca.markets",
+        "anthropic": "https://api.anthropic.com",
+        "gemini": "https://generativelanguage.googleapis.com",
+        "groq": "https://api.groq.com",
+        "telegram": "https://api.telegram.org",
+        "marketstack": "https://api.marketstack.com",
+        "coingecko": "https://api.coingecko.com",
+    }
+
+    assert isinstance(server.origin, AnyUrl)
+    assert all(
+        isinstance(getattr(origins, name), AnyUrl) for name in expected_origins
+    )
+    assert str(server.origin) == "https://localhost:8020"
+    assert {
+        name: str(getattr(origins, name)) for name in expected_origins
+    } == expected_origins
+    assert server.model_dump(mode="json", warnings="error")["origin"] == (
+        "https://localhost:8020"
+    )
+    assert origins.model_dump(mode="json", warnings="error") == expected_origins
+
+
+def test_committed_provider_origins_match_approved_urls(app_config):
+    origins = app_config.provider_origins
+
+    assert str(origins.alpaca_trading) == "https://paper-api.alpaca.markets"
+    assert str(origins.alpaca_data) == "https://data.alpaca.markets"
+    assert str(origins.alpaca_stream) == "wss://stream.data.alpaca.markets"
+    assert str(origins.anthropic) == "https://api.anthropic.com"
+    assert str(origins.gemini) == "https://generativelanguage.googleapis.com"
+    assert str(origins.groq) == "https://api.groq.com"
+    assert str(origins.telegram) == "https://api.telegram.org"
+    assert str(origins.marketstack) == "https://api.marketstack.com"
+    assert str(origins.coingecko) == "https://api.coingecko.com"
 
 
 def test_runtime_secrets_never_include_bind_or_provider_urls():

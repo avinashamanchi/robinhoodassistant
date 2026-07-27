@@ -15,6 +15,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterator
 
+from pydantic import SecretStr
+
 # Patterns for secrets that must never appear in logs.
 _PATTERNS = [
     re.compile(r"sk-ant-[A-Za-z0-9\-_]{6,}"),          # Anthropic keys
@@ -61,7 +63,11 @@ _SECRET_ATTRS = (
 def register_all_secrets(secrets) -> None:
     """Register every known secret value before providers are constructed."""
     for attr in _SECRET_ATTRS:
-        register_secret(str(getattr(secrets, attr, "") or ""))
+        value = getattr(secrets, attr, "")
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        if isinstance(value, str) and value:
+            register_secret(value)
 
 
 def redact(message: str) -> str:

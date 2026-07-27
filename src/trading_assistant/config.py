@@ -39,7 +39,11 @@ LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
 class _Strict(BaseModel):
     """Base for all YAML config models: unknown keys are a hard error (A8)."""
 
-    model_config = ConfigDict(extra="forbid", url_preserve_empty_path=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        url_preserve_empty_path=True,
+        validate_default=True,
+    )
 
 
 class ServerConfig(_Strict):
