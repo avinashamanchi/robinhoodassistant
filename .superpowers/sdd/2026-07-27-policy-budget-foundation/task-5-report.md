@@ -211,3 +211,163 @@ Tests:
 ## Concerns
 
 None.
+
+## Fix round 1
+
+### Status
+
+Completed the focused corrections from `task-5-review-1.md`. This section
+supersedes the original report's statements that validation used `analysis`
+and that standalone Analyst/backtest calls could generate request IDs.
+
+### Corrections
+
+- Removed Analyst's `uuid4()` fallback. Omitted, `None`, blank, and
+  whitespace-only request IDs now fail before either Analyst method invokes
+  its backend. A supplied ID is normalized once and reused unchanged across
+  every configured structured retry.
+- Added a required, validated `run_id` to `AnalystStrategy`,
+  `run_llm_backtest()`, and `analyst_accuracy()`.
+- Each triggered, uncached decision now uses
+  `backtest:{run_id}:{symbol}:{timestamp}` when it fits the durable
+  64-character request-ID field. Longer material is represented by a stable
+  `backtest:`-prefixed SHA-256 form capped at 64 characters.
+- Cache hits make no additional provider attempt. Full-model spot checks reuse
+  the exact parent decision request ID. Replaying the same run ID, symbol, and
+  timestamp reproduces the same request ID.
+- `validate_analyst._build_analyst()` now selects `category="backtest"` with
+  the exact supplied `ProviderBudgetService`.
+- Validation's default-off path returns the factory's disabled no-delegate
+  backend before estimator or raw SDK construction. Explicit enablement
+  constructs one raw delegate and wraps it in exactly one
+  `BudgetedLLMBackend`.
+- Validation derives a deterministic, bounded `validation:` run ID from the
+  sorted symbols, holdout window, analyst version, and LLM run configuration,
+  and passes it to `analyst_accuracy()`.
+
+### Caller inventory
+
+- HTTP planning and daemon shadow paths retain their existing caller-supplied
+  request identities through `PlanningService`.
+- `AnalystStrategy` is the sole production adapter that directly invokes
+  `Analyst.analyze()` for backtests; it now supplies the deterministic decision
+  ID to both the selected analyst and optional spot-check analyst.
+- `run_llm_backtest()` requires and forwards an explicit run ID.
+- `analyst_accuracy()` requires a run ID before replay and forwards it to every
+  per-symbol strategy.
+- `validate_analyst.run()` is the sole production `analyst_accuracy()` caller;
+  it supplies the deterministic validation run ID.
+- `validate_analyst._build_analyst()` remains the sole validation factory
+  caller and now uses the shared budget with category `backtest`.
+- All affected test callers were migrated to explicit request or run IDs;
+  the missing-ID cases are intentional zero-call regression tests.
+
+### Strict TDD evidence
+
+Initial provenance/composition RED:
+
+```bash
+uv run pytest -q \
+  tests/test_analyst.py::test_analyst_rejects_missing_request_id_before_backend \
+  tests/test_llm_runner.py::test_strategy_reuses_deterministic_request_id_across_cache_and_replay \
+  tests/test_llm_runner.py::test_strategy_bounds_request_id_and_rejects_blank_run_before_replay \
+  tests/test_bootstrap.py::test_validation_analyst_default_off_uses_disabled_backtest_without_construction \
+  tests/test_bootstrap.py::test_validation_analyst_enabled_wraps_backtest_exactly_once
+```
+
+Result:
+
+```text
+8 failed, 6 passed, 1 warning
+```
+
+The failures showed omitted/`None` IDs reaching Analyst's backend, no replay
+`run_id` contract, validation constructing an analysis delegate while
+backtests were disabled, and the enabled validator wrapper carrying the wrong
+category.
+
+Entry-point/validator identity RED:
+
+```bash
+uv run pytest -q \
+  tests/test_llm_runner.py::test_run_llm_backtest_rejects_blank_run_id_before_replay \
+  tests/test_launch_features.py::test_accuracy_rejects_blank_run_id_before_replay \
+  tests/test_bootstrap.py::test_validation_run_passes_deterministic_bounded_identity
+```
+
+Result:
+
+```text
+3 failed, 1 warning
+```
+
+The two replay APIs rejected the new keyword as unsupported, and validation
+called `analyst_accuracy()` without a run ID.
+
+### GREEN verification
+
+Focused affected suite:
+
+```bash
+uv run pytest -q \
+  tests/test_analyst.py tests/test_analyst_v2.py tests/test_news.py \
+  tests/test_llm_runner.py tests/test_launch_features.py \
+  tests/test_bootstrap.py tests/test_factory.py tests/test_llm_budget.py
+```
+
+Result:
+
+```text
+127 passed, 1 warning
+```
+
+Final full suite, run once after focused GREEN and self-review:
+
+```bash
+uv run pytest -q
+```
+
+Result:
+
+```text
+1823 passed, 1 skipped, 1 warning
+```
+
+The warning remains the pre-existing `websockets.legacy` deprecation warning.
+`git diff --check` also exited `0` with no output.
+
+### Changed files
+
+Production:
+
+- `src/trading_assistant/analyst/analyst.py`
+- `src/trading_assistant/backtest/llm_runner.py`
+- `src/trading_assistant/analyst/accuracy.py`
+- `src/trading_assistant/validate_analyst.py`
+
+Tests:
+
+- `tests/test_analyst.py`
+- `tests/test_analyst_v2.py`
+- `tests/test_news.py`
+- `tests/test_llm_runner.py`
+- `tests/test_launch_features.py`
+- `tests/test_bootstrap.py`
+
+### Self-review
+
+- Mutating validator category back to `analysis`, constructing a disabled raw
+  delegate, wrapping an enabled delegate twice, dropping run validation,
+  changing replay IDs, duplicating cache calls, or changing the spot-check ID
+  is covered by the focused regressions.
+- All production `build_llm_backend()` callers still require the shared
+  provider budget and an exact allowlisted category.
+- The fix does not alter HTTP/planning/shadow identity generation, provider
+  denial ordering, configured structured-attempt ceilings, or any Task 6/9
+  behavior.
+- No production app/daemon process, broker/provider/LLM call, notification,
+  breaker reset, or order action was performed.
+
+### Concerns
+
+None.

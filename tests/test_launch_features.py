@@ -620,12 +620,30 @@ def _analyst(action="buy", conf=0.8):
 
 def test_accuracy_report_shape(make_service):
     source = DataSource({"AAPL": make_bars(300, seed=1), "SPY": make_bars(300, seed=2)})
-    rep = analyst_accuracy(source, ["AAPL"], _analyst(), LLMRunConfig(max_llm_calls=100), spy_symbol="SPY")
+    rep = analyst_accuracy(
+        source,
+        ["AAPL"],
+        _analyst(),
+        LLMRunConfig(max_llm_calls=100),
+        run_id="accuracy-shape",
+        spy_symbol="SPY",
+    )
     assert set(rep) >= {"hit_rate", "brier", "calibration", "per_regime",
                         "analyst_avg_return_pct", "buy_hold_avg_return_pct", "shows_edge", "verdict"}
     assert rep["graded_calls"] >= 1
     # A single always-buy 0.8-confidence analyst can't clear the >=50-call edge bar.
     assert rep["shows_edge"] is False
+
+
+def test_accuracy_rejects_blank_run_id_before_replay():
+    with pytest.raises(ValueError, match="run_id"):
+        analyst_accuracy(
+            None,
+            [],
+            None,
+            LLMRunConfig(),
+            run_id=" ",
+        )
 
 
 # ── daemon daily tasks (D1/D2 wiring) ───────────────────────────

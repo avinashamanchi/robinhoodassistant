@@ -810,12 +810,14 @@ def test_daemon_shadow_uses_shared_analysis_budget_and_attempt_ceiling(
     assert monitor.provider_budget is container.provider_budget
 
 
-def test_validation_analyst_uses_analysis_budget_and_attempt_ceiling(
+def test_validation_analyst_default_off_uses_disabled_backtest_without_construction(
     app_config,
     session_factory,
     monkeypatch,
 ):
     import trading_assistant.validate_analyst as validation
+    from trading_assistant.llm import factory
+    from trading_assistant.llm.budget import ProviderBudgetExceeded
 
     secrets = Secrets(app_api_token="validation-budget-secret")
     provider_budget = ProviderBudgetService(
@@ -827,14 +829,17 @@ def test_validation_analyst_uses_analysis_budget_and_attempt_ceiling(
         ),
         prices=app_config.security.provider_budget.prices,
     )
-    backend = object()
-    seen = []
+    estimator_calls = []
+    raw_calls = []
     monkeypatch.setattr(
-        validation,
-        "build_llm_backend",
-        lambda cfg, supplied, *, provider_budget, category: seen.append(
-            (cfg, supplied, provider_budget, category)
-        ) or backend,
+        factory,
+        "resolve_input_estimator",
+        lambda provider: estimator_calls.append(provider) or object(),
+    )
+    monkeypatch.setattr(
+        factory,
+        "_make_backend",
+        lambda provider, *_args: raw_calls.append(provider) or object(),
     )
 
     analyst = validation._build_analyst(
@@ -843,18 +848,140 @@ def test_validation_analyst_uses_analysis_budget_and_attempt_ceiling(
         provider_budget,
     )
 
-    assert analyst.backend is backend
     assert analyst.max_attempts == (
         app_config.security.provider_budget.max_structured_attempts
     )
-    assert seen == [
-        (
-            app_config,
-            secrets,
-            provider_budget,
-            "analysis",
+    assert not hasattr(analyst.backend, "delegate")
+    with pytest.raises(ProviderBudgetExceeded, match="disabled"):
+        analyst.backend.create(
+            system="system",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            request_id="validation-disabled",
         )
+    assert estimator_calls == []
+    assert raw_calls == []
+
+
+def test_validation_analyst_enabled_wraps_backtest_exactly_once(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    import trading_assistant.validate_analyst as validation
+    from trading_assistant.llm import factory
+    from trading_assistant.llm.base import BudgetedLLMBackend
+
+    configured = app_config.security.provider_budget
+    enabled_budget_config = configured.model_copy(
+        update={"backtest_llm_enabled": True}
+    )
+    enabled_config = app_config.model_copy(
+        update={
+            "security": app_config.security.model_copy(
+                update={"provider_budget": enabled_budget_config}
+            )
+        }
+    )
+    provider_budget = ProviderBudgetService(
+        session_factory,
+        BudgetLimits(
+            calls=configured.daily_calls,
+            input_tokens=configured.daily_input_tokens,
+            output_tokens=configured.daily_output_tokens,
+        ),
+        prices=configured.prices,
+    )
+    raw_backend = object()
+    raw_calls = []
+    monkeypatch.setattr(
+        factory,
+        "_make_backend",
+        lambda provider, *_args: raw_calls.append(provider) or raw_backend,
+    )
+
+    analyst = validation._build_analyst(
+        enabled_config,
+        Secrets(app_api_token="validation-budget-secret"),
+        provider_budget,
+    )
+
+    assert isinstance(analyst.backend, BudgetedLLMBackend)
+    assert analyst.backend.delegate is raw_backend
+    assert analyst.backend.budgets is provider_budget
+    assert analyst.backend.category == "backtest"
+    assert raw_calls == [enabled_config.llm.provider]
+
+
+def test_validation_run_passes_deterministic_bounded_identity(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+
+    from trading_assistant import bootstrap
+    import trading_assistant.validate_analyst as validation
+
+    timeline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
     ]
+
+    class StubSource:
+        def timeline(self, _symbols):
+            return timeline
+
+    class StubGuard:
+        def __init__(self, _timeline, *, holdout_months):
+            assert holdout_months == 12
+
+        def split(self, _timeline):
+            return [], timeline
+
+    secrets = Secrets(app_api_token="validation-run-secret")
+    runtime = SimpleNamespace(session_factory=session_factory)
+    provider_budget = object()
+    analyst = object()
+    captured_run_ids = []
+    monkeypatch.setattr(validation, "load_config", lambda _path: app_config)
+    monkeypatch.setattr(validation, "Secrets", lambda: secrets)
+    monkeypatch.setattr(validation, "load_parquet", lambda _path: object())
+    monkeypatch.setattr(validation, "DataSource", lambda _frames: StubSource())
+    monkeypatch.setattr(validation, "HoldoutGuard", StubGuard)
+    monkeypatch.setattr(
+        validation,
+        "estimate_llm_calls",
+        lambda *_args, **_kwargs: {"estimated_calls": 0},
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "prepare_database_runtime",
+        lambda *_args, **_kwargs: runtime,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_provider_budget_service",
+        lambda *_args, **_kwargs: provider_budget,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_build_analyst",
+        lambda *_args, **_kwargs: analyst,
+    )
+
+    def accuracy(*_args, **kwargs):
+        captured_run_ids.append(kwargs["run_id"])
+        return {"verdict": "validation complete"}
+
+    monkeypatch.setattr(validation, "analyst_accuracy", accuracy)
+
+    assert validation.run(["--symbols", "AAPL", "--yes"]) == 0
+    assert validation.run(["--symbols", "AAPL", "--yes"]) == 0
+    assert len(captured_run_ids) == 2
+    assert captured_run_ids[0] == captured_run_ids[1]
+    assert captured_run_ids[0].startswith("validation:")
+    assert len(captured_run_ids[0]) <= 64
 
 
 @pytest.mark.parametrize(

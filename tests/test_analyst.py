@@ -52,7 +52,10 @@ _VALID = {
 
 def test_analyst_returns_structured_report():
     analyst = Analyst(_backend(_VALID), max_attempts=2)
-    report = analyst.analyze(_feat(rsi_14=28))
+    report = analyst.analyze(
+        _feat(rsi_14=28),
+        request_id="analyst-structured-report",
+    )
     assert report.action is AnalystAction.BUY
     assert report.symbol == "AAPL"
     assert report.cited_concepts and report.regime_note
@@ -61,7 +64,10 @@ def test_analyst_returns_structured_report():
 def test_missing_cited_concepts_rejected():
     bad = dict(_VALID, cited_concepts=[])
     with pytest.raises(ValidationError):
-        Analyst(_backend(bad), max_attempts=2).analyze(_feat())
+        Analyst(_backend(bad), max_attempts=2).analyze(
+            _feat(),
+            request_id="analyst-missing-citations",
+        )
 
 
 def test_earnings_in_horizon_must_be_addressed():
@@ -70,7 +76,10 @@ def test_earnings_in_horizon_must_be_addressed():
         max_attempts=2,
     )  # _VALID has no earnings_note
     with pytest.raises(ValueError):
-        analyst.analyze(_feat(days_to_next_earnings=5))
+        analyst.analyze(
+            _feat(days_to_next_earnings=5),
+            request_id="analyst-earnings-guard",
+        )
 
 
 def test_earnings_addressed_passes():
@@ -78,7 +87,10 @@ def test_earnings_addressed_passes():
     report = Analyst(
         _backend(inp),
         max_attempts=2,
-    ).analyze(_feat(days_to_next_earnings=5))
+    ).analyze(
+        _feat(days_to_next_earnings=5),
+        request_id="analyst-earnings-addressed",
+    )
     assert report.earnings_note is not None
 
 
@@ -96,7 +108,10 @@ def test_no_tool_call_raises():
             return SimpleNamespace(content=[SimpleNamespace(type="text", text="no")])
 
     with pytest.raises(ValueError):
-        Analyst(B(), max_attempts=2).analyze(_feat())
+        Analyst(B(), max_attempts=2).analyze(
+            _feat(),
+            request_id="analyst-no-tool-call",
+        )
 
 
 @pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
@@ -116,7 +131,10 @@ def test_analyst_types_backend_outage_without_exposing_provider_text(method):
             raise RuntimeError(marker)
 
     with pytest.raises(RequiredDependencyUnavailable) as failure:
-        getattr(Analyst(B(), max_attempts=2), method)(_feat())
+        getattr(Analyst(B(), max_attempts=2), method)(
+            _feat(),
+            request_id=f"analyst-outage-{method}",
+        )
 
     assert marker not in str(failure.value)
 
@@ -150,3 +168,46 @@ def test_analyst_uses_one_configured_structured_attempt_and_request_id():
         )
 
     assert backend.request_ids == ["configured-structured-attempt"]
+
+
+_MISSING_REQUEST_ID = object()
+
+
+@pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
+@pytest.mark.parametrize(
+    "request_id",
+    [_MISSING_REQUEST_ID, None, "", " ", "\t"],
+    ids=["missing", "none", "empty", "space", "tab"],
+)
+def test_analyst_rejects_missing_request_id_before_backend(
+    method,
+    request_id,
+):
+    class CountingBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
+            self.calls += 1
+            return SimpleNamespace(content=[])
+
+    backend = CountingBackend()
+    analyst = Analyst(backend, max_attempts=2)
+    kwargs = (
+        {}
+        if request_id is _MISSING_REQUEST_ID
+        else {"request_id": request_id}
+    )
+
+    with pytest.raises(ValueError, match="request_id"):
+        getattr(analyst, method)(_feat(), **kwargs)
+
+    assert backend.calls == 0

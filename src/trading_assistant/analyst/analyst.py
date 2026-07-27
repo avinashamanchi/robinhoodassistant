@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
-from uuid import uuid4
 
 from ..dependencies import RequiredDependencyUnavailable
 from ..signals.models import MarketFeatures
@@ -169,8 +168,6 @@ class Analyst:
 
     @staticmethod
     def _request_id(request_id: str | None) -> str:
-        if request_id is None:
-            return uuid4().hex
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("analyst request_id must be non-empty")
         return request_id.strip()

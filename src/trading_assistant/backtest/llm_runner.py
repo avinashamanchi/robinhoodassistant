@@ -39,6 +39,9 @@ class BudgetExceeded(Exception):
     """Raised when a run exceeds its max_llm_calls budget — aborts the run."""
 
 
+_MAX_REQUEST_ID_LENGTH = 64
+
+
 @dataclass
 class LLMRunConfig:
     trigger_events: Optional[set[EventType]] = None  # None => any event triggers
@@ -72,6 +75,23 @@ def _features_hash(features: MarketFeatures) -> str:
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
 
 
+def _require_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id must be non-empty")
+    return run_id.strip()
+
+
+def _decision_request_id(run_id: str, features: MarketFeatures) -> str:
+    material = (
+        f"backtest:{run_id}:{features.symbol.upper()}:"
+        f"{features.as_of.isoformat()}"
+    )
+    if len(material) <= _MAX_REQUEST_ID_LENGTH:
+        return material
+    digest = hashlib.sha256(material.encode()).hexdigest()
+    return f"backtest:{digest[:55]}"
+
+
 class ResponseCache:
     def __init__(self) -> None:
         self._store: dict[str, AnalysisReport] = {}
@@ -94,10 +114,13 @@ class AnalystStrategy(Strategy):
         config: LLMRunConfig,
         cache: Optional[ResponseCache] = None,
         full_analyst: Optional[Analyst] = None,
+        *,
+        run_id: str,
     ) -> None:
         self.analyst = analyst
         self.full_analyst = full_analyst
         self.config = config
+        self.run_id = _require_run_id(run_id)
         self.cache = cache or ResponseCache()
         self.calls = 0
         self.spot_checks = 0
@@ -119,16 +142,25 @@ class AnalystStrategy(Strategy):
         # Count the ATTEMPT against the budget before making it — a failed call
         # still hits the provider, so the cap must be fail-closed (security).
         self.calls += 1
+        request_id = _decision_request_id(self.run_id, features)
         try:
-            report = self.analyst.analyze(features)
+            report = self.analyst.analyze(
+                features,
+                request_id=request_id,
+            )
         except Exception:  # a malformed LLM response must not abort the whole run
             return hold("analyst error; skipped")
         self.cache.put(features, report)
         self.reports.append((features, report))
-        self._maybe_spot_check(features, report)
+        self._maybe_spot_check(features, report, request_id)
         return self._to_signal(report)
 
-    def _maybe_spot_check(self, features: MarketFeatures, cheap: AnalysisReport) -> None:
+    def _maybe_spot_check(
+        self,
+        features: MarketFeatures,
+        cheap: AnalysisReport,
+        request_id: str,
+    ) -> None:
         if (
             self.full_analyst is None
             or self.config.spot_check_every <= 0
@@ -136,7 +168,10 @@ class AnalystStrategy(Strategy):
         ):
             return
         self.spot_checks += 1
-        full = self.full_analyst.analyze(features)
+        full = self.full_analyst.analyze(
+            features,
+            request_id=request_id,
+        )
         if full.action is not cheap.action:
             self.spot_check_disagreements += 1
 
@@ -237,6 +272,7 @@ def run_llm_backtest(
     source: DataSource,
     symbol: str,
     *,
+    run_id: str,
     run_config: LLMRunConfig,
     backtest_config: Optional[BacktestConfig] = None,
     spy_symbol: Optional[str] = None,
@@ -244,7 +280,12 @@ def run_llm_backtest(
     end: Optional[datetime] = None,
     full_analyst: Optional[Analyst] = None,
 ) -> LLMBacktestResult:
-    strategy = AnalystStrategy(analyst, run_config, full_analyst=full_analyst)
+    strategy = AnalystStrategy(
+        analyst,
+        run_config,
+        full_analyst=full_analyst,
+        run_id=run_id,
+    )
     engine_result = run_backtest(
         strategy,
         source,

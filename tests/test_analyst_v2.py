@@ -65,7 +65,10 @@ def test_report_forced_hold_in_ranging():
         suppress_ranging=True,
         max_attempts=2,
     )
-    assert a.analyze(_feat(Regime.RANGING)).action is AnalystAction.HOLD
+    assert a.analyze(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-ranging-hold",
+    ).action is AnalystAction.HOLD
 
 
 def test_report_untouched_outside_ranging():
@@ -74,7 +77,10 @@ def test_report_untouched_outside_ranging():
         suppress_ranging=True,
         max_attempts=2,
     )
-    assert a.analyze(_feat(Regime.TRENDING_UP)).action is AnalystAction.BUY
+    assert a.analyze(
+        _feat(Regime.TRENDING_UP),
+        request_id="analyst-v2-trending-buy",
+    ).action is AnalystAction.BUY
 
 
 def test_plan_forced_no_trade_in_ranging():
@@ -83,7 +89,10 @@ def test_plan_forced_no_trade_in_ranging():
         suppress_ranging=True,
         max_attempts=2,
     )
-    assert a.analyze_plan(_feat(Regime.RANGING)).action is PlanAction.NO_TRADE
+    assert a.analyze_plan(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-ranging-plan",
+    ).action is PlanAction.NO_TRADE
 
 
 def test_suppression_off_leaves_buy():
@@ -92,7 +101,10 @@ def test_suppression_off_leaves_buy():
         suppress_ranging=False,
         max_attempts=2,
     )
-    assert a.analyze(_feat(Regime.RANGING)).action is AnalystAction.BUY
+    assert a.analyze(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-suppression-off",
+    ).action is AnalystAction.BUY
 
 
 def test_plan_validation_failure_gets_one_bounded_repair_attempt():
@@ -171,7 +183,10 @@ def test_plan_repair_is_capped_at_one_retry():
         Analyst(
             backend,
             max_attempts=2,
-        ).analyze_plan(_feat(Regime.TRENDING_UP))
+        ).analyze_plan(
+            _feat(Regime.TRENDING_UP),
+            request_id="analyst-v2-repair-cap",
+        )
     assert backend.calls == 2
 
 

@@ -12,6 +12,7 @@ from trading_assistant.analyst.models import AnalysisReport, AnalystAction
 from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.llm_runner import (
+    AnalystStrategy,
     BudgetExceeded,
     LLMRunConfig,
     ResponseCache,
@@ -19,7 +20,12 @@ from trading_assistant.backtest.llm_runner import (
     run_llm_backtest,
 )
 from trading_assistant.backtest.synthetic import make_bars
-from trading_assistant.signals.models import MarketFeatures, Regime
+from trading_assistant.signals.models import (
+    EventTag,
+    EventType,
+    MarketFeatures,
+    Regime,
+)
 
 TS = datetime(2016, 6, 1, tzinfo=timezone.utc)
 
@@ -54,7 +60,13 @@ def test_trigger_mode_limits_calls():
     cfg = LLMRunConfig()
     est = estimate_llm_calls(source, "AAPL", cfg)
     assert est["estimated_calls"] >= 1
-    res = run_llm_backtest(_analyst("buy"), source, "AAPL", run_config=cfg)
+    res = run_llm_backtest(
+        _analyst("buy"),
+        source,
+        "AAPL",
+        run_id="trigger-mode",
+        run_config=cfg,
+    )
     assert res.llm_calls == est["estimated_calls"]     # estimate matches the run
     assert res.llm_calls < 300                         # far fewer than one/bar
 
@@ -66,13 +78,23 @@ def test_budget_aborts_run():
         pytest.skip("not enough triggers to exceed a budget of 1")
     with pytest.raises(BudgetExceeded):
         run_llm_backtest(
-            _analyst(), source, "AAPL", run_config=LLMRunConfig(max_llm_calls=1)
+            _analyst(),
+            source,
+            "AAPL",
+            run_id="budget-abort",
+            run_config=LLMRunConfig(max_llm_calls=1),
         )
 
 
 def test_grading_feeds_scorecard():
     source = DataSource({"AAPL": make_bars(300, seed=7)})
-    res = run_llm_backtest(_analyst("buy"), source, "AAPL", run_config=LLMRunConfig())
+    res = run_llm_backtest(
+        _analyst("buy"),
+        source,
+        "AAPL",
+        run_id="grading-scorecard",
+        run_config=LLMRunConfig(),
+    )
     assert res.scorecard.n_calls >= 1
     assert res.graded_calls == res.scorecard.n_calls
 
@@ -96,7 +118,12 @@ def test_spot_check_records_disagreement():
     source = DataSource({"AAPL": make_bars(250, seed=3)})
     cfg = LLMRunConfig(spot_check_every=1)
     res = run_llm_backtest(
-        _analyst("buy"), source, "AAPL", run_config=cfg, full_analyst=_analyst("sell")
+        _analyst("buy"),
+        source,
+        "AAPL",
+        run_id="spot-check",
+        run_config=cfg,
+        full_analyst=_analyst("sell"),
     )
     if res.llm_calls >= 1:
         # cheap says buy, full says sell on every checked call -> all disagree.
@@ -107,3 +134,116 @@ def test_estimate_flags_over_budget():
     source = DataSource({"AAPL": make_bars(200, seed=3)})
     est = estimate_llm_calls(source, "AAPL", LLMRunConfig(max_llm_calls=0))
     assert est["within_budget"] is (est["estimated_calls"] == 0)
+
+
+def test_strategy_reuses_deterministic_request_id_across_cache_and_replay():
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.BUY,
+        confidence=0.6,
+        thesis="thesis",
+        cited_concepts=["Trend"],
+        regime_note="regime note",
+    )
+
+    class RecordingAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze(self, features, *, request_id):
+            self.request_ids.append(request_id)
+            return report
+
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        last_close=100.0,
+        regime=Regime.TRENDING_UP,
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+    cheap = RecordingAnalyst()
+    full = RecordingAnalyst()
+    first = AnalystStrategy(
+        cheap,
+        LLMRunConfig(spot_check_every=1),
+        run_id="holdout-2022",
+        full_analyst=full,
+    )
+
+    first.on_bar(features)
+    first.on_bar(features)
+
+    expected = "backtest:holdout-2022:AAPL:2016-06-01T00:00:00+00:00"
+    assert cheap.request_ids == [expected]
+    assert full.request_ids == [expected]
+
+    replay = RecordingAnalyst()
+    AnalystStrategy(
+        replay,
+        LLMRunConfig(),
+        run_id="holdout-2022",
+    ).on_bar(features)
+    assert replay.request_ids == [expected]
+
+
+def test_strategy_bounds_request_id_and_rejects_blank_run_before_replay():
+    class RecordingAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze(self, features, *, request_id):
+            self.request_ids.append(request_id)
+            return AnalysisReport(
+                symbol=features.symbol,
+                as_of=features.as_of,
+                action=AnalystAction.HOLD,
+                confidence=0.5,
+                thesis="hold",
+                cited_concepts=["Trend"],
+                regime_note="range",
+            )
+
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+    analyst = RecordingAnalyst()
+    strategy = AnalystStrategy(
+        analyst,
+        LLMRunConfig(),
+        run_id="r" * 500,
+    )
+    strategy.on_bar(features)
+
+    assert len(analyst.request_ids) == 1
+    assert analyst.request_ids[0].startswith("backtest:")
+    assert len(analyst.request_ids[0]) <= 64
+
+    with pytest.raises(ValueError, match="run_id"):
+        AnalystStrategy(analyst, LLMRunConfig(), run_id=" ")
+
+
+def test_run_llm_backtest_rejects_blank_run_id_before_replay(monkeypatch):
+    import trading_assistant.backtest.llm_runner as llm_runner
+
+    replay_calls = []
+    monkeypatch.setattr(
+        llm_runner,
+        "run_backtest",
+        lambda *_args, **_kwargs: replay_calls.append("replayed"),
+    )
+
+    with pytest.raises(ValueError, match="run_id"):
+        run_llm_backtest(
+            _analyst(),
+            object(),
+            "AAPL",
+            run_id=" ",
+            run_config=LLMRunConfig(),
+        )
+
+    assert replay_calls == []
