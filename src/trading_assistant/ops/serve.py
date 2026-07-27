@@ -8,6 +8,7 @@ checks have passed.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 import uvicorn
@@ -19,6 +20,7 @@ from ..db.session import create_db_engine
 from ..preflight import StructuralCheck, structural_runtime_check
 from ..security.secrets import RuntimeSecrets, load_role_secrets
 from ..security.transport import TransportPolicy
+from .control import start_app_control
 from .tls import TLSMaterialError, validate_tls_material
 
 
@@ -118,17 +120,21 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("ops.serve accepts no arguments")
     config = load_config()
     run_startup_guard(config=config)
-    uvicorn.run(
-        "trading_assistant.app.main:create_app",
-        factory=True,
-        host=config.server.bind_host,
-        port=config.server.port,
-        ssl_certfile=str(config.server.tls_cert_path),
-        ssl_keyfile=str(config.server.tls_key_path),
-        proxy_headers=False,
-        forwarded_allow_ips="",
-        access_log=False,
-    )
+    control = start_app_control(Path.cwd())
+    try:
+        uvicorn.run(
+            "trading_assistant.app.main:create_app",
+            factory=True,
+            host=config.server.bind_host,
+            port=config.server.port,
+            ssl_certfile=str(config.server.tls_cert_path),
+            ssl_keyfile=str(config.server.tls_key_path),
+            proxy_headers=False,
+            forwarded_allow_ips="",
+            access_log=False,
+        )
+    finally:
+        control.close()
     return 0
 
 

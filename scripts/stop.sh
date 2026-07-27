@@ -7,20 +7,19 @@ cd "$(dirname "$0")/.."
 PROJECT="$(pwd -P)"
 PY="$PROJECT/.venv/bin/python"
 PID_FILE="$PROJECT/logs/app.pid"
-
-# shellcheck source=lib/app-process-identity.sh
-source "$PROJECT/scripts/lib/app-process-identity.sh"
-configure_process_identity "$PROJECT" "$PY" "$PID_FILE"
+EXPECTED_ARGV="$PY -m trading_assistant.ops.serve"
 
 if [[ ! -e "$PID_FILE" && ! -L "$PID_FILE" ]]; then
-  echo "app is not running (no managed PID file)"
+  echo "app is not running (no cooperative control metadata)"
   exit 0
 fi
 
-if ! signal_managed_process TERM; then
-  echo "refusing to signal unmanaged PID from $PID_FILE" >&2
+if ! "$PY" -m trading_assistant.ops.control stop \
+  --project "$PROJECT" \
+  --pid-file "$PID_FILE" \
+  --expected-argv "$EXPECTED_ARGV"; then
+  echo "refusing cooperative stop for stale or unmanaged metadata" >&2
   exit 1
 fi
 
-rm -f "$PID_FILE"
-echo "app stop requested (pid $PROCESS_METADATA_PID)"
+echo "app cooperative stop requested"

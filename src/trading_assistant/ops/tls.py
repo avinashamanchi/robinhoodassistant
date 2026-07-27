@@ -31,7 +31,24 @@ class TLSMaterialStatus:
 
 
 def _tls_directory() -> Path:
-    return (Path.cwd() / ".local" / "tls").resolve()
+    """Return the fixed repository TLS root without resolving attacker input."""
+    repository = Path.cwd().resolve()
+    local_root = repository / ".local"
+    tls_root = local_root / "tls"
+    if local_root.is_symlink() or tls_root.is_symlink():
+        raise TLSMaterialError("tls_root_symlink_forbidden")
+    try:
+        canonical_local = local_root.resolve(strict=True)
+        canonical_tls = tls_root.resolve(strict=True)
+    except OSError:
+        raise TLSMaterialError("tls_directory_permissions_invalid") from None
+    if (
+        canonical_local != local_root
+        or canonical_tls != tls_root
+        or not canonical_tls.is_dir()
+    ):
+        raise TLSMaterialError("tls_root_symlink_forbidden")
+    return canonical_tls
 
 
 def _contained(path: Path, root: Path) -> Path:
@@ -52,7 +69,7 @@ def validate_tls_material(server) -> TLSMaterialStatus:
     root = _tls_directory()
     certificate_path = _contained(Path(server.tls_cert_path), root)
     private_key_path = _contained(Path(server.tls_key_path), root)
-    if not root.is_dir() or _mode(root) != 0o700:
+    if _mode(root) != 0o700:
         raise TLSMaterialError("tls_directory_permissions_invalid")
     if not certificate_path.is_file() or _mode(certificate_path) != 0o644:
         raise TLSMaterialError("tls_certificate_permissions_invalid")

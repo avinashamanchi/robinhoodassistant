@@ -16,7 +16,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
-from trading_assistant.db.models import AuditEvent, AuthSession, RateWindow
+from trading_assistant.db.models import (
+    AuditEvent,
+    AuthSession,
+    ConcurrencyLease,
+    MutationInterlock,
+    RateWindow,
+)
 from trading_assistant.security.transport import (
     TransportBoundaryMiddleware,
     TransportPolicy,
@@ -59,13 +65,189 @@ class _CountingSessionFactory:
         return self._factory()
 
 
-def _durable_perimeter_state(service) -> tuple[int, int, int]:
-    with service.session_factory() as session:
+def _durable_perimeter_state(
+    service,
+    *,
+    session_factory=None,
+) -> tuple[int, int, int, int, int]:
+    with (session_factory or service.session_factory)() as session:
         return (
             session.query(AuthSession).count(),
             session.query(RateWindow).count(),
             session.query(AuditEvent).count(),
+            session.query(ConcurrencyLease).count(),
+            session.query(MutationInterlock).count(),
         )
+
+
+class _FailFastInnerLayer:
+    """A denied perimeter request must never reach this fake dependency."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls = 0
+
+    def _touched(self, *_args, **_kwargs):
+        self.calls += 1
+        raise AssertionError(f"{self.name} must not run for transport denial")
+
+    def __getattr__(self, _name):
+        return self._touched
+
+
+@pytest.mark.parametrize(
+    ("base_url", "headers", "body_factory", "expected_status"),
+    [
+        (
+            "https://localhost:8020",
+            {"Host": "evil.example"},
+            lambda: b'{"message":"denied"}',
+            400,
+        ),
+        (
+            "https://localhost:8020",
+            {"Origin": "https://evil.example"},
+            lambda: b'{"message":"denied"}',
+            403,
+        ),
+        (
+            "https://localhost:8020",
+            {"Forwarded": "for=198.51.100.7;proto=https"},
+            lambda: b'{"message":"denied"}',
+            400,
+        ),
+        (
+            "https://localhost:8020",
+            {"X-Forwarded-For": "198.51.100.7"},
+            lambda: b'{"message":"denied"}',
+            400,
+        ),
+        (
+            "http://localhost:8020",
+            {},
+            lambda: b'{"message":"denied"}',
+            426,
+        ),
+        (
+            "https://localhost:8020",
+            {"X-Too-Large": "x" * 65_536},
+            lambda: b'{"message":"denied"}',
+            431,
+        ),
+        (
+            "https://localhost:8020",
+            {f"X-Count-{index}": "x" for index in range(65)},
+            lambda: b'{"message":"denied"}',
+            431,
+        ),
+        (
+            "https://localhost:8020",
+            {"Content-Length": "65536"},
+            lambda: b'{"message":"denied"}',
+            413,
+        ),
+        (
+            "https://localhost:8020",
+            {},
+            lambda: iter((b'{"message":"', b"x" * 65_536, b'"}')),
+            413,
+        ),
+        (
+            "https://localhost:8020",
+            {"Content-Type": "text/plain"},
+            lambda: b'{"message":"denied"}',
+            415,
+        ),
+    ],
+    ids=(
+        "host",
+        "origin",
+        "forwarded",
+        "x_forwarded",
+        "http",
+        "header_size",
+        "header_count",
+        "content_length",
+        "streamed_body",
+        "content_type",
+    ),
+)
+def test_transport_denials_have_zero_inner_layer_side_effects(
+    make_service,
+    monkeypatch,
+    base_url,
+    headers,
+    body_factory,
+    expected_status,
+):
+    """Every `/chat` denial must precede auth, durable limits, domain, and loaders."""
+    service = make_service()
+    domain = _FailFastInnerLayer("domain_handler")
+    app = create_app(
+        service=service,
+        agent=domain,
+        api_token="transport-boundary-test-secret",
+        planning=None,
+    )
+    with TestClient(app, base_url="https://localhost:8020") as setup_client:
+        login = setup_client.post(
+            "/auth/login",
+            json={"secret": "transport-boundary-test-secret"},
+        )
+        assert login.status_code == 200
+        token = setup_client.cookies.get("__Host-trading_session")
+        csrf = login.json()["csrf_token"]
+
+    session_auth = _FailFastInnerLayer("session_auth")
+    rate_limiter = _FailFastInnerLayer("persistent_rate_limiter")
+    broker = _FailFastInnerLayer("broker_client")
+    secret_loader = _FailFastInnerLayer("secret_provider_loader")
+    app.state.session_auth = session_auth
+    app.state.rate_limiter = rate_limiter
+    service.broker = broker
+    monkeypatch.setattr(
+        "trading_assistant.security.secrets.load_role_secrets",
+        secret_loader._touched,
+    )
+    real_session_factory = service.session_factory
+    before = _durable_perimeter_state(
+        service,
+        session_factory=real_session_factory,
+    )
+    database_access = _CountingSessionFactory(real_session_factory)
+    service.session_factory = database_access
+    request_headers = {
+        "Cookie": f"__Host-trading_session={token}",
+        "X-CSRF-Token": csrf,
+        "Content-Type": "application/json",
+        **headers,
+    }
+
+    with TestClient(
+        app,
+        base_url=base_url,
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.post(
+            "/chat",
+            content=body_factory(),
+            headers=request_headers,
+        )
+
+    assert response.status_code == expected_status
+    assert session_auth.calls == 0
+    assert rate_limiter.calls == 0
+    assert domain.calls == 0
+    assert broker.calls == 0
+    assert secret_loader.calls == 0
+    assert database_access.calls == 0
+    assert (
+        _durable_perimeter_state(
+            service,
+            session_factory=real_session_factory,
+        )
+        == before
+    )
 
 
 @pytest.mark.parametrize(
@@ -617,6 +799,32 @@ def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
     assert exc_info.value.code == "tls_path_outside_local_directory"
 
 
+@pytest.mark.parametrize("symlinked_component", (".local", ".local/tls"))
+def test_tls_inspection_rejects_symlinked_root_components(
+    tmp_path,
+    monkeypatch,
+    symlinked_component,
+):
+    """The accepted TLS root is anchored below the canonical repository, not resolved input."""
+    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    server = _write_tls_pair(outside)
+    if symlinked_component == ".local":
+        (repository / ".local").symlink_to(outside / ".local")
+    else:
+        (repository / ".local").mkdir()
+        (repository / ".local/tls").symlink_to(outside / ".local/tls")
+    monkeypatch.chdir(repository)
+
+    with pytest.raises(TLSMaterialError) as exc_info:
+        validate_tls_material(server)
+
+    assert exc_info.value.code == "tls_root_symlink_forbidden"
+
+
 @pytest.mark.parametrize(
     ("not_valid_before", "not_valid_after"),
     [
@@ -764,8 +972,15 @@ def test_strict_launcher_uses_only_loopback_tls_and_disables_proxy_headers(
         tls_key_path=Path(".local/tls/localhost-key.pem"),
     )
     called: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    closed: list[bool] = []
+
+    class FakeControl:
+        def close(self):
+            closed.append(True)
+
     monkeypatch.setattr(serve, "load_config", lambda: SimpleNamespace(server=server))
     monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
+    monkeypatch.setattr(serve, "start_app_control", lambda _project: FakeControl())
     monkeypatch.setattr(
         serve.uvicorn,
         "run",
@@ -788,3 +1003,4 @@ def test_strict_launcher_uses_only_loopback_tls_and_disables_proxy_headers(
             },
         )
     ]
+    assert closed == [True]
