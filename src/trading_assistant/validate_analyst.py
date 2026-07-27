@@ -21,7 +21,7 @@ from .backtest.data import DataSource, cache_path, load_parquet
 from .backtest.holdout import HoldoutGuard
 from .backtest.llm_runner import LLMRunConfig, estimate_llm_calls
 from .config import Secrets, load_config
-from .llm.factory import build_llm_backend
+from .llm.factory import build_llm_backend, selected_llm_model
 
 COST_CONFIRM_USD = 5.0
 
@@ -44,6 +44,7 @@ def _build_analyst(config, secrets, provider_budget) -> Analyst:
 
 def _validation_run_id(
     *,
+    config,
     symbols,
     start,
     end,
@@ -53,12 +54,12 @@ def _validation_run_id(
     payload = json.dumps(
         {
             "analyst_version": analyst_version,
-            "cheap_model": run_config.cheap_model,
             "cost_per_call_usd": run_config.cost_per_call_usd,
             "end": end.isoformat() if end is not None else None,
-            "full_model": run_config.full_model,
             "horizon_bars": run_config.horizon_bars,
             "max_llm_calls": run_config.max_llm_calls,
+            "model": selected_llm_model(config),
+            "provider": config.llm.provider,
             "spot_check_every": run_config.spot_check_every,
             "start": start.isoformat() if start is not None else None,
             "symbols": sorted(symbol.upper() for symbol in symbols),
@@ -99,6 +100,7 @@ def run(argv=None) -> int:
 
     run_cfg = LLMRunConfig(max_llm_calls=args.max_calls, cost_per_call_usd=args.cost_per_call, horizon_bars=5)
     run_id = _validation_run_id(
+        config=config,
         symbols=symbols,
         start=start,
         end=end,

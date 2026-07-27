@@ -36,14 +36,28 @@ def resolve_input_estimator(provider: str) -> ProviderInputEstimator:
     return estimator
 
 
+def selected_llm_model(config: AppConfig) -> str:
+    provider = config.llm.provider
+    selected_models = {
+        "anthropic": config.llm.model,
+        "gemini": config.llm.gemini_model,
+        "groq": config.llm.groq_model,
+    }
+    try:
+        return selected_models[provider]
+    except KeyError:
+        raise ValueError(f"unknown LLM provider: {provider}") from None
+
+
 def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
     llm = config.llm
+    model = selected_llm_model(config)
     if provider == "anthropic":
         from .anthropic_backend import AnthropicBackend
 
         return AnthropicBackend(
             secrets.anthropic_api_key,
-            llm.model,
+            model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
         )
@@ -52,7 +66,7 @@ def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
 
         return GeminiBackend(
             secrets.gemini_api_key,
-            llm.gemini_model,
+            model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
         )
@@ -61,7 +75,7 @@ def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
 
         return GroqBackend(
             secrets.groq_api_key,
-            llm.groq_model,
+            model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
         )

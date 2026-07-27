@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import base64
+import hashlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -105,13 +107,14 @@ def test_response_cache():
         symbol="AAPL", asset_class=AssetClass.EQUITY, as_of=TS,
         last_close=100.0, rsi_14=45.0, regime=Regime.RANGING,
     )
-    assert cache.get(feat) is None
+    assert cache.get("backtest:decision-one", feat) is None
     report = AnalysisReport(
         symbol="AAPL", as_of=TS, action=AnalystAction.HOLD, confidence=0.5,
         thesis="t", cited_concepts=["Trend"], regime_note="r",
     )
-    cache.put(feat, report)
-    assert cache.get(feat) is report
+    cache.put("backtest:decision-one", feat, report)
+    assert cache.get("backtest:decision-one", feat) is report
+    assert cache.get("backtest:decision-two", feat) is None
 
 
 def test_spot_check_records_disagreement():
@@ -165,9 +168,11 @@ def test_strategy_reuses_deterministic_request_id_across_cache_and_replay():
     )
     cheap = RecordingAnalyst()
     full = RecordingAnalyst()
+    shared_cache = ResponseCache()
     first = AnalystStrategy(
         cheap,
         LLMRunConfig(spot_check_every=1),
+        cache=shared_cache,
         run_id="holdout-2022",
         full_analyst=full,
     )
@@ -175,9 +180,21 @@ def test_strategy_reuses_deterministic_request_id_across_cache_and_replay():
     first.on_bar(features)
     first.on_bar(features)
 
-    expected = "backtest:holdout-2022:AAPL:2016-06-01T00:00:00+00:00"
+    canonical = (
+        '{"run_id":"holdout-2022","symbol":"AAPL",'
+        '"timestamp":"2016-06-01T00:00:00.000000Z"}'
+    )
+    digest = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(canonical.encode("utf-8")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    expected = f"backtest:{digest}"
     assert cheap.request_ids == [expected]
     assert full.request_ids == [expected]
+    assert len(expected) == 52
 
     replay = RecordingAnalyst()
     AnalystStrategy(
@@ -186,6 +203,134 @@ def test_strategy_reuses_deterministic_request_id_across_cache_and_replay():
         run_id="holdout-2022",
     ).on_bar(features)
     assert replay.request_ids == [expected]
+
+    same_run_cached = RecordingAnalyst()
+    AnalystStrategy(
+        same_run_cached,
+        LLMRunConfig(),
+        cache=shared_cache,
+        run_id="holdout-2022",
+    ).on_bar(features)
+    assert same_run_cached.request_ids == []
+
+    different_run = RecordingAnalyst()
+    AnalystStrategy(
+        different_run,
+        LLMRunConfig(),
+        cache=shared_cache,
+        run_id="holdout-2023",
+    ).on_bar(features)
+    assert len(different_run.request_ids) == 1
+    assert different_run.request_ids[0] != expected
+
+
+def test_decision_request_id_normalizes_symbol_run_and_equivalent_offset():
+    report = AnalysisReport(
+        symbol="AAPL",
+        as_of=TS,
+        action=AnalystAction.HOLD,
+        confidence=0.5,
+        thesis="hold",
+        cited_concepts=["Trend"],
+        regime_note="range",
+    )
+
+    class RecordingAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze(self, features, *, request_id):
+            self.request_ids.append(request_id)
+            return report
+
+    offset_features = MarketFeatures(
+        symbol=" aapl ",
+        asset_class=AssetClass.EQUITY,
+        as_of=datetime(
+            2016,
+            5,
+            31,
+            17,
+            tzinfo=timezone(timedelta(hours=-7)),
+        ),
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+    analyst = RecordingAnalyst()
+    AnalystStrategy(
+        analyst,
+        LLMRunConfig(),
+        run_id=" holdout-2022 ",
+    ).on_bar(offset_features)
+
+    canonical = (
+        '{"run_id":"holdout-2022","symbol":"AAPL",'
+        '"timestamp":"2016-06-01T00:00:00.000000Z"}'
+    )
+    expected = "backtest:" + (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(canonical.encode("utf-8")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert analyst.request_ids == [expected]
+
+
+@pytest.mark.parametrize("symbol", ["", " ", "\t"])
+def test_decision_rejects_blank_symbol_before_provider(symbol):
+    class RecordingAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze(self, features, *, request_id):
+            self.request_ids.append(request_id)
+            raise AssertionError("provider must not be called")
+
+    features = MarketFeatures(
+        symbol=symbol,
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+    analyst = RecordingAnalyst()
+    strategy = AnalystStrategy(
+        analyst,
+        LLMRunConfig(),
+        run_id="symbol-validation",
+    )
+
+    with pytest.raises(ValueError, match="symbol"):
+        strategy.on_bar(features)
+
+    assert analyst.request_ids == []
+
+
+def test_decision_rejects_naive_timestamp_before_provider():
+    class RecordingAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze(self, features, *, request_id):
+            self.request_ids.append(request_id)
+            raise AssertionError("provider must not be called")
+
+    features = MarketFeatures(
+        symbol="AAPL",
+        asset_class=AssetClass.EQUITY,
+        as_of=TS.replace(tzinfo=None),
+        events=[EventTag(type=EventType.BREAKOUT, ts=TS)],
+    )
+    analyst = RecordingAnalyst()
+    strategy = AnalystStrategy(
+        analyst,
+        LLMRunConfig(),
+        run_id="timestamp-validation",
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        strategy.on_bar(features)
+
+    assert analyst.request_ids == []
 
 
 def test_strategy_bounds_request_id_and_rejects_blank_run_before_replay():

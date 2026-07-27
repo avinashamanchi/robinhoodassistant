@@ -371,3 +371,138 @@ Tests:
 ### Concerns
 
 None.
+
+## Fix round 2
+
+### Status
+
+Completed the remaining provenance corrections from `task-5-review-2.md`.
+This section supersedes Fix round 1's decision-ID encoding, cache-key, and
+validation-model identity descriptions.
+
+### Corrections
+
+- Decision identity now trims and NFC-normalizes `run_id`, trims,
+  NFC-normalizes, and uppercases `symbol`, and rejects either when non-string
+  or blank.
+- Triggered decisions require a timezone-aware `features.as_of`. The timestamp
+  is normalized to UTC and serialized with fixed microsecond precision and a
+  `Z` suffix before any cache lookup or provider attempt.
+- Canonical decision material is unambiguous, sorted-key compact JSON with
+  exactly `run_id`, `symbol`, and `timestamp`.
+- The decision request ID is `backtest:` plus the complete SHA-256 digest
+  encoded as unpadded URL-safe Base64. It retains all 256 digest bits and is
+  always 52 characters, below the durable 64-character ceiling.
+- `ResponseCache` now keys reports by both the stable decision request ID and
+  normalized feature fingerprint. A shared cache hits for the same run and
+  identical features without another provider call, but a different run ID
+  cannot reuse or attribute the prior run's report.
+- Provider-to-model selection is centralized in
+  `llm.factory.selected_llm_model()` and is used by raw backend construction
+  and validator run identity.
+- Validation identity now includes `config.llm.provider` and the provider's
+  actual selected `model`, `gemini_model`, or `groq_model` value. It no longer
+  includes the unused `LLMRunConfig.cheap_model` or `full_model` placeholders.
+
+### Strict TDD evidence
+
+Focused RED command:
+
+```bash
+uv run pytest -q \
+  tests/test_llm_runner.py::test_response_cache \
+  tests/test_llm_runner.py::test_strategy_reuses_deterministic_request_id_across_cache_and_replay \
+  tests/test_llm_runner.py::test_decision_request_id_normalizes_symbol_run_and_equivalent_offset \
+  tests/test_llm_runner.py::test_decision_rejects_blank_symbol_before_provider \
+  tests/test_llm_runner.py::test_decision_rejects_naive_timestamp_before_provider \
+  tests/test_bootstrap.py::test_validation_run_identity_uses_actual_provider_and_selected_model \
+  tests/test_bootstrap.py::test_validation_run_identity_ignores_unused_model_placeholders
+```
+
+Result:
+
+```text
+9 failed, 1 warning
+```
+
+The failures showed the cache accepting no decision identity, raw
+delimiter-concatenated request IDs, no UTC/symbol/timestamp canonicalization,
+blank and naive provenance reaching the Analyst boundary, and validator
+identity accepting no application config.
+
+The expected decision ID in tests is independently derived from the literal
+canonical material:
+
+```text
+{"run_id":"holdout-2022","symbol":"AAPL","timestamp":"2016-06-01T00:00:00.000000Z"}
+```
+
+using standard-library SHA-256 and URL-safe Base64 rather than any production
+identity helper.
+
+### GREEN verification
+
+Focused affected suite:
+
+```bash
+uv run pytest -q \
+  tests/test_llm_runner.py tests/test_launch_features.py \
+  tests/test_bootstrap.py tests/test_factory.py \
+  tests/test_llm_backends.py tests/test_config.py
+```
+
+Result:
+
+```text
+154 passed, 1 warning
+```
+
+Final full suite, run once after focused GREEN and self-review:
+
+```bash
+uv run pytest -q
+```
+
+Result:
+
+```text
+1830 passed, 1 skipped, 1 warning
+```
+
+The warning remains the pre-existing `websockets.legacy` deprecation warning.
+`git diff --check` also exited `0` with no output.
+
+### Changed files
+
+Production:
+
+- `src/trading_assistant/backtest/llm_runner.py`
+- `src/trading_assistant/llm/factory.py`
+- `src/trading_assistant/validate_analyst.py`
+
+Tests:
+
+- `tests/test_llm_runner.py`
+- `tests/test_bootstrap.py`
+
+### Self-review
+
+- Equivalent instants expressed with different UTC offsets produce the exact
+  same request ID; a naive timestamp, blank symbol, or blank run ID fails
+  before provider use.
+- Mutating canonical material back to delimiter concatenation, omitting UTC
+  conversion, truncating the digest representation, or omitting decision
+  identity from the cache key is covered by the focused regressions.
+- Same-run identical features make zero additional Analyst call through a
+  shared cache; changing only `run_id` causes a distinct call and request ID.
+- Changing the active provider or selected model changes validation identity.
+  Changing an inactive provider-model field or the unused cheap/full
+  placeholders does not.
+- Factory category checks, default-off backtest zero-construction behavior,
+  exact-once wrapping, and the shared provider-budget instance are unchanged.
+- No production app/daemon process, broker/provider/LLM call, notification,
+  breaker reset, or order action was performed.
+
+### Concerns
+
+None.

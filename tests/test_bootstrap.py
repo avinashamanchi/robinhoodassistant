@@ -984,6 +984,88 @@ def test_validation_run_passes_deterministic_bounded_identity(
     assert len(captured_run_ids[0]) <= 64
 
 
+def test_validation_run_identity_uses_actual_provider_and_selected_model(
+    app_config,
+):
+    from datetime import datetime, timezone
+
+    import trading_assistant.validate_analyst as validation
+    from trading_assistant.backtest.llm_runner import LLMRunConfig
+
+    start = datetime(2022, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2022, 12, 31, tzinfo=timezone.utc)
+    run_config = LLMRunConfig(max_llm_calls=25, horizon_bars=7)
+
+    def identity(config, selected_run_config=run_config):
+        return validation._validation_run_id(
+            config=config,
+            symbols=["MSFT", "AAPL"],
+            start=start,
+            end=end,
+            run_config=selected_run_config,
+            analyst_version="v2",
+        )
+
+    baseline = identity(app_config)
+    changed_actual_model = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"gemini_model": "gemini-review-model"}
+            )
+        }
+    )
+    changed_provider = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"provider": "anthropic"}
+            )
+        }
+    )
+    changed_inactive_model = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"model": "inactive-while-gemini-selected"}
+            )
+        }
+    )
+
+    assert identity(changed_actual_model) != baseline
+    assert identity(changed_provider) != baseline
+    assert identity(changed_inactive_model) == baseline
+
+
+def test_validation_run_identity_ignores_unused_model_placeholders(
+    app_config,
+):
+    from datetime import datetime, timezone
+
+    import trading_assistant.validate_analyst as validation
+    from trading_assistant.backtest.llm_runner import LLMRunConfig
+
+    common = {
+        "config": app_config,
+        "symbols": ["AAPL", "MSFT"],
+        "start": datetime(2022, 1, 1, tzinfo=timezone.utc),
+        "end": datetime(2022, 12, 31, tzinfo=timezone.utc),
+        "analyst_version": "v2",
+    }
+    baseline = validation._validation_run_id(
+        **common,
+        run_config=LLMRunConfig(max_llm_calls=25, horizon_bars=7),
+    )
+    placeholders_changed = validation._validation_run_id(
+        **common,
+        run_config=LLMRunConfig(
+            max_llm_calls=25,
+            horizon_bars=7,
+            cheap_model="unused-cheap-placeholder",
+            full_model="unused-full-placeholder",
+        ),
+    )
+
+    assert placeholders_changed == baseline
+
+
 @pytest.mark.parametrize(
     ("config_update", "message"),
     [

@@ -4,8 +4,8 @@ Running the analyst on every bar of a multi-year backtest would cost a fortune, 
 
 * **trigger_mode** — the analyst is invoked ONLY on bars where signal events fire
   (golden cross, breakout, …); deterministic HOLD otherwise.
-* **response cache** — keyed on (symbol, date, features hash); identical features
-  never pay twice.
+* **response cache** — keyed on stable decision identity plus features hash;
+  identical features in the same run never pay twice.
 * **hard budget** — ``max_llm_calls`` aborts the run if exceeded; a pre-run
   ``estimate_llm_calls`` prints the expected count/cost for confirmation.
 * **cheap model + spot-check** — run on a cheap model, optionally re-run every Nth
@@ -19,9 +19,12 @@ buy-and-hold on the holdout?
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from ..analyst.analyst import Analyst
@@ -37,9 +40,6 @@ from .metrics import Metrics, compute_metrics
 
 class BudgetExceeded(Exception):
     """Raised when a run exceeds its max_llm_calls budget — aborts the run."""
-
-
-_MAX_REQUEST_ID_LENGTH = 64
 
 
 @dataclass
@@ -63,8 +63,8 @@ def _triggered(features: MarketFeatures, config: LLMRunConfig) -> bool:
 
 def _features_hash(features: MarketFeatures) -> str:
     parts = (
-        features.symbol,
-        features.as_of.date().isoformat(),
+        _normalized_symbol(features.symbol),
+        _canonical_utc_timestamp(features.as_of),
         round(features.last_close or 0, 2),
         round(features.rsi_14 or 0, 1),
         round(features.sma_50 or 0, 2),
@@ -75,32 +75,82 @@ def _features_hash(features: MarketFeatures) -> str:
     return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
 
 
+def _normalized_text(field: str, value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be non-empty")
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized:
+        raise ValueError(f"{field} must be non-empty")
+    return normalized
+
+
 def _require_run_id(run_id: str) -> str:
-    if not isinstance(run_id, str) or not run_id.strip():
-        raise ValueError("run_id must be non-empty")
-    return run_id.strip()
+    return _normalized_text("run_id", run_id)
+
+
+def _normalized_symbol(symbol: str) -> str:
+    return _normalized_text("symbol", symbol).upper()
+
+
+def _canonical_utc_timestamp(timestamp: datetime) -> str:
+    if (
+        not isinstance(timestamp, datetime)
+        or timestamp.tzinfo is None
+        or timestamp.utcoffset() is None
+    ):
+        raise ValueError("features.as_of must be timezone-aware")
+    return (
+        timestamp.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _decision_request_id(run_id: str, features: MarketFeatures) -> str:
-    material = (
-        f"backtest:{run_id}:{features.symbol.upper()}:"
-        f"{features.as_of.isoformat()}"
+    material = json.dumps(
+        {
+            "run_id": _require_run_id(run_id),
+            "symbol": _normalized_symbol(features.symbol),
+            "timestamp": _canonical_utc_timestamp(features.as_of),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
     )
-    if len(material) <= _MAX_REQUEST_ID_LENGTH:
-        return material
-    digest = hashlib.sha256(material.encode()).hexdigest()
-    return f"backtest:{digest[:55]}"
+    digest = base64.urlsafe_b64encode(
+        hashlib.sha256(material.encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    return f"backtest:{digest}"
 
 
 class ResponseCache:
     def __init__(self) -> None:
-        self._store: dict[str, AnalysisReport] = {}
+        self._store: dict[tuple[str, str], AnalysisReport] = {}
 
-    def get(self, features: MarketFeatures) -> Optional[AnalysisReport]:
-        return self._store.get(_features_hash(features))
+    @staticmethod
+    def _key(
+        decision_id: str,
+        features: MarketFeatures,
+    ) -> tuple[str, str]:
+        return (
+            _normalized_text("decision_id", decision_id),
+            _features_hash(features),
+        )
 
-    def put(self, features: MarketFeatures, report: AnalysisReport) -> None:
-        self._store[_features_hash(features)] = report
+    def get(
+        self,
+        decision_id: str,
+        features: MarketFeatures,
+    ) -> Optional[AnalysisReport]:
+        return self._store.get(self._key(decision_id, features))
+
+    def put(
+        self,
+        decision_id: str,
+        features: MarketFeatures,
+        report: AnalysisReport,
+    ) -> None:
+        self._store[self._key(decision_id, features)] = report
 
 
 class AnalystStrategy(Strategy):
@@ -131,7 +181,8 @@ class AnalystStrategy(Strategy):
         if not _triggered(features, self.config):
             return hold("no trigger event")
 
-        cached = self.cache.get(features)
+        request_id = _decision_request_id(self.run_id, features)
+        cached = self.cache.get(request_id, features)
         if cached is not None:
             return self._to_signal(cached)
 
@@ -142,7 +193,6 @@ class AnalystStrategy(Strategy):
         # Count the ATTEMPT against the budget before making it — a failed call
         # still hits the provider, so the cap must be fail-closed (security).
         self.calls += 1
-        request_id = _decision_request_id(self.run_id, features)
         try:
             report = self.analyst.analyze(
                 features,
@@ -150,7 +200,7 @@ class AnalystStrategy(Strategy):
             )
         except Exception:  # a malformed LLM response must not abort the whole run
             return hold("analyst error; skipped")
-        self.cache.put(features, report)
+        self.cache.put(request_id, features, report)
         self.reports.append((features, report))
         self._maybe_spot_check(features, report, request_id)
         return self._to_signal(report)
