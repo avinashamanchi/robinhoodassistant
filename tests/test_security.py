@@ -734,25 +734,219 @@ def test_auth_module_redirects_401_and_parses_stable_error_envelope():
     )
 
 
-def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
+def test_auth_module_clones_mutable_options_and_preserves_header_precedence():
     _run_module(
         _STATIC / "js" / "auth.js",
         """
         globalThis.window = { location: { assign: () => {} } };
+        const calls = [];
+        globalThis.fetch = async (path, options = {}) => {
+          if (path === "/auth/session") {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-memory-only",
+              }),
+            };
+          }
+          calls.push({ path, options });
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({ accepted: true }),
+          };
+        };
+        const callerHeaders = {
+          "Content-Type": "application/vnd.operator+json",
+          "Idempotency-Key": "caller-action-key",
+          "X-CSRF-Token": "stale-caller-csrf",
+          "X-Operator-Trace": "trace-7",
+        };
+        const callerOptions = {
+          method: "post",
+          credentials: "omit",
+          headers: callerHeaders,
+          body: '{"reason":"reviewed exact proof"}',
+        };
+        const original = JSON.stringify(callerOptions);
+
+        await module.api("/custom-mutation", callerOptions);
+
+        if (JSON.stringify(callerOptions) !== original) {
+          throw new Error("mutable caller options changed");
+        }
+        if (callerOptions.headers !== callerHeaders) {
+          throw new Error("mutable caller headers reference changed");
+        }
+        const internal = calls[0].options;
+        if (internal === callerOptions) {
+          throw new Error("fetch received caller-owned options");
+        }
+        if (internal.headers === callerHeaders) {
+          throw new Error("fetch received caller-owned headers");
+        }
+        if (internal.method !== "POST") {
+          throw new Error(`method was not normalized: ${internal.method}`);
+        }
+        if (internal.credentials !== "same-origin") {
+          throw new Error(`credentials precedence failed: ${internal.credentials}`);
+        }
+        const headers = new Headers(internal.headers);
+        const expected = {
+          contentType: "application/vnd.operator+json",
+          csrf: "csrf-memory-only",
+          idempotency: "caller-action-key",
+          trace: "trace-7",
+        };
+        const observed = {
+          contentType: headers.get("Content-Type"),
+          csrf: headers.get("X-CSRF-Token"),
+          idempotency: headers.get("Idempotency-Key"),
+          trace: headers.get("X-Operator-Trace"),
+        };
+        if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+          throw new Error(`header precedence failed: ${JSON.stringify(observed)}`);
+        }
+        """,
+    )
+
+
+def test_auth_module_accepts_frozen_options_and_plain_headers():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        const calls = [];
+        globalThis.fetch = async (path, options = {}) => {
+          if (path === "/auth/session") {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-frozen",
+              }),
+            };
+          }
+          calls.push({ path, options });
+          return { status: 200, ok: true, json: async () => ({}) };
+        };
+        const frozenHeaders = Object.freeze({
+          "Content-Type": "application/json",
+          "Idempotency-Key": "frozen-action-key",
+          "X-Frozen": "preserved",
+        });
+        const frozenOptions = Object.freeze({
+          method: "post",
+          credentials: "omit",
+          headers: frozenHeaders,
+          body: "{}",
+        });
+
+        await module.api("/frozen-mutation", frozenOptions);
+
+        const internal = calls[0].options;
+        if (internal === frozenOptions || internal.headers === frozenHeaders) {
+          throw new Error("frozen caller ownership leaked into fetch");
+        }
+        if (
+          frozenOptions.method !== "post"
+          || frozenOptions.credentials !== "omit"
+          || frozenOptions.headers !== frozenHeaders
+        ) {
+          throw new Error("frozen caller input changed");
+        }
+        const headers = new Headers(internal.headers);
+        if (
+          internal.method !== "POST"
+          || internal.credentials !== "same-origin"
+          || headers.get("X-CSRF-Token") !== "csrf-frozen"
+          || headers.get("Idempotency-Key") !== "frozen-action-key"
+          || headers.get("X-Frozen") !== "preserved"
+        ) {
+          throw new Error("frozen options were not normalized internally");
+        }
+        """,
+    )
+
+
+def test_auth_module_clones_supplied_headers_without_mutating_them():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        const calls = [];
+        globalThis.fetch = async (path, options = {}) => {
+          if (path === "/auth/session") {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-owned",
+              }),
+            };
+          }
+          calls.push({ path, options });
+          return { status: 200, ok: true, json: async () => ({}) };
+        };
+        const suppliedHeaders = new Headers({
+          "Content-Type": "application/custom+json",
+          "Idempotency-Key": "headers-action-key",
+          "X-CSRF-Token": "caller-csrf",
+          "X-Supplied": "preserved",
+        });
+        const before = JSON.stringify(Array.from(suppliedHeaders.entries()));
+        const callerOptions = {
+          method: "POST",
+          headers: suppliedHeaders,
+          body: "{}",
+        };
+
+        await module.api("/headers-mutation", callerOptions);
+
+        if (JSON.stringify(Array.from(suppliedHeaders.entries())) !== before) {
+          throw new Error("supplied Headers instance was mutated");
+        }
+        if (callerOptions.headers !== suppliedHeaders) {
+          throw new Error("caller lost its supplied Headers instance");
+        }
+        const internal = calls[0].options;
+        if (internal.headers === suppliedHeaders) {
+          throw new Error("fetch reused the supplied Headers instance");
+        }
+        const headers = new Headers(internal.headers);
+        if (
+          headers.get("Content-Type") !== "application/custom+json"
+          || headers.get("Idempotency-Key") !== "headers-action-key"
+          || headers.get("X-CSRF-Token") !== "csrf-owned"
+          || headers.get("X-Supplied") !== "preserved"
+        ) {
+          throw new Error("internal header precedence was incorrect");
+        }
+        """,
+    )
+
+
+def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        const generatedKeys = ["operator-action-1", "operator-action-2"];
         let uuidCalls = 0;
         Object.defineProperty(globalThis, "crypto", {
           configurable: true,
           value: {
-            randomUUID: () => {
-              uuidCalls += 1;
-              return "operator-action-uuid";
-            },
+            randomUUID: () => generatedKeys[uuidCalls++],
           },
         });
         const secretInput = { value: "fresh-operator-secret" };
         module.configureReauthentication(async () => secretInput);
         const calls = [];
-        let approvalCalls = 0;
+        let firstActionAttempts = 0;
         globalThis.fetch = async (path, options = {}) => {
           calls.push({ path, options });
           if (path === "/auth/session") {
@@ -772,68 +966,90 @@ def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
             if (JSON.parse(options.body).secret !== "fresh-operator-secret") {
               throw new Error("reauth request did not copy the secret");
             }
+            const headers = new Headers(options.headers);
+            if (headers.has("Idempotency-Key")) {
+              throw new Error("reauth request inherited a mutation key");
+            }
+            if (
+              headers.get("Content-Type") !== "application/json"
+              || headers.get("X-CSRF-Token") !== "csrf-memory-only"
+            ) {
+              throw new Error("reauth internal headers were incorrect");
+            }
             return { status: 200, ok: true, json: async () => ({}) };
           }
-          approvalCalls += 1;
-          if (approvalCalls > 1) {
-            return {
-              status: 200,
-              ok: true,
-              json: async () => ({ executed: false }),
-            };
+          if (path === "/approve/7") {
+            firstActionAttempts += 1;
+            if (firstActionAttempts === 1) {
+              return {
+                status: 403,
+                ok: false,
+                json: async () => ({
+                  error: {
+                    code: "recent_authentication_required",
+                    message: "Recent operator reauthentication is required",
+                    request_id: "approval-first",
+                  },
+                }),
+              };
+            }
           }
           return {
-            status: 403,
-            ok: false,
-            json: async () => ({
-              error: {
-                code: "recent_authentication_required",
-                message: "Recent operator reauthentication is required",
-                request_id: `approval-${calls.length}`,
-              },
-            }),
+            status: 200,
+            ok: true,
+            json: async () => ({ executed: false }),
           };
         };
-        await module.loadSession();
-        const options = module.jsonPost({
+
+        const firstCallerOptions = module.jsonPost({
           reason: "reviewed exact proof",
         });
-        if (uuidCalls !== 1) {
-          throw new Error(`expected one idempotency UUID, got ${uuidCalls}`);
+        const firstCallerHeaders = firstCallerOptions.headers;
+        await module.api("/approve/7", firstCallerOptions);
+
+        const firstActionCalls = calls.filter(
+          (call) => call.path === "/approve/7",
+        );
+        if (firstActionCalls[0].options === firstCallerOptions) {
+          throw new Error("retry object remained caller-owned");
         }
-        await module.api("/approve/7", options);
-        const paths = calls.map((call) => call.path);
-        const expected = [
-          "/auth/session",
-          "/approve/7",
-          "/auth/reauth",
-          "/approve/7",
-        ];
-        if (JSON.stringify(paths) !== JSON.stringify(expected)) {
-          throw new Error(`unexpected calls: ${JSON.stringify(paths)}`);
+        if (firstActionCalls[0].options !== firstActionCalls[1].options) {
+          throw new Error("recent-auth retry replaced internal options");
         }
-        const mutationCalls = calls.filter((call) => call.path === "/approve/7");
-        if (mutationCalls[0].options !== options) {
-          throw new Error("jsonPost options object was replaced before fetch");
+        if (
+          firstCallerOptions.headers !== firstCallerHeaders
+          || Object.hasOwn(firstCallerHeaders, "X-CSRF-Token")
+          || Object.hasOwn(firstCallerOptions, "credentials")
+        ) {
+          throw new Error("jsonPost caller options were mutated");
         }
-        if (mutationCalls[0].options !== mutationCalls[1].options) {
-          throw new Error("recent-auth retry replaced the options object");
-        }
-        for (const call of mutationCalls) {
+        for (const call of firstActionCalls) {
           const headers = new Headers(call.options.headers);
-          if (headers.get("X-CSRF-Token") !== "csrf-memory-only") {
-              throw new Error("mutation did not carry in-memory CSRF");
-          }
-          if (headers.get("Idempotency-Key") !== "operator-action-uuid") {
-            throw new Error("mutation did not reuse the operator action key");
+          if (
+            headers.get("Content-Type") !== "application/json"
+            || headers.get("X-CSRF-Token") !== "csrf-memory-only"
+            || headers.get("Idempotency-Key") !== "operator-action-1"
+          ) {
+            throw new Error("first action retry headers changed");
           }
         }
-        const reauthCall = calls.find((call) => call.path === "/auth/reauth");
-        if (new Headers(reauthCall.options.headers).has("Idempotency-Key")) {
-          throw new Error("reauth request inherited a mutation key");
+
+        const secondCallerOptions = module.jsonPost({
+          reason: "second operator action",
+        });
+        await module.api("/approve/8", secondCallerOptions);
+        const secondActionCall = calls.find(
+          (call) => call.path === "/approve/8",
+        );
+        const secondHeaders = new Headers(secondActionCall.options.headers);
+        if (secondActionCall.options === firstActionCalls[0].options) {
+          throw new Error("new action reused the previous internal options");
         }
-        if (uuidCalls !== 1) {
-          throw new Error(`retry generated ${uuidCalls} idempotency UUIDs`);
+        if (secondHeaders.get("Idempotency-Key") !== "operator-action-2") {
+          throw new Error("new action did not receive a new idempotency key");
+        }
+        if (uuidCalls !== 2) {
+          throw new Error(`expected two action UUIDs, got ${uuidCalls}`);
         }
         """,
     )
@@ -861,6 +1077,9 @@ def test_login_clears_secret_before_fetch_even_when_network_fails():
         globalThis.fetch = async (_path, options) => {
           if (secretInput.value !== "") {
             throw new Error("login secret was not cleared before fetch");
+          }
+          if (new Headers(options.headers).has("Idempotency-Key")) {
+            throw new Error("login request carried a mutation key");
           }
           requestBody = JSON.parse(options.body);
           throw new TypeError("network unavailable");

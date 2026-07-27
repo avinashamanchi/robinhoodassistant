@@ -48,23 +48,36 @@ function redirectForAuthentication() {
   window.location.assign("/login");
 }
 
-async function fetchJson(path, options = {}) {
-  const method = (options.method || "GET").toUpperCase();
-  const headers = options.headers instanceof Headers
-    ? options.headers
-    : new Headers(options.headers || {});
+function cloneRequestOptions(options = {}) {
+  const requestOptions = {...options};
+  requestOptions.headers = new Headers(requestOptions.headers || {});
+  return requestOptions;
+}
+
+function normalizeRequestOptions(requestOptions) {
+  const method = (requestOptions.method || "GET").toUpperCase();
   if (method !== "GET" && method !== "HEAD") {
-    headers.set("X-CSRF-Token", csrfToken || "");
+    requestOptions.headers.set("X-CSRF-Token", csrfToken || "");
   }
-  options.method = method;
-  options.headers = headers;
-  options.credentials = "same-origin";
-  const response = await fetch(path, options);
+  requestOptions.method = method;
+  requestOptions.credentials = "same-origin";
+  return requestOptions;
+}
+
+async function fetchOwnedJson(path, requestOptions) {
+  const response = await fetch(path, requestOptions);
   const body = await responseBody(response);
   if (response.status === 401) {
     redirectForAuthentication();
   }
   return {response, body};
+}
+
+async function fetchJson(path, options = {}) {
+  const requestOptions = normalizeRequestOptions(
+    cloneRequestOptions(options),
+  );
+  return fetchOwnedJson(path, requestOptions);
 }
 
 export function loadSession() {
@@ -132,8 +145,8 @@ async function reauthenticate() {
   }
 }
 
-async function request(path, options, mayReauthenticate) {
-  const {response, body} = await fetchJson(path, options);
+async function request(path, requestOptions, mayReauthenticate) {
+  const {response, body} = await fetchOwnedJson(path, requestOptions);
   if (response.ok) {
     return body;
   }
@@ -144,14 +157,16 @@ async function request(path, options, mayReauthenticate) {
     && error.code === "recent_authentication_required"
   ) {
     await reauthenticate();
-    return request(path, options, false);
+    return request(path, requestOptions, false);
   }
   throw error;
 }
 
 export async function api(path, options = {}) {
+  const requestOptions = cloneRequestOptions(options);
   await loadSession();
-  return request(path, options, true);
+  normalizeRequestOptions(requestOptions);
+  return request(path, requestOptions, true);
 }
 
 export function jsonPost(body) {
