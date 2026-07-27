@@ -7,6 +7,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
@@ -101,6 +102,13 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         in inspect(engine).get_table_names()
     )
     assert "auth_sessions" in inspect(engine).get_table_names()
+    assert {
+        "rate_windows",
+        "concurrency_leases",
+        "provider_budget_days",
+        "provider_reservations",
+        "panic_receipts",
+    } <= set(inspect(engine).get_table_names())
     assert "alembic_version" in inspect(engine).get_table_names()
     rule_columns = {
         column["name"]
@@ -134,6 +142,167 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         order_indexes["ix_orders_plan_cancel_state"]["unique"]
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    ("counter_name", "statement"),
+    [
+        (
+            "rate window hits",
+            "INSERT INTO rate_windows "
+            "(bucket_key,policy_name,window_started_at,expires_at,hits) VALUES "
+            "('negative-rate-hits','chat',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,-1)",
+        ),
+        (
+            "rate window version",
+            "INSERT INTO rate_windows "
+            "(bucket_key,policy_name,window_started_at,expires_at,hits,version) VALUES "
+            "('negative-rate-version','chat',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,-1)",
+        ),
+        (
+            "lease generation",
+            "INSERT INTO concurrency_leases "
+            "(resource_key,owner,expires_at,generation) VALUES "
+            "('negative-lease-generation','',CURRENT_TIMESTAMP,-1)",
+        ),
+        (
+            "provider calls",
+            "INSERT INTO provider_budget_days "
+            "(provider,budget_day,calls_used,input_tokens_used,output_tokens_used) VALUES "
+            "('negative-calls','2026-07-27',-1,0,0)",
+        ),
+        (
+            "provider input tokens",
+            "INSERT INTO provider_budget_days "
+            "(provider,budget_day,calls_used,input_tokens_used,output_tokens_used) VALUES "
+            "('negative-input-tokens','2026-07-27',0,-1,0)",
+        ),
+        (
+            "provider output tokens",
+            "INSERT INTO provider_budget_days "
+            "(provider,budget_day,calls_used,input_tokens_used,output_tokens_used) VALUES "
+            "('negative-output-tokens','2026-07-27',0,0,-1)",
+        ),
+        (
+            "reservation input",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,input_actual,output_actual,created_at,expires_at) "
+            "VALUES ('negative-reservation-input','gemini','chat','request',"
+            "'2026-07-27','reserved',-1,0,NULL,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "reservation output",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,input_actual,output_actual,created_at,expires_at) "
+            "VALUES ('negative-reservation-output','gemini','chat','request',"
+            "'2026-07-27','reserved',0,-1,NULL,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "reservation actual input",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,input_actual,output_actual,created_at,expires_at) "
+            "VALUES ('negative-reservation-actual-input','gemini','chat','request',"
+            "'2026-07-27','reserved',0,0,-1,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "reservation actual output",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,input_actual,output_actual,created_at,expires_at) "
+            "VALUES ('negative-reservation-actual-output','gemini','chat','request',"
+            "'2026-07-27','reserved',0,0,NULL,-1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+    ],
+)
+def test_policy_budget_migration_rejects_negative_counters(
+    tmp_path, counter_name, statement
+):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"negative-{counter_name}.db", "head"
+    )
+
+    with engine.connect() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(text(statement))
+
+
+@pytest.mark.parametrize(
+    ("table_name", "statement"),
+    [
+        (
+            "provider reservations",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,created_at,expires_at) VALUES "
+            "('invalid-reservation-state','gemini','chat','request','2026-07-27',"
+            "'invalid',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "panic receipts",
+            "INSERT INTO panic_receipts "
+            "(account_scope,request_id,state,started_at,expires_at) VALUES "
+            "('invalid-panic-state','request','invalid',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+    ],
+)
+def test_policy_budget_migration_rejects_invalid_states(
+    tmp_path, table_name, statement
+):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"invalid-{table_name}.db", "head"
+    )
+
+    with engine.connect() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(text(statement))
+
+
+@pytest.mark.parametrize(
+    ("durable_state", "statement"),
+    [
+        (
+            "started provider reservation",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,created_at,expires_at) VALUES "
+            "('started-reservation','gemini','chat','request','2026-07-27',"
+            "'started',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "unknown provider reservation",
+            "INSERT INTO provider_reservations "
+            "(reservation_id,provider,category,request_id,budget_day,state,"
+            "input_reserved,output_reserved,created_at,expires_at) VALUES "
+            "('unknown-reservation','gemini','chat','request','2026-07-27',"
+            "'unknown',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+        (
+            "started panic receipt",
+            "INSERT INTO panic_receipts "
+            "(account_scope,request_id,state,started_at,expires_at) VALUES "
+            "('started-panic','request','started',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ),
+    ],
+)
+def test_policy_budget_downgrade_refuses_durable_inflight_state(
+    tmp_path, durable_state, statement
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / f"{durable_state}.db", "head"
+    )
+    with engine.begin() as connection:
+        connection.execute(text(statement))
+
+    with pytest.raises(RuntimeError, match="inflight policy state"):
+        command.downgrade(cfg, "20260726_0010")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0011"
 
 
 def test_fill_activated_upgrade_refuses_active_legacy_plan(
@@ -559,7 +728,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260726_0010"
+    assert version == "20260727_0011"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -595,7 +764,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260726_0010"
+        ) == "20260727_0011"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -636,7 +805,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260726_0010"
+    assert version == "20260727_0011"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")

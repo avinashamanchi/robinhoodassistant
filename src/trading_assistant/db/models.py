@@ -7,12 +7,13 @@ are stored in UTC (A2); timezone conversion happens only at market-day boundarie
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -597,6 +598,80 @@ class StartupReconciliationState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=utcnow
     )
+
+
+class RateWindow(Base):
+    __tablename__ = "rate_windows"
+
+    bucket_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    policy_name: Mapped[str] = mapped_column(String(32), index=True)
+    window_started_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    hits: Mapped[int] = mapped_column(default=0)
+    version: Mapped[int] = mapped_column(default=0)
+
+
+class ConcurrencyLease(Base):
+    __tablename__ = "concurrency_leases"
+
+    resource_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(64), default="")
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    generation: Mapped[int] = mapped_column(default=0)
+
+
+class ProviderBudgetDay(Base):
+    __tablename__ = "provider_budget_days"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    budget_day: Mapped[date] = mapped_column(Date, primary_key=True)
+    calls_used: Mapped[int] = mapped_column(default=0)
+    input_tokens_used: Mapped[int] = mapped_column(default=0)
+    output_tokens_used: Mapped[int] = mapped_column(default=0)
+    reconciliation_required: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    reconciliation_code: Mapped[str] = mapped_column(String(32), default="")
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
+class ProviderReservation(Base):
+    __tablename__ = "provider_reservations"
+
+    reservation_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    budget_day: Mapped[date] = mapped_column(Date, index=True)
+    state: Mapped[str] = mapped_column(
+        String(16), default="reserved", index=True
+    )
+    input_reserved: Mapped[int] = mapped_column()
+    output_reserved: Mapped[int] = mapped_column()
+    input_actual: Mapped[Optional[int]] = mapped_column(nullable=True)
+    output_actual: Mapped[Optional[int]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    settled_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class PanicReceipt(Base):
+    __tablename__ = "panic_receipts"
+
+    account_scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
 
 # ── Atomic approval primitive (A5) ──────────────────────────────

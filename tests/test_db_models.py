@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from trading_assistant.broker.models import OrderStatus
-from trading_assistant.db.models import AuthSession, Fill, Order, Proposal, utcnow
+from trading_assistant.db.models import (
+    AuthSession,
+    ConcurrencyLease,
+    Fill,
+    Order,
+    PanicReceipt,
+    Proposal,
+    ProviderBudgetDay,
+    ProviderReservation,
+    RateWindow,
+    utcnow,
+)
 from trading_assistant.db.session import create_db_engine
 
 
@@ -91,6 +102,66 @@ def test_auth_session_hash_is_unique(session_factory):
         )
         with pytest.raises(Exception):
             session.commit()
+
+
+def test_policy_rows_round_trip(session_factory):
+    now = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    with session_factory() as session:
+        session.add(
+            RateWindow(
+                bucket_key="a" * 64,
+                policy_name="chat",
+                window_started_at=now,
+                expires_at=now + timedelta(minutes=10),
+                hits=1,
+            )
+        )
+        session.add(
+            ConcurrencyLease(
+                resource_key="backtest:global",
+                owner="test:owner",
+                expires_at=now + timedelta(minutes=10),
+            )
+        )
+        session.add(
+            ProviderBudgetDay(
+                provider="gemini",
+                budget_day=date(2026, 7, 27),
+                calls_used=1,
+                input_tokens_used=100,
+                output_tokens_used=50,
+            )
+        )
+        session.add(
+            ProviderReservation(
+                reservation_id="reservation-1",
+                provider="gemini",
+                category="chat",
+                request_id="request-1",
+                budget_day=date(2026, 7, 27),
+                input_reserved=100,
+                output_reserved=50,
+                expires_at=now + timedelta(minutes=5),
+            )
+        )
+        session.add(
+            PanicReceipt(
+                account_scope="alpaca-paper",
+                request_id="request-1",
+                state="started",
+                expires_at=now + timedelta(seconds=90),
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        assert session.get(RateWindow, "a" * 64).hits == 1
+        assert session.get(ConcurrencyLease, "backtest:global").owner == "test:owner"
+        assert session.get(
+            ProviderBudgetDay, ("gemini", date(2026, 7, 27))
+        ).calls_used == 1
+        assert session.get(ProviderReservation, "reservation-1").state == "reserved"
+        assert session.get(PanicReceipt, "alpaca-paper").request_id == "request-1"
 
 
 def test_sqlite_database_and_sidecars_are_owner_only(tmp_path):
