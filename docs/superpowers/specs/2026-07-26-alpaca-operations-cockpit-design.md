@@ -87,7 +87,7 @@ show their age, and failures remain visible while the page is usable.
 ```
 
 On mobile, the proof tape scrolls horizontally, account facts become a
-two-column grid, and the truth panel stacks above decisions.
+single-column stack, and the truth panel stacks above decisions.
 
 ## Data and interaction contracts
 
@@ -95,9 +95,16 @@ two-column grid, and the truth panel stacks above decisions.
 
 Add authenticated `GET /account`, backed by the existing read-only
 `TradingService.get_account_summary()`. The response contains decimal strings
-for equity, buying power, and cash plus broker positions. Provider failures use
-the existing stable dependency-unavailable envelope. The browser never
-calculates or guesses account truth.
+for equity, buying power, cash, and gross exposure plus broker positions and a
+UTC `observed_at` timestamp. Account and position values are validated before
+they can be returned as truth. Provider or integrity failures use the existing
+stable dependency-unavailable envelope. The browser never calculates or
+guesses account truth.
+
+The account, positions, and combined-holdings routes share a per-session
+broker-read limit. Account-backed views use a two-second, fail-closed cache
+that coalesces concurrent reads. Expired cache entries are never served as a
+fallback after a provider failure.
 
 The account masthead has explicit loading, unavailable, and observed states.
 If unavailable, all values say `Unavailable`; prior values are cleared rather
@@ -105,9 +112,12 @@ than left looking current.
 
 ### Proof tape
 
-The UI derives tape labels only from current `/health`, `/account`,
-`/positions`, and `/pending` responses. It may summarize those responses, but
-cannot infer that trading is ready. The server remains authoritative.
+The UI derives tape labels only from current `/health`, `/account`, and
+`/pending` responses. Account metrics, the position table, and the Alpaca rows
+in combined holdings render from the same cached account snapshot so a fill
+between two broker calls cannot create a self-contradictory screen. It may
+summarize server responses, but cannot infer that trading is ready. The server
+remains authoritative.
 
 The current release says `PAPER` everywhere. No UI control or copy claims live
 trading, future profitability, or autonomous execution.
@@ -124,8 +134,13 @@ render a partial receipt as success.
 
 Account refresh follows the same abort-and-sequence pattern as positions,
 holdings, and risk events so a slower older request cannot overwrite fresher
-truth. The 10-second refresh remains; timestamps and freshness labels expose
-what was actually observed.
+truth. It invalidates prior proof before every request, has a finite 15-second
+browser timeout, and rejects malformed or stale observation timestamps. The
+10-second refresh remains; timestamps and freshness labels expose what was
+actually observed.
+
+Reconciliation proof has a configured 300-second maximum age. Evidence older
+than that remains visible with its age but renders stale, never current.
 
 Preflight reports Alpaca account authentication, market clock, and market data
 as independent checks. A bad quote must fail the data check without falsely

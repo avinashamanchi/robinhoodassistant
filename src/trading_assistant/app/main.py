@@ -8,11 +8,14 @@ inside TradingService.approve_order.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import ipaddress
 from datetime import timedelta
 from functools import wraps
 import inspect
 from pathlib import Path
+import threading
+import time
 from typing import TYPE_CHECKING, Callable, Optional
 
 from fastapi import Depends, FastAPI, Request
@@ -51,6 +54,7 @@ from .security import (
 _STATIC = Path(__file__).parent / "static"
 _DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
 _AUTO_PLANNING = object()
+_ACCOUNT_CACHE_TTL_SECONDS = 2.0
 
 if TYPE_CHECKING:
     from ..bootstrap import ApplicationContainer
@@ -58,9 +62,33 @@ if TYPE_CHECKING:
 
 class _AssetOnlyStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
-        if Path(path).suffix.lower() not in {".css", ".js"}:
+        if Path(path).suffix.lower() not in {".css", ".js", ".svg"}:
             raise StarletteHTTPException(status_code=404)
         return await super().get_response(path, scope)
+
+
+class _AccountSummaryCache:
+    """Short, fail-closed cache that coalesces concurrent broker reads."""
+
+    def __init__(self, ttl_seconds: float = _ACCOUNT_CACHE_TTL_SECONDS) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+        self._stored_at: float | None = None
+        self._payload: dict | None = None
+
+    def get(self, loader: Callable[[], dict]) -> dict:
+        with self._lock:
+            now = time.monotonic()
+            if (
+                self._payload is not None
+                and self._stored_at is not None
+                and now - self._stored_at <= self._ttl_seconds
+            ):
+                return deepcopy(self._payload)
+            payload = loader()
+            self._payload = deepcopy(payload)
+            self._stored_at = time.monotonic()
+            return deepcopy(payload)
 
 
 def _dependency_unavailable() -> ApiError:
@@ -239,6 +267,7 @@ def _create_app(
     approve_rate: RateLimiter | None = None,
     analysis_rate: RateLimiter | None = None,
     backtest_rate: RateLimiter | None = None,
+    account_rate: RateLimiter | None = None,
     login_rate: RateLimiter | None = None,
     auth_now: Callable | None = None,
     bind_host: str | None = None,
@@ -345,7 +374,9 @@ def _create_app(
     approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
     analysis_rate = analysis_rate or RateLimiter(max_requests=5, window_seconds=60)
     backtest_rate = backtest_rate or RateLimiter(max_requests=2, window_seconds=3600)
+    account_rate = account_rate or RateLimiter(max_requests=30, window_seconds=60)
     login_rate = login_rate or RateLimiter(max_requests=5, window_seconds=60)
+    account_cache = _AccountSummaryCache()
 
     app = FastAPI(
         title="Trading Assistant",
@@ -360,6 +391,19 @@ def _create_app(
     app.state.runtime_secrets = runtime_secrets
     app.state.operator_secret = api_token
     app.state.login_rate = login_rate
+    app.state.account_cache = account_cache
+
+    def enforce_broker_read_rate(
+        request: Request,
+        principal: SessionPrincipal,
+    ) -> None:
+        if not account_rate.allow(rate_limit_key(request, principal)):
+            raise ApiError(
+                "rate_limit_exceeded",
+                429,
+                "Broker read rate limit exceeded",
+            )
+
     session_kwargs = {
         "ttl": timedelta(hours=security_config.session_hours),
         "reauthentication_window": timedelta(
@@ -572,10 +616,23 @@ def _create_app(
 
     @app.get("/positions")
     def positions(
+        request: Request,
         principal: SessionPrincipal = Depends(current_principal),
     ):
+        enforce_broker_read_rate(request, principal)
         try:
             return {"positions": service.get_positions()}
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
+
+    @app.get("/account")
+    def account(
+        request: Request,
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        enforce_broker_read_rate(request, principal)
+        try:
+            return account_cache.get(service.get_account_summary)
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 
@@ -991,11 +1048,19 @@ def _create_app(
     # ── external (read-only) accounts ──────────────────────────
     @app.get("/holdings")
     def holdings(
+        request: Request,
         principal: SessionPrincipal = Depends(current_principal),
     ):
         """Combined Alpaca + external holdings, labeled by source (read-only external)."""
+        enforce_broker_read_rate(request, principal)
         try:
-            return service.get_combined_holdings()
+            account_snapshot = account_cache.get(
+                service.get_account_summary
+            )
+            return service.get_combined_holdings(
+                alpaca_positions=account_snapshot["positions"],
+                alpaca_observed_at=account_snapshot["observed_at"],
+            )
         except RequiredDependencyUnavailable:
             raise _dependency_unavailable() from None
 

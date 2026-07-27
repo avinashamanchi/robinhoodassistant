@@ -396,6 +396,7 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
 
 def test_financial_get_endpoints_fail_closed(client):
     assert client.get("/pending").status_code == 401
+    assert client.get("/account").status_code == 401
     assert client.get("/positions").status_code == 401
     assert client.get("/log").status_code == 401
 
@@ -499,6 +500,13 @@ def test_pages_have_no_inline_script_style_or_handler(page):
     )
 
 
+@pytest.mark.parametrize("page", _PAGES)
+def test_pages_use_the_local_flight_deck_icon(page):
+    text = (_STATIC / page).read_text(encoding="utf-8")
+
+    assert '<link rel="icon" href="/static/img/flight-deck.svg">' in text
+
+
 @pytest.mark.parametrize("source", (*_PAGES, *_SCRIPTS))
 def test_ui_sources_forbid_browser_secrets_and_html_sinks(source):
     text = (_STATIC / source).read_text(encoding="utf-8")
@@ -521,6 +529,7 @@ def test_static_assets_are_anonymous_but_operator_pages_remain_protected(client)
         "/static/js/index.js",
         "/static/js/plans.js",
         "/static/js/backtests.js",
+        "/static/img/flight-deck.svg",
     ):
         assert client.get(path).status_code == 200, path
     assert client.get("/login").status_code == 200
@@ -1111,6 +1120,116 @@ def test_approval_dialog_requires_explicit_current_pending_status():
     )
 
 
+def test_account_refresh_invalidates_proof_and_times_out():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshAccount",),
+        r"""
+        const elements = installDom([
+          "account-status",
+          "account-equity",
+          "account-buying-power",
+          "account-cash",
+          "account-exposure",
+          "proof-data",
+          "positions",
+        ]);
+        let timeoutCallback = null;
+        window.setTimeout = (callback) => {
+          timeoutCallback = callback;
+          return 17;
+        };
+        window.clearTimeout = () => {};
+        let requestSignal = null;
+        globalThis.__api = (path, options = {}) => {
+          if (path !== "/account") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          requestSignal = options.signal;
+          return new Promise((_resolve, reject) => {
+            requestSignal.addEventListener(
+              "abort",
+              () => reject(new Error("account request timed out")),
+              {once: true},
+            );
+          });
+        };
+
+        const refresh = module.refreshAccount();
+        if (
+          !elements["proof-data"].textContent.includes("Refreshing")
+          || !elements["proof-data"].className.includes("caution")
+        ) {
+          throw new Error("account refresh retained stale verified proof");
+        }
+        if (typeof timeoutCallback !== "function") {
+          throw new Error("account refresh did not install a finite timeout");
+        }
+
+        timeoutCallback();
+        try {
+          await refresh;
+          throw new Error("timed-out account refresh unexpectedly succeeded");
+        } catch (error) {
+          if (error.message === "timed-out account refresh unexpectedly succeeded") {
+            throw error;
+          }
+        }
+
+        if (!requestSignal.aborted) {
+          throw new Error("account timeout did not abort the broker read");
+        }
+        if (!elements["proof-data"].className.includes("alarm")) {
+          throw new Error("timed-out account proof did not fail closed");
+        }
+        """,
+    )
+
+
+def test_account_snapshot_renders_positions_from_same_response():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshAccount",),
+        r"""
+        const elements = installDom([
+          "account-status",
+          "account-equity",
+          "account-buying-power",
+          "account-cash",
+          "account-exposure",
+          "proof-data",
+          "positions",
+        ]);
+        window.clearTimeout = () => {};
+        globalThis.__api = (path) => {
+          if (path !== "/account") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          return Promise.resolve({
+            equity: "100",
+            buying_power: "200",
+            cash: "90",
+            gross_exposure: "10",
+            observed_at: new Date().toISOString(),
+            positions: [{
+              ticker: "AAPL",
+              qty: "1",
+              avg_entry_price: "10",
+              current_price: "10",
+              market_value: "10",
+            }],
+          });
+        };
+
+        await module.refreshAccount();
+
+        if (!elements.positions.textContent.includes("AAPL")) {
+          throw new Error("account snapshot did not render its coherent positions");
+        }
+        """,
+    )
+
+
 @pytest.mark.parametrize(
     (
         "function_name",
@@ -1123,6 +1242,36 @@ def test_approval_dialog_requires_explicit_current_pending_status():
         "newer_evidence",
     ),
     (
+        (
+            "refreshAccount",
+            "/account",
+            "account-status",
+            (
+                "account-equity",
+                "account-buying-power",
+                "account-cash",
+                "account-exposure",
+                "proof-data",
+            ),
+            (
+                '{equity: "100", buying_power: "200", cash: "90", '
+                'gross_exposure: "10", positions: [{ticker: "OLD", '
+                'qty: "1", avg_entry_price: "10", current_price: "10", '
+                'market_value: "10"}], '
+                'observed_at: new Date().toISOString()}'
+            ),
+            (
+                '{equity: "200", buying_power: "300", cash: "160", '
+                'gross_exposure: "40", positions: [{ticker: "NEW1", '
+                'qty: "1", avg_entry_price: "20", current_price: "20", '
+                'market_value: "20"}, {ticker: "NEW2", qty: "1", '
+                'avg_entry_price: "20", current_price: "20", '
+                'market_value: "20"}], '
+                'observed_at: new Date().toISOString()}'
+            ),
+            "1 open broker position",
+            "2 open broker positions",
+        ),
         (
             "refreshPositions",
             "/positions",
@@ -1271,6 +1420,28 @@ def test_operational_refreshes_bind_rendering_to_latest_generation(
         "newer_evidence",
     ),
     (
+        (
+            "refreshAccount",
+            "/account",
+            "account-status",
+            (
+                "account-equity",
+                "account-buying-power",
+                "account-cash",
+                "account-exposure",
+                "proof-data",
+            ),
+            (
+                '{equity: "200", buying_power: "300", cash: "160", '
+                'gross_exposure: "40", positions: [{ticker: "NEW1", '
+                'qty: "1", avg_entry_price: "20", current_price: "20", '
+                'market_value: "20"}, {ticker: "NEW2", qty: "1", '
+                'avg_entry_price: "20", current_price: "20", '
+                'market_value: "20"}], '
+                'observed_at: new Date().toISOString()}'
+            ),
+            "2 open broker positions",
+        ),
         (
             "refreshPositions",
             "/positions",
@@ -2394,6 +2565,10 @@ _HEALTH_DOM_SETUP = r"""
       "critical-banner-message",
       "status-region",
       "receipt-panel",
+      "proof-broker",
+      "proof-daemon",
+      "proof-reconciliation",
+      "proof-safety",
     ]);
     elements["breaker-scope"].value = "";
     const emptyUnsafeLocalState = () => ({
@@ -2458,6 +2633,9 @@ _HEALTH_DOM_SETUP = r"""
           crypto: 3,
         },
         active_breakers: activeBreakers,
+        broker_contact_evidence_valid: true,
+        reconciliation_age_seconds: 1.5,
+        reconciliation_max_age_seconds: 300,
         safety: safetyTruth({
           observedAt,
           activeBreakers,
@@ -2493,6 +2671,35 @@ _HEALTH_DOM_SETUP = r"""
       }
     };
 """
+
+
+def test_reconciliation_proof_marks_aged_contact_stale():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("refreshHealth",),
+        _HEALTH_DOM_SETUP
+        + r"""
+        globalThis.__api = (path) => {
+          if (path !== "/health") throw new Error(`unexpected API path ${path}`);
+          return Promise.resolve({
+            ...validHealth(),
+            broker_contact_evidence_valid: false,
+            reconciliation_age_seconds: 301,
+            reconciliation_max_age_seconds: 300,
+          });
+        };
+
+        await module.refreshHealth();
+
+        const proof = elements["proof-reconciliation"];
+        if (!proof.textContent.includes("Stale")) {
+          throw new Error(`aged evidence was not labeled stale: ${proof.textContent}`);
+        }
+        if (!proof.className.includes("caution")) {
+          throw new Error("aged evidence retained a verified proof class");
+        }
+        """,
+    )
 
 
 @pytest.mark.parametrize(

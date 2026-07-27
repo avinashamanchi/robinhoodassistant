@@ -20,6 +20,7 @@ from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
+    Account,
     BrokerFill,
     OrderStatus,
     Position,
@@ -577,6 +578,247 @@ def test_positions_and_log(client):
     assert "positions" in c.get("/positions").json()
     log = c.get("/log").json()
     assert len(log["risk_events"]) >= 1
+
+
+def test_account_returns_authenticated_broker_summary(client):
+    c, _, _ = client
+
+    response = c.get("/account")
+
+    assert response.status_code == 200
+    payload = response.json()
+    observed_at = datetime.fromisoformat(payload.pop("observed_at"))
+    assert observed_at.tzinfo is not None
+    assert payload == {
+        "buying_power": "100000",
+        "equity": "100000",
+        "cash": "100000",
+        "gross_exposure": "0",
+        "positions": [],
+    }
+
+
+def test_account_broker_outage_returns_hardened_503(
+    make_service,
+    authenticate_client,
+):
+    marker = "provider-secret-account-read"
+
+    class AccountReadOutage(MockBroker):
+        def get_account(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=AccountReadOutage())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get("/account")
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+
+
+@pytest.mark.parametrize("invalid_field", ("buying_power", "equity", "cash"))
+def test_account_rejects_invalid_broker_account_values(
+    make_service,
+    authenticate_client,
+    invalid_field,
+):
+    class InvalidAccountBroker(MockBroker):
+        def get_account(self):
+            values = {
+                "buying_power": Decimal("100000"),
+                "equity": Decimal("100000"),
+                "cash": Decimal("100000"),
+            }
+            values[invalid_field] = Decimal("NaN")
+            return Account(**values)
+
+    service = make_service(broker=InvalidAccountBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    _assert_dependency_unavailable(test_client.get("/account"))
+
+
+def test_account_rejects_invalid_broker_position_values(
+    make_service,
+    authenticate_client,
+):
+    class InvalidPositionBroker(MockBroker):
+        def get_positions(self):
+            return [
+                Position(
+                    ticker="AAPL",
+                    qty=Decimal("1"),
+                    avg_entry_price=Decimal("NaN"),
+                    current_price=Decimal("100"),
+                )
+            ]
+
+    service = make_service(broker=InvalidPositionBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    _assert_dependency_unavailable(test_client.get("/account"))
+
+
+def test_account_reads_are_rate_limited(
+    make_service,
+    authenticate_client,
+):
+    app = create_app(
+        service=make_service(),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+        account_rate=RateLimiter(max_requests=1, window_seconds=60),
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    assert test_client.get("/account").status_code == 200
+    limited = test_client.get("/account")
+
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_account_reads_use_a_short_bounded_broker_snapshot_cache(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    from trading_assistant.app import main as app_main
+
+    monotonic_now = [100.0]
+    monkeypatch.setattr(
+        app_main.time,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    app = create_app(
+        service=make_service(broker=broker),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    first = test_client.get("/account")
+    second = test_client.get("/account")
+
+    assert first.status_code == second.status_code == 200
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+    assert first.json()["observed_at"] == second.json()["observed_at"]
+
+    monotonic_now[0] += 2.1
+    third = test_client.get("/account")
+
+    assert third.status_code == 200
+    assert broker.account_reads == 2
+    assert broker.position_reads == 2
+
+
+def test_account_and_holdings_share_one_broker_snapshot(
+    make_service,
+    authenticate_client,
+):
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    app = create_app(
+        service=make_service(broker=broker),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    account = test_client.get("/account")
+    holdings = test_client.get("/holdings")
+
+    assert account.status_code == holdings.status_code == 200
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+    assert (
+        holdings.json()["alpaca_observed_at"]
+        == account.json()["observed_at"]
+    )
+
+
+@pytest.mark.parametrize("second_path", ("/positions", "/holdings"))
+def test_broker_read_rate_limit_cannot_be_bypassed(
+    make_service,
+    authenticate_client,
+    second_path,
+):
+    app = create_app(
+        service=make_service(),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+        account_rate=RateLimiter(max_requests=1, window_seconds=60),
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    assert test_client.get("/account").status_code == 200
+    limited = test_client.get(second_path)
+
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
 
 
 def test_health_reports_server_observed_broker_and_mode(client):

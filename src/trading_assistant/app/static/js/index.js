@@ -18,6 +18,8 @@ const unsafeLocalIdFields = [
 ];
 const dialogReturnFocus = new Map();
 const HEALTH_OBSERVATION_MAX_AGE_MS = 30000;
+const ACCOUNT_OBSERVATION_MAX_AGE_MS = 30000;
+const OPERATIONAL_REQUEST_TIMEOUT_MS = 15000;
 
 let latestHealth = null;
 let healthRequestSequence = 0;
@@ -30,9 +32,10 @@ let approvalRequestSequence = 0;
 let rejectionOrderId = null;
 let unsafePanicLatched = false;
 const operationalRefreshState = {
-  positions: {requestSequence: 0, controller: null},
-  holdings: {requestSequence: 0, controller: null},
-  riskLog: {requestSequence: 0, controller: null},
+  account: {requestSequence: 0, controller: null, timeoutId: null},
+  positions: {requestSequence: 0, controller: null, timeoutId: null},
+  holdings: {requestSequence: 0, controller: null, timeoutId: null},
+  riskLog: {requestSequence: 0, controller: null, timeoutId: null},
 };
 
 function node(tag, value, className) {
@@ -126,6 +129,91 @@ function setState(element, label, kind) {
   element.className = `state state-${kind}`;
 }
 
+function setProof(elementId, label, kind) {
+  const element = byId(elementId);
+  if (!element) {
+    return;
+  }
+  element.textContent = label;
+  element.className = `proof-value proof-${kind}`;
+}
+
+function decimalText(value) {
+  return (
+    typeof value === "string"
+    && /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)
+  );
+}
+
+function formatAccountMoney(value) {
+  if (!decimalText(value)) {
+    return "Unavailable";
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "Unavailable";
+  }
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(numeric);
+}
+
+function accountPayloadIsComplete(payload) {
+  const observedAt = Date.parse(payload?.observed_at);
+  const observationAge = Date.now() - observedAt;
+  return Boolean(
+    payload
+    && decimalText(payload.equity)
+    && Number.isFinite(Number(payload.equity))
+    && Number(payload.equity) > 0
+    && decimalText(payload.buying_power)
+    && Number.isFinite(Number(payload.buying_power))
+    && Number(payload.buying_power) > 0
+    && decimalText(payload.cash)
+    && Number.isFinite(Number(payload.cash))
+    && Number(payload.cash) > 0
+    && decimalText(payload.gross_exposure)
+    && Number.isFinite(Number(payload.gross_exposure))
+    && Number(payload.gross_exposure) >= 0
+    && Number.isFinite(observedAt)
+    && observationAge >= -5000
+    && observationAge <= ACCOUNT_OBSERVATION_MAX_AGE_MS
+    && Array.isArray(payload.positions)
+    && payload.positions.every((position) => (
+      position
+      && typeof position.ticker === "string"
+      && Boolean(position.ticker.trim())
+      && decimalText(position.qty)
+      && Number.isFinite(Number(position.qty))
+      && Number(position.qty) !== 0
+      && decimalText(position.avg_entry_price)
+      && Number(position.avg_entry_price) > 0
+      && decimalText(position.current_price)
+      && Number(position.current_price) > 0
+      && decimalText(position.market_value)
+      && Number.isFinite(Number(position.market_value))
+    ))
+  );
+}
+
+function clearAccountTruth(message) {
+  [
+    "account-equity",
+    "account-buying-power",
+    "account-cash",
+    "account-exposure",
+  ].forEach((elementId) => {
+    byId(elementId).textContent = "Unavailable";
+  });
+  const status = byId("account-status");
+  clear(status);
+  status.appendChild(node("p", message, "account-status-error"));
+  setProof("proof-data", "Unavailable", "alarm");
+}
+
 function makeTable(headers, rows) {
   const wrapper = node("div", null, "table-wrap");
   const table = node("table");
@@ -173,17 +261,28 @@ function orderSummary(order) {
 
 function beginOperationalRefresh(resource, target, loadingMessage) {
   const state = operationalRefreshState[resource];
+  if (
+    state.timeoutId !== null
+    && typeof window.clearTimeout === "function"
+  ) {
+    window.clearTimeout(state.timeoutId);
+  }
   if (state.controller) {
     state.controller.abort();
   }
   state.requestSequence += 1;
-  state.controller = new AbortController();
+  const controller = new AbortController();
+  state.controller = controller;
+  state.timeoutId = window.setTimeout(
+    () => controller.abort(),
+    OPERATIONAL_REQUEST_TIMEOUT_MS,
+  );
   clear(target);
   target.appendChild(node("p", loadingMessage, "empty-state"));
   return Object.freeze({
     resource,
     requestToken: state.requestSequence,
-    controller: state.controller,
+    controller,
   });
 }
 
@@ -200,7 +299,15 @@ function finishOperationalRefresh(request) {
   if (!operationalRefreshIsCurrent(request)) {
     return false;
   }
-  operationalRefreshState[request.resource].controller = null;
+  const state = operationalRefreshState[request.resource];
+  if (
+    state.timeoutId !== null
+    && typeof window.clearTimeout === "function"
+  ) {
+    window.clearTimeout(state.timeoutId);
+  }
+  state.timeoutId = null;
+  state.controller = null;
   return true;
 }
 
@@ -779,6 +886,10 @@ function renderUnknownHealth() {
   scopeSelect.appendChild(scopeOption);
   byId("truth-broker").textContent = "Unknown";
   byId("truth-mode").textContent = "Unknown";
+  setProof("proof-broker", "Unverified", "caution");
+  setProof("proof-daemon", "Unverified", "caution");
+  setProof("proof-reconciliation", "Unverified", "caution");
+  setProof("proof-safety", "Waiting for persisted truth", "caution");
   setState(byId("truth-database"), "Unknown", "caution");
   setState(byId("truth-daemon"), "Unknown", "caution");
   setState(byId("truth-safety"), "Unknown", "caution");
@@ -959,9 +1070,33 @@ function healthPayloadIsComplete(health) {
     || !health.killswitch_generation
     || typeof health.killswitch_generation !== "object"
     || !Array.isArray(health.active_breakers)
+    || typeof health.broker_contact_evidence_valid !== "boolean"
+    || typeof health.reconciliation_max_age_seconds !== "number"
+    || !Number.isFinite(health.reconciliation_max_age_seconds)
+    || health.reconciliation_max_age_seconds <= 0
     || !health.safety
     || typeof health.safety !== "object"
     || !Array.isArray(health.safety.active_breakers)
+  ) {
+    return false;
+  }
+  if (
+    health.reconciliation_age_seconds !== null
+    && (
+      typeof health.reconciliation_age_seconds !== "number"
+      || !Number.isFinite(health.reconciliation_age_seconds)
+      || health.reconciliation_age_seconds < 0
+    )
+  ) {
+    return false;
+  }
+  if (
+    health.broker_contact_evidence_valid === true
+    && (
+      typeof health.reconciliation_age_seconds !== "number"
+      || health.reconciliation_age_seconds
+        > health.reconciliation_max_age_seconds
+    )
   ) {
     return false;
   }
@@ -1033,6 +1168,11 @@ function renderSafetyTruth(safety) {
       "Locally clear · broker open orders unverified",
       "caution",
     );
+    setProof(
+      "proof-safety",
+      "Locally clear · broker orders unverified",
+      "caution",
+    );
     if (!unsafePanicLatched) {
       byId("critical-banner").hidden = true;
     }
@@ -1044,6 +1184,7 @@ function renderSafetyTruth(safety) {
     "Unsafe · persisted local evidence",
     "alarm",
   );
+  setProof("proof-safety", "Blocked · persisted unsafe state", "alarm");
   const evidence = [];
   const activeScopes = safety.active_breakers.map(
     (breaker) => breaker.scope,
@@ -1077,6 +1218,11 @@ function renderSafetyTruth(safety) {
 function renderHealth(health) {
   byId("truth-broker").textContent = health.broker;
   byId("truth-mode").textContent = health.mode;
+  setProof(
+    "proof-broker",
+    `${health.broker} · ${health.mode}`,
+    "verified",
+  );
   setState(byId("truth-database"), "Available", "verified");
   if (health.daemon_alive === true) {
     setState(
@@ -1084,8 +1230,44 @@ function renderHealth(health) {
       `Fresh · ${readable(health.heartbeat_age_seconds)}s`,
       "verified",
     );
+    setProof(
+      "proof-daemon",
+      `Fresh · ${readable(health.heartbeat_age_seconds)}s`,
+      "verified",
+    );
   } else {
     setState(byId("truth-daemon"), "Stale or absent", "caution");
+    setProof("proof-daemon", "Stale or absent", "caution");
+  }
+  if (
+    health.broker_contact_evidence_valid === true
+    && typeof health.reconciliation_age_seconds === "number"
+    && Number.isFinite(health.reconciliation_age_seconds)
+    && health.reconciliation_age_seconds >= 0
+    && health.reconciliation_age_seconds
+      <= health.reconciliation_max_age_seconds
+  ) {
+    setProof(
+      "proof-reconciliation",
+      `Current · ${Math.round(health.reconciliation_age_seconds)}s`,
+      "verified",
+    );
+  } else if (
+    typeof health.reconciliation_age_seconds === "number"
+    && Number.isFinite(health.reconciliation_age_seconds)
+    && health.reconciliation_age_seconds >= 0
+  ) {
+    setProof(
+      "proof-reconciliation",
+      `Stale · ${Math.round(health.reconciliation_age_seconds)}s`,
+      "caution",
+    );
+  } else {
+    setProof(
+      "proof-reconciliation",
+      "No current broker-contact proof",
+      "caution",
+    );
   }
   assetClasses.forEach((scope) => {
     const tripped = health.killswitch[scope];
@@ -1202,6 +1384,91 @@ async function refreshHealth() {
   return true;
 }
 
+async function refreshAccount() {
+  const status = byId("account-status");
+  const request = beginOperationalRefresh(
+    "account",
+    status,
+    "Refreshing authenticated Alpaca account…",
+  );
+  [
+    "account-equity",
+    "account-buying-power",
+    "account-cash",
+    "account-exposure",
+  ].forEach((elementId) => {
+    byId(elementId).textContent = "Checking…";
+  });
+  setProof("proof-data", "Refreshing account snapshot", "caution");
+
+  let payload;
+  try {
+    payload = await api("/account", {
+      signal: request.controller.signal,
+    });
+  } catch (error) {
+    if (!operationalRefreshIsCurrent(request)) {
+      return false;
+    }
+    finishOperationalRefresh(request);
+    clearAccountTruth("Authenticated broker account truth is unavailable.");
+    throw error;
+  }
+  if (!finishOperationalRefresh(request)) {
+    return false;
+  }
+  if (!accountPayloadIsComplete(payload)) {
+    clearAccountTruth("Broker account response was incomplete.");
+    throw new Error("Broker account response was incomplete");
+  }
+
+  byId("account-equity").textContent = formatAccountMoney(payload.equity);
+  byId("account-buying-power").textContent = formatAccountMoney(
+    payload.buying_power,
+  );
+  byId("account-cash").textContent = formatAccountMoney(payload.cash);
+  byId("account-exposure").textContent = formatAccountMoney(
+    payload.gross_exposure,
+  );
+  renderPositions(payload.positions);
+  clear(status);
+  const observedTime = new Date(payload.observed_at).toLocaleTimeString(
+    [],
+    {hour: "2-digit", minute: "2-digit", second: "2-digit"},
+  );
+  status.appendChild(node(
+    "p",
+    `${payload.positions.length} open broker position${
+      payload.positions.length === 1 ? "" : "s"
+    } · observed ${observedTime}`,
+    "account-status-ok",
+  ));
+  setProof("proof-data", `Fresh account snapshot · ${observedTime}`, "verified");
+  return true;
+}
+
+function renderPositions(positions) {
+  const target = byId("positions");
+  if (!target) {
+    return;
+  }
+  clear(target);
+  if (!positions.length) {
+    target.appendChild(node("p", "No open positions.", "empty-state"));
+    return;
+  }
+  target.appendChild(makeTable(
+    ["Symbol", "Quantity", "Average", "Last", "Value"],
+    positions.map((position) => [
+      position.ticker,
+      position.qty,
+      position.avg_entry_price,
+      position.current_price,
+      position.market_value,
+    ]),
+  ));
+}
+
 async function refreshPositions() {
   const target = byId("positions");
   const request = beginOperationalRefresh(
@@ -1230,22 +1497,8 @@ async function refreshPositions() {
   if (!finishOperationalRefresh(request)) {
     return false;
   }
-  clear(target);
   const positions = Array.isArray(payload.positions) ? payload.positions : [];
-  if (!positions.length) {
-    target.appendChild(node("p", "No open positions.", "empty-state"));
-    return true;
-  }
-  target.appendChild(makeTable(
-    ["Symbol", "Quantity", "Average", "Last", "Value"],
-    positions.map((position) => [
-      position.ticker,
-      position.qty,
-      position.avg_entry_price,
-      position.current_price,
-      position.market_value,
-    ]),
-  ));
+  renderPositions(positions);
   return true;
 }
 
@@ -1396,8 +1649,8 @@ async function submitChat(event) {
 async function refreshAll() {
   const jobs = [
     refreshHealth(),
+    refreshAccount(),
     refreshPending(),
-    refreshPositions(),
     refreshHoldings(),
     refreshRiskLog(),
   ];

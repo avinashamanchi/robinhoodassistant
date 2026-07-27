@@ -77,6 +77,7 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     cfg = load_config(_write(tmp_path, VALID))
     assert cfg.trading.mode is TradingMode.PAPER
     assert cfg.trading.request_timeout_seconds == 10.0
+    assert cfg.trading.reconciliation_max_age_seconds == 300.0
     assert cfg.llm.request_timeout_seconds == 45.0
     # allowlist uppercased
     assert cfg.risk.ticker_allowlist == ["AAPL", "MSFT"]
@@ -183,6 +184,23 @@ def test_non_positive_limit_rejected(tmp_path):
 def test_non_positive_external_timeout_rejected(tmp_path, old, new):
     with pytest.raises(ValidationError):
         load_config(_write(tmp_path, VALID.replace(old, new)))
+
+
+@pytest.mark.parametrize("yaml_value", [".nan", ".inf", "-.inf"])
+def test_nonfinite_reconciliation_freshness_fails_to_load(
+    tmp_path,
+    yaml_value,
+):
+    invalid = VALID.replace(
+        "broker: mock",
+        (
+            "broker: mock\n"
+            f"  reconciliation_max_age_seconds: {yaml_value}"
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, invalid))
 
 
 @pytest.mark.parametrize(

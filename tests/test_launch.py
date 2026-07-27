@@ -7,6 +7,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 import plistlib
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from sqlalchemy import event, func, select
 from trading_assistant.app.main import create_app
 from trading_assistant.app.errors import ApiError
 from trading_assistant.assets import AssetClass
+from trading_assistant.broker.models import Account, Position
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import AuditEvent, Fill, Heartbeat, Order
 from trading_assistant.dependencies import RequiredDependencyUnavailable
@@ -254,6 +256,40 @@ def test_operational_health_never_clamps_future_contact_to_zero(
         report["broker_contact_observed_at"]
         == report["observed_at"]
     )
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_valid"),
+    ((1, True), (301, False)),
+)
+def test_operational_health_applies_configured_reconciliation_freshness(
+    make_service,
+    age_seconds,
+    expected_valid,
+):
+    service = make_service()
+    with service.session_factory() as session:
+        session.add(
+            AuditEvent(
+                actor="daemon:test",
+                action="positions.reconcile",
+                target_type="portfolio",
+                target_id="alpaca-paper",
+                request_id=f"aged-health-contact-{age_seconds}",
+                result_code="in_sync",
+                created_at=(
+                    service.snapshot_service.now()
+                    - timedelta(seconds=age_seconds)
+                ),
+            )
+        )
+        session.commit()
+
+    report = build_operational_health(service).as_dict()
+
+    assert report["reconciliation_max_age_seconds"] == 300.0
+    assert report["broker_contact_evidence_valid"] is expected_valid
+    assert report["reconciliation_age_seconds"] >= age_seconds
 
 
 @pytest.mark.parametrize("operation", ["panic", "reset"])
@@ -528,6 +564,141 @@ def test_preflight_app_secret_quality_is_independent_of_provider_credentials():
     )
     assert result.status == "PASS"
     assert "basic format/placeholder checks" in result.detail
+
+
+def _install_preflight_alpaca_stubs(
+    monkeypatch,
+    *,
+    account_error: Exception | None = None,
+    clock_error: Exception | None = None,
+    quote_error: Exception | None = None,
+    account: Account | None = None,
+    positions: list[Position] | None = None,
+):
+    from trading_assistant.broker import alpaca
+
+    class BrokerStub:
+        def get_account(self):
+            if account_error is not None:
+                raise account_error
+            return account or Account(
+                buying_power=Decimal("100000"),
+                equity=Decimal("100000"),
+                cash=Decimal("100000"),
+            )
+
+        def get_positions(self):
+            return list(positions or [])
+
+        def get_quote(self, _ticker):
+            if quote_error is not None:
+                raise quote_error
+            return SimpleNamespace(last=Decimal("100"))
+
+    class ClockStub:
+        def is_open(self):
+            if clock_error is not None:
+                raise clock_error
+            return False
+
+    monkeypatch.setattr(
+        alpaca.AlpacaBroker,
+        "from_credentials",
+        lambda *_args, **_kwargs: BrokerStub(),
+    )
+    monkeypatch.setattr(
+        alpaca.AlpacaClock,
+        "from_credentials",
+        lambda *_args, **_kwargs: ClockStub(),
+    )
+
+
+def test_preflight_quote_failure_does_not_fail_auth_or_clock(monkeypatch):
+    from trading_assistant import preflight
+
+    _install_preflight_alpaca_stubs(
+        monkeypatch,
+        quote_error=ValueError("provider-secret-invalid-quote"),
+    )
+
+    auth, clock, data = preflight._alpaca(
+        Secrets(alpaca_api_key="key", alpaca_secret_key="secret")
+    )
+
+    assert (auth.status, clock.status, data.status) == (
+        preflight.PASS,
+        preflight.PASS,
+        preflight.FAIL,
+    )
+    assert "provider-secret-invalid-quote" not in data.detail
+
+
+def test_preflight_account_failure_does_not_fail_clock_or_data(monkeypatch):
+    from trading_assistant import preflight
+
+    _install_preflight_alpaca_stubs(
+        monkeypatch,
+        account_error=ConnectionError("provider-secret-account"),
+    )
+
+    auth, clock, data = preflight._alpaca(
+        Secrets(alpaca_api_key="key", alpaca_secret_key="secret")
+    )
+
+    assert (auth.status, clock.status, data.status) == (
+        preflight.FAIL,
+        preflight.PASS,
+        preflight.PASS,
+    )
+
+
+def test_preflight_clock_failure_does_not_fail_auth_or_data(monkeypatch):
+    from trading_assistant import preflight
+
+    _install_preflight_alpaca_stubs(
+        monkeypatch,
+        clock_error=RuntimeError("provider-secret-clock"),
+    )
+
+    auth, clock, data = preflight._alpaca(
+        Secrets(alpaca_api_key="key", alpaca_secret_key="secret")
+    )
+
+    assert (auth.status, clock.status, data.status) == (
+        preflight.PASS,
+        preflight.FAIL,
+        preflight.PASS,
+    )
+
+
+def test_preflight_rejects_invalid_account_and_position_truth(monkeypatch):
+    from trading_assistant import preflight
+
+    invalid_position = Position(
+        ticker="AAPL",
+        qty=Decimal("1"),
+        avg_entry_price=Decimal("NaN"),
+        current_price=Decimal("100"),
+    )
+    _install_preflight_alpaca_stubs(
+        monkeypatch,
+        account=Account(
+            buying_power=Decimal("NaN"),
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+        ),
+        positions=[invalid_position],
+    )
+
+    auth, clock, data = preflight._alpaca(
+        Secrets(alpaca_api_key="key", alpaca_secret_key="secret")
+    )
+
+    assert (auth.status, clock.status, data.status) == (
+        preflight.FAIL,
+        preflight.PASS,
+        preflight.PASS,
+    )
 
 
 def test_preflight_needs_me_is_not_ready_and_nonzero(

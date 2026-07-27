@@ -8,6 +8,9 @@ import pytest
 import yaml
 
 
+_STATIC = Path("src/trading_assistant/app/static")
+
+
 def test_release_static_gate_passes_for_the_committed_runtime_sources():
     completed = subprocess.run(
         [sys.executable, "scripts/check_release_safety.py"],
@@ -18,6 +21,46 @@ def test_release_static_gate_passes_for_the_committed_runtime_sources():
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == "release static checks: PASS"
+
+
+def test_operator_cockpit_exposes_broker_truth_contract():
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    script = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
+    required_ids = (
+        "proof-broker",
+        "proof-market",
+        "proof-data",
+        "proof-daemon",
+        "proof-reconciliation",
+        "account-status",
+        "account-equity",
+        "account-buying-power",
+        "account-cash",
+        "account-exposure",
+    )
+
+    for element_id in required_ids:
+        assert html.count(f'id="{element_id}"') == 1
+
+    assert (
+        "account: {requestSequence: 0, controller: null, timeoutId: null}"
+        in script
+    )
+    assert 'api("/account"' in script
+    assert "async function refreshAccount()" in script
+    assert "renderPositions(payload.positions)" in script
+    refresh_all = script.split("async function refreshAll()", 1)[1].split(
+        "async function initialize()",
+        1,
+    )[0]
+    assert "refreshPositions()" not in refresh_all
+
+
+def test_private_runtime_artifacts_are_gitignored():
+    rules = Path(".gitignore").read_text(encoding="utf-8")
+
+    assert "*.db.*.pre-migration.bak" in rules
+    assert "*.db.submission.lock*" in rules
 
 
 def _static_fixture(tmp_path: Path) -> Path:

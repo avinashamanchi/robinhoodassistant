@@ -43,9 +43,12 @@ class BrokerKind(str, enum.Enum):
 
 
 class TradingConfig(_Strict):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
     mode: TradingMode = TradingMode.PAPER
     broker: BrokerKind = BrokerKind.MOCK
     request_timeout_seconds: float = Field(default=10.0, gt=0)
+    reconciliation_max_age_seconds: float = Field(default=300.0, gt=0)
 
 
 class RiskConfig(_Strict):

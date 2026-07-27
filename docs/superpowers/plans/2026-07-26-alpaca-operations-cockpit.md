@@ -4,7 +4,7 @@
 
 **Goal:** Ship a distinctive, broker-truth-first operator cockpit, verify its paper-Alpaca launch path, and publish the verified branch without weakening any execution guardrail.
 
-**Architecture:** Reuse the existing FastAPI/static-JavaScript application and expose one authenticated read-only account endpoint backed by `TradingService`. Extend the current abortable refresh model for account truth, reshape the HTML/CSS into a proof tape plus account masthead, and keep all mutations on their existing audited server paths.
+**Architecture:** Reuse the existing FastAPI/static-JavaScript application and expose one authenticated, rate-limited read-only account endpoint backed by a validated `TradingService` snapshot and a two-second coalescing cache. Extend the current abortable refresh model for account truth, render account metrics and positions from that one snapshot, enforce finite account and reconciliation freshness budgets, reshape the HTML/CSS into a proof tape plus account masthead, and keep all mutations on their existing audited server paths.
 
 **Tech Stack:** Python 3.11, FastAPI, SQLAlchemy, pytest, vanilla ES modules, HTML, CSS, Alpaca paper API, Git/GitHub.
 

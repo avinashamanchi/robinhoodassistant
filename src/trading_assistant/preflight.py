@@ -110,22 +110,72 @@ def _alpaca(secrets: Secrets) -> tuple[Result, Result, Result]:
     if not (secrets.alpaca_api_key and secrets.alpaca_secret_key):
         n = Result("Alpaca paper auth", NEEDS, "set ALPACA keys, then re-run")
         return n, Result("market clock reachable", NEEDS), Result("data bars reachable", NEEDS)
+
     try:
         from .broker.alpaca import AlpacaBroker, AlpacaClock
 
-        broker = AlpacaBroker.from_credentials(secrets.alpaca_api_key, secrets.alpaca_secret_key, paper=True)
-        acct = broker.get_account()
-        auth = Result("Alpaca paper auth", PASS, f"equity={acct.equity}")
-        clock = AlpacaClock.from_credentials(secrets.alpaca_api_key, secrets.alpaca_secret_key, paper=True)
-        clk = Result("market clock reachable", PASS, f"open={clock.is_open()}")
-        q = broker.get_quote("AAPL")
-        data = Result("data reachable (AAPL quote)", PASS, f"last={q.last}")
-        return auth, clk, data
-    except Exception as e:
-        err = _safe_exception_code(e)
-        return (Result("Alpaca paper auth", FAIL, err),
-                Result("market clock reachable", FAIL, err),
-                Result("data reachable", FAIL, err))
+        broker = AlpacaBroker.from_credentials(
+            secrets.alpaca_api_key,
+            secrets.alpaca_secret_key,
+            paper=True,
+        )
+    except Exception as exc:
+        detail = _safe_exception_code(exc)
+        auth = Result("Alpaca paper auth", FAIL, detail)
+        data = Result("data reachable", FAIL, detail)
+    else:
+        try:
+            acct = broker.get_account()
+            positions = broker.get_positions()
+            if (
+                not acct.is_valid
+                or any(
+                    not position.risk_values_valid
+                    for position in positions
+                )
+            ):
+                raise ValueError("invalid broker account snapshot")
+            auth = Result("Alpaca paper auth", PASS, f"equity={acct.equity}")
+        except Exception as exc:
+            auth = Result(
+                "Alpaca paper auth",
+                FAIL,
+                _safe_exception_code(exc),
+            )
+
+        try:
+            quote = broker.get_quote("AAPL")
+            data = Result(
+                "data reachable (AAPL quote)",
+                PASS,
+                f"last={quote.last}",
+            )
+        except Exception as exc:
+            data = Result(
+                "data reachable",
+                FAIL,
+                _safe_exception_code(exc),
+            )
+
+    try:
+        clock_client = AlpacaClock.from_credentials(
+            secrets.alpaca_api_key,
+            secrets.alpaca_secret_key,
+            paper=True,
+        )
+        clock = Result(
+            "market clock reachable",
+            PASS,
+            f"open={clock_client.is_open()}",
+        )
+    except Exception as exc:
+        clock = Result(
+            "market clock reachable",
+            FAIL,
+            _safe_exception_code(exc),
+        )
+
+    return auth, clock, data
 
 
 def _db(secrets: Secrets) -> tuple[Result, Result, Result]:

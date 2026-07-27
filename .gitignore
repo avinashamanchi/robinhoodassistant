@@ -24,6 +24,8 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+*.db.*.pre-migration.bak
+*.db.submission.lock*
 *.sqlite
 *.sqlite3
 

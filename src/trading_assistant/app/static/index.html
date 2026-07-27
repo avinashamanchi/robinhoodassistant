@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Operator console — Trading Assistant</title>
+  <link rel="icon" href="/static/img/flight-deck.svg">
   <link rel="stylesheet" href="/static/css/console.css">
   <script type="module" src="/static/js/index.js"></script>
 </head>
@@ -11,7 +12,7 @@
   <a class="skip-link" href="#main-content">Skip to operator console</a>
   <header class="app-header">
     <div class="brand">
-      <span class="brand-mark">Paper operations</span>
+      <span class="brand-mark">Alpaca paper flight deck</span>
       <h1>Trading Assistant</h1>
     </div>
     <nav class="primary-nav" aria-label="Primary">
@@ -30,8 +31,70 @@
     <span id="critical-banner-message">Waiting for complete persisted local safety evidence; broker open orders are unverified.</span>
   </div>
 
-  <main class="console-layout" id="main-content">
-    <aside class="truth-rail" aria-labelledby="truth-title">
+  <main id="main-content">
+    <section class="proof-tape" aria-label="Current operational proof" tabindex="0">
+      <div class="proof-tape-cell">
+        <span>Broker target</span>
+        <strong class="proof-value proof-caution" id="proof-broker">Unverified</strong>
+      </div>
+      <div class="proof-tape-cell">
+        <span>Market gate</span>
+        <strong class="proof-value proof-neutral" id="proof-market">Checked at execution</strong>
+      </div>
+      <div class="proof-tape-cell">
+        <span>Broker data</span>
+        <strong class="proof-value proof-caution" id="proof-data">Waiting for account</strong>
+      </div>
+      <div class="proof-tape-cell">
+        <span>Daemon</span>
+        <strong class="proof-value proof-caution" id="proof-daemon">Unverified</strong>
+      </div>
+      <div class="proof-tape-cell">
+        <span>Reconciliation</span>
+        <strong class="proof-value proof-caution" id="proof-reconciliation">Unverified</strong>
+      </div>
+      <div class="proof-tape-cell proof-tape-cell-wide">
+        <span>Safety authority</span>
+        <strong class="proof-value proof-caution" id="proof-safety">Waiting for persisted truth</strong>
+      </div>
+    </section>
+
+    <section class="account-masthead" aria-labelledby="account-title">
+      <div class="account-heading">
+        <div>
+          <p class="section-label">Alpaca paper account</p>
+          <h2 id="account-title">Capital under control.</h2>
+        </div>
+        <div class="account-status" id="account-status" role="status">
+          <p>Waiting for authenticated broker account truth…</p>
+        </div>
+      </div>
+      <div class="account-metrics">
+        <article class="account-metric account-metric-primary">
+          <span>Account equity</span>
+          <strong id="account-equity">Unavailable</strong>
+          <small>Broker-reported total value</small>
+        </article>
+        <article class="account-metric">
+          <span>Buying power</span>
+          <strong id="account-buying-power">Unavailable</strong>
+          <small>Available before fresh risk checks</small>
+        </article>
+        <article class="account-metric">
+          <span>Cash</span>
+          <strong id="account-cash">Unavailable</strong>
+          <small>Broker-reported cash balance</small>
+        </article>
+        <article class="account-metric">
+          <span>Gross exposure</span>
+          <strong id="account-exposure">Unavailable</strong>
+          <small>Absolute value of open positions</small>
+        </article>
+      </div>
+    </section>
+
+    <div class="console-layout">
+      <aside class="truth-rail" aria-labelledby="truth-title">
       <div class="rail-heading">
         <p class="eyebrow">Server-observed</p>
         <h2 id="truth-title">Operational truth</h2>
@@ -97,17 +160,17 @@
         <p class="field-hint">A reset requires a tripped scope, a positive observed generation, complete health, and recent sign-in.</p>
         <button id="breaker-reset-button" type="submit" disabled>Reset selected scope</button>
       </form>
-    </aside>
+      </aside>
 
-    <div class="workspace">
-      <section class="page-intro" aria-labelledby="console-title">
-        <div>
-          <p class="section-label">Decision ledger</p>
-          <h2 id="console-title">Know what is proven before you act.</h2>
-          <p>Pending orders, operator decisions, and broker receipts remain distinct.</p>
-        </div>
-        <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>
-      </section>
+      <div class="workspace">
+        <section class="page-intro" aria-labelledby="console-title">
+          <div>
+            <p class="section-label">Decision ledger</p>
+            <h2 id="console-title">Command the system. Never guess its state.</h2>
+            <p>Proposals, human decisions, and broker receipts remain separate evidence.</p>
+          </div>
+          <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>
+        </section>
 
       <section class="ledger" aria-labelledby="pending-title">
         <div class="section-heading">
@@ -186,19 +249,20 @@
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="risk-log-title">
-        <div class="section-heading">
-          <div>
-            <p class="section-label">Audit trail</p>
-            <h2 id="risk-log-title">Execution and risk log</h2>
+        <section class="panel" aria-labelledby="risk-log-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Audit trail</p>
+              <h2 id="risk-log-title">Execution and risk log</h2>
+            </div>
           </div>
-        </div>
-        <div class="section-body">
-          <div class="event-log" id="risk-log">
-            <p class="empty-state">Loading risk events…</p>
+          <div class="section-body">
+            <div class="event-log" id="risk-log">
+              <p class="empty-state">Loading risk events…</p>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
+      </div>
     </div>
   </main>
 

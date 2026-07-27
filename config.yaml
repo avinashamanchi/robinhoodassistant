@@ -6,6 +6,7 @@ trading:
   mode: paper              # paper | live  (live ALSO requires env confirmation)
   broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
   request_timeout_seconds: 10
+  reconciliation_max_age_seconds: 300
 
 risk:
   ticker_allowlist: [AAPL, MSFT, GOOGL, GOOG, AMZN, NVDA, META, TSLA]

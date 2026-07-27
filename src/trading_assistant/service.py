@@ -31,6 +31,7 @@ from .broker.models import (
     OrderTimeInForce,
     OrderType,
     PortfolioSnapshot,
+    Position,
 )
 from .assets import AssetClass
 from .config import AppConfig, BrokerKind, TradingMode
@@ -307,22 +308,46 @@ class TradingService:
             "day_change_pct": None if change is None else f"{change:.2f}",
         }
 
+    def _read_valid_broker_positions(self) -> list[Position]:
+        positions = self.broker.get_positions()
+        seen_tickers: set[str] = set()
+        for position in positions:
+            if not position.risk_values_valid:
+                raise RequiredDependencyUnavailable
+            ticker_key = position.ticker.strip().upper()
+            if ticker_key in seen_tickers:
+                raise RequiredDependencyUnavailable
+            seen_tickers.add(ticker_key)
+        return positions
+
     def get_account_summary(self) -> dict[str, Any]:
-        acct = self.broker.get_account()
-        positions = [
-            {
-                "ticker": p.ticker,
-                "qty": str(p.qty),
-                "avg_entry_price": str(p.avg_entry_price),
-                "current_price": str(p.current_price),
-                "market_value": str(p.market_value),
-            }
-            for p in self.broker.get_positions()
-        ]
+        try:
+            acct = self.broker.get_account()
+            if not acct.is_valid:
+                raise RequiredDependencyUnavailable
+            broker_positions = self._read_valid_broker_positions()
+            positions = [
+                {
+                    "ticker": p.ticker,
+                    "qty": str(p.qty),
+                    "avg_entry_price": str(p.avg_entry_price),
+                    "current_price": str(p.current_price),
+                    "market_value": str(p.market_value),
+                }
+                for p in broker_positions
+            ]
+            gross_exposure = sum(
+                (abs(position.market_value) for position in broker_positions),
+                Decimal(0),
+            )
+        except Exception:
+            raise RequiredDependencyUnavailable from None
         return {
+            "observed_at": utcnow().isoformat(),
             "buying_power": str(acct.buying_power),
             "equity": str(acct.equity),
             "cash": str(acct.cash),
+            "gross_exposure": str(gross_exposure),
             "positions": positions,
         }
 
@@ -2605,7 +2630,7 @@ class TradingService:
 
     def get_positions(self) -> list[dict[str, Any]]:
         try:
-            positions = self.broker.get_positions()
+            positions = self._read_valid_broker_positions()
         except Exception:
             raise RequiredDependencyUnavailable from None
         return [
@@ -2759,11 +2784,20 @@ class TradingService:
         except Exception:
             return {"available": True, "dividends": [], "stale": True}
 
-    def get_combined_holdings(self) -> dict[str, Any]:
+    def get_combined_holdings(
+        self,
+        *,
+        alpaca_positions: list[dict[str, Any]] | None = None,
+        alpaca_observed_at: str | None = None,
+    ) -> dict[str, Any]:
         """Alpaca + external positions in one view, labeled by source, with
         per-ticker combined totals. External rows are marked read-only."""
+        if alpaca_positions is None:
+            alpaca_positions = self.get_positions()
+            alpaca_observed_at = utcnow().isoformat()
         alpaca = [
-            {**p, "source": "alpaca", "read_only": False} for p in self.get_positions()
+            {**position, "source": "alpaca", "read_only": False}
+            for position in alpaca_positions
         ]
         ext = self.get_external_positions()
         external = [
@@ -2782,6 +2816,7 @@ class TradingService:
         for row in external:
             combined[row["ticker"]] = combined.get(row["ticker"], 0.0) + float(row["current_value"])
         return {
+            "alpaca_observed_at": alpaca_observed_at,
             "alpaca": alpaca,
             "external": external,
             "combined_by_ticker": {k: round(v, 2) for k, v in combined.items()},

@@ -118,16 +118,22 @@ def build_operational_health(service) -> OperationalHealthReport:
     payload["last_confirmed_broker_contact"] = (
         last_contact.isoformat() if last_contact is not None else None
     )
+    max_reconciliation_age = float(
+        service.config.trading.reconciliation_max_age_seconds
+    )
+    payload["reconciliation_max_age_seconds"] = max_reconciliation_age
     reconciliation_age = None
-    contact_valid = last_contact is None
+    contact_valid = False
     if last_contact is not None:
         if last_contact.tzinfo is None:
             last_contact = last_contact.replace(tzinfo=timezone.utc)
-        contact_valid = last_contact <= observed_at
-        if contact_valid:
+        if last_contact <= observed_at:
             reconciliation_age = (
                 observed_at - last_contact
             ).total_seconds()
+            contact_valid = (
+                reconciliation_age <= max_reconciliation_age
+            )
     payload["broker_contact_evidence_valid"] = contact_valid
     payload["reconciliation_age_seconds"] = reconciliation_age
     return OperationalHealthReport(payload)
