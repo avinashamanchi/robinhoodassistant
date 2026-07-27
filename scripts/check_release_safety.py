@@ -273,28 +273,17 @@ _LLM_BACKEND_CLASSES = {
     "GeminiBackend",
     "GroqBackend",
 }
+_LLM_BACKEND_MODULES = {
+    "anthropic_backend",
+    "gemini_backend",
+    "groq_backend",
+}
 _LLM_BACKEND_ALLOWED_PATHS = {
     "src/trading_assistant/llm/factory.py",
     "src/trading_assistant/llm/anthropic_backend.py",
     "src/trading_assistant/llm/gemini_backend.py",
     "src/trading_assistant/llm/groq_backend.py",
 }
-
-
-def _canonical_route_path(
-    path: str,
-    *,
-    kind: str,
-    relative: str,
-    lineno: int,
-) -> str:
-    if (
-        not path.startswith("/")
-        or "//" in path
-        or (path != "/" and path.endswith("/"))
-    ):
-        _fail(f"noncanonical {kind} path: {relative}:{lineno}")
-    return path
 
 
 def _literal_route_policies(root: Path) -> set[tuple[str, str]]:
@@ -332,60 +321,64 @@ def _literal_route_policies(root: Path) -> set[tuple[str, str]]:
             or not isinstance(entry.args[1].value, str)
         ):
             _fail("ROUTE_POLICIES must use literal RoutePolicy method/path")
-        path = _canonical_route_path(
-            entry.args[1].value,
-            kind="route policy",
-            relative=relative,
-            lineno=entry.lineno,
-        )
-        policies.add((entry.args[0].value.upper(), path))
+        policies.add((entry.args[0].value.upper(), entry.args[1].value))
     return policies
 
 
-def _route_decorator_aliases(tree: ast.AST) -> dict[str, str]:
+def _route_decorator_aliases(
+    tree: ast.AST,
+    relative: str,
+) -> dict[str, str]:
     aliases: dict[str, str] = {}
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = (
-                node.targets
-                if isinstance(node, ast.Assign)
-                else [node.target]
-            )
-            names = {
-                target.id
-                for target in targets
-                if isinstance(target, ast.Name)
-            }
-            if not names:
-                continue
-            value = node.value
-            decorator = (
-                value.attr
-                if isinstance(value, ast.Attribute)
-                else aliases.get(value.id)
-                if isinstance(value, ast.Name)
-                else None
-            )
-            if decorator not in (
-                set(_ROUTE_DECORATOR_METHODS)
-                | _GENERIC_ROUTE_DECORATORS
-            ):
-                continue
-            for name in names:
-                if aliases.get(name) != decorator:
-                    aliases[name] = decorator
-                    changed = True
+    assignments = sorted(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    route_decorators = (
+        set(_ROUTE_DECORATOR_METHODS) | _GENERIC_ROUTE_DECORATORS
+    )
+    for node in assignments:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        names = {
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        }
+        if not names:
+            continue
+        value = node.value
+        decorator = (
+            value.attr
+            if isinstance(value, ast.Attribute)
+            else aliases.get(value.id)
+            if isinstance(value, ast.Name)
+            else None
+        )
+        if decorator not in route_decorators:
+            continue
+        for name in names:
+            previous = aliases.get(name)
+            if previous is not None and previous != decorator:
+                _fail(
+                    f"conflicting route decorator alias: "
+                    f"{relative}:{node.lineno}"
+                )
+            aliases[name] = decorator
     return aliases
 
 
 def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
     relative = path.relative_to(root).as_posix()
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
-    aliases = _route_decorator_aliases(tree)
+    aliases = _route_decorator_aliases(tree, relative)
     routes: list[tuple[str, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -408,6 +401,16 @@ def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
                 _fail(
                     f"unresolved route decorator: {relative}:{node.lineno}"
                 )
+            if decorator_name not in (
+                set(_ROUTE_DECORATOR_METHODS)
+                | _GENERIC_ROUTE_DECORATORS
+                | _NON_ROUTE_DECORATORS
+            ):
+                _fail(
+                    f"unresolved route decorator: {relative}:{node.lineno}"
+                )
+            if decorator_name in _NON_ROUTE_DECORATORS:
+                continue
             method = _ROUTE_DECORATOR_METHODS.get(decorator_name)
             if method is None and decorator_name not in _GENERIC_ROUTE_DECORATORS:
                 continue
@@ -420,12 +423,7 @@ def _decorated_routes(path: Path, root: Path) -> list[tuple[str, str]]:
                     f"route decorator must use literal path: "
                     f"{relative}:{node.lineno}"
                 )
-            route_path = _canonical_route_path(
-                path_arg.value,
-                kind="route decorator",
-                relative=relative,
-                lineno=node.lineno,
-            )
+            route_path = path_arg.value
             if method is not None:
                 routes.append((method, route_path))
                 continue
@@ -473,15 +471,62 @@ def _check_route_policy_inventory(root: Path) -> None:
         _fail(f"route missing from ROUTE_POLICIES: {method} {path}")
 
 
+def _is_llm_backend_module(module: str | None) -> bool:
+    return (
+        isinstance(module, str)
+        and module.rsplit(".", 1)[-1] in _LLM_BACKEND_MODULES
+    )
+
+
+def _global_backend_lookup(node: ast.AST) -> bool:
+    if (
+        not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Subscript)
+    ):
+        return False
+    lookup = node.func
+    if (
+        not isinstance(lookup.slice, ast.Constant)
+        or lookup.slice.value not in _LLM_BACKEND_CLASSES
+        or not isinstance(lookup.value, ast.Call)
+        or not isinstance(lookup.value.func, ast.Name)
+    ):
+        return False
+    return lookup.value.func.id in {"globals", "locals"}
+
+
 def _check_llm_construction_paths(root: Path) -> None:
     runtime = root / "src" / "trading_assistant"
-    offenders: list[str] = []
+    wildcard_imports: list[str] = []
+    module_imports: list[str] = []
+    references: list[str] = []
     for path in sorted(runtime.rglob("*.py")):
         relative = path.relative_to(root).as_posix()
         if relative in _LLM_BACKEND_ALLOWED_PATHS:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         for node in ast.walk(tree):
+            if not hasattr(node, "lineno"):
+                continue
+            location = f"{relative}:{node.lineno}"
+            if isinstance(node, ast.ImportFrom) and any(
+                imported.name == "*" for imported in node.names
+            ):
+                wildcard_imports.append(location)
+                continue
+            imported_module = (
+                isinstance(node, ast.Import)
+                and any(
+                    _is_llm_backend_module(imported.name)
+                    for imported in node.names
+                )
+            ) or (
+                isinstance(node, ast.ImportFrom)
+                and _is_llm_backend_module(node.module)
+            )
+            if imported_module:
+                module_imports.append(location)
+                continue
             imported_backend = (
                 isinstance(node, ast.ImportFrom)
                 and any(
@@ -496,13 +541,27 @@ def _check_llm_construction_paths(root: Path) -> None:
             ) or (
                 isinstance(node, ast.Attribute)
                 and node.attr in _LLM_BACKEND_CLASSES
-            )
+            ) or _getattr_call(
+                node,
+                _LLM_BACKEND_CLASSES,
+                dynamic=False,
+            ) or _global_backend_lookup(node)
             if imported_backend or raw_reference:
-                offenders.append(f"{relative}:{node.lineno}")
-    if offenders:
+                references.append(location)
+    if wildcard_imports:
+        _fail(
+            "unproven wildcard import: "
+            + ", ".join(sorted(set(wildcard_imports)))
+        )
+    if module_imports:
+        _fail(
+            "raw LLM backend module import outside factory: "
+            + ", ".join(sorted(set(module_imports)))
+        )
+    if references:
         _fail(
             "raw LLM backend reference outside factory: "
-            + ", ".join(sorted(set(offenders)))
+            + ", ".join(sorted(set(references)))
         )
 
 
@@ -523,6 +582,14 @@ def _check_no_deleted_rate_limiter_import(root: Path) -> None:
                 isinstance(node, ast.Import)
                 and any(
                     _is_deleted_rate_limiter_module(imported.name)
+                    for imported in node.names
+                )
+            ):
+                module_imports.append(f"{relative}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom) and (
+                node.module == "trading_assistant.app"
+                and any(
+                    imported.name == "ratelimit"
                     for imported in node.names
                 )
             ):

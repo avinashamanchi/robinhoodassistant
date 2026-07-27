@@ -273,8 +273,7 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
             "@app.get('/covered')\n"
             "def covered():\n"
             "    return None\n",
-            "noncanonical route policy path: "
-            "src/trading_assistant/app/policy.py:2",
+            "route missing from ROUTE_POLICIES: GET /covered",
             "ROUTE_POLICIES = (\n"
             "    RoutePolicy('GET', 'covered', AuthLevel.PUBLIC, 'read'),\n"
             ")\n",
@@ -284,8 +283,7 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
             "@app.get('//covered')\n"
             "def covered():\n"
             "    return None\n",
-            "noncanonical route decorator path: "
-            "src/trading_assistant/app/main.py:2",
+            "route missing from ROUTE_POLICIES: GET //covered",
             None,
         ),
         (
@@ -307,7 +305,7 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
         (
             "src/trading_assistant/unsafe_backend.py",
             "from trading_assistant.llm.anthropic_backend import AnthropicBackend\n",
-            "raw LLM backend reference outside factory: "
+            "raw LLM backend module import outside factory: "
             "src/trading_assistant/unsafe_backend.py:1",
             None,
         ),
@@ -361,6 +359,134 @@ def test_release_static_gate_rejects_fix_round_one_bypasses(
 
     assert completed.returncode == 1
     assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected"),
+    [
+        (
+            "src/trading_assistant/app/main.py",
+            "@decorators.expose('/uncovered')\n"
+            "def uncovered():\n"
+            "    return None\n",
+            "unresolved route decorator: "
+            "src/trading_assistant/app/main.py:2",
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "from trading_assistant.llm.groq_backend import *\n"
+            "globals()['GroqBackend']()\n",
+            "unproven wildcard import: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_backend.py",
+            "from trading_assistant.llm.groq_backend import BACKENDS\n"
+            "BACKENDS['groq']()\n",
+            "raw LLM backend module import outside factory: "
+            "src/trading_assistant/unsafe_backend.py:1",
+        ),
+        (
+            "src/trading_assistant/unsafe_limiter.py",
+            "from trading_assistant.app import ratelimit as old\n"
+            "old.RateLimiter()\n",
+            "deleted RateLimiter module import: "
+            "src/trading_assistant/unsafe_limiter.py:1",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_fix_round_two_bypasses(
+    tmp_path,
+    relative_path,
+    source,
+    expected,
+):
+    root = _static_fixture(tmp_path)
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
+@pytest.mark.parametrize("route_path", ("/covered/", "//covered"))
+def test_release_static_gate_accepts_exact_noncanonical_route_paths(
+    tmp_path,
+    route_path,
+):
+    policy_source = (
+        "ROUTE_POLICIES = (\n"
+        f"    RoutePolicy('GET', '{route_path}', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n"
+    )
+    root = _static_fixture(tmp_path, policy_source=policy_source)
+    (root / "src" / "trading_assistant" / "app" / "main.py").write_text(
+        f"@app.get('{route_path}')\n"
+        "def covered():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_release_static_gate_rejects_conflicting_route_aliases(tmp_path):
+    root = _static_fixture(tmp_path)
+    (root / "src" / "trading_assistant" / "app" / "main.py").write_text(
+        "expose = app.post\n"
+        "expose = app.get\n\n"
+        "@expose('/covered')\n"
+        "def covered():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/check_release_safety.py",
+                "--root",
+                str(root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"checker did not terminate: {exc}")
+
+    assert completed.returncode == 1
+    assert (
+        "conflicting route decorator alias: "
+        "src/trading_assistant/app/main.py:2"
+    ) in completed.stderr
 
 
 def test_release_static_gate_ignores_backend_and_rate_limiter_text(tmp_path):
