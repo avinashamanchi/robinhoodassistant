@@ -13,6 +13,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -622,6 +623,20 @@ class ConcurrencyLease(Base):
 
 class ProviderBudgetDay(Base):
     __tablename__ = "provider_budget_days"
+    __table_args__ = (
+        CheckConstraint(
+            "calls_used >= 0",
+            name="ck_provider_budget_days_calls_nonnegative",
+        ),
+        CheckConstraint(
+            "input_tokens_used >= 0",
+            name="ck_provider_budget_days_input_tokens_nonnegative",
+        ),
+        CheckConstraint(
+            "output_tokens_used >= 0",
+            name="ck_provider_budget_days_output_tokens_nonnegative",
+        ),
+    )
 
     provider: Mapped[str] = mapped_column(String(32), primary_key=True)
     budget_day: Mapped[date] = mapped_column(Date, primary_key=True)
@@ -637,6 +652,29 @@ class ProviderBudgetDay(Base):
 
 class ProviderReservation(Base):
     __tablename__ = "provider_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN "
+            "('reserved', 'started', 'settled', 'unknown', 'released')",
+            name="ck_provider_reservations_state",
+        ),
+        CheckConstraint(
+            "input_reserved >= 0",
+            name="ck_provider_reservations_input_reserved_nonnegative",
+        ),
+        CheckConstraint(
+            "output_reserved >= 0",
+            name="ck_provider_reservations_output_reserved_nonnegative",
+        ),
+        CheckConstraint(
+            "input_actual IS NULL OR input_actual >= 0",
+            name="ck_provider_reservations_input_actual_nonnegative",
+        ),
+        CheckConstraint(
+            "output_actual IS NULL OR output_actual >= 0",
+            name="ck_provider_reservations_output_actual_nonnegative",
+        ),
+    )
 
     reservation_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     provider: Mapped[str] = mapped_column(String(32), index=True)

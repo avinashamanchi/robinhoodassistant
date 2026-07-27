@@ -19,6 +19,11 @@ from .budget import (
     ProviderBudgetService,
     ProviderInputEstimator,
 )
+from .payloads import (
+    to_gemini_contents,
+    to_openai,
+    validate_llm_payload,
+)
 
 
 # ── normalized response (what the agent/analyst consume) ────────
@@ -95,6 +100,12 @@ class BudgetedLLMBackend:
     ):
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("budgeted LLM calls require request_id")
+        validate_llm_payload(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         input_reservation = self.estimator.estimate_upper_bound(
             system=system,
             messages=messages,
@@ -116,84 +127,57 @@ class BudgetedLLMBackend:
                 tool_choice=tool_choice,
                 request_id=request_id,
             )
-        except Exception:
-            self.budgets.mark_unknown(reservation.reservation_id)
+        except Exception as delegate_error:
+            try:
+                self.budgets.mark_unknown(reservation.reservation_id)
+            except Exception:
+                delegate_error.add_note(
+                    "provider reservation remains started because "
+                    "mark_unknown failed"
+                )
             raise
 
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            self.budgets.mark_unknown(reservation.reservation_id)
-            return response
         try:
-            input_tokens = int(
-                getattr(usage, "input_tokens", 0) or 0
-            )
-            output_tokens = int(
-                getattr(usage, "output_tokens", 0) or 0
-            )
-            if input_tokens < 0 or output_tokens < 0:
-                raise ValueError("provider usage must be non-negative")
-        except (TypeError, ValueError, OverflowError):
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                usage_counts = None
+            else:
+                try:
+                    input_tokens = getattr(usage, "input_tokens")
+                    output_tokens = getattr(usage, "output_tokens")
+                except AttributeError:
+                    usage_counts = None
+                else:
+                    usage_counts = (
+                        (input_tokens, output_tokens)
+                        if (
+                            type(input_tokens) is int
+                            and input_tokens >= 0
+                            and type(output_tokens) is int
+                            and output_tokens >= 0
+                        )
+                        else None
+                    )
+        except Exception as usage_error:
+            try:
+                self.budgets.mark_unknown(reservation.reservation_id)
+            except Exception:
+                usage_error.add_note(
+                    "provider reservation remains started because "
+                    "mark_unknown failed"
+                )
+            raise
+
+        if usage_counts is None:
             self.budgets.mark_unknown(reservation.reservation_id)
             return response
+        input_tokens, output_tokens = usage_counts
         self.budgets.settle(
             reservation.reservation_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
         return response
-
-
-# ── OpenAI / Groq translation ───────────────────────────────────
-def to_openai(system: str, messages: list[dict], tools: list[dict]) -> tuple[list[dict], list[dict]]:
-    out: list[dict] = [{"role": "system", "content": system}]
-    for msg in messages:
-        role, content = msg["role"], msg["content"]
-        if isinstance(content, str):
-            out.append({"role": role, "content": content})
-            continue
-        if role == "assistant":
-            text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
-            tool_calls = [
-                {
-                    "id": b["id"],
-                    "type": "function",
-                    "function": {"name": b["name"], "arguments": json.dumps(b["input"])},
-                }
-                for b in content
-                if b.get("type") == "tool_use"
-            ]
-            entry: dict[str, Any] = {"role": "assistant", "content": text or None}
-            if tool_calls:
-                entry["tool_calls"] = tool_calls
-            out.append(entry)
-        else:  # user: may carry tool_result blocks
-            handled = False
-            for b in content:
-                if b.get("type") == "tool_result":
-                    out.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": b["tool_use_id"],
-                            "content": b.get("content", ""),
-                        }
-                    )
-                    handled = True
-            texts = "".join(b.get("text", "") for b in content if b.get("type") == "text")
-            if texts or not handled:
-                out.append({"role": "user", "content": texts})
-    tools_oai = [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t["input_schema"],
-            },
-        }
-        for t in tools
-    ]
-    return out, tools_oai
 
 
 def from_openai(resp: Any) -> LLMResponse:
@@ -212,61 +196,30 @@ def from_openai(resp: Any) -> LLMResponse:
         blocks.append(TextBlock(text=msg.content or ""))
         stop = "end_turn"
     provider_usage = getattr(resp, "usage", None)
+    usage = None
+    if provider_usage is not None:
+        try:
+            input_tokens = getattr(provider_usage, "prompt_tokens")
+            output_tokens = getattr(
+                provider_usage,
+                "completion_tokens",
+            )
+        except AttributeError:
+            pass
+        else:
+            if (
+                type(input_tokens) is int
+                and input_tokens >= 0
+                and type(output_tokens) is int
+                and output_tokens >= 0
+            ):
+                usage = Usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
     return LLMResponse(
         content=blocks,
         stop_reason=stop,
-        usage=(
-            Usage(
-                input_tokens=(
-                    getattr(provider_usage, "prompt_tokens", 0) or 0
-                ),
-                output_tokens=(
-                    getattr(provider_usage, "completion_tokens", 0) or 0
-                ),
-            )
-            if provider_usage is not None
-            else None
-        ),
+        usage=usage,
         model=getattr(resp, "model", ""),
     )
-
-
-# ── Gemini translation ──────────────────────────────────────────
-def to_gemini_contents(messages: list[dict]) -> list[dict]:
-    """Return Gemini-style contents (dicts; the backend maps to SDK types).
-
-    Builds a tool_use_id -> name map so tool_result blocks can be turned into
-    function_response parts (Gemini keys those by function name).
-    """
-    id_to_name: dict[str, str] = {}
-    for msg in messages:
-        if isinstance(msg["content"], list):
-            for b in msg["content"]:
-                if b.get("type") == "tool_use":
-                    id_to_name[b["id"]] = b["name"]
-
-    contents: list[dict] = []
-    for msg in messages:
-        role = "model" if msg["role"] == "assistant" else "user"
-        content = msg["content"]
-        parts: list[dict] = []
-        if isinstance(content, str):
-            parts.append({"text": content})
-        else:
-            for b in content:
-                if b.get("type") == "text":
-                    parts.append({"text": b["text"]})
-                elif b.get("type") == "tool_use":
-                    parts.append({"function_call": {"name": b["name"], "args": b["input"]}})
-                elif b.get("type") == "tool_result":
-                    name = id_to_name.get(b["tool_use_id"], "tool")
-                    payload = b.get("content", "")
-                    try:
-                        payload = json.loads(payload)
-                    except (json.JSONDecodeError, TypeError):
-                        payload = {"result": payload}
-                    parts.append(
-                        {"function_response": {"name": name, "response": payload}}
-                    )
-        contents.append({"role": role, "parts": parts})
-    return contents

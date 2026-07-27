@@ -8,26 +8,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import LLMResponse, TextBlock, ToolUseBlock, Usage, to_gemini_contents
+from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
+from .payloads import (
+    build_gemini_payload,
+    sanitize_gemini_schema,
+)
 
 
 def _sanitize_schema(schema: Any) -> Any:
-    """Make a JSON schema Gemini-friendly: collapse ["string","null"] unions to a
-    single type and recurse into properties/items."""
-    if not isinstance(schema, dict):
-        return schema
-    out = {}
-    for k, v in schema.items():
-        if k == "type" and isinstance(v, list):
-            non_null = [t for t in v if t != "null"]
-            out[k] = non_null[0] if non_null else "string"
-        elif k == "properties" and isinstance(v, dict):
-            out[k] = {pk: _sanitize_schema(pv) for pk, pv in v.items()}
-        elif k == "items":
-            out[k] = _sanitize_schema(v)
-        else:
-            out[k] = v
-    return out
+    return sanitize_gemini_schema(schema)
 
 
 def from_gemini(resp: Any) -> LLMResponse:
@@ -48,19 +37,28 @@ def from_gemini(resp: Any) -> LLMResponse:
     if not blocks:
         blocks.append(TextBlock(text=""))
     meta = getattr(resp, "usage_metadata", None)
+    usage = None
+    if meta is not None:
+        try:
+            input_tokens = getattr(meta, "prompt_token_count")
+            output_tokens = getattr(meta, "candidates_token_count")
+        except AttributeError:
+            pass
+        else:
+            if (
+                type(input_tokens) is int
+                and input_tokens >= 0
+                and type(output_tokens) is int
+                and output_tokens >= 0
+            ):
+                usage = Usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
     return LLMResponse(
         content=blocks,
         stop_reason=stop,
-        usage=(
-            Usage(
-                input_tokens=getattr(meta, "prompt_token_count", 0) or 0,
-                output_tokens=(
-                    getattr(meta, "candidates_token_count", 0) or 0
-                ),
-            )
-            if meta is not None
-            else None
-        ),
+        usage=usage,
         model=getattr(resp, "model_version", ""),
     )
 
@@ -98,30 +96,40 @@ class GeminiBackend:
         tool_choice: Optional[str] = None,
         request_id: str = "",
     ) -> LLMResponse:
+        payload = build_gemini_payload(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         from google.genai import types
 
         gem_contents = [
             types.Content(
                 role=c["role"], parts=[self._part(types, p) for p in c["parts"]]
             )
-            for c in to_gemini_contents(messages)
+            for c in payload["contents"]
         ]
         decls = [
             types.FunctionDeclaration(
-                name=t["name"],
-                description=t.get("description", ""),
-                parameters=_sanitize_schema(t["input_schema"]),
+                name=declaration["name"],
+                description=declaration["description"],
+                parameters=declaration["parameters"],
             )
-            for t in tools
+            for declaration in (
+                payload["tools"][0]["function_declarations"]
+                if payload["tools"] is not None
+                else []
+            )
         ]
         cfg_kwargs: dict[str, Any] = dict(
-            system_instruction=system,
+            system_instruction=payload["system_instruction"],
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
         )
         # "any" forces a function call so a 200 always carries structured output
         # (Gemini otherwise sometimes replies in prose -> "did not submit a plan").
-        if decls and tool_choice == "any":
+        if "tool_config" in payload:
             cfg_kwargs["tool_config"] = types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="ANY")
             )

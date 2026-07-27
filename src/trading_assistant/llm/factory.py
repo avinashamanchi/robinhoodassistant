@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from ..config import AppConfig, Secrets
 from .budget import (
+    AnthropicInputEstimator,
+    GeminiInputEstimator,
+    GroqInputEstimator,
     ProviderBudgetUnavailable,
     ProviderInputEstimator,
-    Utf8ByteUpperBoundEstimator,
 )
 
 
 _PROVIDER_INPUT_ESTIMATORS: dict[str, ProviderInputEstimator] = {
-    "anthropic": Utf8ByteUpperBoundEstimator(),
-    "gemini": Utf8ByteUpperBoundEstimator(),
-    "groq": Utf8ByteUpperBoundEstimator(),
+    "anthropic": AnthropicInputEstimator(),
+    "gemini": GeminiInputEstimator(),
+    "groq": GroqInputEstimator(),
 }
 
 

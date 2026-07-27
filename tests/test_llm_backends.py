@@ -332,7 +332,12 @@ def test_anthropic_client_uses_configured_timeout(monkeypatch):
     monkeypatch.setattr(
         anthropic, "Anthropic", lambda **kwargs: seen.update(kwargs) or object()
     )
-    AnthropicBackend("key", "model", 100, timeout_seconds=19)
+    AnthropicBackend(
+        "key",
+        "model",
+        100,
+        timeout_seconds=19,
+    )._get_client()
     assert seen["timeout"] == 19
 
 

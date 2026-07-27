@@ -55,7 +55,7 @@ Focused GREEN:
 - UTC behavior: midnight creates a new day, non-UTC timestamps normalize to
   UTC, and unresolved prior-day reconciliation still blocks later reserves.
 - Cost behavior: Decimal USD estimates use only matching provider/model
-  metadata effective on the budget day; future-dated metadata yields zero.
+  metadata effective on the budget day; future-dated metadata is unavailable.
 - Store failure: a real held SQLite write lock normalized to
   `ProviderBudgetUnavailable`, with zero delegate calls and zero reservations.
 - State safety: only expired `reserved` rows release; `started`, `unknown`, and
@@ -90,3 +90,69 @@ Focused GREEN:
   exactly once, passing stable request IDs, and applying configured chat and
   structured-attempt ceilings. This task deliberately does not compose or wrap
   factory outputs.
+
+## Fix round 1
+
+### Review items resolved
+
+- Added `src/trading_assistant/llm/payloads.py` with shared pure validation and
+  provider-bound Anthropic, Gemini, and Groq builders. Raw adapters and their
+  explicit estimators consume the same transformations, so estimation cannot
+  drift from request construction. Each estimator serializes a conservative
+  envelope with `allow_nan=False`.
+- Payload root and nested JSON shape, finite numbers, message/tool semantics,
+  and optional non-empty `tool_choice` are validated before estimation,
+  reservation, SDK client construction, or delegate invocation. Provider-bound
+  transformed envelopes are also checked, including Gemini tool-result JSON.
+- Usage is accepted only when both fields are exact non-negative integers.
+  Missing, partial, boolean, string, fractional, negative, and property-raising
+  usage remains fully charged as `unknown`; OpenAI/Groq and Gemini adapters no
+  longer synthesize zero for partial or malformed usage.
+- Delegate failures preserve the original exception if `mark_unknown` also
+  fails. Usage-access failures attempt unknown marking and never settle/refund.
+- ORM metadata now mirrors Task 2's day-counter and reservation constraints.
+  Reserve, settle, release, and status validate every durable row they load;
+  corrupted counters, reservation states, actuals, and underflow fail closed.
+- Price metadata is validated eagerly for valid keys/models/effective dates,
+  unique dated records, and finite non-negative Decimal rates. Missing
+  applicable reviewed pricing returns `estimated_usd=None`; exact zero requires
+  valid applicable rates and zero token usage.
+- Modified `src/trading_assistant/db/models.py`,
+  `src/trading_assistant/llm/{base,budget,factory,anthropic_backend,gemini_backend,groq_backend}.py`,
+  `tests/test_llm_backends.py`, and `tests/test_llm_budget.py`; added
+  `tests/test_llm_budget_review.py`.
+
+### Strict TDD evidence
+
+- Initial review RED:
+  `uv run pytest tests/test_llm_budget_review.py
+  tests/test_llm_budget.py::test_estimated_usd_is_unavailable_before_configured_effective_date -v`
+  collected 68 tests: 65 failed, 3 passed.
+- Additional boundary REDs independently exposed non-finite transformed Gemini
+  payload acceptance, falsey non-mapping price metadata, duplicate dated
+  prices, and non-expired corrupt reservations before their minimal fixes.
+- Focused GREEN:
+  `uv run pytest tests/test_llm_budget_review.py tests/test_llm_budget.py
+  tests/test_llm_backends.py tests/test_db_models.py -q` passed all 132 tests.
+- Parallel reservation race: the three calls/input/output ceiling cases passed
+  20/20 repetitions, covering 60 real-SQLite concurrent-writer races.
+- Restart, UTC rollover/normalization, prior-day reconciliation, Decimal cost,
+  missing-price, malformed usage, zero-write denial, overrun, refund, and
+  durable corruption paths all passed in focused tests.
+- Single final full suite: `uv run pytest` produced
+  `1746 passed, 1 skipped, 1 warning in 242.51s`; the warning is the same
+  pre-existing `websockets.legacy` deprecation warning.
+
+### Fix-round self-review and concerns
+
+- Reserve still inserts its day totals and reservation row atomically under
+  `BEGIN IMMEDIATE`; cleanup runs in that transaction and only releases expired
+  unstarted `reserved` rows.
+- `mark_started` commits before the delegate; started, unknown, settled, and
+  overrun attempts cannot be released. Normal settlement refunds only unused
+  token reservations, while actual overruns are fully charged and block later
+  reserves through durable reconciliation.
+- Budget, estimator, payload, and store denials cause no raw provider call.
+  Factory work remains the minimal explicit estimator resolver only; Task 5
+  shared-container and wrapper composition remains out of scope.
+- No unresolved Task 4 fix-round concern.

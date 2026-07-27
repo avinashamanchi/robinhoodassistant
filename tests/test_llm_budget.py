@@ -765,7 +765,7 @@ def test_estimated_usd_uses_matching_effective_dated_price_metadata(
     assert status.price_effective_date == date(2026, 7, 27)
 
 
-def test_estimated_usd_is_zero_before_configured_effective_date(
+def test_estimated_usd_is_unavailable_before_configured_effective_date(
     session_factory,
 ):
     prices = {
@@ -789,7 +789,7 @@ def test_estimated_usd_is_zero_before_configured_effective_date(
 
     status = service.status("test", model="model-a", now=NOW)
 
-    assert status.estimated_usd == Decimal("0")
+    assert status.estimated_usd is None
     assert status.price_model == ""
     assert status.price_effective_date is None
 

@@ -7,7 +7,8 @@ import logging
 import re
 from typing import Any, Optional
 
-from .base import LLMResponse, ToolUseBlock, from_openai, to_openai
+from .base import LLMResponse, ToolUseBlock, from_openai
+from .payloads import build_groq_payload
 
 log = logging.getLogger(__name__)
 
@@ -86,17 +87,17 @@ class GroqBackend:
         tool_choice: Optional[str] = None,
         request_id: str = "",
     ) -> LLMResponse:
-        oai_messages, oai_tools = to_openai(system, messages, tools)
+        payload = build_groq_payload(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": oai_messages,
             "max_tokens": self.max_tokens,
+            **payload,
         }
-        if oai_tools:
-            kwargs["tools"] = oai_tools
-            # "any" -> the model MUST emit a tool call (used for structured
-            # analyst output); default "auto" lets chat reply in plain text.
-            kwargs["tool_choice"] = "required" if tool_choice == "any" else "auto"
         try:
             resp = self._get_client().chat.completions.create(**kwargs)
         except Exception as err:  # noqa: BLE001 — inspect for a recoverable tool_use_failed
