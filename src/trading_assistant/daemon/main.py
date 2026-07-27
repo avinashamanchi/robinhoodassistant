@@ -27,7 +27,14 @@ def build_monitor() -> Monitor:
         return _build_monitor(load_config(), secrets)
 
 
-def _build_monitor(config, secrets: Secrets) -> Monitor:
+def _build_monitor(
+    config,
+    secrets: Secrets,
+    *,
+    historical_alpaca_client_factory=None,
+    historical_coingecko_http=None,
+    historical_cache_dir=".cache/bars",
+) -> Monitor:
     from .. import bootstrap
 
     container = bootstrap.build_container(
@@ -62,9 +69,32 @@ def _build_monitor(config, secrets: Secrets) -> Monitor:
                 config.security.provider_budget.max_structured_attempts
             ),
         )
-        planning = PlanningService(service, analyst, build_live_feature_provider(config, secrets), secrets)
+        historical_kwargs = {
+            "scheduled_service": service,
+            "rate_limiter": container.rate_limiter,
+            "alpaca_client_factory": (
+                historical_alpaca_client_factory
+            ),
+            "coingecko_http": historical_coingecko_http,
+            "cache_dir": historical_cache_dir,
+        }
+        planning = PlanningService(
+            service,
+            analyst,
+            build_live_feature_provider(
+                config,
+                secrets,
+                **historical_kwargs,
+            ),
+            secrets,
+        )
         universe = config.screener.universe or config.risk.ticker_allowlist
-        screen_source = build_screen_source([s.upper() for s in universe], secrets)
+        screen_source = build_screen_source(
+            [s.upper() for s in universe],
+            secrets,
+            config=config,
+            **historical_kwargs,
+        )
 
         def _price(sym: str):
             try:

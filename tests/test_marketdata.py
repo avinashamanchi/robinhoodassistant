@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import pandas as pd
+import pytest
+
 from trading_assistant.backtest.coingecko import CoinGeckoClient, coin_id
+from trading_assistant.backtest.data import download_alpaca_bars
 from trading_assistant.backtest.marketstack import MarketStackClient
 
 
@@ -80,3 +84,84 @@ def test_coingecko_merges_ohlc_and_volume(tmp_path):
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
     assert df["close"].iloc[0] == 100.5
     assert df["volume"].iloc[0] == 5000.0
+
+
+def test_coingecko_cache_miss_gates_each_http_attempt(tmp_path):
+    attempts = 0
+
+    def gate(operation):
+        nonlocal attempts
+        attempts += 1
+        return operation()
+
+    def router(url, params):
+        if "/ohlc" in url:
+            return [[1672790400000, 100, 101, 99, 100.5]]
+        return {"total_volumes": [[1672790400000, 5000]]}
+
+    http = _HTTP(router)
+    client = CoinGeckoClient(
+        http=http,
+        cache_dir=tmp_path,
+        attempt_gate=gate,
+    )
+
+    client.bars("BTC/USD")
+    client.bars("BTC/USD")
+
+    assert attempts == 2
+    assert http.calls == 2
+
+
+def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1_000.0],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-07-24T00:00:00Z"],
+            name="ts",
+        ),
+    )
+
+    class FakeAlpacaHistory:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            return type("Bars", (), {"df": frame.copy()})()
+
+    client = FakeAlpacaHistory()
+    attempts = 0
+
+    def gate(operation):
+        nonlocal attempts
+        attempts += 1
+        return operation()
+
+    download_alpaca_bars(
+        "AAPL",
+        "fake-key",
+        "fake-secret",
+        cache_dir=tmp_path,
+        client_factory=lambda *_args: client,
+        attempt_gate=gate,
+    )
+    download_alpaca_bars(
+        "AAPL",
+        "fake-key",
+        "fake-secret",
+        cache_dir=tmp_path,
+        client_factory=lambda *_args: client,
+        attempt_gate=lambda _operation: pytest.fail(
+            "cache hit must not consume provider allowance"
+        ),
+    )
+
+    assert attempts == 1
+    assert client.calls == 1

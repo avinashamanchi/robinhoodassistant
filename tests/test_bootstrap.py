@@ -784,12 +784,12 @@ def test_daemon_shadow_uses_shared_analysis_budget_and_attempt_ceiling(
     monkeypatch.setattr(
         live_features,
         "build_live_feature_provider",
-        lambda *_args: object(),
+        lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
         live_features,
         "build_screen_source",
-        lambda *_args: object(),
+        lambda *_args, **_kwargs: object(),
     )
 
     monitor = daemon_main._build_monitor(config, secrets)

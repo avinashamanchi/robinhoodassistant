@@ -448,12 +448,12 @@ def test_daemon_shadow_quote_denial_uses_durable_data_breaker(
     monkeypatch.setattr(
         live_features,
         "build_live_feature_provider",
-        lambda *_args: object(),
+        lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
         live_features,
         "build_screen_source",
-        lambda *_args: object(),
+        lambda *_args, **_kwargs: object(),
     )
 
     monitor = daemon_main._build_monitor(
@@ -468,6 +468,273 @@ def test_daemon_shadow_quote_denial_uses_durable_data_breaker(
     assert service.breakers.is_tripped(
         BreakerScope.data(AssetClass.EQUITY)
     )
+
+
+def test_production_daemon_builders_gate_every_historical_network_attempt(
+    app_config,
+    make_service,
+    monkeypatch,
+    tmp_path,
+):
+    import pandas as pd
+
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import live_features
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.llm import factory as llm_factory
+
+    frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1_000.0],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-07-24T00:00:00Z"],
+            name="ts",
+        ),
+    )
+
+    class RecordingLimiter:
+        def __init__(self):
+            self.principals: list[str] = []
+
+        def consume_pair(self, _spec, *, principal):
+            self.principals.append(principal)
+            return SimpleNamespace(allowed=True)
+
+    class FakeAlpacaHistory:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            return SimpleNamespace(df=frame.copy())
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeCoinGeckoHTTP:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, params):
+            self.calls += 1
+            if url.endswith("/ohlc"):
+                return FakeResponse(
+                    [[1672790400000, 100, 101, 99, 100.5]]
+                )
+            return FakeResponse(
+                {"total_volumes": [[1672790400000, 5000]]}
+            )
+
+    captured = {}
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(
+            self,
+            _service,
+            _analyst,
+            feature_provider,
+            _secrets,
+        ):
+            captured["feature_provider"] = feature_provider
+
+    service = make_service()
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            ),
+            "screener": app_config.screener.model_copy(
+                update={"universe": ["AAPL", "BTC/USD"]}
+            ),
+        }
+    )
+    service.config = config
+    limiter = RecordingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    alpaca = FakeAlpacaHistory()
+    coingecko = FakeCoinGeckoHTTP()
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+    monkeypatch.setattr(
+        live_features,
+        "build_features",
+        lambda *_args, **_kwargs: SimpleNamespace(source="fake"),
+    )
+
+    monitor = daemon_main._build_monitor(
+        config,
+        Secrets(app_api_token="historical-builder-secret"),
+        historical_alpaca_client_factory=lambda *_args: alpaca,
+        historical_coingecko_http=coingecko,
+        historical_cache_dir=tmp_path,
+    )
+    captured["feature_provider"]("MSFT")
+    captured["feature_provider"]("ETH/USD")
+
+    assert monitor.shadow is not None
+    assert alpaca.calls == 3
+    assert coingecko.calls == 4
+    assert limiter.principals.count(
+        "provider:alpaca:market-data"
+    ) == 3
+    assert limiter.principals.count(
+        "provider:coingecko:market-data"
+    ) == 4
+    assert service.broker.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["denied", "store-unavailable"],
+)
+def test_production_daemon_historical_denial_trips_breakers_without_calls(
+    app_config,
+    make_service,
+    monkeypatch,
+    tmp_path,
+    store_unavailable,
+):
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.dependencies import RequiredDependencyUnavailable
+    from trading_assistant.llm import factory as llm_factory
+
+    class DenyingLimiter:
+        def __init__(self):
+            self.principals: list[str] = []
+
+        def consume_pair(self, _spec, *, principal):
+            self.principals.append(principal)
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "historical limiter store unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    class FakeAlpacaHistory:
+        calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            raise AssertionError("denied Alpaca history call")
+
+    class FakeCoinGeckoHTTP:
+        calls = 0
+
+        def get(self, _url, _params):
+            self.calls += 1
+            raise AssertionError("denied CoinGecko history call")
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    service = make_service()
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            ),
+            "screener": app_config.screener.model_copy(
+                update={"universe": ["AAPL", "BTC/USD"]}
+            ),
+        }
+    )
+    service.config = config
+    limiter = DenyingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    alpaca = FakeAlpacaHistory()
+    coingecko = FakeCoinGeckoHTTP()
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+
+    with pytest.raises(RequiredDependencyUnavailable):
+        daemon_main._build_monitor(
+            config,
+            Secrets(app_api_token="historical-denial-secret"),
+            historical_alpaca_client_factory=lambda *_args: alpaca,
+            historical_coingecko_http=coingecko,
+            historical_cache_dir=tmp_path,
+        )
+
+    assert alpaca.calls == 0
+    assert coingecko.calls == 0
+    assert "provider:alpaca:market-data" in limiter.principals
+    assert "provider:coingecko:market-data" in limiter.principals
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.CRYPTO)
+    )
+    assert service.broker.submit_calls == 0
 
 
 def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):

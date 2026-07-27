@@ -11,7 +11,7 @@ injectable so parsing is unit-tested without network.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -33,9 +33,15 @@ def coin_id(symbol: str) -> str:
 
 
 class CoinGeckoClient:
-    def __init__(self, http: Any = None, cache_dir: str | Path = ".cache/bars") -> None:
+    def __init__(
+        self,
+        http: Any = None,
+        cache_dir: str | Path = ".cache/bars",
+        attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
+    ) -> None:
         self._http = http
         self._cache_dir = cache_dir
+        self._attempt_gate = attempt_gate
 
     def _client(self):
         if self._http is None:
@@ -45,7 +51,15 @@ class CoinGeckoClient:
         return self._http
 
     def _get(self, path: str, params: dict) -> Any:
-        resp = self._client().get(f"{BASE}{path}", params=params)
+        operation = lambda: self._client().get(
+            f"{BASE}{path}",
+            params=params,
+        )
+        resp = (
+            self._attempt_gate(operation)
+            if self._attempt_gate is not None
+            else operation()
+        )
         resp.raise_for_status()
         return resp.json()
 

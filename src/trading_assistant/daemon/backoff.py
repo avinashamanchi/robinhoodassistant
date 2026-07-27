@@ -19,7 +19,9 @@ from ..risk.breakers import BreakerScope
 
 _T = TypeVar("_T")
 RETRIABLE_READ_ERRORS = (TimeoutError, ConnectionError)
-SCHEDULED_MARKET_DATA_PRINCIPAL = "provider:alpaca:market-data"
+ALPACA_MARKET_DATA_PRINCIPAL = "provider:alpaca:market-data"
+COINGECKO_MARKET_DATA_PRINCIPAL = "provider:coingecko:market-data"
+SCHEDULED_MARKET_DATA_PRINCIPAL = ALPACA_MARKET_DATA_PRINCIPAL
 
 
 class ScheduledMarketDataDenied(RuntimeError):
@@ -85,6 +87,7 @@ def scheduled_market_data_read(
     *,
     rate_limiter,
     limit_config: WindowLimitConfig,
+    principal: str = SCHEDULED_MARKET_DATA_PRINCIPAL,
     retry_policy: RetryPolicy = RetryPolicy(),
     sleep: Callable[[float], object] = time.sleep,
 ) -> _T:
@@ -92,6 +95,8 @@ def scheduled_market_data_read(
 
     if rate_limiter is None:
         raise ValueError("scheduled market-data limiter is required")
+    if not principal.strip():
+        raise ValueError("scheduled market-data principal is required")
     spec = LimitSpec(
         name="provider_read",
         principal_requests=limit_config.requests,
@@ -104,7 +109,7 @@ def scheduled_market_data_read(
     def authorized_attempt():
         decision = rate_limiter.consume_pair(
             spec,
-            principal=SCHEDULED_MARKET_DATA_PRINCIPAL,
+            principal=principal,
         )
         if not decision.allowed:
             raise ScheduledMarketDataDenied(
