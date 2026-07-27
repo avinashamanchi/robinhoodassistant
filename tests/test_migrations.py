@@ -230,38 +230,105 @@ def test_policy_budget_migration_rejects_negative_counters(
 
 
 @pytest.mark.parametrize(
-    ("table_name", "statement"),
-    [
-        (
-            "provider reservations",
-            "INSERT INTO provider_reservations "
-            "(reservation_id,provider,category,request_id,budget_day,state,"
-            "input_reserved,output_reserved,created_at,expires_at) VALUES "
-            "('invalid-reservation-state','gemini','chat','request','2026-07-27',"
-            "'invalid',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        ),
-        (
-            "panic receipts",
-            "INSERT INTO panic_receipts "
-            "(account_scope,request_id,state,started_at,expires_at) VALUES "
-            "('invalid-panic-state','request','invalid',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        ),
-    ],
+    "state", ["reserved", "started", "settled", "unknown", "released"]
 )
-def test_policy_budget_migration_rejects_invalid_states(
-    tmp_path, table_name, statement
+def test_provider_reservation_migration_accepts_authoritative_states(
+    tmp_path, state
 ):
     engine, _cfg = _engine_at_revision(
-        tmp_path / f"invalid-{table_name}.db", "head"
+        tmp_path / f"accepted-reservation-{state}.db", "head"
+    )
+
+    reservation_id = f"accepted-reservation-{state}"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO provider_reservations "
+                "(reservation_id,provider,category,request_id,budget_day,state,"
+                "input_reserved,output_reserved,created_at,expires_at) VALUES "
+                "(:reservation_id,'gemini','chat','request','2026-07-27',:state,"
+                "0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            {"reservation_id": reservation_id, "state": state},
+        )
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT state FROM provider_reservations "
+                "WHERE reservation_id = :reservation_id"
+            ),
+            {"reservation_id": reservation_id},
+        ) == state
+
+
+@pytest.mark.parametrize("state", ["canceled", "expired"])
+def test_provider_reservation_migration_rejects_outside_states(tmp_path, state):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"rejected-reservation-{state}.db", "head"
     )
 
     with engine.connect() as connection:
         with pytest.raises(IntegrityError):
-            connection.execute(text(statement))
+            connection.execute(
+                text(
+                    "INSERT INTO provider_reservations "
+                    "(reservation_id,provider,category,request_id,budget_day,state,"
+                    "input_reserved,output_reserved,created_at,expires_at) VALUES "
+                    "(:reservation_id,'gemini','chat','request','2026-07-27',:state,"
+                    "0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {"reservation_id": f"rejected-reservation-{state}", "state": state},
+            )
+
+
+@pytest.mark.parametrize("state", ["started", "completed", "failed"])
+def test_panic_receipt_migration_accepts_authoritative_states(tmp_path, state):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"accepted-panic-{state}.db", "head"
+    )
+
+    account_scope = f"accepted-panic-{state}"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO panic_receipts "
+                "(account_scope,request_id,state,started_at,expires_at) VALUES "
+                "(:account_scope,'request',:state,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            {"account_scope": account_scope, "state": state},
+        )
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT state FROM panic_receipts "
+                "WHERE account_scope = :account_scope"
+            ),
+            {"account_scope": account_scope},
+        ) == state
+
+
+@pytest.mark.parametrize("state", ["reserved", "unknown"])
+def test_panic_receipt_migration_rejects_outside_states(tmp_path, state):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"rejected-panic-{state}.db", "head"
+    )
+
+    with engine.connect() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO panic_receipts "
+                    "(account_scope,request_id,state,started_at,expires_at) VALUES "
+                    "(:account_scope,'request',:state,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {"account_scope": f"rejected-panic-{state}", "state": state},
+            )
 
 
 @pytest.mark.parametrize(
-    ("durable_state", "statement"),
+    ("durable_state", "statement", "preserved_query", "expected_row"),
     [
         (
             "started provider reservation",
@@ -270,6 +337,9 @@ def test_policy_budget_migration_rejects_invalid_states(
             "input_reserved,output_reserved,created_at,expires_at) VALUES "
             "('started-reservation','gemini','chat','request','2026-07-27',"
             "'started',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "SELECT reservation_id, state FROM provider_reservations "
+            "WHERE reservation_id = 'started-reservation'",
+            ("started-reservation", "started"),
         ),
         (
             "unknown provider reservation",
@@ -278,17 +348,23 @@ def test_policy_budget_migration_rejects_invalid_states(
             "input_reserved,output_reserved,created_at,expires_at) VALUES "
             "('unknown-reservation','gemini','chat','request','2026-07-27',"
             "'unknown',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "SELECT reservation_id, state FROM provider_reservations "
+            "WHERE reservation_id = 'unknown-reservation'",
+            ("unknown-reservation", "unknown"),
         ),
         (
             "started panic receipt",
             "INSERT INTO panic_receipts "
             "(account_scope,request_id,state,started_at,expires_at) VALUES "
             "('started-panic','request','started',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "SELECT account_scope, state FROM panic_receipts "
+            "WHERE account_scope = 'started-panic'",
+            ("started-panic", "started"),
         ),
     ],
 )
 def test_policy_budget_downgrade_refuses_durable_inflight_state(
-    tmp_path, durable_state, statement
+    tmp_path, durable_state, statement, preserved_query, expected_row
 ):
     engine, cfg = _engine_at_revision(
         tmp_path / f"{durable_state}.db", "head"
@@ -303,6 +379,14 @@ def test_policy_budget_downgrade_refuses_durable_inflight_state(
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
         ) == "20260727_0011"
+        assert {
+            "rate_windows",
+            "concurrency_leases",
+            "provider_budget_days",
+            "provider_reservations",
+            "panic_receipts",
+        } <= set(inspect(engine).get_table_names())
+        assert connection.execute(text(preserved_query)).one() == expected_row
 
 
 def test_fill_activated_upgrade_refuses_active_legacy_plan(
