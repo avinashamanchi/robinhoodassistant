@@ -222,3 +222,55 @@ Focused GREEN:
 - No migration, real provider call, process, notification, broker action, or
   Task 5 composition was introduced.
 - No unresolved Task 4 fix-round concern.
+
+## Fix round 3
+
+### Review items resolved
+
+- Provider/day aggregate validation now derives overrun presence from every
+  settled reservation whose input or output actual exceeds its reservation.
+  Any overrun requires `reconciliation_required=True` and exactly
+  `provider_usage_over_reservation`; no overrun requires a false flag and empty
+  code because no other reconciliation code is currently supported.
+- The bidirectional reconciliation relation is enforced by the same aggregate
+  validator already used before reserve authorization, every transition,
+  cleanup, and status. Cleared flags/codes, changed codes, and stale
+  reconciliation without an overrun all fail closed.
+- Each provider estimator now serializes both valid provider-specific `auto`
+  and `any` envelopes when tools exist and returns the maximum UTF-8 byte
+  count. Tool-free payloads are serialized once with no explicit choice.
+- Added `tests/test_llm_budget_review_3.py`; modified only
+  `src/trading_assistant/llm/budget.py` for production behavior.
+
+### Strict TDD evidence
+
+- RED: `uv run pytest tests/test_llm_budget_review_3.py -v` collected 11 tests
+  and produced `5 failed, 6 passed`. Anthropic/Gemini `auto` exceeded the
+  estimator by one byte, while cleared-both, changed, and stale reconciliation
+  states escaped validation.
+- Estimator expectations are complete literal Anthropic, Gemini, and Groq
+  provider envelopes for both valid modes. No production builder or helper is
+  used to derive expected bytes.
+- Focused GREEN:
+  `uv run pytest tests/test_llm_budget_review_3.py
+  tests/test_llm_budget_review_2.py tests/test_llm_budget_review.py
+  tests/test_llm_budget.py tests/test_llm_backends.py tests/test_db_models.py -v`
+  produced `175 passed`.
+- Parallel reservation race: calls/input/output ceilings passed 20/20 repeated
+  runs, covering 60 real-SQLite concurrent-writer cases without overspend.
+- Single final full suite: `uv run pytest` produced
+  `1789 passed, 1 skipped, 1 warning in 242.07s`; the warning remains the
+  pre-existing `websockets.legacy` deprecation warning.
+
+### Fix-round self-review and concerns
+
+- Multiple settled reservations are folded with logical overrun existence:
+  any input or output overrun requires the exact durable marker.
+- Legitimate overrun settlement still charges exact actual usage before the
+  post-state reconciliation check and continues to block later reservations.
+- Estimation compares actual valid translated modes instead of relying on a
+  generic forced choice; Groq `required`, Anthropic `auto`, and Gemini `AUTO`
+  are each covered.
+- No migration, provider call, process, notification, broker action, factory
+  composition, or other Task 5 scope was introduced.
+- No unresolved Task 4 fix-round concern.

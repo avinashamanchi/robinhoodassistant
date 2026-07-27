@@ -31,6 +31,7 @@ _MILLION = Decimal(1_000_000)
 _RESERVATION_STATES = frozenset(
     {"reserved", "started", "settled", "unknown", "released"}
 )
+_USAGE_OVERRUN_CODE = "provider_usage_over_reservation"
 
 
 class ProviderBudgetUnavailable(RuntimeError):
@@ -162,20 +163,24 @@ class _ProviderPayloadEstimator:
         messages: list[dict],
         tools: list[dict],
     ) -> int:
-        payload = self._builder(
-            system=system,
-            messages=messages,
-            tools=tools,
-            conservative_tool_choice=True,
+        tool_choices = ("auto", "any") if tools else (None,)
+        return max(
+            len(
+                json.dumps(
+                    self._builder(
+                        system=system,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    ),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            for tool_choice in tool_choices
         )
-        serialized = json.dumps(
-            payload,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return len(serialized.encode("utf-8"))
 
 
 class AnthropicInputEstimator(_ProviderPayloadEstimator):
@@ -434,9 +439,7 @@ class ProviderBudgetService:
                 or output_tokens > reservation.output_reserved
             ):
                 day.reconciliation_required = True
-                day.reconciliation_code = (
-                    "provider_usage_over_reservation"
-                )
+                day.reconciliation_code = _USAGE_OVERRUN_CODE
             day.updated_at = current
             reservation.input_actual = input_tokens
             reservation.output_actual = output_tokens
@@ -872,6 +875,7 @@ class ProviderBudgetService:
         ).all()
         days_by_date: dict[date, ProviderBudgetDay] = {}
         expected: dict[date, list[int]] = {}
+        overruns: dict[date, bool] = {}
         for day in days:
             cls._validate_day(day)
             if day.provider != provider or day.budget_day in days_by_date:
@@ -880,6 +884,7 @@ class ProviderBudgetService:
                 )
             days_by_date[day.budget_day] = day
             expected[day.budget_day] = [0, 0, 0]
+            overruns[day.budget_day] = False
 
         for reservation in reservations:
             cls._validate_reservation(reservation)
@@ -900,6 +905,13 @@ class ProviderBudgetService:
             if reservation.state == "settled":
                 totals[1] += reservation.input_actual
                 totals[2] += reservation.output_actual
+                if (
+                    reservation.input_actual
+                    > reservation.input_reserved
+                    or reservation.output_actual
+                    > reservation.output_reserved
+                ):
+                    overruns[reservation.budget_day] = True
             else:
                 totals[1] += reservation.input_reserved
                 totals[2] += reservation.output_reserved
@@ -910,6 +922,15 @@ class ProviderBudgetService:
                 day.calls_used != totals[0]
                 or day.input_tokens_used != totals[1]
                 or day.output_tokens_used != totals[2]
+            ):
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
+            overrun = overruns[budget_day]
+            if (
+                day.reconciliation_required is not overrun
+                or day.reconciliation_code
+                != (_USAGE_OVERRUN_CODE if overrun else "")
             ):
                 raise ProviderBudgetUnavailable(
                     "corrupt provider budget state"
