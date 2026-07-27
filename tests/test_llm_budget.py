@@ -286,6 +286,31 @@ def test_budgeted_backend_rejects_empty_request_id_before_store_or_delegate(
     assert delegate.calls == []
 
 
+def test_budgeted_backend_requires_explicit_request_id_before_store_or_delegate(
+    session_factory,
+):
+    counting_factory = CountingSessionFactory(session_factory)
+    delegate = ScriptedBackend([])
+    backend = BudgetedLLMBackend(
+        delegate,
+        _service(counting_factory),
+        provider="test",
+        category="analysis",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+
+    with pytest.raises(TypeError, match="request_id"):
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+        )
+
+    assert counting_factory.calls == 0
+    assert delegate.calls == []
+
+
 def test_mark_started_precedes_delegate_invocation(session_factory):
     service = _service(session_factory)
     observed_states: list[str] = []

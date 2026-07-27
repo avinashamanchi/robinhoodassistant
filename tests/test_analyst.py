@@ -61,6 +61,34 @@ def test_analyst_returns_structured_report():
     assert report.cited_concepts and report.regime_note
 
 
+def test_analyst_passes_explicit_request_id_to_analysis_attempt():
+    class CaptureBackend:
+        def __init__(self):
+            self.request_ids: list[str] = []
+
+        def create(self, **kwargs):
+            self.request_ids.append(kwargs["request_id"])
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        name="submit_analysis",
+                        id="t1",
+                        input=_VALID,
+                    )
+                ]
+            )
+
+    backend = CaptureBackend()
+
+    Analyst(backend, max_attempts=2).analyze(
+        _feat(),
+        request_id="  analyst-analysis-parent  ",
+    )
+
+    assert backend.request_ids == ["analyst-analysis-parent"]
+
+
 def test_missing_cited_concepts_rejected():
     bad = dict(_VALID, cited_concepts=[])
     with pytest.raises(ValidationError):
@@ -170,14 +198,20 @@ def test_analyst_uses_one_configured_structured_attempt_and_request_id():
     assert backend.request_ids == ["configured-structured-attempt"]
 
 
-_MISSING_REQUEST_ID = object()
+@pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
+def test_analyst_requires_explicit_request_id_keyword(method):
+    backend = _backend(_VALID)
+    analyst = Analyst(backend, max_attempts=2)
+
+    with pytest.raises(TypeError, match="request_id"):
+        getattr(analyst, method)(_feat())
 
 
 @pytest.mark.parametrize("method", ["analyze", "analyze_plan"])
 @pytest.mark.parametrize(
     "request_id",
-    [_MISSING_REQUEST_ID, None, "", " ", "\t"],
-    ids=["missing", "none", "empty", "space", "tab"],
+    [None, "", " ", "\t"],
+    ids=["none", "empty", "space", "tab"],
 )
 def test_analyst_rejects_missing_request_id_before_backend(
     method,
@@ -201,13 +235,8 @@ def test_analyst_rejects_missing_request_id_before_backend(
 
     backend = CountingBackend()
     analyst = Analyst(backend, max_attempts=2)
-    kwargs = (
-        {}
-        if request_id is _MISSING_REQUEST_ID
-        else {"request_id": request_id}
-    )
 
     with pytest.raises(ValueError, match="request_id"):
-        getattr(analyst, method)(_feat(), **kwargs)
+        getattr(analyst, method)(_feat(), request_id=request_id)
 
     assert backend.calls == 0

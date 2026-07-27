@@ -7,10 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event, func, select
 
+from trading_assistant.analyst.analyst import Analyst
 from trading_assistant.analyst.models import (
     EntryPlan,
     ExitPlan,
@@ -40,11 +42,19 @@ from trading_assistant.db.models import (
     PLAN_CANCEL_REQUESTED,
     PLAN_CANCEL_SETTLED,
     Proposal,
+    ProviderBudgetDay,
+    ProviderReservation,
     Rule,
     RuleGroup,
     TradePlanRow,
 )
 from trading_assistant.dependencies import RequiredDependencyUnavailable
+from trading_assistant.llm.base import BudgetedLLMBackend
+from trading_assistant.llm.budget import (
+    BudgetLimits,
+    ProviderBudgetService,
+    Utf8ByteUpperBoundEstimator,
+)
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.clock import FakeClock
@@ -148,6 +158,90 @@ def test_planning_passes_boundary_request_id_to_each_structured_attempt(
     )
 
     assert analyst.request_ids == ["planning-budget-request"]
+
+
+def test_planning_repair_attempts_share_parent_id_but_reserve_separately(
+    make_service,
+):
+    class RepairBackend:
+        def __init__(self):
+            plan_input = _plan().model_dump(
+                mode="json",
+                exclude={"symbol", "as_of", "reference_price"},
+            )
+            self.responses = [
+                SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="invalid")],
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                ),
+                SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            type="tool_use",
+                            name="submit_plan",
+                            input=plan_input,
+                        )
+                    ],
+                    usage=SimpleNamespace(input_tokens=2, output_tokens=2),
+                ),
+            ]
+            self.request_ids: list[str] = []
+
+        def create(self, **kwargs):
+            self.request_ids.append(kwargs["request_id"])
+            return self.responses.pop(0)
+
+    service = make_service()
+    delegate = RepairBackend()
+    budget = ProviderBudgetService(
+        service.session_factory,
+        BudgetLimits(
+            calls=10,
+            input_tokens=100_000,
+            output_tokens=10_000,
+        ),
+    )
+    backend = BudgetedLLMBackend(
+        delegate,
+        budget,
+        provider="test",
+        category="analysis",
+        max_output_tokens=100,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+    planning = PlanningService(
+        service,
+        Analyst(backend, max_attempts=2),
+        _provider,
+        Secrets(),
+    )
+
+    planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="repair invalid structured plan",
+        request_id="planning-repair-parent",
+    )
+
+    assert delegate.request_ids == [
+        "planning-repair-parent",
+        "planning-repair-parent",
+    ]
+    with service.session_factory() as session:
+        reservations = session.scalars(
+            select(ProviderReservation).where(
+                ProviderReservation.request_id == "planning-repair-parent"
+            )
+        ).all()
+        day = session.scalar(
+            select(ProviderBudgetDay).where(
+                ProviderBudgetDay.provider == "test"
+            )
+        )
+    assert len(reservations) == 2
+    assert len({row.reservation_id for row in reservations}) == 2
+    assert {row.state for row in reservations} == {"settled"}
+    assert day.calls_used == 2
 
 
 def test_live_feature_provider_types_primary_market_data_outage(

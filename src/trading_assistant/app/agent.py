@@ -222,7 +222,10 @@ class Agent:
         reason: str,
         request_id: str,
     ) -> dict[str, Any]:
-        if not actor.strip() or not reason.strip() or not request_id.strip():
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = request_id.strip()
+        if not actor or not reason or not request_id:
             raise ValueError(
                 "chat actor, reason, and request_id must be non-empty"
             )

@@ -91,6 +91,49 @@ def test_agent_calls_tool_then_replies(make_service):
     ]
 
 
+def test_agent_uses_one_normalized_request_id_for_provider_turns_and_audit(
+    make_service,
+):
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        "t1",
+                        "propose_order",
+                        {
+                            "ticker": "AAPL",
+                            "side": "buy",
+                            "order_type": "market",
+                            "notional": "100",
+                        },
+                    )
+                ],
+            ),
+            _resp("end_turn", [_text("Proposed for review.")]),
+        ],
+    )
+
+    agent.chat(
+        "Propose $100 of AAPL",
+        actor="operator:test",
+        reason="capture stable parent identity",
+        request_id="  http-request-123  ",
+    )
+
+    assert agent.backend.request_ids == [
+        "http-request-123",
+        "http-request-123",
+    ]
+    with svc.session_factory() as session:
+        audit = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "order.propose")
+        )
+    assert audit.request_id == "http-request-123"
+
+
 def test_agent_proposes_order_but_does_not_execute(make_service):
     agent, svc = _agent(
         make_service,

@@ -407,6 +407,26 @@ def test_decision_request_id_normalizes_symbol_run_and_equivalent_offset():
     )
     assert analyst.request_ids == [expected]
 
+    changed_symbol = RecordingAnalyst()
+    AnalystStrategy(
+        changed_symbol,
+        LLMRunConfig(),
+        run_id="holdout-2022",
+    ).on_bar(offset_features.model_copy(update={"symbol": "MSFT"}))
+    changed_time = RecordingAnalyst()
+    AnalystStrategy(
+        changed_time,
+        LLMRunConfig(),
+        run_id="holdout-2022",
+    ).on_bar(
+        offset_features.model_copy(
+            update={"as_of": TS + timedelta(seconds=1)}
+        )
+    )
+    assert changed_symbol.request_ids[0] != expected
+    assert changed_time.request_ids[0] != expected
+    assert changed_symbol.request_ids[0] != changed_time.request_ids[0]
+
 
 @pytest.mark.parametrize("symbol", ["", " ", "\t"])
 def test_decision_rejects_blank_symbol_before_provider(symbol):

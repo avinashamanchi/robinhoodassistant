@@ -96,7 +96,7 @@ class BudgetedLLMBackend:
         messages: list[dict],
         tools: list[dict],
         tool_choice: str | None = None,
-        request_id: str = "",
+        request_id: str,
     ):
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("budgeted LLM calls require request_id")

@@ -8,11 +8,13 @@ track record on live data in parallel with manual paper trading — nothing trad
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Callable, Optional
-from uuid import uuid4
 
 from sqlalchemy import select
 
@@ -34,6 +36,27 @@ def _base_report(plan: TradePlan) -> AnalysisReport:
     )
 
 DEFAULT_HORIZON_DAYS = 5
+
+
+def _request_id_for_daily_call(
+    scheduled_date: date,
+    analyst_version: str,
+    symbol: str,
+) -> str:
+    material = json.dumps(
+        {
+            "analyst_version": analyst_version,
+            "scheduled_date": scheduled_date.isoformat(),
+            "symbol": symbol.strip().upper(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = base64.urlsafe_b64encode(
+        hashlib.sha256(material.encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    return f"shadow:{digest}"
 
 
 class ShadowRunner:
@@ -87,10 +110,14 @@ class ShadowRunner:
                 ).scalars()
             )
         plan_ids: list[int] = []
-        request_id = uuid4().hex
         for c in candidates:
             if c["symbol"] in completed_symbols:
                 continue
+            request_id = _request_id_for_daily_call(
+                day_start.date(),
+                version,
+                c["symbol"],
+            )
             try:
                 # Stores a shadow plan only; it never creates or executes an order.
                 out = self.planning.analyze(

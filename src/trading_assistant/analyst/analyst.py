@@ -195,7 +195,7 @@ class Analyst:
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
         *,
-        request_id: str | None = None,
+        request_id: str,
     ) -> AnalysisReport:
         budget_request_id = self._request_id(request_id)
         resp = self._create(
@@ -224,7 +224,8 @@ class Analyst:
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
         news: Optional[list[str]] = None,
-        request_id: str | None = None,
+        *,
+        request_id: str,
     ):
         """Produce a full TradePlan (scenarios, invalidation, entry ladder, exits)."""
         from decimal import Decimal

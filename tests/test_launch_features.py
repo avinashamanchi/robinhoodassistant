@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -173,6 +175,72 @@ def test_shadow_batch_is_idempotent_across_process_restarts(make_service):
 
     assert len(first_process.run_once()) == 1
     assert second_process.run_once() == []
+
+
+def test_shadow_request_identity_is_stable_per_persisted_daily_call(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import db
+
+    fixed_now = datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(db.models, "utcnow", lambda: fixed_now)
+    svc = make_service()
+    source = DataSource(
+        {
+            symbol: make_bars(300, seed=index)
+            for index, symbol in enumerate(["AAPL", "MSFT", "SPY"])
+        }
+    )
+
+    class CaptureFailurePlanning:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def analyze(self, symbol, **context):
+            self.calls.append((symbol, context["request_id"]))
+            raise RuntimeError("capture only")
+
+    first = CaptureFailurePlanning()
+    second = CaptureFailurePlanning()
+    ShadowRunner(
+        svc,
+        first,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    ShadowRunner(
+        svc,
+        second,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+
+    assert len(first.calls) == 2
+    assert second.calls == first.calls
+    assert len({request_id for _symbol, request_id in first.calls}) == 2
+    for symbol, request_id in first.calls:
+        material = json.dumps(
+            {
+                "analyst_version": svc.config.analyst.version,
+                "scheduled_date": fixed_now.date().isoformat(),
+                "symbol": symbol.upper(),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(material.encode("utf-8")).digest()
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
+        assert request_id == f"shadow:{digest}"
+        assert len(request_id) <= 64
 
 
 # ── D2 digest ───────────────────────────────────────────────────
