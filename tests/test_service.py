@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 
 from trading_assistant.broker.mock import MockBroker
-from trading_assistant.broker.models import Position
+from trading_assistant.broker.models import OrderStatus, Position
 from trading_assistant.db.models import (
     AuditEvent,
     Order,
@@ -72,6 +72,42 @@ def test_propose_creates_pending_and_does_not_execute(app_config, session_factor
     open_orders = svc.get_open_orders()
     assert len(open_orders) == 1
     assert open_orders[0]["status"] == "proposed"
+
+
+def test_get_open_orders_includes_every_nonterminal_outbox_state(
+    app_config,
+    session_factory,
+):
+    svc = _service(app_config, session_factory)
+    nonterminal = [
+        OrderStatus.PROPOSED,
+        OrderStatus.APPROVED,
+        OrderStatus.APPROVAL_RECORDED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.ACCEPTANCE_UNKNOWN,
+        OrderStatus.SUBMITTED,
+        OrderStatus.PARTIALLY_FILLED,
+    ]
+    with session_factory() as session:
+        for index, status in enumerate(
+            [*nonterminal, OrderStatus.FILLED],
+            start=1,
+        ):
+            session.add(
+                Order(
+                    idempotency_key=f"open-state-{index}",
+                    ticker="AAPL",
+                    side="buy",
+                    order_type="market",
+                    notional=Decimal("10"),
+                    status=status.value,
+                )
+            )
+        session.commit()
+
+    listed = {row["status"] for row in svc.get_open_orders()}
+
+    assert listed == {status.value for status in nonterminal}
 
 
 def test_rejected_order_is_persisted_with_reason(app_config, session_factory):

@@ -70,6 +70,27 @@ def _provider(sym):
                           last_close=100.0, regime=Regime.RANGING)
 
 
+def _propose_and_approve_bracket(
+    service,
+    request,
+    take_profit,
+    stop_loss,
+    **context,
+):
+    proposal = service.propose_bracket_order(
+        request,
+        take_profit,
+        stop_loss,
+        **context,
+    )
+    if proposal["status"] != "proposed":
+        return proposal
+    return service.approve_order(
+        proposal["order_id"],
+        **context,
+    )
+
+
 # ── D1 shadow mode ──────────────────────────────────────────────
 def test_shadow_creates_graded_calls_without_orders(make_service):
     svc = make_service()
@@ -220,7 +241,8 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         limit_price=Decimal("100"),
     )
 
-    first = svc.submit_bracket_order(
+    first = _propose_and_approve_bracket(
+        svc,
         request,
         Decimal("110"),
         Decimal("95"),
@@ -237,7 +259,8 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
         assert stored.status == "acceptance_unknown"
         assert stored.broker_order_id is None
 
-    result = svc.submit_bracket_order(
+    result = _propose_and_approve_bracket(
+        svc,
         request,
         Decimal("110"),
         Decimal("95"),
@@ -249,6 +272,51 @@ def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
     assert result["executed"] is False
     assert result["status"] == "acceptance_unknown"
     assert len(broker._orders_by_key) == 1
+
+
+def test_bracket_public_path_only_proposes_until_normal_human_approval(
+    make_service,
+):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="human-gated-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    proposal = service.propose_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="propose bracket for review",
+        request_id="human-gated-bracket-proposal",
+    )
+
+    assert not hasattr(service, "submit_bracket_order")
+    assert proposal["status"] == "proposed"
+    assert proposal["executed"] is False
+    assert service.broker.submit_calls == 0
+
+    result = service.approve_order(
+        proposal["order_id"],
+        actor="operator:test",
+        reason="explicitly reviewed bracket",
+        request_id="human-gated-bracket-approval",
+    )
+
+    assert result["status"] == "submitted"
+    assert result["executed"] is True
+    assert service.broker.submit_calls == 1
 
 
 def test_bracket_proposal_audit_is_exact_and_idempotent(make_service):
@@ -273,13 +341,15 @@ def test_bracket_proposal_audit_is_exact_and_idempotent(make_service):
         "request_id": "bracket-proposal-audit",
     }
 
-    first = service.submit_bracket_order(
+    first = _propose_and_approve_bracket(
+        service,
         request,
         Decimal("110"),
         Decimal("95"),
         **context,
     )
-    replay = service.submit_bracket_order(
+    replay = _propose_and_approve_bracket(
+        service,
         request,
         Decimal("110"),
         Decimal("95"),
@@ -356,7 +426,7 @@ def test_bracket_proposal_audit_failure_rolls_back_and_retry_is_safe(
             RuntimeError,
             match="injected bracket proposal audit failure",
         ):
-            service.submit_bracket_order(
+            service.propose_bracket_order(
                 request,
                 Decimal("110"),
                 Decimal("95"),
@@ -390,7 +460,8 @@ def test_bracket_proposal_audit_failure_rolls_back_and_retry_is_safe(
     assert service.broker.submit_calls == 0
     assert service.broker.brackets == []
 
-    result = service.submit_bracket_order(
+    result = _propose_and_approve_bracket(
+        service,
         request,
         Decimal("110"),
         Decimal("95"),

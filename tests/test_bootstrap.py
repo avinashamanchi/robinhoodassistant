@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from decimal import Decimal
 
 import pytest
 
 from trading_assistant.app.auth import SessionAuth
 from trading_assistant.app.main import create_app
+from trading_assistant.broker.alpaca import AlpacaBroker
+from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
+from trading_assistant.broker.models import (
+    OrderRequest,
+    OrderSide,
+    OrderType,
+)
 from trading_assistant.config import BrokerKind, Secrets, TradingMode
 from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.schema import SchemaOutOfDate
@@ -57,6 +65,160 @@ def _injected_container(service, secrets):
 class _StubAgent:
     def chat(self, message, **context):
         return {"reply": message, "context": context}
+
+
+class _MutationTradingClient:
+    def __init__(self) -> None:
+        self._sandbox = True
+        self._base_url = "https://paper-api.alpaca.markets"
+        self.submit_calls = 0
+        self.cancel_calls = 0
+        self._orders: dict[str, SimpleNamespace] = {}
+
+    def submit_order(self, order_data):
+        self.submit_calls += 1
+        order = SimpleNamespace(
+            id=f"broker-{self.submit_calls}",
+            client_order_id=order_data.client_order_id,
+            status=SimpleNamespace(value="new"),
+            filled_qty="0",
+            filled_avg_price=None,
+            symbol=order_data.symbol,
+            asset_class=SimpleNamespace(value="us_equity"),
+        )
+        self._orders[order.id] = order
+        return order
+
+    def cancel_order_by_id(self, order_id):
+        self.cancel_calls += 1
+        order = self._orders[order_id]
+        order.status = SimpleNamespace(value="canceled")
+
+    def get_order_by_id(self, order_id):
+        return self._orders[order_id]
+
+
+def _paper_alpaca_broker() -> tuple[AlpacaBroker, _MutationTradingClient]:
+    trading = _MutationTradingClient()
+    broker = AlpacaBroker(trading, SimpleNamespace())
+    broker.get_order_by_client_id = lambda _client_id: None
+    return broker, trading
+
+
+def _market_order(key: str) -> OrderRequest:
+    return OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        idempotency_key=key,
+        notional=Decimal("10"),
+    )
+
+
+def _bracket_order(key: str) -> OrderRequest:
+    return OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key=key,
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+
+def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    broker, trading = _paper_alpaca_broker()
+    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda *_args: FakeClock(is_open=True),
+    )
+
+    container = bootstrap.build_container(
+        _alpaca_config(app_config),
+        _migrated_secrets(tmp_path),
+    )
+
+    submitted = container.broker.submit_order(_market_order("paper-submit"))
+    bracket = container.broker.submit_bracket(
+        _bracket_order("paper-bracket"),
+        Decimal("110"),
+        Decimal("95"),
+    )
+    container.broker.cancel_order(submitted.broker_order_id)
+    assert bracket.broker_order_id is not None
+    assert trading.submit_calls == 2
+    assert trading.cancel_calls == 1
+
+    trading._sandbox = False
+    trading._base_url = "https://api.alpaca.markets"
+    writes_before = (trading.submit_calls, trading.cancel_calls)
+
+    with pytest.raises(
+        BrokerSubmissionRejected,
+        match="not official Alpaca paper",
+    ):
+        container.broker.submit_order(_market_order("blocked-submit"))
+    with pytest.raises(
+        BrokerSubmissionRejected,
+        match="not official Alpaca paper",
+    ):
+        container.broker.submit_bracket(
+            _bracket_order("blocked-bracket"),
+            Decimal("110"),
+            Decimal("95"),
+        )
+    with pytest.raises(
+        BrokerSubmissionRejected,
+        match="not official Alpaca paper",
+    ):
+        container.broker.cancel_order(bracket.broker_order_id)
+
+    assert (trading.submit_calls, trading.cancel_calls) == writes_before
+
+
+def test_production_container_rejects_non_alpaca_or_unsafe_target(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda *_args: FakeClock(is_open=True),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args: MockBroker(),
+    )
+    with pytest.raises(RuntimeError, match="exact AlpacaBroker"):
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
+        )
+
+    broker, trading = _paper_alpaca_broker()
+    trading._sandbox = False
+    trading._base_url = "https://api.alpaca.markets"
+    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    with pytest.raises(
+        BrokerSubmissionRejected,
+        match="not official Alpaca paper",
+    ):
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
+        )
 
 
 def test_create_app_builds_missing_agent_from_exact_injected_container(

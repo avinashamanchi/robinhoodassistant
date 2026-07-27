@@ -42,6 +42,7 @@ from .db.models import (
     LLMDecision,
     Order,
     OrderStateMachine,
+    NONTERMINAL_STATES,
     Proposal,
     RiskEvent,
     Rule,
@@ -71,13 +72,9 @@ from .risk.submission_barrier import (
     serialized_writer,
 )
 
-# Statuses that count as "still live / open" for listing purposes.
-_OPEN_STATUSES = (
-    OrderStatus.PROPOSED.value,
-    OrderStatus.APPROVED.value,
-    OrderStatus.SUBMITTED.value,
-    OrderStatus.PARTIALLY_FILLED.value,
-)
+# Every nonterminal state must remain visible to operators and MCP callers,
+# especially indeterminate outbox states that require reconciliation.
+_OPEN_STATUSES = tuple(status.value for status in NONTERMINAL_STATES)
 
 _EXIT_RESERVATION_STATUSES = (
     OrderStatus.APPROVED.value,
@@ -535,7 +532,7 @@ class TradingService:
             "risk_reasons": list(result.risk_reasons),
         }
 
-    def submit_bracket_order(
+    def propose_bracket_order(
         self,
         order_req: OrderRequest,
         take_profit,
@@ -545,7 +542,7 @@ class TradingService:
         reason: str,
         request_id: str,
     ) -> dict[str, Any]:
-        """Persist, approve, and submit a bracket through the same durable outbox."""
+        """Persist a bracket proposal; only ``approve_order`` may execute it."""
         actor, reason, request_id = _require_mutation_context(
             actor,
             reason,
@@ -637,31 +634,14 @@ class TradingService:
                 current = session.get(Order, order_id)
                 assert current is not None
                 current_status = OrderStatus(current.status)
-            if current_status is OrderStatus.PROPOSED:
-                approval = self.order_application.approve(
-                    ApprovalCommand(
-                        order_id,
-                        actor,
-                        reason,
-                        utcnow(),
-                        request_id,
-                    )
-                )
-                current_status = approval.status
-        result = self.order_submission.submit(
-            order_id,
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
+                broker_order_id = current.broker_order_id
         return {
-            "executed": result.status
-            in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
+            "executed": False,
             "bracket": True,
             "order_id": order_id,
-            "status": result.status.value,
-            "broker_order_id": result.broker_order_id,
-            "risk_reasons": list(result.risk_reasons),
+            "status": current_status.value,
+            "broker_order_id": broker_order_id,
+            "risk_reasons": [],
         }
 
     @serialized_writer

@@ -1296,7 +1296,12 @@ def _bracket_submission_process(
     )
     started.set()
     try:
-        result = service.submit_bracket_order(
+        context = {
+            "actor": "operator:process-bracket",
+            "reason": "human reviewed process bracket",
+            "request_id": "process-bracket-race",
+        }
+        proposal = service.propose_bracket_order(
             OrderRequest(
                 ticker="AAPL",
                 side=OrderSide.BUY,
@@ -1307,9 +1312,11 @@ def _bracket_submission_process(
             ),
             Decimal("110"),
             Decimal("95"),
-            actor="operator:process-bracket",
-            reason="human reviewed process bracket",
-            request_id="process-bracket-race",
+            **context,
+        )
+        result = service.approve_order(
+            proposal["order_id"],
+            **context,
         )
         outcome.put(
             (

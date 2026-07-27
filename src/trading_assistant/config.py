@@ -8,8 +8,9 @@ Two sources, deliberately separated:
   dropped risk limit is the worst failure mode this project has.
 * ``.env`` — secrets, loaded via pydantic-settings (:class:`Secrets`).
 
-Live trading is gated by a double-lock (guardrail #1): ``trading.mode == "live"``
-in the YAML AND ``LIVE_TRADING_CONFIRM`` equal to the exact confirmation string.
+Legacy live-mode fields remain parseable for configuration compatibility, but
+the safety-foundation production bootstrap and broker factory reject/ignore
+them: this release is hard-locked to Alpaca paper trading.
 """
 
 from __future__ import annotations

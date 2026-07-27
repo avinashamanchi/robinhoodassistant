@@ -1,12 +1,8 @@
-"""Selects the broker + clock implementation from config, enforcing guardrail #1.
-
-An Alpaca broker is only ever built in LIVE mode when the double-lock is
-satisfied; otherwise it is forced to paper. The mock broker needs no creds.
-"""
+"""Select broker + clock implementations for this paper-only release."""
 
 from __future__ import annotations
 
-from ..config import AppConfig, BrokerKind, Secrets, live_trading_enabled
+from ..config import AppConfig, BrokerKind, Secrets
 from .base import BrokerClient
 from .mock import MockBroker
 
@@ -15,14 +11,12 @@ def build_broker(config: AppConfig, secrets: Secrets) -> BrokerClient:
     if config.trading.broker is BrokerKind.MOCK:
         return MockBroker()
 
-    # Alpaca: paper unless the full double-lock is satisfied.
     from .alpaca import AlpacaBroker  # lazy: keeps mock-only installs SDK-free
 
-    paper = not live_trading_enabled(config, secrets)
     return AlpacaBroker.from_credentials(
         secrets.alpaca_api_key,
         secrets.alpaca_secret_key,
-        paper=paper,
+        paper=True,
         timeout_seconds=config.trading.request_timeout_seconds,
     )
 
@@ -36,10 +30,9 @@ def build_clock(config: AppConfig, secrets: Secrets):
 
     from .alpaca import AlpacaClock
 
-    paper = not live_trading_enabled(config, secrets)
     return AlpacaClock.from_credentials(
         secrets.alpaca_api_key,
         secrets.alpaca_secret_key,
-        paper=paper,
+        paper=True,
         timeout_seconds=config.trading.request_timeout_seconds,
     )

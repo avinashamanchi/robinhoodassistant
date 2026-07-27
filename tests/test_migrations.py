@@ -201,6 +201,76 @@ def test_adoption_backup_contains_committed_wal_rows(tmp_path):
         ) == 1
 
 
+def test_adoption_backup_does_not_follow_predictable_target_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate
+
+    path = tmp_path / "legacy.db"
+    engine = _legacy_engine(path)
+    victim = tmp_path / "must-not-be-overwritten.txt"
+    victim.write_text("sentinel", encoding="utf-8")
+    frozen = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+    monkeypatch.setattr(migrate, "datetime", FrozenDateTime)
+    predictable = path.with_name(
+        f"{path.name}.20260726T123456000000Z.pre-migration.bak"
+    )
+    predictable.symlink_to(victim)
+
+    backup = adopt_existing(engine)
+
+    assert backup != predictable
+    assert backup.exists()
+    assert not backup.is_symlink()
+    assert victim.read_text(encoding="utf-8") == "sentinel"
+    assert predictable.is_symlink()
+    assert not list(tmp_path.glob(f".{path.name}.migration-backup-*"))
+
+
+def test_adoption_backup_publication_never_replaces_existing_name(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate
+
+    path = tmp_path / "legacy.db"
+    engine = _legacy_engine(path)
+    frozen = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+    target_tokens = iter(("collision", "fresh"))
+
+    def token_hex(size):
+        if size == 16:
+            return "private-staging"
+        return next(target_tokens)
+
+    monkeypatch.setattr(migrate, "datetime", FrozenDateTime)
+    monkeypatch.setattr(migrate.secrets, "token_hex", token_hex)
+    collision = path.with_name(
+        f"{path.name}.20260726T123456000000Z.collision."
+        "pre-migration.bak"
+    )
+    collision.write_text("sentinel", encoding="utf-8")
+
+    backup = adopt_existing(engine)
+
+    assert backup.name.endswith(".fresh.pre-migration.bak")
+    assert collision.read_text(encoding="utf-8") == "sentinel"
+    assert not list(tmp_path.glob(f".{path.name}.migration-backup-*"))
+
+
 def test_unknown_revision_is_rejected_at_startup(tmp_path):
     engine = create_db_engine(_url(tmp_path / "unknown.db"))
     with engine.begin() as conn:

@@ -1,8 +1,12 @@
 import argparse
+import os
+import secrets
 import sqlite3
 import sys
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from alembic import command
 from alembic.config import Config
@@ -21,6 +25,7 @@ LEGACY_TABLES = {
     "llm_decisions", "orders", "proposals", "risk_events", "rules",
     "shadow_calls", "trade_plans",
 }
+_BACKUP_NAME_ATTEMPTS = 16
 
 
 def _config(engine: Engine) -> Config:
@@ -35,15 +40,17 @@ def _backup(engine: Engine) -> Path | None:
         return None
     source = Path(url.database).resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    target = source.with_name(f"{source.name}.{stamp}.pre-migration.bak")
-    # SQLite's online backup API includes committed WAL pages. A raw file copy
-    # can silently omit them.
-    with sqlite3.connect(source) as source_db, sqlite3.connect(target) as backup_db:
+    source_uri = f"file:{quote(str(source), safe='/')}?mode=ro"
+    # SQLite's online backup API includes committed WAL pages. Materialize into
+    # memory first so no attacker-controlled filesystem path is ever opened by
+    # SQLite as a writable destination.
+    with (
+        sqlite3.connect(source_uri, uri=True) as source_db,
+        sqlite3.connect(":memory:") as backup_db,
+    ):
         source_db.backup(backup_db)
-    with sqlite3.connect(target) as backup_db:
         integrity = backup_db.execute("PRAGMA integrity_check").fetchone()
         if integrity != ("ok",):
-            target.unlink(missing_ok=True)
             raise RuntimeError(f"migration backup failed integrity check: {integrity!r}")
         backed_up_tables = {
             row[0]
@@ -51,12 +58,125 @@ def _backup(engine: Engine) -> Path | None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-    source_tables = set(inspect(engine).get_table_names())
+        source_tables = {
+            row[0]
+            for row in source_db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        serialized = backup_db.serialize()
     if backed_up_tables != source_tables:
-        target.unlink(missing_ok=True)
         raise RuntimeError("migration backup table manifest mismatch")
-    target.chmod(0o600)
-    return target
+
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(source.parent, directory_flags)
+    staging_name: str | None = None
+    staging_fd: int | None = None
+    try:
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_flags |= getattr(os, "O_CLOEXEC", 0)
+        for _ in range(_BACKUP_NAME_ATTEMPTS):
+            candidate = (
+                f".{source.name}.migration-backup-"
+                f"{secrets.token_hex(16)}"
+            )
+            try:
+                staging_fd = os.open(
+                    candidate,
+                    file_flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            staging_name = candidate
+            break
+        if staging_fd is None or staging_name is None:
+            raise RuntimeError("could not allocate private migration backup")
+
+        os.fchmod(staging_fd, 0o600)
+        remaining = memoryview(serialized)
+        while remaining:
+            written = os.write(staging_fd, remaining)
+            if written <= 0:
+                raise OSError("short write creating migration backup")
+            remaining = remaining[written:]
+        os.fsync(staging_fd)
+
+        staged = os.fstat(staging_fd)
+        linked = os.stat(
+            staging_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or (staged.st_dev, staged.st_ino)
+            != (linked.st_dev, linked.st_ino)
+        ):
+            raise RuntimeError("migration backup staging identity changed")
+
+        target_name: str | None = None
+        for _ in range(_BACKUP_NAME_ATTEMPTS):
+            candidate = (
+                f"{source.name}.{stamp}.{secrets.token_hex(8)}."
+                "pre-migration.bak"
+            )
+            try:
+                os.link(
+                    staging_name,
+                    candidate,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                continue
+            target_name = candidate
+            break
+        if target_name is None:
+            raise RuntimeError("could not publish migration backup")
+
+        published = os.stat(
+            target_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or (staged.st_dev, staged.st_ino)
+            != (published.st_dev, published.st_ino)
+        ):
+            raise RuntimeError("migration backup publication identity changed")
+        os.fsync(directory_fd)
+        os.unlink(staging_name, dir_fd=directory_fd)
+        staging_name = None
+        os.fsync(directory_fd)
+        return source.parent / target_name
+    finally:
+        if staging_name is not None and staging_fd is not None:
+            try:
+                staged = os.fstat(staging_fd)
+                linked = os.stat(
+                    staging_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (staged.st_dev, staged.st_ino) == (
+                    linked.st_dev,
+                    linked.st_ino,
+                ):
+                    os.unlink(staging_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+        if staging_fd is not None:
+            os.close(staging_fd)
+        os.close(directory_fd)
 
 
 def adopt_existing(engine: Engine) -> Path:

@@ -23,12 +23,12 @@ Built in phases (see `docs/superpowers/specs/`):
   startup reconciliation, kill-switch drill.
 - **Phase 8 ✅** — the decision layer: full `TradePlan` (bear/base/bull scenarios,
   invalidation, entry ladder, exits), deterministic sizing, exit rule types
-  (trailing/time stops, OCO), approved-plan → pre-approved-rules autonomy path,
+  (trailing/time stops, OCO), approved-plan → human-gated rule proposals,
   deterministic screener, `/analyze` + plans/screener UI, optional Alpaca news.
 - **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
   cited + regime-conditioned, earnings-aware), scorecard grading vs realized
   forward returns, and a 50-graded-calls promotion gate (advice only — never
-  auto-enables; the live double-lock still applies).
+  auto-enables; this release rejects live mode at startup).
 - **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
   backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
   synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop

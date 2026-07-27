@@ -147,6 +147,9 @@ TERMINAL_STATES = frozenset(
         OrderStatus.EXPIRED,
     }
 )
+NONTERMINAL_STATES = frozenset(
+    status for status in OrderStatus if status not in TERMINAL_STATES
+)
 
 
 class OrderStateMachine:

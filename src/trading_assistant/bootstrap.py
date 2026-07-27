@@ -106,6 +106,18 @@ def _guard_runtime(config: AppConfig, secrets: Secrets) -> None:
         )
 
 
+def _arm_production_paper_broker(broker: BrokerClient) -> None:
+    """Bind every production write path to Alpaca's official paper endpoint."""
+    from .broker.alpaca import AlpacaBroker
+
+    if type(broker) is not AlpacaBroker:
+        raise RuntimeError(
+            "production broker must be the exact AlpacaBroker adapter"
+        )
+    broker.arm_paper_only_mutations()
+    broker.validate_armed_paper_target()
+
+
 def build_container(
     config: AppConfig | None = None,
     secrets: Secrets | None = None,
@@ -153,6 +165,7 @@ def _build_container(
 
     if broker is None:
         broker = build_broker(config, secrets)
+        _arm_production_paper_broker(broker)
     if clock is None:
         clock = build_clock(config, secrets)
     service = TradingService(
