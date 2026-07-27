@@ -15,7 +15,6 @@ from trading_assistant.app.auth import (
     SessionExpired,
 )
 from trading_assistant.app.main import create_app
-from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.assets import AssetClass
 from trading_assistant.db.models import AuthSession
 from trading_assistant.risk.breakers import BreakerScope
@@ -455,34 +454,73 @@ def test_logout_requires_csrf_and_revokes_session(authenticated_client):
     assert client.get("/positions").status_code == 401
 
 
-def test_login_has_separate_tight_source_rate_limit(make_service):
-    app = create_app(
-        service=make_service(),
+def test_login_source_rate_limit_survives_restart_before_secret_comparison(
+    make_service,
+    with_limit,
+):
+    service = make_service()
+    service.config = with_limit(
+        service.config,
+        "login",
+        requests=1,
+        window_seconds=60,
+    )
+    first_app = create_app(
+        service=service,
         agent=_StubAgent(),
         api_token=TOKEN,
         planning=None,
-        login_rate=RateLimiter(max_requests=1, window_seconds=60),
     )
-    client = TestClient(app)
+    first_client = TestClient(first_app)
 
     assert (
-        client.post("/auth/login", json={"secret": "wrong"}).status_code
+        first_client.post(
+            "/auth/login",
+            json={"secret": "wrong"},
+        ).status_code
         == 401
     )
-    limited = client.post("/auth/login", json={"secret": TOKEN})
+    restarted_app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    login_calls = 0
+
+    def forbidden_login(*_args, **_kwargs):
+        nonlocal login_calls
+        login_calls += 1
+        raise AssertionError("denied login reached secret comparison")
+
+    restarted_app.state.session_auth.login = forbidden_login
+    limited = TestClient(restarted_app).post(
+        "/auth/login",
+        json={"secret": TOKEN},
+    )
+
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert login_calls == 0
 
 
 def test_authenticated_rate_limits_are_keyed_by_session(
-    make_service, authenticate_client
+    make_service,
+    authenticate_client,
+    with_limit,
 ):
+    service = make_service()
+    service.config = with_limit(
+        service.config,
+        "chat",
+        requests=1,
+        window_seconds=60,
+    )
     app = create_app(
-        service=make_service(),
+        service=service,
         agent=_StubAgent(),
         api_token=TOKEN,
         planning=None,
-        chat_rate=RateLimiter(max_requests=1, window_seconds=60),
     )
     first, first_csrf = authenticate_client(TestClient(app), TOKEN)
     second, second_csrf = authenticate_client(TestClient(app), TOKEN)

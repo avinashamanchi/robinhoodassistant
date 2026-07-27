@@ -10,7 +10,13 @@ import pytest
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
-from trading_assistant.config import AppConfig, BrokerKind, RiskConfig, load_config
+from trading_assistant.config import (
+    AppConfig,
+    BrokerKind,
+    RiskConfig,
+    WindowLimitConfig,
+    load_config,
+)
 from trading_assistant.db.models import Base
 from trading_assistant.db.session import create_db_engine, make_session_factory
 
@@ -49,6 +55,35 @@ def app_config() -> AppConfig:
             "max_position_per_ticker": 2000,
         }),
     })
+
+
+@pytest.fixture
+def with_limit():
+    def _with_limit(
+        app_config: AppConfig,
+        name: str,
+        *,
+        requests: int,
+        window_seconds: int,
+    ) -> AppConfig:
+        current = getattr(app_config.security.rate_limits, name)
+        configured = WindowLimitConfig(
+            requests=requests,
+            global_requests=current.global_requests,
+            window_seconds=window_seconds,
+            concurrency=1,
+            daily_requests=current.daily_requests,
+            global_daily_requests=current.global_daily_requests,
+        )
+        limits = app_config.security.rate_limits.model_copy(
+            update={name: configured}
+        )
+        security = app_config.security.model_copy(
+            update={"rate_limits": limits}
+        )
+        return app_config.model_copy(update={"security": security})
+
+    return _with_limit
 
 
 @pytest.fixture

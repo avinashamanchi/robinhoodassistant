@@ -50,16 +50,16 @@ function redirectForAuthentication() {
 
 async function fetchJson(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
-  const headers = new Headers(options.headers || {});
+  const headers = options.headers instanceof Headers
+    ? options.headers
+    : new Headers(options.headers || {});
   if (method !== "GET" && method !== "HEAD") {
     headers.set("X-CSRF-Token", csrfToken || "");
   }
-  const response = await fetch(path, {
-    ...options,
-    method,
-    headers,
-    credentials: "same-origin",
-  });
+  options.method = method;
+  options.headers = headers;
+  options.credentials = "same-origin";
+  const response = await fetch(path, options);
   const body = await responseBody(response);
   if (response.status === 401) {
     redirectForAuthentication();
@@ -157,7 +157,10 @@ export async function api(path, options = {}) {
 export function jsonPost(body) {
   return {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": crypto.randomUUID(),
+    },
     body: JSON.stringify(body),
   };
 }

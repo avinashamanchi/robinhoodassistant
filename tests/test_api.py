@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 
 from trading_assistant.app.main import create_app
-from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
@@ -141,16 +140,20 @@ class StubAgent:
 
 
 @pytest.fixture
-def client(make_service, authenticate_client):
+def client(make_service, authenticate_client, with_limit):
     svc = make_service()
+    svc.config = with_limit(
+        svc.config,
+        "chat",
+        requests=2,
+        window_seconds=60,
+    )
     agent = StubAgent()
     app = create_app(
         service=svc,
         agent=agent,
         api_token=TOKEN,
         planning=None,
-        chat_rate=RateLimiter(max_requests=2, window_seconds=60),
-        approve_rate=RateLimiter(max_requests=100, window_seconds=60),
     )
     test_client, csrf = authenticate_client(TestClient(app), TOKEN)
     test_client.headers.update({"X-CSRF-Token": csrf})
@@ -718,24 +721,65 @@ def test_account_rejects_invalid_broker_position_values(
     _assert_dependency_unavailable(test_client.get("/account"))
 
 
-def test_account_reads_are_rate_limited(
+def test_account_read_rate_limit_survives_new_app_instance(
     make_service,
     authenticate_client,
+    with_limit,
 ):
-    app = create_app(
-        service=make_service(),
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    service = make_service(broker=broker)
+    service.config = with_limit(
+        service.config,
+        "broker_read",
+        requests=1,
+        window_seconds=60,
+    )
+    first_app = create_app(
+        service=service,
         agent=StubAgent(),
         api_token=TOKEN,
         planning=None,
-        account_rate=RateLimiter(max_requests=1, window_seconds=60),
     )
-    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+    first_client, csrf = authenticate_client(TestClient(first_app), TOKEN)
 
-    assert test_client.get("/account").status_code == 200
-    limited = test_client.get("/account")
+    assert first_client.get("/account").status_code == 200
+    session_token = first_client.cookies.get(
+        first_app.state.session_auth.cookie_name()
+    )
+    restarted_app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    restarted_client = TestClient(restarted_app)
+    restarted_client.cookies.set(
+        restarted_app.state.session_auth.cookie_name(),
+        session_token,
+    )
+    limited = restarted_client.get(
+        "/account",
+        headers={"X-CSRF-Token": csrf},
+    )
 
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
 
 
 def test_account_reads_use_a_short_bounded_broker_snapshot_cache(
@@ -834,14 +878,36 @@ def test_account_and_holdings_share_one_broker_snapshot(
 def test_broker_read_rate_limit_cannot_be_bypassed(
     make_service,
     authenticate_client,
+    with_limit,
     second_path,
 ):
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    service = make_service(broker=broker)
+    service.config = with_limit(
+        service.config,
+        "broker_read",
+        requests=1,
+        window_seconds=60,
+    )
     app = create_app(
-        service=make_service(),
+        service=service,
         agent=StubAgent(),
         api_token=TOKEN,
         planning=None,
-        account_rate=RateLimiter(max_requests=1, window_seconds=60),
     )
     test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
 
@@ -850,6 +916,34 @@ def test_broker_read_rate_limit_cannot_be_bypassed(
 
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_argument_parts",
+    (
+        ("chat", "rate"),
+        ("approve", "rate"),
+        ("analysis", "rate"),
+        ("backtest", "rate"),
+        ("account", "rate"),
+        ("login", "rate"),
+    ),
+)
+def test_process_local_rate_limiter_overrides_are_rejected(
+    make_service,
+    legacy_argument_parts,
+):
+    legacy_argument = "_".join(legacy_argument_parts)
+    with pytest.raises(TypeError, match=legacy_argument):
+        create_app(
+            service=make_service(),
+            agent=StubAgent(),
+            api_token=TOKEN,
+            planning=None,
+            **{legacy_argument: object()},
+        )
 
 
 def test_health_reports_server_observed_broker_and_mode(client):
@@ -3156,6 +3250,7 @@ def test_chat_and_rate_limit(client):
     c.post("/chat", json={"message": "again"})       # 2nd allowed (limit=2)
     r = c.post("/chat", json={"message": "third"})   # 3rd blocked
     assert r.status_code == 429
+    assert agent.calls == 2
 
 
 def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):

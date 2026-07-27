@@ -41,13 +41,16 @@ from ..service import TradingService
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
 from .errors import ApiError
-from .ratelimit import RateLimiter
+from .limits import (
+    ConcurrencyLeaseService,
+    DurableRateLimiter,
+    MutationInterlockService,
+)
 from .routers.auth import router as auth_router
 from .security import (
     csrf_protected,
     current_principal,
     install_security,
-    rate_limit_key,
     recent_principal,
 )
 
@@ -271,12 +274,6 @@ def _create_app(
     runtime_secrets: Secrets | None = None,
     screen_source=None,
     api_token: Optional[str] = None,
-    chat_rate: RateLimiter | None = None,
-    approve_rate: RateLimiter | None = None,
-    analysis_rate: RateLimiter | None = None,
-    backtest_rate: RateLimiter | None = None,
-    account_rate: RateLimiter | None = None,
-    login_rate: RateLimiter | None = None,
     auth_now: Callable | None = None,
     bind_host: str | None = None,
 ) -> FastAPI:
@@ -387,13 +384,17 @@ def _create_app(
                 "configured planning subsystem is unavailable"
             ) from exc
 
-    chat_rate = chat_rate or RateLimiter(max_requests=20, window_seconds=60)
-    approve_rate = approve_rate or RateLimiter(max_requests=30, window_seconds=60)
-    analysis_rate = analysis_rate or RateLimiter(max_requests=5, window_seconds=60)
-    backtest_rate = backtest_rate or RateLimiter(max_requests=2, window_seconds=3600)
-    account_rate = account_rate or RateLimiter(max_requests=30, window_seconds=60)
-    login_rate = login_rate or RateLimiter(max_requests=5, window_seconds=60)
     account_cache = _AccountSummaryCache()
+    rate_limiter = (
+        container.rate_limiter
+        if container is not None
+        else DurableRateLimiter(service.session_factory)
+    )
+    leases = (
+        container.leases
+        if container is not None
+        else ConcurrencyLeaseService(service.session_factory)
+    )
 
     app = FastAPI(
         title="Trading Assistant",
@@ -407,28 +408,15 @@ def _create_app(
     app.state.planning = planning
     app.state.runtime_secrets = runtime_secrets
     app.state.operator_secret = api_token
-    app.state.rate_limiter = (
-        container.rate_limiter if container is not None else None
-    )
-    app.state.leases = (
-        container.leases if container is not None else None
+    app.state.rate_limiter = rate_limiter
+    app.state.leases = leases
+    app.state.mutation_interlocks = MutationInterlockService(
+        service.session_factory
     )
     app.state.provider_budget = (
         container.provider_budget if container is not None else None
     )
-    app.state.login_rate = login_rate
     app.state.account_cache = account_cache
-
-    def enforce_broker_read_rate(
-        request: Request,
-        principal: SessionPrincipal,
-    ) -> None:
-        if not account_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded",
-                429,
-                "Broker read rate limit exceeded",
-            )
 
     session_kwargs = {
         "ttl": timedelta(hours=security_config.session_hours),
@@ -519,10 +507,6 @@ def _create_app(
             "conversation",
             "active",
         )
-        if not chat_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Chat rate limit exceeded"
-            )
         return agent.chat(
             body.message,
             actor=context.actor,
@@ -576,10 +560,6 @@ def _create_app(
             "order",
             order_id,
         )
-        if not approve_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Approval rate limit exceeded"
-            )
         try:
             result = service.approve_order(
                 order_id,
@@ -642,10 +622,8 @@ def _create_app(
 
     @app.get("/positions")
     def positions(
-        request: Request,
         principal: SessionPrincipal = Depends(current_principal),
     ):
-        enforce_broker_read_rate(request, principal)
         try:
             return {"positions": service.get_positions()}
         except RequiredDependencyUnavailable:
@@ -653,10 +631,8 @@ def _create_app(
 
     @app.get("/account")
     def account(
-        request: Request,
         principal: SessionPrincipal = Depends(current_principal),
     ):
-        enforce_broker_read_rate(request, principal)
         try:
             return account_cache.get(service.get_account_summary)
         except RequiredDependencyUnavailable:
@@ -871,10 +847,6 @@ def _create_app(
             "symbol",
             body.symbol.upper(),
         )
-        if not analysis_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
-            )
         try:
             return _require_planning().analyze(
                 body.symbol,
@@ -1015,13 +987,8 @@ def _create_app(
 
     @app.post("/screen")
     def screen(
-        request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
-        if not analysis_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
-            )
         return {"candidates": _screen_candidates(service.config.screener.top_n)}
 
     @app.post("/propose")
@@ -1041,10 +1008,6 @@ def _create_app(
             "trade_plan_batch",
             body.n,
         )
-        if not analysis_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Analysis rate limit exceeded"
-            )
         planning = _require_planning()
         candidates = _screen_candidates(max(body.n, service.config.screener.top_n))
         created = []
@@ -1079,11 +1042,9 @@ def _create_app(
     # ── external (read-only) accounts ──────────────────────────
     @app.get("/holdings")
     def holdings(
-        request: Request,
         principal: SessionPrincipal = Depends(current_principal),
     ):
         """Combined Alpaca + external holdings, labeled by source (read-only external)."""
-        enforce_broker_read_rate(request, principal)
         try:
             account_snapshot = account_cache.get(
                 service.get_account_summary
@@ -1128,10 +1089,6 @@ def _create_app(
             "backtest",
             "new",
         )
-        if not backtest_rate.allow(rate_limit_key(request, principal)):
-            raise ApiError(
-                "rate_limit_exceeded", 429, "Backtest rate limit exceeded"
-            )
         from ..backtest.runner import run_synthetic_backtest
 
         run_id, report = run_synthetic_backtest(

@@ -77,10 +77,6 @@ def recent_principal(
     return principal
 
 
-def rate_limit_key(request: Request, principal: SessionPrincipal) -> str:
-    return f"session:{principal.session_id}:{principal.actor}"
-
-
 def _error_response(request: Request, error: ApiError) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None) or uuid4().hex
     request.state.request_id = request_id

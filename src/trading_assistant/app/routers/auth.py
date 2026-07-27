@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from ..auth import SessionAuth, SessionPrincipal
-from ..errors import ApiError
 from ..security import csrf_protected, current_principal, session_auth
 
 router = APIRouter()
@@ -31,13 +30,6 @@ def login(
     response: Response,
     auth: SessionAuth = Depends(session_auth),
 ):
-    source = request.client.host if request.client else "unknown"
-    if not request.app.state.login_rate.allow(f"login:{source}"):
-        raise ApiError(
-            "rate_limit_exceeded",
-            429,
-            "Login rate limit exceeded",
-        )
     issued = auth.login(body.secret, request.app.state.operator_secret)
     response.set_cookie(
         key=auth.cookie_name(),

@@ -19,7 +19,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
-from trading_assistant.app.ratelimit import RateLimiter
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Quote
 
@@ -424,20 +423,53 @@ def test_blocked_boundary_audit_does_not_delay_exact_liveness(
 
 
 def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
-    make_service, authenticate_client
+    make_service,
+    authenticate_client,
+    with_limit,
+    monkeypatch,
 ):
     class StubPlanning:
-        def analyze(self, symbol):
+        def __init__(self):
+            self.calls = 0
+
+        def analyze(self, symbol, **_context):
+            self.calls += 1
             return {"symbol": symbol}
 
-    blocked = RateLimiter(max_requests=0, window_seconds=60)
+    class StubReport:
+        def to_dict(self):
+            return {"status": "complete"}
+
+    planning = StubPlanning()
+    backtest_calls = 0
+
+    def run_stub_backtest(*_args, **_kwargs):
+        nonlocal backtest_calls
+        backtest_calls += 1
+        return 7, StubReport()
+
+    monkeypatch.setattr(
+        "trading_assistant.backtest.runner.run_synthetic_backtest",
+        run_stub_backtest,
+    )
+    service = make_service()
+    service.config = with_limit(
+        service.config,
+        "analysis",
+        requests=1,
+        window_seconds=60,
+    )
+    service.config = with_limit(
+        service.config,
+        "backtest",
+        requests=1,
+        window_seconds=60,
+    )
     app = create_app(
-        service=make_service(),
+        service=service,
         agent=_StubAgent(),
         api_token=TOKEN,
-        planning=StubPlanning(),
-        analysis_rate=blocked,
-        backtest_rate=blocked,
+        planning=planning,
     )
     limited, csrf = authenticate_client(TestClient(app), TOKEN)
     assert limited.post(
@@ -447,7 +479,7 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
             "X-CSRF-Token": csrf,
             "Idempotency-Key": "security-rate-analyze",
         },
-    ).status_code == 429
+    ).status_code == 200
     assert limited.post(
         "/propose",
         json={"n": 1, "reason": "rate limit test"},
@@ -456,6 +488,7 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
             "Idempotency-Key": "security-rate-propose",
         },
     ).status_code == 429
+    assert planning.calls == 1
     assert limited.post(
         "/backtests/run",
         json={"symbols": [], "reason": "rate limit test"},
@@ -463,7 +496,16 @@ def test_paid_analysis_and_backtest_endpoints_are_rate_limited(
             "X-CSRF-Token": csrf,
             "Idempotency-Key": "security-rate-backtest",
         },
+    ).status_code == 200
+    assert limited.post(
+        "/backtests/run",
+        json={"symbols": [], "reason": "rate limit retry"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "security-rate-backtest-retry",
+        },
     ).status_code == 429
+    assert backtest_calls == 1
 
 
 def test_financial_get_endpoints_fail_closed(client):
@@ -697,9 +739,20 @@ def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
         _STATIC / "js" / "auth.js",
         """
         globalThis.window = { location: { assign: () => {} } };
+        let uuidCalls = 0;
+        Object.defineProperty(globalThis, "crypto", {
+          configurable: true,
+          value: {
+            randomUUID: () => {
+              uuidCalls += 1;
+              return "operator-action-uuid";
+            },
+          },
+        });
         const secretInput = { value: "fresh-operator-secret" };
         module.configureReauthentication(async () => secretInput);
         const calls = [];
+        let approvalCalls = 0;
         globalThis.fetch = async (path, options = {}) => {
           calls.push({ path, options });
           if (path === "/auth/session") {
@@ -721,6 +774,14 @@ def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
             }
             return { status: 200, ok: true, json: async () => ({}) };
           }
+          approvalCalls += 1;
+          if (approvalCalls > 1) {
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({ executed: false }),
+            };
+          }
           return {
             status: 403,
             ok: false,
@@ -734,16 +795,13 @@ def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
           };
         };
         await module.loadSession();
-        await module.api("/approve/7", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reason: "reviewed exact proof" }),
-        }).then(
-          () => { throw new Error("retry should surface the second 403"); },
-          (error) => {
-            if (error.code !== "recent_authentication_required") throw error;
-          },
-        );
+        const options = module.jsonPost({
+          reason: "reviewed exact proof",
+        });
+        if (uuidCalls !== 1) {
+          throw new Error(`expected one idempotency UUID, got ${uuidCalls}`);
+        }
+        await module.api("/approve/7", options);
         const paths = calls.map((call) => call.path);
         const expected = [
           "/auth/session",
@@ -755,11 +813,27 @@ def test_auth_module_clears_reauth_secret_and_retries_mutation_once():
           throw new Error(`unexpected calls: ${JSON.stringify(paths)}`);
         }
         const mutationCalls = calls.filter((call) => call.path === "/approve/7");
+        if (mutationCalls[0].options !== options) {
+          throw new Error("jsonPost options object was replaced before fetch");
+        }
+        if (mutationCalls[0].options !== mutationCalls[1].options) {
+          throw new Error("recent-auth retry replaced the options object");
+        }
         for (const call of mutationCalls) {
           const headers = new Headers(call.options.headers);
           if (headers.get("X-CSRF-Token") !== "csrf-memory-only") {
-            throw new Error("mutation did not carry in-memory CSRF");
+              throw new Error("mutation did not carry in-memory CSRF");
           }
+          if (headers.get("Idempotency-Key") !== "operator-action-uuid") {
+            throw new Error("mutation did not reuse the operator action key");
+          }
+        }
+        const reauthCall = calls.find((call) => call.path === "/auth/reauth");
+        if (new Headers(reauthCall.options.headers).has("Idempotency-Key")) {
+          throw new Error("reauth request inherited a mutation key");
+        }
+        if (uuidCalls !== 1) {
+          throw new Error(`retry generated ${uuidCalls} idempotency UUIDs`);
         }
         """,
     )
