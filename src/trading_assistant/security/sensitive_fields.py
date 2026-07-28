@@ -46,6 +46,7 @@ class _StagedField:
     object_ref: weakref.ReferenceType[object]
     object_id: int
     column: str
+    operation_token: str
     pending_ref: SensitiveFieldRef
     final_ref: SensitiveFieldRef | None = None
 
@@ -56,6 +57,7 @@ class _StagingState:
     staged: dict[tuple[int, str], _StagedField] = field(
         default_factory=dict
     )
+    active_operation: str | None = None
 
 
 _STAGING_STATES: WeakKeyDictionary[Session, _StagingState] = (
@@ -86,6 +88,13 @@ def _verify_registered_values(
     *,
     allow_staged: bool,
 ) -> None:
+    if state.staged and (
+        not allow_staged or state.active_operation is None
+    ):
+        raise PlaintextSensitiveField()
+    if state.active_operation is not None and not state.staged:
+        raise PlaintextSensitiveField()
+
     candidates = set(session.new).union(session.dirty)
     for instance in candidates:
         table = _table_name(instance)
@@ -110,6 +119,9 @@ def _verify_registered_values(
                 if staged is not None:
                     if (
                         not allow_staged
+                        or state.active_operation is None
+                        or staged.operation_token
+                        != state.active_operation
                         or staged.object_id != id(instance)
                         or staged.object_ref() is not instance
                         or staged.column != column
@@ -189,7 +201,7 @@ def install_sensitive_field_guards(
         )
 
     def before_commit(guarded_session: Session) -> None:
-        if state.staged:
+        if state.staged or state.active_operation is not None:
             raise PlaintextSensitiveField()
         _verify_registered_values(
             guarded_session,
@@ -198,20 +210,25 @@ def install_sensitive_field_guards(
             allow_staged=False,
         )
 
-    def after_soft_rollback(
+    def after_transaction_end(
         guarded_session: Session,
-        previous_transaction,
+        transaction,
     ) -> None:
         try:
-            is_outermost = previous_transaction.parent is None
+            is_outermost = transaction.parent is None
         except Exception:
             return
         if is_outermost and not guarded_session.in_transaction():
             state.staged.clear()
+            state.active_operation = None
 
     event.listen(session, "before_flush", before_flush)
     event.listen(session, "before_commit", before_commit)
-    event.listen(session, "after_soft_rollback", after_soft_rollback)
+    event.listen(
+        session,
+        "after_transaction_end",
+        after_transaction_end,
+    )
 
 
 class SensitiveFieldStore:
@@ -239,6 +256,12 @@ class SensitiveFieldStore:
         instance: object,
         values: Mapping[str, str],
     ) -> object:
+        if (
+            self._guard_state.staged
+            or self._guard_state.active_operation is not None
+        ):
+            raise PlaintextSensitiveField()
+
         table = _table_name(instance)
         registered = SENSITIVE_FIELDS.get(table or "")
         if registered is None or not isinstance(values, Mapping) or not values:
@@ -248,6 +271,7 @@ class SensitiveFieldStore:
             raise PlaintextSensitiveField()
 
         plaintext_values = dict(values)
+        operation_token: str | None = None
         try:
             if any(
                 not isinstance(value, str) or not value
@@ -289,14 +313,20 @@ class SensitiveFieldStore:
                         )
                         for column in field_names
                     }
+                    operation_token = token
+                    self._guard_state.active_operation = operation_token
                     self._session.add(instance)
                     for column, envelope in staged_envelopes.items():
+                        staging_key = (id(instance), column)
+                        if staging_key in self._guard_state.staged:
+                            raise PlaintextSensitiveField()
                         setattr(instance, column, envelope)
-                        self._guard_state.staged[(id(instance), column)] = (
+                        self._guard_state.staged[staging_key] = (
                             _StagedField(
                                 object_ref=weakref.ref(instance),
                                 object_id=id(instance),
                                 column=column,
+                                operation_token=operation_token,
                                 pending_ref=pending_refs[column],
                             )
                         )
@@ -330,6 +360,7 @@ class SensitiveFieldStore:
                                 object_ref=staged.object_ref,
                                 object_id=staged.object_id,
                                 column=staged.column,
+                                operation_token=staged.operation_token,
                                 pending_ref=staged.pending_ref,
                                 final_ref=final_refs[column],
                             )
@@ -344,6 +375,7 @@ class SensitiveFieldStore:
                         if (
                             staged is None
                             or staged.object_ref() is not instance
+                            or staged.operation_token != operation_token
                             or staged.final_ref != final_refs[column]
                         ):
                             raise PlaintextSensitiveField()
@@ -355,10 +387,11 @@ class SensitiveFieldStore:
                         except Exception:
                             raise PlaintextSensitiveField() from None
                     for column in field_names:
-                        self._guard_state.staged.pop(
-                            (id(instance), column),
-                            None,
-                        )
+                        del self._guard_state.staged[
+                            (id(instance), column)
+                        ]
+                    self._guard_state.active_operation = None
+                    operation_token = None
                     return instance
 
                 final_envelopes = {
@@ -380,6 +413,11 @@ class SensitiveFieldStore:
                 self._session.flush([instance])
                 return instance
         finally:
+            if (
+                operation_token is not None
+                and self._guard_state.active_operation == operation_token
+            ):
+                self._guard_state.active_operation = None
             plaintext_values.clear()
 
     def read(self, instance: object, column: str) -> str:

@@ -1,15 +1,16 @@
 import json
 import hashlib
+import threading
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from alembic import command
+from alembic import command, op as alembic_op
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import func, inspect, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event, func, inspect, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
@@ -471,6 +472,169 @@ def test_sensitive_trust_downgrade_refuses_unsafe_state_before_ddl(
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
         ) == "20260727_0013"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["state-update", "dependent-insert"],
+)
+def test_sensitive_trust_downgrade_lock_closes_checked_after_race(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    database_path = tmp_path / f"downgrade-race-{mutation}.db"
+    engine, cfg = _engine_at_revision(database_path, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(text("PRAGMA journal_mode=WAL")) == "wal"
+
+    gate_checked = threading.Event()
+    allow_ddl = threading.Event()
+    mutation_attempted = threading.Event()
+    mutation_finished = threading.Event()
+    migration_errors: list[BaseException] = []
+    mutation_errors: list[BaseException] = []
+    mutation_committed: list[bool] = []
+    original_drop_index = alembic_op.drop_index
+    first_drop = True
+
+    def pause_after_gate(*args, **kwargs):
+        nonlocal first_drop
+        if first_drop:
+            first_drop = False
+            gate_checked.set()
+            if not allow_ddl.wait(timeout=10):
+                raise RuntimeError("test_downgrade_pause_timeout")
+        return original_drop_index(*args, **kwargs)
+
+    monkeypatch.setattr(alembic_op, "drop_index", pause_after_gate)
+
+    def run_downgrade() -> None:
+        try:
+            command.downgrade(cfg, "20260727_0012")
+        except BaseException as error:
+            migration_errors.append(error)
+
+    migration_thread = threading.Thread(target=run_downgrade)
+    migration_thread.start()
+    assert gate_checked.wait(timeout=10)
+
+    concurrent_engine = create_db_engine(_url(database_path))
+
+    def mark_attempt(
+        _conn,
+        _cursor,
+        _statement,
+        _parameters,
+        _context,
+        _many,
+    ):
+        mutation_attempted.set()
+
+    event.listen(
+        concurrent_engine,
+        "before_cursor_execute",
+        mark_attempt,
+    )
+
+    def run_mutation() -> None:
+        try:
+            with concurrent_engine.begin() as connection:
+                if mutation == "state-update":
+                    connection.execute(
+                        text(
+                            "UPDATE sensitive_migration_state "
+                            "SET state='migrating',"
+                            "started_at=CURRENT_TIMESTAMP"
+                        )
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            "INSERT INTO candidate_nonces "
+                            "(nonce_hash,actor,kind,expires_at,request_id) "
+                            "VALUES "
+                            "(:nonce_hash,'operator:test','analysis',"
+                            "CURRENT_TIMESTAMP,'checked-after-race')"
+                        ),
+                        {"nonce_hash": "f" * 64},
+                    )
+            mutation_committed.append(True)
+        except BaseException as error:
+            mutation_errors.append(error)
+        finally:
+            mutation_finished.set()
+
+    mutation_thread = threading.Thread(target=run_mutation)
+    mutation_thread.start()
+    assert mutation_attempted.wait(timeout=10)
+    mutation_was_blocked = not mutation_finished.wait(timeout=0.5)
+
+    allow_ddl.set()
+    migration_thread.join(timeout=10)
+    mutation_thread.join(timeout=10)
+    concurrent_engine.dispose()
+
+    assert not migration_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert migration_errors == []
+    assert mutation_was_blocked
+    assert mutation_committed == []
+    assert len(mutation_errors) == 1
+    assert isinstance(mutation_errors[0], OperationalError)
+    assert {
+        "sensitive_migration_state",
+        "candidate_nonces",
+        "untrusted_ingest_events",
+    }.isdisjoint(inspect(engine).get_table_names())
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0012"
+
+
+def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
+    tmp_path,
+):
+    database_path = tmp_path / "downgrade-lock-failure.db"
+    engine, cfg = _engine_at_revision(database_path, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(text("PRAGMA journal_mode=WAL")) == "wal"
+    cfg.set_main_option(
+        "sqlalchemy.url",
+        f"{_url(database_path)}?timeout=0.05",
+    )
+
+    with engine.connect() as blocker:
+        blocker.exec_driver_sql("BEGIN IMMEDIATE")
+        blocker.execute(
+            text(
+                "INSERT INTO candidate_nonces "
+                "(nonce_hash,actor,kind,expires_at,request_id) VALUES "
+                "(:nonce_hash,'operator:test','analysis',"
+                "CURRENT_TIMESTAMP,'lock-failure-evidence')"
+            ),
+            {"nonce_hash": "9" * 64},
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="^sensitive_trust_downgrade_blocked$",
+        ):
+            command.downgrade(cfg, "20260727_0012")
+        blocker.commit()
+
+    assert {
+        "sensitive_migration_state",
+        "candidate_nonces",
+        "untrusted_ingest_events",
+    } <= set(inspect(engine).get_table_names())
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0013"
+        assert connection.scalar(
+            text("SELECT count(*) FROM candidate_nonces")
+        ) == 1
 
 
 @pytest.mark.parametrize(

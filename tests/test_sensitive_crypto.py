@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import gc
 import hashlib
 import json
+import weakref
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -10,7 +12,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import SecretStr
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, inspect as sa_inspect, select
 from sqlalchemy.orm import make_transient
 
 from trading_assistant.config import EncryptionConfig
@@ -79,6 +81,32 @@ class _FailFinalCipher:
 
     def decrypt(self, envelope, ref):
         return self.cipher.decrypt(envelope, ref)
+
+
+def _force_final_flush_failure(session, store, row) -> None:
+    flush_count = 0
+
+    def fail_second_flush(_session, _context, _instances):
+        nonlocal flush_count
+        flush_count += 1
+        if flush_count == 2:
+            raise RuntimeError("forced_final_flush_failure")
+
+    event.listen(session, "before_flush", fail_second_flush)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="^forced_final_flush_failure$",
+        ):
+            store.write(
+                row,
+                {
+                    "reason": PLAINTEXT_MARKER,
+                    "detail_json": '{"stage":"inserted"}',
+                },
+            )
+    finally:
+        event.remove(session, "before_flush", fail_second_flush)
 
 
 def _encoded_payload(envelope: str) -> bytes:
@@ -769,6 +797,285 @@ def test_final_flush_failure_latch_survives_detach_and_prevents_commit(
         assert session.scalar(
             select(func.count()).select_from(AuditEvent)
         ) == 0
+
+
+@pytest.mark.parametrize(
+    "retry_kind",
+    ["same", "transient-same", "new", "manual-final"],
+)
+@pytest.mark.parametrize(
+    "nested_rollback",
+    [False, True],
+    ids=["outer-active", "after-savepoint-rollback"],
+)
+def test_incomplete_staging_poisons_every_retry_until_outer_rollback(
+    tmp_path,
+    cipher,
+    retry_kind,
+    nested_rollback,
+):
+    database_path = tmp_path / (
+        f"poisoned-{retry_kind}-{nested_rollback}.db"
+    )
+    engine = create_db_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    statements: list[tuple[str, object]] = []
+
+    def capture_sql(_conn, _cursor, statement, parameters, _context, _many):
+        if (
+            statement.lstrip().upper().startswith("INSERT INTO AUDIT_EVENTS")
+            or statement.lstrip().upper().startswith("UPDATE AUDIT_EVENTS")
+        ):
+            statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        with session_factory() as session:
+            store = SensitiveFieldStore(session, cipher)
+            if nested_rollback:
+                session.begin()
+                nested = session.begin_nested()
+            original = _audit_event()
+            original.request_id = (
+                f"poisoned-original-{retry_kind}-{nested_rollback}"
+            )
+            _force_final_flush_failure(session, store, original)
+            staging = sensitive_field_module._STAGING_STATES[session]
+            staged_before_retry = dict(staging.staged)
+
+            if nested_rollback:
+                nested.rollback()
+
+            writes_before_retry = len(statements)
+            retry = _audit_event()
+            retry.request_id = (
+                f"poisoned-retry-{retry_kind}-{nested_rollback}"
+            )
+
+            if retry_kind == "same":
+                attempt = lambda: store.write(
+                    original,
+                    {"reason": "retry", "detail_json": '{"retry":true}'},
+                )
+            elif retry_kind == "transient-same":
+                if sa_inspect(original).session is session:
+                    session.expunge(original)
+                if not sa_inspect(original).transient:
+                    make_transient(original)
+                assert sa_inspect(original).transient
+                attempt = lambda: store.write(
+                    original,
+                    {"reason": "retry", "detail_json": '{"retry":true}'},
+                )
+            elif retry_kind == "new":
+                assert sa_inspect(retry).transient
+                attempt = lambda: store.write(
+                    retry,
+                    {"reason": "retry", "detail_json": '{"retry":true}'},
+                )
+            else:
+                original.reason = cipher.encrypt(
+                    "manual final",
+                    SensitiveFieldRef(
+                        "audit_events",
+                        str(original.id),
+                        "reason",
+                        1,
+                    ),
+                )
+                original.detail_json = cipher.encrypt(
+                    '{"manual":true}',
+                    SensitiveFieldRef(
+                        "audit_events",
+                        str(original.id),
+                        "detail_json",
+                        1,
+                    ),
+                )
+                if sa_inspect(original).transient:
+                    session.add(original)
+                attempt = session.flush
+
+            with pytest.raises(
+                PlaintextSensitiveField,
+                match="^plaintext_sensitive_field$",
+            ):
+                attempt()
+
+            assert staging.staged == staged_before_retry
+            assert len(statements) == writes_before_retry
+            if retry_kind == "new":
+                assert sa_inspect(retry).transient
+                assert retry.reason is None
+                assert retry.detail_json is None
+
+            with pytest.raises(
+                PlaintextSensitiveField,
+                match="^plaintext_sensitive_field$",
+            ):
+                session.commit()
+            assert staging.staged == staged_before_retry
+            assert len(statements) == writes_before_retry
+
+            session.rollback()
+            assert staging.staged == {}
+
+            clean = _audit_event()
+            clean.request_id = (
+                f"clean-retry-{retry_kind}-{nested_rollback}"
+            )
+            store.write(
+                clean,
+                {
+                    "reason": "clean retry",
+                    "detail_json": '{"clean":true}',
+                },
+            )
+            session.commit()
+            assert store.read(clean, "reason") == "clean retry"
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    with session_factory() as session:
+        request_ids = session.scalars(
+            select(AuditEvent.request_id)
+        ).all()
+    assert request_ids == [
+        f"clean-retry-{retry_kind}-{nested_rollback}"
+    ]
+    assert PLAINTEXT_MARKER not in repr(statements)
+    assert PLAINTEXT_MARKER.encode() not in _all_file_bytes(database_path)
+
+
+@pytest.mark.parametrize("lifecycle", ["close", "reset"])
+@pytest.mark.parametrize(
+    "inside_savepoint",
+    [False, True],
+    ids=["outer", "savepoint"],
+)
+def test_close_and_reset_clear_latch_only_after_outer_transaction_end(
+    session_factory,
+    cipher,
+    lifecycle,
+    inside_savepoint,
+):
+    session = session_factory()
+    try:
+        store = SensitiveFieldStore(session, cipher)
+        if inside_savepoint:
+            session.begin()
+            nested = session.begin_nested()
+        original = _audit_event()
+        original.request_id = f"{lifecycle}-{inside_savepoint}-original"
+        _force_final_flush_failure(session, store, original)
+        staging = sensitive_field_module._STAGING_STATES[session]
+        assert staging.staged
+
+        getattr(session, lifecycle)()
+
+        assert not session.in_transaction()
+        assert staging.staged == {}
+        if inside_savepoint:
+            assert not nested.is_active
+
+        clean = _audit_event()
+        clean.request_id = f"{lifecycle}-{inside_savepoint}-clean"
+        store.write(
+            clean,
+            {
+                "reason": "clean lifecycle retry",
+                "detail_json": '{"clean":true}',
+            },
+        )
+        session.commit()
+        assert store.read(clean, "reason") == "clean lifecycle retry"
+        assert session.scalars(
+            select(AuditEvent.request_id)
+        ).all() == [clean.request_id]
+    finally:
+        session.close()
+
+
+def test_nested_transaction_close_preserves_poison_until_session_close(
+    session_factory,
+    cipher,
+):
+    session = session_factory()
+    try:
+        store = SensitiveFieldStore(session, cipher)
+        session.begin()
+        nested = session.begin_nested()
+        original = _audit_event()
+        original.request_id = "nested-close-original"
+        _force_final_flush_failure(session, store, original)
+        staging = sensitive_field_module._STAGING_STATES[session]
+        staged_before_nested = dict(staging.staged)
+
+        nested.close()
+
+        assert session.in_transaction()
+        assert staging.staged == staged_before_nested
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            store.write(
+                _audit_event(),
+                {
+                    "reason": "must reject",
+                    "detail_json": '{"reject":true}',
+                },
+            )
+        with pytest.raises(PlaintextSensitiveField):
+            session.commit()
+
+        session.close()
+        assert staging.staged == {}
+
+        clean = _audit_event()
+        clean.request_id = "nested-close-clean"
+        store.write(
+            clean,
+            {
+                "reason": "clean after close",
+                "detail_json": '{"clean":true}',
+            },
+        )
+        session.commit()
+        assert session.scalars(
+            select(AuditEvent.request_id)
+        ).all() == ["nested-close-clean"]
+    finally:
+        session.close()
+
+
+def test_scoped_idempotent_guards_do_not_retain_closed_sessions(
+    session_factory,
+    cipher,
+):
+    gc.collect()
+    state_count = len(sensitive_field_module._STAGING_STATES)
+    installation_count = len(
+        sensitive_field_module._GUARD_INSTALLATIONS
+    )
+    session = session_factory()
+    install_sensitive_field_guards(session, cipher)
+    install_sensitive_field_guards(session, cipher)
+    store = SensitiveFieldStore(session, cipher)
+    session_reference = weakref.ref(session)
+
+    session.close()
+    del store
+    del session
+    gc.collect()
+
+    assert session_reference() is None
+    assert len(sensitive_field_module._STAGING_STATES) == state_count
+    assert (
+        len(sensitive_field_module._GUARD_INSTALLATIONS)
+        == installation_count
+    )
 
 
 def test_nested_rollback_cannot_clear_outer_staging_latch(

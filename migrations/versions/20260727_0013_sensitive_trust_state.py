@@ -22,6 +22,24 @@ def _hash_check(column: str) -> str:
     )
 
 
+def _acquire_downgrade_lock() -> None:
+    connection = op.get_bind()
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("sensitive_trust_downgrade_blocked")
+    try:
+        # Alembic has already opened the per-migration transaction. This
+        # no-op write upgrades it to SQLite's single-writer lock without
+        # releasing that transaction before the checks, DDL, or version move.
+        connection.execute(
+            sa.text(
+                "UPDATE sensitive_migration_state "
+                "SET singleton_id=singleton_id"
+            )
+        )
+    except Exception:
+        raise RuntimeError("sensitive_trust_downgrade_blocked") from None
+
+
 def _require_pristine_downgrade_state() -> None:
     connection = op.get_bind()
     try:
@@ -302,6 +320,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _acquire_downgrade_lock()
     _require_pristine_downgrade_state()
 
     op.drop_index(
