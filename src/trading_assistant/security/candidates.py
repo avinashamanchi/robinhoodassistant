@@ -43,6 +43,7 @@ from trading_assistant.db.models import (
     AuditEvent,
     CandidateNonce,
     CandidateQueueReceipt,
+    FILL_RECONCILIATION_SUPERSEDED,
     Fill,
     Order,
     OrderStateMachine,
@@ -50,6 +51,7 @@ from trading_assistant.db.models import (
     RiskEvent,
     Rule,
     RuleGroup,
+    fill_has_trusted_identity,
     utcnow,
 )
 from trading_assistant.dependencies import RequiredDependencyUnavailable
@@ -60,7 +62,10 @@ from trading_assistant.security.secrets import (
     RuntimeSecrets,
     validate_base64_key,
 )
-from trading_assistant.security.sensitive_fields import persist_sensitive
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
 
 
 _CANONICAL_DECIMAL = re.compile(
@@ -959,10 +964,15 @@ class CandidateQueueService:
             ):
                 raise CandidateError("candidate_receipt_inconsistent")
             if (
-                current_status == initial_status
-                and not self._order_initial_lifecycle_is_pristine(
+                not self._proposal_is_canonical(
                     session,
                     target,
+                    receipt,
+                )
+                or not self._order_lifecycle_is_consistent(
+                    session,
+                    target,
+                    initial_status,
                 )
             ):
                 raise CandidateError("candidate_receipt_inconsistent")
@@ -1023,6 +1033,326 @@ class CandidateQueueService:
         ):
             raise CandidateError("candidate_receipt_inconsistent")
 
+    def _proposal_is_canonical(
+        self,
+        session,
+        order: Order,
+        receipt: CandidateQueueReceipt,
+    ) -> bool:
+        proposals = list(
+            session.scalars(
+                select(Proposal).where(Proposal.order_id == order.id)
+            )
+        )
+        if len(proposals) != 1:
+            return False
+        proposal = proposals[0]
+        ttl_minutes = self._risk_config(order.ticker).proposal_ttl_minutes
+        if (
+            proposal.source_rule_group_id is not None
+            or proposal.source_rule_id is not None
+            or proposal.plan_generation != 0
+            or proposal.ttl_minutes != ttl_minutes
+            or proposal.created_at != order.created_at
+            or proposal.expires_at
+            != proposal.created_at + timedelta(minutes=ttl_minutes)
+        ):
+            return False
+        try:
+            reasoning = sensitive_store(
+                session,
+                self.service.session_factory,
+            ).read(proposal, "reasoning")
+            reasoning_hash = self.signer.metadata_hash(
+                "reason",
+                reasoning,
+            )
+        except Exception:
+            return False
+        return hmac.compare_digest(
+            reasoning_hash,
+            receipt.reason_hash,
+        )
+
+    @classmethod
+    def _order_lifecycle_is_consistent(
+        cls,
+        session,
+        order: Order,
+        initial_status: OrderStatus,
+    ) -> bool:
+        try:
+            current_status = OrderStatus(order.status)
+        except ValueError:
+            return False
+        if not OrderStateMachine.is_reachable(
+            initial_status,
+            current_status,
+        ):
+            return False
+        if current_status == initial_status:
+            return cls._order_initial_lifecycle_is_pristine(
+                session,
+                order,
+            )
+
+        fills = list(
+            session.scalars(
+                select(Fill).where(Fill.order_id == order.id)
+            )
+        )
+        if any(
+            fill.ticker != order.ticker
+            or fill.side != order.side
+            or not fill.qty.is_finite()
+            or fill.qty <= 0
+            or not fill.price.is_finite()
+            or fill.price <= 0
+            or fill.filled_at < order.created_at
+            for fill in fills
+        ):
+            return False
+        approval_actor = (
+            order.approval_actor.strip()
+            if isinstance(order.approval_actor, str)
+            else ""
+        )
+        approval_present = bool(
+            approval_actor and order.approved_at is not None
+        )
+        approval_partial = bool(approval_actor) != bool(
+            order.approved_at is not None
+        )
+        if (
+            initial_status is not OrderStatus.PROPOSED
+            or approval_partial
+            or order.submission_kind != "simple"
+            or order.submission_payload_json != "{}"
+            or order.plan_cancel_state != "none"
+            or order.version < 0
+            or order.updated_at < order.created_at
+            or (
+                order.approved_at is not None
+                and order.approved_at < order.created_at
+            )
+            or order.submission_attempt not in {0, 1}
+            or (
+                (order.submission_attempt == 0)
+                != (order.submission_started_at is None)
+            )
+            or (
+                order.submission_started_at is not None
+                and (
+                    not approval_present
+                    or order.submission_started_at < order.approved_at
+                )
+            )
+            or (
+                order.last_reconciled_at is not None
+                and (
+                    order.submission_started_at is None
+                    or order.last_reconciled_at
+                    < order.submission_started_at
+                )
+            )
+            or (
+                order.broker_order_id is not None
+                and order.submission_attempt == 0
+            )
+            or (
+                fills
+                and (
+                    order.submission_attempt == 0
+                    or not order.broker_order_id
+                )
+            )
+        ):
+            return False
+
+        no_submission_state = bool(
+            order.submission_attempt == 0
+            and order.submission_started_at is None
+            and order.broker_order_id is None
+            and order.acceptance_state == "not_started"
+            and order.last_reconciled_at is None
+            and not fills
+        )
+        if current_status is OrderStatus.APPROVAL_RECORDED:
+            return bool(
+                approval_present
+                and no_submission_state
+                and order.last_error_code == ""
+                and order.version == 1
+            )
+        if current_status is OrderStatus.SUBMITTING:
+            return bool(
+                approval_present
+                and order.submission_attempt == 1
+                and order.submission_started_at is not None
+                and order.broker_order_id is None
+                and order.acceptance_state == "pending"
+                and order.last_reconciled_at is None
+                and order.last_error_code == ""
+                and not fills
+                and order.version == 2
+            )
+        if current_status is OrderStatus.SUBMITTED:
+            if not (
+                approval_present
+                and order.submission_attempt == 1
+                and order.submission_started_at is not None
+                and bool(order.broker_order_id)
+                and order.version >= 3
+                and order.acceptance_state
+                in {
+                    OrderStatus.SUBMITTED.value,
+                    "accepted",
+                    "fill_reconcile_required",
+                }
+            ):
+                return False
+            if (
+                order.acceptance_state == "accepted"
+                and (
+                    order.last_reconciled_at is None
+                    or not cls._accepted_fills_match_order(
+                        order,
+                        fills,
+                        current_status,
+                    )
+                )
+            ):
+                return False
+            return not (
+                fills
+                and order.acceptance_state
+                == OrderStatus.SUBMITTED.value
+            )
+        if current_status in {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+        }:
+            if not (
+                approval_present
+                and order.submission_attempt == 1
+                and order.submission_started_at is not None
+                and bool(order.broker_order_id)
+                and order.version >= 3
+                and order.acceptance_state
+                in {"accepted", "fill_reconcile_required"}
+            ):
+                return False
+            if order.acceptance_state != "accepted":
+                return True
+            return bool(
+                order.last_reconciled_at is not None
+                and cls._accepted_fills_match_order(
+                    order,
+                    fills,
+                    current_status,
+                )
+            )
+        if current_status is OrderStatus.ACCEPTANCE_UNKNOWN:
+            return bool(
+                approval_present
+                and order.submission_attempt == 1
+                and order.submission_started_at is not None
+                and order.version >= 3
+                and order.acceptance_state
+                in {
+                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                    "fill_reconcile_required",
+                }
+                and bool(order.last_error_code)
+            )
+        if current_status not in {
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+            OrderStatus.CANCELED,
+        }:
+            return False
+        if order.submission_attempt == 0:
+            if not no_submission_state:
+                return False
+            if approval_present:
+                if current_status not in {
+                    OrderStatus.REJECTED,
+                    OrderStatus.EXPIRED,
+                }:
+                    return False
+                return bool(
+                    order.version == 2
+                    and (
+                        current_status is OrderStatus.EXPIRED
+                        or order.last_error_code == "risk_rejected"
+                    )
+                )
+            expected_versions = {
+                OrderStatus.REJECTED: {0},
+                OrderStatus.EXPIRED: {1},
+                OrderStatus.CANCELED: {0},
+            }
+            return order.version in expected_versions[current_status]
+        if not (
+            approval_present
+            and order.submission_attempt == 1
+            and order.submission_started_at is not None
+            and order.version >= 3
+            and order.acceptance_state
+            in {
+                current_status.value,
+                "accepted",
+                "fill_reconcile_required",
+            }
+        ):
+            return False
+        return not (
+            order.acceptance_state == "accepted"
+            and (
+                order.last_reconciled_at is None
+                or not cls._accepted_fills_match_order(
+                    order,
+                    fills,
+                    current_status,
+                )
+            )
+        )
+
+    @staticmethod
+    def _accepted_fills_match_order(
+        order: Order,
+        fills: list[Fill],
+        status: OrderStatus,
+    ) -> bool:
+        trusted_fills = [
+            fill for fill in fills if fill_has_trusted_identity(fill)
+        ]
+        if any(
+            not fill_has_trusted_identity(fill)
+            and fill.reconciliation_state
+            != FILL_RECONCILIATION_SUPERSEDED
+            for fill in fills
+        ):
+            return False
+        filled_qty = sum(
+            (fill.qty for fill in trusted_fills),
+            Decimal(0),
+        )
+        if order.qty is not None:
+            if filled_qty > order.qty:
+                return False
+            if status is OrderStatus.FILLED:
+                return filled_qty == order.qty
+            if status is OrderStatus.PARTIALLY_FILLED:
+                return Decimal(0) < filled_qty < order.qty
+            return True
+        if status in {
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+        }:
+            return filled_qty > 0
+        return True
+
     @staticmethod
     def _order_initial_lifecycle_is_pristine(
         session,
@@ -1071,37 +1401,40 @@ class CandidateQueueService:
             group_state is RuleState.ACTIVE
             and rule_state is RuleState.ACTIVE
         ):
-            if group.terminal_rule_id is not None:
+            if (
+                group.terminal_rule_id is not None
+                or group.reconciliation_required
+            ):
                 return False
-            if require_initial_lifecycle:
-                return bool(
-                    group.version == 0
-                    and group.lease_owner is None
-                    and group.lease_expires_at is None
-                    and not group.reconciliation_required
-                )
             if group.version == 0:
                 return bool(
                     group.lease_owner is None
                     and group.lease_expires_at is None
-                    and not group.reconciliation_required
                 )
-            return True
+            if group.lease_owner is None:
+                return bool(
+                    group.lease_expires_at is None
+                    and group.version >= 2
+                )
+            return group.version >= 1
         if group.lease_owner is not None or group.lease_expires_at is not None:
-            return False
-        if group.reconciliation_required:
             return False
         if group_state in {RuleState.TRIGGERED, RuleState.FAILED}:
             return bool(
                 rule_state is group_state
                 and group.terminal_rule_id == rule.id
-                and group.version >= 1
+                and group.version >= 2
+                and (
+                    group_state is RuleState.TRIGGERED
+                    or not group.reconciliation_required
+                )
             )
         if group_state is RuleState.CANCELED:
             return bool(
                 rule_state is RuleState.CANCELED
-                and group.terminal_rule_id in {None, rule.id}
+                and group.terminal_rule_id is None
                 and group.version >= 1
+                and not group.reconciliation_required
             )
         return False
 

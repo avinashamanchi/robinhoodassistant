@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import event, func, select
+from sqlalchemy.exc import IntegrityError
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.app.main import create_app
@@ -24,15 +25,18 @@ from trading_assistant.db.models import (
     CircuitBreakerState,
     Fill,
     Order,
-    OrderStateMachine,
+    Proposal,
     RiskEvent,
     Rule,
     RuleGroup,
 )
 from trading_assistant.broker.models import OrderStatus
+from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import BreakerTripIntent, RiskResult
+from trading_assistant.rules.models import RuleState
 from trading_assistant.rules.worker import RuleWorker
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 NOW = datetime(2026, 7, 28, 17, 0, tzinfo=timezone.utc)
@@ -228,6 +232,80 @@ def _mark_receipt_target_persisted(service) -> None:
         receipt.state = "target_persisted"
         receipt.completed_at = None
         session.commit()
+
+
+def _set_receipt_recovery_mode(service, receipt_state: str) -> None:
+    if receipt_state == "target_persisted":
+        _mark_receipt_target_persisted(service)
+
+
+def _approve_candidate_order(service, order_id: int) -> None:
+    service.order_application.approve(
+        ApprovalCommand(
+            order_id=order_id,
+            actor=ACTOR,
+            reason="explicit candidate approval for lifecycle test",
+            now=NOW + timedelta(seconds=1),
+            request_id="candidate-order-approval-progression",
+        )
+    )
+
+
+def _submit_candidate_order(service, order_id: int) -> None:
+    _approve_candidate_order(service, order_id)
+    repository = service.order_application.repository
+    assert repository.claim_submission(
+        order_id,
+        NOW + timedelta(seconds=2),
+        ("operator_global", "equity"),
+        actor=ACTOR,
+        reason="claim candidate submission for lifecycle test",
+        request_id="candidate-order-submission-claim",
+    )
+    assert (
+        repository.record_submission_result(
+            order_id,
+            OrderStatus.SUBMITTED,
+            "paper-candidate-order",
+            "",
+            NOW + timedelta(seconds=3),
+            actor=ACTOR,
+            reason="record synthetic paper submission result",
+            request_id="candidate-order-submission-result",
+        )
+        is OrderStatus.SUBMITTED
+    )
+
+
+def _trigger_candidate_rule(
+    service,
+    *,
+    risk_rejected: bool = False,
+) -> None:
+    if risk_rejected:
+        service._risk_for(AssetClass.EQUITY).check = (
+            lambda _order, _snapshot: RiskResult(
+                approved=False,
+                reasons=["synthetic worker risk rejection"],
+            )
+        )
+    worker = RuleWorker(
+        service,
+        service.rule_repository,
+        service.rule_application,
+        now=lambda: NOW,
+    )
+    outcomes = worker.tick(
+        actor=ACTOR,
+        reason="exercise real candidate rule worker lifecycle",
+        request_id=(
+            "candidate-rule-worker-failed"
+            if risk_rejected
+            else "candidate-rule-worker-triggered"
+        ),
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].proposal is not None
 
 
 def test_candidate_models_are_strict_frozen_and_omit_rule_proposal_ttl():
@@ -1031,10 +1109,16 @@ def test_completed_order_receipt_replays_after_legal_status_progression(
     envelope, service, signer, binding = _order_envelope(make_service)
     queue = _queue(service, signer)
     first = _queue_order(queue, envelope, binding)
-    with service.session_factory() as session:
-        order = session.get(Order, first.target_id)
-        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
-        session.commit()
+    assert (
+        service.order_application.repository.expire_if_eligible(
+            first.target_id,
+            NOW + timedelta(minutes=16),
+            actor=ACTOR,
+            reason="expire candidate through repository authority",
+            request_id="candidate-order-expire-progression",
+        )
+        is OrderStatus.EXPIRED
+    )
 
     replay = _queue_order(queue, envelope, binding)
 
@@ -1061,29 +1145,66 @@ def test_completed_order_receipt_rejects_unreachable_legacy_approved_state(
         _queue_order(queue, envelope, binding)
 
 
-@pytest.mark.parametrize("progressed_state", ["triggered", "canceled"])
-def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
+def test_completed_rule_receipt_replays_after_real_worker_trigger(
     make_service,
-    progressed_state,
 ):
-    envelope, service, signer, binding = _rule_envelope(make_service)
+    envelope, service, signer, binding = _rule_envelope(
+        make_service,
+        tool_input={
+            "ticker": "AAPL",
+            "condition": {
+                "comparator": "price_above",
+                "trigger_price": "90",
+            },
+            "action": {
+                "side": "buy",
+                "order_type": "market",
+                "notional": "100",
+            },
+            "thesis": "Exercise the real worker terminal transition.",
+        },
+    )
     queue = _queue(service, signer)
     first = _queue_rule(queue, envelope, binding)
-    with service.session_factory() as session:
-        rule = session.get(Rule, first.target_id)
-        group = session.get(RuleGroup, rule.group_id)
-        rule.state = progressed_state
-        group.state = progressed_state
-        group.version = 1
-        if progressed_state == "triggered":
-            group.terminal_rule_id = rule.id
-        session.commit()
+    _trigger_candidate_rule(service)
 
     replay = _queue_rule(queue, envelope, binding)
 
     assert replay == first
     with service.session_factory() as session:
-        assert session.get(Rule, first.target_id).state == progressed_state
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == RuleState.TRIGGERED.value
+        assert group.state == RuleState.TRIGGERED.value
+        assert group.terminal_rule_id == rule.id
+        assert group.version == 2
+
+
+def test_completed_rule_receipt_replays_after_real_direct_cancellation(
+    make_service,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+
+    canceled = service.cancel_rule(
+        first.target_id,
+        actor=ACTOR,
+        reason="cancel candidate through application authority",
+        request_id="candidate-rule-direct-cancel",
+    )
+    assert canceled["canceled"] is True
+
+    replay = _queue_rule(queue, envelope, binding)
+
+    assert replay == first
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == RuleState.CANCELED.value
+        assert group.state == RuleState.CANCELED.value
+        assert group.terminal_rule_id is None
+        assert group.version == 1
 
 
 @pytest.mark.parametrize(
@@ -1149,10 +1270,7 @@ def test_target_persisted_order_recovery_accepts_legal_forward_progression(
     queue = _queue(service, signer)
     first = _queue_order(queue, envelope, binding)
     _mark_receipt_target_persisted(service)
-    with service.session_factory() as session:
-        order = session.get(Order, first.target_id)
-        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
-        session.commit()
+    _submit_candidate_order(service, first.target_id)
 
     replay = _queue_order(queue, envelope, binding)
 
@@ -1160,6 +1278,326 @@ def test_target_persisted_order_recovery_accepts_legal_forward_progression(
     with service.session_factory() as session:
         receipt = session.scalar(select(_receipt_model()))
         assert receipt.state == "completed"
+        order = session.get(Order, first.target_id)
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.approval_actor == ACTOR
+        assert order.broker_order_id == "paper-candidate-order"
+        assert order.submission_attempt == 1
+        assert order.version == 3
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing",
+        "ttl",
+        "created_at",
+        "expires_at",
+        "source_group",
+        "plan_generation",
+        "reasoning",
+    ],
+)
+def test_order_receipt_rejects_missing_or_tampered_canonical_proposal(
+    make_service,
+    receipt_state,
+    tamper,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+
+    with service.session_factory() as session:
+        proposal = session.scalar(
+            select(Proposal).where(Proposal.order_id == first.target_id)
+        )
+        assert proposal is not None
+        if tamper == "missing":
+            sensitive_store(session).delete(proposal)
+        elif tamper == "ttl":
+            proposal.ttl_minutes += 1
+        elif tamper == "created_at":
+            proposal.created_at += timedelta(seconds=1)
+        elif tamper == "expires_at":
+            proposal.expires_at += timedelta(seconds=1)
+        elif tamper == "source_group":
+            group = RuleGroup(
+                group_key=f"proposal-tamper-{receipt_state}",
+                state=RuleState.ACTIVE.value,
+            )
+            session.add(group)
+            session.flush()
+            proposal.source_rule_group_id = group.id
+        elif tamper == "plan_generation":
+            proposal.plan_generation = 1
+        else:
+            sensitive_store(session).write_many(
+                proposal,
+                {"reasoning": "tampered but validly encrypted reasoning"},
+            )
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_order(queue, envelope, binding)
+
+
+def test_candidate_order_schema_forbids_an_extra_proposal(make_service):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    first = _queue_order(_queue(service, signer), envelope, binding)
+    with service.session_factory() as session:
+        duplicate = Proposal(
+            order_id=first.target_id,
+            ttl_minutes=service.config.risk.proposal_ttl_minutes,
+            created_at=NOW,
+            expires_at=(
+                NOW
+                + timedelta(
+                    minutes=service.config.risk.proposal_ttl_minutes,
+                )
+            ),
+        )
+        with pytest.raises(IntegrityError):
+            sensitive_store(session).write_many(
+                duplicate,
+                {"reasoning": REASON},
+            )
+        session.rollback()
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "approval_without_metadata",
+        "approval_without_version",
+        "submitted_without_approval",
+        "submitted_without_broker_identity",
+        "accepted_fill_state_without_fill",
+        "fill_without_broker_identity",
+        "accepted_fill_with_wrong_identity",
+    ],
+)
+def test_order_receipt_rejects_impossible_advanced_lifecycle_metadata(
+    make_service,
+    receipt_state,
+    tamper,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+
+    with service.session_factory() as session:
+        order = session.get(Order, first.target_id)
+        if tamper == "approval_without_metadata":
+            order.status = OrderStatus.APPROVAL_RECORDED.value
+        elif tamper == "approval_without_version":
+            order.status = OrderStatus.APPROVAL_RECORDED.value
+            order.approval_actor = ACTOR
+            order.approved_at = NOW + timedelta(seconds=1)
+        elif tamper == "submitted_without_approval":
+            order.status = OrderStatus.SUBMITTED.value
+            order.submission_attempt = 1
+            order.submission_started_at = NOW + timedelta(seconds=2)
+            order.acceptance_state = OrderStatus.SUBMITTED.value
+            order.broker_order_id = "forged-paper-order"
+            order.version = 3
+        elif tamper == "submitted_without_broker_identity":
+            order.status = OrderStatus.SUBMITTED.value
+            order.approval_actor = ACTOR
+            order.approved_at = NOW + timedelta(seconds=1)
+            order.submission_attempt = 1
+            order.submission_started_at = NOW + timedelta(seconds=2)
+            order.acceptance_state = OrderStatus.SUBMITTED.value
+            order.version = 3
+        elif tamper == "accepted_fill_state_without_fill":
+            order.status = OrderStatus.FILLED.value
+            order.approval_actor = ACTOR
+            order.approved_at = NOW + timedelta(seconds=1)
+            order.submission_attempt = 1
+            order.submission_started_at = NOW + timedelta(seconds=2)
+            order.acceptance_state = "accepted"
+            order.broker_order_id = "forged-paper-order"
+            order.last_reconciled_at = NOW + timedelta(seconds=3)
+            order.version = 4
+        elif tamper == "fill_without_broker_identity":
+            order.status = OrderStatus.FILLED.value
+            order.approval_actor = ACTOR
+            order.approved_at = NOW + timedelta(seconds=1)
+            order.submission_attempt = 1
+            order.submission_started_at = NOW + timedelta(seconds=2)
+            order.acceptance_state = "fill_reconcile_required"
+            order.version = 3
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker=order.ticker,
+                    side=order.side,
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="forged-fill-without-order-identity",
+                    filled_at=NOW + timedelta(seconds=3),
+                )
+            )
+        else:
+            order.status = OrderStatus.FILLED.value
+            order.approval_actor = ACTOR
+            order.approved_at = NOW + timedelta(seconds=1)
+            order.submission_attempt = 1
+            order.submission_started_at = NOW + timedelta(seconds=2)
+            order.acceptance_state = "accepted"
+            order.broker_order_id = "forged-paper-order"
+            order.last_reconciled_at = NOW + timedelta(seconds=3)
+            order.version = 4
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="MSFT",
+                    side="sell",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="forged-wrong-identity-fill",
+                    filled_at=NOW + timedelta(seconds=3),
+                )
+            )
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_order(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_order_receipt_rejects_filled_quantity_inconsistent_with_order(
+    make_service,
+    receipt_state,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(
+        make_service,
+        tool_input={
+            "ticker": "AAPL",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": "2",
+            "thesis": "Quantity-bounded candidate for fill integrity.",
+        },
+    )
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        order = session.get(Order, first.target_id)
+        order.status = OrderStatus.FILLED.value
+        order.approval_actor = ACTOR
+        order.approved_at = NOW + timedelta(seconds=1)
+        order.submission_attempt = 1
+        order.submission_started_at = NOW + timedelta(seconds=2)
+        order.acceptance_state = "accepted"
+        order.broker_order_id = "forged-paper-order"
+        order.last_reconciled_at = NOW + timedelta(seconds=3)
+        order.version = 4
+        session.add(
+            Fill(
+                order_id=order.id,
+                ticker=order.ticker,
+                side=order.side,
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                broker_fill_id="forged-short-filled-quantity",
+                filled_at=NOW + timedelta(seconds=3),
+            )
+        )
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_order(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize("progression", ["approval_recorded", "submitted"])
+def test_order_receipt_accepts_real_repository_lifecycle_progression(
+    make_service,
+    receipt_state,
+    progression,
+):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+
+    if progression == "approval_recorded":
+        _approve_candidate_order(service, first.target_id)
+    else:
+        _submit_candidate_order(service, first.target_id)
+
+    assert _queue_order(queue, envelope, binding) == first
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    ("status", "broker_order_id", "error_code"),
+    [
+        (OrderStatus.PARTIALLY_FILLED, "paper-partial", ""),
+        (OrderStatus.FILLED, "paper-filled", ""),
+        (
+            OrderStatus.ACCEPTANCE_UNKNOWN,
+            None,
+            "broker_submission_unknown",
+        ),
+        (OrderStatus.REJECTED, None, "paper_rejected"),
+        (OrderStatus.CANCELED, "paper-canceled", ""),
+        (OrderStatus.EXPIRED, "paper-expired", ""),
+    ],
+)
+def test_order_receipt_accepts_real_repository_submission_outcomes(
+    make_service,
+    receipt_state,
+    status,
+    broker_order_id,
+    error_code,
+):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    _approve_candidate_order(service, first.target_id)
+    repository = service.order_application.repository
+    assert repository.claim_submission(
+        first.target_id,
+        NOW + timedelta(seconds=2),
+        ("operator_global", "equity"),
+        actor=ACTOR,
+        reason="claim candidate for repository outcome",
+        request_id="candidate-order-outcome-claim",
+    )
+    assert (
+        repository.record_submission_result(
+            first.target_id,
+            status,
+            broker_order_id,
+            error_code,
+            NOW + timedelta(seconds=3),
+            actor=ACTOR,
+            reason="record repository outcome without broker IO",
+            request_id=f"candidate-order-outcome-{status.value}",
+        )
+        is status
+    )
+
+    assert _queue_order(queue, envelope, binding) == first
 
 
 @pytest.mark.parametrize(
@@ -1215,25 +1653,290 @@ def test_target_persisted_initial_order_rejects_lifecycle_marker_tamper(
 def test_target_persisted_rule_recovery_accepts_legal_forward_progression(
     make_service,
 ):
-    envelope, service, signer, binding = _rule_envelope(make_service)
+    envelope, service, signer, binding = _rule_envelope(
+        make_service,
+        tool_input={
+            "ticker": "AAPL",
+            "condition": {
+                "comparator": "price_above",
+                "trigger_price": "90",
+            },
+            "action": {
+                "side": "buy",
+                "order_type": "market",
+                "notional": "100",
+            },
+            "thesis": "Exercise legacy recovery after a real trigger.",
+        },
+    )
     queue = _queue(service, signer)
     first = _queue_rule(queue, envelope, binding)
     _mark_receipt_target_persisted(service)
-    with service.session_factory() as session:
-        rule = session.get(Rule, first.target_id)
-        group = session.get(RuleGroup, rule.group_id)
-        rule.state = "triggered"
-        group.state = "triggered"
-        group.terminal_rule_id = rule.id
-        group.version = 1
-        session.commit()
+    _trigger_candidate_rule(service)
 
     replay = _queue_rule(queue, envelope, binding)
 
     assert replay == first
     with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == RuleState.TRIGGERED.value
+        assert group.state == RuleState.TRIGGERED.value
+        assert group.terminal_rule_id == rule.id
+        assert group.version == 2
         receipt = session.scalar(select(_receipt_model()))
         assert receipt.state == "completed"
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    "terminal_state",
+    [RuleState.TRIGGERED, RuleState.FAILED],
+)
+def test_rule_receipt_rejects_worker_impossible_terminal_version_one(
+    make_service,
+    receipt_state,
+    terminal_state,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = terminal_state.value
+        group.state = terminal_state.value
+        group.terminal_rule_id = rule.id
+        group.version = 1
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    "terminal_state",
+    [RuleState.FAILED, RuleState.CANCELED],
+)
+def test_rule_receipt_rejects_terminal_reconciliation_state_worker_cannot_make(
+    make_service,
+    receipt_state,
+    terminal_state,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = terminal_state.value
+        group.state = terminal_state.value
+        group.terminal_rule_id = (
+            rule.id if terminal_state is RuleState.FAILED else None
+        )
+        group.version = (
+            2 if terminal_state is RuleState.FAILED else 1
+        )
+        group.reconciliation_required = True
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_rule_receipt_rejects_canceled_candidate_with_terminal_winner(
+    make_service,
+    receipt_state,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = RuleState.CANCELED.value
+        group.state = RuleState.CANCELED.value
+        group.terminal_rule_id = rule.id
+        group.version = 2
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_rule_receipt_rejects_active_version_one_without_lease(
+    make_service,
+    receipt_state,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert group.state == RuleState.ACTIVE.value
+        assert group.lease_owner is None
+        group.version = 1
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize("released", [False, True])
+def test_rule_receipt_accepts_real_active_lease_or_release_state(
+    make_service,
+    receipt_state,
+    released,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group_id = rule.group_id
+    lease = service.rule_repository.lease_group(
+        group_id,
+        NOW,
+        actor=ACTOR,
+        reason="exercise candidate rule lease lifecycle",
+        request_id="candidate-rule-real-lease",
+    )
+    assert lease is not None
+    assert lease.version == 1
+    if released:
+        assert service.rule_repository.release_group(
+            lease,
+            now=NOW + timedelta(seconds=1),
+            actor=ACTOR,
+            reason="exercise candidate rule release lifecycle",
+            request_id="candidate-rule-real-release",
+        )
+
+    assert _queue_rule(queue, envelope, binding) == first
+    with service.session_factory() as session:
+        group = session.get(RuleGroup, group_id)
+        assert group.state == RuleState.ACTIVE.value
+        assert group.version == (2 if released else 1)
+        assert (group.lease_owner is None) is released
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize("risk_rejected", [False, True])
+def test_rule_receipt_accepts_real_worker_terminal_version_two(
+    make_service,
+    receipt_state,
+    risk_rejected,
+):
+    envelope, service, signer, binding = _rule_envelope(
+        make_service,
+        tool_input={
+            "ticker": "AAPL",
+            "condition": {
+                "comparator": "price_above",
+                "trigger_price": "90",
+            },
+            "action": {
+                "side": "buy",
+                "order_type": "market",
+                "notional": "100",
+            },
+            "thesis": "Exercise a real worker terminal lifecycle.",
+        },
+    )
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    _trigger_candidate_rule(service, risk_rejected=risk_rejected)
+
+    assert _queue_rule(queue, envelope, binding) == first
+    expected_state = (
+        RuleState.FAILED if risk_rejected else RuleState.TRIGGERED
+    )
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert rule.state == expected_state.value
+        assert group.state == expected_state.value
+        assert group.terminal_rule_id == rule.id
+        assert group.version == 2
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_rule_receipt_accepts_terminal_reconciliation_latch_from_linked_order(
+    make_service,
+    receipt_state,
+):
+    envelope, service, signer, binding = _rule_envelope(
+        make_service,
+        tool_input={
+            "ticker": "AAPL",
+            "condition": {
+                "comparator": "price_above",
+                "trigger_price": "90",
+            },
+            "action": {
+                "side": "buy",
+                "order_type": "market",
+                "notional": "100",
+            },
+            "thesis": "Exercise a real linked-order reconciliation latch.",
+        },
+    )
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    _trigger_candidate_rule(service)
+    with service.session_factory() as session:
+        linked_order_id = session.scalar(
+            select(Proposal.order_id).where(
+                Proposal.source_rule_id == first.target_id
+            )
+        )
+    assert linked_order_id is not None
+    _approve_candidate_order(service, linked_order_id)
+    assert service.order_application.repository.claim_submission(
+        linked_order_id,
+        NOW + timedelta(seconds=2),
+        ("operator_global", "equity"),
+        actor=ACTOR,
+        reason="latch linked candidate order reconciliation",
+        request_id="candidate-rule-linked-order-claim",
+    )
+
+    assert _queue_rule(queue, envelope, binding) == first
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        assert group.state == RuleState.TRIGGERED.value
+        assert group.version == 2
+        assert group.reconciliation_required is True
 
 
 @pytest.mark.parametrize(
