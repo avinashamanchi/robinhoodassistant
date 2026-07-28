@@ -656,6 +656,195 @@ The full suite was not rerun.
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-0aac06b..b6af5fe.diff`
 - Diff size: 1,835 lines / 62,269 bytes
 
+## Review fix round 5
+
+Both Important proof-path findings and the Minor plan-reconciliation finding
+were addressed in implementation commit `a8dca94`:
+
+- Reconciliation's transaction-local flush listener now collects every parent
+  order affected by a `Fill` insert, promotion, supersession, deletion,
+  reassignment, or reconciliation-state change. The final audit phase writes
+  one `order.fill_reconcile` proof per affected parent unless a simultaneous
+  authoritative order audit already snapshots the same final fill set.
+  Fill/cursor/proof failure rolls the entire transaction back.
+- Terminal late fills now refresh the candidate order proof even when the
+  terminal order is excluded from status sync. That proof remains committed
+  if a later reconciliation phase crashes or a later status dependency fails,
+  so completed and compatibility `target_persisted` receipt replay sees the
+  exact new fill set.
+- `RuleRepository.lease_group` validates an aware datetime before opening a
+  mutation path, normalizes it to UTC, requires it to be at or after both
+  durable group timestamps, and requires expiry strictly after the sample.
+  Invalid/backdated time can neither set the unresolved-acceptance latch nor
+  create proof. A worker whose pre-lock sample is overtaken by another
+  serialized writer treats the typed chronology rejection as a lost lease and
+  evaluates nothing.
+- Rule persistence accepts an optional aware timestamp and uses it for the
+  new group, rule, and creation audits. Candidate queueing passes its trusted
+  queue time, and fixed-clock tests can create a chronologically valid group
+  without weakening the repository check.
+- Plan fill reconciliation now changes
+  `RuleGroup.reconciliation_required` through a shared proof-producing helper.
+  Both the untrusted-fill latch and the terminal-late-residual path therefore
+  retain exact latest group proof. Audit failure rolls the group changes back.
+- No model or migration changed. The one edit in
+  `tests/test_release_gate_branches.py` only injects that test's existing
+  fixed clock into rule creation; no Task 10 production interface or behavior
+  was implemented.
+
+### Fix-round-5 RED evidence
+
+An initial multi-file command mistakenly supplied more than one `-k` option,
+so pytest honored only the last planning selector. It still produced the
+expected planning RED, and each intended selector was then rerun explicitly
+before production changed:
+
+```text
+uv run pytest tests/test_candidate_boundary.py -k \
+  'terminal_late_fill_refreshes_one_complete_parent_order_proof or \
+   late_fill_parent_proof_survives_later_reconciliation_phase_failure or \
+   rule_receipt_backdated_lease_is_rejected_before_mutation_or_proof'
+8 failed, 191 deselected in 0.86s
+
+uv run pytest tests/test_rule_leases.py -k \
+  'lease_group_rejects_non_aware_or_invalid_now_before_mutation or \
+   lease_group_rejects_now_before_group_creation or \
+   backdated_lease_cannot_set_reconciliation_latch_before_rejection or \
+   lease_group_accepts_equal_time_and_normalizes_offset_to_utc'
+5 failed, 14 deselected in 0.24s
+
+uv run pytest tests/test_planning.py -k \
+  'untrusted_plan_fill_refreshes_every_changed_group_proof_atomically'
+1 failed, 64 deselected in 0.22s
+
+uv run pytest tests/test_reconciliation_service.py -k \
+  'each_fill_mutation_batch_refreshes_one_complete_parent_order_proof'
+4 failed, 106 deselected in 0.80s
+```
+
+The failures proved that every tested fill mutation had zero parent batch
+proofs, lease time was neither validated nor normalized before mutation, and
+plan reconciliation emitted no group proof.
+
+### Fix-round-5 focused and adversarial evidence
+
+The corrected new selectors passed 8 candidate cases, 5 lease cases, 4 fill
+mutation classes, and the plan proof case. Two broad focused runs then exposed
+test-clock assumptions: one acceptance-recovery test reused a timestamp older
+than the reconciliation write, and one worker/cancel race sampled time before
+waiting for the serialized writer. The first now leases at the durable
+recovery timestamp; the second exercises the production fail-closed lost-lease
+behavior.
+
+Final focused evidence:
+
+```text
+uv run pytest tests/test_candidate_boundary.py \
+  tests/test_order_application.py tests/test_order_submission.py \
+  tests/test_reconciliation_service.py tests/test_rule_leases.py \
+  tests/test_rules_engine.py tests/test_submission_barrier.py \
+  tests/test_api.py tests/test_mcp_tools.py \
+  tests/test_sensitive_write_sites.py tests/test_sensitive_crypto.py \
+  tests/test_sensitive_migration.py tests/test_order_state_machine.py \
+  tests/test_startup_reconciliation.py tests/test_planning.py
+754 passed, 1 warning in 70.04s
+
+uv run pytest tests/test_monitor.py tests/test_plan_rules.py \
+  tests/test_rule_models.py
+78 passed, 1 warning in 2.35s
+
+for repeat in 1 2 3 4 5; do
+  uv run pytest -q tests/test_candidate_boundary.py \
+    tests/test_reconciliation_service.py tests/test_rule_leases.py \
+    tests/test_planning.py -k \
+    'terminal_late_fill_refreshes_one_complete_parent_order_proof or
+     late_fill_parent_proof_survives_later_reconciliation_phase_failure or
+     rule_receipt_backdated_lease_is_rejected_before_mutation_or_proof or
+     each_fill_mutation_batch_refreshes_one_complete_parent_order_proof or
+     lease_group_rejects_non_aware_or_invalid_now_before_mutation or
+     lease_group_rejects_now_before_group_creation or
+     backdated_lease_cannot_set_reconciliation_latch_before_rejection or
+     lease_group_accepts_equal_time_and_normalizes_offset_to_utc or
+     untrusted_plan_fill_refreshes_every_changed_group_proof_atomically or
+     worker_and_plan_cancellation_commit_one_coherent_group_state' || exit 1
+done
+95 passed
+
+uv run pytest \
+  tests/test_reconciliation_service.py::test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails
+2 passed, 1 warning
+
+uv run pytest \
+  tests/test_planning.py::test_untrusted_plan_fill_refreshes_every_changed_group_proof_atomically
+2 passed
+
+uv run python -m py_compile \
+  src/trading_assistant/orders/reconciliation.py \
+  src/trading_assistant/rules/application.py \
+  src/trading_assistant/rules/repository.py \
+  src/trading_assistant/rules/worker.py \
+  src/trading_assistant/security/candidates.py \
+  tests/test_candidate_boundary.py tests/test_planning.py \
+  tests/test_reconciliation_service.py \
+  tests/test_release_gate_branches.py tests/test_rule_leases.py
+PASS
+
+git diff --check
+PASS
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning.
+
+### Fix-round-5 full and release gates
+
+Exactly one no-argument full suite was run:
+
+```text
+uv run pytest
+3231 passed, 4 failed, 1 skipped, 1 warning in 249.02s
+```
+
+All four failures were in `tests/test_release_gate_branches.py`. Its
+`_group_with_rule` helper used fixed `NOW=2026-07-26T18:00:00Z` for leasing but
+created the group through wall-clock defaults on July 28. The new chronology
+check correctly rejected that impossible ordering. The helper now passes its
+fixed `NOW` through the injectable rule-persistence clock.
+
+Post-correction focused confirmation:
+
+```text
+uv run pytest tests/test_release_gate_branches.py -k \
+  'rule_loader_refuses_unknown_persisted_payload_version or
+   stale_rule_release_is_a_noop or
+   terminal_claim_refuses_nonterminal_state_and_wrong_winner or
+   terminal_claim_rolls_back_if_audit_cannot_commit'
+4 passed, 32 deselected
+
+uv run pytest tests/test_rules_engine.py tests/test_rule_leases.py -k \
+  'create_rule or lease_group'
+4 passed, 19 deselected
+
+uv run pytest tests/test_release_gate_branches.py \
+  tests/test_rule_leases.py tests/test_rules_engine.py tests/test_monitor.py
+96 passed, 1 warning in 4.32s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+The full suite was not rerun because the round explicitly permits exactly one
+full run. This report therefore does not claim a post-fix green no-argument
+suite.
+
+### Fix-round-5 review package
+
+- Base: `b7c5be6`
+- Implementation: `a8dca94`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-b7c5be6..a8dca94.diff`
+- Diff size: 1,317 lines / 45,746 bytes
+
 ## Safety statement
 
 All tests used temporary SQLite databases and deterministic fakes. No app,
@@ -687,5 +876,9 @@ equity/crypto behavior.
 - The fix-round-4 review package is prepared but has not yet received a fresh
   independent review, so this report claims implementation-gate completion,
   not independent-review closure.
+- The fix-round-5 review package has not received independent review, and its
+  sole full suite was not green before the fixed-clock test correction. The
+  exact failures and complete affected adjacency are green, but no post-fix
+  no-argument-suite result is claimed.
 - Candidate queueing intentionally does not make profitability claims and does
   not weaken the separate recent-auth approval boundary.

@@ -1,0 +1,1317 @@
+diff --git a/src/trading_assistant/orders/reconciliation.py b/src/trading_assistant/orders/reconciliation.py
+index 197637c..578bb7f 100644
+--- a/src/trading_assistant/orders/reconciliation.py
++++ b/src/trading_assistant/orders/reconciliation.py
+@@ -161,6 +161,7 @@ def _changed_columns(row: object) -> list[str]:
+ 
+ _RECONCILIATION_CONTEXT = "reconciliation_mutation_context"
+ _PENDING_RECONCILIATION_AUDITS = "pending_reconciliation_audits"
++_PENDING_PARENT_ORDER_PROOFS = "pending_reconciliation_parent_order_proofs"
+ 
+ 
+ def _bind_reconciliation_context(
+@@ -172,6 +173,23 @@ def _bind_reconciliation_context(
+     session.info[_RECONCILIATION_CONTEXT] = (actor, reason, request_id)
+ 
+ 
++def _fill_parent_order_ids(fill: Fill) -> set[int]:
++    """Return every parent whose fill snapshot changes in this flush."""
++    candidates: set[object] = {fill.order_id}
++    history = sa_inspect(fill).attrs.order_id.history
++    candidates.update(history.added)
++    candidates.update(history.deleted)
++    return {
++        candidate
++        for candidate in candidates
++        if (
++            isinstance(candidate, int)
++            and not isinstance(candidate, bool)
++            and candidate > 0
++        )
++    }
++
++
+ @event.listens_for(Session, "before_flush")
+ def _audit_reconciliation_flush(
+     session: Session,
+@@ -186,8 +204,10 @@ def _audit_reconciliation_flush(
+     pending: list[
+         tuple[object, str, str, str, dict[str, object]]
+     ] = []
++    parent_order_ids: set[int] = set()
+     for row in list(session.new):
+         if isinstance(row, Fill):
++            parent_order_ids.update(_fill_parent_order_ids(row))
+             pending.append(
+                 (
+                     row,
+@@ -222,6 +242,7 @@ def _audit_reconciliation_flush(
+                 )
+             )
+         elif isinstance(row, Fill):
++            parent_order_ids.update(_fill_parent_order_ids(row))
+             pending.append(
+                 (
+                     row,
+@@ -243,6 +264,7 @@ def _audit_reconciliation_flush(
+             )
+     for row in list(session.deleted):
+         if isinstance(row, Fill):
++            parent_order_ids.update(_fill_parent_order_ids(row))
+             pending.append(
+                 (
+                     row,
+@@ -257,6 +279,11 @@ def _audit_reconciliation_flush(
+         [],
+     )
+     audit_queue.extend(pending)
++    proof_queue = session.info.setdefault(
++        _PENDING_PARENT_ORDER_PROOFS,
++        set(),
++    )
++    proof_queue.update(parent_order_ids)
+ 
+ 
+ def _persist_pending_reconciliation_audits(
+@@ -267,6 +294,18 @@ def _persist_pending_reconciliation_audits(
+     request_id: str,
+ ) -> None:
+     pending = session.info.pop(_PENDING_RECONCILIATION_AUDITS, [])
++    parent_order_ids = set(
++        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, set())
++    )
++    directly_audited_order_ids = {
++        row.id
++        for row, _action, target_type, _result_code, _detail in pending
++        if (
++            target_type == "order"
++            and isinstance(row, Order)
++            and isinstance(row.id, int)
++        )
++    }
+     for row, action, target_type, result_code, detail in pending:
+         if isinstance(row, ReconciliationCursor):
+             target_id = f"{row.broker}:{row.stream}"
+@@ -285,6 +324,20 @@ def _persist_pending_reconciliation_audits(
+             result_code=result_code,
+             detail=detail,
+         )
++    for order_id in sorted(
++        parent_order_ids - directly_audited_order_ids
++    ):
++        _audit_reconciliation_mutation(
++            session,
++            actor=actor,
++            reason=reason,
++            request_id=request_id,
++            action="order.fill_reconcile",
++            target_type="order",
++            target_id=str(order_id),
++            result_code="fills_reconciled",
++            detail={"changed_fields": ["fills"]},
++        )
+ 
+ 
+ def _commit_reconciliation_mutations(
+@@ -318,6 +371,7 @@ def _commit_reconciliation_mutations(
+     finally:
+         session.info.pop(_RECONCILIATION_CONTEXT, None)
+         session.info.pop(_PENDING_RECONCILIATION_AUDITS, None)
++        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, None)
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/src/trading_assistant/rules/application.py b/src/trading_assistant/rules/application.py
+index 980d0c9..d214008 100644
+--- a/src/trading_assistant/rules/application.py
++++ b/src/trading_assistant/rules/application.py
+@@ -139,6 +139,7 @@ class RuleApplicationService:
+         reason: str,
+         request_id: str,
+         plan_id: int | None = None,
++        now: datetime | None = None,
+     ) -> int:
+         with self.service.session_factory() as session:
+             rows = self.persist_commands(
+@@ -148,6 +149,7 @@ class RuleApplicationService:
+                 reason=reason,
+                 request_id=request_id,
+                 plan_id=plan_id,
++                now=now,
+             )
+             session.commit()
+             return rows[0].id
+@@ -161,6 +163,7 @@ class RuleApplicationService:
+         reason: str,
+         request_id: str,
+         plan_id: int | None = None,
++        now: datetime | None = None,
+     ) -> list[Rule]:
+         actor = actor.strip()
+         reason = reason.strip()
+@@ -170,6 +173,16 @@ class RuleApplicationService:
+                 "rule persistence actor, reason, and request_id "
+                 "must be non-empty"
+             )
++        observed_at = now or utcnow()
++        if (
++            not isinstance(observed_at, datetime)
++            or observed_at.tzinfo is None
++            or observed_at.utcoffset() is None
++        ):
++            raise ValueError(
++                "rule persistence now must be timezone-aware"
++            )
++        observed_at = observed_at.astimezone(timezone.utc)
+         validated = [self._validated(command) for command in commands]
+         if not validated:
+             return []
+@@ -202,6 +215,8 @@ class RuleApplicationService:
+                     group = RuleGroup(
+                         group_key=group_key,
+                         state=desired_group_state,
++                        created_at=observed_at,
++                        updated_at=observed_at,
+                     )
+                     session.add(group)
+                     session.flush()
+@@ -214,6 +229,7 @@ class RuleApplicationService:
+                             request_id=request_id,
+                             reason=reason,
+                             result_code=group.state,
++                            created_at=observed_at,
+                     )
+                 elif (
+                     command.activation == "immediate"
+@@ -290,6 +306,7 @@ class RuleApplicationService:
+                 pre_approved=command.pre_approved,
+                 activation=command.activation,
+                 terminal_on_trigger=command.terminal_on_trigger,
++                created_at=observed_at,
+             )
+             session.add(row)
+             session.flush()
+@@ -302,6 +319,7 @@ class RuleApplicationService:
+                     request_id=request_id,
+                     reason=reason,
+                     result_code=row.state,
++                    created_at=observed_at,
+             )
+             rows.append(row)
+         return rows
+diff --git a/src/trading_assistant/rules/repository.py b/src/trading_assistant/rules/repository.py
+index 5d37918..be72999 100644
+--- a/src/trading_assistant/rules/repository.py
++++ b/src/trading_assistant/rules/repository.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ from dataclasses import dataclass
+-from datetime import datetime, timedelta
++from datetime import datetime, timedelta, timezone
+ from decimal import Decimal, ROUND_DOWN
+ 
+ from sqlalchemy import exists, or_, select, update
+@@ -58,6 +58,10 @@ class RuleGroupLease:
+     version: int
+ 
+ 
++class RuleLeaseChronologyError(ValueError):
++    """The caller's clock sample predates durable group state."""
++
++
+ @dataclass(frozen=True)
+ class StoredRule:
+     id: int
+@@ -248,6 +252,18 @@ def _require_context(
+     return actor, reason, request_id
+ 
+ 
++def _require_aware_utc_lease_now(value: object) -> datetime:
++    if not isinstance(value, datetime) or value.tzinfo is None:
++        raise ValueError("rule lease now must be timezone-aware")
++    try:
++        offset = value.utcoffset()
++    except (OverflowError, TypeError, ValueError):
++        offset = None
++    if offset is None:
++        raise ValueError("rule lease now must be timezone-aware")
++    return value.astimezone(timezone.utc)
++
++
+ def _audit(
+     session: Session,
+     *,
+@@ -348,6 +364,33 @@ def _set_group_state(
+     return True
+ 
+ 
++def _set_group_reconciliation_required(
++    session: Session,
++    group: RuleGroup,
++    required: bool,
++    *,
++    now: datetime,
++    actor: str,
++    reason: str,
++    request_id: str,
++) -> bool:
++    if group.reconciliation_required == required:
++        return False
++    group.reconciliation_required = required
++    group.updated_at = now
++    _audit(
++        session,
++        actor=actor,
++        reason=reason,
++        request_id=request_id,
++        action="rule_group.reconciliation_required",
++        target_type="rule_group",
++        target_id=group.id,
++        result_code="required" if required else "cleared",
++    )
++    return True
++
++
+ def reconcile_plan_lifecycle_in_session(
+     session: Session,
+     *,
+@@ -489,8 +532,15 @@ def reconcile_plan_lifecycle_in_session(
+                 )
+             )
+             for group in groups.values():
+-                group.reconciliation_required = True
+-                group.updated_at = now
++                _set_group_reconciliation_required(
++                    session,
++                    group,
++                    True,
++                    now=now,
++                    actor=actor,
++                    reason=reason,
++                    request_id=request_id,
++                )
+             trip_in_session(
+                 session,
+                 BreakerScope.broker_drift(),
+@@ -725,8 +775,14 @@ def reconcile_plan_lifecycle_in_session(
+                 ):
+                     rules_activated += 1
+                 group = groups[rule.group_id]
+-                group.reconciliation_required = (
+-                    plan_reconciliation_required
++                _set_group_reconciliation_required(
++                    session,
++                    group,
++                    plan_reconciliation_required,
++                    now=now,
++                    actor=actor,
++                    reason=reason,
++                    request_id=request_id,
+                 )
+                 _set_group_state(
+                     session,
+@@ -1571,10 +1627,34 @@ class RuleRepository:
+         actor, reason, request_id = _require_context(
+             actor, reason, request_id
+         )
+-        if ttl <= timedelta(0):
++        normalized_now = _require_aware_utc_lease_now(now)
++        if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
+             raise ValueError("rule lease ttl must be positive")
+-        expires_at = now + ttl
++        try:
++            expires_at = normalized_now + ttl
++        except (OverflowError, TypeError):
++            raise ValueError("rule lease ttl is invalid") from None
++        if expires_at <= normalized_now:
++            raise ValueError("rule lease expiry must follow now")
+         with self.session_factory() as session:
++            group = session.get(RuleGroup, group_id)
++            if group is None:
++                session.rollback()
++                return None
++            created_at = _require_aware_utc_lease_now(
++                group.created_at
++            )
++            updated_at = _require_aware_utc_lease_now(
++                group.updated_at
++            )
++            if (
++                normalized_now < created_at
++                or normalized_now < updated_at
++            ):
++                session.rollback()
++                raise RuleLeaseChronologyError(
++                    "rule lease now precedes durable group state"
++                )
+             unresolved = exists(
+                 select(Order.id)
+                 .join(Proposal, Proposal.order_id == Order.id)
+@@ -1592,12 +1672,14 @@ class RuleRepository:
+                 update(RuleGroup)
+                 .where(
+                     RuleGroup.id == group_id,
++                    RuleGroup.created_at <= normalized_now,
++                    RuleGroup.updated_at <= normalized_now,
+                     RuleGroup.reconciliation_required.is_(False),
+                     unresolved,
+                 )
+                 .values(
+                     reconciliation_required=True,
+-                    updated_at=now,
++                    updated_at=normalized_now,
+                 )
+             )
+             if latch.rowcount:
+@@ -1615,18 +1697,20 @@ class RuleRepository:
+                 update(RuleGroup)
+                 .where(
+                     RuleGroup.id == group_id,
++                    RuleGroup.created_at <= normalized_now,
++                    RuleGroup.updated_at <= normalized_now,
+                     RuleGroup.state == RuleState.ACTIVE.value,
+                     RuleGroup.reconciliation_required.is_(False),
+                     or_(
+                         RuleGroup.lease_expires_at.is_(None),
+-                        RuleGroup.lease_expires_at <= now,
++                        RuleGroup.lease_expires_at <= normalized_now,
+                     ),
+                 )
+                 .values(
+                     lease_owner=self.owner,
+                     lease_expires_at=expires_at,
+                     version=RuleGroup.version + 1,
+-                    updated_at=now,
++                    updated_at=normalized_now,
+                 )
+                 .returning(RuleGroup.version)
+             ).scalar_one_or_none()
+diff --git a/src/trading_assistant/rules/worker.py b/src/trading_assistant/rules/worker.py
+index a687f28..1e1d7bd 100644
+--- a/src/trading_assistant/rules/worker.py
++++ b/src/trading_assistant/rules/worker.py
+@@ -29,7 +29,11 @@ from .models import (
+     TimeCondition,
+     TrailingCondition,
+ )
+-from .repository import RuleRepository, StoredRule
++from .repository import (
++    RuleLeaseChronologyError,
++    RuleRepository,
++    StoredRule,
++)
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -99,13 +103,19 @@ class RuleWorker:
+         )
+         for group_id in self.repository.active_group_ids():
+             tick_now = self.now()
+-            lease = self.repository.lease_group(
+-                group_id,
+-                now=tick_now,
+-                actor=actor,
+-                reason=reason,
+-                request_id=request_id,
+-            )
++            try:
++                lease = self.repository.lease_group(
++                    group_id,
++                    now=tick_now,
++                    actor=actor,
++                    reason=reason,
++                    request_id=request_id,
++                )
++            except RuleLeaseChronologyError:
++                # Another serialized writer advanced the group after this
++                # worker sampled its clock. Treat that stale sample exactly
++                # like a lost lease and evaluate nothing.
++                continue
+             if lease is None:
+                 continue
+             try:
+diff --git a/src/trading_assistant/security/candidates.py b/src/trading_assistant/security/candidates.py
+index ea33b63..9cddfec 100644
+--- a/src/trading_assistant/security/candidates.py
++++ b/src/trading_assistant/security/candidates.py
+@@ -1581,6 +1581,7 @@ class CandidateQueueService:
+                 actor=actor,
+                 reason=reason,
+                 request_id=request_id,
++                now=now,
+             )[0]
+             for warning in risk.warnings:
+                 persist_sensitive(
+diff --git a/tests/test_candidate_boundary.py b/tests/test_candidate_boundary.py
+index 45ac77d..8f38545 100644
+--- a/tests/test_candidate_boundary.py
++++ b/tests/test_candidate_boundary.py
+@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.app.main import create_app
+ from trading_assistant.app.limits import InterlockDecision
++from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.db.models import (
+     AuditEvent,
+     CandidateNonce,
+@@ -31,7 +32,15 @@ from trading_assistant.db.models import (
+     RuleGroup,
+     approve_proposed,
+ )
+-from trading_assistant.broker.models import OrderResult, OrderStatus
++from trading_assistant.broker.models import (
++    BrokerFill,
++    OrderResult,
++    OrderStatus,
++)
++from trading_assistant.db.lifecycle_proofs import (
++    lifecycle_proof_matches,
++)
++from trading_assistant.dependencies import RequiredDependencyUnavailable
+ from trading_assistant.orders.application import ApprovalCommand
+ from trading_assistant.risk.breakers import BreakerScope
+ from trading_assistant.risk.engine import BreakerTripIntent, RiskResult
+@@ -50,6 +59,21 @@ REQUEST_ID = "candidate-boundary-request"
+ IDEMPOTENCY_KEY = "candidate-boundary-once"
+ 
+ 
++class _CandidateActivityBroker(MockBroker):
++    def __init__(self) -> None:
++        super().__init__(now=lambda: NOW)
++        self.activities: list[BrokerFill] = []
++        self.fail_status_for: str | None = None
++
++    def get_fill_activities(self, after=None):
++        return list(self.activities)
++
++    def get_order_status(self, order_id: str) -> OrderResult:
++        if order_id == self.fail_status_for:
++            raise ConnectionError("synthetic status dependency failure")
++        return super().get_order_status(order_id)
++
++
+ def _candidate_api():
+     try:
+         from trading_assistant.security.candidates import (
+@@ -305,6 +329,69 @@ def _reconcile_candidate_order_terminal(
+     )
+ 
+ 
++def _stage_late_candidate_fill(
++    service,
++    broker: _CandidateActivityBroker,
++    order_id: int,
++    *,
++    broker_fill_id: str,
++) -> None:
++    with service.session_factory() as session:
++        order = session.get(Order, order_id)
++        broker.activities = [
++            BrokerFill(
++                broker_fill_id=broker_fill_id,
++                broker_order_id=order.broker_order_id,
++                ticker=order.ticker,
++                side=order.side,
++                qty=Decimal("1"),
++                price=Decimal("100"),
++                filled_at=NOW + timedelta(seconds=4),
++            )
++        ]
++
++
++def _assert_exact_parent_fill_proof(
++    service,
++    order_id: int,
++    *,
++    request_id: str,
++    broker_fill_id: str,
++) -> None:
++    with service.session_factory() as session:
++        audits = list(
++            session.scalars(
++                select(AuditEvent).where(
++                    AuditEvent.action == "order.fill_reconcile",
++                    AuditEvent.target_type == "order",
++                    AuditEvent.target_id == str(order_id),
++                    AuditEvent.request_id == request_id,
++                )
++            )
++        )
++        assert len(audits) == 1
++        detail = json.loads(
++            sensitive_store(session).read(
++                audits[0],
++                "detail_json",
++            )
++        )
++        proof = detail["lifecycle_proof"]
++        fills = proof["snapshot"]["fills"]
++        assert proof["target_type"] == "order"
++        assert proof["target_id"] == order_id
++        assert len(fills) == 1
++        assert fills[0]["order_id"] == order_id
++        assert fills[0]["broker_fill_id"] == broker_fill_id
++        assert fills[0]["reconciliation_state"] == "trusted"
++        assert lifecycle_proof_matches(
++            session,
++            service.session_factory,
++            target_type="order",
++            target_id=order_id,
++        )
++
++
+ def _trigger_candidate_rule(
+     service,
+     *,
+@@ -1352,6 +1439,140 @@ def test_order_receipt_accepts_real_reconciled_terminal_with_submitted_acceptanc
+         assert order.version == 4
+ 
+ 
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_terminal_late_fill_refreshes_one_complete_parent_order_proof(
++    make_service,
++    receipt_state,
++):
++    broker = _CandidateActivityBroker()
++    envelope, service, signer, binding = _order_envelope(
++        make_service,
++        service=_service_at(make_service, broker=broker),
++    )
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    _reconcile_candidate_order_terminal(
++        service,
++        first.target_id,
++        OrderStatus.CANCELED,
++    )
++    fill_id = f"late-terminal-{receipt_state}"
++    request_id = f"candidate-late-fill-{receipt_state}"
++    _stage_late_candidate_fill(
++        service,
++        broker,
++        first.target_id,
++        broker_fill_id=fill_id,
++    )
++
++    first_reconcile = service.reconciliation.reconcile(
++        actor=ACTOR,
++        reason="persist terminal late fill with parent proof",
++        request_id=request_id,
++    )
++    replay_reconcile = service.reconciliation.reconcile(
++        actor=ACTOR,
++        reason="replay terminal late fill without duplicate proof",
++        request_id=request_id,
++    )
++
++    assert first_reconcile.inserted_fills == 1
++    assert first_reconcile.synced_orders == 0
++    assert replay_reconcile.inserted_fills == 0
++    assert replay_reconcile.synced_orders == 0
++    _assert_exact_parent_fill_proof(
++        service,
++        first.target_id,
++        request_id=request_id,
++        broker_fill_id=fill_id,
++    )
++    assert _queue_order(queue, envelope, binding) == first
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    "failure_phase",
++    ["between_fill_and_status", "status_dependency"],
++)
++def test_late_fill_parent_proof_survives_later_reconciliation_phase_failure(
++    make_service,
++    monkeypatch,
++    receipt_state,
++    failure_phase,
++):
++    broker = _CandidateActivityBroker()
++    envelope, service, signer, binding = _order_envelope(
++        make_service,
++        service=_service_at(make_service, broker=broker),
++    )
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    _reconcile_candidate_order_terminal(
++        service,
++        first.target_id,
++        OrderStatus.CANCELED,
++    )
++    fill_id = f"late-{failure_phase}-{receipt_state}"
++    request_id = f"candidate-{failure_phase}-{receipt_state}"
++    _stage_late_candidate_fill(
++        service,
++        broker,
++        first.target_id,
++        broker_fill_id=fill_id,
++    )
++
++    if failure_phase == "between_fill_and_status":
++        def fail_between_phases(*args, **kwargs):
++            raise RuntimeError("synthetic inter-phase crash")
++
++        monkeypatch.setattr(
++            service.reconciliation,
++            "_reconcile_statuses",
++            fail_between_phases,
++        )
++        expected_error = RuntimeError
++        expected_message = "synthetic inter-phase crash"
++    else:
++        with service.session_factory() as session:
++            unrelated = Order(
++                idempotency_key=f"status-failure-{receipt_state}",
++                ticker="MSFT",
++                side="buy",
++                order_type="market",
++                notional=Decimal("10"),
++                status=OrderStatus.SUBMITTED.value,
++                broker_order_id=f"status-failure-{receipt_state}",
++                acceptance_state=OrderStatus.SUBMITTED.value,
++                created_at=NOW,
++                updated_at=NOW,
++            )
++            sensitive_store(session).write_many(
++                unrelated,
++                {"approval_reason": "synthetic status dependency fixture"},
++            )
++            session.commit()
++        broker.fail_status_for = f"status-failure-{receipt_state}"
++        expected_error = RequiredDependencyUnavailable
++        expected_message = None
++
++    with pytest.raises(expected_error, match=expected_message):
++        service.reconciliation.reconcile(
++            actor=ACTOR,
++            reason="prove committed fill proof survives later phase failure",
++            request_id=request_id,
++        )
++
++    _assert_exact_parent_fill_proof(
++        service,
++        first.target_id,
++        request_id=request_id,
++        broker_fill_id=fill_id,
++    )
++    assert _queue_order(queue, envelope, binding) == first
++
++
+ def test_order_replay_never_decrypts_proposal_reasoning(
+     make_service,
+     monkeypatch,
+@@ -2220,6 +2441,50 @@ def test_rule_receipt_accepts_terminal_reconciliation_latch_from_linked_order(
+         assert group.reconciliation_required is True
+ 
+ 
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_rule_receipt_backdated_lease_is_rejected_before_mutation_or_proof(
++    make_service,
++    receipt_state,
++):
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        group_id = group.id
++        backdated = group.created_at - timedelta(microseconds=1)
++
++    with pytest.raises(
++        ValueError,
++        match="rule lease now precedes durable group state",
++    ):
++        service.rule_repository.lease_group(
++            group_id,
++            now=backdated,
++            actor=ACTOR,
++            reason="reject backdated candidate rule lease",
++            request_id=f"candidate-backdated-lease-{receipt_state}",
++        )
++
++    with service.session_factory() as session:
++        group = session.get(RuleGroup, group_id)
++        assert group.state == RuleState.ACTIVE.value
++        assert group.version == 0
++        assert group.lease_owner is None
++        assert group.lease_expires_at is None
++        assert session.scalar(
++            select(func.count())
++            .select_from(AuditEvent)
++            .where(
++                AuditEvent.request_id
++                == f"candidate-backdated-lease-{receipt_state}"
++            )
++        ) == 0
++    assert _queue_rule(queue, envelope, binding) == first
++
++
+ @pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+ def test_rule_receipt_rejects_malformed_active_lease_chronology(
+     make_service,
+diff --git a/tests/test_planning.py b/tests/test_planning.py
+index f8f668a..08a63ae 100644
+--- a/tests/test_planning.py
++++ b/tests/test_planning.py
+@@ -33,6 +33,9 @@ from trading_assistant.broker.models import (
+     Position,
+ )
+ from trading_assistant.config import Secrets, TradingMode
++from trading_assistant.db.lifecycle_proofs import (
++    lifecycle_proof_matches,
++)
+ from trading_assistant.db.models import (
+     AuditEvent,
+     FILL_RECONCILIATION_REQUIRED,
+@@ -854,6 +857,133 @@ def test_reconciliation_commit_activates_exits_without_a_second_service_step(
+     } == {qty}
+ 
+ 
++@pytest.mark.parametrize("audit_failure", [False, True])
++def test_untrusted_plan_fill_refreshes_every_changed_group_proof_atomically(
++    make_service,
++    audit_failure,
++):
++    broker = _FillAwareBroker()
++    service = make_service(broker=broker)
++    planning = _planning(service)
++    plan_id = _analyze(planning, "untrusted group proof")["plan_id"]
++    _approve(
++        planning,
++        plan_id,
++        actor="operator:test",
++        reason="review untrusted group proof",
++        request_id="planning-untrusted-group-proof-approval",
++    )
++    broker.set_price("AAPL", Decimal("98"))
++    proposal = _plan_worker(service).tick(
++        actor="daemon:test",
++        reason="create plan order for untrusted fill proof",
++        request_id="planning-untrusted-group-proof-proposal",
++    )[0].proposal
++    assert proposal is not None
++    with service.session_factory() as session:
++        group_ids = tuple(
++            session.scalars(
++                select(Rule.group_id)
++                .where(Rule.plan_id == plan_id)
++                .distinct()
++                .order_by(Rule.group_id)
++            ).all()
++        )
++        assert group_ids
++        assert all(
++            lifecycle_proof_matches(
++                session,
++                service.session_factory,
++                target_type="rule_group",
++                target_id=group_id,
++            )
++            for group_id in group_ids
++        )
++        order = session.get(Order, proposal["order_id"])
++        session.add(
++            Fill(
++                order_id=order.id,
++                ticker=order.ticker,
++                side=order.side,
++                qty=Decimal("1"),
++                price=Decimal("98"),
++                broker_fill_id=None,
++                filled_at=datetime.now(timezone.utc),
++            )
++        )
++        session.commit()
++
++    request_id = "planning-untrusted-group-proof-reconcile"
++    listener = _fail_audit_action(
++        "rule_group.reconciliation_required"
++    )
++    session_type = service.session_factory.class_
++    if audit_failure:
++        event.listen(session_type, "before_flush", listener)
++    try:
++        if audit_failure:
++            with pytest.raises(
++                RuntimeError,
++                match=(
++                    "injected rule_group.reconciliation_required "
++                    "audit failure"
++                ),
++            ):
++                service.rule_repository.refresh_fill_activated_rules(
++                    now=datetime.now(timezone.utc),
++                    actor="daemon:test",
++                    reason=(
++                        "rollback untrusted plan fill proof failure"
++                    ),
++                    request_id=request_id,
++                )
++        else:
++            service.rule_repository.refresh_fill_activated_rules(
++                now=datetime.now(timezone.utc),
++                actor="daemon:test",
++                reason=(
++                    "latch untrusted plan fill with exact group proof"
++                ),
++                request_id=request_id,
++            )
++    finally:
++        if audit_failure:
++            event.remove(session_type, "before_flush", listener)
++
++    with service.session_factory() as session:
++        groups = [
++            session.get(RuleGroup, group_id)
++            for group_id in group_ids
++        ]
++        audits = list(
++            session.scalars(
++                select(AuditEvent)
++                .where(
++                    AuditEvent.request_id == request_id,
++                    AuditEvent.action
++                    == "rule_group.reconciliation_required",
++                )
++                .order_by(AuditEvent.target_id)
++            )
++        )
++        assert all(
++            group.reconciliation_required is (not audit_failure)
++            for group in groups
++        )
++        assert [int(audit.target_id) for audit in audits] == (
++            [] if audit_failure else list(group_ids)
++        )
++        assert all(
++            lifecycle_proof_matches(
++                session,
++                service.session_factory,
++                target_type="rule_group",
++                target_id=group_id,
++            )
++            for group_id in group_ids
++        )
++
++
+ def _multi_target_plan() -> TradePlan:
+     plan = _plan()
+     return plan.model_copy(
+diff --git a/tests/test_reconciliation_service.py b/tests/test_reconciliation_service.py
+index a43b4de..1cc9a31 100644
+--- a/tests/test_reconciliation_service.py
++++ b/tests/test_reconciliation_service.py
+@@ -21,6 +21,9 @@ from trading_assistant.broker.models import (
+     Position,
+ )
+ from trading_assistant.db import models as db_models
++from trading_assistant.db.lifecycle_proofs import (
++    lifecycle_proof_matches,
++)
+ from trading_assistant.db.models import (
+     FILL_RECONCILIATION_QUARANTINED,
+     FILL_RECONCILIATION_REQUIRED,
+@@ -1810,6 +1813,154 @@ class ActivityBroker(MockBroker):
+         return list(self.activities)
+ 
+ 
++@pytest.mark.parametrize(
++    "mutation_kind",
++    ("insert", "promote", "supersede", "delete_synthetic"),
++)
++def test_each_fill_mutation_batch_refreshes_one_complete_parent_order_proof(
++    make_service,
++    monkeypatch,
++    mutation_kind,
++):
++    broker = ActivityBroker()
++    service = make_service(broker=broker)
++    observed_at = utcnow()
++    broker_order_id = f"proof-fill-{mutation_kind}"
++    exact_fill_id = f"proof-exact-{mutation_kind}"
++    with service.session_factory() as session:
++        order = _persist_order(
++            session,
++            Order(
++                idempotency_key=f"proof-client-{mutation_kind}",
++                ticker="AAPL",
++                side="buy",
++                order_type="market",
++                qty=Decimal("1"),
++                status=OrderStatus.CANCELED.value,
++                broker_order_id=broker_order_id,
++                acceptance_state="accepted",
++                created_at=observed_at - timedelta(minutes=1),
++                updated_at=observed_at - timedelta(minutes=1),
++            ),
++        )
++        session.flush()
++        if mutation_kind == "promote":
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker="AAPL",
++                    side="buy",
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id=exact_fill_id,
++                    reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
++                    filled_at=observed_at - timedelta(seconds=30),
++                )
++            )
++        elif mutation_kind == "supersede":
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker="AAPL",
++                    side="buy",
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id="proof-legacy-superseded",
++                    reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
++                    filled_at=observed_at - timedelta(seconds=30),
++                )
++            )
++        elif mutation_kind == "delete_synthetic":
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker="AAPL",
++                    side="buy",
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id=f"{broker_order_id}:1",
++                    filled_at=observed_at - timedelta(seconds=30),
++                )
++            )
++        session.commit()
++        order_id = order.id
++
++    broker.activities = [
++        BrokerFill(
++            broker_fill_id=exact_fill_id,
++            broker_order_id=broker_order_id,
++            ticker="AAPL",
++            side="buy",
++            qty=Decimal("1"),
++            price=Decimal("100"),
++            filled_at=observed_at,
++        )
++    ]
++    context = _mutation(f"proof fill batch {mutation_kind}")
++
++    def fail_after_fill_phase(*args, **kwargs):
++        raise RuntimeError("synthetic status phase failure")
++
++    monkeypatch.setattr(
++        service.reconciliation,
++        "_reconcile_statuses",
++        fail_after_fill_phase,
++    )
++    with pytest.raises(
++        RuntimeError,
++        match="synthetic status phase failure",
++    ):
++        service.reconciliation.reconcile(**context)
++
++    with service.session_factory() as session:
++        parent_audits = list(
++            session.scalars(
++                select(AuditEvent).where(
++                    AuditEvent.action == "order.fill_reconcile",
++                    AuditEvent.target_type == "order",
++                    AuditEvent.target_id == str(order_id),
++                    AuditEvent.request_id == context["request_id"],
++                )
++            )
++        )
++        fills = list(
++            session.scalars(
++                select(Fill)
++                .where(Fill.order_id == order_id)
++                .order_by(Fill.id)
++            )
++        )
++        assert len(parent_audits) == 1
++        assert lifecycle_proof_matches(
++            session,
++            service.session_factory,
++            target_type="order",
++            target_id=order_id,
++        )
++        assert [
++            (fill.broker_fill_id, fill.reconciliation_state)
++            for fill in fills
++        ] == (
++            [
++                (
++                    exact_fill_id,
++                    "trusted",
++                )
++            ]
++            if mutation_kind in {"insert", "promote", "delete_synthetic"}
++            else [
++                (
++                    "proof-legacy-superseded",
++                    "superseded",
++                ),
++                (
++                    exact_fill_id,
++                    "trusted",
++                ),
++            ]
++        )
++
++
+ def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
+     make_service,
+ ):
+@@ -1881,8 +2032,13 @@ def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
+     }
+ 
+ 
++@pytest.mark.parametrize(
++    "failed_action",
++    ("fill.reconcile", "order.fill_reconcile"),
++)
+ def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
+     make_service,
++    failed_action,
+ ):
+     broker = ActivityBroker()
+     service = make_service(broker=broker)
+@@ -1902,13 +2058,13 @@ def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
+             )
+         ]
+ 
+-    listener = _audit_failure_listener("fill.reconcile")
++    listener = _audit_failure_listener(failed_action)
+     session_type = service.session_factory.class_
+     event.listen(session_type, "before_flush", listener)
+     try:
+         with pytest.raises(
+             RuntimeError,
+-            match="injected fill.reconcile audit failure",
++            match=f"injected {failed_action} audit failure",
+         ):
+             service.reconciliation.reconcile(
+                 actor="operator:fill-rollback",
+diff --git a/tests/test_release_gate_branches.py b/tests/test_release_gate_branches.py
+index 12404fd..eb1de6a 100644
+--- a/tests/test_release_gate_branches.py
++++ b/tests/test_release_gate_branches.py
+@@ -427,6 +427,7 @@ def _rule_command(group_key: str, *, price="101") -> dict:
+ def _group_with_rule(service, key: str) -> tuple[int, int]:
+     rule_id = service.rule_application.create_rule(
+         _rule_command(key),
++        now=NOW,
+         **MUTATION,
+     )
+     with service.session_factory() as session:
+diff --git a/tests/test_rule_leases.py b/tests/test_rule_leases.py
+index 69c5dbf..32d6e34 100644
+--- a/tests/test_rule_leases.py
++++ b/tests/test_rule_leases.py
+@@ -71,7 +71,11 @@ def _command(
+ def _seed_group(session_factory, *commands: RuleCommand) -> tuple[int, list[int]]:
+     assert commands
+     with session_factory() as session:
+-        group = RuleGroup(group_key=commands[0].group_key)
++        group = RuleGroup(
++            group_key=commands[0].group_key,
++            created_at=NOW - timedelta(minutes=1),
++            updated_at=NOW - timedelta(minutes=1),
++        )
+         session.add(group)
+         session.flush()
+         rule_ids = []
+@@ -88,6 +92,7 @@ def _seed_group(session_factory, *commands: RuleCommand) -> tuple[int, list[int]
+                 pre_approved=command.pre_approved,
+                 fraction=command.fraction,
+                 hwm=command.high_water_mark,
++                created_at=NOW - timedelta(minutes=1),
+             )
+             session.add(rule)
+             session.flush()
+@@ -118,6 +123,162 @@ def test_two_workers_cannot_lease_sibling_rules(session_factory, seeded_oco_grou
+     ) is None
+ 
+ 
++@pytest.mark.parametrize(
++    "invalid_now",
++    [NOW.replace(tzinfo=None), "not-a-datetime"],
++)
++def test_lease_group_rejects_non_aware_or_invalid_now_before_mutation(
++    session_factory,
++    seeded_oco_group,
++    invalid_now,
++):
++    repository = RuleRepository(session_factory, owner="worker-a")
++
++    with pytest.raises(
++        ValueError,
++        match="rule lease now must be timezone-aware",
++    ):
++        repository.lease_group(
++            seeded_oco_group,
++            now=invalid_now,
++            **DEFAULT_RULE_CONTEXT,
++        )
++
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        assert group.version == 0
++        assert group.lease_owner is None
++        assert session.scalar(
++            select(func.count())
++            .select_from(AuditEvent)
++            .where(
++                AuditEvent.request_id
++                == DEFAULT_RULE_CONTEXT["request_id"]
++            )
++        ) == 0
++
++
++def test_lease_group_rejects_now_before_group_creation(
++    session_factory,
++    seeded_oco_group,
++):
++    repository = RuleRepository(session_factory, owner="worker-a")
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        group.created_at = NOW
++        group.updated_at = NOW
++        session.commit()
++
++    with pytest.raises(
++        ValueError,
++        match="rule lease now precedes durable group state",
++    ):
++        repository.lease_group(
++            seeded_oco_group,
++            now=NOW - timedelta(microseconds=1),
++            **DEFAULT_RULE_CONTEXT,
++        )
++
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        assert group.created_at == NOW
++        assert group.updated_at == NOW
++        assert group.version == 0
++        assert group.lease_owner is None
++        assert session.scalar(
++            select(func.count())
++            .select_from(AuditEvent)
++            .where(
++                AuditEvent.request_id
++                == DEFAULT_RULE_CONTEXT["request_id"]
++            )
++        ) == 0
++
++
++def test_backdated_lease_cannot_set_reconciliation_latch_before_rejection(
++    session_factory,
++    seeded_oco_group,
++):
++    repository = RuleRepository(session_factory, owner="worker-a")
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        group.updated_at = NOW + timedelta(seconds=1)
++        order = persist_sensitive(
++            session,
++            Order(
++                idempotency_key="backdated-lease-unresolved-order",
++                ticker="AAPL",
++                side="buy",
++                order_type="market",
++                notional=Decimal("100"),
++                status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
++            ),
++            {"approval_reason": "backdated lease fixture"},
++        )
++        persist_sensitive(
++            session,
++            Proposal(
++                order_id=order.id,
++                source_rule_group_id=seeded_oco_group,
++                expires_at=NOW + timedelta(minutes=15),
++            ),
++            {"reasoning": "backdated lease unresolved fixture"},
++        )
++        session.commit()
++
++    with pytest.raises(
++        ValueError,
++        match="rule lease now precedes durable group state",
++    ):
++        repository.lease_group(
++            seeded_oco_group,
++            now=NOW,
++            **DEFAULT_RULE_CONTEXT,
++        )
++
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        assert group.updated_at == NOW + timedelta(seconds=1)
++        assert group.reconciliation_required is False
++        assert group.version == 0
++        assert group.lease_owner is None
++        assert session.scalar(
++            select(func.count())
++            .select_from(AuditEvent)
++            .where(
++                AuditEvent.request_id
++                == DEFAULT_RULE_CONTEXT["request_id"]
++            )
++        ) == 0
++
++
++def test_lease_group_accepts_equal_time_and_normalizes_offset_to_utc(
++    session_factory,
++    seeded_oco_group,
++):
++    repository = RuleRepository(session_factory, owner="worker-a")
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        group.created_at = NOW
++        group.updated_at = NOW
++        session.commit()
++    offset_now = NOW.astimezone(timezone(timedelta(hours=-4)))
++
++    lease = repository.lease_group(
++        seeded_oco_group,
++        now=offset_now,
++        **DEFAULT_RULE_CONTEXT,
++    )
++
++    assert lease is not None
++    assert lease.expires_at == NOW + timedelta(seconds=30)
++    assert lease.expires_at.utcoffset() == timedelta(0)
++    with session_factory() as session:
++        group = session.get(RuleGroup, seeded_oco_group)
++        assert group.updated_at == NOW
++        assert group.lease_expires_at == NOW + timedelta(seconds=30)
++
++
+ def test_expired_lease_can_be_recovered_with_a_new_owner(
+     session_factory, seeded_oco_group
+ ):
+@@ -499,8 +660,10 @@ def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
+         reason="rule lease acceptance recovery",
+         request_id="rule-lease-recovery",
+     ) == (1, ())
++    with svc.session_factory() as session:
++        recovery_now = session.get(RuleGroup, group_id).updated_at
+     assert recovering.lease_group(
+-        group_id, now=NOW, **DEFAULT_RULE_CONTEXT
++        group_id, now=recovery_now, **DEFAULT_RULE_CONTEXT
+     ) is not None
+     with svc.session_factory() as session:
+         assert session.get(RuleGroup, group_id).reconciliation_required is False

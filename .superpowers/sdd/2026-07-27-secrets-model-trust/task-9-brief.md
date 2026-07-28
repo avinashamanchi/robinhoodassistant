@@ -203,3 +203,34 @@ through deterministic fakes, with zero broker submission/cancellation calls.
 - Use temporary SQLite and deterministic fakes only. Do not start services,
   contact providers, read Keychain content, touch the ignored runtime database,
   trade, reset a breaker, push, or begin Task 10.
+
+## Review fix round 5 evidence contract
+
+- Every reconciliation write that changes an order's fill snapshot must
+  produce one complete parent-order proof in the same transaction. This covers
+  insert, promotion, supersession, deletion, and reconciliation-state changes,
+  including a terminal order excluded from status sync and a failure in a
+  later reconciliation phase.
+- Parent proof creation is coalesced per affected order. If that proof cannot
+  flush, the fill, cursor, and audit writes roll back together. A same-
+  transaction authoritative order proof may subsume the dedicated fill-batch
+  proof because it snapshots the same final fill set.
+- `lease_group` rejects non-datetime, naive, invalid, and durable-state-
+  backdated samples before a reconciliation latch, lease, or audit can be
+  written. Valid time is normalized to UTC, must be at or after both group
+  timestamps, and must produce an expiry strictly later than the sample.
+- Rule persistence accepts an injected aware timestamp so candidate and
+  fixed-clock tests create the group, rule, and audit evidence on the same
+  chronology. A worker sample overtaken while waiting for the serialized
+  writer lock is treated as a lost lease and causes no evaluation.
+- Plan fill reconciliation changes a group's reconciliation latch only through
+  the shared proof-producing mutation helper. Proof failure must roll the group
+  write back, and every changed group must retain an exact latest proof.
+- Run RED selectors for all three defects, the broad Task 9/reconciliation/
+  rule/planning focused set, repeated adversarial selectors, exactly one
+  no-argument full suite, then compile/diff and release-static checks. If the
+  one full suite exposes a fixture defect, correct and verify it with focused
+  tests only; do not conceal the result or run a second full suite.
+- Use temporary SQLite and deterministic fakes only. Do not start services,
+  contact providers, read Keychain content, touch the ignored runtime database,
+  trade, reset a breaker, push, or begin Task 10.

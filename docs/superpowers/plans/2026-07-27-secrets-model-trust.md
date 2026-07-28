@@ -1458,6 +1458,20 @@ git commit -m "feat(analyst): isolate untrusted model context"
   or release, terminal/reconciliation states require the atomically linked
   order and canonical `Proposal`, and cancellation/panic paths write proof
   only after their target mutations.
+- Reconciliation coalesces every inserted, promoted, superseded, deleted, or
+  otherwise changed `Fill` into one parent-order lifecycle proof per affected
+  order and transaction. A simultaneous authoritative order proof subsumes the
+  batch proof; otherwise `order.fill_reconcile` records the complete final fill
+  set. Proof failure rolls back the fill/cursor transaction.
+- Rule leases accept only aware UTC caller time at or after both durable group
+  timestamps, with expiry strictly later than the normalized sample. Invalid
+  or stale samples mutate and audit nothing. A worker whose pre-lock sample is
+  overtaken by another serialized writer treats the chronology rejection as a
+  lost lease and performs no evaluation.
+- Plan fill reconciliation changes `RuleGroup.reconciliation_required` only
+  through the proof-producing shared mutation helper. Rule creation accepts an
+  injected aware timestamp so candidate/fake-clock groups and their audit
+  evidence share one chronology.
 - Candidate expiry is exclusive: an observation at or after `expires_at` is
   expired.
 - MCP remains explicit and non-executing with its existing authenticated tool
@@ -1539,6 +1553,32 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - [x] **FR4.6:** Pass RED/focused/repeated-adversarial verification, exactly
   one full suite, review diff, compile/diff, and release-static gates without
   runtime or external calls.
+
+**Fix round 5**
+
+- [x] **FR5.1:** Refresh the parent order proof atomically for every
+  reconciliation fill insert, promotion, supersession, deletion, or state
+  change, including terminal-order and later-phase-failure boundaries.
+- [x] **FR5.2:** Reject invalid, naive, or backdated rule-lease clock samples
+  before any latch, lease, or proof write; normalize valid samples to UTC and
+  preserve exact-equality/restart behavior.
+- [x] **FR5.3:** Route plan reconciliation-latch changes through shared
+  proof-producing group mutations and prove audit failure rolls back the group
+  changes.
+- [x] **FR5.4:** Prove completed and compatibility receipt replay after
+  terminal late fills, candidate lease rejection, all fill mutation classes,
+  proof rollback, and plan-group proof refresh.
+- [x] **FR5.5:** Run focused and repeated-adversarial verification, exactly one
+  no-argument full suite, compile/diff, review-package, and release-static
+  gates without runtime or external calls.
+
+Fix-round-5 verification caveat: the sole no-argument suite produced
+`3231 passed, 4 failed, 1 skipped, 1 warning`; all four failures were a single
+fixed-clock release-test helper that created rules at wall-clock time. The
+helper now uses the injected rule-persistence clock, and the exact four plus
+the complete affected release/rule/daemon set pass focused verification.
+The suite was not rerun because this round explicitly permits exactly one full
+run, so no post-fix green no-argument-suite result is claimed.
 
 ---
 
