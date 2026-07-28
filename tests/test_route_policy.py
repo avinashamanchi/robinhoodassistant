@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import threading
@@ -1622,6 +1622,323 @@ def test_panic_receipt_renewal_store_loss_stops_without_renewing_again(
     assert leaked == []
 
 
+@pytest.mark.parametrize("attempt", range(20))
+def test_panic_stop_after_lease_renewal_completes_receipt_fence(
+    make_service,
+    monkeypatch,
+    attempt,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-receipt-fence-secret",
+        planning=None,
+    )
+    lease_renewed = threading.Event()
+    allow_renewal_return = threading.Event()
+    receipt_calls = 0
+    hold = policy_module._LeaseHold(
+        resource_key=f"route:{attempt:064x}:0",
+        owner=f"fenced-panic-owner-{attempt}",
+        generation=17 + attempt,
+        expires_at=utcnow() + timedelta(seconds=1),
+        ttl_seconds=1,
+    )
+    renewed_expires_at = utcnow() + timedelta(seconds=5)
+
+    class BlockingSuccessfulLeaseRenewal:
+        def renew(self, *_args, **_kwargs):
+            lease_renewed.set()
+            assert allow_renewal_return.wait(timeout=5)
+            return LeaseDecision(
+                acquired=True,
+                owner=hold.owner,
+                generation=hold.generation,
+                expires_at=renewed_expires_at,
+                retry_after_seconds=0,
+            )
+
+    def renew_receipt(
+        _app,
+        request_id,
+        generation,
+        expires_at,
+    ):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        assert request_id == hold.owner
+        assert generation == hold.generation
+        assert expires_at == renewed_expires_at
+        return True
+
+    app.state.leases = BlockingSuccessfulLeaseRenewal()
+    monkeypatch.setattr(
+        policy_module,
+        "_renew_panic_receipt",
+        renew_receipt,
+    )
+
+    async def exercise():
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            policy_module._maintain_lease(
+                app,
+                hold,
+                stop,
+                panic_request_id=hold.owner,
+            )
+        )
+        assert await asyncio.to_thread(lease_renewed.wait, 2)
+        stop.set()
+        allow_renewal_return.set()
+        return await asyncio.wait_for(task, timeout=1)
+
+    try:
+        result = asyncio.run(exercise())
+    finally:
+        allow_renewal_return.set()
+
+    assert result is None
+    assert receipt_calls == 1
+    assert hold.expires_at == renewed_expires_at
+
+
+def test_panic_receipt_fence_uses_successfully_renewed_horizon(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-renewed-horizon-secret",
+        planning=None,
+    )
+    initial_now = datetime(2026, 7, 28, tzinfo=timezone.utc)
+    original_expires_at = initial_now + timedelta(seconds=1)
+    renewed_expires_at = initial_now + timedelta(seconds=5)
+    observed_now = [initial_now]
+    stop_holder = []
+    loop_holder = []
+    receipt_calls = 0
+    hold = policy_module._LeaseHold(
+        resource_key="route:" + "a" * 64 + ":0",
+        owner="renewed-horizon-owner",
+        generation=23,
+        expires_at=original_expires_at,
+        ttl_seconds=1,
+    )
+
+    monkeypatch.setattr(
+        policy_module,
+        "utcnow",
+        lambda: observed_now[0],
+    )
+
+    class DelayedSuccessfulLeaseRenewal:
+        def renew(self, *_args, **_kwargs):
+            observed_now[0] = original_expires_at + timedelta(
+                milliseconds=1
+            )
+            return LeaseDecision(
+                acquired=True,
+                owner=hold.owner,
+                generation=hold.generation,
+                expires_at=renewed_expires_at,
+                retry_after_seconds=0,
+            )
+
+    def renew_receipt(
+        _app,
+        request_id,
+        generation,
+        expires_at,
+    ):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        assert request_id == hold.owner
+        assert generation == hold.generation
+        assert expires_at == renewed_expires_at
+        loop_holder[0].call_soon_threadsafe(stop_holder[0].set)
+        return True
+
+    app.state.leases = DelayedSuccessfulLeaseRenewal()
+    monkeypatch.setattr(
+        policy_module,
+        "_renew_panic_receipt",
+        renew_receipt,
+    )
+
+    async def exercise():
+        stop = asyncio.Event()
+        stop_holder.append(stop)
+        loop_holder.append(asyncio.get_running_loop())
+        return await asyncio.wait_for(
+            policy_module._maintain_lease(
+                app,
+                hold,
+                stop,
+                panic_request_id=hold.owner,
+            ),
+            timeout=1,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result is None
+    assert receipt_calls == 1
+    assert hold.expires_at == renewed_expires_at
+
+
+def test_panic_receipt_transient_store_busy_retries_with_same_fence(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-transient-receipt-secret",
+        planning=None,
+    )
+    hold = policy_module._LeaseHold(
+        resource_key="route:" + "b" * 64 + ":0",
+        owner="transient-receipt-owner",
+        generation=29,
+        expires_at=utcnow() + timedelta(seconds=1),
+        ttl_seconds=1,
+    )
+    renewed_expires_at = utcnow() + timedelta(seconds=2)
+    receipt_calls = 0
+    stop_holder = []
+    loop_holder = []
+
+    class SuccessfulLeaseRenewal:
+        def renew(self, *_args, **_kwargs):
+            return LeaseDecision(
+                acquired=True,
+                owner=hold.owner,
+                generation=hold.generation,
+                expires_at=renewed_expires_at,
+                retry_after_seconds=0,
+            )
+
+    def transient_receipt_store(
+        _app,
+        request_id,
+        generation,
+        expires_at,
+    ):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        assert request_id == hold.owner
+        assert generation == hold.generation
+        assert expires_at == renewed_expires_at
+        if receipt_calls == 1:
+            raise LimitStoreUnavailable("temporary sqlite busy")
+        loop_holder[0].call_soon_threadsafe(stop_holder[0].set)
+        return True
+
+    app.state.leases = SuccessfulLeaseRenewal()
+    monkeypatch.setattr(
+        policy_module,
+        "_renew_panic_receipt",
+        transient_receipt_store,
+    )
+
+    async def exercise():
+        stop = asyncio.Event()
+        stop_holder.append(stop)
+        loop_holder.append(asyncio.get_running_loop())
+        return await asyncio.wait_for(
+            policy_module._maintain_lease(
+                app,
+                hold,
+                stop,
+                panic_request_id=hold.owner,
+            ),
+            timeout=1,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result is None
+    assert receipt_calls == 2
+    assert hold.expires_at == renewed_expires_at
+
+
+def test_panic_renewal_fails_closed_on_genuine_fence_loss(
+    make_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        policy_module,
+        "_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="route-fence-loss-secret",
+        planning=None,
+    )
+    receipt_calls = 0
+    hold = policy_module._LeaseHold(
+        resource_key="route:" + "c" * 64 + ":0",
+        owner="predecessor-owner",
+        generation=31,
+        expires_at=utcnow() + timedelta(seconds=1),
+        ttl_seconds=1,
+    )
+
+    class SuccessorOwnedLease:
+        def renew(self, *_args, **_kwargs):
+            return LeaseDecision(
+                acquired=False,
+                owner="successor-owner",
+                generation=hold.generation + 1,
+                expires_at=utcnow() + timedelta(seconds=2),
+                retry_after_seconds=2,
+            )
+
+    def forbidden_receipt_renewal(*_args, **_kwargs):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        return True
+
+    app.state.leases = SuccessorOwnedLease()
+    monkeypatch.setattr(
+        policy_module,
+        "_renew_panic_receipt",
+        forbidden_receipt_renewal,
+    )
+
+    result = asyncio.run(
+        policy_module._maintain_lease(
+            app,
+            hold,
+            asyncio.Event(),
+            panic_request_id=hold.owner,
+        )
+    )
+
+    assert result == "lost"
+    assert receipt_calls == 0
+
+
 @pytest.mark.parametrize("reconciled", [True, False])
 def test_reconcile_clears_only_after_proven_truth_and_atomic_audit(
     make_service,
@@ -1887,7 +2204,11 @@ def test_long_panic_keeps_one_lease_owner_and_executes_once(
 
     app.state.operations.panic = slow_panic
     original_acquire = app.state.leases.acquire
+    original_renew = app.state.leases.renew
+    original_wait_for_receipt = policy_module._wait_for_panic_receipt
     acquired_owners: list[str] = []
+    lease_renewed = threading.Event()
+    follower_waiting = threading.Event()
 
     def record_acquire(*args, **kwargs):
         decision = original_acquire(*args, **kwargs)
@@ -1895,7 +2216,23 @@ def test_long_panic_keeps_one_lease_owner_and_executes_once(
             acquired_owners.append(decision.owner)
         return decision
 
+    def record_renew(*args, **kwargs):
+        decision = original_renew(*args, **kwargs)
+        if decision.acquired:
+            lease_renewed.set()
+        return decision
+
+    async def record_wait_for_receipt(*args, **kwargs):
+        follower_waiting.set()
+        return await original_wait_for_receipt(*args, **kwargs)
+
     app.state.leases.acquire = record_acquire
+    app.state.leases.renew = record_renew
+    monkeypatch.setattr(
+        policy_module,
+        "_wait_for_panic_receipt",
+        record_wait_for_receipt,
+    )
     owner_headers = {
         "X-CSRF-Token": login.json()["csrf_token"],
         "Idempotency-Key": "panic-long-owner",
@@ -1915,14 +2252,14 @@ def test_long_panic_keeps_one_lease_owner_and_executes_once(
             headers=owner_headers,
         )
         assert started.wait(timeout=5)
-        time.sleep(1.2)
+        assert lease_renewed.wait(timeout=5)
         follower = pool.submit(
             follower_client.post,
             "/panic",
             json={"reason": "must follow original"},
             headers=follower_headers,
         )
-        time.sleep(0.1)
+        assert follower_waiting.wait(timeout=5)
         release.set()
         owner_response = owner.result(timeout=5)
         follower_response = follower.result(timeout=5)

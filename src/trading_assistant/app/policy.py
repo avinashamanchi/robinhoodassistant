@@ -1143,12 +1143,12 @@ async def _maintain_lease(
             ):
                 return "lost"
             if panic_request_id is not None:
-                coherent_horizon = hold.expires_at
+                coherent_horizon = renewed.expires_at
                 while True:
                     remaining = (
                         coherent_horizon - utcnow()
                     ).total_seconds()
-                    if stop.is_set() or remaining <= 0:
+                    if remaining <= 0:
                         return "store"
                     try:
                         receipt_renewed = await _offload(
