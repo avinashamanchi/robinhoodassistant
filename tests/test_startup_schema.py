@@ -94,7 +94,7 @@ def test_runtime_package_never_calls_create_all():
     assert offenders == []
 
 
-def test_api_startup_fails_on_0004_without_mutating_schema_and_upgrade_preserves_latches(
+def test_api_startup_and_in_place_upgrade_fail_closed_on_pre_tenure_schema(
     tmp_path,
     monkeypatch,
 ):
@@ -119,29 +119,32 @@ def test_api_startup_fails_on_0004_without_mutating_schema_and_upgrade_preserves
     assert set(inspect(engine).get_table_names()) == before
     assert "circuit_breaker_state" not in before
 
-    upgrade(
-        engine,
-        backup_key=b"u" * 32,
-        backup_key_id="startup-schema-backup-2026",
-        backup_directory=tmp_path / "encrypted-backups",
-    )
-
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_maintenance_bootstrap_required$",
+    ):
+        upgrade(
+            engine,
+            backup_key=b"u" * 32,
+            backup_key_id="startup-schema-backup-2026",
+            backup_directory=tmp_path / "encrypted-backups",
+        )
     with engine.connect() as connection:
         rows = connection.execute(
             text(
-                "SELECT scope_key,tripped,reason FROM circuit_breaker_state "
-                "WHERE scope_key IN ('loss:equity','operator_global') "
-                "ORDER BY scope_key"
+                "SELECT asset_class,tripped,reason FROM killswitch_state "
+                "WHERE asset_class IN ('equity','operator_global') "
+                "ORDER BY asset_class"
             )
         ).mappings().all()
     assert rows == [
         {
-            "scope_key": "loss:equity",
+            "asset_class": "equity",
             "tripped": 1,
             "reason": "equity loss",
         },
         {
-            "scope_key": "operator_global",
+            "asset_class": "operator_global",
             "tripped": 1,
             "reason": "panic",
         },

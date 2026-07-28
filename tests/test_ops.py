@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
@@ -11,16 +12,33 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
 from trading_assistant.config import BrokerKind, TradingMode
+from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.models import PanicReceipt, utcnow
-from trading_assistant.ops.backup import backup_database
+from trading_assistant.db.session import (
+    create_db_engine,
+    make_session_factory,
+)
+from trading_assistant.ops.backup import (
+    backup_database,
+    main as backup_main,
+    read_encrypted_backup_header,
+)
 from trading_assistant.ops.paper_drill import PaperDrillError, run_paper_drill
+from trading_assistant.ops.tenure import (
+    ProcessIdentity,
+    ProcessProof,
+    RuntimeTenureService,
+    TenureUnavailable,
+)
 from trading_assistant.security.sensitive_fields import sensitive_store
+from trading_assistant.security.secrets import RuntimeSecrets
 
 
 class _StubAgent:
@@ -28,37 +46,197 @@ class _StubAgent:
         return {"reply": "", "tool_calls": []}
 
 
-def test_online_backup_is_valid_and_rotates_only_matching_old_files(tmp_path):
-    source = tmp_path / "live.sqlite3"
-    with sqlite3.connect(source) as connection:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("CREATE TABLE sample (value TEXT)")
-        connection.execute("INSERT INTO sample VALUES ('preserved')")
-        connection.commit()
+BACKUP_KEY = b"b" * 32
+BACKUP_KEY_ID = "operational-backup-2026"
+BACKUP_MARKER = b"operational-backup-marker-never-plaintext"
+BACKUP_IDENTITY = ProcessIdentity(87654, "pytest-backup-process-start")
 
+
+class _OfflineInspector:
+    def inspect(self, _identity):
+        return ProcessProof.NOT_SAME
+
+
+def _operational_database(tmp_path, state: str):
+    source = tmp_path / f"{state}.sqlite3"
+    engine = create_db_engine(f"sqlite:///{source}")
+    assert upgrade(engine) is None
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE operational_backup_probe "
+            "(value BLOB NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO operational_backup_probe (value) VALUES (?)",
+            (BACKUP_MARKER,),
+        )
+        if state == "migrating":
+            connection.exec_driver_sql(
+                "UPDATE sensitive_migration_state "
+                "SET state='migrating',"
+                "started_at=CURRENT_TIMESTAMP,"
+                "updated_at=CURRENT_TIMESTAMP"
+            )
+        elif state == "complete":
+            connection.exec_driver_sql(
+                "UPDATE sensitive_migration_state "
+                "SET state='complete',"
+                "started_at=CURRENT_TIMESTAMP,"
+                "completed_at=CURRENT_TIMESTAMP,"
+                "updated_at=CURRENT_TIMESTAMP,"
+                "backup_path_hash=?",
+                ("a" * 64,),
+            )
+    engine.dispose()
+    return source
+
+
+@pytest.mark.parametrize("migration_state", ["required", "migrating", "complete"])
+def test_operational_backup_is_encrypted_for_every_migration_state(
+    tmp_path,
+    migration_state,
+):
+    source = _operational_database(tmp_path, migration_state)
+    destination = tmp_path / "backups"
+    receipt = backup_database(
+        source,
+        destination,
+        retention_days=14,
+        backup_key=BACKUP_KEY,
+        backup_key_id=BACKUP_KEY_ID,
+        process_identity=BACKUP_IDENTITY,
+        process_inspector=_OfflineInspector(),
+    )
+
+    artifact = receipt.path
+    encrypted = artifact.read_bytes()
+    assert receipt.verified is True
+    assert artifact.suffix == ".aesgcm"
+    assert read_encrypted_backup_header(artifact)["key_id"] == BACKUP_KEY_ID
+    assert b"SQLite format 3" not in encrypted
+    assert BACKUP_MARKER not in encrypted
+    assert list(destination.glob("*.sqlite3")) == []
+    assert not any(path.name.startswith(".") for path in destination.iterdir())
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+
+def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
+    source = _operational_database(tmp_path, "required")
     destination = tmp_path / "backups"
     destination.mkdir()
-    old_match = destination / "trading-assistant-20000101T000000Z.sqlite3"
-    old_match.write_bytes(b"old")
-    unrelated = destination / "keep-me.sqlite3"
+    old_match = (
+        destination
+        / "20000101T000000000000Z-whole-database-v1.sqlite3.aesgcm"
+    )
+    old_match.write_bytes(b"old-encrypted-artifact")
+    unrelated = destination / "keep-me.aesgcm"
     unrelated.write_bytes(b"unrelated")
     old_time = time.time() - 30 * 86400
     os.utime(old_match, (old_time, old_time))
     os.utime(unrelated, (old_time, old_time))
 
-    created = backup_database(source, destination, retention_days=14)
+    receipt = backup_database(
+        source,
+        destination,
+        retention_days=14,
+        backup_key=BACKUP_KEY,
+        backup_key_id=BACKUP_KEY_ID,
+        process_identity=BACKUP_IDENTITY,
+        process_inspector=_OfflineInspector(),
+    )
 
-    with sqlite3.connect(created) as connection:
-        assert connection.execute("SELECT value FROM sample").fetchone() == (
-            "preserved",
-        )
+    assert receipt.path.exists()
     assert not old_match.exists()
     assert unrelated.exists()
-    assert list(destination.glob("*.tmp*")) == []
-    assert not created.with_name(f"{created.name}-wal").exists()
-    assert not created.with_name(f"{created.name}-shm").exists()
-    assert stat.S_IMODE(created.stat().st_mode) == 0o600
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+
+def test_operational_backup_requires_exclusive_maintenance_tenure(tmp_path):
+    source = _operational_database(tmp_path, "required")
+    engine = create_db_engine(f"sqlite:///{source}")
+    inspector = _OfflineInspector()
+    RuntimeTenureService(
+        make_session_factory(engine),
+        process_inspector=inspector,
+    ).acquire_runtime(
+        "app",
+        ProcessIdentity(9001, "active-app-during-backup"),
+        ttl_seconds=30,
+    )
+    destination = tmp_path / "blocked-backups"
+
+    with pytest.raises(TenureUnavailable) as captured:
+        backup_database(
+            source,
+            destination,
+            retention_days=14,
+            backup_key=BACKUP_KEY,
+            backup_key_id=BACKUP_KEY_ID,
+            process_identity=BACKUP_IDENTITY,
+            process_inspector=inspector,
+        )
+
+    assert captured.value.stable_code == "runtime_tenure_active"
+    assert not destination.exists() or list(destination.iterdir()) == []
+
+
+def test_operational_backup_cli_prints_only_stable_encrypted_receipt(
+    tmp_path,
+    app_config,
+    capsys,
+):
+    source = _operational_database(tmp_path, "required")
+    destination = tmp_path / "cli-backups"
+    secrets = RuntimeSecrets(
+        database_url=f"sqlite:///{source}",
+        backup_encryption_key=base64.b64encode(BACKUP_KEY).decode(),
+    )
+    config = app_config.model_copy(
+        update={
+            "encryption": app_config.encryption.model_copy(
+                update={"backup_key_id": BACKUP_KEY_ID}
+            )
+        }
+    )
+
+    result = backup_main(
+        ["--destination", str(destination), "--retention-days", "14"],
+        config_loader=lambda: config,
+        secrets_loader=lambda *_args, **_kwargs: secrets,
+        process_identity=BACKUP_IDENTITY,
+        process_inspector=_OfflineInspector(),
+    )
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert result == 0
+    assert payload == {
+        "backup_key_id": BACKUP_KEY_ID,
+        "path_hash": payload["path_hash"],
+        "status": "verified",
+    }
+    assert len(payload["path_hash"]) == 64
+    assert str(source) not in output
+    assert str(destination) not in output
+    assert BACKUP_MARKER.decode() not in output
+
+
+def test_scheduled_backup_and_operator_docs_have_no_plaintext_entrypoint():
+    install = Path("scripts/launchd/install.sh").read_text(encoding="utf-8")
+    launchd_readme = Path("scripts/launchd/README.md").read_text(
+        encoding="utf-8"
+    )
+    runbook = Path("docs/RUNBOOK.md").read_text(encoding="utf-8")
+    ops_readme = Path("docs/ops/README.md").read_text(encoding="utf-8")
+
+    assert "trading_assistant.ops.backup" in install
+    assert '"$PROJ/backups"' not in install
+    assert ".local/encrypted-backups" in install
+    for document in (launchd_readme, runbook, ops_readme):
+        assert "whole-database-v1.sqlite3.aesgcm" in document
+        assert "standalone SQLite files" not in document
+        assert "trading-assistant-*.sqlite3 |" not in document
+        assert 'sqlite3 "$backup_file"' not in document
 
 
 def test_paper_drill_refuses_live_configuration(app_config):

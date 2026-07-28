@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import AssetClass
@@ -345,12 +345,14 @@ def reset_in_session(
     row = session.get(CircuitBreakerState, scope.key)
     assert row is not None
     sensitive_store(session).write_many(row, {"reason": reason})
-    session.execute(
-        delete(PanicReceipt).where(
+    completed_receipts = session.scalars(
+        select(PanicReceipt).where(
             PanicReceipt.account_scope == "alpaca-paper",
             PanicReceipt.state == "completed",
         )
-    )
+    ).all()
+    for receipt in completed_receipts:
+        sensitive_store(session).delete(receipt)
     _audit(
         session,
         scope=scope,

@@ -37,7 +37,7 @@ UNIQUE_FIELDS = (
     set().union(*(fields for _, fields in MODEL_FIELDS.values()))
     - {"reason"}
 )
-_DML_PREFIX = re.compile(r"^\s*(?:insert|update|replace)\b", re.I)
+_DML = re.compile(r"\b(?:delete|insert|update|replace)\b", re.I)
 
 
 def _name(node: ast.AST | None) -> str | None:
@@ -69,8 +69,15 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         self.path = path
         self.offenders: list[str] = []
         self.class_aliases = {name: name for name in MODEL_FIELDS}
+        self.sql_builders = {
+            "select": "select",
+            "insert": "insert",
+            "update": "update",
+            "delete": "delete",
+        }
         self.object_models: dict[str, str] = {}
         self.statement_models: dict[str, str] = {}
+        self.structured_statements: set[str] = set()
         self.string_constants: dict[str, str] = {}
 
     def _report(
@@ -106,6 +113,30 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             and node.args
         ):
             return self._model(node.args[0])
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"scalar", "scalars", "execute"}
+            and node.args
+        ):
+            return self._selection_model(node.args[0])
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in {"one", "one_or_none", "first", "scalar_one", "scalar_one_or_none"}
+        ):
+            return self._call_model(node.func.value)
+        return None
+
+    def _selection_model(self, node: ast.AST | None) -> str | None:
+        if not isinstance(node, ast.Call):
+            return None
+        if (
+            self.sql_builders.get(_name(node.func) or "") == "select"
+            and node.args
+        ):
+            return self._model(node.args[0])
+        if isinstance(node.func, ast.Attribute):
+            return self._selection_model(node.func.value)
         return None
 
     def _mutation_model(self, node: ast.AST | None) -> str | None:
@@ -125,9 +156,53 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             }
         ):
             return self._mutation_model(node.func.value)
-        if _name(node.func) in {"insert", "update"} and node.args:
+        if (
+            self.sql_builders.get(_name(node.func) or "")
+            in {"delete", "insert", "update"}
+            and node.args
+        ):
             return self._model(node.args[0])
         return None
+
+    def _mutation_kind(self, node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Name):
+            model = self.statement_models.get(node.id)
+            return "unknown" if model is not None else None
+        if not isinstance(node, ast.Call):
+            return None
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in {
+                "values",
+                "returning",
+                "where",
+                "execution_options",
+                "on_conflict_do_update",
+            }
+        ):
+            return self._mutation_kind(node.func.value)
+        kind = self.sql_builders.get(_name(node.func) or "")
+        return kind if kind in {"delete", "insert", "update"} else None
+
+    def _structured_sql(self, node: ast.AST | None) -> bool:
+        if isinstance(node, ast.Name):
+            return (
+                node.id in self.structured_statements
+                or node.id in self.statement_models
+            )
+        if not isinstance(node, ast.Call):
+            return False
+        if self.sql_builders.get(_name(node.func) or "") in {
+            "select",
+            "insert",
+            "update",
+            "delete",
+        }:
+            return True
+        if isinstance(node.func, ast.Attribute):
+            return self._structured_sql(node.func.value)
+        return False
 
     def _mapping_fields(
         self,
@@ -201,14 +276,25 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             return self._constant_string(node.args[0])
         return None
 
-    def _check_raw_sql(self, node: ast.AST, expression: ast.AST) -> None:
+    def _check_raw_sql(
+        self,
+        node: ast.AST,
+        expression: ast.AST,
+    ) -> None:
         sql = self._constant_string(expression)
-        if sql is None or _DML_PREFIX.match(sql) is None:
+        if sql is None:
+            if self._structured_sql(expression):
+                return
+            self._report(node, "dynamic_sql", "**expression")
+            return
+        if _DML.search(sql) is None:
             return
         lowered = sql.lower()
         for table, fields in TABLE_FIELDS.items():
             if re.search(rf"\b{re.escape(table.lower())}\b", lowered) is None:
                 continue
+            if re.search(r"\bdelete\b", lowered):
+                self._report(node, table, "**row")
             for field in sorted(fields):
                 if re.search(
                     rf"\b{re.escape(field.lower())}\b",
@@ -222,6 +308,10 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 self.class_aliases[
                     imported.asname or imported.name
                 ] = imported.name
+            if imported.name in self.sql_builders:
+                self.sql_builders[
+                    imported.asname or imported.name
+                ] = self.sql_builders[imported.name]
         self.generic_visit(node)
 
     def _record_target(
@@ -242,6 +332,8 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         statement_model = self._mutation_model(value)
         if statement_model is not None:
             self.statement_models[target.id] = statement_model
+        if self._structured_sql(value):
+            self.structured_statements.add(target.id)
         constant = self._constant_string(value)
         if constant is not None:
             self.string_constants[target.id] = constant
@@ -363,15 +455,22 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 and field in MODEL_FIELDS[object_model][1]
             ):
                 self._report(node, object_model, field)
+            elif object_model is not None and field is None:
+                self._report(node, object_model, "**field")
             elif field in UNIQUE_FIELDS:
                 self._report(node, "*", field)
 
         if (
             isinstance(node.func, ast.Attribute)
-            and node.func.attr == "execute"
+            and node.func.attr in {"execute", "exec_driver_sql"}
             and node.args
         ):
             execute_model = self._mutation_model(node.args[0])
+            if (
+                execute_model is not None
+                and self._mutation_kind(node.args[0]) == "delete"
+            ):
+                self._report(node, execute_model, "**row")
             if execute_model is not None and len(node.args) > 1:
                 self._check_mapping(
                     node,
@@ -380,6 +479,19 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                     keywords=node.keywords,
                 )
             self._check_raw_sql(node, node.args[0])
+
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "delete"
+            and node.args
+        ):
+            object_model = self._object_model(node.args[0])
+            canonical_store = (
+                isinstance(node.func.value, ast.Call)
+                and _name(node.func.value.func) == "sensitive_store"
+            )
+            if object_model is not None and not canonical_store:
+                self._report(node, object_model, "**row")
 
         self.generic_visit(node)
 

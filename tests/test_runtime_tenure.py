@@ -4,23 +4,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import errno
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from trading_assistant.db.models import Base
+from trading_assistant.db.models import Base, RuntimeTenure
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.ops.tenure import (
+    LocalProcessInspector,
     ProcessIdentity,
     ProcessProof,
     RuntimeTenureGuard,
     RuntimeTenureService,
+    TenureCloseResult,
     TenureGuardedBroker,
     TenureLost,
     TenureUncertain,
     TenureUnavailable,
     install_runtime_mutation_barrier,
 )
+
+_LOCAL_PROCESS_INSPECT = LocalProcessInspector.inspect
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
@@ -32,6 +40,10 @@ DAEMON = ProcessIdentity(
 MCP = ProcessIdentity(
     pid=4104,
     start_identity="mcp-start-20260727T120000Z",
+)
+VALIDATION = ProcessIdentity(
+    pid=4105,
+    start_identity="validation-start-20260727T120000Z",
 )
 MAINTENANCE = ProcessIdentity(
     pid=4103,
@@ -115,6 +127,51 @@ def test_app_daemon_and_mcp_runtime_tenures_coexist(tenure_service):
     assert UUID(mcp.owner_id).version == 4
 
 
+def test_all_runtime_writer_roles_coexist_and_exclude_maintenance(
+    tenure_service,
+):
+    service, _clock, _inspector = tenure_service
+
+    app = service.acquire_runtime("app", APP, ttl_seconds=30)
+    daemon = service.acquire_runtime("daemon", DAEMON, ttl_seconds=30)
+    mcp = service.acquire_runtime("mcp", MCP, ttl_seconds=30)
+    validation = service.acquire_runtime(
+        "validation",
+        VALIDATION,
+        ttl_seconds=30,
+    )
+
+    assert len(
+        {
+            app.owner_id,
+            daemon.owner_id,
+            mcp.owner_id,
+            validation.owner_id,
+        }
+    ) == 4
+    with pytest.raises(TenureUnavailable) as exc:
+        service.acquire_maintenance(MAINTENANCE, ttl_seconds=30)
+    assert exc.value.stable_code == "runtime_tenure_active"
+
+
+def test_maintenance_excludes_validation_runtime_writer(tenure_service):
+    service, _clock, _inspector = tenure_service
+    maintenance = service.acquire_maintenance(
+        MAINTENANCE,
+        ttl_seconds=30,
+    )
+
+    with pytest.raises(TenureUnavailable) as exc:
+        service.acquire_runtime(
+            "validation",
+            VALIDATION,
+            ttl_seconds=30,
+        )
+
+    assert exc.value.stable_code == "maintenance_tenure_active"
+    assert maintenance.role == "maintenance"
+
+
 def test_live_mcp_runtime_tenure_blocks_maintenance(tenure_service):
     service, _clock, _inspector = tenure_service
     mcp = service.acquire_runtime("mcp", MCP, ttl_seconds=30)
@@ -186,6 +243,34 @@ def test_expired_runtime_is_reclaimed_only_after_exact_not_same_proof(
     with pytest.raises(TenureLost):
         expired.renew(ttl_seconds=30)
     assert expired.release() is False
+    with service._session_factory() as session:
+        reclaimed = session.get(RuntimeTenure, "runtime:app")
+        assert reclaimed is not None
+        assert reclaimed.state == "fenced"
+
+
+def test_expired_maintenance_requires_maintenance_recovery_before_runtime(
+    tenure_service,
+):
+    service, clock, inspector = tenure_service
+    expired = service.acquire_maintenance(MAINTENANCE, ttl_seconds=10)
+    clock.advance(11)
+    inspector.set(MAINTENANCE, ProcessProof.NOT_SAME)
+
+    with pytest.raises(TenureUnavailable) as exc:
+        service.acquire_runtime("app", APP, ttl_seconds=30)
+
+    assert exc.value.stable_code == "maintenance_recovery_required"
+    recovery = service.acquire_maintenance(
+        ProcessIdentity(
+            pid=4301,
+            start_identity="maintenance-recovery-20260727T120011Z",
+        ),
+        ttl_seconds=30,
+    )
+    assert recovery.generation > expired.generation
+    assert recovery.release() is True
+    assert service.acquire_runtime("app", APP, ttl_seconds=30).role == "app"
 
 
 def test_successor_generation_fences_predecessor_renew_and_release(
@@ -301,6 +386,29 @@ def test_graceful_guard_close_releases_exact_handle_once():
     assert handle.release_calls == 1
 
 
+def test_guard_resolves_release_response_loss_from_exact_database_truth(
+    tenure_service,
+    monkeypatch,
+):
+    service, _clock, _inspector = tenure_service
+    handle = service.acquire_runtime("app", APP, ttl_seconds=30)
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    original_release = service._release
+
+    def commit_then_lose_response(*args, **kwargs):
+        assert original_release(*args, **kwargs) is True
+        raise TenureUncertain()
+
+    monkeypatch.setattr(service, "_release", commit_then_lose_response)
+
+    assert guard.close() is True
+    assert guard.close_result is TenureCloseResult.CONFIRMED
+
+
 def test_started_guard_stops_renewal_worker_before_graceful_release():
     handle = FailingRenewHandle()
     guard = RuntimeTenureGuard(
@@ -312,6 +420,59 @@ def test_started_guard_stops_renewal_worker_before_graceful_release():
 
     assert guard.close() is True
     assert handle.release_calls == 1
+
+
+def test_guard_start_failure_releases_exact_ownership(
+    monkeypatch,
+):
+    import trading_assistant.ops.tenure as tenure_module
+
+    class BrokenThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread-start-failed")
+
+        def is_alive(self):
+            return False
+
+    handle = FailingRenewHandle()
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    monkeypatch.setattr(tenure_module, "Thread", BrokenThread)
+
+    with pytest.raises(RuntimeError, match="thread-start-failed"):
+        guard.start()
+
+    assert guard.closed
+    assert guard.close_result is TenureCloseResult.CONFIRMED
+    assert handle.release_calls == 1
+
+
+def test_guard_close_preserves_uncertain_cleanup_result_across_rechecks():
+    class UncertainReleaseHandle:
+        role = "app"
+
+        def renew(self, *, ttl_seconds):
+            return None
+
+        def release(self):
+            return False
+
+    guard = RuntimeTenureGuard(
+        UncertainReleaseHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+
+    assert guard.close() is False
+    assert guard.close_result.value == "uncertain"
+    assert guard.close() is False
+    assert guard.close_result.value == "uncertain"
 
 
 def test_app_rejects_mutations_immediately_after_tenure_loss(
@@ -445,3 +606,348 @@ def test_exact_internal_tenure_statement_can_renew_through_barrier(
     assert guard.renew_once() is True
     guard.ensure_owned()
     assert guard.close() is True
+
+
+def test_barrier_callback_registration_failure_removes_sql_listeners(
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_db_engine(f"sqlite:///{tmp_path}/barrier-setup.db")
+    Base.metadata.create_all(engine)
+    guard = RuntimeTenureGuard(
+        FailingRenewHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    monkeypatch.setattr(
+        guard,
+        "add_close_callback",
+        lambda _callback: (_ for _ in ()).throw(
+            RuntimeError("callback-registration-failed")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="callback-registration-failed",
+    ):
+        install_runtime_mutation_barrier(engine, guard)
+
+    assert guard.renew_once() is False
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('app', CURRENT_TIMESTAMP)"
+        )
+    assert _heartbeat_count(engine) == 1
+
+
+def test_partial_barrier_listener_failure_removes_prior_listeners(
+    tmp_path,
+    monkeypatch,
+):
+    import trading_assistant.ops.tenure as tenure_module
+
+    engine = create_db_engine(f"sqlite:///{tmp_path}/partial-barrier.db")
+    Base.metadata.create_all(engine)
+    guard = RuntimeTenureGuard(
+        FailingRenewHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    original_listen = tenure_module.event.listen
+
+    def fail_commit_listener(target, identifier, callback, *args, **kwargs):
+        if identifier == "commit":
+            raise RuntimeError("commit-listener-install-failed")
+        return original_listen(
+            target,
+            identifier,
+            callback,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        tenure_module.event,
+        "listen",
+        fail_commit_listener,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="commit-listener-install-failed",
+    ):
+        install_runtime_mutation_barrier(engine, guard)
+    monkeypatch.setattr(tenure_module.event, "listen", original_listen)
+
+    assert guard.renew_once() is False
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('app', CURRENT_TIMESTAMP)"
+        )
+    assert _heartbeat_count(engine) == 1
+
+
+def _guarded_runtime_engine(tmp_path, filename: str):
+    engine = create_db_engine(f"sqlite:///{tmp_path}/{filename}")
+    Base.metadata.create_all(engine)
+    guard = RuntimeTenureGuard(
+        FailingRenewHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    install_runtime_mutation_barrier(engine, guard)
+    return engine, guard
+
+
+def _heartbeat_count(engine) -> int:
+    with engine.connect() as connection:
+        return connection.execute(
+            text("SELECT COUNT(*) FROM heartbeats")
+        ).scalar_one()
+
+
+def test_core_transaction_commit_is_fenced_if_tenure_is_lost_after_dml(
+    tmp_path,
+):
+    engine, guard = _guarded_runtime_engine(tmp_path, "core-commit.db")
+    connection = engine.connect()
+    transaction = connection.begin()
+    connection.execute(
+        text(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('app', CURRENT_TIMESTAMP)"
+        )
+    )
+
+    assert guard.renew_once() is False
+    with pytest.raises(TenureLost):
+        transaction.commit()
+    connection.close()
+
+    assert _heartbeat_count(engine) == 0
+
+
+def test_engine_begin_context_commit_is_fenced_after_tenure_loss(tmp_path):
+    engine, guard = _guarded_runtime_engine(tmp_path, "context-commit.db")
+
+    with pytest.raises(TenureLost):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO heartbeats (source, at) "
+                    "VALUES ('app', CURRENT_TIMESTAMP)"
+                )
+            )
+            assert guard.renew_once() is False
+
+    assert _heartbeat_count(engine) == 0
+
+
+def test_orm_commit_is_fenced_if_tenure_is_lost_after_flush(tmp_path):
+    engine, guard = _guarded_runtime_engine(tmp_path, "orm-commit.db")
+    session = Session(engine)
+    session.execute(
+        text(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('app', CURRENT_TIMESTAMP)"
+        )
+    )
+
+    assert guard.renew_once() is False
+    with pytest.raises(TenureLost):
+        session.commit()
+    session.close()
+
+    assert _heartbeat_count(engine) == 0
+
+
+def test_nested_transaction_release_is_fenced_and_outer_cannot_commit(
+    tmp_path,
+):
+    engine, guard = _guarded_runtime_engine(tmp_path, "nested-commit.db")
+    connection = engine.connect()
+    outer = connection.begin()
+    nested = connection.begin_nested()
+    connection.execute(
+        text(
+            "INSERT INTO heartbeats (source, at) "
+            "VALUES ('app', CURRENT_TIMESTAMP)"
+        )
+    )
+
+    assert guard.renew_once() is False
+    with pytest.raises(TenureLost):
+        nested.commit()
+    with pytest.raises((TenureLost, RuntimeError)):
+        outer.commit()
+    connection.close()
+
+    assert _heartbeat_count(engine) == 0
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "CREATE TABLE escaped_authority (id INTEGER PRIMARY KEY)",
+        "PRAGMA user_version = 42",
+        "ATTACH DATABASE ':memory:' AS escaped_authority",
+    ],
+)
+def test_non_dml_sql_mutations_are_fenced_after_tenure_loss(
+    tmp_path,
+    statement,
+):
+    engine, guard = _guarded_runtime_engine(tmp_path, "non-dml.db")
+    assert guard.renew_once() is False
+
+    with pytest.raises(TenureLost):
+        with engine.begin() as connection:
+            connection.exec_driver_sql(statement)
+
+
+def test_successor_generation_fences_mutation_at_statement_source(
+    tenure_service,
+):
+    service, clock, inspector = tenure_service
+    predecessor = service.acquire_runtime("app", APP, ttl_seconds=30)
+    guard = RuntimeTenureGuard(
+        predecessor,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    engine = service._session_factory.kw["bind"]
+    install_runtime_mutation_barrier(engine, guard)
+    clock.advance(31)
+    inspector.set(APP, ProcessProof.NOT_SAME)
+    successor_engine = create_db_engine(
+        engine.url.render_as_string(hide_password=False)
+    )
+    successor_service = RuntimeTenureService(
+        make_session_factory(successor_engine),
+        process_inspector=inspector,
+        clock=clock,
+    )
+    successor_service.acquire_runtime(
+        "app",
+        ProcessIdentity(4111, "app-successor-start"),
+        ttl_seconds=30,
+    )
+
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        with pytest.raises(TenureLost):
+            connection.exec_driver_sql(
+                "CREATE TABLE escaped_generation (id INTEGER PRIMARY KEY)"
+            )
+        transaction.rollback()
+
+    with engine.connect() as connection:
+        assert "escaped_generation" not in {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+
+
+def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
+    monkeypatch,
+):
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Sun Jul 27 12:00:00 2026\n",
+            stderr="",
+        )
+
+    monkeypatch.setenv("PATH", "/tmp/attacker-controlled")
+    inspector = LocalProcessInspector(
+        runner=runner,
+        process_probe=lambda _pid: None,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
+    assert calls[0][0] == "/bin/ps"
+
+
+def test_process_inspector_rc1_with_stderr_is_unknown():
+    inspector = LocalProcessInspector(
+        runner=lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="permission denied",
+        ),
+        process_probe=lambda _pid: None,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.UNKNOWN
+
+
+def test_process_inspector_permission_error_is_unknown():
+    def denied(_pid):
+        raise PermissionError(errno.EPERM, "not permitted")
+
+    inspector = LocalProcessInspector(
+        runner=lambda *_args, **_kwargs: pytest.fail(
+            "ps must not run after uncertain process probe"
+        ),
+        process_probe=denied,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.UNKNOWN
+
+
+def test_process_inspector_esrch_is_exact_absence_proof():
+    def absent(_pid):
+        raise ProcessLookupError(errno.ESRCH, "no such process")
+
+    inspector = LocalProcessInspector(
+        runner=lambda *_args, **_kwargs: pytest.fail(
+            "ps must not run after exact absence proof"
+        ),
+        process_probe=absent,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
+
+
+def test_process_inspector_detects_pid_reuse_by_start_identity():
+    inspector = LocalProcessInspector(
+        runner=lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Sun Jul 27 12:00:01 2026\n",
+            stderr="",
+        ),
+        process_probe=lambda _pid: None,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
+
+
+def test_guarded_broker_does_not_expose_raw_broker_or_unknown_methods():
+    class Broker:
+        reconciliation_key = "fake"
+
+        def get_fill_activities(self, *, after=None):
+            return [after]
+
+        def raw_sdk_mutation(self):
+            raise AssertionError("unguarded mutation escaped")
+
+    broker = Broker()
+    guard = RuntimeTenureGuard(
+        FailingRenewHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    guarded = TenureGuardedBroker(broker, guard)
+
+    assert not hasattr(guarded, "_broker")
+    assert guarded.get_fill_activities(after="cursor") == ["cursor"]
+    with pytest.raises(AttributeError):
+        guarded.raw_sdk_mutation()

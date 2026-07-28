@@ -50,13 +50,22 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
-`systemctl enable --now trading-daemon` (a second unit runs the uvicorn app).
+`systemctl enable --now trading-daemon` (a second unit runs
+`python -m trading_assistant.ops.serve`, the tenure-aware Uvicorn owner).
 
-## Nightly backup (cron, 14-day retention)
+## Nightly encrypted backup (cron, 14-day retention)
 
 ```cron
-0 2 * * *  cd /home/you/trading-assistant && uv run python -m trading_assistant.ops.backup --destination backups --retention-days 14
+0 2 * * *  cd /home/you/trading-assistant && uv run python -m trading_assistant.ops.backup --destination .local/encrypted-backups --retention-days 14
 ```
+
+The job acquires exclusive maintenance tenure and publishes only
+`<timestamp>-whole-database-v1.sqlite3.aesgcm` artifacts. AES-256-GCM uses the
+dedicated configured backup key; the command verifies a streamed decryption,
+snapshot hash, and SQLite `quick_check` before success. The destination is mode
+`0700`, artifacts are mode `0600`, publication never overwrites, and every
+plaintext snapshot/verification temporary is removed on success or failure.
+Do not create an operational plaintext database copy for retention or analysis.
 
 The watchdog probes anonymous app liveness at
 `http://127.0.0.1:8000/health/live`. It reads the persisted daemon heartbeat

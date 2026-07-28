@@ -38,19 +38,36 @@ The runtime has no unofficial Robinhood login dependency or production path.
 
 ## Verified backup and migration
 
-Create and inspect a transactionally consistent online backup before migration:
+Create a transactionally consistent, verified encrypted backup while all
+runtime writer roles are stopped:
 
 ```bash
-uv run python -m trading_assistant.ops.backup --destination backups
-backup_file="$(ls -t backups/trading-assistant-*.sqlite3 | head -1)"
-sqlite3 "$backup_file" 'PRAGMA integrity_check;'
+uv run python -m trading_assistant.ops.backup \
+  --destination .local/encrypted-backups
 uv run python -m trading_assistant.db.migrate status
 uv run python -m trading_assistant.db.migrate upgrade
 uv run python -m trading_assistant.db.migrate status
 ```
 
-Proceed only when integrity reports `ok` and migration status reports current.
-Backups are standalone SQLite files with owner-only permissions. Migrations
+Proceed only when backup emits a redacted `status=verified` receipt and
+migration status reports current. The backup command acquires exclusive
+maintenance tenure, snapshots online into a private temporary, streams
+AES-256-GCM with the dedicated backup key, decrypts into a separate private
+verification temporary, checks its hash and SQLite `quick_check`, and removes
+all plaintext temporaries. It publishes only mode-`0600`
+`.local/encrypted-backups/<timestamp>-whole-database-v1.sqlite3.aesgcm`
+artifacts in a mode-`0700` directory, without overwrite. It works independently
+of whether sensitive-field migration state is required, migrating, or complete.
+Only a completely empty database may bootstrap directly to the current schema.
+An existing database at migration `0014` or later is upgraded while an
+exclusive, continuously renewed maintenance tenure is held. Older unversioned
+or pre-tenure schemas fail with `schema_maintenance_bootstrap_required`; move
+their data through a separately reviewed isolated-copy import instead of
+stamping or altering them in place. A stale held maintenance row also remains
+startup-blocking after expiry. A new maintenance operation may reclaim it only
+after exact process-identity inspection proves the recorded process is gone;
+an app, daemon, MCP, or validation writer may never infer recovery from expiry.
+Migrations
 `0001` through `0010` are the frozen release history. Migration `0008` adds
 the durable process-start broker-reconciliation generation latch; a runtime
 cannot submit until the newest generation has reconciled orders, fills, open
@@ -67,12 +84,20 @@ Migration `0010` separates durable plan-order cancellation intent from transient
 broker error classification. Requested or indeterminate cancellation survives a
 restart and prevents startup readiness and daemon rule evaluation until the
 order is terminal and exact fill truth has reconciled.
+Migrations `0014` and `0015` add the cross-role runtime/maintenance tenure
+protocol, the independent validation-writer role, and immutable plan-review
+authority evidence. App, daemon, MCP, and validation roles may coexist, but
+each is fenced from commit after ownership loss and all exclude maintenance.
 
-To recover from a bad migration, stop the app, daemon, and watchdog first. Verify
-the chosen backup again, move the failed database and any `-wal`/`-shm` sidecars
-aside as evidence, copy the verified backup into the configured database path,
-set mode `0600`, run migration status, and restart. Never copy over a database
-while a process has it open.
+To recover from a bad migration, stop the app, daemon, MCP, validation writer,
+and watchdog first. Preserve the encrypted artifact and failed database
+sidecars as evidence. Recovery requires a reviewed restore procedure that
+decrypts only to a new mode-`0600` staging file under a private mode-`0700`
+directory, verifies the authenticated header, snapshot hash, and SQLite
+`quick_check`, then atomically installs it while exclusive maintenance tenure
+is held. The production backup command intentionally has no option that
+persists a decrypted copy. Never copy over a database while a process has it
+open.
 
 ## Release-safety gates
 
@@ -226,8 +251,7 @@ values for redaction. Treat process memory and crash dumps as sensitive.
 
 ```bash
 uv run python -m trading_assistant.preflight
-uv run uvicorn trading_assistant.app.main:create_app \
-  --factory --host 127.0.0.1 --port 8000
+uv run python -m trading_assistant.ops.serve
 uv run python -m trading_assistant.daemon.main
 ```
 
@@ -262,15 +286,9 @@ attempt. If provider acceptance is unknown after the attempt starts, its
 reservation remains charged until durable reconciliation proves otherwise; do
 not retry merely because the response was lost.
 
-To inspect budget state without changing it, take the verified online backup
-described above and query the copy only:
-
-```bash
-sqlite3 "$backup_file" \
-  'SELECT provider, budget_day, calls_used, input_tokens_used, output_tokens_used, reconciliation_required, reconciliation_code FROM provider_budget_days ORDER BY budget_day DESC, provider;'
-sqlite3 "$backup_file" \
-  "SELECT provider, budget_day, category, request_id, state, input_reserved, output_reserved FROM provider_reservations WHERE state = 'unknown' ORDER BY created_at;"
-```
+Inspect budget state through the authenticated control plane. Do not decrypt an
+operational backup or create a retained plaintext database copy for ad-hoc
+analysis.
 
 Never edit `provider_budget_days` or `provider_reservations` counters manually.
 Reservations and aggregate counters are updated atomically; manual edits break
@@ -360,14 +378,17 @@ launchctl print "gui/$(id -u)/com.trading.watchdog"
 launchctl print "gui/$(id -u)/com.trading.backup"
 ```
 
-The agents run the loopback API, daemon, one-minute liveness watchdog, and 02:00
-online backup. The watchdog may restart a stale process; it never clears a
+The installer runs the loopback API, one-minute liveness watchdog, and 02:00
+verified encrypted backup; the daemon remains an explicit operator workflow.
+The watchdog may restart a stale process; it never clears a
 breaker or changes trading mode. On failure, inspect the role-specific bounded
 runtime log, verify `.env`/database permissions, run migration status and
 preflight manually, then reload only the affected plist. Use
 `./scripts/launchd/uninstall.sh` to remove all four agents.
 
-Keep FileVault enabled and off-device backups encrypted.
+The scheduled artifact name ends in
+`whole-database-v1.sqlite3.aesgcm`; no plaintext operational backup is
+retained. Keep FileVault enabled and off-device backups encrypted.
 
 ## Analyst version and future evidence gates
 

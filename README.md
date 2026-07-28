@@ -44,7 +44,7 @@ harness (`backtest/`) benchmark everything against buy-and-hold.
 
 ```bash
 # Run a synthetic walk-forward (no credentials needed) and open the report UI:
-uv run uvicorn trading_assistant.app.main:create_app --factory --reload
+uv run python -m trading_assistant.ops.serve
 # visit http://127.0.0.1:8000/backtests/ui  → "Run new backtest"
 
 # Real data (equities + crypto), cached to parquet, adjusted for corp actions:
@@ -95,7 +95,7 @@ uv run pytest
 
 ```bash
 # API + UI (chat, approvals, positions, backtests):
-uv run uvicorn trading_assistant.app.main:create_app --factory --reload
+uv run python -m trading_assistant.ops.serve
 
 # Monitoring daemon (evaluates conditional rules against live quotes):
 uv run python -m trading_assistant.daemon.main
@@ -110,7 +110,7 @@ safety_dir="$(cd "$safety_stage" && pwd -P)"
 uv run python -m trading_assistant.ops.safety_drill \
   --database-copy "$safety_dir/release-safety.sqlite3" --mock
 
-# Install API + daemon + watchdog + nightly online backup on macOS:
+# Install API + watchdog + nightly encrypted backup on macOS:
 ./scripts/launchd/install.sh
 ```
 
@@ -127,7 +127,9 @@ quantity. Plan-order cancellation intent is persisted independently from broker
 error codes, retried after restart, and keeps startup plus the daemon fail-closed
 until terminal broker and fill truth are confirmed.
 
-Operational details, verified backup/migration/restore commands, and the optional
+Operational backups retain only verified
+`whole-database-v1.sqlite3.aesgcm` artifacts; no plaintext SQLite backup is
+published. Detailed backup/migration/restore commands and the optional
 credentialed Alpaca paper gate are in
 [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Paper trading is a simulation and does not
 establish that a strategy will be profitable in live markets.

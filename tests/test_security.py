@@ -2438,6 +2438,9 @@ _PLAN_DOM_SETUP = r"""
     ]);
     const planDetail = (planId, symbol) => ({
       plan_id: planId,
+      authority_digest: `digest-${planId}-${symbol}`,
+      authority_version: 1,
+      review_token: `plan:${planId}:authority:v1:digest-${planId}-${symbol}`,
       symbol,
       status: "proposed",
       paper_only: true,
@@ -2735,6 +2738,15 @@ def test_plan_detail_and_approval_ignore_out_of_order_other_plan():
         }
         if (submitted.length !== 1 || submitted[0].path !== "/plans/2/approve") {
           failures.push(`submitted ${submitted.map((call) => call.path)}`);
+        }
+        const submittedBody = submitted.length
+          ? JSON.parse(submitted[0].options.body)
+          : {};
+        if (
+          submittedBody.review_token
+          !== "plan:2:authority:v1:digest-2-MSFT"
+        ) {
+          failures.push(`review token ${submittedBody.review_token}`);
         }
         if (failures.length) throw new Error(failures.join("; "));
         """,

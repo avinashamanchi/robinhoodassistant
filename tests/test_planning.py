@@ -123,6 +123,18 @@ def _analyze(planning, reason):
     )
 
 
+def _approve(planning, plan_id, *, review_token=None, **context):
+    if review_token is None:
+        detail = planning.get_plan(plan_id)
+        assert detail is not None
+        review_token = detail["review_token"]
+    return planning.approve_plan(
+        plan_id,
+        review_token=review_token,
+        **context,
+    )
+
+
 def _fail_audit_action(action):
     def fail(session, flush_context, instances):
         if any(
@@ -140,6 +152,193 @@ def test_analyze_stores_sized_plan(make_service):
     assert out["plan_id"] > 0
     assert out["sized"]["direction"] == "long"
     assert Decimal(out["sized"]["total_shares"]) > 0
+
+
+def test_analyze_returns_persisted_immutable_review_authority(make_service):
+    planning = _planning(make_service())
+
+    out = _analyze(planning, "return immutable review authority")
+    detail = planning.get_plan(out["plan_id"])
+
+    assert out["authority_version"] == 1
+    assert len(out["authority_digest"]) == 64
+    assert out["review_token"]
+    assert detail is not None
+    assert detail["authority_version"] == out["authority_version"]
+    assert detail["authority_digest"] == out["authority_digest"]
+    assert detail["review_token"] == out["review_token"]
+
+
+def test_approval_rejects_authoritative_payload_mutation_without_rules(
+    make_service,
+):
+    service = make_service()
+    planning = _planning(service)
+    review = _analyze(planning, "bind reviewed authority")
+    plan_id = review["plan_id"]
+
+    with service.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        store = sensitive_store(session, service.session_factory)
+        payload = json.loads(store.read(row, "plan_json"))
+        payload["entry_plan"]["tranches"][0]["price_level"] = "77"
+        store.write_many(
+            row,
+            {
+                "plan_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+        )
+        session.commit()
+
+    result = _approve(planning,
+        plan_id,
+        review_token=review["review_token"],
+        actor="operator:test",
+        reason="approve exact reviewed authority",
+        request_id="planning-authority-stale",
+    )
+
+    assert result["error"] == "plan_review_stale"
+    with service.session_factory() as session:
+        assert session.get(TradePlanRow, plan_id).status == "proposed"
+        assert session.scalar(
+            select(func.count())
+            .select_from(Rule)
+            .where(Rule.plan_id == plan_id)
+        ) == 0
+
+
+def test_approval_rechecks_payload_after_review_before_atomic_claim(
+    make_service,
+):
+    service = make_service()
+    planning = _planning(service)
+    review = _analyze(planning, "race reviewed authority")
+    plan_id = review["plan_id"]
+    original_decompose = planning._decompose
+
+    def mutate_after_initial_review(plan, sized, supplied_plan_id):
+        with service.session_factory() as session:
+            row = session.get(TradePlanRow, supplied_plan_id)
+            store = sensitive_store(session, service.session_factory)
+            payload = json.loads(store.read(row, "sized_json"))
+            payload["tranches"][0]["shares"] = "999"
+            store.write_many(
+                row,
+                {
+                    "sized_json": json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                },
+            )
+            session.commit()
+        return original_decompose(plan, sized, supplied_plan_id)
+
+    planning._decompose = mutate_after_initial_review
+    result = _approve(
+        planning,
+        plan_id,
+        review_token=review["review_token"],
+        actor="operator:test",
+        reason="reject raced reviewed authority",
+        request_id="planning-authority-race",
+    )
+
+    assert result["error"] == "plan_review_stale"
+    with service.session_factory() as session:
+        assert session.get(TradePlanRow, plan_id).status == "proposed"
+        assert session.scalar(
+            select(func.count())
+            .select_from(Rule)
+            .where(Rule.plan_id == plan_id)
+        ) == 0
+        assert session.scalar(select(func.count()).select_from(Order)) == 0
+
+
+def test_approval_maps_malformed_authority_payload_to_stale_review(
+    make_service,
+):
+    service = make_service()
+    planning = _planning(service)
+    review = _analyze(planning, "malformed reviewed authority")
+    plan_id = review["plan_id"]
+
+    with service.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        store = sensitive_store(session, service.session_factory)
+        payload = json.loads(store.read(row, "sized_json"))
+        payload["total_shares"] = "not-a-number"
+        store.write_many(
+            row,
+            {
+                "sized_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+        )
+        session.commit()
+
+    result = _approve(
+        planning,
+        plan_id,
+        review_token=review["review_token"],
+        actor="operator:test",
+        reason="reject malformed reviewed authority",
+        request_id="planning-authority-malformed",
+    )
+
+    assert result["error"] == "plan_review_stale"
+    with service.session_factory() as session:
+        assert session.get(TradePlanRow, plan_id).status == "proposed"
+        assert session.scalar(
+            select(func.count())
+            .select_from(Rule)
+            .where(Rule.plan_id == plan_id)
+        ) == 0
+
+
+def test_non_authoritative_narrative_edit_preserves_review_authority(
+    make_service,
+):
+    service = make_service()
+    planning = _planning(service)
+    review = _analyze(planning, "narrative is non authoritative")
+    plan_id = review["plan_id"]
+
+    with service.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        store = sensitive_store(session, service.session_factory)
+        payload = json.loads(store.read(row, "plan_json"))
+        payload["thesis"] = "changed narrative must not gain authority"
+        store.write_many(
+            row,
+            {
+                "plan_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+        )
+        session.commit()
+
+    result = _approve(planning,
+        plan_id,
+        review_token=review["review_token"],
+        actor="operator:test",
+        reason="approve unchanged authority",
+        request_id="planning-authority-narrative",
+    )
+
+    assert result["status"] == "approved"
 
 
 def test_planning_passes_boundary_request_id_to_each_structured_attempt(
@@ -224,13 +423,18 @@ def test_plan_mutation_boundaries_reject_noncanonical_request_id_before_lookup(
     request_id,
 ):
     planning = _planning(make_service())
+    kwargs = {
+        "actor": "operator:test",
+        "reason": "reject invalid plan mutation identity",
+        "request_id": request_id,
+    }
+    if method == "approve_plan":
+        kwargs["review_token"] = "invalid-review-token"
 
     with pytest.raises(ValueError, match="request_id"):
         getattr(planning, method)(
             999_999,
-            actor="operator:test",
-            reason="reject invalid plan mutation identity",
-            request_id=request_id,
+            **kwargs,
         )
 
 
@@ -385,7 +589,7 @@ def test_approve_decomposes_into_human_gated_typed_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = _analyze(pln, "decompose approved plan")["plan_id"]
-    res = pln.approve_plan(
+    res = _approve(pln,
         pid,
         actor="operator:test",
         reason="reviewed plan",
@@ -533,7 +737,7 @@ def test_entry_trigger_does_not_cancel_other_entries_or_protection(
     service = make_service()
     planning = _planning(service)
     plan_id = _analyze(planning, "independent entry groups")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed independent entries",
@@ -569,7 +773,7 @@ def test_confirmed_entry_fill_activates_and_sizes_exit_group(
     service = make_service(broker=broker)
     planning = _planning(service)
     plan_id = _analyze(planning, "fill activated exits")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed fill activated exits",
@@ -601,7 +805,7 @@ def test_reconciliation_commit_activates_exits_without_a_second_service_step(
     service = make_service(broker=broker)
     planning = _planning(service)
     plan_id = _analyze(planning, "atomic fill activation")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed atomic activation",
@@ -684,7 +888,7 @@ def test_exit_proposal_preserves_every_protection_until_broker_fill(
         Secrets(),
     )
     plan_id = _analyze(planning, "progressive exit lifecycle")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed progressive exits",
@@ -809,7 +1013,7 @@ def test_direct_rule_cancel_cannot_strip_approved_plan_protection(
     plan_id = _analyze(planning, "reject direct plan rule cancel")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed direct cancellation guard",
@@ -859,7 +1063,7 @@ def test_expired_protective_proposal_is_swept_and_rearmed(
     plan_id = _analyze(planning, "passive protective ttl sweep")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed passive ttl sweep",
@@ -945,7 +1149,7 @@ def test_rejected_intermediate_target_does_not_shrink_final_exit(
         Secrets(),
     )
     plan_id = _analyze(planning, "rejected target sizing")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed target sizing",
@@ -1021,7 +1225,7 @@ def test_confirmed_target_fills_progress_then_close_plan(
         Secrets(),
     )
     plan_id = _analyze(planning, "confirmed target lifecycle")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed confirmed target lifecycle",
@@ -1127,7 +1331,7 @@ def test_confirmed_exit_cancels_live_unfilled_entry_before_plan_closes(
     service = make_service(broker=broker)
     planning = _planning(service)
     plan_id = _analyze(planning, "cancel live entry after exit")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed live entry cancellation",
@@ -1206,7 +1410,7 @@ def test_late_entry_fill_reopens_terminal_plan_protection(
     plan_id = _analyze(planning, "late terminal entry fill")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed late terminal fill protection",
@@ -1314,7 +1518,7 @@ def test_cancel_plan_refuses_to_abandon_confirmed_open_quantity(
     plan_id = _analyze(planning, "refuse naked cancellation")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed cancellation guard",
@@ -1352,7 +1556,7 @@ def test_plan_cancel_requires_exact_fill_truth_after_broker_cancel(
     plan_id = _analyze(planning, "late fill cancellation latch")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed late fill latch",
@@ -1431,7 +1635,7 @@ def test_only_one_nonterminal_exit_intent_can_exist_per_plan_group(
         Secrets(),
     )
     plan_id = _analyze(planning, "single exit intent")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed single exit intent",
@@ -1502,7 +1706,7 @@ def test_delayed_old_exit_fill_cancels_newer_stale_generation(
     plan_id = _analyze(planning, "delayed exit fill generation")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed delayed fill generation",
@@ -1679,7 +1883,7 @@ def test_new_entry_fill_cancels_and_resizes_older_live_stop(
     plan_id = _analyze(planning, "entry growth residual generation")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed entry growth generation",
@@ -1808,7 +2012,7 @@ def test_plan_exit_rejects_unproven_cross_plan_allocation(
         first_planning,
         "first allocation plan",
     )["plan_id"]
-    first_planning.approve_plan(
+    _approve(first_planning,
         first_plan_id,
         actor="operator:test",
         reason="approve first allocation plan",
@@ -1824,7 +2028,7 @@ def test_plan_exit_rejects_unproven_cross_plan_allocation(
         second_planning,
         "second allocation plan",
     )["plan_id"]
-    second_planning.approve_plan(
+    _approve(second_planning,
         second_plan_id,
         actor="operator:test",
         reason="approve second allocation plan",
@@ -1891,7 +2095,7 @@ def test_manual_exit_cannot_consume_plan_allocated_position(
         planning,
         "reserve plan allocation from manual exit",
     )["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="approve allocation reservation plan",
@@ -1942,7 +2146,7 @@ def test_manual_exit_can_use_only_unallocated_position(
         planning,
         "preserve plan allocation while reducing excess",
     )["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="approve excess allocation plan",
@@ -1987,7 +2191,7 @@ def test_plan_over_exit_trips_drift_and_cannot_complete(make_service):
     service = make_service(broker=broker)
     planning = _planning(service)
     plan_id = _analyze(planning, "over exit detection")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed over exit detection",
@@ -2065,7 +2269,7 @@ def test_immediate_entry_fill_reconciles_before_returning(
     plan_id = _analyze(planning, "immediate fill protection")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed immediate fill protection",
@@ -2118,7 +2322,7 @@ def test_immediate_entry_fill_requires_full_downside_protection(
     plan_id = _analyze(planning, "mandatory downside protection")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed mandatory downside protection",
@@ -2177,7 +2381,7 @@ def test_restart_recovers_fill_before_post_submission_protection_callback(
     plan_id = _analyze(planning, "post send crash recovery")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed post-send recovery",
@@ -2246,7 +2450,7 @@ def test_startup_sync_resumes_durable_plan_cancel_intent(
     plan_id = _analyze(planning, "durable plan cancel intent")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed durable cancellation intent",
@@ -2314,7 +2518,7 @@ def test_unresolved_plan_cancel_retries_and_blocks_startup(
     plan_id = _analyze(planning, "startup blocking plan cancel")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="approve startup blocking cancellation",
@@ -2410,7 +2614,7 @@ def test_indeterminate_cancel_error_never_erases_retry_intent(
     plan_id = _analyze(planning, "indeterminate cancel intent")[
         "plan_id"
     ]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="approve indeterminate cancellation",
@@ -2497,7 +2701,7 @@ def test_cancel_plan_confirms_broker_entry_cancel_before_rules_terminal(
     service = make_service(broker=broker)
     planning = _planning(service)
     plan_id = _analyze(planning, "cancel broker live plan")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed broker live cancellation",
@@ -2550,7 +2754,7 @@ def test_plan_approval_crash_before_atomic_commit_is_retryable(make_service):
 
     planning._decompose = crash
     with pytest.raises(SimulatedCrash):
-        planning.approve_plan(
+        _approve(planning,
             plan_id,
             actor="operator:approval-crash",
             reason="approval crash drill",
@@ -2582,7 +2786,7 @@ def test_plan_approval_and_all_lifecycle_audits_roll_back_together(
             RuntimeError,
             match="injected plan.approve audit failure",
         ):
-            planning.approve_plan(
+            _approve(planning,
                 plan_id,
                 actor="operator:approval-rollback",
                 reason="approval audit rollback drill",
@@ -2610,7 +2814,7 @@ def test_cancel_plan_cancels_rules(make_service):
     svc = make_service()
     pln = _planning(svc)
     pid = _analyze(pln, "cancel plan")["plan_id"]
-    pln.approve_plan(
+    _approve(pln,
         pid,
         actor="operator:test",
         reason="reviewed plan",
@@ -2665,7 +2869,7 @@ def test_plan_cancellation_and_per_target_audits_are_one_transaction(
     svc = make_service()
     planning = _planning(svc)
     plan_id = _analyze(planning, "cancel audit rollback")["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:cancel-setup",
         reason="approve before cancel rollback",
@@ -2741,8 +2945,8 @@ def test_plan_approval_retry_is_idempotent_and_lifecycle_audits_are_exact(
         "request_id": "plan-approval-idempotency",
     }
 
-    first = planning.approve_plan(plan_id, **context)
-    second = planning.approve_plan(plan_id, **context)
+    first = _approve(planning, plan_id, **context)
+    second = _approve(planning, plan_id, **context)
 
     assert first["status"] == "approved"
     assert second["status"] == "approved"
@@ -2793,7 +2997,7 @@ def test_cancel_plan_cancels_every_resumable_member_of_mixed_group(make_service)
         reason="planning lifecycle analysis",
         request_id="planning-lifecycle-analysis",
     )["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed plan",
@@ -2868,7 +3072,7 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
         reason="planning race analysis",
         request_id="planning-race-analysis",
     )["plan_id"]
-    planning.approve_plan(
+    _approve(planning,
         plan_id,
         actor="operator:test",
         reason="reviewed plan",
@@ -2964,7 +3168,7 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
     pln = PlanningService(svc_live, _StubAnalyst(_plan()), _provider, sec)
 
     pid = _analyze(pln, "promotion gate")["plan_id"]
-    res = pln.approve_plan(
+    res = _approve(pln,
         pid,
         actor="operator:test",
         reason="reviewed plan",

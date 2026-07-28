@@ -212,6 +212,17 @@ class ApprovalIn(BaseModel):
         return value.strip()
 
 
+class PlanApprovalIn(ApprovalIn):
+    review_token: str
+
+    @field_validator("review_token")
+    @classmethod
+    def review_token_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("review_token must be non-empty")
+        return value.strip()
+
+
 class PanicIn(BaseModel):
     reason: str
 
@@ -950,7 +961,7 @@ def _create_app(
     @app.post("/plans/{plan_id}/approve")
     def approve_plan(
         plan_id: int,
-        body: ApprovalIn,
+        body: PlanApprovalIn,
         request: Request,
         principal: SessionPrincipal = Depends(recent_principal),
     ):
@@ -964,6 +975,7 @@ def _create_app(
         )
         result = _require_planning().approve_plan(
             plan_id,
+            review_token=body.review_token,
             actor=context.actor,
             reason=context.reason,
             request_id=context.request_id,
@@ -976,6 +988,12 @@ def _create_app(
             )
         if result.get("error") == "not found":
             raise ApiError("plan_not_found", 404, "Plan not found")
+        if result.get("error") == "plan_review_stale":
+            raise ApiError(
+                "plan_review_stale",
+                409,
+                "Plan authority changed after review",
+            )
         if "error" in result:
             raise ApiError(
                 "approval_conflict", 409, "Plan approval is no longer current"

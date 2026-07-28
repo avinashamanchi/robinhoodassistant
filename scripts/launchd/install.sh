@@ -13,8 +13,8 @@ LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
-mkdir -p "$LA" "$PROJ/logs" "$PROJ/backups"
-chmod 700 "$PROJ/logs" "$PROJ/backups"
+mkdir -p "$LA" "$PROJ/logs" "$PROJ/.local/encrypted-backups"
+chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
 
 reload_plist () {  # launchd can briefly return EIO immediately after bootout
@@ -108,7 +108,7 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
 
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
-emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/backups" --retention-days 14
+emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
 
 sleep 6
 echo "=== status ==="

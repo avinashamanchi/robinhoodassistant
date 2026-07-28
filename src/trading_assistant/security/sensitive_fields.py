@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+import re
 import secrets
+import sqlite3
 import weakref
 from weakref import WeakKeyDictionary
 
@@ -79,6 +83,158 @@ _FACTORY_GUARD_CALLBACKS: WeakKeyDictionary[
     sessionmaker[Session],
     object,
 ] = WeakKeyDictionary()
+_ENGINE_WRITE_CAPABILITIES: WeakKeyDictionary[Engine, object] = (
+    WeakKeyDictionary()
+)
+_ENGINE_BOUNDARY_CALLBACKS: WeakKeyDictionary[
+    Engine,
+    tuple[object, object, object],
+] = WeakKeyDictionary()
+_ACTIVE_SENSITIVE_WRITE: ContextVar[object | None] = ContextVar(
+    "trading_assistant_sensitive_write",
+    default=None,
+)
+
+
+def _sensitive_sql_mutation(statement: object) -> bool:
+    if not isinstance(statement, str):
+        return True
+    for table, fields in SENSITIVE_FIELDS.items():
+        quoted_table = rf'(?:"{re.escape(table)}"|`{re.escape(table)}`|\[{re.escape(table)}\]|{re.escape(table)})'
+        if re.search(
+            rf"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO)"
+            rf"\s+{quoted_table}\b",
+            statement,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            rf"\bDELETE\s+FROM\s+{quoted_table}\b",
+            statement,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        update = re.search(
+            rf"\bUPDATE\s+(?:OR\s+\w+\s+)?{quoted_table}\b",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if update is None:
+            continue
+        remainder = statement[update.end():]
+        if any(
+            re.search(
+                rf"\b{re.escape(column)}\b",
+                remainder,
+                flags=re.IGNORECASE,
+            )
+            for column in fields
+        ):
+            return True
+    return False
+
+
+def _install_sensitive_sql_boundary(engine: Engine) -> None:
+    if engine in _ENGINE_BOUNDARY_CALLBACKS:
+        return
+    capability = _ENGINE_WRITE_CAPABILITIES[engine]
+
+    def authorizer(
+        action,
+        first,
+        second,
+        _database,
+        _trigger,
+    ):
+        if _ACTIVE_SENSITIVE_WRITE.get() is capability:
+            return sqlite3.SQLITE_OK
+        table = first if isinstance(first, str) else ""
+        column = second if isinstance(second, str) else ""
+        if (
+            action == sqlite3.SQLITE_INSERT
+            and table in SENSITIVE_FIELDS
+        ):
+            return sqlite3.SQLITE_DENY
+        if (
+            action == sqlite3.SQLITE_DELETE
+            and table in SENSITIVE_FIELDS
+        ):
+            return sqlite3.SQLITE_DENY
+        if (
+            action == sqlite3.SQLITE_UPDATE
+            and column in SENSITIVE_FIELDS.get(table, set())
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def install_authorizer(
+        dbapi_connection,
+        _record,
+        _proxy=None,
+    ) -> None:
+        setter = getattr(dbapi_connection, "set_authorizer", None)
+        if callable(setter):
+            setter(authorizer)
+
+    def before_cursor_execute(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _many,
+    ) -> None:
+        if _ACTIVE_SENSITIVE_WRITE.get() is capability:
+            return
+        if _sensitive_sql_mutation(statement):
+            raise PlaintextSensitiveField()
+
+    def handle_error(exception_context):
+        if _ACTIVE_SENSITIVE_WRITE.get() is capability:
+            return None
+        original = getattr(exception_context, "original_exception", None)
+        if (
+            isinstance(original, sqlite3.DatabaseError)
+            and "not authorized" in str(original).lower()
+        ):
+            return PlaintextSensitiveField()
+        return None
+
+    event.listen(engine, "connect", install_authorizer)
+    event.listen(engine, "checkout", install_authorizer)
+    event.listen(
+        engine,
+        "before_cursor_execute",
+        before_cursor_execute,
+    )
+    event.listen(engine, "handle_error", handle_error, retval=True)
+    _ENGINE_BOUNDARY_CALLBACKS[engine] = (
+        install_authorizer,
+        before_cursor_execute,
+        handle_error,
+    )
+
+
+def _bind_sensitive_sql_boundary(engine: Engine) -> None:
+    """Install the runtime boundary without binding key material."""
+    if not isinstance(engine, Engine):
+        raise PlaintextSensitiveField()
+    if engine not in _ENGINE_WRITE_CAPABILITIES:
+        _ENGINE_WRITE_CAPABILITIES[engine] = object()
+    _install_sensitive_sql_boundary(engine)
+
+
+@contextmanager
+def _sensitive_write_authority(engine: Engine):
+    """Internal exact-engine capability for store and maintenance writes."""
+    capability = _ENGINE_WRITE_CAPABILITIES.get(engine)
+    if capability is None:
+        raise PlaintextSensitiveField()
+    token = _ACTIVE_SENSITIVE_WRITE.set(capability)
+    try:
+        yield
+    finally:
+        _ACTIVE_SENSITIVE_WRITE.reset(token)
 
 
 def bind_sensitive_cipher(
@@ -99,6 +255,7 @@ def bind_sensitive_cipher(
     if existing_engine is not None and existing_engine is not cipher:
         raise SensitiveDataInvalid()
     _ENGINE_CIPHERS[engine] = cipher
+    _bind_sensitive_sql_boundary(engine)
     if session_factory not in _FACTORY_GUARD_CALLBACKS:
         def install_factory_guard(
             session: Session,
@@ -324,6 +481,13 @@ class SensitiveFieldStore:
         *,
         schema_version: int = 1,
     ) -> None:
+        engine = session.get_bind()
+        if not isinstance(engine, Engine):
+            raise PlaintextSensitiveField()
+        # Direct construction is the canonical Task 5 write protocol too.
+        # Ensure it receives the same exact-engine SQL boundary as a
+        # factory-bound production store before any staged flush can occur.
+        _bind_sensitive_sql_boundary(engine)
         install_sensitive_field_guards(
             session,
             cipher,
@@ -364,7 +528,13 @@ class SensitiveFieldStore:
             row_id = _row_id(instance)
             state = sa_inspect(instance)
             generated_pk = row_id is None
-            with self._session.no_autoflush:
+            engine = self._session.get_bind()
+            if not isinstance(engine, Engine):
+                raise PlaintextSensitiveField()
+            with (
+                _sensitive_write_authority(engine),
+                self._session.no_autoflush,
+            ):
                 if generated_pk:
                     required = {
                         column
@@ -529,8 +699,27 @@ class SensitiveFieldStore:
             raise PlaintextSensitiveField()
         for column in columns:
             setattr(instance, column, None)
-        self._session.flush([instance])
+        engine = self._session.get_bind()
+        if not isinstance(engine, Engine):
+            raise PlaintextSensitiveField()
+        with _sensitive_write_authority(engine):
+            self._session.flush([instance])
         return instance
+
+    def delete(self, instance: object) -> None:
+        """Delete one registered row through the exact-engine capability."""
+        table = _table_name(instance)
+        row_id = _row_id(instance)
+        engine = self._session.get_bind()
+        if (
+            table not in SENSITIVE_FIELDS
+            or row_id is None
+            or not isinstance(engine, Engine)
+        ):
+            raise PlaintextSensitiveField()
+        with _sensitive_write_authority(engine):
+            self._session.delete(instance)
+            self._session.flush([instance])
 
     def read(self, instance: object, column: str) -> str:
         table = _table_name(instance)

@@ -185,7 +185,7 @@ def _check_submission_paths(root: Path) -> None:
                         and isinstance(candidate.func, ast.Attribute)
                         and candidate.func.attr == "ensure_owned"
                         and isinstance(candidate.func.value, ast.Attribute)
-                        and candidate.func.value.attr == "_guard"
+                        and candidate.func.value.attr == "__guard"
                         and isinstance(candidate.func.value.value, ast.Name)
                         and candidate.func.value.value.id == "self"
                         for candidate in ast.walk(function)
@@ -201,7 +201,7 @@ def _check_submission_paths(root: Path) -> None:
                                 candidate.func.value,
                                 ast.Attribute,
                             )
-                            and candidate.func.value.attr == "_broker"
+                            and candidate.func.value.attr == "__broker"
                             and isinstance(
                                 candidate.func.value.value,
                                 ast.Name,
@@ -259,6 +259,49 @@ def _check_submission_paths(root: Path) -> None:
                 offenders.append(f"{relative}:{node.lineno}")
     if offenders:
         _fail("broker submission outside approved paths: " + ", ".join(offenders))
+
+
+def _check_no_raw_broker_escape(root: Path) -> None:
+    runtime = root / "src" / "trading_assistant"
+    allowed = {
+        "src/trading_assistant/broker/alpaca.py",
+        "src/trading_assistant/ops/tenure.py",
+        "src/trading_assistant/ops/safety_drill.py",
+    }
+    private_names = {
+        "_broker",
+        "__broker",
+        "_TenureGuardedBroker__broker",
+        "_trading",
+        "_data",
+        "_crypto_data",
+    }
+    offenders: list[str] = []
+    for path in runtime.rglob("*.py"):
+        relative = path.relative_to(root).as_posix()
+        if relative in allowed:
+            continue
+        tree = ast.parse(
+            path.read_text(encoding="utf-8"),
+            filename=relative,
+        )
+        for node in ast.walk(tree):
+            direct = (
+                isinstance(node, ast.Attribute)
+                and node.attr in private_names
+            )
+            dynamic = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in private_names
+            )
+            if direct or dynamic:
+                offenders.append(f"{relative}:{node.lineno}")
+    if offenders:
+        _fail("raw broker escape: " + ", ".join(sorted(set(offenders))))
 
 
 def _check_browser_sources(root: Path) -> None:
@@ -949,6 +992,87 @@ def _check_sensitive_field_writes(root: Path) -> None:
         )
 
 
+def _check_encrypted_operational_backup_surface(root: Path) -> None:
+    relative = "src/trading_assistant/ops/backup.py"
+    path = root / relative
+    if path.exists():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        backup_function = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "backup_database"
+            ),
+            None,
+        )
+        if backup_function is None:
+            _fail("plaintext operational backup entrypoint: missing encrypted backup")
+        encrypted_call = any(
+            isinstance(node, ast.Call)
+            and (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "create_encrypted_database_backup"
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "create_encrypted_database_backup"
+                )
+            )
+            and any(
+                keyword.arg == "artifact_label"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "whole-database-v1"
+                for keyword in node.keywords
+            )
+            for node in ast.walk(backup_function)
+        )
+        plaintext_target = any(
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.lower().endswith((".sqlite", ".sqlite3", ".db"))
+            for node in ast.walk(backup_function)
+        )
+        direct_sqlite_target = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "sqlite3"
+            and node.func.attr == "connect"
+            for node in ast.walk(backup_function)
+        )
+        if not encrypted_call or plaintext_target or direct_sqlite_target:
+            _fail(
+                "plaintext operational backup entrypoint: "
+                f"{relative}:{backup_function.lineno}"
+            )
+
+    required_marker = "whole-database-v1.sqlite3.aesgcm"
+    operational_surfaces = (
+        "README.md",
+        "scripts/launchd/install.sh",
+        "scripts/launchd/README.md",
+        "docs/RUNBOOK.md",
+        "docs/ops/README.md",
+    )
+    forbidden = (
+        re.compile(r"--destination\s+['\"]?\$PROJ/backups(?:['\"\s]|$)"),
+        re.compile(r"trading-assistant-\*\.sqlite3"),
+        re.compile(r"sqlite3\s+['\"]?\$backup_file"),
+    )
+    for surface in operational_surfaces:
+        candidate = root / surface
+        if not candidate.exists():
+            continue
+        text = candidate.read_text(encoding="utf-8")
+        if (
+            surface != "scripts/launchd/install.sh"
+            and required_marker not in text
+        ) or any(pattern.search(text) for pattern in forbidden):
+            _fail(f"plaintext operational backup entrypoint: {surface}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -958,6 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
         _check_config,
         _check_no_runtime_create_all,
         _check_submission_paths,
+        _check_no_raw_broker_escape,
         _check_browser_sources,
         _check_no_unofficial_robinhood_dependency,
         _check_route_policy_inventory,
@@ -965,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         _check_llm_construction_paths,
         _check_no_deleted_rate_limiter_import,
         _check_sensitive_field_writes,
+        _check_encrypted_operational_backup_surface,
         _check_no_tracked_secret_files,
     )
     try:

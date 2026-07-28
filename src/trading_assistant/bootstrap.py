@@ -42,7 +42,6 @@ from .ops.tenure import (
     LocalProcessInspector,
     ProcessIdentity,
     RuntimeTenureGuard,
-    RuntimeTenureHandle,
     RuntimeTenureService,
     TenureGuardedBroker,
     TenureUncertain,
@@ -120,6 +119,57 @@ def prepare_database_runtime(
         engine=engine,
         session_factory=make_session_factory(engine),
     )
+
+
+def acquire_runtime_guard(
+    runtime: DatabaseRuntime,
+    role: str,
+    *,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector=None,
+    tenure_clock=None,
+    tenure_owner_factory=None,
+) -> RuntimeTenureGuard:
+    """Acquire, start renewal, and install SQL fencing for one writer role."""
+    if role not in {"app", "daemon", "mcp", "validation"}:
+        raise ValueError("runtime_role_invalid")
+    inspector = process_inspector or LocalProcessInspector()
+    identity = process_identity
+    if identity is None:
+        try:
+            identity = inspector.current()
+        except Exception:
+            raise TenureUncertain() from None
+    service_kwargs = {"process_inspector": inspector}
+    if tenure_clock is not None:
+        service_kwargs["clock"] = tenure_clock
+    if tenure_owner_factory is not None:
+        service_kwargs["owner_factory"] = tenure_owner_factory
+    handle = RuntimeTenureService(
+        runtime.session_factory,
+        **service_kwargs,
+    ).acquire_runtime(
+        role,
+        identity,
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    try:
+        guard.start()
+        install_runtime_mutation_barrier(runtime.engine, guard)
+    except BaseException:
+        try:
+            released = guard.close()
+        except BaseException:
+            raise TenureUncertain() from None
+        if not released:
+            raise TenureUncertain() from None
+        raise
+    return guard
 
 
 def _guard_runtime(config: AppConfig, secrets: RuntimeSecrets) -> None:
@@ -247,38 +297,15 @@ def _build_container(
             "sensitive_key_unavailable"
         ) from None
     bind_sensitive_cipher(session_factory, sensitive_cipher)
-    runtime_tenure: RuntimeTenureHandle | None = None
     runtime_tenure_guard: RuntimeTenureGuard | None = None
     if enforce_runtime_tenure:
-        inspector = process_inspector or LocalProcessInspector()
-        identity = process_identity
-        if identity is None:
-            try:
-                identity = inspector.current()
-            except Exception:
-                raise TenureUncertain() from None
-        service_kwargs = {"process_inspector": inspector}
-        if tenure_clock is not None:
-            service_kwargs["clock"] = tenure_clock
-        if tenure_owner_factory is not None:
-            service_kwargs["owner_factory"] = tenure_owner_factory
-        runtime_tenure = RuntimeTenureService(
-            session_factory,
-            **service_kwargs,
-        ).acquire_runtime(
+        runtime_tenure_guard = acquire_runtime_guard(
+            runtime,
             effective_role,
-            identity,
-            ttl_seconds=30,
-        )
-        runtime_tenure_guard = RuntimeTenureGuard(
-            runtime_tenure,
-            ttl_seconds=30,
-            renewal_interval_seconds=5,
-        )
-        runtime_tenure_guard.start()
-        install_runtime_mutation_barrier(
-            runtime.engine,
-            runtime_tenure_guard,
+            process_identity=process_identity,
+            process_inspector=process_inspector,
+            tenure_clock=tenure_clock,
+            tenure_owner_factory=tenure_owner_factory,
         )
     try:
         return _finish_container(

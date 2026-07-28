@@ -27,10 +27,12 @@ from trading_assistant.db.models import (
     CircuitBreakerState,
     Fill,
     RiskEvent,
+    Rule,
     TradePlanRow,
 )
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.risk.clock import FakeClock
+from trading_assistant.security.sensitive_fields import sensitive_store
 from trading_assistant.signals.models import MarketFeatures, Regime
 from tests.conftest import decrypt_test_sensitive
 
@@ -249,7 +251,10 @@ def test_analyze_and_plan_flow(client):
 
     approve_response = c.post(
         f"/plans/{pid}/approve",
-        json={"reason": "reviewed plan"},
+        json={
+            "reason": "reviewed plan",
+            "review_token": res["review_token"],
+        },
         headers={"Idempotency-Key": "plan-flow-approve"},
     )
     approve = approve_response.json()
@@ -282,6 +287,60 @@ def test_analyze_and_plan_flow(client):
     assert audit.actor == "operator:local"
     assert decrypt_test_sensitive(audit, "reason") == "review complete"
     assert audit.request_id == cancel_response.headers["X-Request-ID"]
+
+
+def test_plan_approval_requires_exact_review_token_and_rejects_stale_payload(
+    client,
+):
+    c, svc = client
+    analyzed = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review immutable authority",
+        },
+        headers={"Idempotency-Key": "authority-analyze"},
+    ).json()
+    plan_id = analyzed["plan_id"]
+
+    missing = c.post(
+        f"/plans/{plan_id}/approve",
+        json={"reason": "missing review token"},
+        headers={"Idempotency-Key": "authority-missing-token"},
+    )
+    assert missing.status_code == 422
+
+    with svc.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        store = sensitive_store(session, svc.session_factory)
+        payload = json.loads(store.read(row, "sized_json"))
+        payload["total_shares"] = "999"
+        store.write_many(
+            row,
+            {
+                "sized_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+        )
+        session.commit()
+
+    stale = c.post(
+        f"/plans/{plan_id}/approve",
+        json={
+            "reason": "approve exact reviewed payload",
+            "review_token": analyzed["review_token"],
+        },
+        headers={"Idempotency-Key": "authority-stale-token"},
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "plan_review_stale"
+    with svc.session_factory() as session:
+        assert session.get(TradePlanRow, plan_id).status == "proposed"
+        assert session.query(Rule).filter_by(plan_id=plan_id).count() == 0
 
 
 @pytest.mark.parametrize(

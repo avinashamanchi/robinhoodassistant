@@ -1093,3 +1093,75 @@ def test_launcher_closes_running_tenure_if_server_construction_fails(
         serve.main()
 
     assert guard.closed is True
+
+
+def test_launcher_fails_nonzero_when_lifespan_already_saw_uncertain_release(
+    monkeypatch,
+):
+    from trading_assistant.ops import serve
+    from trading_assistant.ops.tenure import RuntimeTenureGuard
+
+    server_config = SimpleNamespace(
+        bind_host="127.0.0.1",
+        port=8020,
+        tls_cert_path=Path(".local/tls/localhost.pem"),
+        tls_key_path=Path(".local/tls/localhost-key.pem"),
+    )
+
+    class Handle:
+        role = "app"
+
+        def renew(self, *, ttl_seconds):
+            return None
+
+        def release(self):
+            return False
+
+    guard = RuntimeTenureGuard(
+        Handle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    shutdown_callbacks: list[object] = []
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            runtime_tenure_guard=guard,
+            install_controlled_shutdown=shutdown_callbacks.append,
+        )
+    )
+
+    class FakeServer:
+        should_exit = False
+
+        def __init__(self, _config):
+            pass
+
+        def run(self):
+            # Simulate FastAPI's shutdown callback running before Uvicorn
+            # returns control to the launcher.
+            assert guard.close() is False
+
+    monkeypatch.setattr(
+        serve,
+        "load_config",
+        lambda: SimpleNamespace(server=server_config),
+    )
+    monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        serve,
+        "start_app_control",
+        lambda _project: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(serve, "create_app", lambda: app)
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "Config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(serve.uvicorn, "Server", FakeServer)
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime_tenure_cleanup_uncertain",
+    ):
+        serve.main()

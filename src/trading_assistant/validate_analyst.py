@@ -158,24 +158,50 @@ def run(argv=None) -> int:
         secrets,
         runtime_role="validate-analyst",
     )
-    provider_budget = bootstrap.build_provider_budget_service(
-        config,
-        runtime.session_factory,
-    )
-    analyst = _build_analyst(config, secrets, provider_budget)
-    print("Running analyst over the holdout (this makes real LLM calls)...")
-    report = analyst_accuracy(
-        source,
-        symbols,
-        analyst,
-        run_cfg,
-        run_id=run_id,
-        start=start,
-        end=end,
-    )
-    print(json.dumps(report, indent=2))
-    print("\n" + report["verdict"])
-    return 0
+    tenure = bootstrap.acquire_runtime_guard(runtime, "validation")
+    primary_failure = False
+    try:
+        tenure.ensure_owned()
+        provider_budget = bootstrap.build_provider_budget_service(
+            config,
+            runtime.session_factory,
+        )
+        tenure.ensure_owned()
+        analyst = _build_analyst(config, secrets, provider_budget)
+        tenure.ensure_owned()
+        print(
+            "Running analyst over the holdout "
+            "(this makes real LLM calls)..."
+        )
+        report = analyst_accuracy(
+            source,
+            symbols,
+            analyst,
+            run_cfg,
+            run_id=run_id,
+            start=start,
+            end=end,
+        )
+        tenure.ensure_owned()
+        print(json.dumps(report, indent=2))
+        print("\n" + report["verdict"])
+        return 0
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        try:
+            released = tenure.close()
+        except BaseException:
+            if not primary_failure:
+                raise RuntimeError(
+                    "runtime_tenure_cleanup_uncertain"
+                ) from None
+        else:
+            if not released and not primary_failure:
+                raise RuntimeError(
+                    "runtime_tenure_cleanup_uncertain"
+                )
 
 
 if __name__ == "__main__":

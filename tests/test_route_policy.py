@@ -1748,16 +1748,18 @@ def test_panic_follower_never_accepts_replacement_owner_receipt(
     app.state.operations.panic = should_not_execute
     expires_at = utcnow() + timedelta(seconds=60)
     with service.session_factory() as session:
-        session.add(
+        persist_sensitive(
+            session,
             PanicReceipt(
                 account_scope="alpaca-paper",
                 request_id="owner-request-a",
                 lease_generation=41,
                 state="started",
-                response_json=None,
                 started_at=utcnow(),
                 expires_at=expires_at,
-            )
+            ),
+            {"response_json": "{}"},
+            session_factory=service.session_factory,
         )
         session.commit()
 

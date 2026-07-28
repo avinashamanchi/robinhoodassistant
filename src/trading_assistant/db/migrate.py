@@ -18,17 +18,21 @@ from trading_assistant.ops.backup import (
     EncryptedBackupReceipt,
     create_encrypted_database_backup,
 )
+from trading_assistant.ops.tenure import (
+    LocalProcessInspector,
+    ProcessIdentity,
+    ProcessInspector,
+    RuntimeTenureGuard,
+    RuntimeTenureService,
+    TenureUncertain,
+    install_runtime_mutation_barrier,
+)
 
 from .schema import SchemaOutOfDate, require_current_schema, schema_status
-from .session import create_db_engine
+from .models import utcnow
+from .session import create_db_engine, make_session_factory
 
 BASELINE = "20260724_0001"
-LEGACY_TABLES = {
-    "analysis_reports", "backtest_metric_rows", "backtest_runs", "fills",
-    "graded_calls", "heartbeats", "holdout_access_log", "killswitch_state",
-    "llm_decisions", "orders", "proposals", "risk_events", "rules",
-    "shadow_calls", "trade_plans",
-}
 def _config(engine: Engine) -> Config:
     cfg = Config("alembic.ini")
     cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
@@ -42,6 +46,7 @@ def _backup(
     backup_key_id: str | None,
     backup_directory: str | Path | None,
     schema_head: str,
+    ensure_maintenance=None,
 ) -> EncryptedBackupReceipt:
     url = make_url(str(engine.url))
     if (
@@ -60,6 +65,7 @@ def _backup(
         backup_key=backup_key,
         backup_key_id=backup_key_id,
         schema_head=schema_head,
+        ensure_maintenance=ensure_maintenance,
     )
 
 
@@ -70,18 +76,11 @@ def adopt_existing(
     backup_key_id: str | None = None,
     backup_directory: str | Path | None = None,
 ) -> EncryptedBackupReceipt:
-    tables = set(inspect(engine).get_table_names())
-    if tables != LEGACY_TABLES:
-        raise RuntimeError(f"legacy schema mismatch: {sorted(tables ^ LEGACY_TABLES)}")
-    backup = _backup(
-        engine,
-        backup_key=backup_key,
-        backup_key_id=backup_key_id,
-        backup_directory=backup_directory,
-        schema_head=BASELINE,
-    )
-    command.stamp(_config(engine), BASELINE)
-    return backup
+    del engine, backup_key, backup_key_id, backup_directory
+    # A pre-tenure database cannot prove that every legacy process is offline,
+    # so an in-place stamp would create an unfenced schema race. Bootstrap it
+    # only through a separately reviewed, isolated-copy procedure.
+    raise RuntimeError("schema_maintenance_bootstrap_required")
 
 
 def upgrade(
@@ -90,27 +89,95 @@ def upgrade(
     backup_key: bytes | None = None,
     backup_key_id: str | None = None,
     backup_directory: str | Path | None = None,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector: ProcessInspector | None = None,
+    tenure_clock=utcnow,
 ) -> EncryptedBackupReceipt | None:
     status = schema_status(engine)
-    if not status.versioned and set(inspect(engine).get_table_names()):
-        raise RuntimeError(
-            "unversioned non-empty database; run `python -m "
-            "trading_assistant.db.migrate adopt-existing` first"
-        )
-    backup = (
-        _backup(
+    tables = set(inspect(engine).get_table_names())
+    if not status.versioned and tables:
+        raise RuntimeError("schema_maintenance_bootstrap_required")
+    if not tables:
+        command.upgrade(_config(engine), "head")
+        require_current_schema(engine)
+        return None
+    if status.ready:
+        require_current_schema(engine)
+        return None
+    if "runtime_tenures" not in tables:
+        raise RuntimeError("schema_maintenance_bootstrap_required")
+    if process_identity is None or process_inspector is None:
+        raise RuntimeError("schema_maintenance_tenure_required")
+
+    service = RuntimeTenureService(
+        make_session_factory(engine),
+        process_inspector=process_inspector,
+        clock=tenure_clock,
+    )
+    handle = service.acquire_maintenance(
+        process_identity,
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    try:
+        guard.start()
+        barrier = install_runtime_mutation_barrier(engine, guard)
+    except BaseException:
+        if not guard.closed:
+            try:
+                if not guard.close():
+                    raise TenureUncertain()
+            except BaseException:
+                raise TenureUncertain() from None
+        raise
+    primary_failure = False
+    released = False
+    try:
+        def renew_maintenance() -> None:
+            if not guard.renew_once():
+                raise TenureUncertain()
+
+        backup = _backup(
             engine,
             backup_key=backup_key,
             backup_key_id=backup_key_id,
             backup_directory=backup_directory,
             schema_head=status.current or BASELINE,
+            ensure_maintenance=renew_maintenance,
         )
-        if status.versioned and not status.ready
-        else None
-    )
-    command.upgrade(_config(engine), "head")
-    require_current_schema(engine)
-    return backup
+        guard.ensure_owned()
+        with engine.connect() as connection:
+            cfg = _config(engine)
+            cfg.attributes["connection"] = connection
+            cfg.attributes["runtime_tenure_fence_schema"] = (
+                barrier.fence_schema_execution_option
+            )
+            cfg.attributes["runtime_tenure_assert_owned"] = (
+                guard.assert_owned_in_transaction
+            )
+            command.upgrade(cfg, "head")
+        guard.ensure_owned()
+        require_current_schema(engine)
+        if not guard.close():
+            raise TenureUncertain()
+        released = True
+        return backup
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        if not released and not guard.closed:
+            try:
+                if not guard.close() and not primary_failure:
+                    raise TenureUncertain()
+            except BaseException:
+                if not primary_failure:
+                    raise
+        barrier.close()
 
 
 def _print_result(
@@ -126,7 +193,12 @@ def _print_result(
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector: ProcessInspector | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description="Manage the trading assistant schema.")
     parser.add_argument(
         "--development-environment-secrets",
@@ -153,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     engine = create_db_engine(runtime_secrets.database_url)
     backup_buffer: bytearray | None = None
+    inspector = process_inspector or LocalProcessInspector()
+    identity = process_identity
 
     from trading_assistant.logging import runtime_startup
 
@@ -162,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print_result("status", engine)
                 require_current_schema(engine)
             elif args.command == "adopt-existing":
+                identity = identity or inspector.current()
                 backup_buffer = validate_base64_key(
                     "backup_encryption_key",
                     runtime_secrets.backup_encryption_key,
@@ -175,9 +250,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 backup = adopt_existing(engine, **backup_args)
                 _print_result("adopt-existing", engine, backup)
-                upgrade_backup = upgrade(engine, **backup_args)
+                upgrade_backup = upgrade(
+                    engine,
+                    **backup_args,
+                    process_identity=identity,
+                    process_inspector=inspector,
+                )
                 _print_result("upgrade", engine, upgrade_backup)
             else:
+                identity = identity or inspector.current()
                 backup_buffer = validate_base64_key(
                     "backup_encryption_key",
                     runtime_secrets.backup_encryption_key,
@@ -187,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
                     backup_key=bytes(backup_buffer),
                     backup_key_id=config.encryption.backup_key_id,
                     backup_directory=config.encryption.backup_directory,
+                    process_identity=identity,
+                    process_inspector=inspector,
                 )
                 _print_result("upgrade", engine, backup)
         except SchemaOutOfDate as exc:

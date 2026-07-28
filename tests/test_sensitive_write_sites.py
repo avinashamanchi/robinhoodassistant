@@ -5,11 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select, text
 
 from trading_assistant.db.models import AuditEvent
 from trading_assistant.security.sensitive_fields import (
     PlaintextSensitiveField,
+    persist_sensitive,
 )
 from trading_assistant.security.sensitive_write_scan import (
     scan_sensitive_writes,
@@ -122,6 +123,81 @@ session.execute(
 """,
             "proposals.reasoning",
         ),
+        (
+            """
+from sqlalchemy import text
+session.execute(text(
+    "WITH chosen AS (SELECT 1) "
+    "UPDATE audit_events SET reason = :reason WHERE id = 1"
+))
+""",
+            "audit_events.reason",
+        ),
+        (
+            """
+table = "audit_events"
+session.execute(f"UPDATE {table} SET reason = :reason")
+""",
+            "dynamic_sql.**expression",
+        ),
+        (
+            """
+table = "audit_events"
+sql = "UPDATE " + table + " SET reason = :reason"
+connection.exec_driver_sql(sql)
+""",
+            "dynamic_sql.**expression",
+        ),
+        (
+            """
+connection.exec_driver_sql(
+    "UPDATE audit_events SET detail_json = :value WHERE id = 1"
+)
+""",
+            "audit_events.detail_json",
+        ),
+        (
+            """
+from sqlalchemy import select
+from trading_assistant.db.models import AuditEvent
+row = session.scalar(select(AuditEvent))
+row.reason = "plain"
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent as Event
+Model = Event
+rows = [{"reason": "plain"}]
+session.bulk_insert_mappings(Model, rows)
+""",
+            "AuditEvent.**mapping",
+        ),
+        (
+            """
+from sqlalchemy import delete
+from trading_assistant.db.models import AuditEvent
+session.execute(delete(AuditEvent))
+""",
+            "AuditEvent.**row",
+        ),
+        (
+            """
+from sqlalchemy import select
+from trading_assistant.db.models import AuditEvent
+row = session.scalar(select(AuditEvent))
+session.delete(row)
+""",
+            "AuditEvent.**row",
+        ),
+        (
+            """
+from sqlalchemy import text
+session.execute(text("DELETE FROM audit_events WHERE id = 1"))
+""",
+            "audit_events.**row",
+        ),
     ],
 )
 def test_static_gate_rejects_sensitive_write_bypasses(
@@ -166,3 +242,106 @@ def test_factory_bound_runtime_guard_blocks_direct_plaintext_commit(
         assert session.scalar(
             select(func.count()).select_from(AuditEvent)
         ) == 0
+
+
+def _valid_audit(session_factory) -> int:
+    with session_factory() as session:
+        event = AuditEvent(
+            actor="test",
+            action="sensitive.boundary",
+            target_type="test",
+            target_id="1",
+            request_id="sensitive-boundary",
+        )
+        persist_sensitive(
+            session,
+            event,
+            {"reason": "valid", "detail_json": "{}"},
+            session_factory=session_factory,
+        )
+        session.commit()
+        return event.id
+
+
+def test_runtime_boundary_blocks_core_insert_into_sensitive_table(
+    session_factory,
+):
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                insert(AuditEvent).values(
+                    actor="raw",
+                    action="sensitive.escape",
+                    target_type="test",
+                    target_id="1",
+                    request_id="raw-sensitive-insert",
+                    reason="plain",
+                    detail_json="{}",
+                )
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+
+
+def test_runtime_boundary_blocks_cte_update_of_sensitive_column(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                text(
+                    "WITH chosen AS (SELECT :event_id AS id) "
+                    "UPDATE audit_events SET reason = :reason "
+                    "WHERE id IN (SELECT id FROM chosen)"
+                ),
+                {"event_id": event_id, "reason": "plain"},
+            )
+        session.rollback()
+
+
+def test_runtime_boundary_blocks_exec_driver_sql_sensitive_update(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+    engine = session_factory.kw["bind"]
+
+    with pytest.raises(
+        PlaintextSensitiveField,
+        match="^plaintext_sensitive_field$",
+    ):
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE audit_events SET detail_json = ? WHERE id = ?",
+                ("{}", event_id),
+            )
+
+
+def test_runtime_boundary_blocks_core_delete_from_sensitive_table(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                delete(AuditEvent).where(AuditEvent.id == event_id)
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        assert session.get(AuditEvent, event_id) is not None

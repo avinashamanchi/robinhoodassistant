@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import errno
 import os
 import subprocess
 from threading import Event, Lock, Thread, current_thread
@@ -20,22 +21,43 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..db.models import RuntimeTenure, utcnow
 
 
-RuntimeRole = Literal["app", "daemon", "mcp"]
-TenureRole = Literal["app", "daemon", "mcp", "maintenance"]
-_RUNTIME_ROLES: tuple[RuntimeRole, ...] = ("app", "daemon", "mcp")
+RuntimeRole = Literal["app", "daemon", "mcp", "validation"]
+TenureRole = Literal[
+    "app",
+    "daemon",
+    "mcp",
+    "validation",
+    "maintenance",
+]
+_RUNTIME_ROLES: tuple[RuntimeRole, ...] = (
+    "app",
+    "daemon",
+    "mcp",
+    "validation",
+)
 _RESOURCE_FOR_ROLE: dict[TenureRole, str] = {
     "app": "runtime:app",
     "daemon": "runtime:daemon",
     "mcp": "runtime:mcp",
+    "validation": "runtime:validation",
     "maintenance": "sensitive-migration:global",
 }
 _INTERNAL_TENURE_SQL = "_trading_assistant_tenure_internal"
+_FENCE_SCHEMA_REBUILD_SQL = (
+    "_trading_assistant_tenure_fence_schema_rebuild"
+)
 
 
 class ProcessProof(str, Enum):
     SAME = "same"
     NOT_SAME = "not_same"
     UNKNOWN = "unknown"
+
+
+class TenureCloseResult(str, Enum):
+    NOT_ATTEMPTED = "not_attempted"
+    CONFIRMED = "confirmed"
+    UNCERTAIN = "uncertain"
 
 
 @dataclass(frozen=True)
@@ -91,11 +113,35 @@ class TenureUncertain(RuntimeError):
 class LocalProcessInspector:
     """Compare PID/start identity without signalling another process."""
 
-    @staticmethod
-    def _read_start(pid: int) -> tuple[ProcessProof, str | None]:
+    def __init__(
+        self,
+        *,
+        runner: Callable[..., object] = subprocess.run,
+        process_probe: Callable[[int], None] | None = None,
+    ) -> None:
+        self._runner = runner
+        self._process_probe = process_probe or (
+            lambda pid: os.kill(pid, 0)
+        )
+
+    def _read_start(self, pid: int) -> tuple[ProcessProof, str | None]:
         try:
-            result = subprocess.run(
-                ["ps", "-ww", "-p", str(pid), "-o", "lstart="],
+            self._process_probe(pid)
+        except ProcessLookupError as exc:
+            if exc.errno == errno.ESRCH:
+                return ProcessProof.NOT_SAME, None
+            return ProcessProof.UNKNOWN, None
+        except PermissionError:
+            return ProcessProof.UNKNOWN, None
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return ProcessProof.NOT_SAME, None
+            return ProcessProof.UNKNOWN, None
+        except Exception:
+            return ProcessProof.UNKNOWN, None
+        try:
+            result = self._runner(
+                ["/bin/ps", "-ww", "-p", str(pid), "-o", "lstart="],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -103,9 +149,14 @@ class LocalProcessInspector:
             )
         except (OSError, subprocess.SubprocessError):
             return ProcessProof.UNKNOWN, None
-        if result.returncode == 1 and not result.stdout.strip():
-            return ProcessProof.NOT_SAME, None
-        if result.returncode != 0:
+        except Exception:
+            return ProcessProof.UNKNOWN, None
+        if (
+            getattr(result, "returncode", None) != 0
+            or not isinstance(getattr(result, "stdout", None), str)
+            or not isinstance(getattr(result, "stderr", None), str)
+            or result.stderr.strip()
+        ):
             return ProcessProof.UNKNOWN, None
         value = " ".join(result.stdout.split())
         if not value:
@@ -158,14 +209,45 @@ class RuntimeTenureHandle:
     def release(self) -> bool:
         if self._released:
             return False
-        released = self._service._release(
+        try:
+            released = self._service._release(
+                self.resource_key,
+                owner_id=self.owner_id,
+                generation=self.generation,
+            )
+        except TenureUncertain:
+            if not self._service._release_confirmed(
+                self.resource_key,
+                owner_id=self.owner_id,
+                generation=self.generation,
+                identity=self.identity,
+            ):
+                raise
+            released = True
+        if not released:
+            released = self._service._release_confirmed(
+                self.resource_key,
+                owner_id=self.owner_id,
+                generation=self.generation,
+                identity=self.identity,
+            )
+        if released:
+            self._released = True
+        return released
+
+    @property
+    def internal_capability(self) -> object:
+        return self._service._internal_capability
+
+    def assert_owned_in_transaction(self, connection) -> None:
+        if self._released:
+            raise TenureLost()
+        self._service._assert_owned(
+            connection,
             self.resource_key,
             owner_id=self.owner_id,
             generation=self.generation,
         )
-        if released:
-            self._released = True
-        return released
 
 
 class RuntimeTenureGuard:
@@ -194,6 +276,8 @@ class RuntimeTenureGuard:
         self._lock = Lock()
         self._thread: Thread | None = None
         self._closed = False
+        self._close_result = TenureCloseResult.NOT_ATTEMPTED
+        self._close_callbacks: list[Callable[[], None]] = []
 
     @property
     def lost(self) -> bool:
@@ -203,6 +287,11 @@ class RuntimeTenureGuard:
     def closed(self) -> bool:
         with self._lock:
             return self._closed
+
+    @property
+    def close_result(self) -> TenureCloseResult:
+        with self._lock:
+            return self._close_result
 
     def _mark_lost(self) -> None:
         callback: Callable[[], None] | None = None
@@ -230,6 +319,14 @@ class RuntimeTenureGuard:
             except Exception:
                 pass
 
+    def add_close_callback(self, callback: Callable[[], None]) -> None:
+        if not callable(callback):
+            raise TypeError("tenure_close_callback_invalid")
+        with self._lock:
+            if self._closed:
+                raise TenureLost()
+            self._close_callbacks.append(callback)
+
     def ensure_owned(self) -> None:
         if self._lost.is_set() or self._closed:
             raise TenureLost()
@@ -244,16 +341,49 @@ class RuntimeTenureGuard:
             return False
         return True
 
+    def assert_owned_in_transaction(self, connection) -> None:
+        """Prove the exact fenced owner inside an existing writer txn."""
+        self.ensure_owned()
+        assertion = getattr(
+            self.handle,
+            "assert_owned_in_transaction",
+            None,
+        )
+        if not callable(assertion):
+            return
+        try:
+            assertion(connection)
+        except Exception:
+            self._mark_lost()
+            raise TenureLost() from None
+        self.ensure_owned()
+
     def start(self) -> None:
+        start_failure: BaseException | None = None
         with self._lock:
             if self._closed or self._thread is not None:
                 raise TenureLost()
-            self._thread = Thread(
+            thread = Thread(
                 target=self._run,
                 name=f"{self.handle.role}-tenure-renewal",
                 daemon=True,
             )
-            self._thread.start()
+            self._thread = thread
+            try:
+                thread.start()
+            except BaseException as exc:
+                if not thread.is_alive():
+                    self._thread = None
+                start_failure = exc
+        if start_failure is None:
+            return
+        try:
+            released = self.close()
+        except BaseException:
+            raise TenureUncertain() from None
+        if not released:
+            raise TenureUncertain()
+        raise start_failure
 
     def _run(self) -> None:
         while not self._stop.wait(self.renewal_interval_seconds):
@@ -267,17 +397,33 @@ class RuntimeTenureGuard:
             self._closed = True
             self._stop.set()
             thread = self._thread
+            callbacks = tuple(self._close_callbacks)
+            self._close_callbacks.clear()
         if thread is not None and thread is not current_thread():
             thread.join(timeout=min(self.renewal_interval_seconds, 1.0))
+        released = False
         if self._lost.is_set():
-            return False
+            released = False
+        else:
+            try:
+                released = self.handle.release()
+            except Exception:
+                self._mark_lost()
+                released = False
+            if not released:
+                self._mark_lost()
         try:
-            released = self.handle.release()
+            for callback in callbacks:
+                callback()
         except Exception:
             self._mark_lost()
-            return False
-        if not released:
-            self._mark_lost()
+            released = False
+        with self._lock:
+            self._close_result = (
+                TenureCloseResult.CONFIRMED
+                if released
+                else TenureCloseResult.UNCERTAIN
+            )
         return released
 
 
@@ -285,79 +431,245 @@ class TenureGuardedBroker:
     """Delegate broker reads, checking tenure at the final mutation seam."""
 
     def __init__(self, broker, guard: RuntimeTenureGuard) -> None:
-        self._broker = broker
-        self._guard = guard
+        self.__broker = broker
+        self.__guard = guard
 
     @property
     def reconciliation_key(self):
-        return self._broker.reconciliation_key
+        return self.__broker.reconciliation_key
 
     def get_quote(self, ticker):
-        return self._broker.get_quote(ticker)
+        return self.__broker.get_quote(ticker)
 
     def get_account(self):
-        return self._broker.get_account()
+        return self.__broker.get_account()
 
     def get_positions(self):
-        return self._broker.get_positions()
+        return self.__broker.get_positions()
 
     def get_order_by_client_id(self, client_order_id):
-        return self._broker.get_order_by_client_id(client_order_id)
+        return self.__broker.get_order_by_client_id(client_order_id)
 
     def get_open_orders(self):
-        return self._broker.get_open_orders()
+        return self.__broker.get_open_orders()
 
     def get_order_status(self, order_id):
-        return self._broker.get_order_status(order_id)
+        return self.__broker.get_order_status(order_id)
+
+    def get_fill_activities(self, *, after=None):
+        reader = getattr(self.__broker, "get_fill_activities", None)
+        if not callable(reader):
+            raise AttributeError("get_fill_activities")
+        return reader(after=after)
 
     def submit_order(self, order):
-        self._guard.ensure_owned()
-        return self._broker.submit_order(order)
+        self.__guard.ensure_owned()
+        return self.__broker.submit_order(order)
 
     def submit_bracket(self, order, take_profit, stop_loss):
-        self._guard.ensure_owned()
-        return self._broker.submit_bracket(
+        self.__guard.ensure_owned()
+        return self.__broker.submit_bracket(
             order,
             take_profit,
             stop_loss,
         )
 
     def cancel_order(self, order_id):
-        self._guard.ensure_owned()
-        return self._broker.cancel_order(order_id)
+        self.__guard.ensure_owned()
+        return self.__broker.cancel_order(order_id)
 
-    def __getattr__(self, name: str):
-        return getattr(self._broker, name)
+
+class RuntimeMutationBarrier:
+    """Removable SQL and transaction-commit fence for one tenure."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        guard: RuntimeTenureGuard,
+    ) -> None:
+        self.engine = engine
+        self.guard = guard
+        try:
+            self._capability = guard.handle.internal_capability
+        except Exception:
+            self._capability = None
+        self._fence_schema_capability = object()
+        self._closed = False
+        self._installed_listeners: list[
+            tuple[object, str, Callable[..., object]]
+        ] = []
+        registrations = (
+            (
+                engine,
+                "before_cursor_execute",
+                self._before_cursor_execute,
+            ),
+            (engine, "commit", self._before_commit),
+            (
+                engine,
+                "release_savepoint",
+                self._before_release_savepoint,
+            ),
+        )
+        try:
+            for target, identifier, callback in registrations:
+                event.listen(target, identifier, callback)
+                self._installed_listeners.append(
+                    (target, identifier, callback)
+                )
+        except BaseException:
+            for target, identifier, callback in reversed(
+                self._installed_listeners
+            ):
+                try:
+                    event.remove(target, identifier, callback)
+                except Exception:
+                    pass
+            self._installed_listeners.clear()
+            self._closed = True
+            raise
+
+    def _internal(self, connection, context=None) -> bool:
+        if self._capability is None:
+            return False
+        option = connection.get_execution_options().get(
+            _INTERNAL_TENURE_SQL
+        )
+        if option is self._capability:
+            return True
+        if context is not None:
+            return (
+                context.execution_options.get(_INTERNAL_TENURE_SQL)
+                is self._capability
+            )
+        return False
+
+    def _fence_schema_rebuild(
+        self,
+        connection,
+        context=None,
+    ) -> bool:
+        option = connection.get_execution_options().get(
+            _FENCE_SCHEMA_REBUILD_SQL
+        )
+        if option is self._fence_schema_capability:
+            return True
+        if context is not None:
+            return (
+                context.execution_options.get(
+                    _FENCE_SCHEMA_REBUILD_SQL
+                )
+                is self._fence_schema_capability
+            )
+        return False
+
+    @property
+    def fence_schema_execution_option(self) -> tuple[str, object]:
+        """Opaque, narrowly scoped capability for rebuilding the fence table."""
+        return (
+            _FENCE_SCHEMA_REBUILD_SQL,
+            self._fence_schema_capability,
+        )
+
+    @staticmethod
+    def _read_only(statement: object) -> bool:
+        if not isinstance(statement, str):
+            return False
+        normalized = statement.lstrip().upper()
+        return normalized.startswith(("SELECT", "EXPLAIN", "VALUES"))
+
+    @staticmethod
+    def _rollback_driver(connection) -> None:
+        try:
+            proxied = connection.connection
+            driver = getattr(proxied, "driver_connection", proxied)
+            driver.rollback()
+        except Exception:
+            pass
+
+    def _fence_commit(self, connection) -> None:
+        if self._internal(connection):
+            return
+        try:
+            self.guard.assert_owned_in_transaction(connection)
+        except TenureLost:
+            self._rollback_driver(connection)
+            raise
+
+    def _before_cursor_execute(
+        self,
+        connection,
+        _cursor,
+        statement,
+        _parameters,
+        context,
+        _executemany,
+    ) -> None:
+        if self._internal(connection, context):
+            return
+        if self._fence_schema_rebuild(connection, context):
+            # The runtime_tenures table is temporarily unavailable while
+            # SQLite recreates its CHECK constraint. The migration performs
+            # exact owner/generation proofs immediately before and after this
+            # narrow block; every statement still checks the latched guard.
+            self.guard.ensure_owned()
+            return
+        if self._read_only(statement):
+            return
+        normalized = (
+            statement.lstrip().upper()
+            if isinstance(statement, str)
+            else ""
+        )
+        if normalized.startswith("BEGIN"):
+            # Proving ownership with SELECT would itself autobegin and make
+            # an explicit BEGIN IMMEDIATE invalid. Every subsequent mutation
+            # and the final commit perform the exact in-transaction proof.
+            self.guard.ensure_owned()
+            return
+        self.guard.assert_owned_in_transaction(connection)
+
+    def _before_commit(self, connection) -> None:
+        self._fence_commit(connection)
+
+    def _before_release_savepoint(
+        self,
+        connection,
+        _name,
+        _context,
+    ) -> None:
+        self._fence_commit(connection)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        failure: Exception | None = None
+        for target, identifier, callback in reversed(
+            self._installed_listeners
+        ):
+            try:
+                event.remove(target, identifier, callback)
+            except Exception as exc:
+                failure = failure or exc
+        self._installed_listeners.clear()
+        if failure is not None:
+            raise failure
 
 
 def install_runtime_mutation_barrier(
     engine: Engine,
     guard: RuntimeTenureGuard,
-) -> None:
-    """Block authoritative SQL mutations after runtime ownership is lost."""
+) -> RuntimeMutationBarrier:
+    """Fence SQL execution and final commit to exact live ownership."""
 
-    def before_cursor_execute(
-        _connection,
-        _cursor,
-        statement,
-        _parameters,
-        _context,
-        _executemany,
-    ) -> None:
-        normalized = statement.lstrip().upper()
-        mutating = normalized.startswith(
-            ("INSERT", "UPDATE", "DELETE", "REPLACE", "WITH")
-        )
-        if not mutating:
-            return
-        # Only the service's exact fenced renew/release statements receive
-        # this private execution option. SQL text mentioning the table is not
-        # an exemption.
-        if _context.execution_options.get(_INTERNAL_TENURE_SQL) is True:
-            return
-        guard.ensure_owned()
-
-    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    barrier = RuntimeMutationBarrier(engine, guard)
+    try:
+        guard.add_close_callback(barrier.close)
+    except BaseException:
+        barrier.close()
+        raise
+    return barrier
 
 
 class RuntimeTenureService:
@@ -375,6 +687,7 @@ class RuntimeTenureService:
         self._process_inspector = process_inspector
         self._clock = clock
         self._owner_factory = owner_factory
+        self._internal_capability = object()
 
     @staticmethod
     def _aware(value: datetime) -> datetime:
@@ -422,7 +735,7 @@ class RuntimeTenureService:
         live_code: str,
         unknown_code: str,
     ) -> None:
-        if row.state == "released":
+        if row.state in {"released", "fenced"}:
             return
         if row.state != "held" or row.expires_at is None:
             raise TenureUnavailable(unknown_code)
@@ -440,7 +753,10 @@ class RuntimeTenureService:
 
     @staticmethod
     def _fence_reclaimed(row: RuntimeTenure, now: datetime) -> None:
-        row.state = "released"
+        # Preserve the distinction between an owner-confirmed graceful release
+        # and an authority-revoking reclaim by a successor.  A predecessor may
+        # resolve a lost release response only from the former.
+        row.state = "fenced"
         row.generation += 1
         row.renewed_at = now
         row.expires_at = now
@@ -517,7 +833,14 @@ class RuntimeTenureService:
                             unknown_code="maintenance_process_unknown",
                         )
                         if maintenance.state == "held":
-                            self._fence_reclaimed(maintenance, now)
+                            # A crashed/uncertain maintenance owner may have
+                            # committed either side of a terminal transition.
+                            # Only a new maintenance owner may reclaim and
+                            # reconcile that state; runtime startup must not
+                            # turn lease expiry into proof of completion.
+                            raise TenureUnavailable(
+                                "maintenance_recovery_required"
+                            )
 
                 current = rows.get(resource_key)
                 if current is not None:
@@ -601,7 +924,12 @@ class RuntimeTenureService:
         expires_at = now + timedelta(seconds=ttl_seconds)
         try:
             with self._session_factory() as session:
-                session.execute(text("BEGIN IMMEDIATE"))
+                connection = session.connection(
+                    execution_options={
+                        _INTERNAL_TENURE_SQL: self._internal_capability
+                    }
+                )
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
                 result = session.execute(
                     update(RuntimeTenure)
                     .where(
@@ -614,9 +942,6 @@ class RuntimeTenureService:
                     .values(
                         renewed_at=now,
                         expires_at=expires_at,
-                    )
-                    .execution_options(
-                        **{_INTERNAL_TENURE_SQL: True}
                     )
                 )
                 if result.rowcount != 1:
@@ -639,7 +964,12 @@ class RuntimeTenureService:
         now = self._now()
         try:
             with self._session_factory() as session:
-                session.execute(text("BEGIN IMMEDIATE"))
+                connection = session.connection(
+                    execution_options={
+                        _INTERNAL_TENURE_SQL: self._internal_capability
+                    }
+                )
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
                 result = session.execute(
                     update(RuntimeTenure)
                     .where(
@@ -656,11 +986,59 @@ class RuntimeTenureService:
                         expires_at=now,
                         released_at=now,
                     )
-                    .execution_options(
-                        **{_INTERNAL_TENURE_SQL: True}
-                    )
                 )
                 session.commit()
                 return result.rowcount == 1
         except (SQLAlchemyError, OSError, ValueError, TypeError):
             raise TenureUncertain() from None
+
+    def _release_confirmed(
+        self,
+        resource_key: str,
+        *,
+        owner_id: str,
+        generation: int,
+        identity: ProcessIdentity,
+    ) -> bool:
+        """Resolve an ambiguous release only from exact durable row truth."""
+        try:
+            with self._session_factory() as session:
+                row = session.get(RuntimeTenure, resource_key)
+                return bool(
+                    row is not None
+                    and row.state == "released"
+                    and row.owner_id == owner_id
+                    and row.generation == generation + 1
+                    and row.pid == identity.pid
+                    and row.process_start_identity
+                    == identity.start_identity
+                    and row.released_at is not None
+                    and row.released_at == row.expires_at
+                )
+        except (SQLAlchemyError, OSError, ValueError, TypeError):
+            return False
+
+    def _assert_owned(
+        self,
+        connection,
+        resource_key: str,
+        *,
+        owner_id: str,
+        generation: int,
+    ) -> None:
+        """Verify exact ownership using the caller's locked transaction."""
+        now = self._now()
+        try:
+            row = connection.execute(
+                select(RuntimeTenure.resource_key).where(
+                    RuntimeTenure.resource_key == resource_key,
+                    RuntimeTenure.state == "held",
+                    RuntimeTenure.owner_id == owner_id,
+                    RuntimeTenure.generation == generation,
+                    RuntimeTenure.expires_at > now,
+                )
+            ).one_or_none()
+        except (SQLAlchemyError, OSError, ValueError, TypeError):
+            raise TenureUncertain() from None
+        if row is None:
+            raise TenureLost()

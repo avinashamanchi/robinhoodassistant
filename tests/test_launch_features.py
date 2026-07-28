@@ -462,14 +462,16 @@ def test_explicit_bracket_preference_still_creates_human_gated_rules(make_servic
         }
     )
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
-    pid = planning.analyze(
+    review = planning.analyze(
         "AAPL",
         actor="operator:test",
         reason="single launch analysis",
         request_id="single-launch-analysis",
-    )["plan_id"]
+    )
+    pid = review["plan_id"]
     res = planning.approve_plan(
         pid,
+        review_token=review["review_token"],
         actor="operator:avi",
         reason="reviewed single-target plan",
         request_id="launch-feature-plan-approval",
@@ -775,14 +777,16 @@ def test_bracket_proposal_audit_failure_rolls_back_and_retry_is_safe(
 def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
-    pid = planning.analyze(
+    review = planning.analyze(
         "AAPL",
         actor="operator:test",
         reason="multi-rule launch analysis",
         request_id="multi-rule-launch-analysis",
-    )["plan_id"]
+    )
+    pid = review["plan_id"]
     planning.approve_plan(
         pid,
+        review_token=review["review_token"],
         actor="operator:test",
         reason="reviewed ladder plan",
         request_id="launch-feature-ladder-approval",
@@ -799,12 +803,13 @@ def test_ladder_plan_still_uses_rules(make_service):
 def test_concurrent_plan_approval_claims_exactly_once(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
-    plan_id = planning.analyze(
+    analysis = planning.analyze(
         "AAPL",
         actor="operator:test",
         reason="launch feature analysis",
         request_id="launch-feature-analysis",
-    )["plan_id"]
+    )
+    plan_id = analysis["plan_id"]
     with svc.session_factory() as session:
         stored = session.get(TradePlanRow, plan_id)
         expected_rule_count = len(
@@ -841,6 +846,7 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
         first_result.update(
             planning.approve_plan(
                 plan_id,
+                review_token=analysis["review_token"],
                 actor="operator:test",
                 reason="reviewed",
                 request_id="launch-feature-concurrent-first",
@@ -852,6 +858,7 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
     assert entered.wait(timeout=2)
     second = planning.approve_plan(
         plan_id,
+        review_token=analysis["review_token"],
         actor="operator:second",
         reason="reviewed",
         request_id="launch-feature-concurrent-second",

@@ -177,14 +177,28 @@ def main(argv: list[str] | None = None) -> int:
                     "runtime_tenure_guard",
                     None,
                 )
-                if (
-                    guard is not None
-                    and not getattr(guard, "closed", False)
-                    and not guard.close()
-                ):
-                    raise RuntimeError(
-                        "runtime_tenure_cleanup_uncertain"
+                if guard is not None:
+                    if (
+                        not getattr(guard, "closed", False)
+                        and not guard.close()
+                    ):
+                        raise RuntimeError(
+                            "runtime_tenure_cleanup_uncertain"
+                        )
+                    close_result = getattr(
+                        guard,
+                        "close_result",
+                        None,
                     )
+                    close_value = getattr(
+                        close_result,
+                        "value",
+                        close_result,
+                    )
+                    if close_value == "uncertain":
+                        raise RuntimeError(
+                            "runtime_tenure_cleanup_uncertain"
+                        )
         finally:
             control.close()
     return 0

@@ -385,6 +385,9 @@ function planApprovalIsActionable() {
     && Number(plan.sized && plan.sized.total_shares) > 0
     && state.symbol === plan.symbol
     && state.action === (plan.plan && plan.plan.action)
+    && typeof state.reviewToken === "string"
+    && state.reviewToken.length > 0
+    && state.reviewToken === plan.review_token
   );
 }
 
@@ -411,6 +414,7 @@ function openPlanApproval(plan, detailRequestToken, invoker) {
     requestToken,
     symbol: plan.symbol,
     action: plan.plan && plan.plan.action,
+    reviewToken: plan.review_token,
     invoker,
     submitting: false,
   });
@@ -628,6 +632,7 @@ async function submitPlanApproval(event) {
     state.requestToken !== planApprovalRequestSequence
     || !currentDetailMatches(planId, state.detailRequestToken)
     || planDetailState.plan.plan_id !== planId
+    || state.reviewToken !== planDetailState.plan.review_token
   ) {
     updatePlanApprovalButton();
     return;
@@ -640,7 +645,7 @@ async function submitPlanApproval(event) {
   try {
     const result = await api(
       `/plans/${planId}/approve`,
-      jsonPost({reason}),
+      jsonPost({reason, review_token: state.reviewToken}),
     );
     closeDialog(byId("plan-approval-dialog"));
     notify(

@@ -796,8 +796,19 @@ def _start_panic_receipt(
                     snapshot=_snapshot_from_row(row, session),
                 )
             if row is None:
-                row = PanicReceipt(account_scope="alpaca-paper")
-                session.add(row)
+                row = PanicReceipt(
+                    account_scope="alpaca-paper",
+                    request_id=request_id,
+                    lease_generation=lease_generation,
+                    state="started",
+                    started_at=now,
+                    completed_at=None,
+                    expires_at=expires_at,
+                )
+                sensitive_store(session).write_many(
+                    row,
+                    {"response_json": "{}"},
+                )
             row.request_id = request_id
             row.lease_generation = lease_generation
             row.state = "started"
@@ -956,7 +967,7 @@ def _discard_panic_receipt(
             ):
                 session.rollback()
                 return False
-            session.delete(row)
+            sensitive_store(session).delete(row)
             session.commit()
             return True
     except (SQLAlchemyError, OSError) as exc:

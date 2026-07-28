@@ -170,7 +170,7 @@ class SensitiveEncryptionStateInspector:
                 inspect_sensitive_envelopes,
             )
 
-            rows_total = inspect_sensitive_envelopes(
+            inspect_sensitive_envelopes(
                 self._engine,
                 self._cipher,
                 active_key_id=self._active_key_id,
@@ -180,8 +180,6 @@ class SensitiveEncryptionStateInspector:
             return self._blocked(exc.stable_code)
         except Exception:
             return self._blocked("sensitive_envelope_scan_invalid")
-        if rows_total != row.rows_total:
-            return self._blocked("sensitive_migration_evidence_invalid")
         return StructuralCheck("encryption", "passed", "ok")
 
 

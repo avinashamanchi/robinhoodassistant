@@ -32,7 +32,10 @@ from trading_assistant.db.models import (
     StartupReconciliationState,
     TradePlanRow,
 )
-from trading_assistant.db.session import create_db_engine
+from trading_assistant.db.session import (
+    create_db_engine,
+    make_session_factory,
+)
 from trading_assistant.ops.backup import (
     EncryptedBackupError,
     create_encrypted_database_backup,
@@ -50,12 +53,20 @@ from trading_assistant.ops.encrypt_sensitive import (
 from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
+    RuntimeTenureService,
+    TenureUncertain,
 )
+from trading_assistant.preflight import SensitiveEncryptionStateInspector
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
     SensitiveFieldRef,
 )
-from trading_assistant.security.sensitive_fields import SENSITIVE_FIELDS
+from trading_assistant.security.sensitive_fields import (
+    SENSITIVE_FIELDS,
+    bind_sensitive_cipher,
+    persist_sensitive,
+    sensitive_store,
+)
 from trading_assistant.security.secrets import RuntimeSecrets
 
 
@@ -712,6 +723,183 @@ def test_maintenance_release_uncertainty_durably_blocks_startup(
         ) == "failed"
 
 
+def test_release_response_loss_resolves_only_from_exact_database_truth(
+    tmp_path,
+    monkeypatch,
+):
+    engine, path = _legacy_engine(tmp_path)
+    _seed_all_registered_fields(engine)
+    original_release = RuntimeTenureService._release
+
+    def commit_release_then_lose_response(self, *args, **kwargs):
+        assert original_release(self, *args, **kwargs) is True
+        raise TenureUncertain()
+
+    monkeypatch.setattr(
+        RuntimeTenureService,
+        "_release",
+        commit_release_then_lose_response,
+    )
+    cipher = SensitiveDataCipher(
+        {OLD_KEY_ID: OLD_KEY},
+        active_key_id=OLD_KEY_ID,
+    )
+
+    receipt = migrate_sensitive_fields(
+        engine,
+        cipher,
+        **_migration_kwargs(
+            path,
+            tmp_path / "release-response-loss-backups",
+        ),
+    )
+
+    assert receipt.status == "complete"
+    with engine.connect() as connection:
+        tenure = connection.execute(
+            text(
+                "SELECT state,owner_id,generation,released_at,expires_at "
+                "FROM runtime_tenures "
+                "WHERE resource_key='sensitive-migration:global'"
+            )
+        ).mappings().one()
+        assert tenure["state"] == "released"
+        assert tenure["generation"] == 2
+        assert tenure["released_at"] == tenure["expires_at"]
+    assert SensitiveEncryptionStateInspector(
+        engine,
+        schema_version=1,
+        active_key_id=OLD_KEY_ID,
+        cipher=cipher,
+    ).inspect().passed
+
+
+def test_mid_batch_expiry_fences_source_transaction_and_preserves_rows(
+    tmp_path,
+):
+    engine, path = _legacy_engine(tmp_path)
+    _seed_all_registered_fields(engine)
+
+    class TenureClock:
+        value = NOW
+
+        def __call__(self):
+            return self.value
+
+    tenure_clock = TenureClock()
+    observed: list[str] = []
+
+    def expire_before_commit(stage: str) -> None:
+        observed.append(stage)
+        if stage == "before_batch_commit":
+            tenure_clock.value += timedelta(seconds=31)
+
+    kwargs = _migration_kwargs(
+        path,
+        tmp_path / "mid-batch-expiry-backups",
+        stage_hook=expire_before_commit,
+    )
+    kwargs["tenure_clock"] = tenure_clock
+
+    with pytest.raises(SensitiveMigrationError) as captured:
+        migrate_sensitive_fields(
+            engine,
+            SensitiveDataCipher(
+                {OLD_KEY_ID: OLD_KEY},
+                active_key_id=OLD_KEY_ID,
+            ),
+            **kwargs,
+        )
+
+    assert "before_batch_commit" in observed
+    assert (
+        captured.value.stable_code
+        == "sensitive_migration_tenure_lost"
+    )
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT approval_reason FROM orders "
+                "WHERE idempotency_key='legacy-order'"
+            )
+        ) == "legacy-order-reason"
+        # Authority can no longer be proven, so the predecessor may not
+        # rewrite terminal evidence. Migrating plus the held/expired tenure
+        # remains fail-closed for startup.
+        assert connection.scalar(
+            text("SELECT state FROM sensitive_migration_state")
+        ) == "migrating"
+
+
+def test_release_uncertainty_after_successor_fence_does_not_write_state(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.ops.tenure import RuntimeTenureGuard
+
+    engine, path = _legacy_engine(tmp_path)
+    _seed_all_registered_fields(engine)
+    successor_owner = "11111111-1111-4111-8111-111111111111"
+
+    def successor_wins_before_close(self):
+        self._stop.set()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE runtime_tenures "
+                    "SET owner_id=:owner_id,generation=generation+1,"
+                    "pid=99001,process_start_identity='successor-start',"
+                    "renewed_at=:renewed,expires_at=:expires "
+                    "WHERE resource_key='sensitive-migration:global'"
+                ),
+                {
+                    "owner_id": successor_owner,
+                    "renewed": NOW,
+                    "expires": NOW + timedelta(seconds=60),
+                },
+            )
+        return False
+
+    monkeypatch.setattr(
+        RuntimeTenureGuard,
+        "close",
+        successor_wins_before_close,
+    )
+
+    with pytest.raises(SensitiveMigrationError) as captured:
+        migrate_sensitive_fields(
+            engine,
+            SensitiveDataCipher(
+                {OLD_KEY_ID: OLD_KEY},
+                active_key_id=OLD_KEY_ID,
+            ),
+            **_migration_kwargs(
+                path,
+                tmp_path / "successor-release-backups",
+            ),
+        )
+
+    assert (
+        captured.value.stable_code
+        == "sensitive_migration_release_uncertain"
+    )
+    with engine.connect() as connection:
+        state = connection.execute(
+            text(
+                "SELECT state,active_key_id "
+                "FROM sensitive_migration_state"
+            )
+        ).one()
+        tenure = connection.execute(
+            text(
+                "SELECT state,owner_id FROM runtime_tenures "
+                "WHERE resource_key='sensitive-migration:global'"
+            )
+        ).one()
+    assert state == ("complete", OLD_KEY_ID)
+    assert tenure == ("held", successor_owner)
+
+
 def test_frozen_clock_allows_equal_started_and_completed_timestamps(tmp_path):
     engine, path = _legacy_engine(tmp_path)
     _seed_all_registered_fields(engine)
@@ -768,6 +956,121 @@ def test_completed_migration_rerun_is_a_verified_read_only_noop(tmp_path):
         for statement in statements
     )
     assert len(list((tmp_path / "noop-backups").glob("*.aesgcm"))) == 1
+
+
+def test_completed_migration_allows_new_encrypted_rows_at_restart_and_verify(
+    tmp_path,
+):
+    engine, path = _legacy_engine(tmp_path)
+    _seed_all_registered_fields(engine)
+    cipher = SensitiveDataCipher(
+        {OLD_KEY_ID: OLD_KEY},
+        active_key_id=OLD_KEY_ID,
+    )
+    migrate_sensitive_fields(
+        engine,
+        cipher,
+        **_migration_kwargs(path, tmp_path / "cardinality-insert-backups"),
+    )
+    factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, cipher)
+    with factory() as session:
+        order = persist_sensitive(
+            session,
+            Order(
+                idempotency_key="post-migration-order",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+            ),
+            {"approval_reason": "post-migration reviewed order"},
+            session_factory=factory,
+        )
+        persist_sensitive(
+            session,
+            Proposal(
+                order_id=order.id,
+                expires_at=NOW + timedelta(hours=2),
+            ),
+            {"reasoning": "post-migration proposal"},
+            session_factory=factory,
+        )
+        persist_sensitive(
+            session,
+            AuditEvent(
+                actor="operator",
+                action="post-migration",
+                target_type="order",
+                target_id=str(order.id),
+                request_id="post-migration-audit",
+                result_code="created",
+            ),
+            {
+                "reason": "post-migration audit",
+                "detail_json": '{"source":"normal-runtime-write"}',
+            },
+            session_factory=factory,
+        )
+        session.commit()
+
+    verified = verify_sensitive_fields(
+        engine,
+        cipher,
+        configured_active_key_id=OLD_KEY_ID,
+    )
+    startup = SensitiveEncryptionStateInspector(
+        engine,
+        schema_version=1,
+        active_key_id=OLD_KEY_ID,
+        cipher=cipher,
+    ).inspect()
+
+    assert verified.status == "verified"
+    assert verified.rows_total == 13
+    assert startup.passed
+
+
+def test_completed_migration_allows_encrypted_row_deletion_at_restart_and_verify(
+    tmp_path,
+):
+    engine, path = _legacy_engine(tmp_path)
+    _seed_all_registered_fields(engine)
+    cipher = SensitiveDataCipher(
+        {OLD_KEY_ID: OLD_KEY},
+        active_key_id=OLD_KEY_ID,
+    )
+    migrate_sensitive_fields(
+        engine,
+        cipher,
+        **_migration_kwargs(path, tmp_path / "cardinality-delete-backups"),
+    )
+    factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, cipher)
+    with factory() as session:
+        report = session.scalar(
+            select(AnalysisReportRow).where(
+                AnalysisReportRow.symbol == "AAPL"
+            )
+        )
+        assert report is not None
+        sensitive_store(session, factory).delete(report)
+        session.commit()
+
+    verified = verify_sensitive_fields(
+        engine,
+        cipher,
+        configured_active_key_id=OLD_KEY_ID,
+    )
+    startup = SensitiveEncryptionStateInspector(
+        engine,
+        schema_version=1,
+        active_key_id=OLD_KEY_ID,
+        cipher=cipher,
+    ).inspect()
+
+    assert verified.status == "verified"
+    assert verified.rows_total == 9
+    assert startup.passed
 
 
 def test_malformed_envelope_fails_durably_without_exposing_value(tmp_path):
@@ -903,13 +1206,13 @@ def test_startup_crypto_scan_returns_stable_redacted_field_codes(
         cipher,
         **_migration_kwargs(path, tmp_path / "startup-scan-backups"),
     )
-    with engine.begin() as connection:
+    # Simulate out-of-band on-disk corruption through an independent SQLite
+    # connection; the application's runtime boundary correctly rejects this.
+    with sqlite3.connect(path) as connection:
         connection.execute(
-            text(
-                "UPDATE orders SET approval_reason=:replacement "
-                "WHERE idempotency_key='legacy-order'"
-            ),
-            {"replacement": replacement},
+            "UPDATE orders SET approval_reason=? "
+            "WHERE idempotency_key='legacy-order'",
+            (replacement,),
         )
 
     with pytest.raises(SensitiveMigrationError) as exc:
@@ -946,12 +1249,10 @@ def test_startup_crypto_scan_blocks_valid_retained_key_as_mixed_state(
         "replacement",
         SensitiveFieldRef("orders", "1", "approval_reason", 1),
     )
-    with engine.begin() as connection:
+    with sqlite3.connect(path) as connection:
         connection.execute(
-            text(
-                "UPDATE orders SET approval_reason=:replacement WHERE id=1"
-            ),
-            {"replacement": replacement},
+            "UPDATE orders SET approval_reason=? WHERE id=1",
+            (replacement,),
         )
 
     with pytest.raises(SensitiveMigrationError) as exc:

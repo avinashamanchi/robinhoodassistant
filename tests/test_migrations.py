@@ -1,10 +1,10 @@
 import json
 import hashlib
-import stat
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic import command, op as alembic_op
@@ -34,7 +34,13 @@ from trading_assistant.db.session import (
 )
 from trading_assistant.orders.reconciliation import ReconciliationService
 from trading_assistant.orders.repository import OrderRepository
-from trading_assistant.ops.backup import read_encrypted_backup_header
+from trading_assistant.ops.tenure import (
+    ProcessIdentity,
+    ProcessProof,
+    RuntimeTenureService,
+    TenureLost,
+    TenureUnavailable,
+)
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
     SensitiveFieldRef,
@@ -155,6 +161,8 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         "entry_filled_qty",
         "exit_filled_qty",
         "residual_generation",
+        "authority_version",
+        "authority_digest",
     } <= plan_columns
     order_columns = {
         column["name"]
@@ -171,13 +179,271 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     )
 
 
+class _AbsentProcessInspector:
+    def inspect(self, _identity):
+        return ProcessProof.NOT_SAME
+
+
+def test_schema_upgrade_is_blocked_by_active_runtime_tenure(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate as migrate_module
+
+    engine = create_db_engine(_url(tmp_path / "runtime-blocks-upgrade.db"))
+    upgrade(engine)
+    factory = make_session_factory(engine)
+    inspector = _AbsentProcessInspector()
+    service = RuntimeTenureService(
+        factory,
+        process_inspector=inspector,
+    )
+    service.acquire_runtime(
+        "app",
+        ProcessIdentity(8001, "schema-upgrade-app"),
+        ttl_seconds=30,
+    )
+    monkeypatch.setattr(
+        migrate_module,
+        "schema_status",
+        lambda _engine: SimpleNamespace(
+            versioned=True,
+            ready=False,
+            current="20260727_0014",
+        ),
+    )
+
+    with pytest.raises(TenureUnavailable) as exc:
+        upgrade(
+            engine,
+            **_migration_backup_args(tmp_path),
+            process_identity=ProcessIdentity(
+                8002,
+                "schema-upgrade-maintenance",
+            ),
+            process_inspector=inspector,
+        )
+
+    assert exc.value.stable_code == "runtime_tenure_active"
+
+
+def test_schema_upgrade_holds_maintenance_through_backup_and_ddl(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate as migrate_module
+
+    engine = create_db_engine(_url(tmp_path / "maintenance-upgrade.db"))
+    upgrade(engine)
+    factory = make_session_factory(engine)
+    inspector = _AbsentProcessInspector()
+    observed: list[str] = []
+    backup_receipt = object()
+    monkeypatch.setattr(
+        migrate_module,
+        "schema_status",
+        lambda _engine: SimpleNamespace(
+            versioned=True,
+            ready=False,
+            current="20260727_0014",
+        ),
+    )
+
+    def backup_while_held(*_args, **_kwargs):
+        contender = RuntimeTenureService(
+            factory,
+            process_inspector=inspector,
+        )
+        with pytest.raises(TenureUnavailable) as exc:
+            contender.acquire_runtime(
+                "daemon",
+                ProcessIdentity(8011, "upgrade-backup-daemon"),
+                ttl_seconds=30,
+            )
+        observed.append(exc.value.stable_code)
+        return backup_receipt
+
+    def ddl_while_held(*_args, **_kwargs):
+        contender = RuntimeTenureService(
+            factory,
+            process_inspector=inspector,
+        )
+        with pytest.raises(TenureUnavailable) as exc:
+            contender.acquire_runtime(
+                "validation",
+                ProcessIdentity(8012, "upgrade-ddl-validation"),
+                ttl_seconds=30,
+            )
+        observed.append(exc.value.stable_code)
+
+    monkeypatch.setattr(migrate_module, "_backup", backup_while_held)
+    monkeypatch.setattr(migrate_module.command, "upgrade", ddl_while_held)
+
+    receipt = upgrade(
+        engine,
+        **_migration_backup_args(tmp_path),
+        process_identity=ProcessIdentity(
+            8010,
+            "schema-upgrade-maintenance",
+        ),
+        process_inspector=inspector,
+    )
+
+    assert receipt is backup_receipt
+    assert observed == [
+        "maintenance_tenure_active",
+        "maintenance_tenure_active",
+    ]
+    successor = RuntimeTenureService(
+        factory,
+        process_inspector=inspector,
+    ).acquire_runtime(
+        "app",
+        ProcessIdentity(8013, "post-upgrade-app"),
+        ttl_seconds=30,
+    )
+    assert successor.role == "app"
+
+
+def test_schema_upgrade_ddl_is_source_fenced_after_successor_generation(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate as migrate_module
+
+    engine = create_db_engine(_url(tmp_path / "fenced-schema-upgrade.db"))
+    upgrade(engine)
+    now = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+
+    class Clock:
+        value = now
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    inspector = _AbsentProcessInspector()
+    monkeypatch.setattr(
+        migrate_module,
+        "schema_status",
+        lambda _engine: SimpleNamespace(
+            versioned=True,
+            ready=False,
+            current="20260727_0014",
+        ),
+    )
+    monkeypatch.setattr(
+        migrate_module,
+        "_backup",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def successor_wins_before_ddl(config, _revision):
+        clock.value = now.replace(second=31)
+        successor_engine = create_db_engine(
+            engine.url.render_as_string(hide_password=False)
+        )
+        RuntimeTenureService(
+            make_session_factory(successor_engine),
+            process_inspector=inspector,
+            clock=clock,
+        ).acquire_maintenance(
+            ProcessIdentity(8021, "schema-successor-maintenance"),
+            ttl_seconds=30,
+        )
+        connection = config.attributes["connection"]
+        connection.exec_driver_sql(
+            "CREATE TABLE escaped_schema_generation "
+            "(id INTEGER PRIMARY KEY)"
+        )
+
+    monkeypatch.setattr(
+        migrate_module.command,
+        "upgrade",
+        successor_wins_before_ddl,
+    )
+
+    with pytest.raises(TenureLost):
+        upgrade(
+            engine,
+            **_migration_backup_args(tmp_path),
+            process_identity=ProcessIdentity(
+                8020,
+                "schema-predecessor-maintenance",
+            ),
+            process_inspector=inspector,
+            tenure_clock=clock,
+        )
+
+    assert "escaped_schema_generation" not in inspect(
+        engine
+    ).get_table_names()
+
+
+def test_schema_upgrade_barrier_setup_failure_releases_maintenance(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate as migrate_module
+
+    engine = create_db_engine(_url(tmp_path / "schema-barrier-failure.db"))
+    upgrade(engine)
+    captured = []
+    monkeypatch.setattr(
+        migrate_module,
+        "schema_status",
+        lambda _engine: SimpleNamespace(
+            versioned=True,
+            ready=False,
+            current="20260727_0014",
+        ),
+    )
+
+    def fail_barrier(_engine, guard):
+        captured.append(guard)
+        raise RuntimeError("schema-barrier-install-failed")
+
+    monkeypatch.setattr(
+        migrate_module,
+        "install_runtime_mutation_barrier",
+        fail_barrier,
+    )
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="schema-barrier-install-failed",
+        ):
+            upgrade(
+                engine,
+                **_migration_backup_args(tmp_path),
+                process_identity=ProcessIdentity(
+                    8030,
+                    "schema-barrier-maintenance",
+                ),
+                process_inspector=_AbsentProcessInspector(),
+            )
+
+        assert captured[0].closed
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT state FROM runtime_tenures "
+                    "WHERE resource_key='sensitive-migration:global'"
+                )
+            ) == "released"
+    finally:
+        if captured and not captured[0].closed:
+            captured[0].close()
+
+
 def test_runtime_tenure_migration_is_successor_0014():
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
     sensitive_revision = script.get_revision("20260727_0013")
     tenure_revision = script.get_revision("20260727_0014")
 
-    assert script.get_current_head() == "20260727_0014"
+    assert script.get_current_head() == "20260727_0015"
     assert sensitive_revision is not None
     assert sensitive_revision.down_revision == "20260727_0012"
     assert sensitive_revision.path.endswith(
@@ -188,6 +454,75 @@ def test_runtime_tenure_migration_is_successor_0014():
     assert tenure_revision.path.endswith(
         "20260727_0014_runtime_tenures.py"
     )
+
+
+def test_plan_authority_migration_is_successor_0015():
+    cfg = Config("alembic.ini")
+    script = ScriptDirectory.from_config(cfg)
+    authority_revision = script.get_revision("20260727_0015")
+
+    assert script.get_current_head() == "20260727_0015"
+    assert authority_revision is not None
+    assert authority_revision.down_revision == "20260727_0014"
+    assert authority_revision.path.endswith(
+        "20260727_0015_plan_authority_and_validation_tenure.py"
+    )
+
+
+def test_plan_authority_upgrade_preserves_legacy_rows_under_maintenance(
+    tmp_path,
+):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / "plan-authority-upgrade.db",
+        "20260727_0014",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(symbol,action,status,paper_only,shadow,plan_json,sized_json,"
+                "entry_filled_qty,exit_filled_qty,residual_generation,"
+                "created_at) VALUES "
+                "('AAPL','hold','proposed',1,0,'legacy-plan','legacy-size',"
+                "0,0,0,CURRENT_TIMESTAMP)"
+            )
+        )
+
+    backup = upgrade(
+        engine,
+        **_migration_backup_args(tmp_path),
+        process_identity=ProcessIdentity(
+            8100,
+            "plan-authority-schema-upgrade",
+        ),
+        process_inspector=_AbsentProcessInspector(),
+    )
+
+    assert backup is not None and backup.verified is True
+    with engine.begin() as connection:
+        assert connection.execute(
+            text(
+                "SELECT plan_json,sized_json,authority_version,"
+                "authority_digest FROM trade_plans"
+            )
+        ).one() == ("legacy-plan", "legacy-size", 0, None)
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "UPDATE trade_plans SET "
+                    "authority_version=1,authority_digest='bad'"
+                )
+            )
+
+    validation = RuntimeTenureService(
+        make_session_factory(engine),
+        process_inspector=_AbsentProcessInspector(),
+    ).acquire_runtime(
+        "validation",
+        ProcessIdentity(8101, "validation-after-schema-upgrade"),
+        ttl_seconds=30,
+    )
+    assert validation.role == "validation"
 
 
 def test_runtime_tenure_schema_rejects_invalid_resource_role(tmp_path):
@@ -247,6 +582,61 @@ def test_runtime_tenure_schema_rejects_invalid_resource_role(tmp_path):
                 "WHERE resource_key='runtime:mcp' AND role='mcp'"
             )
         ) == 1
+        connection.execute(
+            text(
+                "INSERT INTO runtime_tenures "
+                "(resource_key,role,state,owner_id,generation,pid,"
+                "process_start_identity,acquired_at,renewed_at,"
+                "expires_at,released_at) VALUES "
+                "('runtime:validation','validation','held',"
+                "'00000000-0000-4000-8000-000000000003',1,44,"
+                "'validation-stable-start','2026-07-27 12:00:00',"
+                "'2026-07-27 12:00:00','2026-07-27 12:01:00',NULL)"
+            )
+        )
+
+
+def test_runtime_tenure_schema_preserves_fenced_reclaim_distinction(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "runtime-tenures-fenced-state.db",
+        "head",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO runtime_tenures "
+                "(resource_key,role,state,owner_id,generation,pid,"
+                "process_start_identity,acquired_at,renewed_at,"
+                "expires_at,released_at) VALUES "
+                "('runtime:app','app','fenced',"
+                "'00000000-0000-4000-8000-000000000004',2,45,"
+                "'fenced-app-start','2026-07-27 12:00:00',"
+                "'2026-07-27 12:01:00','2026-07-27 12:01:00',"
+                "'2026-07-27 12:01:00')"
+            )
+        )
+
+    engine.dispose()
+    command.downgrade(cfg, "20260727_0014")
+    downgraded = create_db_engine(
+        _url(tmp_path / "runtime-tenures-fenced-state.db")
+    )
+    with downgraded.begin() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT state FROM runtime_tenures "
+                "WHERE resource_key='runtime:app'"
+            )
+        ) == "released"
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "UPDATE runtime_tenures SET state='fenced' "
+                    "WHERE resource_key='runtime:app'"
+                )
+            )
 
 
 def test_sensitive_trust_schema_constraints_indexes_and_no_raw_text(tmp_path):
@@ -716,7 +1106,7 @@ def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0014"
+        ) == "20260727_0015"
         assert connection.scalar(
             text("SELECT count(*) FROM candidate_nonces")
         ) == 1
@@ -1534,7 +1924,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260727_0014"
+    assert version == "20260727_0015"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -1570,7 +1960,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0014"
+        ) == "20260727_0015"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -1611,7 +2001,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260727_0014"
+    assert version == "20260727_0015"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")
@@ -1657,60 +2047,84 @@ def test_startup_reconciliation_downgrade_refuses_to_drop_durable_state(
         ) == "20260724_0008"
 
 
-def test_existing_unversioned_database_must_be_adopted(tmp_path):
+def test_unversioned_database_refuses_unsafe_in_place_bootstrap(tmp_path):
     path = tmp_path / "legacy.db"
     engine = _legacy_engine(path)
-    with pytest.raises(SchemaOutOfDate, match="adopt-existing"):
+    with pytest.raises(
+        SchemaOutOfDate,
+        match="manual isolated schema bootstrap",
+    ):
         require_current_schema(engine)
-    backup_args = _migration_backup_args(tmp_path)
-    backup = adopt_existing(engine, **backup_args)
-    assert backup.path.exists()
-    upgrade(engine, **backup_args)
-    require_current_schema(engine)
-
-
-def test_adoption_backup_contains_committed_wal_rows(tmp_path):
-    path = tmp_path / "legacy.db"
-    engine = _legacy_engine(path)
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO orders "
-                          "(idempotency_key,ticker,side,order_type,status,created_at,updated_at) "
-                          "VALUES ('keep-me','AAPL','buy','market','proposed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
-    backup = adopt_existing(
-        engine,
-        **_migration_backup_args(tmp_path),
-    )
-    artifact = backup.path.read_bytes()
-    assert backup.verified is True
-    assert read_encrypted_backup_header(backup.path)["source_sha256"] == (
-        backup.source_sha256
-    )
-    assert b"SQLite format 3" not in artifact
-    assert b"keep-me" not in artifact
-
-
-def test_adoption_requires_dedicated_encrypted_backup_key(tmp_path):
-    path = tmp_path / "legacy.db"
-    engine = _legacy_engine(path)
+    destination = tmp_path / "must-not-be-created"
 
     with pytest.raises(
         RuntimeError,
-        match="^encrypted_migration_backup_required$",
+        match="^schema_maintenance_bootstrap_required$",
+    ):
+        adopt_existing(
+            engine,
+            backup_key=MIGRATION_BACKUP_KEY,
+            backup_key_id=MIGRATION_BACKUP_KEY_ID,
+            backup_directory=destination,
+        )
+
+    assert "alembic_version" not in inspect(engine).get_table_names()
+    assert not destination.exists()
+
+
+def test_unversioned_bootstrap_refusal_preserves_committed_rows(tmp_path):
+    path = tmp_path / "legacy.db"
+    engine = _legacy_engine(path)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO orders "
+                "(idempotency_key,ticker,side,order_type,status,"
+                "created_at,updated_at) VALUES "
+                "('keep-me','AAPL','buy','market','proposed',"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_maintenance_bootstrap_required$",
     ):
         adopt_existing(engine)
 
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM orders "
+                "WHERE idempotency_key='keep-me'"
+            )
+        ) == 1
+    assert "alembic_version" not in inspect(engine).get_table_names()
 
-def test_adoption_backup_is_private_and_leaves_no_plaintext_temp(tmp_path):
+
+def test_versioned_pre_tenure_schema_refuses_upgrade_without_mutation(tmp_path):
     path = tmp_path / "legacy.db"
-    engine = _legacy_engine(path)
-    backup = adopt_existing(
-        engine,
-        **_migration_backup_args(tmp_path),
-    )
-    directory = backup.path.parent
-    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE(backup.path.stat().st_mode) == 0o600
-    assert list(directory.iterdir()) == [backup.path]
+    engine, _cfg = _engine_at_revision(path, "20260727_0013")
+    destination = tmp_path / "must-not-be-created"
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_maintenance_bootstrap_required$",
+    ):
+        upgrade(
+            engine,
+            backup_key=MIGRATION_BACKUP_KEY,
+            backup_key_id=MIGRATION_BACKUP_KEY_ID,
+            backup_directory=destination,
+            process_identity=ProcessIdentity(8200, "pre-tenure-schema"),
+            process_inspector=_AbsentProcessInspector(),
+        )
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0013"
+    assert not destination.exists()
 
 
 def test_unknown_revision_is_rejected_at_startup(tmp_path):
@@ -1734,10 +2148,10 @@ def test_order_outbox_upgrade_preserves_and_maps_legacy_order(tmp_path):
             "VALUES ('legacy-approved','AAPL','buy','market','approved',"
             "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
         ))
-    backup_args = _migration_backup_args(tmp_path)
-    adopt_existing(engine, **backup_args)
-    upgrade_backup = upgrade(engine, **backup_args)
-    assert upgrade_backup is not None
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+    command.stamp(cfg, "20260724_0001")
+    command.upgrade(cfg, "head")
     with engine.connect() as conn:
         row = conn.execute(text(
             "SELECT status, approval_actor FROM orders "

@@ -173,6 +173,98 @@ def test_release_static_gate_rejects_negative_fixtures(
     ("relative_path", "source", "expected"),
     [
         (
+            "src/trading_assistant/sensitive_cte_escape.py",
+            "from sqlalchemy import text\n"
+            "session.execute(text('WITH x AS (SELECT 1) UPDATE "
+            "audit_events SET reason=:reason'))\n",
+            "sensitive field write bypass",
+        ),
+        (
+            "src/trading_assistant/sensitive_dynamic_escape.py",
+            "table = 'audit_events'\n"
+            "session.execute(f'UPDATE {table} SET reason=:reason')\n",
+            "sensitive field write bypass",
+        ),
+        (
+            "src/trading_assistant/sensitive_driver_escape.py",
+            "connection.exec_driver_sql("
+            "'UPDATE audit_events SET detail_json=:value')\n",
+            "sensitive field write bypass",
+        ),
+        (
+            "src/trading_assistant/sensitive_delete_escape.py",
+            "from sqlalchemy import text\n"
+            "session.execute(text("
+            "'WITH chosen AS (SELECT 1) DELETE FROM audit_events'))\n",
+            "sensitive field write bypass",
+        ),
+        (
+            "src/trading_assistant/sensitive_untyped_escape.py",
+            "from sqlalchemy import select\n"
+            "from trading_assistant.db.models import AuditEvent\n"
+            "row = session.scalar(select(AuditEvent))\n"
+            "row.reason = 'plain'\n",
+            "sensitive field write bypass",
+        ),
+        (
+            "src/trading_assistant/raw_broker_escape.py",
+            "def escape(guarded):\n"
+            "    return guarded._broker\n",
+            "raw broker escape",
+        ),
+        (
+            "src/trading_assistant/raw_sdk_escape.py",
+            "def escape(broker):\n"
+            "    return broker._trading.cancel_order_by_id('id')\n",
+            "raw broker escape",
+        ),
+        (
+            "src/trading_assistant/ops/backup.py",
+            "import sqlite3\n"
+            "def backup_database(source, destination):\n"
+            "    target = destination / 'trading-assistant-copy.sqlite3'\n"
+            "    with sqlite3.connect(target) as backup:\n"
+            "        return target\n",
+            "plaintext operational backup entrypoint",
+        ),
+        (
+            "README.md",
+            "Retain trading-assistant-*.sqlite3 as the nightly backup.\n",
+            "plaintext operational backup entrypoint",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_task6_review_bypasses(
+    tmp_path,
+    relative_path,
+    source,
+    expected,
+):
+    root = _static_fixture(tmp_path)
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "expected"),
+    [
+        (
             "src/trading_assistant/app/main.py",
             "app.mount('/plugin', plugin)\n",
             "non-allowlisted route mount: "

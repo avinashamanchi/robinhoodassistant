@@ -34,6 +34,7 @@ from trading_assistant.risk.submission_barrier import (
 from trading_assistant.rules.models import RuleCommand, RuleState
 from trading_assistant.rules.repository import RuleRepository
 from trading_assistant.rules.worker import RuleWorker
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 AUTH_SECRET = "task-10-release-gate-auth-secret"
 NOW = datetime(2026, 7, 26, 18, 0, tzinfo=timezone.utc)
@@ -301,10 +302,10 @@ def test_submission_fails_closed_if_lost_claim_order_disappears(
                 select(Proposal).where(Proposal.order_id == order_id)
             )
             if proposal is not None:
-                session.delete(proposal)
+                sensitive_store(session).delete(proposal)
             order = session.get(Order, order_id)
             assert order is not None
-            session.delete(order)
+            sensitive_store(session).delete(order)
             session.commit()
         return False
 

@@ -37,8 +37,16 @@ def require_current_schema(engine: Engine) -> None:
     status = schema_status(engine)
     if status.ready:
         return
-    action = "adopt-existing" if not status.versioned else "upgrade"
+    if not status.versioned:
+        guidance = (
+            "manual isolated schema bootstrap is required; "
+            "in-place adoption is disabled"
+        )
+    else:
+        guidance = (
+            "run `python -m trading_assistant.db.migrate upgrade`"
+        )
     raise SchemaOutOfDate(
         f"database schema is not current: current={status.current!r}, "
-        f"head={status.head!r}; run `python -m trading_assistant.db.migrate {action}`"
+        f"head={status.head!r}; {guidance}"
     )

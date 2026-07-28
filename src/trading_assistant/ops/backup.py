@@ -1,4 +1,4 @@
-"""Consistent online SQLite backups with bounded retention."""
+"""Verified encrypted online SQLite backups with bounded retention."""
 
 from __future__ import annotations
 
@@ -16,16 +16,28 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from pydantic import SecretStr
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 
 from ..config import load_config
-from ..security.secrets import load_role_secrets, secret_value
+from ..db.schema import require_current_schema, schema_status
+from ..db.session import create_db_engine, make_session_factory
+from ..security.secrets import (
+    load_role_secrets,
+    secret_value,
+    validate_base64_key,
+)
+from .tenure import (
+    LocalProcessInspector,
+    ProcessIdentity,
+    ProcessInspector,
+    RuntimeTenureGuard,
+    RuntimeTenureService,
+)
 
-_BACKUP_PREFIX = "trading-assistant-"
-_BACKUP_SUFFIX = ".sqlite3"
 _ENCRYPTED_MAGIC = b"TA-SENSITIVE-BACKUP\x00"
 _ENCRYPTED_VERSION = 1
 _NONCE_BYTES = 12
@@ -194,6 +206,10 @@ def create_encrypted_database_backup(
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ensure_maintenance: Callable[[], None] | None = None,
     stage_hook: Callable[[str], None] | None = None,
+    artifact_label: Literal[
+        "before-sensitive-v1",
+        "whole-database-v1",
+    ] = "before-sensitive-v1",
 ) -> EncryptedBackupReceipt:
     """Create, publish, decrypt, hash, and quick-check one encrypted snapshot."""
 
@@ -205,6 +221,8 @@ def create_encrypted_database_backup(
         or not isinstance(schema_head, str)
         or not schema_head
         or len(schema_head) > 64
+        or artifact_label
+        not in {"before-sensitive-v1", "whole-database-v1"}
     ):
         raise EncryptedBackupError("backup_metadata_invalid")
     hook = stage_hook or (lambda _stage: None)
@@ -301,9 +319,7 @@ def create_encrypted_database_backup(
         maintain()
 
         stamp = created.strftime("%Y%m%dT%H%M%S%fZ")
-        target = directory / (
-            f"{stamp}-before-sensitive-v1.sqlite3.aesgcm"
-        )
+        target = directory / f"{stamp}-{artifact_label}.sqlite3.aesgcm"
         try:
             os.link(encrypted_temp, target, follow_symlinks=False)
         except FileExistsError:
@@ -442,46 +458,90 @@ def backup_database(
     source: str | Path,
     destination_dir: str | Path,
     retention_days: int = 14,
-) -> Path:
-    """Create a transactionally consistent backup and rotate our old backups."""
-    if retention_days <= 0:
+    *,
+    backup_key: bytes,
+    backup_key_id: str,
+    process_identity: ProcessIdentity,
+    process_inspector: ProcessInspector,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    tenure_clock: Callable[[], datetime] = lambda: datetime.now(
+        timezone.utc
+    ),
+) -> EncryptedBackupReceipt:
+    """Create one verified encrypted whole-database operational backup."""
+    if (
+        isinstance(retention_days, bool)
+        or not isinstance(retention_days, int)
+        or retention_days <= 0
+    ):
         raise ValueError("retention_days must be positive")
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(source).expanduser().resolve(strict=True)
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
-    destination = Path(destination_dir).expanduser().resolve()
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    destination.chmod(0o700)
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    target = destination / f"{_BACKUP_PREFIX}{stamp}{_BACKUP_SUFFIX}"
-    temporary = target.with_suffix(f"{target.suffix}.tmp")
+    source_url = URL.create(
+        "sqlite",
+        database=str(source_path),
+    ).render_as_string(hide_password=False)
+    engine = create_db_engine(source_url)
+    require_current_schema(engine)
+    head = schema_status(engine).head
+    service = RuntimeTenureService(
+        make_session_factory(engine),
+        process_inspector=process_inspector,
+        clock=tenure_clock,
+    )
+    handle = service.acquire_maintenance(
+        process_identity,
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    guard.start()
+    primary_failure = False
     try:
-        with (
-            sqlite3.connect(source_path) as source_connection,
-            sqlite3.connect(temporary) as backup_connection,
-        ):
-            source_connection.backup(backup_connection)
-            check = backup_connection.execute("PRAGMA integrity_check").fetchone()
-            if check != ("ok",):
-                raise RuntimeError(f"backup integrity check failed: {check}")
-            # A source in WAL mode transfers that journal setting into the copy.
-            # Backups should be standalone files, not require adjacent -wal/-shm
-            # sidecars, so normalize the completed copy before publishing it.
-            backup_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
-        os.replace(temporary, target)
-        target.chmod(0o600)
-    finally:
-        temporary.unlink(missing_ok=True)
-        temporary.with_name(f"{temporary.name}-wal").unlink(missing_ok=True)
-        temporary.with_name(f"{temporary.name}-shm").unlink(missing_ok=True)
+        def maintain() -> None:
+            if not guard.renew_once():
+                raise EncryptedBackupError("backup_tenure_lost")
 
+        receipt = create_encrypted_database_backup(
+            source_path,
+            destination_dir,
+            backup_key=backup_key,
+            backup_key_id=backup_key_id,
+            schema_head=head,
+            now=now,
+            ensure_maintenance=maintain,
+            artifact_label="whole-database-v1",
+        )
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        released = guard.close()
+        engine.dispose()
+        if not released and not primary_failure:
+            raise EncryptedBackupError(
+                "backup_tenure_release_uncertain"
+            )
+
+    destination = Path(destination_dir).expanduser().resolve(strict=True)
     cutoff = time.time() - retention_days * 86400
-    pattern = f"{_BACKUP_PREFIX}*{_BACKUP_SUFFIX}"
-    for candidate in destination.glob(pattern):
-        if candidate != target and candidate.stat().st_mtime < cutoff:
+    removed = False
+    for candidate in destination.glob(
+        "*-whole-database-v1.sqlite3.aesgcm"
+    ):
+        if (
+            candidate != receipt.path
+            and candidate.stat().st_mtime < cutoff
+        ):
             candidate.unlink()
-    return target
+            removed = True
+    if removed:
+        _fsync_directory(destination)
+    return receipt
 
 
 def database_path(database_url: str | SecretStr) -> Path:
@@ -491,23 +551,58 @@ def database_path(database_url: str | SecretStr) -> Path:
     return Path(url.database)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    config_loader=load_config,
+    secrets_loader=load_role_secrets,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector: ProcessInspector | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--destination", default="backups")
+    parser.add_argument("--destination")
     parser.add_argument("--retention-days", type=int, default=14)
     args = parser.parse_args(argv)
     from ..logging import runtime_startup
 
-    config = load_config()
-    secrets = load_role_secrets("backup", config=config)
-    with runtime_startup("backup", secrets):
-        created = backup_database(
-            database_path(secrets.database_url),
-            args.destination,
-            args.retention_days,
-        )
-        print(created)
-        return 0
+    config = config_loader()
+    secrets = secrets_loader("backup", config=config)
+    inspector = process_inspector or LocalProcessInspector()
+    identity = process_identity or inspector.current()
+    key_buffer = validate_base64_key(
+        "backup_encryption_key",
+        secrets.backup_encryption_key,
+    )
+    try:
+        with runtime_startup("backup", secrets):
+            receipt = backup_database(
+                database_path(secrets.database_url),
+                (
+                    args.destination
+                    if args.destination is not None
+                    else config.encryption.backup_directory
+                ),
+                args.retention_days,
+                backup_key=bytes(key_buffer),
+                backup_key_id=config.encryption.backup_key_id,
+                process_identity=identity,
+                process_inspector=inspector,
+            )
+            print(
+                json.dumps(
+                    {
+                        "backup_key_id": receipt.backup_key_id,
+                        "path_hash": receipt.path_hash,
+                        "status": "verified",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+    finally:
+        for index in range(len(key_buffer)):
+            key_buffer[index] = 0
 
 
 if __name__ == "__main__":

@@ -170,13 +170,15 @@ def test_policy_rows_round_trip(session_factory):
                 expires_at=now + timedelta(minutes=5),
             )
         )
-        session.add(
+        persist_sensitive(
+            session,
             PanicReceipt(
                 account_scope="alpaca-paper",
                 request_id="request-1",
                 state="started",
                 expires_at=now + timedelta(seconds=90),
-            )
+            ),
+            {"response_json": "{}"},
         )
         session.commit()
 

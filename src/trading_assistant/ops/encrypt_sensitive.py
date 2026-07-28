@@ -30,7 +30,11 @@ from ..security.secrets import (
     load_role_secrets,
     validate_base64_key,
 )
-from ..security.sensitive_fields import SENSITIVE_FIELDS
+from ..security.sensitive_fields import (
+    SENSITIVE_FIELDS,
+    _bind_sensitive_sql_boundary,
+    _sensitive_write_authority,
+)
 from .backup import create_encrypted_database_backup
 from .tenure import (
     ProcessIdentity,
@@ -38,6 +42,7 @@ from .tenure import (
     LocalProcessInspector,
     RuntimeTenureGuard,
     RuntimeTenureService,
+    TenureLost,
     TenureUnavailable,
     TenureUncertain,
 )
@@ -205,6 +210,18 @@ def _verify_envelope(
         ) from None
 
 
+def _assert_maintenance(
+    handle: RuntimeTenureGuard,
+    connection,
+) -> None:
+    try:
+        handle.assert_owned_in_transaction(connection)
+    except Exception:
+        raise SensitiveMigrationError(
+            "sensitive_migration_tenure_lost"
+        ) from None
+
+
 def _rows(
     engine: Engine,
     specs: Sequence[_TableSpec],
@@ -367,7 +384,6 @@ def verify_sensitive_fields(
     if (
         scan.pending
         or scan.rows_completed != scan.rows_total
-        or scan.rows_total != state.rows_total
     ):
         raise SensitiveMigrationError(
             "sensitive_migration_evidence_invalid"
@@ -448,9 +464,12 @@ def _set_operation_state(
     scan: _Scan,
     backup_path_hash: str,
     now: datetime,
+    handle: RuntimeTenureGuard,
 ) -> None:
     with Session(engine) as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        connection = session.connection()
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        _assert_maintenance(handle, connection)
         row = session.get(SensitiveMigrationState, 1)
         if row is None:
             raise SensitiveMigrationError(
@@ -478,6 +497,7 @@ def _set_operation_state(
         row.backup_path_hash = backup_path_hash
         row.completed_at = None
         row.updated_at = now
+        _assert_maintenance(handle, connection)
         session.commit()
 
 
@@ -487,9 +507,12 @@ def _set_progress(
     *,
     operation: Literal["migrating", "rotating"],
     now: datetime,
+    handle: RuntimeTenureGuard,
 ) -> None:
     with Session(engine) as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        connection = session.connection()
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        _assert_maintenance(handle, connection)
         row = session.get(SensitiveMigrationState, 1)
         if row is None or row.state != operation:
             raise SensitiveMigrationError(
@@ -498,6 +521,7 @@ def _set_progress(
         row.rows_total = scan.rows_total
         row.rows_completed = scan.rows_completed
         row.updated_at = now
+        _assert_maintenance(handle, connection)
         session.commit()
 
 
@@ -508,13 +532,16 @@ def _set_complete(
     operation: Literal["migrating", "rotating"],
     active_key_id: str,
     now: datetime,
+    handle: RuntimeTenureGuard,
 ) -> None:
     if scan.pending or scan.rows_completed != scan.rows_total:
         raise SensitiveMigrationError(
             "sensitive_migration_evidence_invalid"
         )
     with Session(engine) as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        connection = session.connection()
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        _assert_maintenance(handle, connection)
         row = session.get(SensitiveMigrationState, 1)
         if (
             row is None
@@ -531,6 +558,7 @@ def _set_complete(
         row.rows_completed = scan.rows_completed
         row.completed_at = now
         row.updated_at = now
+        _assert_maintenance(handle, connection)
         session.commit()
 
 
@@ -539,15 +567,26 @@ def _mark_failed(
     *,
     active_key_id: str,
     clock: Callable[[], datetime],
-) -> None:
+    handle: RuntimeTenureGuard,
+) -> bool:
     try:
         now = _timestamp(clock)
         with Session(engine) as session:
-            session.execute(text("BEGIN IMMEDIATE"))
+            connection = session.connection()
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            assertion = getattr(
+                handle.handle,
+                "assert_owned_in_transaction",
+                None,
+            )
+            if not callable(assertion):
+                session.rollback()
+                return False
+            assertion(connection)
             row = session.get(SensitiveMigrationState, 1)
             if row is None:
                 session.rollback()
-                return
+                return False
             row.state = "failed"
             row.active_key_id = active_key_id
             row.started_at = row.started_at or now
@@ -556,9 +595,11 @@ def _mark_failed(
             if row.rows_completed > row.rows_total:
                 row.rows_completed = 0
                 row.rows_total = 0
+            assertion(connection)
             session.commit()
+            return True
     except Exception:
-        pass
+        return False
 
 
 def _renew(guard: RuntimeTenureGuard) -> None:
@@ -576,6 +617,8 @@ def _rewrite_batch(
     cipher: SensitiveDataCipher,
     old_key_id: str,
     new_key_id: str | None,
+    handle: RuntimeTenureGuard,
+    stage_hook: Callable[[str], None],
 ) -> None:
     allowed = (
         frozenset({old_key_id})
@@ -586,79 +629,87 @@ def _rewrite_batch(
     with engine.connect() as connection:
         connection.exec_driver_sql("BEGIN IMMEDIATE")
         try:
-            for row_ref in batch:
-                spec = row_ref.spec
-                selected = ", ".join(
-                    _quote(column) for column in spec.columns
-                )
-                values = connection.execute(
-                    text(
-                        f"SELECT {selected} FROM {_quote(spec.table)} "
-                        f"WHERE {_quote(spec.primary_key)} = :primary"
-                    ),
-                    {"primary": row_ref.primary_value},
-                ).one_or_none()
-                if values is None:
-                    raise SensitiveMigrationError(
-                        "sensitive_migration_data_changed"
+            _assert_maintenance(handle, connection)
+            with _sensitive_write_authority(engine):
+                for row_ref in batch:
+                    spec = row_ref.spec
+                    selected = ", ".join(
+                        _quote(column) for column in spec.columns
                     )
-                changed: dict[str, str] = {}
-                for column, value in zip(
-                    spec.columns,
-                    values,
-                    strict=True,
-                ):
-                    if value is None:
-                        continue
-                    ref = SensitiveFieldRef(
-                        spec.table,
-                        row_ref.row_id,
-                        column,
-                        1,
-                    )
-                    if mode == "migrate" and (
-                        not isinstance(value, str)
-                        or not value.startswith("enc:")
-                    ):
-                        if not isinstance(value, str) or not value:
-                            raise SensitiveMigrationError(
-                                "sensitive_migration_data_invalid"
-                            )
-                        plaintext = value
-                    else:
-                        key_id = (
-                            _envelope_key(value)
-                            if isinstance(value, str)
-                            else None
-                        )
-                        plaintext = _verify_envelope(
-                            cipher,
-                            value,
-                            ref,
-                            allowed_key_ids=allowed,
-                        )
-                        if key_id == target_key_id:
-                            continue
-                    envelope = cipher.encrypt(plaintext, ref)
-                    _verify_envelope(
-                        cipher,
-                        envelope,
-                        ref,
-                        allowed_key_ids=frozenset({target_key_id}),
-                    )
-                    changed[column] = envelope
-                if changed:
-                    assignments = ", ".join(
-                        f"{_quote(column)} = :{column}"
-                        for column in changed
-                    )
-                    connection.execute(
+                    values = connection.execute(
                         text(
-                            f"UPDATE {_quote(spec.table)} SET {assignments} "
+                            f"SELECT {selected} FROM {_quote(spec.table)} "
                             f"WHERE {_quote(spec.primary_key)} = :primary"
                         ),
-                        {**changed, "primary": row_ref.primary_value},
-                    )
+                        {"primary": row_ref.primary_value},
+                    ).one_or_none()
+                    if values is None:
+                        raise SensitiveMigrationError(
+                            "sensitive_migration_data_changed"
+                        )
+                    changed: dict[str, str] = {}
+                    for column, value in zip(
+                        spec.columns,
+                        values,
+                        strict=True,
+                    ):
+                        if value is None:
+                            continue
+                        ref = SensitiveFieldRef(
+                            spec.table,
+                            row_ref.row_id,
+                            column,
+                            1,
+                        )
+                        if mode == "migrate" and (
+                            not isinstance(value, str)
+                            or not value.startswith("enc:")
+                        ):
+                            if not isinstance(value, str) or not value:
+                                raise SensitiveMigrationError(
+                                    "sensitive_migration_data_invalid"
+                                )
+                            plaintext = value
+                        else:
+                            key_id = (
+                                _envelope_key(value)
+                                if isinstance(value, str)
+                                else None
+                            )
+                            plaintext = _verify_envelope(
+                                cipher,
+                                value,
+                                ref,
+                                allowed_key_ids=allowed,
+                            )
+                            if key_id == target_key_id:
+                                continue
+                        envelope = cipher.encrypt(plaintext, ref)
+                        _verify_envelope(
+                            cipher,
+                            envelope,
+                            ref,
+                            allowed_key_ids=frozenset({target_key_id}),
+                        )
+                        changed[column] = envelope
+                    if changed:
+                        assignments = ", ".join(
+                            f"{_quote(column)} = :{column}"
+                            for column in changed
+                        )
+                        connection.execute(
+                            text(
+                                f"UPDATE {_quote(spec.table)} "
+                                f"SET {assignments} "
+                                f"WHERE {_quote(spec.primary_key)} = :primary"
+                            ),
+                            {
+                                **changed,
+                                "primary": row_ref.primary_value,
+                            },
+                        )
+            stage_hook("before_batch_commit")
+            _assert_maintenance(handle, connection)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -695,6 +746,7 @@ def _run_batches(
             scan,
             operation=operation,
             now=_timestamp(clock),
+            handle=handle,
         )
         if not scan.pending:
             return scan
@@ -710,6 +762,8 @@ def _run_batches(
             cipher=cipher,
             old_key_id=old_key_id,
             new_key_id=new_key_id,
+            handle=handle,
+            stage_hook=stage_hook,
         )
         _renew(handle)
         refreshed = _scan(
@@ -726,6 +780,7 @@ def _run_batches(
             refreshed,
             operation=operation,
             now=_timestamp(clock),
+            handle=handle,
         )
         stage_hook(f"batch_committed:{len(batch)}")
 
@@ -776,6 +831,7 @@ def _release_or_fail(
             engine,
             active_key_id=active_key_id,
             clock=clock,
+            handle=handle,
         )
         raise SensitiveMigrationError(
             "sensitive_migration_release_uncertain"
@@ -833,7 +889,10 @@ def migrate_sensitive_fields(
         process_inspector=process_inspector,
         tenure_clock=tenure_clock,
     )
+    _bind_sensitive_sql_boundary(engine)
     released = False
+    release_attempted = False
+    primary_failure = False
     try:
         specs = _registry(engine)
         backup = create_encrypted_database_backup(
@@ -861,6 +920,7 @@ def migrate_sensitive_fields(
             scan=initial,
             backup_path_hash=backup.path_hash,
             now=_timestamp(now),
+            handle=handle,
         )
         final = _run_batches(
             engine,
@@ -893,8 +953,10 @@ def migrate_sensitive_fields(
             operation="migrating",
             active_key_id=cipher.active_key_id,
             now=_timestamp(now),
+            handle=handle,
         )
         _renew(handle)
+        release_attempted = True
         _release_or_fail(
             engine,
             handle,
@@ -910,13 +972,16 @@ def migrate_sensitive_fields(
             backup_path_hash=backup.path_hash,
         )
     except (KeyboardInterrupt, SystemExit):
+        primary_failure = True
         raise
     except BaseException as exc:
+        primary_failure = True
         if isinstance(exc, Exception):
             _mark_failed(
                 engine,
                 active_key_id=cipher.active_key_id,
                 clock=now,
+                handle=handle,
             )
             if isinstance(exc, SensitiveMigrationError):
                 raise
@@ -925,13 +990,17 @@ def migrate_sensitive_fields(
             ) from None
         raise
     finally:
-        if not released:
-            _release_or_fail(
-                engine,
-                handle,
-                active_key_id=cipher.active_key_id,
-                clock=now,
-            )
+        if not released and not release_attempted:
+            try:
+                _release_or_fail(
+                    engine,
+                    handle,
+                    active_key_id=cipher.active_key_id,
+                    clock=now,
+                )
+            except SensitiveMigrationError:
+                if not primary_failure:
+                    raise
 
 
 def rotate_sensitive_fields(
@@ -983,7 +1052,10 @@ def rotate_sensitive_fields(
         process_inspector=process_inspector,
         tenure_clock=tenure_clock,
     )
+    _bind_sensitive_sql_boundary(engine)
     released = False
+    release_attempted = False
+    primary_failure = False
     try:
         specs = _registry(engine)
         backup = create_encrypted_database_backup(
@@ -1012,6 +1084,7 @@ def rotate_sensitive_fields(
             scan=initial,
             backup_path_hash=backup.path_hash,
             now=_timestamp(now),
+            handle=handle,
         )
         final = _run_batches(
             engine,
@@ -1044,8 +1117,10 @@ def rotate_sensitive_fields(
             operation="rotating",
             active_key_id=new_key_id,
             now=_timestamp(now),
+            handle=handle,
         )
         _renew(handle)
+        release_attempted = True
         _release_or_fail(
             engine,
             handle,
@@ -1063,13 +1138,16 @@ def rotate_sensitive_fields(
             old_key_status="retained",
         )
     except (KeyboardInterrupt, SystemExit):
+        primary_failure = True
         raise
     except BaseException as exc:
+        primary_failure = True
         if isinstance(exc, Exception):
             _mark_failed(
                 engine,
                 active_key_id=old_key_id,
                 clock=now,
+                handle=handle,
             )
             if isinstance(exc, SensitiveMigrationError):
                 raise
@@ -1078,14 +1156,18 @@ def rotate_sensitive_fields(
             ) from None
         raise
     finally:
-        if not released:
-            state = _state(engine)
-            _release_or_fail(
-                engine,
-                handle,
-                active_key_id=state.active_key_id,
-                clock=now,
-            )
+        if not released and not release_attempted:
+            try:
+                state = _state(engine)
+                _release_or_fail(
+                    engine,
+                    handle,
+                    active_key_id=state.active_key_id,
+                    clock=now,
+                )
+            except SensitiveMigrationError:
+                if not primary_failure:
+                    raise
 
 
 def _rotation_cipher(

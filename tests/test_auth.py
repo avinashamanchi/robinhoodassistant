@@ -378,7 +378,13 @@ def test_each_non_login_mutation_rejects_missing_csrf(
                 "expected_generation": 1,
             },
         ),
-        ("/plans/999/approve", {"reason": "reviewed"}),
+        (
+            "/plans/999/approve",
+            {
+                "reason": "reviewed",
+                "review_token": "plan:999:authority:v1:test-digest",
+            },
+        ),
         ("/panic", {"reason": "manual drill"}),
         ("/reconcile", {"reason": "reviewed positions"}),
     ],

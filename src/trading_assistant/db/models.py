@@ -463,6 +463,15 @@ class AnalysisReportRow(Base):
 
 class TradePlanRow(Base):
     __tablename__ = "trade_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "(authority_version = 0 AND authority_digest IS NULL) OR "
+            "(authority_version = 1 "
+            "AND length(authority_digest) = 64 "
+            "AND authority_digest NOT GLOB '*[^0-9a-f]*')",
+            name="ck_trade_plans_authority_evidence",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
@@ -472,6 +481,11 @@ class TradePlanRow(Base):
     shadow: Mapped[bool] = mapped_column(Boolean, default=False)  # D1 shadow-mode plan
     plan_json: Mapped[str] = mapped_column(Text)      # full TradePlan
     sized_json: Mapped[str] = mapped_column(Text)     # SizedTradePlan
+    authority_version: Mapped[int] = mapped_column(default=0)
+    authority_digest: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     entry_filled_qty: Mapped[Decimal] = mapped_column(
         Numeric(20, 6), default=Decimal(0)
     )
@@ -634,13 +648,16 @@ class RuntimeTenure(Base):
             ") OR ("
             "resource_key = 'runtime:mcp' AND role = 'mcp'"
             ") OR ("
+            "resource_key = 'runtime:validation' "
+            "AND role = 'validation'"
+            ") OR ("
             "resource_key = 'sensitive-migration:global' "
             "AND role = 'maintenance'"
             ")",
             name="ck_runtime_tenures_resource_role",
         ),
         CheckConstraint(
-            "state IN ('held','released')",
+            "state IN ('held','released','fenced')",
             name="ck_runtime_tenures_state",
         ),
         CheckConstraint(
@@ -666,7 +683,8 @@ class RuntimeTenure(Base):
         CheckConstraint(
             "(state = 'held' AND released_at IS NULL "
             "AND renewed_at < expires_at) OR "
-            "(state = 'released' AND released_at IS NOT NULL "
+            "(state IN ('released','fenced') "
+            "AND released_at IS NOT NULL "
             "AND released_at = expires_at)",
             name="ck_runtime_tenures_lifecycle",
         ),

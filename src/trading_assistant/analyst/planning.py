@@ -11,6 +11,8 @@ for that class may be approved in PAPER mode only.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -35,6 +37,72 @@ from .store import build_scorecard_from_db
 
 def _floor(x: Decimal) -> Decimal:
     return x.to_integral_value(rounding=ROUND_DOWN)
+
+
+_AUTHORITY_VERSION = 1
+
+
+def _canonical_number(value: object) -> str:
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("plan authority number invalid")
+    normalized = format(number.normalize(), "f")
+    return "0" if Decimal(normalized) == 0 else normalized
+
+
+def _authority_payload(plan: TradePlan, sized: dict[str, Any]) -> dict:
+    return {
+        "action": plan.action.value,
+        "entry_type": plan.entry_plan.type,
+        "exit": {
+            "stop": _canonical_number(plan.exit_plan.stop),
+            "targets": [
+                {
+                    "fraction": _canonical_number(
+                        target.fraction_to_sell
+                    ),
+                    "price": _canonical_number(target.price_level),
+                }
+                for target in plan.exit_plan.targets
+            ],
+            "time_stop_days": plan.exit_plan.time_stop_days,
+            "trailing_stop_pct": (
+                _canonical_number(plan.exit_plan.trailing_stop_pct)
+                if plan.exit_plan.trailing_stop_pct is not None
+                else None
+            ),
+        },
+        "sized": {
+            "direction": str(sized.get("direction", "")),
+            "total_shares": _canonical_number(sized["total_shares"]),
+            "tranches": [
+                {
+                    "fraction": _canonical_number(tranche["fraction"]),
+                    "price": _canonical_number(
+                        tranche["price_level"]
+                    ),
+                    "shares": _canonical_number(tranche["shares"]),
+                }
+                for tranche in sized["tranches"]
+            ],
+        },
+        "symbol": plan.symbol,
+        "version": _AUTHORITY_VERSION,
+    }
+
+
+def _authority_digest(plan: TradePlan, sized: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        _authority_payload(plan, sized),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _review_token(plan_id: int, version: int, digest: str) -> str:
+    return f"plan:{plan_id}:authority:v{version}:{digest}"
 
 
 class PlanningService:
@@ -90,15 +158,25 @@ class PlanningService:
         equity = snapshot.account_equity
         sized = size_trade(plan, snapshot, self._risk_cfg(symbol), equity)
 
-        plan_id = self._store(
+        plan_id, authority_digest = self._store(
             plan,
             sized,
             actor=actor,
             reason=reason,
             request_id=request_id,
         )
-        return {"plan_id": plan_id, "plan": json.loads(plan.model_dump_json()),
-                "sized": sized.to_dict()}
+        return {
+            "plan_id": plan_id,
+            "plan": json.loads(plan.model_dump_json()),
+            "sized": sized.to_dict(),
+            "authority_version": _AUTHORITY_VERSION,
+            "authority_digest": authority_digest,
+            "review_token": _review_token(
+                plan_id,
+                _AUTHORITY_VERSION,
+                authority_digest,
+            ),
+        }
 
     def _store(
         self,
@@ -108,19 +186,23 @@ class PlanningService:
         actor: str,
         reason: str,
         request_id: str,
-    ) -> int:
+    ) -> tuple[int, str]:
+        sized_payload = sized.to_dict()
+        authority_digest = _authority_digest(plan, sized_payload)
         with self.service.session_factory() as s:
             row = TradePlanRow(
                 symbol=plan.symbol,
                 action=plan.action.value,
                 status="proposed",
+                authority_version=_AUTHORITY_VERSION,
+                authority_digest=authority_digest,
             )
             store = sensitive_store(s, self.service.session_factory)
             store.write_many(
                 row,
                 {
                     "plan_json": plan.model_dump_json(),
-                    "sized_json": json.dumps(sized.to_dict()),
+                    "sized_json": json.dumps(sized_payload),
                 },
             )
             audit = AuditEvent(
@@ -142,13 +224,14 @@ class PlanningService:
                 },
             )
             s.commit()
-            return row.id
+            return row.id, authority_digest
 
     # ── approve (gate + decompose into rules) ──────────────────
     def approve_plan(
         self,
         plan_id: int,
         *,
+        review_token: str,
         actor: str,
         reason: str,
         request_id: str,
@@ -160,6 +243,8 @@ class PlanningService:
             raise ValueError(
                 "approval actor, reason, and request_id must be non-empty"
             )
+        if not isinstance(review_token, str) or not review_token:
+            return {"plan_id": plan_id, "error": "plan_review_stale"}
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
@@ -167,12 +252,44 @@ class PlanningService:
             if row.status != "proposed":
                 return {"plan_id": plan_id, "status": row.status,
                         "error": "only proposed plans can be approved"}
+            if (
+                row.authority_version != _AUTHORITY_VERSION
+                or not isinstance(row.authority_digest, str)
+                or not hmac.compare_digest(
+                    review_token,
+                    _review_token(
+                        row.id,
+                        row.authority_version,
+                        row.authority_digest,
+                    ),
+                )
+            ):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
 
             store = sensitive_store(s, self.service.session_factory)
-            plan = TradePlan.model_validate_json(
-                store.read(row, "plan_json")
-            )
-            sized = json.loads(store.read(row, "sized_json"))
+            try:
+                plan = TradePlan.model_validate_json(
+                    store.read(row, "plan_json")
+                )
+                sized = json.loads(store.read(row, "sized_json"))
+                observed_digest = _authority_digest(plan, sized)
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
+            if not hmac.compare_digest(
+                observed_digest,
+                row.authority_digest,
+            ):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
+            reviewed_digest = row.authority_digest
             if plan.action not in (PlanAction.BUY, PlanAction.SELL) or Decimal(sized["total_shares"]) <= 0:
                 return {"plan_id": plan_id, "error": "plan has no sized entry to approve"}
 
@@ -192,11 +309,62 @@ class PlanningService:
         bracket = None
         with self.service.submission_barrier.hold_writer():
             with self.service.session_factory() as s:
+                connection = s.connection()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                current = s.get(TradePlanRow, plan_id)
+                if (
+                    current is None
+                    or current.status != "proposed"
+                    or current.authority_version != _AUTHORITY_VERSION
+                    or current.authority_digest != reviewed_digest
+                ):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "status": (
+                            current.status if current else None
+                        ),
+                        "error": "plan_review_stale",
+                    }
+                current_store = sensitive_store(
+                    s,
+                    self.service.session_factory,
+                )
+                try:
+                    current_plan = TradePlan.model_validate_json(
+                        current_store.read(current, "plan_json")
+                    )
+                    current_sized = json.loads(
+                        current_store.read(current, "sized_json")
+                    )
+                    current_digest = _authority_digest(
+                        current_plan,
+                        current_sized,
+                    )
+                except (ArithmeticError, KeyError, TypeError, ValueError):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "error": "plan_review_stale",
+                    }
+                if not hmac.compare_digest(
+                    current_digest,
+                    reviewed_digest,
+                ):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "error": "plan_review_stale",
+                    }
                 claim = s.execute(
                     update(TradePlanRow)
                     .where(
                         TradePlanRow.id == plan_id,
                         TradePlanRow.status == "proposed",
+                        TradePlanRow.authority_version
+                        == _AUTHORITY_VERSION,
+                        TradePlanRow.authority_digest
+                        == reviewed_digest,
                     )
                     .values(
                         status="approved",
@@ -491,6 +659,18 @@ class PlanningService:
             rows = s.execute(select(TradePlanRow).order_by(TradePlanRow.id.desc())).scalars().all()
             return [{"plan_id": r.id, "symbol": r.symbol, "action": r.action,
                      "status": r.status, "paper_only": r.paper_only,
+                     "authority_version": r.authority_version,
+                     "authority_digest": r.authority_digest,
+                     "review_token": (
+                         _review_token(
+                             r.id,
+                             r.authority_version,
+                             r.authority_digest,
+                         )
+                         if r.authority_version == _AUTHORITY_VERSION
+                         and isinstance(r.authority_digest, str)
+                         else None
+                     ),
                      "created_at": r.created_at.isoformat()} for r in rows]
 
     def get_plan(self, plan_id: int) -> Optional[dict[str, Any]]:
@@ -501,6 +681,18 @@ class PlanningService:
             return {
                 "plan_id": row.id, "symbol": row.symbol, "status": row.status,
                 "paper_only": row.paper_only,
+                "authority_version": row.authority_version,
+                "authority_digest": row.authority_digest,
+                "review_token": (
+                    _review_token(
+                        row.id,
+                        row.authority_version,
+                        row.authority_digest,
+                    )
+                    if row.authority_version == _AUTHORITY_VERSION
+                    and isinstance(row.authority_digest, str)
+                    else None
+                ),
                 "plan": json.loads(
                     sensitive_store(s).read(row, "plan_json")
                 ),

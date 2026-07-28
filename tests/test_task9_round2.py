@@ -601,51 +601,69 @@ def test_utility_main_reuses_one_secret_and_role_log(
 def test_backup_main_reuses_one_secret_and_writes_role_log(
     tmp_path,
     monkeypatch,
+    app_config,
 ):
+    import trading_assistant.logging as runtime_logging
     from trading_assistant.ops import backup
+    from trading_assistant.ops.tenure import (
+        ProcessIdentity,
+        ProcessProof,
+    )
 
     source = tmp_path / "source.sqlite3"
-    source.write_bytes(b"placeholder")
+    engine = create_db_engine(f"sqlite:///{source}")
+    assert upgrade(engine) is None
+    engine.dispose()
     destination = tmp_path / "backups"
+    backup_key = b"task9-encrypted-backup-key-32byt"
+    assert len(backup_key) == 32
     secrets = Secrets(
         database_url=f"sqlite:///{source}",
         app_api_token="backup-role-secret",
+        backup_encryption_key=base64.b64encode(backup_key).decode(),
     )
     calls = {"secrets": 0}
 
-    config = SimpleNamespace()
+    config = app_config.model_copy(
+        update={
+            "encryption": app_config.encryption.model_copy(
+                update={"backup_key_id": "task9-backup-2026"}
+            )
+        }
+    )
 
     def one_secrets(role, *, config):
         calls["secrets"] += 1
         assert role == "backup"
         return secrets
 
+    class OfflineInspector:
+        def inspect(self, _identity):
+            return ProcessProof.NOT_SAME
+
+    log_path = tmp_path / "logs" / "backup.runtime.log"
     monkeypatch.setattr(
-        backup,
-        "load_config",
-        lambda: config,
-        raising=False,
+        runtime_logging,
+        "runtime_log_path",
+        lambda role: log_path,
     )
-    monkeypatch.setattr(
-        backup,
-        "load_role_secrets",
-        one_secrets,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        backup,
-        "backup_database",
-        lambda source_path, destination_dir, retention_days: (
-            destination / "created.sqlite3"
-        ),
-    )
-    monkeypatch.chdir(tmp_path)
 
     assert backup.main(
-        ["--destination", str(destination)]
+        ["--destination", str(destination)],
+        config_loader=lambda: config,
+        secrets_loader=one_secrets,
+        process_identity=ProcessIdentity(
+            pid=87654,
+            start_identity="task9-backup-process",
+        ),
+        process_inspector=OfflineInspector(),
     ) == 0
     assert calls["secrets"] == 1
-    assert (tmp_path / "logs" / "backup.runtime.log").exists()
+    assert log_path.exists()
+    artifacts = list(destination.glob("*.aesgcm"))
+    assert len(artifacts) == 1
+    assert list(destination.glob("*.sqlite3")) == []
+    assert b"SQLite format 3" not in artifacts[0].read_bytes()
 
 
 def test_migration_main_loads_one_role_secret_before_engine_construction(

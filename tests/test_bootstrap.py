@@ -1310,6 +1310,108 @@ def test_validation_analyst_enabled_wraps_backtest_exactly_once(
     assert raw_calls == [enabled_config.llm.provider]
 
 
+def test_validation_acquires_writer_tenure_before_provider_and_closes(
+    app_config,
+    session_factory,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    import trading_assistant.validate_analyst as validation
+
+    timeline = [
+        datetime(2022, 1, 1, tzinfo=timezone.utc),
+        datetime(2022, 12, 31, tzinfo=timezone.utc),
+    ]
+    events: list[str] = []
+
+    class Source:
+        def timeline(self, _symbols):
+            return timeline
+
+    class Guard:
+        def split(self, _timeline):
+            return [], timeline
+
+    class Tenure:
+        def ensure_owned(self):
+            events.append("ensure")
+
+        def close(self):
+            events.append("close")
+            return True
+
+    runtime = SimpleNamespace(
+        engine=session_factory.kw["bind"],
+        session_factory=session_factory,
+    )
+    monkeypatch.setattr(validation, "load_config", lambda _path: app_config)
+    monkeypatch.setattr(
+        validation,
+        "load_role_secrets",
+        lambda *_args, **_kwargs: Secrets(
+            app_api_token="validation-tenure-secret"
+        ),
+    )
+    monkeypatch.setattr(validation, "load_parquet", lambda _path: object())
+    monkeypatch.setattr(validation, "DataSource", lambda _frames: Source())
+    monkeypatch.setattr(
+        validation,
+        "HoldoutGuard",
+        lambda *_args, **_kwargs: Guard(),
+    )
+    monkeypatch.setattr(
+        validation,
+        "estimate_llm_calls",
+        lambda *_args, **_kwargs: {"estimated_calls": 0},
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "prepare_database_runtime",
+        lambda *_args, **_kwargs: (
+            events.append("database") or runtime
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "acquire_runtime_guard",
+        lambda supplied, role, **_kwargs: (
+            events.append(f"tenure:{role}") or Tenure()
+        ),
+        raising=False,
+    )
+
+    def build_budget(*_args, **_kwargs):
+        assert "tenure:validation" in events
+        events.append("provider-budget")
+        return object()
+
+    def build_analyst(*_args, **_kwargs):
+        assert "tenure:validation" in events
+        events.append("provider")
+        return object()
+
+    monkeypatch.setattr(
+        bootstrap,
+        "build_provider_budget_service",
+        build_budget,
+    )
+    monkeypatch.setattr(validation, "_build_analyst", build_analyst)
+    monkeypatch.setattr(
+        validation,
+        "analyst_accuracy",
+        lambda *_args, **_kwargs: {
+            "verdict": "validation complete"
+        },
+    )
+
+    assert validation.run(["--symbols", "AAPL", "--yes"]) == 0
+    assert events.index("tenure:validation") < events.index(
+        "provider-budget"
+    )
+    assert events.index("tenure:validation") < events.index("provider")
+    assert events[-1] == "close"
+
+
 def _capture_validation_runs(
     *,
     monkeypatch,
@@ -1340,7 +1442,10 @@ def _capture_validation_runs(
         def split(self, _timeline):
             return [], self._timeline
 
-    runtime = SimpleNamespace(session_factory=session_factory)
+    runtime = SimpleNamespace(
+        engine=session_factory.kw["bind"],
+        session_factory=session_factory,
+    )
     monkeypatch.setattr(
         validation,
         "load_config",
@@ -1374,6 +1479,14 @@ def _capture_validation_runs(
         bootstrap,
         "prepare_database_runtime",
         lambda *_args, **_kwargs: runtime,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "acquire_runtime_guard",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ensure_owned=lambda: None,
+            close=lambda: True,
+        ),
     )
     monkeypatch.setattr(
         bootstrap,
@@ -1918,6 +2031,79 @@ def test_broker_constructor_observes_runtime_tenure_and_failure_releases_it(
         )
         assert row is not None
         assert row.state == "released"
+
+
+@pytest.mark.parametrize("failure_stage", ["start", "barrier"])
+def test_runtime_guard_setup_failure_closes_acquired_tenure(
+    session_factory,
+    monkeypatch,
+    failure_stage,
+):
+    from trading_assistant import bootstrap
+
+    events: list[str] = []
+
+    class Handle:
+        role = "app"
+
+    class TenureService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def acquire_runtime(self, role, _identity, *, ttl_seconds):
+            assert role == "app"
+            assert ttl_seconds == 30
+            events.append("acquired")
+            return Handle()
+
+    class Guard:
+        def __init__(self, _handle, **_kwargs):
+            pass
+
+        def start(self):
+            events.append("started")
+            if failure_stage == "start":
+                raise RuntimeError("guard-start-failed")
+
+        def close(self):
+            events.append("closed")
+            return True
+
+    runtime = SimpleNamespace(
+        engine=session_factory.kw["bind"],
+        session_factory=session_factory,
+    )
+    monkeypatch.setattr(bootstrap, "RuntimeTenureService", TenureService)
+    monkeypatch.setattr(bootstrap, "RuntimeTenureGuard", Guard)
+    monkeypatch.setattr(
+        bootstrap,
+        "install_runtime_mutation_barrier",
+        (
+            lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("barrier-install-failed")
+            )
+            if failure_stage == "barrier"
+            else None
+        ),
+    )
+
+    expected = (
+        "guard-start-failed"
+        if failure_stage == "start"
+        else "barrier-install-failed"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        bootstrap.acquire_runtime_guard(
+            runtime,
+            "app",
+            process_identity=ProcessIdentity(
+                8300,
+                "guard-install-failure",
+            ),
+            process_inspector=SimpleNamespace(),
+        )
+
+    assert events == ["acquired", "started", "closed"]
 
 
 def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
