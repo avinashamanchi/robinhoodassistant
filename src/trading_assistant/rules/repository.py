@@ -261,7 +261,20 @@ def _require_aware_utc_lease_now(value: object) -> datetime:
         raise ValueError(
             "rule lease now must be timezone-aware UTC"
         ) from None
-    if offset != timedelta(0):
+    if type(offset) is not timedelta:
+        raise ValueError("rule lease now must be timezone-aware UTC")
+    try:
+        is_exact_zero = (
+            offset.days == 0
+            and offset.seconds == 0
+            and offset.microseconds == 0
+            and offset == timedelta(0)
+        )
+    except Exception:
+        raise ValueError(
+            "rule lease now must be timezone-aware UTC"
+        ) from None
+    if not is_exact_zero:
         raise ValueError("rule lease now must be timezone-aware UTC")
     return value.replace(tzinfo=timezone.utc)
 
