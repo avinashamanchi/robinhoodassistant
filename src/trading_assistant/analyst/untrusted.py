@@ -504,8 +504,8 @@ def _bare_encoded_span(
     compact: list[str] = []
     token_count = 0
     in_token = False
-    last_payload_end = position
     malformed = False
+    padding_seen = False
 
     while position < len(text):
         character = text[position]
@@ -513,6 +513,14 @@ def _bare_encoded_span(
             in_token = False
             position += 1
             continue
+        if padding_seen and character != "=":
+            prefix = "".join(compact)
+            code = (
+                "ambiguous_encoding"
+                if _decode_base64_candidate(prefix) is not None
+                else "malformed_encoding"
+            )
+            raise UntrustedContentError(code)
         if character not in _BASE64_ALPHABET and character != "=":
             code = (
                 "ambiguous_encoding"
@@ -526,39 +534,27 @@ def _bare_encoded_span(
             if token_count > _MAX_ENCODED_TOKENS:
                 malformed = True
         if character == "=":
-            padding_start = position
-            while position < len(text) and text[position] == "=":
-                if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
-                    compact.append("=")
-                else:
-                    malformed = True
-                position += 1
-            if position < len(text) and not text[position].isspace():
-                raise UntrustedContentError("malformed_encoding")
-            padding_count = position - padding_start
-            malformed = malformed or padding_count > 2
-            last_payload_end = position
-            break
+            padding_seen = True
         if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
             compact.append(character)
         else:
             malformed = True
         position += 1
-        last_payload_end = position
 
     candidate = "".join(compact)
-    span_length = last_payload_end - payload_start
+    span_length = len(text) - payload_start
     malformed = (
         malformed
         or not candidate
         or span_length > _MAX_ENCODED_SPAN_CHARACTERS
         or len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS
+        or candidate.count("=") > 2
         or (
             ("+" in candidate or "/" in candidate)
             and ("-" in candidate or "_" in candidate)
         )
     )
-    return last_payload_end, candidate, malformed
+    return len(text), candidate, malformed
 
 
 def _encoded_span_after_cue(
