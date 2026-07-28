@@ -100,75 +100,13 @@ _MARKDOWN_IMAGE_RE = re.compile(
     r"!\[[^\]\r\n]{0,1024}\]\((?:[^()\r\n]|\([^)\r\n]*\)){0,4096}\)"
 )
 _DATA_URL_RE = re.compile(r"(?is)\bdata:[^\s<>'\"\])]{1,8192}")
-_ACTION_CUE_JOIN_PATTERN = (
-    rf"[\W_]{{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+_ACTION_CUE_WORD_RE = re.compile(
+    r"\b(?:decode|encode|base64|encoded)\b",
+    re.IGNORECASE,
 )
-_ACTION_CUE_PUNCTUATION_PATTERN = (
-    rf"(?:[^\w\s]|_){{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
-)
-_ACTION_CUE_STRONG_TERMINAL_PATTERN = (
-    rf"(?:"
-    rf"\s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
-    rf"{_ACTION_CUE_PUNCTUATION_PATTERN}"
-    rf"\s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
-    rf"|\s{{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
-    rf")"
-)
-_ACTION_CUE_FILLER_PATTERN = (
-    rf"(?:this|the{_ACTION_CUE_JOIN_PATTERN}following)"
-)
-_ACTION_CUE_OBJECT_PATTERN = (
-    r"(?:base64|payload|instruction|content|data)"
-)
-_ACTION_CUE_OBJECTS_PATTERN = (
-    rf"{_ACTION_CUE_OBJECT_PATTERN}"
-    rf"(?:{_ACTION_CUE_JOIN_PATTERN}{_ACTION_CUE_OBJECT_PATTERN})?"
-)
-_ENCODED_ACTION_CUE_RE = re.compile(
-    rf"""
-    \b(?:
-        (?>
-            decode{_ACTION_CUE_JOIN_PATTERN}and
-                {_ACTION_CUE_JOIN_PATTERN}obey
-                (?:{_ACTION_CUE_JOIN_PATTERN}
-                    {_ACTION_CUE_FILLER_PATTERN})?
-                (?:{_ACTION_CUE_JOIN_PATTERN}
-                    {_ACTION_CUE_OBJECTS_PATTERN})?
-            |(?:decode|encode){_ACTION_CUE_JOIN_PATTERN}
-                {_ACTION_CUE_FILLER_PATTERN}
-                {_ACTION_CUE_JOIN_PATTERN}
-                {_ACTION_CUE_OBJECTS_PATTERN}
-            |(?:decode|encode){_ACTION_CUE_JOIN_PATTERN}
-                {_ACTION_CUE_OBJECTS_PATTERN}
-            |base64{_ACTION_CUE_JOIN_PATTERN}
-                (?:{_ACTION_CUE_FILLER_PATTERN}
-                    {_ACTION_CUE_JOIN_PATTERN})?
-                {_ACTION_CUE_OBJECTS_PATTERN}
-            |encoded{_ACTION_CUE_JOIN_PATTERN}
-                (?:{_ACTION_CUE_FILLER_PATTERN}
-                    {_ACTION_CUE_JOIN_PATTERN})?
-                (?:base64{_ACTION_CUE_JOIN_PATTERN})?
-                {_ACTION_CUE_OBJECTS_PATTERN}
-        )
-        (?>{_ACTION_CUE_STRONG_TERMINAL_PATTERN})
-        |
-        (?>
-            (?:decode|encode(?:d)?|base64)
-                {_ACTION_CUE_JOIN_PATTERN}
-                {_ACTION_CUE_FILLER_PATTERN}
-            |decode
-            |encode(?:d)?
-            |base64
-        )
-        (?>
-            \s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}
-            {_ACTION_CUE_PUNCTUATION_PATTERN}
-            \s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}
-        )
-    )
-    (?=\S)
-    """,
-    re.IGNORECASE | re.VERBOSE,
+_EXPLICIT_ENCODED_OBJECT_RE = re.compile(
+    r"(?:payload|instruction|content|data)\b",
+    re.IGNORECASE,
 )
 _GENERIC_BASE64_RE = re.compile(
     rf"(?<![A-Za-z0-9_+/-])"
@@ -478,15 +416,56 @@ def _decoded_instruction(candidate: str) -> bool:
 
 
 def _reject_cued_encoded_content(text: str) -> None:
-    """Reject cue-shaped content conservatively instead of parsing payloads.
+    """Reject simple action cues with content instead of parsing payloads.
 
-    False positives are intentional when untrusted prose resembles an
-    explicit encoded-action cue followed by content; standalone cue words
-    without a payload remain available to downstream analysis.
+    Any standalone ``decode``, ``encode``, or ``base64`` word is fail-closed
+    when content remains after at most eight Unicode separator characters.
+    Explicit ``encoded payload|instruction|content|data`` forms follow the
+    same rule. A cue at true EOF remains available to downstream analysis.
     """
     detection_text = " ".join(text.split())
-    if _ENCODED_ACTION_CUE_RE.search(detection_text):
-        raise UntrustedContentError("ambiguous_encoding")
+    for cue in _ACTION_CUE_WORD_RE.finditer(detection_text):
+        cue_end = cue.end()
+        if cue.group(0).casefold() == "encoded":
+            object_start = _skip_action_cue_separators(
+                detection_text,
+                cue_end,
+            )
+            if object_start == cue_end:
+                continue
+            encoded_object = _EXPLICIT_ENCODED_OBJECT_RE.match(
+                detection_text,
+                object_start,
+            )
+            if encoded_object is None:
+                continue
+            cue_end = encoded_object.end()
+
+        remainder_start = _skip_action_cue_separators(
+            detection_text,
+            cue_end,
+        )
+        if remainder_start < len(detection_text):
+            raise UntrustedContentError("ambiguous_encoding")
+
+
+def _skip_action_cue_separators(text: str, start: int) -> int:
+    end = start
+    limit = min(
+        len(text),
+        start + _MAX_ACTION_CUE_SEPARATOR_CHARACTERS,
+    )
+    while end < limit:
+        character = text[end]
+        category = unicodedata.category(character)
+        if not (
+            character.isspace()
+            or category.startswith("P")
+            or category.startswith("S")
+        ):
+            break
+        end += 1
+    return end
 
 
 def _strip_uncued_encoded_payloads(

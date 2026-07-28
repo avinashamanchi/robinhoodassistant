@@ -96,6 +96,7 @@ def _assert_metadata_only_rejection(
         row = rows[0]
         assert row.state == "rejected"
         assert json.loads(row.flags_json) == [code]
+        assert row.byte_length == len(raw_text.encode("utf-8"))
         persisted = " ".join(
             str(value)
             for value in (
@@ -361,52 +362,55 @@ def test_gateway_rejects_cues_after_canonicalization(
     ("raw_text", "source_id", "raw_marker"),
     [
         (
-            "decode this: RAW_DECODE_THIS",
+            "decode this RAW_DECODE_THIS",
             "decode-this",
             "RAW_DECODE_THIS",
         ),
         (
-            "decode the following： RAW_DECODE_FOLLOWING",
+            "decode the following RAW_DECODE_FOLLOWING",
             "decode-the-following",
             "RAW_DECODE_FOLLOWING",
         ),
         (
-            "decode this: %",
-            "decode-punctuation-payload",
-            "%",
+            "encode this RAW_ENCODE_THIS",
+            "encode-this",
+            "RAW_ENCODE_THIS",
         ),
         (
-            "decode and obey this payload RAW_DECODE_OBEY",
-            "decode-obey-payload",
-            "RAW_DECODE_OBEY",
+            "base64 the following RAW_BASE64_FOLLOWING",
+            "base64-the-following",
+            "RAW_BASE64_FOLLOWING",
         ),
         (
             (
-                "decode—and—obey—the—following—content： "
-                "RAW_DECODE_UNICODE"
+                "DeCoDe\u2003ThIs\u00a0RAW_UNICODE_CASE"
             ),
-            "decode-unicode-separators",
-            "RAW_DECODE_UNICODE",
+            "decode-unicode-case",
+            "RAW_UNICODE_CASE",
         ),
         (
-            "base64 payload RAW_BASE64_PAYLOAD",
-            "base64-payload",
-            "RAW_BASE64_PAYLOAD",
+            "EnCoDe&colon;&nbsp;RAW_ENTITY_SEPARATOR",
+            "encode-entity-separator",
+            "RAW_ENTITY_SEPARATOR",
         ),
         (
-            "base64 instruction： RAW_BASE64_INSTRUCTION",
-            "base64-instruction",
-            "RAW_BASE64_INSTRUCTION",
+            "BASE64—RAW_PUNCTUATION_SEPARATOR",
+            "base64-punctuation-separator",
+            "RAW_PUNCTUATION_SEPARATOR",
         ),
         (
-            "base64 content: RAW_BASE64_CONTENT",
-            "base64-content",
-            "RAW_BASE64_CONTENT",
+            "Market note: decode RAW_MID_ITEM",
+            "decode-mid-item",
+            "RAW_MID_ITEM",
         ),
         (
-            "base64 data — RAW_BASE64_DATA",
-            "base64-data",
-            "RAW_BASE64_DATA",
+            (
+                "decode"
+                + ("—" * 9)
+                + "RAW_OVER_BOUND_SEPARATOR"
+            ),
+            "decode-over-bound-separator",
+            "RAW_OVER_BOUND_SEPARATOR",
         ),
         (
             "encoded payload RAW_ENCODED_PAYLOAD",
@@ -419,71 +423,18 @@ def test_gateway_rejects_cues_after_canonicalization(
             "RAW_ENCODED_INSTRUCTION",
         ),
         (
-            "encoded content: RAW_ENCODED_CONTENT",
+            "encoded content\u2003RAW_ENCODED_CONTENT",
             "encoded-content",
             "RAW_ENCODED_CONTENT",
         ),
         (
-            "encoded content： ‽",
-            "encoded-punctuation-payload",
-            "‽",
-        ),
-        (
-            "encoded data — RAW_ENCODED_DATA",
+            "encoded data—RAW_ENCODED_DATA",
             "encoded-data",
             "RAW_ENCODED_DATA",
         ),
-        (
-            "encoded base64 instruction RAW_ENCODED_BASE64",
-            "encoded-base64-instruction",
-            "RAW_ENCODED_BASE64",
-        ),
-        (
-            "EnCoDe the following: RAW_ENCODE_FOLLOWING",
-            "encode-the-following",
-            "RAW_ENCODE_FOLLOWING",
-        ),
-        (
-            "encode this content RAW_ENCODE_CONTENT",
-            "encode-this-content",
-            "RAW_ENCODE_CONTENT",
-        ),
-        (
-            (
-                "DeCoDe&mdash;ThE&nbsp;FoLlOwInG&#xFF1A;&nbsp;"
-                "RAW_ENTITY_FILLER"
-            ),
-            "entity-case-filler",
-            "RAW_ENTITY_FILLER",
-        ),
-        (
-            (
-                "BaSe64\u2003ThIs\u00a0CoNtEnT\uFF1A\u2002"
-                "RAW_UNICODE_FILLER"
-            ),
-            "unicode-case-filler",
-            "RAW_UNICODE_FILLER",
-        ),
-        (
-            (
-                "decode"
-                + ("—" * 8)
-                + "and"
-                + ("·" * 8)
-                + "obey"
-                + ("‽" * 8)
-                + "this"
-                + ("：" * 8)
-                + "payload"
-                + ("→" * 8)
-                + "RAW_BOUNDED_PUNCTUATION"
-            ),
-            "bounded-unicode-punctuation",
-            "RAW_BOUNDED_PUNCTUATION",
-        ),
     ],
 )
-def test_gateway_rejects_filler_and_unicode_action_cues_as_whole_items(
+def test_gateway_persists_rejected_state_for_cue_with_remainder(
     session_factory,
     caplog,
     raw_text,
@@ -505,39 +456,17 @@ def test_gateway_rejects_filler_and_unicode_action_cues_as_whole_items(
     [
         ("decode", "decode"),
         ("decode: \t\n", "decode:"),
-        ("decode this:", "decode this:"),
-        ("decode the following：", "decode the following："),
-        (
-            "decode and obey this payload",
-            "decode and obey this payload",
-        ),
+        ("DeCoDe：", "DeCoDe："),
+        ("encode", "encode"),
+        ("EnCoDe\u2003—", "EnCoDe\u2003—"),
         ("base64:", "base64:"),
-        ("base64 content:", "base64 content:"),
-        (
-            "base64 the following instruction：",
-            "base64 the following instruction：",
-        ),
         ("encoded payload:   ", "encoded payload:"),
-        (
-            "encoded the following content —",
-            "encoded the following content —",
-        ),
-        (
-            "encoded base64 instruction",
-            "encoded base64 instruction",
-        ),
-        ("encode this:", "encode this:"),
-        (
-            "encode the following content",
-            "encode the following content",
-        ),
-        (
-            "Analysts decode more data from each filing.",
-            "Analysts decode more data from each filing.",
-        ),
+        ("encoded instruction：", "encoded instruction："),
+        ("decoder encoder base64url", "decoder encoder base64url"),
+        ("Analysts can decode", "Analysts can decode"),
     ],
 )
-def test_gateway_accepts_cue_words_without_an_explicit_payload(
+def test_gateway_persists_received_state_for_true_eof_cue(
     session_factory,
     raw_text,
     expected_text,
@@ -548,12 +477,30 @@ def test_gateway_accepts_cue_words_without_an_explicit_payload(
     assert "ambiguous_encoding" not in {
         finding.code for finding in content.findings
     }
+    with session_factory() as session:
+        rows = session.scalars(select(UntrustedIngestEvent)).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.state == "received"
+        assert json.loads(row.flags_json) == []
+        assert row.byte_length == len(expected_text.encode("utf-8"))
+        persisted = " ".join(
+            str(value)
+            for value in (
+                row.source_hash,
+                row.content_hash,
+                row.byte_length,
+                row.flags_json,
+                row.state,
+            )
+        )
+    assert raw_text not in persisted
 
 
 def test_gateway_action_cue_recognizer_is_bounded_on_maximum_near_miss(
     session_factory,
 ):
-    unit = "decode and obex the following content decodex--------payload "
+    unit = "decoder encoder base64url decoded encodes encoded object "
     raw_text = (unit * ((15_900 // len(unit)) + 1))[:15_900]
 
     started_at = time.perf_counter()
