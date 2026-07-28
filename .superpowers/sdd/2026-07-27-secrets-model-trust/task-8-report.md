@@ -197,3 +197,82 @@ defaults, and no-tools/raw-seam closure remain unchanged. No migration was
 needed. Only temporary SQLite test databases were used; no runtime database,
 Keychain, network, credentials, broker/provider, notification, order, breaker,
 app, daemon, or MCP state was accessed or changed. No push was performed.
+
+## Fix round 2 — two Important findings
+
+Date: 2026-07-28
+
+Fix-round base: `9c77c2816734625a77b4d99bfc59cf5031c0b654`
+
+Implementation commit: `0fa8b58d49f3bbc72d074b59389e870ae2e3208c`
+
+### Compact copy-through fingerprinting
+
+- Reproduced punctuation/case compaction, output-as-source-substring,
+  source-as-output-substring with added prefixes/suffixes, long partial-token
+  copy, NFKC compatibility forms, and copied uncertainties before changing
+  production code.
+- Added a second bounded copy-through boundary over NFKC/casefolded Unicode
+  alphanumerics. It rejects any output of at least 12 compact characters found
+  in a source and any 12-character source window found inside an output.
+- Fixed-width source windows use bounded 128-bit digests, so reverse substring
+  detection is linear in the capped source/output sizes; a collision can only
+  cause a conservative rejection.
+- Source characters, output characters, source comparisons, source windows,
+  and output windows all have explicit limits under the existing
+  20-item/16-KiB source boundary. Existing 3–5-token checks remain in force.
+- This intentionally accepts false-positive repair or rejection for a
+  legitimate shared 12-character sequence. Rewritten short tickers and
+  ordinary short numbers remain allowed. Facts and uncertainties share the
+  same boundary, and copied material was proven absent from the privileged
+  analyst call.
+
+### Atomic unknown/expiry convergence
+
+- Added injectable `now`/clock handling to `mark_unknown()`.
+- `mark_unknown()` and stale-started reaping now call one helper inside the
+  same `BEGIN IMMEDIATE` transaction. A started reservation moved to unknown,
+  or an idempotently revisited unknown reservation, latches its provider day
+  once `expires_at <= now`.
+- Both lock orderings and simultaneous threads converge to one charged
+  `unknown` reservation plus the stable
+  `provider_started_usage_unknown` reconciliation latch.
+- Call/token aggregates are never released or double-mutated, status exposes
+  the latch, and subsequent reservations fail closed. Unexpired calls are not
+  reaped; settled reservations remain final.
+
+### Fix-round verification
+
+- Compact-copy RED was observed before implementation; the final dedicated
+  compact/control slice passed `8` tests.
+- Expiry-race RED was observed as `4 failed, 1 passed` before implementation.
+- Task 8 plus shared-budget files: `129 passed`.
+- Focused trust/budget/analyst/planning/store/news group: `248 passed`,
+  `1 warning`.
+- Both lock orderings plus simultaneous-thread repetition: `60/60 passed`.
+- Broader app/API/bootstrap/daemon/launch/release/budget-review group:
+  `516 passed`, `1 warning`.
+- Compile check: PASS.
+- Release static checks: `54 passed`.
+- Raw-news seam and privileged `UntrustedContent` searches: PASS.
+- `git diff --check`: PASS.
+- Exactly one fix-round full-suite run:
+  `3002 passed, 1 skipped, 1 warning in 245.68s (0:04:05)`.
+
+The sole warning remains the existing third-party
+`websockets.legacy.__init__` deprecation warning under `.venv`.
+
+Review package:
+`review-9c77c28..0fa8b58.diff` (28,988 bytes, one implementation commit).
+
+A fresh bounded acceptance review of the exact packaged diff found zero open
+correctness, security, or scope findings. Agent-dispatch controls were
+unavailable, so this was a manual packaged-diff review rather than a separately
+executed reviewer agent.
+
+PAPER mode, manual approval, kill switches, broker truth, news-disabled
+defaults, and no-tools/raw-seam closure remain unchanged. No migration was
+needed. Only temporary SQLite test databases were used; no runtime database,
+Keychain, network, credentials, broker/provider, notification, order, breaker,
+app, daemon, or MCP state was accessed or changed. The compromised Composio
+credential was not read, used, logged, or modified. No push was performed.
