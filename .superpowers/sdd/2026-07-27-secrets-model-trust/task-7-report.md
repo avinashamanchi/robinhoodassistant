@@ -20,6 +20,8 @@
   `9e4482a702a660fe047f6a1c898097365b5d661f`.
 - Post-round-5 exact-cue implementation commit:
   `505cdd38fe09271a3d31a09df94c33358b9a39a4`.
+- Final cue-simplification implementation commit:
+  `a4d0eada1f724cc9e6f804b810694e309f80a925`.
 - The Task 7 focused and affected suites are green.
 - The repository-wide full-suite gate is clean. The historical initial run
   exposed one reproducible panic-lease defect, and the historical confirmation
@@ -34,7 +36,9 @@
   skipped, and the same warning. After final quarantine-only reviewer fix
   round 5, exactly one new full suite passed with 2,902 passed, 1 skipped,
   and the same warning. After the post-round-5 exact-cue fix, exactly one new
-  full suite passed with 2,932 passed, 1 skipped, and the same warning.
+  full suite passed with 2,932 passed, 1 skipped, and the same warning. After
+  the final cue simplification, exactly one new full suite passed with 2,921
+  passed, 1 skipped, and the same warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -722,6 +726,103 @@ persistence schema, news-provider, analyst, planning, app, daemon, MCP,
 broker, or runtime code changed. The Task 8 legacy analyst-news seam remains
 explicitly open.
 
+## Final cue simplification — standalone words and linear suffix scan
+
+The final reviewer direction superseded the filler/object grammar:
+
+- the post-round-5 recognizer still depended on a large nested phrase regex;
+- simple whitespace-only forms such as `decode this`, `decode the following`,
+  `encode this`, and `base64 the following` could be forwarded;
+- maintaining special filler permutations was more fragile than the intended
+  fail-closed policy.
+
+The quarantine boundary now:
+
+- runs only after fixed-point canonicalization;
+- finds standalone case-insensitive `decode`, `encode`, `base64`, and
+  `encoded` words with one flat regex;
+- applies `encoded` only to explicit
+  `payload|instruction|content|data` forms using a second flat regex;
+- advances through at most eight Unicode whitespace, punctuation, or symbol
+  characters with an ordinary bounded loop;
+- rejects the entire item with stable `ambiguous_encoding` whenever any
+  content remains;
+- permits a standalone cue or complete explicit `encoded` form only when the
+  bounded scan reaches true EOF;
+- performs no filler parsing, payload parsing, decoded-payload forwarding,
+  nested regex matching, atomic regex matching, URL access, model call, tool
+  call, or external action.
+
+This is intentionally conservative: ordinary prose containing a standalone
+`decode`, `encode`, or `base64` word followed by later text is rejected. The
+only benign exception is a cue at the true end of the canonicalized item,
+optionally followed by at most eight separator characters. Non-standalone
+words such as `decoder`, `encoder`, and `base64url` remain ordinary text.
+
+TDD evidence:
+
+- the first public-gateway RED exposed a test-contract correction: rejected
+  events store raw byte count, while received events store normalized byte
+  count;
+- after correcting that assertion before production changes, the focused
+  selection produced
+  `6 failed, 18 passed, 63 deselected in 0.99s`;
+- all six failures were the expected missing whole-item rejection for the
+  required simple-word forms, including Unicode whitespace and a mid-item
+  cue.
+
+Final GREEN evidence:
+
+- public-gateway rejected/received persistence and maximum-size selection:
+  `24 passed, 63 deselected in 0.84s`;
+- complete quarantine module:
+  `87 passed in 2.59s`;
+- focused selection in 20 fresh processes:
+  480/480 cases;
+- untrusted-content, news, DB-model, and migration group:
+  `260 passed, 1 warning in 31.83s`;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.87s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.51s`;
+- 87 unique quarantine node IDs; no duplicate IDs, skips, xfails,
+  placeholder `pass`, dead parameters, or references to the removed grammar;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+Public-gateway persistence regressions prove that:
+
+- rejected cues store raw byte count, stable
+  `["ambiguous_encoding"]`, and `rejected` state without raw text in the
+  database, exception, or captured logs;
+- accepted true-EOF cues store normalized byte count, empty finding codes,
+  and `received` state without raw text in the database.
+
+The maximum-size near-miss remains 15,900 bytes and must complete through the
+real gateway in under one second. The new recognizer has no nested or
+unbounded regex construction: its regexes contain only word boundaries and
+finite literal alternatives, and each matched cue performs at most eight
+separator iterations.
+
+The implementation changed by 53 additions and 74 deletions; tests changed by
+57 additions and 110 deletions, for 74 net lines removed. No local independent
+reviewer subagent was available; the discovered review tools required an
+existing GitHub pull request and were not used under the no-push/no-external
+boundary. The exact-requirements self-review found no open Critical or
+Important issue.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2921 passed, 1 skipped, 1 warning in 396.28s`.
+
+No second full-suite run was performed. No panic, lease, migration,
+persistence schema, news-provider, analyst, planning, app, daemon, MCP,
+broker, or runtime code changed. The Task 8 legacy analyst-news seam remains
+explicitly open.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -748,6 +849,8 @@ explicitly open.
   `review-b0ddb67..9e4482a.diff`
 - generated post-round-5 exact-cue review package
   `review-7c4a6b4..505cdd3.diff`
+- generated final cue-simplification review package
+  `review-f8531aa..a4d0ead.diff`
 
 ## Caveats
 
@@ -762,4 +865,6 @@ explicitly open.
   as recorded in reviewer fix round 5; this round did not alter that path.
 - Explicit cue-like financial prose may be rejected conservatively; the
   post-round-5 section records the accepted false-positive tradeoff.
+- After final simplification, any standalone `decode`, `encode`, or `base64`
+  word with later content is rejected; only the true-EOF case remains.
 - No push was performed.
