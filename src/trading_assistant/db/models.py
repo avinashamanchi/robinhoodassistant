@@ -163,6 +163,24 @@ class OrderStateMachine:
         return new in _LEGAL_TRANSITIONS.get(current, frozenset())
 
     @staticmethod
+    def is_reachable(initial: OrderStatus, current: OrderStatus) -> bool:
+        """Return whether ``current`` is reachable without bypassing the graph."""
+
+        if initial == current:
+            return True
+        visited = {initial}
+        pending = [initial]
+        while pending:
+            state = pending.pop()
+            for successor in _LEGAL_TRANSITIONS.get(state, frozenset()):
+                if successor == current:
+                    return True
+                if successor not in visited:
+                    visited.add(successor)
+                    pending.append(successor)
+        return False
+
+    @staticmethod
     def transition(order: "Order", new: OrderStatus) -> None:
         current = OrderStatus(order.status)
         if not OrderStateMachine.can_transition(current, new):

@@ -449,6 +449,11 @@ class Agent:
                             }
                         )
                 messages.append({"role": "user", "content": results})
+                if (
+                    stop_code is None
+                    and dispatched_tool_calls >= self.max_tool_calls
+                ):
+                    stop_code = "tool_call_budget_exhausted"
                 if stop_code is not None:
                     final_text = _TOOL_STOP_REPLIES[stop_code]
                     break

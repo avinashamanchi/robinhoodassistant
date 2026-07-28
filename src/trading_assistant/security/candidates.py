@@ -43,7 +43,9 @@ from trading_assistant.db.models import (
     AuditEvent,
     CandidateNonce,
     CandidateQueueReceipt,
+    Fill,
     Order,
+    OrderStateMachine,
     Proposal,
     RiskEvent,
     Rule,
@@ -53,7 +55,7 @@ from trading_assistant.db.models import (
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.identity import canonical_request_id
 from trading_assistant.risk.breakers import trip_in_session
-from trading_assistant.rules.models import RuleAction, RuleCommand
+from trading_assistant.rules.models import RuleAction, RuleCommand, RuleState
 from trading_assistant.security.secrets import (
     RuntimeSecrets,
     validate_base64_key,
@@ -928,6 +930,16 @@ class CandidateQueueService:
                 candidate.payload,
                 order_key,
             )
+            try:
+                initial_status = OrderStatus(receipt.outcome_code)
+                current_status = (
+                    OrderStatus(target.status)
+                    if target is not None
+                    else None
+                )
+            except ValueError:
+                initial_status = None
+                current_status = None
             if (
                 target is None
                 or target.idempotency_key != order_key
@@ -938,9 +950,19 @@ class CandidateQueueService:
                 or target.notional != expected.notional
                 or target.limit_price != expected.limit_price
                 or receipt.outcome_code not in {"proposed", "rejected"}
-                or (
-                    require_initial_lifecycle
-                    and target.status != receipt.outcome_code
+                or initial_status is None
+                or current_status is None
+                or not OrderStateMachine.is_reachable(
+                    initial_status,
+                    current_status,
+                )
+            ):
+                raise CandidateError("candidate_receipt_inconsistent")
+            if (
+                current_status == initial_status
+                and not self._order_initial_lifecycle_is_pristine(
+                    session,
+                    target,
                 )
             ):
                 raise CandidateError("candidate_receipt_inconsistent")
@@ -972,35 +994,116 @@ class CandidateQueueService:
             if group is not None
             else []
         )
+        rule = rules[0] if len(rules) == 1 else None
         if (
             group is None
-            or len(rules) != 1
-            or rules[0].id != receipt.target_id
-            or rules[0].payload_version != 1
-            or rules[0].ticker != command.ticker
-            or rules[0].kind != command.kind.value
-            or rules[0].condition_json != expected_condition
-            or rules[0].action_json != expected_action
-            or rules[0].plan_id is not None
-            or rules[0].fraction != command.fraction
-            or rules[0].hwm != command.high_water_mark
-            or rules[0].deadline is not None
-            or rules[0].pre_approved != command.pre_approved
-            or rules[0].activation != command.activation
+            or rule is None
+            or rule.id != receipt.target_id
+            or rule.payload_version != 1
+            or rule.ticker != command.ticker
+            or rule.kind != command.kind.value
+            or rule.condition_json != expected_condition
+            or rule.action_json != expected_action
+            or rule.plan_id is not None
+            or rule.fraction != command.fraction
+            or rule.hwm != command.high_water_mark
+            or rule.deadline is not None
+            or rule.pre_approved != command.pre_approved
+            or rule.activation != command.activation
             or (
-                rules[0].terminal_on_trigger
+                rule.terminal_on_trigger
                 != command.terminal_on_trigger
             )
             or receipt.outcome_code != "queued"
-            or (
-                require_initial_lifecycle
-                and (
-                    group.state != "active"
-                    or rules[0].state != "active"
-                )
+            or not self._rule_lifecycle_is_consistent(
+                group,
+                rule,
+                require_initial_lifecycle=require_initial_lifecycle,
             )
         ):
             raise CandidateError("candidate_receipt_inconsistent")
+
+    @staticmethod
+    def _order_initial_lifecycle_is_pristine(
+        session,
+        order: Order,
+    ) -> bool:
+        fill_count = session.scalar(
+            select(func.count())
+            .select_from(Fill)
+            .where(Fill.order_id == order.id)
+        )
+        return bool(
+            order.broker_order_id is None
+            and order.approval_actor is None
+            and order.approved_at is None
+            and order.submission_kind == "simple"
+            and order.submission_payload_json == "{}"
+            and order.submission_attempt == 0
+            and order.submission_started_at is None
+            and order.acceptance_state == "not_started"
+            and order.last_reconciled_at is None
+            and order.last_error_code == ""
+            and order.plan_cancel_state == "none"
+            and order.version == 0
+            and fill_count == 0
+        )
+
+    @staticmethod
+    def _rule_lifecycle_is_consistent(
+        group: RuleGroup,
+        rule: Rule,
+        *,
+        require_initial_lifecycle: bool,
+    ) -> bool:
+        try:
+            group_state = RuleState(group.state)
+            rule_state = RuleState(rule.state)
+        except ValueError:
+            return False
+        lease_is_consistent = (
+            (group.lease_owner is None)
+            == (group.lease_expires_at is None)
+        )
+        if not lease_is_consistent or group.version < 0:
+            return False
+        if (
+            group_state is RuleState.ACTIVE
+            and rule_state is RuleState.ACTIVE
+        ):
+            if group.terminal_rule_id is not None:
+                return False
+            if require_initial_lifecycle:
+                return bool(
+                    group.version == 0
+                    and group.lease_owner is None
+                    and group.lease_expires_at is None
+                    and not group.reconciliation_required
+                )
+            if group.version == 0:
+                return bool(
+                    group.lease_owner is None
+                    and group.lease_expires_at is None
+                    and not group.reconciliation_required
+                )
+            return True
+        if group.lease_owner is not None or group.lease_expires_at is not None:
+            return False
+        if group.reconciliation_required:
+            return False
+        if group_state in {RuleState.TRIGGERED, RuleState.FAILED}:
+            return bool(
+                rule_state is group_state
+                and group.terminal_rule_id == rule.id
+                and group.version >= 1
+            )
+        if group_state is RuleState.CANCELED:
+            return bool(
+                rule_state is RuleState.CANCELED
+                and group.terminal_rule_id in {None, rule.id}
+                and group.version >= 1
+            )
+        return False
 
     def _complete(
         self,
@@ -1154,8 +1257,10 @@ class CandidateQueueService:
         now: datetime,
     ) -> None:
         with self.service.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             receipt = session.get(CandidateQueueReceipt, receipt_id)
             if receipt is None or receipt.state != "reserved":
+                session.rollback()
                 raise CandidateError("candidate_receipt_inconsistent")
             existing = session.scalar(
                 select(Order).where(
@@ -1163,6 +1268,7 @@ class CandidateQueueService:
                 )
             )
             if existing is not None:
+                session.rollback()
                 raise CandidateError("candidate_target_conflict")
             order = Order(
                 idempotency_key=request.idempotency_key,
@@ -1239,11 +1345,13 @@ class CandidateQueueService:
                 ),
                 {"reason": reason, "detail_json": "{}"},
             )
-            receipt.state = "target_persisted"
+            receipt.state = "completed"
             receipt.target_id = order.id
             receipt.outcome_code = order.status
             receipt.http_status = 201
+            receipt.completed_at = now
             receipt.updated_at = now
+            self._crash("before_target_commit")
             session.commit()
 
     def _persist_rule(
@@ -1261,14 +1369,17 @@ class CandidateQueueService:
         _order_key, group_key = self._target_keys(identity)
         command = self._rule_command(payload, group_key)
         with self.service.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             receipt = session.get(CandidateQueueReceipt, receipt_id)
             if receipt is None or receipt.state != "reserved":
+                session.rollback()
                 raise CandidateError("candidate_receipt_inconsistent")
             if session.scalar(
                 select(RuleGroup).where(
                     RuleGroup.group_key == group_key
                 )
             ) is not None:
+                session.rollback()
                 raise CandidateError("candidate_target_conflict")
             rule = self.service.rule_application.persist_commands(
                 session,
@@ -1309,11 +1420,13 @@ class CandidateQueueService:
                 ),
                 {"reason": reason, "detail_json": "{}"},
             )
-            receipt.state = "target_persisted"
+            receipt.state = "completed"
             receipt.target_id = rule.id
             receipt.outcome_code = "queued"
             receipt.http_status = 201
+            receipt.completed_at = now
             receipt.updated_at = now
+            self._crash("before_target_commit")
             session.commit()
 
     @staticmethod

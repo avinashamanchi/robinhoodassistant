@@ -88,3 +88,22 @@ def test_terminal_states_have_no_exits(terminal):
 def test_legacy_approved_has_no_runtime_transitions():
     for target in OrderStatus:
         assert not OrderStateMachine.can_transition(OrderStatus.APPROVED, target)
+
+
+def test_reachability_uses_the_legal_transition_graph_transitively():
+    assert OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.FILLED,
+    )
+    assert OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.PROPOSED,
+    )
+    assert not OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.APPROVED,
+    )
+    assert not OrderStateMachine.is_reachable(
+        OrderStatus.REJECTED,
+        OrderStatus.PROPOSED,
+    )

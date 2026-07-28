@@ -454,7 +454,7 @@ def test_agent_chat_survives_backend_error(make_service, caplog):
 
 
 def test_agent_stops_at_max_turns(make_service):
-    # Backend always asks for a tool -> loop must terminate at max_turns, not hang.
+    # Backend always asks for a tool -> terminate locally at the shared bound.
     responses = [
         _resp("tool_use", [_tool(f"t{i}", "get_account_summary", {})])
         for i in range(20)
@@ -462,7 +462,7 @@ def test_agent_stops_at_max_turns(make_service):
     agent, svc = _agent(make_service, responses, max_turns=3)
     out = _chat(agent, "loop forever")
     assert agent.backend.calls == 3
-    assert out.reply == ""  # never produced final text, but returned cleanly
+    assert out.reply == "Tool execution stopped: tool_call_budget_exhausted."
 
 
 def test_prose_only_model_mention_does_not_create_candidate(make_service):
@@ -565,6 +565,43 @@ def test_agent_hard_caps_48_tool_blocks_across_one_model_response(
             decrypt_test_sensitive(decision, "tool_calls_json")
         )
         assert len(calls) == 48
+
+
+def test_agent_exact_tool_budget_returns_without_second_provider_call(
+    make_service,
+):
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        f"tool-{index}",
+                        "get_market_data",
+                        {"ticker": "AAPL"},
+                    )
+                    for index in range(3)
+                ],
+            )
+        ],
+        max_turns=3,
+    )
+    quote_calls = 0
+    original_get_quote = svc.broker.get_quote
+
+    def counted_get_quote(ticker):
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_get_quote(ticker)
+
+    svc.broker.get_quote = counted_get_quote
+
+    reply = _chat(agent, "exactly exhaust the tool budget")
+
+    assert quote_calls == 3
+    assert agent.backend.calls == 1
+    assert reply.reply == "Tool execution stopped: tool_call_budget_exhausted."
 
 
 def test_agent_tool_budget_is_aggregate_across_model_turns(make_service):

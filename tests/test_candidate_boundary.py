@@ -22,6 +22,7 @@ from trading_assistant.db.models import (
     AuditEvent,
     CandidateNonce,
     CircuitBreakerState,
+    Fill,
     Order,
     OrderStateMachine,
     RiskEvent,
@@ -219,6 +220,14 @@ def _queue_rule(
         reason=REASON,
         request_id=REQUEST_ID,
     )
+
+
+def _mark_receipt_target_persisted(service) -> None:
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        receipt.state = "target_persisted"
+        receipt.completed_at = None
+        session.commit()
 
 
 def test_candidate_models_are_strict_frozen_and_omit_rule_proposal_ttl():
@@ -832,6 +841,16 @@ def test_order_crash_windows_recover_original_target_without_duplication(
     with pytest.raises(RuntimeError, match=stage):
         _queue_order(queue, envelope, binding)
 
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        if stage == "after_target_commit":
+            assert receipt.state == "completed"
+            assert receipt.completed_at == NOW
+            assert session.scalar(select(func.count()).select_from(Order)) == 1
+        else:
+            assert receipt.state == "reserved"
+            assert session.scalar(select(func.count()).select_from(Order)) == 0
+
     recovered = _queue_order(queue, envelope, binding)
     assert recovered.status == "proposed"
     with service.session_factory() as session:
@@ -840,6 +859,36 @@ def test_order_crash_windows_recover_original_target_without_duplication(
         receipt = session.scalar(select(CandidateQueueReceipt))
         assert receipt.state == "completed"
         assert receipt.target_id == recovered.target_id
+
+
+def test_order_crash_before_target_commit_rolls_back_target_and_completion(
+    make_service,
+):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    armed = {"value": True}
+
+    def crash_hook(stage):
+        if armed["value"] and stage == "before_target_commit":
+            armed["value"] = False
+            raise RuntimeError("simulated precommit crash")
+
+    queue = _queue(service, signer, crash_hook=crash_hook)
+    with pytest.raises(RuntimeError, match="precommit"):
+        _queue_order(queue, envelope, binding)
+
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "reserved"
+        assert receipt.target_id is None
+        assert session.scalar(select(func.count()).select_from(Order)) == 0
+
+    recovered = _queue_order(queue, envelope, binding)
+
+    assert recovered.status == "proposed"
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+        assert session.scalar(select(func.count()).select_from(Order)) == 1
 
 
 def test_rule_target_commit_crash_recovers_unique_group_and_rule(make_service):
@@ -855,11 +904,50 @@ def test_rule_target_commit_crash_recovers_unique_group_and_rule(make_service):
     with pytest.raises(RuntimeError, match="rule target"):
         _queue_rule(queue, envelope, binding)
 
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+        assert receipt.completed_at == NOW
+        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
+        assert session.scalar(select(func.count()).select_from(Rule)) == 1
+
     recovered = _queue_rule(queue, envelope, binding)
     with service.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
         assert session.scalar(select(func.count()).select_from(Rule)) == 1
         assert session.get(Rule, recovered.target_id) is not None
+
+
+def test_rule_crash_before_target_commit_rolls_back_group_rule_and_completion(
+    make_service,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    armed = {"value": True}
+
+    def crash_hook(stage):
+        if armed["value"] and stage == "before_target_commit":
+            armed["value"] = False
+            raise RuntimeError("simulated rule precommit crash")
+
+    queue = _queue(service, signer, crash_hook=crash_hook)
+    with pytest.raises(RuntimeError, match="precommit"):
+        _queue_rule(queue, envelope, binding)
+
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "reserved"
+        assert receipt.target_id is None
+        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 0
+        assert session.scalar(select(func.count()).select_from(Rule)) == 0
+
+    recovered = _queue_rule(queue, envelope, binding)
+
+    assert recovered.status == "queued"
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
+        assert session.scalar(select(func.count()).select_from(Rule)) == 1
 
 
 def test_receipt_binds_reason_and_reuses_original_request_identity(
@@ -955,6 +1043,24 @@ def test_completed_order_receipt_replays_after_legal_status_progression(
         assert session.get(Order, first.target_id).status == "expired"
 
 
+def test_completed_order_receipt_rejects_unreachable_legacy_approved_state(
+    make_service,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    with service.session_factory() as session:
+        session.get(Order, first.target_id).status = OrderStatus.APPROVED.value
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_order(queue, envelope, binding)
+
+
 @pytest.mark.parametrize("progressed_state", ["triggered", "canceled"])
 def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
     make_service,
@@ -968,6 +1074,7 @@ def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
         group = session.get(RuleGroup, rule.group_id)
         rule.state = progressed_state
         group.state = progressed_state
+        group.version = 1
         if progressed_state == "triggered":
             group.terminal_rule_id = rule.id
         session.commit()
@@ -980,10 +1087,164 @@ def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
 
 
 @pytest.mark.parametrize(
+    ("group_state", "rule_state", "terminal_rule"),
+    [
+        ("pending", "pending", False),
+        ("triggered", "active", True),
+        ("active", "triggered", False),
+        ("canceled", "triggered", False),
+    ],
+)
+def test_completed_rule_receipt_rejects_backward_or_inconsistent_states(
+    make_service,
+    group_state,
+    rule_state,
+    terminal_rule,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        group.state = group_state
+        rule.state = rule_state
+        group.terminal_rule_id = rule.id if terminal_rule else None
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+def test_completed_rule_receipt_rejects_terminal_state_without_version_progress(
+    make_service,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        group.state = "canceled"
+        rule.state = "canceled"
+        assert group.version == 0
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+def test_target_persisted_order_recovery_accepts_legal_forward_progression(
+    make_service,
+):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _mark_receipt_target_persisted(service)
+    with service.session_factory() as session:
+        order = session.get(Order, first.target_id)
+        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
+        session.commit()
+
+    replay = _queue_order(queue, envelope, binding)
+
+    assert replay == first
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "broker_order_id",
+        "approval_metadata",
+        "submission_markers",
+        "fill_marker",
+    ],
+)
+def test_target_persisted_initial_order_rejects_lifecycle_marker_tamper(
+    make_service,
+    tamper,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _mark_receipt_target_persisted(service)
+    with service.session_factory() as session:
+        order = session.get(Order, first.target_id)
+        if tamper == "broker_order_id":
+            order.broker_order_id = "unexpected-broker-order"
+        elif tamper == "approval_metadata":
+            order.approval_actor = "unexpected-approver"
+            order.approved_at = NOW
+        elif tamper == "submission_markers":
+            order.submission_attempt = 1
+            order.submission_started_at = NOW
+            order.acceptance_state = "started"
+        else:
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker=order.ticker,
+                    side=order.side,
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="unexpected-candidate-fill",
+                    filled_at=NOW,
+                )
+            )
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_order(queue, envelope, binding)
+
+
+def test_target_persisted_rule_recovery_accepts_legal_forward_progression(
+    make_service,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _mark_receipt_target_persisted(service)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = "triggered"
+        group.state = "triggered"
+        group.terminal_rule_id = rule.id
+        group.version = 1
+        session.commit()
+
+    replay = _queue_rule(queue, envelope, binding)
+
+    assert replay == first
+    with service.session_factory() as session:
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+
+
+@pytest.mark.parametrize(
     "tamper",
     [
         "group_key",
         "group_initial_state",
+        "group_terminal_rule_id",
+        "group_version",
+        "group_lease",
+        "group_reconciliation",
         "payload_version",
         "ticker",
         "kind",
@@ -1007,16 +1268,9 @@ def test_rule_target_persisted_recovery_rejects_any_immutable_drift(
 ):
     api = _candidate_api()
     envelope, service, signer, binding = _rule_envelope(make_service)
-    armed = {"value": True}
-
-    def crash_hook(stage):
-        if armed["value"] and stage == "after_target_commit":
-            armed["value"] = False
-            raise RuntimeError("target persisted")
-
-    queue = _queue(service, signer, crash_hook=crash_hook)
-    with pytest.raises(RuntimeError, match="target persisted"):
-        _queue_rule(queue, envelope, binding)
+    queue = _queue(service, signer)
+    _queue_rule(queue, envelope, binding)
+    _mark_receipt_target_persisted(service)
 
     with service.session_factory() as session:
         rule = session.scalar(select(Rule))
@@ -1025,6 +1279,15 @@ def test_rule_target_persisted_recovery_rejects_any_immutable_drift(
             group.group_key = "tampered-group-key"
         elif tamper == "group_initial_state":
             group.state = "triggered"
+        elif tamper == "group_terminal_rule_id":
+            group.terminal_rule_id = rule.id
+        elif tamper == "group_version":
+            group.version = 1
+        elif tamper == "group_lease":
+            group.lease_owner = "unexpected-worker"
+            group.lease_expires_at = NOW + timedelta(minutes=1)
+        elif tamper == "group_reconciliation":
+            group.reconciliation_required = True
         elif tamper == "payload_version":
             rule.payload_version = 2
         elif tamper == "ticker":
