@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event, inspect as sa_inspect
 
 from trading_assistant.app.main import create_app
+from trading_assistant.app.limits import DurableRateLimiter
 from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
@@ -208,6 +209,10 @@ def _identity_capture_client(make_service, authenticate_client):
         model="capture-only",
         max_tokens=10,
         max_turns=2,
+        rate_limiter=DurableRateLimiter(service.session_factory),
+        broker_read_limit=(
+            service.config.security.rate_limits.broker_read
+        ),
     )
     app = create_app(
         service=service,
@@ -3321,6 +3326,7 @@ def test_chat_and_rate_limit(client):
         "reason": "hi",
         "request_id": response.headers["X-Request-ID"],
         "session_binding": "",
+        "limit_principal": "session:1:operator:local",
     }
     c.post("/chat", json={"message": "again"})       # 2nd allowed (limit=2)
     broker_reads = []

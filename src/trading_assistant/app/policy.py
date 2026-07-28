@@ -40,6 +40,7 @@ from .limits import (
     LimitSpec,
     LimitStoreUnavailable,
     MutationInterlockService,
+    session_limit_principal,
 )
 
 _DEFAULT_LEASE_TTL_SECONDS = 30
@@ -74,6 +75,16 @@ class RoutePolicy:
     concurrency_behavior: Literal["reject", "coalesce_panic"] = "reject"
     target_param: str | None = None
     mutation_operation: str | None = None
+    receipt_managed_idempotency: bool = False
+
+    def __post_init__(self) -> None:
+        if self.receipt_managed_idempotency and (
+            not self.requires_idempotency
+            or self.mutation_operation is not None
+        ):
+            raise ValueError(
+                "receipt-managed idempotency cannot use a generic interlock"
+            )
 
 
 @dataclass(frozen=True)
@@ -163,7 +174,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         broker_read=True,
         concurrency_scope="principal",
-        mutation_operation="candidate_queue",
+        receipt_managed_idempotency=True,
     ),
     RoutePolicy(
         "POST",
@@ -174,7 +185,7 @@ ROUTE_POLICIES = (
         audit_mutation=True,
         broker_read=True,
         concurrency_scope="principal",
-        mutation_operation="candidate_queue",
+        receipt_managed_idempotency=True,
     ),
     RoutePolicy("GET", "/health", AuthLevel.SESSION, "session_read"),
     RoutePolicy("GET", "/pending", AuthLevel.SESSION, "session_read"),
@@ -1566,6 +1577,10 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         if resolved is None:
             return await call_next(request)
         policy = resolved.policy
+        generic_interlock = (
+            policy.requires_idempotency
+            and not policy.receipt_managed_idempotency
+        )
         request.state.route_policy = policy
         if policy.path == "/health/live":
             return await call_next(request)
@@ -1617,7 +1632,10 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
             )
         source = request.client.host if request.client else "unknown"
         limit_principal = (
-            f"session:{principal.session_id}:{principal.actor}"
+            session_limit_principal(
+                principal.session_id,
+                principal.actor,
+            )
             if principal is not None
             else f"source:{source}"
         )
@@ -1657,7 +1675,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
             limit_principal=limit_principal,
         )
         reconciliation_target: InterlockDecision | None = None
-        if policy.requires_idempotency:
+        if generic_interlock:
             try:
                 if policy.path == "/reconcile":
                     control = await _inspect_interlock(
@@ -1884,7 +1902,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 ),
                 headers=headers,
             )
-        if policy.requires_idempotency:
+        if generic_interlock:
             try:
                 interlock = await _offload(
                     app.state.mutation_interlocks.claim,
@@ -1948,7 +1966,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     panic_request_id,
                     None,
                 )
-            if policy.requires_idempotency:
+            if generic_interlock:
                 await _mark_interlock_uncertain(
                     app,
                     hold,
@@ -1971,7 +1989,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     panic_request_id,
                     None,
                 )
-            if policy.requires_idempotency:
+            if generic_interlock:
                 await _mark_interlock_uncertain(
                     app,
                     hold,
@@ -2065,7 +2083,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                         request.state.request_id,
                     )
 
-        if policy.requires_idempotency:
+        if generic_interlock:
             cleanup_failure = await _settle_and_release_interlock(
                 app,
                 hold,

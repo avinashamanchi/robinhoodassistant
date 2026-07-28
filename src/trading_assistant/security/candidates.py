@@ -3,8 +3,8 @@
 The model can draft candidates but cannot mutate trading state. Only the
 explicit HTTP queue boundary consumes a signed nonce, refreshes complete broker
 truth, runs deterministic risk, and persists a human-reviewable proposal or a
-disabled rule. This module has no execution, approval, submission, cancellation,
-or auto-enable path.
+non-preapproved active standing rule. This module has no execution, approval,
+submission, cancellation, or auto-execution path.
 """
 
 from __future__ import annotations
@@ -485,7 +485,7 @@ class CandidateSigner:
             observed = _aware_utc(now or self.now())
             if candidate.issued_at > observed:
                 raise CandidateError("candidate_issued_in_future")
-            if observed > candidate.expires_at:
+            if observed >= candidate.expires_at:
                 raise CandidateError("candidate_expired")
             age = observed - candidate.payload.quote_as_of
             if (
@@ -737,7 +737,7 @@ class CandidateNonceStore:
 
 
 class CandidateQueueService:
-    """Crash-safe queue coordinator; never executes or enables a rule."""
+    """Crash-safe queue coordinator; never executes or pre-approves a rule."""
 
     def __init__(
         self,
@@ -916,6 +916,8 @@ class CandidateQueueService:
         receipt: CandidateQueueReceipt,
         identity,
         candidate: SignedCandidate,
+        *,
+        require_initial_lifecycle: bool,
     ) -> None:
         if receipt.target_id is None:
             raise CandidateError("candidate_receipt_inconsistent")
@@ -935,10 +937,27 @@ class CandidateQueueService:
                 or target.qty != expected.qty
                 or target.notional != expected.notional
                 or target.limit_price != expected.limit_price
-                or target.status != receipt.outcome_code
+                or receipt.outcome_code not in {"proposed", "rejected"}
+                or (
+                    require_initial_lifecycle
+                    and target.status != receipt.outcome_code
+                )
             ):
                 raise CandidateError("candidate_receipt_inconsistent")
             return
+        assert isinstance(candidate.payload, RuleCandidate)
+        command = self._rule_command(candidate.payload, group_key)
+        expected_payload = command.model_dump(mode="json")
+        expected_condition = json.dumps(
+            expected_payload["condition"],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_action = json.dumps(
+            expected_payload["action"],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         group = session.scalar(
             select(RuleGroup).where(RuleGroup.group_key == group_key)
         )
@@ -955,14 +974,31 @@ class CandidateQueueService:
         )
         if (
             group is None
-            or group.state != "active"
             or len(rules) != 1
             or rules[0].id != receipt.target_id
-            or rules[0].ticker != candidate.payload.ticker
-            or rules[0].state != "active"
-            or rules[0].pre_approved
-            or rules[0].activation != "immediate"
+            or rules[0].payload_version != 1
+            or rules[0].ticker != command.ticker
+            or rules[0].kind != command.kind.value
+            or rules[0].condition_json != expected_condition
+            or rules[0].action_json != expected_action
+            or rules[0].plan_id is not None
+            or rules[0].fraction != command.fraction
+            or rules[0].hwm != command.high_water_mark
+            or rules[0].deadline is not None
+            or rules[0].pre_approved != command.pre_approved
+            or rules[0].activation != command.activation
+            or (
+                rules[0].terminal_on_trigger
+                != command.terminal_on_trigger
+            )
             or receipt.outcome_code != "queued"
+            or (
+                require_initial_lifecycle
+                and (
+                    group.state != "active"
+                    or rules[0].state != "active"
+                )
+            )
         ):
             raise CandidateError("candidate_receipt_inconsistent")
 
@@ -985,6 +1021,7 @@ class CandidateQueueService:
                         receipt,
                         identity,
                         candidate,
+                        require_initial_lifecycle=False,
                     )
                 session.commit()
                 return self._result_from_receipt(receipt)
@@ -1001,6 +1038,7 @@ class CandidateQueueService:
                 receipt,
                 identity,
                 candidate,
+                require_initial_lifecycle=True,
             )
             receipt.state = "completed"
             receipt.completed_at = _aware_utc(self.now())
@@ -1221,35 +1259,7 @@ class CandidateQueueService:
         now: datetime,
     ) -> None:
         _order_key, group_key = self._target_keys(identity)
-        direction = (
-            "below"
-            if payload.condition.comparator == "price_below"
-            else "above"
-        )
-        action = RuleAction.model_validate(
-            {
-                "side": payload.action.side,
-                "order_type": payload.action.order_type,
-                "qty": payload.action.quantity,
-                "notional": payload.action.notional,
-                "limit_price": payload.action.limit_price,
-            }
-        )
-        command = RuleCommand.model_validate(
-            {
-                "ticker": payload.ticker,
-                "kind": "price",
-                "condition": {
-                    "type": "price",
-                    "direction": direction,
-                    "price": payload.condition.trigger_price,
-                },
-                "action": action,
-                "group_key": group_key,
-                "pre_approved": False,
-                "activation": "immediate",
-            }
-        )
+        command = self._rule_command(payload, group_key)
         with self.service.session_factory() as session:
             receipt = session.get(CandidateQueueReceipt, receipt_id)
             if receipt is None or receipt.state != "reserved":
@@ -1305,6 +1315,42 @@ class CandidateQueueService:
             receipt.http_status = 201
             receipt.updated_at = now
             session.commit()
+
+    @staticmethod
+    def _rule_command(
+        payload: RuleCandidate,
+        group_key: str,
+    ) -> RuleCommand:
+        direction = (
+            "below"
+            if payload.condition.comparator == "price_below"
+            else "above"
+        )
+        action = RuleAction.model_validate(
+            {
+                "side": payload.action.side,
+                "order_type": payload.action.order_type,
+                "qty": payload.action.quantity,
+                "notional": payload.action.notional,
+                "limit_price": payload.action.limit_price,
+            }
+        )
+        command = RuleCommand.model_validate(
+            {
+                "ticker": payload.ticker,
+                "kind": "price",
+                "condition": {
+                    "type": "price",
+                    "direction": direction,
+                    "price": payload.condition.trigger_price,
+                },
+                "action": action,
+                "group_key": group_key,
+                "pre_approved": False,
+                "activation": "immediate",
+            }
+        )
+        return command
 
     def _reject_rule_risk(
         self,

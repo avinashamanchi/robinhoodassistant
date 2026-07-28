@@ -68,6 +68,7 @@ from .limits import (
     ConcurrencyLeaseService,
     DurableRateLimiter,
     MutationInterlockService,
+    session_limit_principal,
 )
 from .routers.auth import router as auth_router
 from .security import (
@@ -339,6 +340,8 @@ def _build_agent(container) -> Agent:
             config.security.provider_budget.max_chat_tool_turns
         ),
         candidate_drafts=getattr(container, "candidate_drafts", None),
+        rate_limiter=container.rate_limiter,
+        broker_read_limit=config.security.rate_limits.broker_read,
     )
     return agent
 
@@ -656,6 +659,10 @@ def _create_app(
             reason=context.reason,
             request_id=context.request_id,
             session_binding=binding,
+            limit_principal=session_limit_principal(
+                principal.session_id,
+                principal.actor,
+            ),
         )
 
     def _queue_candidate(

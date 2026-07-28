@@ -1674,6 +1674,14 @@ def test_sensitive_trust_schema_constraints_indexes_and_no_raw_text(tmp_path):
         "ix_candidate_queue_receipts_state",
         "ix_candidate_queue_receipts_request_id",
     }
+    mutation_operation_check = next(
+        constraint["sqltext"]
+        for constraint in inspector.get_check_constraints(
+            "mutation_interlocks"
+        )
+        if constraint["name"] == "ck_mutation_interlocks_operation"
+    )
+    assert "candidate_queue" not in mutation_operation_check
     assert {
         index["name"]
         for index in inspector.get_indexes("untrusted_ingest_events")

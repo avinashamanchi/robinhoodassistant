@@ -210,7 +210,14 @@ class ProviderBudgetConfig(_Strict):
     daily_input_tokens: int = Field(default=1_000_000, gt=0)
     daily_output_tokens: int = Field(default=200_000, gt=0)
     reservation_ttl_seconds: int = Field(default=300, gt=0)
-    max_chat_tool_turns: int = Field(default=8, gt=0, le=8)
+    max_chat_tool_turns: int = Field(
+        default=8,
+        gt=0,
+        le=8,
+        description=(
+            "Maximum provider turns and aggregate model tool calls per chat"
+        ),
+    )
     max_structured_attempts: int = Field(default=2, gt=0, le=2)
     backtest_llm_enabled: bool = False
     prices: dict[str, ProviderPriceConfig] = Field(default_factory=dict)

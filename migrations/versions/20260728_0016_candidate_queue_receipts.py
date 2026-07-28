@@ -38,20 +38,6 @@ def upgrade() -> None:
         allowed_modes=frozenset({"bootstrap", "maintenance"}),
     )
     with migration_schema_fence(authority, connection):
-        with op.batch_alter_table("mutation_interlocks") as batch:
-            batch.drop_constraint(
-                "ck_mutation_interlocks_operation",
-                type_="check",
-            )
-            batch.create_check_constraint(
-                "ck_mutation_interlocks_operation",
-                "operation IN ("
-                "'order_approve','order_reject','breaker_reset','order_cancel',"
-                "'portfolio_reconcile','order_sync','panic','analysis',"
-                "'plan_approve','plan_cancel','proposal_batch','backtest',"
-                "'candidate_queue'"
-                ")",
-            )
         op.create_table(
             "candidate_queue_receipts",
             sa.Column("id", sa.Integer(), primary_key=True),
@@ -229,16 +215,3 @@ def downgrade() -> None:
         raise RuntimeError("candidate_queue_receipt_downgrade_blocked")
     with migration_schema_fence(authority, connection):
         op.drop_table("candidate_queue_receipts")
-        with op.batch_alter_table("mutation_interlocks") as batch:
-            batch.drop_constraint(
-                "ck_mutation_interlocks_operation",
-                type_="check",
-            )
-            batch.create_check_constraint(
-                "ck_mutation_interlocks_operation",
-                "operation IN ("
-                "'order_approve','order_reject','breaker_reset','order_cancel',"
-                "'portfolio_reconcile','order_sync','panic','analysis',"
-                "'plan_approve','plan_cancel','proposal_batch','backtest'"
-                ")",
-            )

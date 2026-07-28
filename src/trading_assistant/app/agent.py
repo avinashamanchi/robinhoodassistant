@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from ..config import WindowLimitConfig
 from ..db.models import LLMDecision
 from ..identity import canonical_request_id
 from ..security.sensitive_fields import sensitive_store
@@ -27,6 +28,11 @@ from ..security.candidates import (
     SignedCandidate,
 )
 from ..service import TradingService
+from .limits import (
+    DurableRateLimiter,
+    LimitSpec,
+    LimitStoreUnavailable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +145,26 @@ READ_ONLY_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     },
 )
 
+_BROKER_READ_TOOLS = frozenset(
+    {
+        "get_market_data",
+        "get_account_summary",
+        "draft_order_candidate",
+        "draft_rule_candidate",
+    }
+)
+_TOOL_STOP_REPLIES = {
+    "tool_call_budget_exhausted": (
+        "Tool execution stopped: tool_call_budget_exhausted."
+    ),
+    "broker_read_rate_limited": (
+        "Tool execution stopped: broker_read_rate_limited."
+    ),
+    "broker_read_unavailable": (
+        "Tool execution stopped: broker_read_unavailable."
+    ),
+}
+
 
 class LLMBackend(Protocol):
     def create(
@@ -161,6 +187,10 @@ class ToolRouter:
     ) -> None:
         self.service = service
         self.candidate_drafts = candidate_drafts
+
+    @staticmethod
+    def requires_broker_read(name: str) -> bool:
+        return name in _BROKER_READ_TOOLS
 
     def dispatch(
         self,
@@ -261,6 +291,8 @@ class Agent:
         *,
         max_turns: int,
         candidate_drafts: CandidateDraftService | None = None,
+        rate_limiter: DurableRateLimiter,
+        broker_read_limit: WindowLimitConfig,
     ) -> None:
         if (
             not isinstance(max_turns, int)
@@ -274,6 +306,20 @@ class Agent:
         self.model = model
         self.max_tokens = max_tokens
         self.max_turns = max_turns
+        # One reviewed bound limits both provider turns and the aggregate
+        # number of model tool_use blocks across the whole chat.
+        self.max_tool_calls = max_turns
+        self.rate_limiter = rate_limiter
+        self.broker_read_spec = LimitSpec(
+            name="broker_read",
+            principal_requests=broker_read_limit.requests,
+            global_requests=broker_read_limit.global_requests,
+            window_seconds=broker_read_limit.window_seconds,
+            principal_daily_requests=broker_read_limit.daily_requests,
+            global_daily_requests=(
+                broker_read_limit.global_daily_requests
+            ),
+        )
 
     def chat(
         self,
@@ -282,6 +328,7 @@ class Agent:
         actor: str,
         reason: str,
         request_id: str,
+        limit_principal: str,
         session_binding: str = "",
     ) -> AgentReply:
         actor = actor.strip()
@@ -296,6 +343,7 @@ class Agent:
         final_text = ""
         last_resp = None
         candidates: list[SignedCandidate] = []
+        dispatched_tool_calls = 0
 
         for _ in range(self.max_turns):
             try:
@@ -320,23 +368,59 @@ class Agent:
 
             if getattr(resp, "stop_reason", None) == "tool_use":
                 results = []
+                stop_code: str | None = None
                 for block in resp.content:
                     if getattr(block, "type", None) == "tool_use":
+                        if stop_code is not None:
+                            output = {"error": stop_code}
+                        elif dispatched_tool_calls >= self.max_tool_calls:
+                            stop_code = "tool_call_budget_exhausted"
+                            output = {"error": stop_code}
+                        else:
+                            dispatched_tool_calls += 1
+                            output = None
                         is_draft = block.name in {
                             "draft_order_candidate",
                             "draft_rule_candidate",
                         }
-                        if is_draft and len(candidates) >= 4:
+                        if output is not None:
+                            pass
+                        elif is_draft and len(candidates) >= 4:
                             output = {"error": "candidate_limit_reached"}
                         else:
-                            output = self.router.dispatch(
-                                block.name,
-                                dict(block.input),
-                                actor=actor,
-                                reason=reason,
-                                request_id=request_id,
-                                session_binding=session_binding,
-                            )
+                            if self.router.requires_broker_read(
+                                block.name
+                            ):
+                                try:
+                                    broker_decision = (
+                                        self.rate_limiter.consume_pair(
+                                            self.broker_read_spec,
+                                            principal=limit_principal,
+                                        )
+                                    )
+                                except (
+                                    LimitStoreUnavailable,
+                                    ValueError,
+                                ):
+                                    stop_code = (
+                                        "broker_read_unavailable"
+                                    )
+                                    output = {"error": stop_code}
+                                else:
+                                    if not broker_decision.allowed:
+                                        stop_code = (
+                                            "broker_read_rate_limited"
+                                        )
+                                        output = {"error": stop_code}
+                            if output is None:
+                                output = self.router.dispatch(
+                                    block.name,
+                                    dict(block.input),
+                                    actor=actor,
+                                    reason=reason,
+                                    request_id=request_id,
+                                    session_binding=session_binding,
+                                )
                         raw_candidate = output.get("candidate")
                         if raw_candidate is not None:
                             try:
@@ -365,6 +449,9 @@ class Agent:
                             }
                         )
                 messages.append({"role": "user", "content": results})
+                if stop_code is not None:
+                    final_text = _TOOL_STOP_REPLIES[stop_code]
+                    break
                 continue
 
             final_text = "".join(

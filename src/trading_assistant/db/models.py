@@ -723,8 +723,7 @@ class MutationInterlock(Base):
             "operation IN ("
             "'order_approve','order_reject','breaker_reset','order_cancel',"
             "'portfolio_reconcile','order_sync','panic','analysis',"
-            "'plan_approve','plan_cancel','proposal_batch','backtest',"
-            "'candidate_queue'"
+            "'plan_approve','plan_cancel','proposal_batch','backtest'"
             ")",
             name="ck_mutation_interlocks_operation",
         ),

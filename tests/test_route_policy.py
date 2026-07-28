@@ -185,7 +185,31 @@ def test_every_api_route_has_exact_policy(make_service):
         assert candidate.audit_mutation is True
         assert candidate.broker_read is True
         assert candidate.concurrency_scope == "principal"
-        assert candidate.mutation_operation == "candidate_queue"
+        assert candidate.receipt_managed_idempotency is True
+        assert candidate.mutation_operation is None
+    approval = registry.get("POST", "/approve/{order_id}")
+    assert approval.receipt_managed_idempotency is False
+    assert approval.mutation_operation == "order_approve"
+
+
+def test_candidate_queue_is_not_a_generic_mutation_interlock_operation(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="candidate-operation-secret",
+        planning=None,
+    )
+
+    with pytest.raises(ValueError, match="unsupported mutation operation"):
+        app.state.mutation_interlocks.claim(
+            "candidate-generic-interlock",
+            owner="review-worker",
+            generation=1,
+            operation="candidate_queue",
+        )
 
 
 def test_duplicate_and_unclassified_routes_fail_inventory_validation():

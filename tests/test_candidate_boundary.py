@@ -17,15 +17,18 @@ from sqlalchemy import event, func, select
 
 from trading_assistant.assets import AssetClass
 from trading_assistant.app.main import create_app
+from trading_assistant.app.limits import InterlockDecision
 from trading_assistant.db.models import (
     AuditEvent,
     CandidateNonce,
     CircuitBreakerState,
     Order,
+    OrderStateMachine,
     RiskEvent,
     Rule,
     RuleGroup,
 )
+from trading_assistant.broker.models import OrderStatus
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import BreakerTripIntent, RiskResult
 from trading_assistant.rules.worker import RuleWorker
@@ -934,6 +937,167 @@ def test_completed_same_key_receipt_replays_after_envelope_expiry(
         assert session.scalar(select(func.count()).select_from(Order)) == 1
 
 
+def test_completed_order_receipt_replays_after_legal_status_progression(
+    make_service,
+):
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    with service.session_factory() as session:
+        order = session.get(Order, first.target_id)
+        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
+        session.commit()
+
+    replay = _queue_order(queue, envelope, binding)
+
+    assert replay == first
+    with service.session_factory() as session:
+        assert session.get(Order, first.target_id).status == "expired"
+
+
+@pytest.mark.parametrize("progressed_state", ["triggered", "canceled"])
+def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
+    make_service,
+    progressed_state,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        rule.state = progressed_state
+        group.state = progressed_state
+        if progressed_state == "triggered":
+            group.terminal_rule_id = rule.id
+        session.commit()
+
+    replay = _queue_rule(queue, envelope, binding)
+
+    assert replay == first
+    with service.session_factory() as session:
+        assert session.get(Rule, first.target_id).state == progressed_state
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "group_key",
+        "group_initial_state",
+        "payload_version",
+        "ticker",
+        "kind",
+        "condition_json",
+        "action_quantity",
+        "action_notional",
+        "action_limit",
+        "rule_initial_state",
+        "activation",
+        "pre_approved",
+        "terminal_on_trigger",
+        "fraction",
+        "hwm",
+        "deadline",
+        "plan_id",
+    ],
+)
+def test_rule_target_persisted_recovery_rejects_any_immutable_drift(
+    make_service,
+    tamper,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    armed = {"value": True}
+
+    def crash_hook(stage):
+        if armed["value"] and stage == "after_target_commit":
+            armed["value"] = False
+            raise RuntimeError("target persisted")
+
+    queue = _queue(service, signer, crash_hook=crash_hook)
+    with pytest.raises(RuntimeError, match="target persisted"):
+        _queue_rule(queue, envelope, binding)
+
+    with service.session_factory() as session:
+        rule = session.scalar(select(Rule))
+        group = session.get(RuleGroup, rule.group_id)
+        if tamper == "group_key":
+            group.group_key = "tampered-group-key"
+        elif tamper == "group_initial_state":
+            group.state = "triggered"
+        elif tamper == "payload_version":
+            rule.payload_version = 2
+        elif tamper == "ticker":
+            rule.ticker = "MSFT"
+        elif tamper == "kind":
+            rule.kind = "target"
+        elif tamper == "condition_json":
+            rule.condition_json = '{"direction":"below","price":"91","type":"price"}'
+        elif tamper.startswith("action_"):
+            action = json.loads(rule.action_json)
+            if tamper == "action_quantity":
+                action["qty"] = "1"
+                action["notional"] = None
+            elif tamper == "action_notional":
+                action["notional"] = "101"
+            else:
+                action["order_type"] = "limit"
+                action["limit_price"] = "99"
+            rule.action_json = json.dumps(
+                action,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        elif tamper == "rule_initial_state":
+            rule.state = "triggered"
+        elif tamper == "activation":
+            rule.activation = "on_entry_fill"
+        elif tamper == "pre_approved":
+            rule.pre_approved = True
+        elif tamper == "terminal_on_trigger":
+            rule.terminal_on_trigger = False
+        elif tamper == "fraction":
+            rule.fraction = Decimal("0.5")
+        elif tamper == "hwm":
+            rule.hwm = Decimal("101")
+        elif tamper == "deadline":
+            rule.deadline = NOW + timedelta(days=1)
+        elif tamper == "plan_id":
+            rule.plan_id = 99
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
+def test_completed_rule_replay_still_rejects_immutable_payload_drift(
+    make_service,
+):
+    api = _candidate_api()
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    _queue_rule(queue, envelope, binding)
+    with service.session_factory() as session:
+        rule = session.scalar(select(Rule))
+        action = json.loads(rule.action_json)
+        action["notional"] = "101"
+        rule.action_json = json.dumps(
+            action,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session.commit()
+
+    with pytest.raises(
+        api.CandidateError,
+        match="candidate_receipt_inconsistent",
+    ):
+        _queue_rule(queue, envelope, binding)
+
+
 def test_reserved_receipt_cannot_resume_after_candidate_ttl(
     make_service,
 ):
@@ -1143,6 +1307,27 @@ def test_queue_rejects_wrong_actor_session_kind_and_expired_candidate(
     )
     with pytest.raises(api.CandidateError, match="candidate_expired"):
         _queue_order(expired_queue, envelope, binding)
+
+
+def test_candidate_expires_at_exact_observed_instant(make_service):
+    api = _candidate_api()
+    envelope, service, signer, binding = _order_envelope(make_service)
+    queue = api.CandidateQueueService(
+        service,
+        signer,
+        now=lambda: envelope.expires_at,
+    )
+
+    with pytest.raises(api.CandidateError, match="candidate_expired"):
+        _queue_order(queue, envelope, binding)
+
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(CandidateNonce)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(_receipt_model())
+        ) == 0
 
 
 def test_provider_reads_never_happen_inside_sqlite_write_transaction(
@@ -1416,6 +1601,201 @@ def test_candidate_queue_http_rate_denial_is_fail_closed(
     )
     assert denied.status_code == 429, denied.text
     assert service.broker.submit_calls == 0
+
+
+def test_receipt_retry_ignores_abandoned_generic_mutation_interlock(
+    make_service,
+    authenticate_client,
+):
+    service = _service_at(make_service)
+    signer = _signer()
+    queue = _queue(service, signer)
+
+    class StubAgent:
+        def chat(self, message, **context):
+            return {"reply": message, "candidates": []}
+
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token="candidate-recovery-operator-secret",
+        planning=None,
+        candidate_signer=signer,
+        candidate_queue=queue,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app),
+        "candidate-recovery-operator-secret",
+    )
+    token = client.cookies.get(app.state.session_auth.cookie_name())
+    principal = app.state.session_auth.authenticate(token)
+    binding = signer.session_binding(
+        actor=principal.actor,
+        session_id=principal.session_id,
+        authenticated_at=principal.authenticated_at,
+    )
+    envelope = _candidate_api().CandidateDraftService(
+        service,
+        signer,
+        now=lambda: NOW,
+    ).draft_order(
+        {
+            "ticker": "AAPL",
+            "side": "buy",
+            "order_type": "market",
+            "notional": "100",
+            "thesis": "Recover only through the durable candidate receipt.",
+        },
+        actor=principal.actor,
+        session_binding=binding,
+    )
+    armed = {"value": True}
+
+    def crash_after_reserve(stage):
+        if armed["value"] and stage == "after_receipt_reserve":
+            armed["value"] = False
+            raise RuntimeError("receipt reserved")
+
+    with pytest.raises(RuntimeError, match="receipt reserved"):
+        _candidate_api().CandidateQueueService(
+            service,
+            signer,
+            now=lambda: NOW,
+            crash_hook=crash_after_reserve,
+        ).queue(
+            envelope,
+            expected_kind="order",
+            actor=principal.actor,
+            session_binding=binding,
+            idempotency_key="receipt-managed-retry",
+            reason=REASON,
+            request_id="receipt-managed-original",
+        )
+
+    app.state.mutation_interlocks.inspect = lambda _key: InterlockDecision(
+        acquired=False,
+        resource_key="abandoned-generic-interlock",
+        owner="dead-worker",
+        generation=1,
+        operation="order_approve",
+        state="uncertain",
+        outcome_code="handler_failed",
+        worker_finished_at=NOW,
+    )
+    app.state.mutation_interlocks.claim = (
+        lambda *_args, **_kwargs: pytest.fail(
+            "receipt-managed queue must not claim the generic interlock"
+        )
+    )
+    response = client.post(
+        "/candidates/order/queue",
+        json={
+            "candidate": envelope.model_dump(mode="json"),
+            "reason": REASON,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "receipt-managed-retry",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "proposed"
+    with service.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Order)) == 1
+        receipt = session.scalar(select(_receipt_model()))
+        assert receipt.state == "completed"
+
+
+def test_candidate_route_lease_still_rejects_concurrent_execution(
+    make_service,
+    authenticate_client,
+):
+    service = _service_at(make_service)
+    signer = _signer()
+    delegate = _queue(service, signer)
+    entered = threading.Event()
+    release = threading.Event()
+    queue_calls = 0
+    queue_lock = threading.Lock()
+
+    class BlockingQueue:
+        def queue(self, *args, **kwargs):
+            nonlocal queue_calls
+            with queue_lock:
+                queue_calls += 1
+            entered.set()
+            assert release.wait(timeout=5)
+            return delegate.queue(*args, **kwargs)
+
+    class StubAgent:
+        def chat(self, message, **context):
+            return {"reply": message, "candidates": []}
+
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token="candidate-lease-operator-secret",
+        planning=None,
+        candidate_signer=signer,
+        candidate_queue=BlockingQueue(),
+    )
+    owner, csrf = authenticate_client(
+        TestClient(app),
+        "candidate-lease-operator-secret",
+    )
+    token = owner.cookies.get(app.state.session_auth.cookie_name())
+    principal = app.state.session_auth.authenticate(token)
+    binding = signer.session_binding(
+        actor=principal.actor,
+        session_id=principal.session_id,
+        authenticated_at=principal.authenticated_at,
+    )
+    envelope = _candidate_api().CandidateDraftService(
+        service,
+        signer,
+        now=lambda: NOW,
+    ).draft_order(
+        {
+            "ticker": "AAPL",
+            "side": "buy",
+            "order_type": "market",
+            "notional": "100",
+            "thesis": "One route lease at a time.",
+        },
+        actor=principal.actor,
+        session_binding=binding,
+    )
+    request = {
+        "json": {
+            "candidate": envelope.model_dump(mode="json"),
+            "reason": REASON,
+        },
+        "headers": {
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "candidate-route-lease",
+        },
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        owner_future = pool.submit(
+            lambda: owner.post(
+                "/candidates/order/queue",
+                **request,
+            )
+        )
+        assert entered.wait(timeout=5)
+        follower = owner.post(
+            "/candidates/order/queue",
+            **request,
+        )
+        release.set()
+        owner_response = owner_future.result(timeout=5)
+
+    assert owner_response.status_code == 201, owner_response.text
+    assert follower.status_code == 409
+    assert follower.json()["error"]["code"] == "route_busy"
+    assert queue_calls == 1
 
 
 def test_http_terminal_rule_rejection_replays_original_403(

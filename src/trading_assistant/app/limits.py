@@ -35,6 +35,20 @@ class LimitStoreUnavailable(RuntimeError):
     """The authoritative durable policy store could not be used."""
 
 
+def session_limit_principal(session_id: int, actor: str) -> str:
+    """Return the one canonical durable-limit identity for an auth session."""
+
+    normalized_actor = actor.strip() if isinstance(actor, str) else ""
+    if (
+        not isinstance(session_id, int)
+        or isinstance(session_id, bool)
+        or session_id <= 0
+        or not normalized_actor
+    ):
+        raise ValueError("authenticated limit principal is invalid")
+    return f"session:{session_id}:{normalized_actor}"
+
+
 @dataclass(frozen=True)
 class LimitSpec:
     name: str
@@ -111,7 +125,6 @@ _MUTATION_OPERATIONS = frozenset(
         "plan_cancel",
         "proposal_batch",
         "backtest",
-        "candidate_queue",
     }
 )
 _UNCERTAIN_OUTCOMES = frozenset(

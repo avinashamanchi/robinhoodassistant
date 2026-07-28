@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
 
 from trading_assistant.app.agent import Agent, READ_ONLY_TOOL_SPECS
-from trading_assistant.db.models import AuditEvent, LLMDecision, Order, Rule
+from trading_assistant.app.limits import (
+    DurableRateLimiter,
+    LimitStoreUnavailable,
+)
+from trading_assistant.db.models import (
+    AuditEvent,
+    LLMDecision,
+    Order,
+    RateWindow,
+    Rule,
+)
 from trading_assistant.security.candidates import (
     CandidateDraftService,
     CandidateSigner,
 )
+from tests.conftest import decrypt_test_sensitive
 
 
 def _text(t):
@@ -59,8 +72,14 @@ class ScriptedBackend:
         return self._responses.pop(0)
 
 
-def _agent(make_service, responses, *, max_turns=8):
-    svc = make_service()
+def _agent_for_service(
+    svc,
+    responses,
+    *,
+    max_turns=8,
+    rate_limiter=None,
+    broker_read_limit=None,
+):
     backend = ScriptedBackend(responses)
     signer = CandidateSigner(b"k" * 32)
     drafts = CandidateDraftService(svc, signer)
@@ -72,6 +91,13 @@ def _agent(make_service, responses, *, max_turns=8):
         max_tokens=100,
         max_turns=max_turns,
         candidate_drafts=drafts,
+        rate_limiter=rate_limiter or DurableRateLimiter(
+            svc.session_factory
+        ),
+        broker_read_limit=(
+            broker_read_limit
+            or svc.config.security.rate_limits.broker_read
+        ),
     )
     agent.test_session_binding = signer.session_binding(
         actor="operator:test",
@@ -81,13 +107,27 @@ def _agent(make_service, responses, *, max_turns=8):
     return agent, svc
 
 
-def _chat(agent, message):
+def _agent(make_service, responses, *, max_turns=8):
+    return _agent_for_service(
+        make_service(),
+        responses,
+        max_turns=max_turns,
+    )
+
+
+def _chat(
+    agent,
+    message,
+    *,
+    limit_principal="session:7:operator:test",
+):
     return agent.chat(
         message,
         actor="operator:test",
         reason=message,
         request_id="agent-test-request",
         session_binding=getattr(agent, "test_session_binding", ""),
+        limit_principal=limit_principal,
     )
 
 
@@ -139,6 +179,7 @@ def test_agent_uses_one_normalized_request_id_for_provider_turns_and_audit(
         actor="operator:test",
         reason="capture stable parent identity",
         request_id="  http-request-123  ",
+        limit_principal="session:7:operator:test",
     )
 
     assert agent.backend.request_ids == [
@@ -189,6 +230,7 @@ def test_agent_rejects_noncanonical_request_id_before_backend_or_audit(
             actor="operator:test",
             reason="reject invalid request identity",
             request_id=request_id,
+            limit_principal="session:7:operator:test",
         )
 
     assert agent.backend.calls == 0
@@ -212,6 +254,7 @@ def test_agent_accepts_full_safe_request_id_character_set_at_64_characters(
         actor="operator:test",
         reason="accept maximum request identity",
         request_id=request_id,
+        limit_principal="session:7:operator:local",
     )
 
     assert len(request_id) == 64
@@ -360,6 +403,7 @@ def test_agent_tool_failure_does_not_return_raw_exception_text(
         actor="operator:local",
         reason="operator requested an AAPL lookup",
         request_id="chat-request-failure",
+        limit_principal="session:7:operator:test",
     )
 
     output = _first_tool_output(agent.backend)
@@ -397,6 +441,8 @@ def test_agent_chat_survives_backend_error(make_service, caplog):
         model="mock",
         max_tokens=100,
         max_turns=8,
+        rate_limiter=DurableRateLimiter(svc.session_factory),
+        broker_read_limit=svc.config.security.rate_limits.broker_read,
     )
     out = _chat(agent, "hi")
     assert out.candidates == ()
@@ -468,3 +514,340 @@ def test_agent_caps_candidates_before_fifth_quote_read(make_service):
 
     assert len(out.candidates) == 4
     assert quote_calls == 4
+    with svc.session_factory() as session:
+        assert sorted(
+            session.scalars(
+                select(RateWindow.hits).where(
+                    RateWindow.policy_name == "broker_read"
+                )
+            )
+        ) == [4, 4]
+
+
+def test_agent_hard_caps_48_tool_blocks_across_one_model_response(
+    make_service,
+):
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        f"tool-{index}",
+                        "get_market_data",
+                        {"ticker": "AAPL"},
+                    )
+                    for index in range(48)
+                ],
+            )
+        ],
+        max_turns=8,
+    )
+    quote_calls = 0
+    original_get_quote = svc.broker.get_quote
+
+    def counted_get_quote(ticker):
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_get_quote(ticker)
+
+    svc.broker.get_quote = counted_get_quote
+
+    reply = _chat(agent, "fan out")
+
+    assert quote_calls == 8
+    assert agent.backend.calls == 1
+    assert reply.reply == "Tool execution stopped: tool_call_budget_exhausted."
+    with svc.session_factory() as session:
+        decision = session.scalar(select(LLMDecision))
+        calls = json.loads(
+            decrypt_test_sensitive(decision, "tool_calls_json")
+        )
+        assert len(calls) == 48
+
+
+def test_agent_tool_budget_is_aggregate_across_model_turns(make_service):
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        f"first-{index}",
+                        "get_market_data",
+                        {"ticker": "AAPL"},
+                    )
+                    for index in range(5)
+                ],
+            ),
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        f"second-{index}",
+                        "get_market_data",
+                        {"ticker": "AAPL"},
+                    )
+                    for index in range(5)
+                ],
+            ),
+        ],
+        max_turns=8,
+    )
+    quote_calls = 0
+    original_get_quote = svc.broker.get_quote
+
+    def counted_get_quote(ticker):
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_get_quote(ticker)
+
+    svc.broker.get_quote = counted_get_quote
+
+    reply = _chat(agent, "cross-turn fan out")
+
+    assert quote_calls == 8
+    assert agent.backend.calls == 2
+    assert reply.reply == "Tool execution stopped: tool_call_budget_exhausted."
+
+
+def test_each_broker_backed_tool_consumes_one_durable_read(
+    make_service,
+):
+    draft = {
+        "ticker": "AAPL",
+        "side": "buy",
+        "order_type": "market",
+        "notional": "100",
+        "thesis": "bounded broker read",
+    }
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool("market", "get_market_data", {"ticker": "AAPL"}),
+                    _tool("account", "get_account_summary", {}),
+                    _tool("draft", "draft_order_candidate", draft),
+                ],
+            ),
+            _resp("end_turn", [_text("done")]),
+        ],
+    )
+
+    reply = _chat(agent, "three broker-backed tools")
+
+    assert reply.reply == "done"
+    with svc.session_factory() as session:
+        assert sorted(
+            session.scalars(
+                select(RateWindow.hits).where(
+                    RateWindow.policy_name == "broker_read"
+                )
+            )
+        ) == [3, 3]
+
+
+def test_broker_read_limits_isolate_authenticated_session_principals(
+    make_service,
+):
+    svc = make_service()
+    limiter = DurableRateLimiter(svc.session_factory)
+    first, _ = _agent_for_service(
+        svc,
+        [
+            _resp(
+                "tool_use",
+                [_tool("first", "get_market_data", {"ticker": "AAPL"})],
+            ),
+            _resp("end_turn", [_text("first done")]),
+        ],
+        rate_limiter=limiter,
+    )
+    second, _ = _agent_for_service(
+        svc,
+        [
+            _resp(
+                "tool_use",
+                [_tool("second", "get_market_data", {"ticker": "AAPL"})],
+            ),
+            _resp("end_turn", [_text("second done")]),
+        ],
+        rate_limiter=limiter,
+    )
+
+    _chat(first, "first", limit_principal="session:11:operator:test")
+    _chat(second, "second", limit_principal="session:12:operator:test")
+
+    with svc.session_factory() as session:
+        assert sorted(
+            session.scalars(
+                select(RateWindow.hits).where(
+                    RateWindow.policy_name == "broker_read"
+                )
+            )
+        ) == [1, 1, 2]
+
+
+def test_concurrent_chats_share_atomic_broker_read_capacity(make_service):
+    svc = make_service()
+    limiter = DurableRateLimiter(svc.session_factory)
+    broker_limit = (
+        svc.config.security.rate_limits.broker_read.model_copy(
+            update={
+                "requests": 5,
+                "global_requests": 5,
+                "window_seconds": 60,
+            }
+        )
+    )
+    agents = [
+        _agent_for_service(
+            svc,
+            [
+                _resp(
+                    "tool_use",
+                    [
+                        _tool(
+                            f"{chat_index}-{tool_index}",
+                            "get_market_data",
+                            {"ticker": "AAPL"},
+                        )
+                        for tool_index in range(4)
+                    ],
+                ),
+                _resp("end_turn", [_text("done")]),
+            ],
+            rate_limiter=limiter,
+            broker_read_limit=broker_limit,
+        )[0]
+        for chat_index in range(2)
+    ]
+    quote_calls = 0
+    quote_lock = Lock()
+    original_get_quote = svc.broker.get_quote
+
+    def counted_get_quote(ticker):
+        nonlocal quote_calls
+        with quote_lock:
+            quote_calls += 1
+        return original_get_quote(ticker)
+
+    svc.broker.get_quote = counted_get_quote
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replies = list(
+            pool.map(
+                lambda agent: _chat(
+                    agent,
+                    "concurrent",
+                    limit_principal="session:21:operator:test",
+                ),
+                agents,
+            )
+        )
+
+    assert quote_calls == 5
+    assert sorted(agent.backend.calls for agent in agents) in (
+        [1, 1],
+        [1, 2],
+    )
+    reply_texts = {reply.reply for reply in replies}
+    assert reply_texts <= {
+        "done",
+        "Tool execution stopped: broker_read_rate_limited.",
+    }
+    assert "Tool execution stopped: broker_read_rate_limited." in reply_texts
+
+
+def test_broker_read_denial_stops_remaining_tools_without_broker_call(
+    make_service,
+):
+    svc = make_service()
+    limiter = DurableRateLimiter(svc.session_factory)
+    broker_limit = (
+        svc.config.security.rate_limits.broker_read.model_copy(
+            update={
+                "requests": 1,
+                "global_requests": 1,
+                "window_seconds": 60,
+            }
+        )
+    )
+    from trading_assistant.app.limits import LimitSpec
+
+    limiter.consume_pair(
+        LimitSpec(
+            name="broker_read",
+            principal_requests=1,
+            global_requests=1,
+            window_seconds=60,
+        ),
+        principal="session:31:operator:test",
+    )
+    agent, _ = _agent_for_service(
+        svc,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool("one", "get_market_data", {"ticker": "AAPL"}),
+                    _tool("two", "get_account_summary", {}),
+                ],
+            )
+        ],
+        rate_limiter=limiter,
+        broker_read_limit=broker_limit,
+    )
+    svc.broker.get_quote = lambda *_args, **_kwargs: pytest.fail(
+        "rate denial must precede the broker"
+    )
+    svc.broker.get_account = lambda *_args, **_kwargs: pytest.fail(
+        "rate denial must stop remaining broker tools"
+    )
+
+    reply = _chat(
+        agent,
+        "denied",
+        limit_principal="session:31:operator:test",
+    )
+
+    assert agent.backend.calls == 1
+    assert reply.reply == "Tool execution stopped: broker_read_rate_limited."
+
+
+def test_broker_read_store_failure_stops_without_broker_call(
+    make_service,
+):
+    class BrokenLimiter:
+        def consume_pair(self, *_args, **_kwargs):
+            raise LimitStoreUnavailable("offline")
+
+    svc = make_service()
+    agent, _ = _agent_for_service(
+        svc,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool("one", "get_market_data", {"ticker": "AAPL"}),
+                    _tool("two", "get_account_summary", {}),
+                ],
+            )
+        ],
+        rate_limiter=BrokenLimiter(),
+    )
+    svc.broker.get_quote = lambda *_args, **_kwargs: pytest.fail(
+        "store failure must precede the broker"
+    )
+    svc.broker.get_account = lambda *_args, **_kwargs: pytest.fail(
+        "store failure must stop remaining broker tools"
+    )
+
+    reply = _chat(agent, "store unavailable")
+
+    assert agent.backend.calls == 1
+    assert reply.reply == "Tool execution stopped: broker_read_unavailable."
