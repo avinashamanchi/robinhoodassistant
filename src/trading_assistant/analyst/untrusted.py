@@ -357,18 +357,20 @@ def _canonicalize_active_content(
     raise UntrustedContentError("canonicalization_not_converged")
 
 
-def _decoded_instruction(candidate: str) -> bool:
+def _decode_base64_candidate(candidate: str) -> bytes | None:
     if len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS:
-        return False
+        return None
     compact = candidate.strip()
     if not compact:
-        return False
+        return None
     has_standard_symbols = "+" in compact or "/" in compact
     has_urlsafe_symbols = "-" in compact or "_" in compact
     if has_standard_symbols and has_urlsafe_symbols:
-        return False
+        return None
     if len(compact.rstrip("=")) % 4 == 1:
-        return False
+        return None
+    if "=" in compact and len(compact) % 4 != 0:
+        return None
     padded = compact + ("=" * (-len(compact) % 4))
     try:
         decoded = base64.b64decode(
@@ -377,7 +379,13 @@ def _decoded_instruction(candidate: str) -> bool:
             validate=True,
         )
     except (UnicodeEncodeError, binascii.Error, ValueError):
-        return False
+        return None
+    if len(decoded) > _MAX_DECODED_PAYLOAD_BYTES:
+        return None
+    return decoded
+
+
+def _decoded_bytes_contain_instruction(decoded: bytes) -> bool:
     if len(decoded) > _MAX_DECODED_PAYLOAD_BYTES:
         return False
     try:
@@ -408,6 +416,14 @@ def _decoded_instruction(candidate: str) -> bool:
             }
             for finding in decoded_findings.values()
         )
+    )
+
+
+def _decoded_instruction(candidate: str) -> bool:
+    decoded = _decode_base64_candidate(candidate)
+    return (
+        decoded is not None
+        and _decoded_bytes_contain_instruction(decoded)
     )
 
 
@@ -483,9 +499,7 @@ def _bare_encoded_span(
             and text[position] != "="
         )
     ):
-        while position < len(text) and not text[position].isspace():
-            position += 1
-        return position, "", True
+        raise UntrustedContentError("malformed_encoding")
 
     compact: list[str] = []
     token_count = 0
@@ -500,7 +514,12 @@ def _bare_encoded_span(
             position += 1
             continue
         if character not in _BASE64_ALPHABET and character != "=":
-            break
+            code = (
+                "ambiguous_encoding"
+                if token_count > 1
+                else "malformed_encoding"
+            )
+            raise UntrustedContentError(code)
         if not in_token:
             token_count += 1
             in_token = True
@@ -514,8 +533,8 @@ def _bare_encoded_span(
                 else:
                     malformed = True
                 position += 1
-            if position < len(text) and text[position] in _BASE64_ALPHABET:
-                raise UntrustedContentError("ambiguous_encoding")
+            if position < len(text) and not text[position].isspace():
+                raise UntrustedContentError("malformed_encoding")
             padding_count = position - padding_start
             malformed = malformed or padding_count > 2
             last_payload_end = position
@@ -539,10 +558,6 @@ def _bare_encoded_span(
             and ("-" in candidate or "_" in candidate)
         )
     )
-    padded = candidate.endswith("=")
-    reached_eof = position >= len(text)
-    if not padded and token_count > 1 and not reached_eof:
-        raise UntrustedContentError("ambiguous_encoding")
     return last_payload_end, candidate, malformed
 
 
@@ -573,7 +588,12 @@ def _strip_cued_encoded_payloads(
             text,
             cue.end(),
         )
-        if not malformed and _decoded_instruction(candidate):
+        if malformed:
+            raise UntrustedContentError("malformed_encoding")
+        decoded = _decode_base64_candidate(candidate)
+        if decoded is None:
+            raise UntrustedContentError("malformed_encoding")
+        if _decoded_bytes_contain_instruction(decoded):
             _add_finding(findings, "encoded_instruction", "high")
         else:
             _add_finding(findings, "malformed_encoding", "medium")
