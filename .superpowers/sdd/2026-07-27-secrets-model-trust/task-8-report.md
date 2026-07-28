@@ -106,3 +106,94 @@ over the packaged diff rather than a separately executed reviewer agent.
   shared-backend contract, while its reservation becomes fully charged
   `unknown`; this task did not change that established behavior.
 - No push was performed.
+
+## Fix round 1 — three Important findings
+
+Date: 2026-07-28
+
+Fix-round base: `a0482b38b0dbf716113b90fb773923d57a3a2fcc`
+
+Implementation commit: `aab0c32310acea1c1cc74c9f96b70742e4b93581`
+
+### Source copy-through
+
+- Reproduced direct `COPYTHROUGHMARKER`, underscore-to-hyphen marker
+  normalization, partial copied phrases, NFKC/case/punctuation variants, and
+  copied uncertainties before changing production code.
+- Added bounded source-derived lexical fingerprints over nonnumeric tokens of
+  at least 12 characters and contiguous 3–5-token n-grams.
+- Fingerprints use NFKC, case-folding, punctuation separation, and bounded
+  128-bit digests. Work is capped by the existing 20-item/16-KiB source limits,
+  per-source and aggregate token limits, and a fixed fingerprint-operation
+  ceiling.
+- Standalone short tickers, ordinary two-token company names, and pure numeric
+  single tokens are intentionally allowed. A legitimate long proper noun can
+  be rejected; that conservative false-positive is preferred to raw
+  copy-through and forces repair/paraphrase.
+- Facts and uncertainties use the same check. Rejected first responses consume
+  the one repair attempt, and copied source material never reaches the
+  privileged analyst call.
+
+### Budget cancellation and stale-started reconciliation
+
+- Reproduced a provider `CancelledError` masked by a secondary
+  `KeyboardInterrupt` from `mark_unknown`.
+- Reconciliation now catches secondary `BaseException`, attaches a stable note
+  where possible, and always preserves/re-raises the original provider or
+  cancellation exception.
+- Added atomic, idempotent stale-started maintenance on reserve, status, and
+  explicit `reconcile_expired_started()`. It acts only at
+  `expires_at <= now`, retains all charged call/token reservations, transitions
+  `started` to `unknown`, and latches the provider day with
+  `provider_started_usage_unknown`.
+- New reservations fail closed until operator/provider reconciliation.
+  Unexpired calls are untouched, invalid start/expiry chronology is rejected,
+  an unknown reservation cannot settle, and concurrent reapers transition
+  exactly once without capacity reuse.
+
+### Citation persistence boundary
+
+- Added one shared `validate_source_citations()` boundary for
+  `AnalysisReport` and `TradePlan`.
+- `Analyst` invokes it for primary outputs. `PlanningService` invokes it
+  immediately after any injected analyst returns, before risk snapshot/sizing,
+  and `_store()` invokes it again before row/audit creation.
+- `save_report()` accepts the summary context and validates before constructing
+  a persistence row. Direct stores, alternate analysts, no-summary citations,
+  missing references, and unknown references fail before report, plan, audit,
+  candidate, or risk-snapshot work.
+- Valid opaque `s1` persistence and no-summary/empty-reference behavior remain
+  covered. Shadow/report callers remain behind `save_report`.
+
+### Fix-round verification
+
+- TDD RED was observed independently for all three findings before production
+  changes.
+- Focused Task 8/budget/analyst/planning/store/news group:
+  `236 passed, 1 warning in 8.26s`.
+- Cancellation plus concurrent-reaper repeats: `40/40 passed`.
+- Broader app/API/bootstrap/daemon/launch/release/budget-review group:
+  `516 passed, 1 warning in 50.81s`.
+- Compile check: PASS.
+- Release static checks: PASS.
+- Raw-news seam and privileged `UntrustedContent` searches: PASS.
+- `git diff --check`: PASS.
+- Exactly one fix-round full-suite run:
+  `2990 passed, 1 skipped, 1 warning in 266.15s (0:04:26)`.
+
+The sole warning remains the existing third-party
+`websockets.legacy.__init__` deprecation warning under `.venv`.
+
+Review package:
+`review-a0482b3..aab0c32.diff` (60,303 bytes, one implementation commit).
+
+A fresh bounded acceptance review of the packaged base-to-implementation diff
+found zero open findings. Agent-dispatch controls were unavailable, so this was
+a manual packaged-diff review rather than a separately executed reviewer
+agent.
+
+PAPER mode, manual approval, kill switches, broker truth, news-disabled
+defaults, and no-tools/raw-seam closure remain unchanged. No migration was
+needed. Only temporary SQLite test databases were used; no runtime database,
+Keychain, network, credentials, broker/provider, notification, order, breaker,
+app, daemon, or MCP state was accessed or changed. No push was performed.
