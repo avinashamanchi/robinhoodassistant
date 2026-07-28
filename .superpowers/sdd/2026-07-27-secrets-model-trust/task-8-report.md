@@ -337,3 +337,27 @@ validation, and analyst behavior remain unchanged. No migration was needed.
 Only temporary SQLite test databases were used; no runtime database, Keychain,
 network, credentials, broker/provider, notification, order, breaker, app,
 daemon, or MCP state was accessed or changed. No push was performed.
+
+## Independent review closure — CLEAN
+
+Date: 2026-07-28
+
+Fresh reviewer verdict: **CLEAN with no findings.**
+
+The independent review verified:
+
+- both expired `started` and `unknown` states are swept atomically;
+- only `started → unknown` increments the transition count;
+- repeated sweeps are idempotent and retain all charged aggregates;
+- reserve and status trigger the provider-scoped sweep;
+- provider and budget-day isolation is preserved; and
+- settled and released reservations remain unchanged.
+
+Independent reviewer evidence:
+
+- `17` focused race cases passed;
+- `11` adjacent integrity cases passed; and
+- `3` adversarial temporary-database probes passed.
+
+No full suite was run for this evidence-only closure. The worktree was clean
+before the documentation-only closure. Task 8 is **CLOSED**.
