@@ -98,7 +98,7 @@ class _StubAnalyst:
         self,
         features,
         held_symbols=None,
-        news=None,
+        untrusted_summary=None,
         request_id=None,
     ):
         self.request_ids.append(request_id)

@@ -478,6 +478,9 @@ class ProviderBudgetService:
                 session,
                 reservation.provider,
             )
+            if reservation.state in {"unknown", "settled"}:
+                session.commit()
+                return
             if reservation.state != "started":
                 session.rollback()
                 raise ProviderBudgetUnavailable(

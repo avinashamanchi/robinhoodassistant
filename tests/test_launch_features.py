@@ -69,7 +69,7 @@ class _StubAnalyst:
         self,
         features,
         held_symbols=None,
-        news=None,
+        untrusted_summary=None,
         request_id=None,
     ):
         return self.plan
@@ -319,7 +319,7 @@ def test_shadow_canonicalizes_identity_once_across_restart_and_persistence(
             self,
             features,
             held_symbols=None,
-            news=None,
+            untrusted_summary=None,
             request_id=None,
         ):
             self.request_ids.append(request_id)

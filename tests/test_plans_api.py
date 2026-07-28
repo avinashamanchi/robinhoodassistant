@@ -142,7 +142,7 @@ class _StubAnalyst:
         self,
         features,
         held_symbols=None,
-        news=None,
+        untrusted_summary=None,
         request_id=None,
     ):
         return _plan()

@@ -33,6 +33,7 @@ from .promotion import can_promote
 from .scorecard import build_scorecard
 from .sizing import SizedTradePlan, size_trade
 from .store import build_scorecard_from_db
+from .untrusted import UntrustedSummary
 
 
 def _floor(x: Decimal) -> Decimal:
@@ -131,6 +132,7 @@ class PlanningService:
         actor: str,
         reason: str,
         request_id: str,
+        untrusted_summary: UntrustedSummary | None = None,
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
@@ -144,6 +146,7 @@ class PlanningService:
         plan = self.analyst.analyze_plan(
             features,
             held_symbols=held,
+            untrusted_summary=untrusted_summary,
             request_id=request_id,
         )
 

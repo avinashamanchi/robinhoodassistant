@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .app.auth import SessionAuth
+from .analyst.untrusted import QuarantineSummarizer
 from .app.limits import (
     ConcurrencyLeaseService,
     DurableRateLimiter,
@@ -97,6 +98,7 @@ class ApplicationContainer:
     operations: OperationsService
     sensitive_cipher: SensitiveDataCipher | None = None
     runtime_tenure_guard: RuntimeTenureGuard | None = None
+    quarantine_summarizer: QuarantineSummarizer | None = None
 
 
 def prepare_database_runtime(
@@ -229,6 +231,26 @@ def build_provider_budget_service(
             reservation_ttl_seconds=configured.reservation_ttl_seconds,
         ),
         prices=configured.prices,
+    )
+
+
+def build_quarantine_summarizer(
+    config: AppConfig,
+    secrets: RuntimeSecrets,
+    provider_budget: ProviderBudgetService,
+) -> QuarantineSummarizer | None:
+    """Compose the no-tools reader separately from the privileged analyst."""
+    if not config.analyst.news_enabled:
+        return None
+    from .llm.factory import build_llm_backend
+
+    return QuarantineSummarizer(
+        build_llm_backend(
+            config,
+            secrets,
+            provider_budget=provider_budget,
+            category="untrusted",
+        )
     )
 
 
@@ -373,6 +395,11 @@ def _finish_container(
         config,
         session_factory,
     )
+    quarantine_summarizer = build_quarantine_summarizer(
+        config,
+        secrets,
+        provider_budget,
+    )
 
     production_broker = broker is None
     if broker is None:
@@ -469,4 +496,5 @@ def _finish_container(
         operations=operations,
         sensitive_cipher=sensitive_cipher,
         runtime_tenure_guard=runtime_tenure_guard,
+        quarantine_summarizer=quarantine_summarizer,
     )

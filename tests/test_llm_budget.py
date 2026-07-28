@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -620,6 +621,220 @@ def test_delegate_exception_leaves_reservation_fully_charged_and_unknown(
     assert reservation.input_actual is None
     assert reservation.output_actual is None
     assert reservation.settled_at is None
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        KeyboardInterrupt("stop"),
+        SystemExit("stop"),
+        asyncio.CancelledError("stop"),
+    ],
+    ids=["keyboard-interrupt", "system-exit", "cancelled"],
+)
+def test_delegate_base_exception_is_preserved_and_reservation_becomes_unknown(
+    session_factory,
+    interruption,
+):
+    backend, delegate, _service = _backend(
+        session_factory,
+        interruption,
+        max_output_tokens=40,
+    )
+
+    with pytest.raises(type(interruption)) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id=f"request-{type(interruption).__name__.lower()}",
+        )
+
+    assert failure.value is interruption
+    assert len(delegate.calls) == 1
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.state == "unknown"
+
+
+def test_mark_started_interruption_after_durable_commit_never_calls_provider(
+    session_factory,
+    monkeypatch,
+):
+    service = _service(session_factory)
+    original_mark_started = service.mark_started
+    interruption = asyncio.CancelledError("cancel-after-start")
+
+    def interrupt_after_commit(reservation_id):
+        original_mark_started(reservation_id)
+        raise interruption
+
+    monkeypatch.setattr(service, "mark_started", interrupt_after_commit)
+    delegate = ScriptedBackend([_response(1, 1)])
+    backend = BudgetedLLMBackend(
+        delegate,
+        service,
+        provider="test",
+        category="untrusted",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+
+    with pytest.raises(asyncio.CancelledError) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id="request-cancel-after-start",
+        )
+
+    assert failure.value is interruption
+    assert delegate.calls == []
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.state == "unknown"
+
+
+def test_usage_base_exception_is_preserved_and_reservation_becomes_unknown(
+    session_factory,
+):
+    interruption = KeyboardInterrupt("cancel-usage-read")
+
+    class UsageFailure:
+        @property
+        def input_tokens(self):
+            raise interruption
+
+    response = SimpleNamespace(content=[], usage=UsageFailure())
+    backend, _delegate, _service = _backend(
+        session_factory,
+        response,
+        max_output_tokens=40,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id="request-cancel-usage-read",
+        )
+
+    assert failure.value is interruption
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.state == "unknown"
+
+
+def test_settlement_failure_marks_started_reservation_unknown_before_raising(
+    session_factory,
+    monkeypatch,
+):
+    service = _service(session_factory)
+    delegate = ScriptedBackend([_response(1, 1)])
+    backend = BudgetedLLMBackend(
+        delegate,
+        service,
+        provider="test",
+        category="untrusted",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+    settlement_error = RuntimeError("settlement unavailable")
+
+    def fail_settlement(*_args, **_kwargs):
+        raise settlement_error
+
+    monkeypatch.setattr(service, "settle", fail_settlement)
+
+    with pytest.raises(RuntimeError) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id="request-settlement-failure",
+        )
+
+    assert failure.value is settlement_error
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.state == "unknown"
+
+
+def test_mark_unknown_is_idempotent_for_unknown_and_settled_reservations(
+    session_factory,
+):
+    service = _service(session_factory)
+    unknown = service.reserve(
+        provider="test",
+        category="untrusted",
+        request_id="request-idempotent-unknown",
+        input_tokens=1,
+        output_tokens=1,
+    )
+    service.mark_started(unknown.reservation_id)
+    service.mark_unknown(unknown.reservation_id)
+    service.mark_unknown(unknown.reservation_id)
+
+    settled = service.reserve(
+        provider="test",
+        category="untrusted",
+        request_id="request-idempotent-settled",
+        input_tokens=1,
+        output_tokens=1,
+    )
+    service.mark_started(settled.reservation_id)
+    service.settle(
+        settled.reservation_id,
+        input_tokens=1,
+        output_tokens=1,
+    )
+    service.mark_unknown(settled.reservation_id)
+
+    assert _reservation_state(
+        session_factory,
+        unknown.reservation_id,
+    ) == "unknown"
+    assert _reservation_state(
+        session_factory,
+        settled.reservation_id,
+    ) == "settled"
+
+
+def test_reconciliation_keyboard_interrupt_is_never_swallowed(
+    session_factory,
+    monkeypatch,
+):
+    service = _service(session_factory)
+    delegate = ScriptedBackend([RuntimeError("provider failed")])
+    backend = BudgetedLLMBackend(
+        delegate,
+        service,
+        provider="test",
+        category="untrusted",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+    interruption = KeyboardInterrupt("operator interruption")
+
+    def interrupt_reconciliation(_reservation_id):
+        raise interruption
+
+    monkeypatch.setattr(
+        service,
+        "mark_unknown",
+        interrupt_reconciliation,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id="request-reconciliation-interrupt",
+        )
+
+    assert failure.value is interruption
 
 
 def test_missing_usage_leaves_reservation_fully_charged_and_unknown(

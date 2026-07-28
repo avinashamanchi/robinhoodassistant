@@ -35,7 +35,9 @@ def _base_report(plan: TradePlan, *, symbol: str | None = None) -> AnalysisRepor
         as_of=plan.as_of,
         action=AnalystAction(action),
         confidence=plan.confidence, thesis=plan.thesis,
-        cited_concepts=plan.cited_concepts, regime_note=plan.regime_note,
+        cited_concepts=plan.cited_concepts,
+        cited_source_refs=plan.cited_source_refs,
+        regime_note=plan.regime_note,
         earnings_note=plan.earnings_note, correlation_note=plan.correlation_note,
     )
 

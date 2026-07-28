@@ -16,6 +16,10 @@ from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
 from ..signals.models import MarketFeatures
 from .models import AnalysisReport
+from .untrusted import (
+    UntrustedSummary,
+    validate_summary_for_privileged_use,
+)
 
 _PLAYBOOK = (Path(__file__).resolve().parent.parent / "signals" / "playbook.md").read_text(
     encoding="utf-8"
@@ -43,11 +47,23 @@ SUBMIT_TOOL: dict[str, Any] = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "thesis": {"type": "string"},
             "cited_concepts": {"type": "array", "items": {"type": "string"}},
+            "cited_source_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
             "regime_note": {"type": "string"},
             "earnings_note": {"type": ["string", "null"]},
             "correlation_note": {"type": ["string", "null"]},
         },
-        "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note"],
+        "required": [
+            "action",
+            "confidence",
+            "thesis",
+            "cited_concepts",
+            "cited_source_refs",
+            "regime_note",
+        ],
     },
 }
 
@@ -76,6 +92,11 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "thesis": {"type": "string"},
             "cited_concepts": {"type": "array", "items": {"type": "string"}},
+            "cited_source_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
             "regime_note": {"type": "string"},
             "earnings_note": {"type": ["string", "null"]},
             "correlation_note": {"type": ["string", "null"]},
@@ -129,8 +150,18 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
                 "required": ["targets", "stop"],
             },
         },
-        "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note",
-                     "scenarios", "invalidation", "entry_plan", "exit_plan"],
+        "required": [
+            "action",
+            "confidence",
+            "thesis",
+            "cited_concepts",
+            "cited_source_refs",
+            "regime_note",
+            "scenarios",
+            "invalidation",
+            "entry_plan",
+            "exit_plan",
+        ],
     },
 }
 
@@ -167,15 +198,32 @@ class Analyst:
         self.suppress_ranging = suppress_ranging
         self.max_attempts = max_attempts
 
-    def _prompt(self, features: MarketFeatures, held_symbols: list[str]) -> str:
+    def _prompt(
+        self,
+        features: MarketFeatures,
+        held_symbols: list[str],
+        untrusted_summary: UntrustedSummary | None,
+    ) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
         # the analyst reasons over.
         payload = features.model_dump(mode="json", exclude={"recent_bars"})
-        return (
+        prompt = (
             "Analyze these features and submit_analysis.\n"
             f"Currently held (for correlation): {held_symbols or 'none'}\n"
             f"FEATURES:\n{json.dumps(payload, indent=2, default=str)}"
         )
+        if untrusted_summary is not None:
+            prompt += (
+                "\nUNTRUSTED_SUMMARY:\n"
+                + json.dumps(
+                    untrusted_summary.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        return prompt
 
     def _create(self, **kwargs):
         try:
@@ -189,18 +237,31 @@ class Analyst:
         self,
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
+        untrusted_summary: UntrustedSummary | None = None,
         *,
         request_id: str,
     ) -> AnalysisReport:
         budget_request_id = canonical_request_id(request_id)
+        if untrusted_summary is not None:
+            validate_summary_for_privileged_use(untrusted_summary)
         resp = self._create(
             system=SYSTEM_PREAMBLE,
-            messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": self._prompt(
+                        features,
+                        held_symbols or [],
+                        untrusted_summary,
+                    ),
+                }
+            ],
             tools=[SUBMIT_TOOL],
             tool_choice="any",   # structured output is mandatory for the analyst
             request_id=budget_request_id,
         )
         report = self._parse(resp, features)
+        self._enforce_source_citations(report, untrusted_summary)
         self._enforce_quality(report, features)
         return self._apply_regime_filter(report, features)
 
@@ -218,7 +279,7 @@ class Analyst:
         self,
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
-        news: Optional[list[str]] = None,
+        untrusted_summary: UntrustedSummary | None = None,
         *,
         request_id: str,
     ):
@@ -227,13 +288,14 @@ class Analyst:
 
         from .models import TradePlan
 
+        if untrusted_summary is not None:
+            validate_summary_for_privileged_use(untrusted_summary)
         system = PLAN_PREAMBLE
-        user = self._prompt(features, held_symbols or [])
-        if news:
-            from .news import NEWS_GUARD, format_news_context
-
-            system = NEWS_GUARD + "\n\n" + PLAN_PREAMBLE
-            user = user + "\n\n" + format_news_context(news)
+        user = self._prompt(
+            features,
+            held_symbols or [],
+            untrusted_summary,
+        )
 
         validation_error: ValueError | None = None
         budget_request_id = canonical_request_id(request_id)
@@ -268,6 +330,10 @@ class Analyst:
                 data["as_of"] = features.as_of
                 data["reference_price"] = Decimal(str(features.last_close or 0))
                 plan = TradePlan(**data)
+                self._enforce_source_citations(
+                    plan,
+                    untrusted_summary,
+                )
                 self._enforce_quality(plan, features)
                 return self._apply_regime_filter(plan, features)
             except StopIteration:
@@ -298,4 +364,29 @@ class Analyst:
         if dte is not None and 0 <= dte <= EARNINGS_HORIZON_DAYS and not report.earnings_note:
             raise ValueError(
                 f"earnings in {dte}d but the analysis did not address earnings risk"
+            )
+
+    @staticmethod
+    def _enforce_source_citations(
+        report: AnalysisReport,
+        untrusted_summary: UntrustedSummary | None,
+    ) -> None:
+        cited = report.cited_source_refs
+        if len(set(cited)) != len(cited):
+            raise ValueError("source citations must be unique")
+        if untrusted_summary is None:
+            if cited:
+                raise ValueError(
+                    "source citations require an untrusted summary"
+                )
+            return
+        allowed = set(untrusted_summary.source_refs)
+        relevant = {
+            fact.source_ref for fact in untrusted_summary.facts
+        }
+        if any(ref not in allowed for ref in cited):
+            raise ValueError("source citation is not in the summary")
+        if untrusted_summary.facts and not relevant.intersection(cited):
+            raise ValueError(
+                "source citation is required for summarized facts"
             )

@@ -90,6 +90,21 @@ class BudgetedLLMBackend:
         self.max_output_tokens = max_output_tokens
         self.estimator = estimator
 
+    def _reconcile_unknown_after_failure(
+        self,
+        reservation_id: str,
+        original_error: BaseException,
+    ) -> None:
+        try:
+            self.budgets.mark_unknown(reservation_id)
+        except Exception:
+            try:
+                original_error.add_note(
+                    "provider reservation reconciliation failed"
+                )
+            except Exception:
+                pass
+
     def create(
         self,
         *,
@@ -118,7 +133,14 @@ class BudgetedLLMBackend:
             input_tokens=input_reservation,
             output_tokens=self.max_output_tokens,
         )
-        self.budgets.mark_started(reservation.reservation_id)
+        try:
+            self.budgets.mark_started(reservation.reservation_id)
+        except BaseException as start_error:
+            self._reconcile_unknown_after_failure(
+                reservation.reservation_id,
+                start_error,
+            )
+            raise
         try:
             response = self.__delegate.create(
                 system=system,
@@ -127,14 +149,11 @@ class BudgetedLLMBackend:
                 tool_choice=tool_choice,
                 request_id=request_id,
             )
-        except Exception as delegate_error:
-            try:
-                self.budgets.mark_unknown(reservation.reservation_id)
-            except Exception:
-                delegate_error.add_note(
-                    "provider reservation remains started because "
-                    "mark_unknown failed"
-                )
+        except BaseException as delegate_error:
+            self._reconcile_unknown_after_failure(
+                reservation.reservation_id,
+                delegate_error,
+            )
             raise
 
         try:
@@ -158,25 +177,29 @@ class BudgetedLLMBackend:
                         )
                         else None
                     )
-        except Exception as usage_error:
-            try:
-                self.budgets.mark_unknown(reservation.reservation_id)
-            except Exception:
-                usage_error.add_note(
-                    "provider reservation remains started because "
-                    "mark_unknown failed"
-                )
+        except BaseException as usage_error:
+            self._reconcile_unknown_after_failure(
+                reservation.reservation_id,
+                usage_error,
+            )
             raise
 
         if usage_counts is None:
             self.budgets.mark_unknown(reservation.reservation_id)
             return response
         input_tokens, output_tokens = usage_counts
-        self.budgets.settle(
-            reservation.reservation_id,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        try:
+            self.budgets.settle(
+                reservation.reservation_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        except BaseException as settlement_error:
+            self._reconcile_unknown_after_failure(
+                reservation.reservation_id,
+                settlement_error,
+            )
+            raise
         return response
 
 

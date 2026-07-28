@@ -1175,17 +1175,29 @@ git commit -m "feat(analyst): quarantine external text"
 
 - Modify: `src/trading_assistant/analyst/untrusted.py`
 - Modify: `src/trading_assistant/analyst/analyst.py`
+- Modify: `src/trading_assistant/analyst/models.py`
+- Modify: `src/trading_assistant/analyst/news.py`
 - Modify: `src/trading_assistant/analyst/planning.py`
+- Modify: `src/trading_assistant/analyst/shadow.py`
+- Modify: `src/trading_assistant/llm/base.py`
+- Modify: `src/trading_assistant/llm/budget.py`
 - Modify: `src/trading_assistant/bootstrap.py`
+- Modify: `src/trading_assistant/app/main.py`
 - Modify: `tests/test_untrusted_content.py`
 - Modify: `tests/test_analyst.py`
 - Modify: `tests/test_planning.py`
+- Modify: `tests/test_llm_budget.py`
+- Modify: `tests/test_news.py`
+- Create: `tests/test_task8_model_trust.py`
 
 **Interfaces:**
 
 - Adds `QuarantineSummarizer.summarize(items, request_id)`.
 - Changes analyst/planner news input to `UntrustedSummary | None`.
 - Uses provider budget category `untrusted`.
+- Adds opaque `cited_source_refs` to reports and plans.
+- Makes started provider-budget reservations cancellation-safe and
+  idempotently reconcilable as `unknown`.
 
 - [ ] **Step 1: Write no-tools and no-raw-forwarding tests**
 
@@ -1237,6 +1249,11 @@ Parse into `UntrustedSummary` with `extra="forbid"`. One repair attempt uses
 `:untrusted:2` and consumes a second reservation. Suspicious flags from
 deterministic sanitation cannot be removed by model output.
 
+The implementation derives bounded hashed child request IDs rather than
+concatenating onto a potentially 64-character operator request ID. It accepts
+exact JSON from one text block only, rejects tool blocks and copied raw markers,
+and re-sanitizes every fact and uncertainty before privileged use.
+
 - [ ] **Step 4: Pass only structured data to privileged analysis**
 
 Remove `format_news_context()` and every raw `news: list[str]` signature.
@@ -1244,7 +1261,19 @@ Serialize `UntrustedSummary.model_dump(mode="json")` into the analyst data
 section beside deterministic `MarketFeatures`. Require the analyst output to
 cite `source_ref` values that exist in the summary.
 
-- [ ] **Step 5: Run model-boundary tests**
+Both report schemas expose `cited_source_refs`. With no summary the field must
+be empty. With summarized facts, at least one cited reference must correspond
+to a supplied fact before any report, plan, candidate, or audit write.
+
+- [ ] **Step 5: Make shared provider budgeting cancellation-safe**
+
+Catch provider, usage-read, and settlement failures across `BaseException`,
+durably move a started reservation to `unknown`, and re-raise the original
+`KeyboardInterrupt`, `SystemExit`, or `CancelledError`. Reconciliation is
+idempotent for already-unknown or already-settled rows. Budget denial happens
+before provider invocation.
+
+- [ ] **Step 6: Run model-boundary tests**
 
 ```bash
 uv run pytest tests/test_untrusted_content.py tests/test_analyst.py tests/test_planning.py tests/test_llm_budget.py -v
@@ -1252,7 +1281,7 @@ uv run pytest tests/test_untrusted_content.py tests/test_analyst.py tests/test_p
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/trading_assistant/analyst/untrusted.py src/trading_assistant/analyst/analyst.py src/trading_assistant/analyst/planning.py src/trading_assistant/bootstrap.py tests/test_untrusted_content.py tests/test_analyst.py tests/test_planning.py

@@ -453,6 +453,11 @@ def _create_app(
     app.state.provider_budget = (
         container.provider_budget if container is not None else None
     )
+    app.state.quarantine_summarizer = (
+        getattr(container, "quarantine_summarizer", None)
+        if container is not None
+        else None
+    )
     app.state.account_cache = account_cache
     app.state.transport_policy = transport_policy
     app.state.controlled_shutdown = None
