@@ -70,25 +70,12 @@ def upgrade() -> None:
     connection = op.get_bind()
     attributes = op.get_context().config.attributes
     authority = attributes.get("migration_authority")
-    mode = assert_migration_authority(
+    authority = assert_migration_authority(
         authority,
         connection,
         allowed_modes=frozenset({"bootstrap", "maintenance"}),
     )
-    schema_capability = attributes.get(
-        "runtime_tenure_fence_schema"
-    )
-    assert_owned = attributes.get(
-        "runtime_tenure_assert_owned"
-    )
-    if mode == "maintenance" and (
-        not isinstance(schema_capability, tuple)
-        or len(schema_capability) != 2
-        or not callable(assert_owned)
-    ):
-        raise RuntimeError("schema_migration_authority_required")
-    if mode == "maintenance":
-        assert_owned(connection)
+    authority.assert_owned(connection)
 
     with op.batch_alter_table("trade_plans") as batch:
         batch.add_column(
@@ -114,13 +101,8 @@ def upgrade() -> None:
             "AND authority_digest NOT GLOB '*[^0-9a-f]*')",
         )
 
-    if mode == "maintenance":
-        option_name, option_value = schema_capability
-        assert_owned(connection)
-        connection.execution_options(
-            **{option_name: option_value}
-        )
-    try:
+    authority.assert_owned(connection)
+    with authority.schema_fence(connection):
         with op.batch_alter_table(
             "runtime_tenures",
             recreate="always",
@@ -149,35 +131,19 @@ def upgrade() -> None:
                 "ck_runtime_tenures_lifecycle",
                 _RUNTIME_LIFECYCLE,
             )
-    finally:
-        if mode == "maintenance":
-            connection.execution_options(**{option_name: None})
-    if mode == "maintenance":
-        assert_owned(connection)
+    authority.assert_owned(connection)
 
 
 def downgrade() -> None:
     connection = op.get_bind()
     attributes = op.get_context().config.attributes
     authority = attributes.get("migration_authority")
-    assert_migration_authority(
+    authority = assert_migration_authority(
         authority,
         connection,
         allowed_modes=frozenset({"maintenance"}),
     )
-    schema_capability = attributes.get(
-        "runtime_tenure_fence_schema"
-    )
-    assert_owned = attributes.get(
-        "runtime_tenure_assert_owned"
-    )
-    if (
-        not isinstance(schema_capability, tuple)
-        or len(schema_capability) != 2
-        or not callable(assert_owned)
-    ):
-        raise RuntimeError("schema_migration_authority_required")
-    assert_owned(connection)
+    authority.assert_owned(connection)
     if connection.dialect.name != "sqlite":
         raise RuntimeError("runtime_tenure_downgrade_blocked")
     try:
@@ -218,35 +184,38 @@ def downgrade() -> None:
         )
     )
 
-    with op.batch_alter_table(
-        "runtime_tenures",
-        recreate="always",
-    ) as batch:
-        batch.drop_constraint(
-            "ck_runtime_tenures_resource_role",
-            type_="check",
-        )
-        batch.drop_constraint(
-            "ck_runtime_tenures_state",
-            type_="check",
-        )
-        batch.drop_constraint(
-            "ck_runtime_tenures_lifecycle",
-            type_="check",
-        )
-        batch.create_check_constraint(
-            "ck_runtime_tenures_resource_role",
-            _OLD_RUNTIME_RESOURCE_ROLE,
-        )
-        batch.create_check_constraint(
-            "ck_runtime_tenures_state",
-            _OLD_RUNTIME_STATE,
-        )
-        batch.create_check_constraint(
-            "ck_runtime_tenures_lifecycle",
-            _OLD_RUNTIME_LIFECYCLE,
-        )
+    authority.assert_owned(connection)
+    with authority.schema_fence(connection):
+        with op.batch_alter_table(
+            "runtime_tenures",
+            recreate="always",
+        ) as batch:
+            batch.drop_constraint(
+                "ck_runtime_tenures_resource_role",
+                type_="check",
+            )
+            batch.drop_constraint(
+                "ck_runtime_tenures_state",
+                type_="check",
+            )
+            batch.drop_constraint(
+                "ck_runtime_tenures_lifecycle",
+                type_="check",
+            )
+            batch.create_check_constraint(
+                "ck_runtime_tenures_resource_role",
+                _OLD_RUNTIME_RESOURCE_ROLE,
+            )
+            batch.create_check_constraint(
+                "ck_runtime_tenures_state",
+                _OLD_RUNTIME_STATE,
+            )
+            batch.create_check_constraint(
+                "ck_runtime_tenures_lifecycle",
+                _OLD_RUNTIME_LIFECYCLE,
+            )
 
+    authority.assert_owned(connection)
     with op.batch_alter_table("trade_plans") as batch:
         batch.drop_constraint(
             "ck_trade_plans_authority_evidence",
@@ -254,3 +223,4 @@ def downgrade() -> None:
         )
         batch.drop_column("authority_digest")
         batch.drop_column("authority_version")
+    authority.assert_owned(connection)

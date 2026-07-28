@@ -269,7 +269,7 @@ def create_encrypted_database_backup(
         "whole-database-v1",
     ] = "before-sensitive-v1",
 ) -> EncryptedBackupReceipt:
-    """Create, publish, decrypt, hash, and quick-check one encrypted snapshot."""
+    """Create, privately verify, then atomically publish one encrypted snapshot."""
 
     if not isinstance(backup_key, bytes) or len(backup_key) != 32:
         raise EncryptedBackupError("backup_key_invalid")
@@ -404,23 +404,10 @@ def create_encrypted_database_backup(
         hook("ciphertext_fsynced")
         maintain()
 
-        stamp = created.strftime("%Y%m%dT%H%M%S%fZ")
-        target = directory / f"{stamp}-{artifact_label}.sqlite3.aesgcm"
-        try:
-            os.link(encrypted_temp, target, follow_symlinks=False)
-        except FileExistsError:
-            raise EncryptedBackupError("encrypted_backup_exists") from None
-        published = True
-        _unlink_private_temp(encrypted_temp)
-        encrypted_temp = None
-        _fsync_directory(directory)
-        hook("artifact_published")
-        maintain()
-
         verification = _private_temp(directory, ".sensitive-verify-")
         hook("verification_opened")
         with (
-            target.open("rb", buffering=0) as ciphertext,
+            encrypted_temp.open("rb", buffering=0) as ciphertext,
             verification.open("r+b", buffering=0) as plaintext,
         ):
             parsed_header, parsed_nonce, parsed_aad = _parse_header_stream(
@@ -506,7 +493,21 @@ def create_encrypted_database_backup(
         if check != ("ok",):
             raise EncryptedBackupError("encrypted_backup_quick_check_failed")
         hook("quick_check_complete")
+
+        stamp = created.strftime("%Y%m%dT%H%M%S%fZ")
+        target = directory / f"{stamp}-{artifact_label}.sqlite3.aesgcm"
         maintain()
+        try:
+            os.link(encrypted_temp, target, follow_symlinks=False)
+        except FileExistsError:
+            raise EncryptedBackupError("encrypted_backup_exists") from None
+        published = True
+        _fsync_directory(directory)
+        hook("artifact_published")
+        maintain()
+        _unlink_private_temp(encrypted_temp)
+        encrypted_temp = None
+        _fsync_directory(directory)
         succeeded = True
         return EncryptedBackupReceipt(
             path=target,

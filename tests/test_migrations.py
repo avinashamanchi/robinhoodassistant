@@ -1,10 +1,12 @@
 import json
 import hashlib
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from alembic import command, op as alembic_op
@@ -31,6 +33,7 @@ from trading_assistant.db.migration_authority import (
     issue_bootstrap_authority,
     issue_maintenance_authority,
 )
+from trading_assistant.db import migration_authority as authority_module
 from trading_assistant.db.schema import SchemaOutOfDate, require_current_schema
 from trading_assistant.db.session import (
     create_db_engine,
@@ -42,9 +45,11 @@ from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
     RuntimeTenureGuard,
+    RuntimeTenureHandle,
     RuntimeTenureService,
     TenureLost,
     TenureUnavailable,
+    install_runtime_mutation_barrier,
 )
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
@@ -72,11 +77,92 @@ def _url(path: Path) -> str:
     return f"sqlite:///{path}"
 
 
+@contextmanager
+def _held_migration_authority(engine, connection, *, pid: int):
+    service = RuntimeTenureService(
+        make_session_factory(engine),
+        process_inspector=_AbsentProcessInspector(),
+    )
+    handle = service.acquire_maintenance(
+        ProcessIdentity(pid, f"migration-authority-{pid}"),
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    guard.start()
+    barrier = install_runtime_mutation_barrier(engine, guard)
+    try:
+        yield issue_maintenance_authority(
+            connection,
+            guard=guard,
+            barrier=barrier,
+        ), guard
+    finally:
+        if not guard.closed:
+            guard.close()
+
+
 class _AuthorizedTestAlembic:
-    """Run historical migration fixtures with an explicit test-only capability."""
+    """Run historical revision tests under an isolated test-only authority."""
+
+    class _HistoricalAuthority:
+        def __init__(self, connection):
+            self.connection = connection
+            self.activated = False
+            self.retired = False
+
+        def assert_owned(self, connection) -> None:
+            if (
+                self.retired
+                or not self.activated
+                or self.connection is not connection
+            ):
+                raise RuntimeError("schema_migration_authority_required")
+
+        @contextmanager
+        def schema_fence(self, connection):
+            self.assert_owned(connection)
+            yield
+            self.assert_owned(connection)
 
     @staticmethod
-    def _run(operation, cfg, *args, **kwargs):
+    def _activate_historical(authority, connection):
+        if (
+            type(authority)
+            is not _AuthorizedTestAlembic._HistoricalAuthority
+            or authority.connection is not connection
+            or authority.activated
+            or authority.retired
+        ):
+            raise RuntimeError("schema_migration_authority_required")
+        authority.activated = True
+        return "maintenance"
+
+    @staticmethod
+    def _assert_historical(
+        authority,
+        connection,
+        *,
+        allowed_modes,
+    ):
+        if "maintenance" not in allowed_modes:
+            raise RuntimeError("schema_migration_authority_required")
+        authority.assert_owned(connection)
+        return authority
+
+    @staticmethod
+    def _retire_historical(authority) -> None:
+        if (
+            type(authority)
+            is _AuthorizedTestAlembic._HistoricalAuthority
+        ):
+            authority.retired = True
+
+    @classmethod
+    def _run(cls, operation, cfg, *args, **kwargs):
         if (
             cfg.attributes.get("connection") is not None
             and cfg.attributes.get("migration_authority") is not None
@@ -98,18 +184,46 @@ class _AuthorizedTestAlembic:
                 if connection.in_transaction():
                     connection.rollback()
                 if has_tables:
-                    authority = issue_maintenance_authority(connection)
+                    # Historical migration tests need to exercise old
+                    # revisions whose schemas predate durable tenures. The
+                    # production wrapper intentionally refuses that path.
+                    # Keep this capability wholly inside the test process:
+                    # no production flag, constructor, or Config assertion
+                    # can mint it.
+                    authority = cls._HistoricalAuthority(connection)
                 else:
                     authority = issue_bootstrap_authority(connection)
                 cfg.attributes["migration_authority"] = authority
-                cfg.attributes["runtime_tenure_fence_schema"] = (
-                    "_pytest_schema_fence",
-                    object(),
+                if not has_tables:
+                    return operation(cfg, *args, **kwargs)
+                revision = ScriptDirectory.from_config(cfg).get_revision(
+                    "20260727_0015"
                 )
-                cfg.attributes["runtime_tenure_assert_owned"] = (
-                    lambda _connection: None
-                )
-                return operation(cfg, *args, **kwargs)
+                assert revision is not None
+                revision_module = revision.module
+                with (
+                    patch.object(
+                        authority_module,
+                        "activate_migration_authority",
+                        cls._activate_historical,
+                    ),
+                    patch.object(
+                        authority_module,
+                        "retire_migration_authority",
+                        cls._retire_historical,
+                    ),
+                    patch.object(
+                        authority_module,
+                        "assert_migration_authority",
+                        cls._assert_historical,
+                    ),
+                    patch.object(
+                        revision_module,
+                        "assert_migration_authority",
+                        cls._assert_historical,
+                    ),
+                ):
+                    return operation(cfg, *args, **kwargs)
         finally:
             cfg.attributes.clear()
             cfg.attributes.update(original)
@@ -815,6 +929,327 @@ def test_offline_alembic_migration_is_refused_before_sql_generation(
         _RAW_ALEMBIC_UPGRADE(cfg, "head", sql=True)
 
     assert not path.exists()
+
+
+def test_forged_maintenance_authority_cannot_upgrade_without_held_tenure(
+    tmp_path,
+):
+    path = tmp_path / "forged-maintenance-upgrade.db"
+    engine, _cfg = _engine_at_revision(path, "20260727_0014")
+    _seed_migration_refusal_row(engine, "forged-upgrade")
+    before = _database_fingerprint(engine)
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        with pytest.raises(
+            RuntimeError,
+            match="^schema_migration_authority_required$",
+        ):
+            cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = (
+                issue_maintenance_authority(connection)
+            )
+            cfg.attributes["runtime_tenure_fence_schema"] = (
+                "attacker-controlled-fence",
+                object(),
+            )
+            cfg.attributes["runtime_tenure_assert_owned"] = (
+                lambda _connection: None
+            )
+            _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    assert _database_fingerprint(engine) == before
+
+
+def test_forged_maintenance_authority_cannot_downgrade_without_held_tenure(
+    tmp_path,
+):
+    path = tmp_path / "forged-maintenance-downgrade.db"
+    engine = create_db_engine(_url(path))
+    assert upgrade(engine) is None
+    _seed_migration_refusal_row(engine, "forged-downgrade")
+    before = _database_fingerprint(engine)
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        with pytest.raises(
+            RuntimeError,
+            match="^schema_migration_authority_required$",
+        ):
+            cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = (
+                issue_maintenance_authority(connection)
+            )
+            cfg.attributes["runtime_tenure_fence_schema"] = (
+                "attacker-controlled-fence",
+                object(),
+            )
+            cfg.attributes["runtime_tenure_assert_owned"] = (
+                lambda _connection: None
+            )
+            _RAW_ALEMBIC_DOWNGRADE(cfg, "20260727_0014")
+
+    assert _database_fingerprint(engine) == before
+
+
+def test_forged_handle_assertion_cannot_mint_maintenance_authority(
+    tmp_path,
+):
+    path = tmp_path / "forged-handle-authority.db"
+    engine, _cfg = _engine_at_revision(path, "20260727_0014")
+
+    class ForgedService:
+        _internal_capability = object()
+
+        def _assert_owned(self, *_args, **_kwargs) -> None:
+            return None
+
+    handle = RuntimeTenureHandle(
+        _service=ForgedService(),
+        resource_key="sensitive-migration:global",
+        role="maintenance",
+        owner_id="00000000-0000-4000-8000-000000000099",
+        generation=99,
+        identity=ProcessIdentity(8799, "forged-maintenance-handle"),
+        expires_at=datetime.max.replace(tzinfo=timezone.utc),
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    barrier = install_runtime_mutation_barrier(engine, guard)
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match="^schema_migration_authority_required$",
+            ):
+                issue_maintenance_authority(
+                    connection,
+                    guard=guard,
+                    barrier=barrier,
+                )
+    finally:
+        barrier.close()
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM runtime_tenures "
+                "WHERE resource_key='sensitive-migration:global'"
+            )
+        ) == 0
+
+
+def test_bootstrap_authority_revalidates_empty_database_at_use_and_is_spent(
+    tmp_path,
+):
+    path = tmp_path / "bootstrap-issue-then-create.db"
+    engine = create_db_engine(_url(path))
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        authority = issue_bootstrap_authority(connection)
+        connection.execute(
+            text(
+                "CREATE TABLE injected_before_bootstrap "
+                "(id INTEGER PRIMARY KEY, marker TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO injected_before_bootstrap(id,marker) "
+                "VALUES (1,'must-survive')"
+            )
+        )
+        connection.commit()
+        cfg.attributes["connection"] = connection
+        cfg.attributes["migration_authority"] = authority
+
+        with pytest.raises(
+            RuntimeError,
+            match="^schema_bootstrap_authority_refused$",
+        ):
+            _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+        assert connection.execute(
+            text(
+                "SELECT id,marker FROM injected_before_bootstrap"
+            )
+        ).one() == (1, "must-survive")
+        assert "alembic_version" not in inspect(connection).get_table_names()
+        connection.rollback()
+        connection.execute(text("DROP TABLE injected_before_bootstrap"))
+        connection.commit()
+
+        with pytest.raises(
+            RuntimeError,
+            match="^schema_migration_authority_required$",
+        ):
+            _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    assert inspect(engine).get_table_names() == []
+
+
+def test_bootstrap_authority_rejects_connection_misuse_and_replay(
+    tmp_path,
+):
+    path = tmp_path / "bootstrap-connection-and-replay.db"
+    engine = create_db_engine(_url(path))
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as issued_connection:
+        authority = issue_bootstrap_authority(issued_connection)
+        with engine.connect() as wrong_connection:
+            cfg.attributes["connection"] = wrong_connection
+            cfg.attributes["migration_authority"] = authority
+            with pytest.raises(
+                RuntimeError,
+                match="^schema_migration_authority_required$",
+            ):
+                _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+        cfg.attributes["connection"] = issued_connection
+        cfg.attributes["migration_authority"] = authority
+        with pytest.raises(
+            RuntimeError,
+            match="^schema_migration_authority_required$",
+        ):
+            _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    assert inspect(engine).get_table_names() == []
+
+
+def test_maintenance_authority_rejects_connection_misuse_and_is_spent(
+    tmp_path,
+):
+    path = tmp_path / "maintenance-connection-misuse.db"
+    engine, _cfg = _engine_at_revision(path, "20260727_0014")
+    before = _database_fingerprint(engine)
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as issued_connection:
+        with _held_migration_authority(
+            engine,
+            issued_connection,
+            pid=8701,
+        ) as (authority, _guard):
+            with engine.connect() as wrong_connection:
+                cfg.attributes["connection"] = wrong_connection
+                cfg.attributes["migration_authority"] = authority
+                with pytest.raises(
+                    RuntimeError,
+                    match="^schema_migration_authority_required$",
+                ):
+                    _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+            cfg.attributes["connection"] = issued_connection
+            cfg.attributes["migration_authority"] = authority
+            with pytest.raises(
+                RuntimeError,
+                match="^schema_migration_authority_required$",
+            ):
+                _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    after = _database_fingerprint(engine)
+    assert (after[0], after[1], after[3]) == (
+        before[0],
+        before[1],
+        before[3],
+    )
+
+
+def test_maintenance_authority_replay_fails_after_successful_upgrade(
+    tmp_path,
+):
+    path = tmp_path / "maintenance-replay.db"
+    engine, _cfg = _engine_at_revision(path, "20260727_0014")
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        with _held_migration_authority(
+            engine,
+            connection,
+            pid=8702,
+        ) as (authority, _guard):
+            cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = authority
+            _RAW_ALEMBIC_UPGRADE(cfg, "head")
+            with pytest.raises(
+                RuntimeError,
+                match="^schema_migration_authority_required$",
+            ):
+                _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    require_current_schema(engine)
+
+
+def test_maintenance_authority_revalidates_lease_after_issuance(
+    tmp_path,
+):
+    path = tmp_path / "maintenance-released-before-ddl.db"
+    engine, _cfg = _engine_at_revision(path, "20260727_0014")
+    before = _database_fingerprint(engine)
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        with _held_migration_authority(
+            engine,
+            connection,
+            pid=8703,
+        ) as (authority, guard):
+            assert guard.close() is True
+            cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = authority
+            with pytest.raises(
+                RuntimeError,
+                match="^schema_migration_authority_required$",
+            ):
+                _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    after = _database_fingerprint(engine)
+    assert (after[0], after[1], after[3]) == (
+        before[0],
+        before[1],
+        before[3],
+    )
+
+
+def test_held_maintenance_authority_supports_fenced_downgrade(
+    tmp_path,
+):
+    path = tmp_path / "held-maintenance-downgrade.db"
+    engine = create_db_engine(_url(path))
+    assert upgrade(engine) is None
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with engine.connect() as connection:
+        with _held_migration_authority(
+            engine,
+            connection,
+            pid=8704,
+        ) as (authority, _guard):
+            cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = authority
+            _RAW_ALEMBIC_DOWNGRADE(cfg, "20260727_0014")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0014"
+    assert {
+        column["name"]
+        for column in inspect(engine).get_columns("trade_plans")
+    }.isdisjoint({"authority_version", "authority_digest"})
 
 
 def test_plan_authority_upgrade_preserves_legacy_rows_under_maintenance(

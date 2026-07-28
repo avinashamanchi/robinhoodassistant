@@ -26,8 +26,8 @@ def run_migrations_online() -> None:
     authority = config.attributes.get("migration_authority")
     if supplied_connection is None or authority is None:
         raise RuntimeError("schema_migration_authority_required")
-    activate_migration_authority(authority, supplied_connection)
     try:
+        activate_migration_authority(authority, supplied_connection)
         context.configure(
             connection=supplied_connection,
             target_metadata=target_metadata,

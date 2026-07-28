@@ -57,6 +57,7 @@ from trading_assistant.ops.tenure import (
     ProcessProof,
     RuntimeTenureGuard,
     RuntimeTenureService,
+    TenureLost,
     TenureUncertain,
 )
 from trading_assistant.preflight import SensitiveEncryptionStateInspector
@@ -308,6 +309,75 @@ def test_backup_streams_more_than_two_mebibytes_in_bounded_chunks(tmp_path):
 
     assert stages.count("encrypt_chunk") >= 3
     assert stages.count("decrypt_chunk") >= 3
+
+
+def test_backup_final_path_is_absent_until_private_verification_completes(
+    tmp_path,
+):
+    source = tmp_path / "verify-before-publish.db"
+    destination = tmp_path / "verify-before-publish-backups"
+    _seed_database(source, payload_bytes=1_250_000)
+    stages: list[str] = []
+    published_during_verification: dict[str, tuple[str, ...]] = {}
+
+    def observe(stage: str) -> None:
+        stages.append(stage)
+        if stage in {
+            "verification_opened",
+            "decrypt_chunk",
+            "verification_hashed",
+            "quick_check_complete",
+        }:
+            published_during_verification[stage] = tuple(
+                path.name
+                for path in destination.iterdir()
+                if not path.name.startswith(".")
+            )
+
+    receipt = _create(source, destination, stage_hook=observe)
+
+    assert published_during_verification
+    assert set(published_during_verification.values()) == {()}
+    assert stages.index("quick_check_complete") < stages.index(
+        "artifact_published"
+    )
+    assert tuple(destination.iterdir()) == (receipt.path,)
+
+
+def test_ownership_loss_during_private_verification_never_publishes(
+    tmp_path,
+):
+    source = tmp_path / "verification-tenure-loss.db"
+    destination = tmp_path / "verification-tenure-loss-backups"
+    _seed_database(source, payload_bytes=1_250_000)
+    phase = "encrypting"
+    visible_at_verification: tuple[str, ...] | None = None
+
+    def observe(stage: str) -> None:
+        nonlocal phase, visible_at_verification
+        if stage == "verification_opened":
+            phase = "verifying"
+            visible_at_verification = tuple(
+                path.name
+                for path in destination.iterdir()
+                if not path.name.startswith(".")
+            )
+
+    def ensure_owned() -> None:
+        if phase == "verifying":
+            raise TenureLost()
+
+    with pytest.raises(TenureLost):
+        _create(
+            source,
+            destination,
+            ensure_maintenance=ensure_owned,
+            stage_hook=observe,
+        )
+
+    assert visible_at_verification == ()
+    assert destination.exists()
+    assert not list(destination.iterdir())
 
 
 def test_large_snapshot_expiry_aborts_before_publication_and_cleans_temps(

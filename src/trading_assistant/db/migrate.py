@@ -161,13 +161,11 @@ def upgrade(
             cfg = _config(engine)
             cfg.attributes["connection"] = connection
             cfg.attributes["migration_authority"] = (
-                issue_maintenance_authority(connection)
-            )
-            cfg.attributes["runtime_tenure_fence_schema"] = (
-                barrier.fence_schema_execution_option
-            )
-            cfg.attributes["runtime_tenure_assert_owned"] = (
-                guard.assert_owned_in_transaction
+                issue_maintenance_authority(
+                    connection,
+                    guard=guard,
+                    barrier=barrier,
+                )
             )
             command.upgrade(cfg, "head")
         guard.ensure_owned()
