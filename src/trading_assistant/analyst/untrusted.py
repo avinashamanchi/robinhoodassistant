@@ -40,6 +40,9 @@ MAX_NORMALIZED_CHARACTERS = 16_000
 _MAX_SOURCE_ID_CHARACTERS = 256
 _MAX_SOURCE_NAME_CHARACTERS = 256
 _MAX_ENCODED_CANDIDATE_CHARACTERS = 4_096
+_MAX_ENCODED_SPAN_CHARACTERS = 8_192
+_MAX_ENCODED_TOKENS = 1_024
+_MAX_DECODED_PAYLOAD_BYTES = 3_072
 _MAX_CANONICALIZATION_PASSES = 4
 
 SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
@@ -100,12 +103,23 @@ _MARKDOWN_IMAGE_RE = re.compile(
 _DATA_URL_RE = re.compile(r"(?is)\bdata:[^\s<>'\"\])]{1,8192}")
 _ENCODED_PAYLOAD_CUE_RE = re.compile(
     r"(?is)\b(?:"
-    r"base64"
+    r"base64(?:\s+(?:payload|data))?"
     r"|decode\s+and\s+obey"
     r"(?:\s+(?:this|the\s+following)(?:\s+payload)?)?"
+    r"|(?:encode(?:d)?|decode)"
+    r"(?:\s+(?:this|the\s+following))?"
+    r"(?:\s+(?:base64|payload|data)){0,2}"
     r")\s*:\s*"
 )
-_BASE64_TOKEN_RE = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
+_BASE64_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_"
+)
+_ENCODED_DELIMITERS = (
+    ("```", "```"),
+    ("`", "`"),
+    ('"', '"'),
+    ("'", "'"),
+)
 _GENERIC_BASE64_RE = re.compile(
     rf"(?<![A-Za-z0-9_+/-])"
     rf"[A-Za-z0-9_+/-]{{16,{_MAX_ENCODED_CANDIDATE_CHARACTERS}}}={{0,2}}"
@@ -349,19 +363,22 @@ def _decoded_instruction(candidate: str) -> bool:
     compact = candidate.strip()
     if not compact:
         return False
+    has_standard_symbols = "+" in compact or "/" in compact
+    has_urlsafe_symbols = "-" in compact or "_" in compact
+    if has_standard_symbols and has_urlsafe_symbols:
+        return False
+    if len(compact.rstrip("=")) % 4 == 1:
+        return False
     padded = compact + ("=" * (-len(compact) % 4))
-    decoded: bytes | None = None
-    for altchars in (None, b"-_"):
-        try:
-            decoded = base64.b64decode(
-                padded.encode("ascii"),
-                altchars=altchars,
-                validate=True,
-            )
-            break
-        except (UnicodeEncodeError, binascii.Error, ValueError):
-            continue
-    if decoded is None or len(decoded) > MAX_CONTENT_BYTES:
+    try:
+        decoded = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_" if has_urlsafe_symbols else None,
+            validate=True,
+        )
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        return False
+    if len(decoded) > _MAX_DECODED_PAYLOAD_BYTES:
         return False
     try:
         decoded_text = decoded.decode("utf-8")
@@ -394,66 +411,152 @@ def _decoded_instruction(candidate: str) -> bool:
     )
 
 
-def _base64_tokens_after_cue(
+def _compact_exact_encoded_span(text: str) -> tuple[str, bool]:
+    compact: list[str] = []
+    token_count = 0
+    in_token = False
+    malformed = len(text) > _MAX_ENCODED_SPAN_CHARACTERS
+    for character in text:
+        if character.isspace():
+            in_token = False
+            continue
+        if not in_token:
+            token_count += 1
+            in_token = True
+            if token_count > _MAX_ENCODED_TOKENS:
+                malformed = True
+        if character not in _BASE64_ALPHABET and character != "=":
+            malformed = True
+        if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
+            compact.append(character)
+        else:
+            malformed = True
+    candidate = "".join(compact)
+    if (
+        not candidate
+        or len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS
+        or candidate.count("=") > 2
+        or (
+            "=" in candidate
+            and not candidate.endswith("=" * candidate.count("="))
+        )
+        or (
+            ("+" in candidate or "/" in candidate)
+            and ("-" in candidate or "_" in candidate)
+        )
+    ):
+        malformed = True
+    return candidate, malformed
+
+
+def _delimited_encoded_span(
     text: str,
     start: int,
-) -> tuple[list[tuple[str, int, int]], int]:
-    scan_end = min(len(text), start + MAX_CONTENT_BYTES)
-    position = start
-    while position < scan_end and text[position].isspace():
-        position += 1
-    first_start = position
-    tokens: list[tuple[str, int, int]] = []
-
-    while position < scan_end:
-        match = _BASE64_TOKEN_RE.match(text, position, scan_end)
-        if match is None:
-            break
-        token = match.group(0)
-        if tokens and len(token.rstrip("=")) not in {2, 3, 4}:
-            break
-        tokens.append((token, match.start(), match.end()))
-        position = match.end()
-        if len(tokens) == 1 and len(token.rstrip("=")) > 4:
-            break
-        if token.endswith("=") or position >= scan_end:
-            break
-        separator = re.match(r"[ \t\r\n]+", text[position:scan_end])
-        if separator is None:
-            break
-        position += separator.end()
-
-    if tokens:
-        return tokens, tokens[-1][2]
-    malformed_end = first_start
-    while (
-        malformed_end < scan_end
-        and not text[malformed_end].isspace()
-    ):
-        malformed_end += 1
-    return [], malformed_end
-
-
-def _malicious_fragmented_prefix(
-    tokens: Sequence[tuple[str, int, int]],
-) -> int | None:
-    if not tokens:
-        return None
-    if len(tokens) == 1:
-        return 1 if _decoded_instruction(tokens[0][0]) else None
-    compact = "".join(token for token, _start, _end in tokens)
-    if len(compact) > _MAX_ENCODED_CANDIDATE_CHARACTERS:
-        return None
-    prefix_lengths: list[int] = []
-    total = 0
-    for token, _start, _end in tokens:
-        total += len(token)
-        prefix_lengths.append(total)
-    for count in range(len(tokens), 3, -1):
-        candidate = compact[: prefix_lengths[count - 1]]
-        if _decoded_instruction(candidate):
-            return count
+) -> tuple[int, str, bool] | None:
+    for opening, closing in _ENCODED_DELIMITERS:
+        if not text.startswith(opening, start):
+            continue
+        payload_start = start + len(opening)
+        close_at = text.find(closing, payload_start)
+        if close_at < 0:
+            raise UntrustedContentError("ambiguous_encoding")
+        candidate, malformed = _compact_exact_encoded_span(
+            text[payload_start:close_at]
+        )
+        return close_at + len(closing), candidate, malformed
     return None
+
+
+def _bare_encoded_span(
+    text: str,
+    start: int,
+) -> tuple[int, str, bool]:
+    position = start
+    while position < len(text) and text[position].isspace():
+        position += 1
+    payload_start = position
+
+    if (
+        position >= len(text)
+        or (
+            text[position] not in _BASE64_ALPHABET
+            and text[position] != "="
+        )
+    ):
+        while position < len(text) and not text[position].isspace():
+            position += 1
+        return position, "", True
+
+    compact: list[str] = []
+    token_count = 0
+    in_token = False
+    last_payload_end = position
+    malformed = False
+
+    while position < len(text):
+        character = text[position]
+        if character.isspace():
+            in_token = False
+            position += 1
+            continue
+        if character not in _BASE64_ALPHABET and character != "=":
+            break
+        if not in_token:
+            token_count += 1
+            in_token = True
+            if token_count > _MAX_ENCODED_TOKENS:
+                malformed = True
+        if character == "=":
+            padding_start = position
+            while position < len(text) and text[position] == "=":
+                if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
+                    compact.append("=")
+                else:
+                    malformed = True
+                position += 1
+            if position < len(text) and text[position] in _BASE64_ALPHABET:
+                raise UntrustedContentError("ambiguous_encoding")
+            padding_count = position - padding_start
+            malformed = malformed or padding_count > 2
+            last_payload_end = position
+            break
+        if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
+            compact.append(character)
+        else:
+            malformed = True
+        position += 1
+        last_payload_end = position
+
+    candidate = "".join(compact)
+    span_length = last_payload_end - payload_start
+    malformed = (
+        malformed
+        or not candidate
+        or span_length > _MAX_ENCODED_SPAN_CHARACTERS
+        or len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS
+        or (
+            ("+" in candidate or "/" in candidate)
+            and ("-" in candidate or "_" in candidate)
+        )
+    )
+    padded = candidate.endswith("=")
+    reached_eof = position >= len(text)
+    if not padded and token_count > 1 and not reached_eof:
+        raise UntrustedContentError("ambiguous_encoding")
+    return last_payload_end, candidate, malformed
+
+
+def _encoded_span_after_cue(
+    text: str,
+    start: int,
+) -> tuple[int, str, bool]:
+    position = start
+    while position < len(text) and text[position].isspace():
+        position += 1
+    delimited = _delimited_encoded_span(text, position)
+    if delimited is not None:
+        return delimited
+    return _bare_encoded_span(text, position)
 
 
 def _strip_cued_encoded_payloads(
@@ -466,11 +569,12 @@ def _strip_cued_encoded_payloads(
         cue = _ENCODED_PAYLOAD_CUE_RE.search(text, cursor)
         if cue is None:
             break
-        tokens, candidate_end = _base64_tokens_after_cue(text, cue.end())
-        malicious_count = _malicious_fragmented_prefix(tokens)
-        if malicious_count is not None:
+        candidate_end, candidate, malformed = _encoded_span_after_cue(
+            text,
+            cue.end(),
+        )
+        if not malformed and _decoded_instruction(candidate):
             _add_finding(findings, "encoded_instruction", "high")
-            candidate_end = tokens[malicious_count - 1][2]
         else:
             _add_finding(findings, "malformed_encoding", "medium")
         interval_end = max(cue.end(), candidate_end)
