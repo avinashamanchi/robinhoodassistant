@@ -16,7 +16,6 @@ import re
 import sqlite3
 import stat
 import struct
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +33,32 @@ from ..security.secrets import (
     secret_value,
     validate_base64_key,
 )
+from .backup_transaction import (
+    BACKUP_CHUNK_BYTES as _CHUNK_BYTES,
+    ENCRYPTED_NAME as _ENCRYPTED_NAME,
+    SNAPSHOT_NAME as _SNAPSHOT_NAME,
+    TRANSACTION_DIRECTORY as _TRANSACTION_DIRECTORY,
+    VERIFICATION_NAME as _VERIFICATION_NAME,
+    BackupTransaction as _BackupTransaction,
+    EncryptedBackupError,
+    acquire_bounded_lock as _acquire_bounded_lock,
+    close_backup_transaction as _close_backup_transaction,
+    create_backup_transaction as _create_backup_transaction,
+    create_transaction_member as _create_transaction_member,
+    decode_checksummed_record as _decode_checksummed_record,
+    encode_checksummed_record as _encode_checksummed_record,
+    fsync_and_hash_transaction_artifact as _fsync_and_hash_transaction_artifact,
+    hash_artifact_descriptor as _hash_artifact_descriptor,
+    hash_transaction_member as _hash_transaction_member,
+    open_transaction_member as _open_transaction_member,
+    positive_record_integer as _positive_record_integer,
+    pread_exact as _pread_exact,
+    pwrite_all as _pwrite_all,
+    recover_backup_transaction as _recover_backup_transaction,
+    retry_flock as _retry_flock,
+    retry_fsync as _retry_fsync,
+    validate_backup_transaction as _validate_backup_transaction,
+)
 from .tenure import (
     LocalProcessInspector,
     ProcessIdentity,
@@ -46,7 +71,6 @@ _ENCRYPTED_MAGIC = b"TA-SENSITIVE-BACKUP\x00"
 _ENCRYPTED_VERSION = 1
 _NONCE_BYTES = 12
 _TAG_BYTES = 16
-_CHUNK_BYTES = 1_048_576
 _MAX_HEADER_BYTES = 4096
 _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
 _COMMITTED_NAME = re.compile(
@@ -57,7 +81,6 @@ _COMMITTED_NAME = re.compile(
 _COMMIT_STATE_MAGIC = b"TA-BACKUP-COMMIT-STATE\x00"
 _COMMIT_STATE_VERSION = 2
 _COMMIT_STATE_BYTES = 1024
-_COMMIT_STATE_DIGEST_BYTES = hashlib.sha256().digest_size
 _COMMIT_STATE_PHASES = {
     "PENDING": 0,
     "COMMITTED": 1,
@@ -65,21 +88,11 @@ _COMMIT_STATE_PHASES = {
 }
 _TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-_STATE_LOCK_TIMEOUT_SECONDS = 0.25
-_STATE_LOCK_RETRY_SECONDS = 0.005
 _STATE_ACCESS_FAILURES = {
     "encrypted_backup_state_busy",
     "encrypted_backup_state_unavailable",
 }
 _ORPHAN_RECOVERY_TTL_SECONDS = 86_400
-
-
-class EncryptedBackupError(RuntimeError):
-    """Stable, content-free failure from encrypted backup handling."""
-
-    def __init__(self, stable_code: str) -> None:
-        self.stable_code = stable_code
-        super().__init__(stable_code)
 
 
 class _MaintenanceCallbackFailure(BaseException):
@@ -189,14 +202,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _unlink_private_temp(path: Path | None) -> None:
-    if path is None:
-        return
-    path.unlink(missing_ok=True)
-    path.with_name(f"{path.name}-wal").unlink(missing_ok=True)
-    path.with_name(f"{path.name}-shm").unlink(missing_ok=True)
-
-
 def _pending_anchor(path: Path) -> Path:
     return path.with_name(f".{path.name}.pending")
 
@@ -222,60 +227,23 @@ def _state_payload(state: _ArtifactCommitState) -> dict[str, object]:
 
 
 def _encode_commit_state(state: _ArtifactCommitState) -> bytes:
-    payload = _canonical_json(_state_payload(state))
-    body_size = _COMMIT_STATE_BYTES - _COMMIT_STATE_DIGEST_BYTES
-    prefix = (
-        _COMMIT_STATE_MAGIC
-        + struct.pack(">I", len(payload))
-        + payload
-    )
-    if len(prefix) > body_size:
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    body = prefix + (b"\x00" * (body_size - len(prefix)))
-    return body + hashlib.sha256(body).digest()
-
-
-def _positive_record_integer(value: object) -> bool:
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value > 0
+    return _encode_checksummed_record(
+        _COMMIT_STATE_MAGIC,
+        _state_payload(state),
+        record_bytes=_COMMIT_STATE_BYTES,
+        invalid_code="encrypted_backup_state_invalid",
     )
 
 
 def _decode_commit_state(encoded: bytes) -> _ArtifactCommitState:
-    if len(encoded) != _COMMIT_STATE_BYTES:
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    body = encoded[:-_COMMIT_STATE_DIGEST_BYTES]
-    digest = encoded[-_COMMIT_STATE_DIGEST_BYTES:]
-    if not hmac.compare_digest(hashlib.sha256(body).digest(), digest):
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    if not body.startswith(_COMMIT_STATE_MAGIC):
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    length_start = len(_COMMIT_STATE_MAGIC)
-    length_end = length_start + 4
-    payload_length = struct.unpack(
-        ">I",
-        body[length_start:length_end],
-    )[0]
-    payload_end = length_end + payload_length
+    payload = _decode_checksummed_record(
+        encoded,
+        _COMMIT_STATE_MAGIC,
+        record_bytes=_COMMIT_STATE_BYTES,
+        invalid_code="encrypted_backup_state_invalid",
+    )
     if (
-        payload_length <= 0
-        or payload_end > len(body)
-        or any(body[payload_end:])
-    ):
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    encoded_payload = body[length_end:payload_end]
-    try:
-        payload = json.loads(encoded_payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise EncryptedBackupError(
-            "encrypted_backup_state_invalid"
-        ) from None
-    if (
-        not isinstance(payload, dict)
-        or _canonical_json(payload) != encoded_payload
-        or set(payload)
+        set(payload)
         != {
             "artifact_device",
             "artifact_inode",
@@ -333,8 +301,6 @@ def _decode_commit_state(encoded: bytes) -> _ArtifactCommitState:
         state_device=payload["state_device"],
         state_inode=payload["state_inode"],
     )
-
-
 def _state_open_flags(*, writable: bool) -> int:
     flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(
         os,
@@ -345,95 +311,6 @@ def _state_open_flags(*, writable: bool) -> int:
         flags |= getattr(os, "O_DSYNC", os.O_SYNC)
     flags |= getattr(os, "O_NONBLOCK", 0)
     return flags
-
-
-def _retry_flock(descriptor: int, operation: int) -> None:
-    while True:
-        try:
-            fcntl.flock(descriptor, operation)
-            return
-        except InterruptedError:
-            continue
-
-
-def _acquire_state_lock(
-    descriptor: int,
-    operation: int,
-    *,
-    timeout_seconds: float = _STATE_LOCK_TIMEOUT_SECONDS,
-) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        try:
-            fcntl.flock(
-                descriptor,
-                operation | fcntl.LOCK_NB,
-            )
-            return
-        except InterruptedError:
-            continue
-        except BlockingIOError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise EncryptedBackupError(
-                    "encrypted_backup_state_busy"
-                ) from None
-            time.sleep(min(_STATE_LOCK_RETRY_SECONDS, remaining))
-        except OSError:
-            raise EncryptedBackupError(
-                "encrypted_backup_state_unavailable"
-            ) from None
-
-
-def _retry_fsync(descriptor: int) -> None:
-    while True:
-        try:
-            os.fsync(descriptor)
-            return
-        except InterruptedError:
-            continue
-
-
-def _pread_retry(descriptor: int, length: int, offset: int) -> bytes:
-    while True:
-        try:
-            return os.pread(descriptor, length, offset)
-        except InterruptedError:
-            continue
-
-
-def _pread_exact(descriptor: int, length: int, offset: int) -> bytes:
-    result = bytearray()
-    while len(result) < length:
-        chunk = _pread_retry(
-            descriptor,
-            length - len(result),
-            offset + len(result),
-        )
-        if not chunk:
-            break
-        result.extend(chunk)
-    return bytes(result)
-
-
-def _pwrite_all(descriptor: int, encoded: bytes) -> None:
-    offset = 0
-    while offset < len(encoded):
-        while True:
-            try:
-                written = os.pwrite(
-                    descriptor,
-                    encoded[offset:],
-                    offset,
-                )
-                break
-            except InterruptedError:
-                continue
-        if written <= 0:
-            raise EncryptedBackupError(
-                "encrypted_backup_state_write_failed"
-            )
-        offset += written
 
 
 def _state_descriptor_identity(
@@ -503,7 +380,7 @@ def _locked_state_descriptor(
     )
     locked = False
     try:
-        _acquire_state_lock(descriptor, fcntl.LOCK_SH)
+        _acquire_bounded_lock(descriptor, fcntl.LOCK_SH)
         locked = True
         descriptor_stat = _state_descriptor_identity(
             descriptor,
@@ -600,43 +477,6 @@ def _matching_artifact_stat(
     ):
         raise EncryptedBackupError("encrypted_backup_state_invalid")
     return artifact_stat
-
-
-def _hash_artifact_descriptor(
-    descriptor: int,
-    *,
-    expected_size: int,
-) -> str:
-    initial_stat = os.fstat(descriptor)
-    if not (
-        stat.S_ISREG(initial_stat.st_mode)
-        and initial_stat.st_size == expected_size
-    ):
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    digest = hashlib.sha256()
-    offset = 0
-    while offset < expected_size:
-        chunk = _pread_retry(
-            descriptor,
-            min(_CHUNK_BYTES, expected_size - offset),
-            offset,
-        )
-        if not chunk:
-            raise EncryptedBackupError(
-                "encrypted_backup_state_invalid"
-            )
-        digest.update(chunk)
-        offset += len(chunk)
-    final_stat = os.fstat(descriptor)
-    if not (
-        initial_stat.st_dev == final_stat.st_dev
-        and initial_stat.st_ino == final_stat.st_ino
-        and initial_stat.st_size == final_stat.st_size
-        and initial_stat.st_mtime_ns == final_stat.st_mtime_ns
-        and initial_stat.st_ctime_ns == final_stat.st_ctime_ns
-    ):
-        raise EncryptedBackupError("encrypted_backup_state_invalid")
-    return digest.hexdigest()
 
 
 def _verify_matching_artifact(
@@ -825,7 +665,7 @@ def list_committed_backups(
 
 def _create_pending_commit_state(
     target: Path,
-    anchor_stat: os.stat_result,
+    artifact_stat: os.stat_result,
     artifact_sha256: str,
     transaction_id: str,
 ) -> _ArtifactCommitState:
@@ -840,12 +680,12 @@ def _create_pending_commit_state(
     locked = False
     try:
         os.fchmod(descriptor, 0o600)
-        _acquire_state_lock(descriptor, fcntl.LOCK_EX)
+        _acquire_bounded_lock(descriptor, fcntl.LOCK_EX)
         locked = True
         state_stat = os.fstat(descriptor)
         path_stat = state_path.lstat()
         if not (
-            stat.S_ISREG(anchor_stat.st_mode)
+            stat.S_ISREG(artifact_stat.st_mode)
             and stat.S_ISREG(state_stat.st_mode)
             and stat.S_ISREG(path_stat.st_mode)
             and state_stat.st_dev == path_stat.st_dev
@@ -859,9 +699,9 @@ def _create_pending_commit_state(
             generation=_COMMIT_STATE_PHASES["PENDING"],
             transaction_id=transaction_id,
             artifact_name=target.name,
-            artifact_device=anchor_stat.st_dev,
-            artifact_inode=anchor_stat.st_ino,
-            artifact_size=anchor_stat.st_size,
+            artifact_device=artifact_stat.st_dev,
+            artifact_inode=artifact_stat.st_ino,
+            artifact_size=artifact_stat.st_size,
             artifact_sha256=artifact_sha256,
             state_device=state_stat.st_dev,
             state_inode=state_stat.st_ino,
@@ -950,7 +790,7 @@ def _transition_commit_state(
             state_path,
             writable=True,
         )
-        _acquire_state_lock(state_descriptor, fcntl.LOCK_EX)
+        _acquire_bounded_lock(state_descriptor, fcntl.LOCK_EX)
         locked = True
         state_stat = _state_descriptor_identity(
             state_descriptor,
@@ -961,28 +801,18 @@ def _transition_commit_state(
             state_stat,
             state_path,
         )
-        artifact_descriptor = _open_matching_artifact(target, current)
         if current != expected:
             raise EncryptedBackupError(
                 "encrypted_backup_state_invalid"
             )
+        # This is the last artifact operation. The fixed-state write, fsync,
+        # and same-descriptor readback below are the irrevocable commit point.
+        artifact_descriptor = _open_matching_artifact(target, current)
         try:
             persist_and_prove(transitioned)
-            _verify_matching_artifact(
-                target,
-                transitioned,
-                artifact_descriptor,
-            )
-            prove_state(transitioned)
         except BaseException as transition_failure:
             try:
                 persist_and_prove(expected)
-                _verify_matching_artifact(
-                    target,
-                    expected,
-                    artifact_descriptor,
-                )
-                prove_state(expected)
             except BaseException as restore_failure:
                 if phase != "COMMITTED":
                     raise EncryptedBackupError(
@@ -995,7 +825,6 @@ def _transition_commit_state(
                 )
                 try:
                     persist_and_prove(fail_closed)
-                    prove_state(fail_closed)
                 except BaseException as retire_failure:
                     raise EncryptedBackupError(
                         "encrypted_backup_state_uncertain"
@@ -1023,6 +852,9 @@ def _transition_commit_state(
                 if cleanup_failure is None:
                     cleanup_failure = exc
 
+    # A proven transition is final. Unlock/close still release kernel
+    # resources even when their wrappers report an error, so descriptor
+    # cleanup cannot reverse or obscure the durable result.
     if transition_proven:
         return transitioned
     if primary_failure is None:
@@ -1059,77 +891,6 @@ def _unlink_matching_regular_file(
 ) -> None:
     if _matching_regular_file(path, device=device, inode=inode):
         path.unlink()
-
-
-def _private_temp(directory: Path, prefix: str) -> Path:
-    descriptor, name = tempfile.mkstemp(prefix=prefix, dir=directory)
-    try:
-        os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
-    return Path(name)
-
-
-def _hash_file(
-    path: Path,
-    *,
-    ensure_maintenance: Callable[[], None] | None = None,
-) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as handle:
-        while True:
-            if ensure_maintenance is not None:
-                ensure_maintenance()
-            chunk = handle.read(_CHUNK_BYTES)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _fsync_and_hash_anchor(
-    anchor: Path,
-) -> tuple[os.stat_result, str]:
-    descriptor = os.open(
-        anchor,
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-    )
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        path_stat = anchor.lstat()
-        if not (
-            stat.S_ISREG(descriptor_stat.st_mode)
-            and stat.S_ISREG(path_stat.st_mode)
-            and descriptor_stat.st_dev == path_stat.st_dev
-            and descriptor_stat.st_ino == path_stat.st_ino
-        ):
-            raise EncryptedBackupError(
-                "encrypted_backup_state_invalid"
-            )
-        _retry_fsync(descriptor)
-        artifact_sha256 = _hash_artifact_descriptor(
-            descriptor,
-            expected_size=descriptor_stat.st_size,
-        )
-        final_stat = os.fstat(descriptor)
-        final_path_stat = anchor.lstat()
-        if not (
-            descriptor_stat.st_dev == final_stat.st_dev
-            and descriptor_stat.st_ino == final_stat.st_ino
-            and descriptor_stat.st_size == final_stat.st_size
-            and descriptor_stat.st_mtime_ns == final_stat.st_mtime_ns
-            and descriptor_stat.st_ctime_ns == final_stat.st_ctime_ns
-            and final_stat.st_dev == final_path_stat.st_dev
-            and final_stat.st_ino == final_path_stat.st_ino
-        ):
-            raise EncryptedBackupError(
-                "encrypted_backup_state_invalid"
-            )
-        return final_stat, artifact_sha256
-    finally:
-        os.close(descriptor)
 
 
 def _created_at(now: Callable[[], datetime]) -> tuple[datetime, str]:
@@ -1270,13 +1031,12 @@ def create_encrypted_database_backup(
 
     def complete_snapshot() -> None:
         invoke(snapshot_complete_callback)
-    snapshot: Path | None = None
-    encrypted_temp: Path | None = None
-    verification: Path | None = None
+
+    transaction: _BackupTransaction | None = None
+    directory: Path | None = None
     target: Path | None = None
-    anchor: Path | None = None
-    anchor_identity: tuple[int, int] | None = None
     pending_state: _ArtifactCommitState | None = None
+    receipt: EncryptedBackupReceipt | None = None
     try:
         source_path = Path(source).expanduser().resolve(strict=True)
         if not source_path.is_file():
@@ -1290,8 +1050,15 @@ def create_encrypted_database_backup(
             raise EncryptedBackupError("backup_directory_invalid")
         os.chmod(directory, 0o700)
 
+        # The checksummed, inode-bound manifest is durable and exclusively
+        # locked before the first plaintext member can exist.
+        transaction = _create_backup_transaction(directory)
+        hook("transaction_manifest_durable")
         check_snapshot()
-        snapshot = _private_temp(directory, ".sensitive-snapshot-")
+        snapshot = _create_transaction_member(
+            transaction,
+            _SNAPSHOT_NAME,
+        )
         source_uri = f"{source_path.as_uri()}?mode=ro"
         with (
             sqlite3.connect(source_uri, uri=True) as source_connection,
@@ -1307,13 +1074,20 @@ def create_encrypted_database_backup(
             snapshot_connection.execute(
                 "PRAGMA journal_mode=DELETE"
             ).fetchone()
-        os.chmod(snapshot, 0o600)
+        _validate_backup_transaction(transaction)
+        snapshot_descriptor = _open_transaction_member(
+            transaction,
+            _SNAPSHOT_NAME,
+            os.O_RDONLY,
+        )
+        os.close(snapshot_descriptor)
         complete_snapshot()
         hook("snapshot_created")
         maintain()
 
-        source_sha256 = _hash_file(
-            snapshot,
+        source_sha256 = _hash_transaction_member(
+            transaction,
+            _SNAPSHOT_NAME,
             ensure_maintenance=maintain,
         )
         hook("snapshot_hashed")
@@ -1331,15 +1105,31 @@ def create_encrypted_database_backup(
         encoded_length = struct.pack(">I", len(encoded_header))
         aad = _ENCRYPTED_MAGIC + encoded_length + encoded_header
         nonce = os.urandom(_NONCE_BYTES)
-        encrypted_temp = _private_temp(directory, ".sensitive-encrypted-")
+        _create_transaction_member(transaction, _ENCRYPTED_NAME)
         encryptor = Cipher(
             algorithms.AES(backup_key),
             modes.GCM(nonce),
         ).encryptor()
         encryptor.authenticate_additional_data(aad)
         with (
-            snapshot.open("rb", buffering=0) as plaintext,
-            encrypted_temp.open("r+b", buffering=0) as ciphertext,
+            os.fdopen(
+                _open_transaction_member(
+                    transaction,
+                    _SNAPSHOT_NAME,
+                    os.O_RDONLY,
+                ),
+                "rb",
+                buffering=0,
+            ) as plaintext,
+            os.fdopen(
+                _open_transaction_member(
+                    transaction,
+                    _ENCRYPTED_NAME,
+                    os.O_RDWR,
+                ),
+                "r+b",
+                buffering=0,
+            ) as ciphertext,
         ):
             ciphertext.write(aad)
             ciphertext.write(nonce)
@@ -1355,14 +1145,34 @@ def create_encrypted_database_backup(
             ciphertext.write(encryptor.tag)
             ciphertext.flush()
             os.fsync(ciphertext.fileno())
+        _validate_backup_transaction(transaction)
         hook("ciphertext_fsynced")
         maintain()
 
-        verification = _private_temp(directory, ".sensitive-verify-")
+        verification = _create_transaction_member(
+            transaction,
+            _VERIFICATION_NAME,
+        )
         hook("verification_opened")
         with (
-            encrypted_temp.open("rb", buffering=0) as ciphertext,
-            verification.open("r+b", buffering=0) as plaintext,
+            os.fdopen(
+                _open_transaction_member(
+                    transaction,
+                    _ENCRYPTED_NAME,
+                    os.O_RDONLY,
+                ),
+                "rb",
+                buffering=0,
+            ) as ciphertext,
+            os.fdopen(
+                _open_transaction_member(
+                    transaction,
+                    _VERIFICATION_NAME,
+                    os.O_RDWR,
+                ),
+                "r+b",
+                buffering=0,
+            ) as plaintext,
         ):
             parsed_header, parsed_nonce, parsed_aad = _parse_header_stream(
                 ciphertext
@@ -1410,6 +1220,7 @@ def create_encrypted_database_backup(
             verification_hash.update(final)
             plaintext.flush()
             os.fsync(plaintext.fileno())
+        _validate_backup_transaction(transaction)
         if verification_hash.hexdigest() != source_sha256:
             raise EncryptedBackupError("encrypted_backup_hash_mismatch")
         hook("verification_hashed")
@@ -1446,6 +1257,7 @@ def create_encrypted_database_backup(
                 raise progress_failure[0]
         if check != ("ok",):
             raise EncryptedBackupError("encrypted_backup_quick_check_failed")
+        _validate_backup_transaction(transaction)
         hook("quick_check_complete")
         maintain()
 
@@ -1454,46 +1266,64 @@ def create_encrypted_database_backup(
         anchor = _pending_anchor(target)
         state_path = _commit_state_path(target)
         if (
-            target.exists()
-            or target.is_symlink()
-            or anchor.exists()
-            or anchor.is_symlink()
-            or state_path.exists()
-            or state_path.is_symlink()
+            _path_entry_exists(target)
+            or _path_entry_exists(anchor)
+            or _path_entry_exists(state_path)
         ):
             raise EncryptedBackupError("encrypted_backup_exists")
 
-        # Plaintext cleanup and every maintenance callback complete before the
-        # publication transaction. The hidden anchor and fixed-size state file
-        # are made durable while the state is PENDING. A public target can then
-        # be safely orphaned after an ambiguous link because official readers
-        # require a valid, inode-bound COMMITTED state record.
-        _unlink_private_temp(snapshot)
-        snapshot = None
-        _unlink_private_temp(verification)
-        verification = None
-        try:
-            os.link(encrypted_temp, anchor, follow_symlinks=False)
-        except FileExistsError:
-            raise EncryptedBackupError("encrypted_backup_exists") from None
-        anchor_stat, artifact_sha256 = _fsync_and_hash_anchor(anchor)
-        anchor_identity = (anchor_stat.st_dev, anchor_stat.st_ino)
-        _unlink_private_temp(encrypted_temp)
-        encrypted_temp = None
-        _fsync_directory(directory)
-
-        transaction_id = os.urandom(16).hex()
+        artifact_stat, artifact_sha256 = (
+            _fsync_and_hash_transaction_artifact(transaction)
+        )
         try:
             pending_state = _create_pending_commit_state(
                 target,
-                anchor_stat,
+                artifact_stat,
                 artifact_sha256,
-                transaction_id,
+                transaction.manifest.transaction_id,
             )
         except FileExistsError:
             raise EncryptedBackupError("encrypted_backup_exists") from None
-        _fsync_directory(directory)
+        _retry_fsync(transaction.destination_descriptor)
         hook("pending_state_durable")
+
+        try:
+            os.link(
+                _ENCRYPTED_NAME,
+                anchor.name,
+                src_dir_fd=transaction.directory_descriptor,
+                dst_dir_fd=transaction.destination_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            raise EncryptedBackupError("encrypted_backup_exists") from None
+        _retry_fsync(transaction.destination_descriptor)
+        hook("anchor_linked_pending")
+
+        try:
+            os.link(
+                anchor.name,
+                target.name,
+                src_dir_fd=transaction.destination_descriptor,
+                dst_dir_fd=transaction.destination_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            raise EncryptedBackupError("encrypted_backup_exists") from None
+        hook("target_linked_pending")
+        _retry_fsync(transaction.destination_descriptor)
+        hook("target_directory_fsynced")
+
+        observed_pending = _authoritative_state(target, "PENDING")
+        if observed_pending != pending_state:
+            raise EncryptedBackupError(
+                "encrypted_backup_state_invalid"
+            )
+
+        # All plaintext/ciphertext operation members and their manifest are
+        # removed and both directories fsynced before commit can begin.
+        _close_backup_transaction(transaction, remove=True)
+        transaction = None
 
         hook("before_artifact_commit")
         maintain()
@@ -1510,31 +1340,13 @@ def create_encrypted_database_backup(
             backup_key_id=backup_key_id,
             verified=True,
         )
-        try:
-            os.link(anchor, target, follow_symlinks=False)
-        except FileExistsError:
-            raise EncryptedBackupError("encrypted_backup_exists") from None
-        hook("target_linked_pending")
-        _fsync_directory(directory)
-        hook("target_directory_fsynced")
-        _transition_commit_state(
-            target,
-            pending_state,
-            "COMMITTED",
-        )
-        return receipt
     except BaseException as exc:
         cleanup_failure: BaseException | None = None
-        for private_path in (
-            snapshot,
-            encrypted_temp,
-            verification,
-        ):
+        if transaction is not None:
             try:
-                _unlink_private_temp(private_path)
+                _close_backup_transaction(transaction, remove=True)
             except BaseException as cleanup_exc:
-                if cleanup_failure is None:
-                    cleanup_failure = cleanup_exc
+                cleanup_failure = cleanup_exc
         if target is not None and pending_state is not None:
             for owned_path, device, inode in (
                 (
@@ -1562,16 +1374,12 @@ def create_encrypted_database_backup(
                 except BaseException as cleanup_exc:
                     if cleanup_failure is None:
                         cleanup_failure = cleanup_exc
-        elif anchor is not None and anchor_identity is not None:
-            try:
-                _unlink_matching_regular_file(
-                    anchor,
-                    device=anchor_identity[0],
-                    inode=anchor_identity[1],
-                )
-            except BaseException as cleanup_exc:
-                if cleanup_failure is None:
-                    cleanup_failure = cleanup_exc
+            if directory is not None:
+                try:
+                    _fsync_directory(directory)
+                except BaseException as cleanup_exc:
+                    if cleanup_failure is None:
+                        cleanup_failure = cleanup_exc
         if isinstance(exc, _MaintenanceCallbackFailure):
             failure = exc.cause
         elif isinstance(
@@ -1586,6 +1394,28 @@ def create_encrypted_database_backup(
         if cleanup_failure is not None:
             raise failure from cleanup_failure
         raise failure from None
+
+    if target is None or pending_state is None or receipt is None:
+        raise EncryptedBackupError("encrypted_backup_failed")
+    # No exception cleanup scope surrounds this final transition. All hooks,
+    # maintenance checks, receipt construction, artifact verification, and
+    # operation-directory cleanup have already completed.
+    try:
+        _transition_commit_state(
+            target,
+            pending_state,
+            "COMMITTED",
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except EncryptedBackupError:
+        raise
+    except BaseException:
+        # The transition proves any ambiguous durable COMMITTED write before
+        # returning or raising. This wrapper normalizes only a proven
+        # non-commit failure and deliberately performs no cleanup.
+        raise EncryptedBackupError("encrypted_backup_failed") from None
+    return receipt
 
 
 def _retire_committed_backup(
@@ -1612,16 +1442,6 @@ def _artifact_for_state_path(state_path: Path) -> Path | None:
     if _COMMITTED_NAME.fullmatch(artifact_name) is None:
         return None
     return state_path.with_name(artifact_name)
-
-
-def _artifact_for_anchor_path(anchor: Path) -> Path | None:
-    name = anchor.name
-    if not (name.startswith(".") and name.endswith(".pending")):
-        return None
-    artifact_name = name[1 : -len(".pending")]
-    if _COMMITTED_NAME.fullmatch(artifact_name) is None:
-        return None
-    return anchor.with_name(artifact_name)
 
 
 def _path_is_older_than(path: Path, cutoff: float) -> bool:
@@ -1723,7 +1543,7 @@ def _recover_state_backed_orphan(
             state_path,
             writable=True,
         )
-        _acquire_state_lock(state_descriptor, fcntl.LOCK_EX)
+        _acquire_bounded_lock(state_descriptor, fcntl.LOCK_EX)
         locked = True
         state_stat = _state_descriptor_identity(
             state_descriptor,
@@ -1810,68 +1630,6 @@ def _recover_state_backed_orphan(
                 pass
 
 
-def _recover_anchor_only_orphan(
-    anchor: Path,
-    *,
-    cutoff: float,
-    durable_directory: Path,
-) -> None:
-    artifact = _artifact_for_anchor_path(anchor)
-    if artifact is None:
-        return
-    if _path_entry_exists(artifact) or _path_entry_exists(
-        _commit_state_path(artifact)
-    ):
-        return
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(
-            anchor,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0),
-        )
-        descriptor_stat = os.fstat(descriptor)
-        path_stat = anchor.lstat()
-        if not (
-            stat.S_ISREG(descriptor_stat.st_mode)
-            and stat.S_ISREG(path_stat.st_mode)
-            and descriptor_stat.st_dev == path_stat.st_dev
-            and descriptor_stat.st_ino == path_stat.st_ino
-            and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
-            and descriptor_stat.st_mtime < cutoff
-        ):
-            return
-        with os.fdopen(os.dup(descriptor), "rb") as handle:
-            _parse_header_stream(handle)
-        final_stat = os.fstat(descriptor)
-        final_path_stat = anchor.lstat()
-        if not (
-            descriptor_stat.st_dev == final_stat.st_dev
-            and descriptor_stat.st_ino == final_stat.st_ino
-            and descriptor_stat.st_size == final_stat.st_size
-            and descriptor_stat.st_mtime_ns == final_stat.st_mtime_ns
-            and descriptor_stat.st_ctime_ns == final_stat.st_ctime_ns
-            and final_stat.st_dev == final_path_stat.st_dev
-            and final_stat.st_ino == final_path_stat.st_ino
-        ):
-            return
-        _unlink_matching_regular_file(
-            anchor,
-            device=descriptor_stat.st_dev,
-            inode=descriptor_stat.st_ino,
-        )
-        _fsync_directory(durable_directory)
-    except (EncryptedBackupError, OSError):
-        return
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
 def _recover_backup_orphans(
     destination_dir: str | Path,
     *,
@@ -1894,17 +1652,17 @@ def _recover_backup_orphans(
     durable_directory = destination.resolve(strict=True)
     cutoff = now() - orphan_ttl_seconds
     candidates = tuple(destination.iterdir())
+    for candidate in candidates:
+        if _TRANSACTION_DIRECTORY.fullmatch(candidate.name) is not None:
+            _recover_backup_transaction(
+                durable_directory,
+                candidate.name,
+                cutoff=cutoff,
+            )
     for state_path in candidates:
         if _artifact_for_state_path(state_path) is not None:
             _recover_state_backed_orphan(
                 state_path,
-                cutoff=cutoff,
-                durable_directory=durable_directory,
-            )
-    for anchor in candidates:
-        if _artifact_for_anchor_path(anchor) is not None:
-            _recover_anchor_only_orphan(
-                anchor,
                 cutoff=cutoff,
                 durable_directory=durable_directory,
             )

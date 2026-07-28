@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sqlite3
 
@@ -597,20 +598,28 @@ def test_directory_fsync_failure_occurs_before_committed_name_is_visible(
     destination = tmp_path / "fsync-backups"
     _seed_backup_source(source)
     visible_during_fsync: list[tuple[str, ...]] = []
+    original_fsync = os.fsync
 
-    def fail_fsync(_directory: Path) -> None:
-        visible_during_fsync.append(
-            tuple(path.name for path in destination.glob("*.aesgcm"))
-        )
-        raise OSError("injected directory fsync failure")
+    def fail_fsync(descriptor: int) -> None:
+        original_fsync(descriptor)
+        if (
+            destination.exists()
+            and os.fstat(descriptor).st_dev == destination.stat().st_dev
+            and os.fstat(descriptor).st_ino == destination.stat().st_ino
+        ):
+            visible_during_fsync.append(
+                tuple(path.name for path in destination.glob("*.aesgcm"))
+            )
+            raise OSError("injected directory fsync failure")
 
-    monkeypatch.setattr(backup_module, "_fsync_directory", fail_fsync)
+    monkeypatch.setattr(os, "fsync", fail_fsync)
 
     with pytest.raises(EncryptedBackupError) as captured:
         _create_backup(source, destination)
 
     assert captured.value.stable_code == "encrypted_backup_failed"
-    assert visible_during_fsync == [()]
+    assert visible_during_fsync
+    assert set(visible_during_fsync) == {()}
     assert list_committed_backups(destination) == ()
 
 

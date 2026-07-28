@@ -125,9 +125,14 @@ def test_link_success_then_cancel_and_cleanup_failure_remains_uncommitted(
     def link_then_cancel(src, dst, *args, **kwargs):
         nonlocal linked_target
         result = original_link(src, dst, *args, **kwargs)
-        candidate = Path(dst)
+        destination_descriptor = kwargs.get("dst_dir_fd")
+        candidate = destination / str(dst)
         if (
-            candidate.parent == destination
+            destination_descriptor is not None
+            and os.fstat(destination_descriptor).st_dev
+            == destination.stat().st_dev
+            and os.fstat(destination_descriptor).st_ino
+            == destination.stat().st_ino
             and not candidate.name.startswith(".")
             and candidate.name.endswith(".sqlite3.aesgcm")
         ):
@@ -169,23 +174,23 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
     source = tmp_path / "target-fsync.db"
     destination = tmp_path / "target-fsync-backups"
     _seed_source(source)
-    original_fsync_directory = backup_module._fsync_directory
+    original_fsync = os.fsync
     observed_pending_target = False
 
-    def fail_after_target_link(directory: Path) -> None:
+    def fail_after_target_link(descriptor: int) -> None:
         nonlocal observed_pending_target
+        original_fsync(descriptor)
         public_targets = tuple(destination.glob("*.sqlite3.aesgcm"))
-        if public_targets:
+        if (
+            public_targets
+            and os.fstat(descriptor).st_dev == destination.stat().st_dev
+            and os.fstat(descriptor).st_ino == destination.stat().st_ino
+        ):
             observed_pending_target = True
             assert list_committed_backups(destination) == ()
             raise OSError("injected target-directory fsync failure")
-        original_fsync_directory(directory)
 
-    monkeypatch.setattr(
-        backup_module,
-        "_fsync_directory",
-        fail_after_target_link,
-    )
+    monkeypatch.setattr(os, "fsync", fail_after_target_link)
 
     with pytest.raises(
         EncryptedBackupError,
@@ -504,17 +509,11 @@ def test_success_receipt_follows_target_and_commit_state_durability(
     source = tmp_path / "durable-receipt.db"
     destination = tmp_path / "durable-receipt-backups"
     _seed_source(source)
-    original_fsync_directory = backup_module._fsync_directory
     original_pwrite = os.pwrite
     original_fsync = os.fsync
     events: list[str] = []
     commit_write_seen = False
-
-    def observe_directory_fsync(directory: Path) -> None:
-        original_fsync_directory(directory)
-        if tuple(destination.glob("*.sqlite3.aesgcm")):
-            events.append("target-directory-durable")
-            assert list_committed_backups(destination) == ()
+    target_directory_durable = False
 
     def observe_state_write(descriptor, data, offset):
         nonlocal commit_write_seen
@@ -525,18 +524,22 @@ def test_success_receipt_follows_target_and_commit_state_durability(
         return written
 
     def observe_state_fsync(descriptor):
-        nonlocal commit_write_seen
+        nonlocal commit_write_seen, target_directory_durable
         result = original_fsync(descriptor)
+        if (
+            not target_directory_durable
+            and tuple(destination.glob("*.sqlite3.aesgcm"))
+            and os.fstat(descriptor).st_dev == destination.stat().st_dev
+            and os.fstat(descriptor).st_ino == destination.stat().st_ino
+        ):
+            target_directory_durable = True
+            events.append("target-directory-durable")
+            assert list_committed_backups(destination) == ()
         if commit_write_seen:
             events.append("commit-state-durable")
             commit_write_seen = False
         return result
 
-    monkeypatch.setattr(
-        backup_module,
-        "_fsync_directory",
-        observe_directory_fsync,
-    )
     monkeypatch.setattr(os, "pwrite", observe_state_write)
     monkeypatch.setattr(os, "fsync", observe_state_fsync)
 

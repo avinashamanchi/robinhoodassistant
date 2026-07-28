@@ -640,20 +640,32 @@ def test_backup_temps_are_mode_0600_while_failure_hook_inspects_directory(
     source = tmp_path / "modes.db"
     destination = tmp_path / "mode-backups"
     _seed_database(source)
-    observed_modes: list[int] = []
+    observed_directory_modes: list[int] = []
+    observed_member_modes: list[int] = []
 
     def inspect_modes(stage: str) -> None:
         if stage in {"snapshot_created", "verification_opened"}:
-            observed_modes.extend(
-                stat.S_IMODE(candidate.stat().st_mode)
+            transactions = tuple(
+                candidate
                 for candidate in destination.iterdir()
-                if candidate.name.startswith(".")
+                if candidate.name.startswith(".backup-txn-")
+            )
+            assert len(transactions) == 1
+            transaction = transactions[0]
+            observed_directory_modes.append(
+                stat.S_IMODE(transaction.stat().st_mode)
+            )
+            observed_member_modes.extend(
+                stat.S_IMODE(candidate.stat().st_mode)
+                for candidate in transaction.iterdir()
             )
 
     _create(source, destination, stage_hook=inspect_modes)
 
-    assert observed_modes
-    assert set(observed_modes) == {0o600}
+    assert observed_directory_modes
+    assert observed_member_modes
+    assert set(observed_directory_modes) == {0o700}
+    assert set(observed_member_modes) == {0o600}
 
 
 def test_migration_backs_up_before_mutation_and_encrypts_every_registered_field(

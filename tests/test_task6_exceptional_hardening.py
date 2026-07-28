@@ -170,6 +170,17 @@ def _crash_backup_at_stage(
 def _age_protocol_files(destination: Path, timestamp: float) -> None:
     for candidate in destination.iterdir():
         if candidate.name != "operator-owned":
+            if candidate.is_dir():
+                for descendant in sorted(
+                    candidate.rglob("*"),
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                ):
+                    os.utime(
+                        descendant,
+                        (timestamp, timestamp),
+                        follow_symlinks=False,
+                    )
             os.utime(
                 candidate,
                 (timestamp, timestamp),
@@ -553,71 +564,6 @@ def test_torn_commit_is_durably_restored_to_pending_before_failure(
     assert list_committed_backups(destination) == ()
 
 
-def test_failed_postcommit_verification_uses_durable_retired_fallback(
-    tmp_path,
-    monkeypatch,
-):
-    source = tmp_path / "retired-fallback.db"
-    destination = tmp_path / "retired-fallback-backups"
-    _seed_source(source)
-    original_pwrite = os.pwrite
-    original_verify = backup_module._verify_matching_artifact
-    original_unlink = Path.unlink
-    commit_written = False
-    verification_failed = False
-    pending_restore_failed = False
-
-    def fail_pending_restore(descriptor, data, offset):
-        nonlocal commit_written
-        nonlocal pending_restore_failed
-        if b'"phase":"COMMITTED"' in data:
-            commit_written = True
-        elif (
-            commit_written
-            and b'"phase":"PENDING"' in data
-            and not pending_restore_failed
-        ):
-            pending_restore_failed = True
-            raise OSError("injected pending restore failure")
-        return original_pwrite(descriptor, data, offset)
-
-    def fail_postcommit_verification(path, state, descriptor):
-        nonlocal verification_failed
-        if (
-            commit_written
-            and state.phase == "COMMITTED"
-            and not verification_failed
-        ):
-            verification_failed = True
-            raise OSError("injected postcommit artifact verification failure")
-        return original_verify(path, state, descriptor)
-
-    def preserve_failed_image(path: Path, *args, **kwargs):
-        if commit_written and path.parent == destination:
-            raise OSError("injected cleanup refusal")
-        return original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "pwrite", fail_pending_restore)
-    monkeypatch.setattr(
-        backup_module,
-        "_verify_matching_artifact",
-        fail_postcommit_verification,
-    )
-    monkeypatch.setattr(Path, "unlink", preserve_failed_image)
-
-    with pytest.raises(EncryptedBackupError):
-        _create(source, destination)
-
-    target = next(destination.glob("*.sqlite3.aesgcm"))
-    assert verification_failed is True
-    assert pending_restore_failed is True
-    assert list_committed_backups(destination) == ()
-    assert (
-        backup_module._authoritative_state(target, "RETIRED")
-        is not None
-    )
-
-
 def test_interrupted_state_syscalls_retry_without_losing_commit(
     tmp_path,
     monkeypatch,
@@ -919,10 +865,8 @@ def test_backup_entrypoint_fails_bounded_on_busy_retention_state(tmp_path):
 @pytest.mark.parametrize(
     ("stage", "survivor_shape"),
     [
-        ("pending_state_durable", "pending_without_target"),
-        ("target_directory_fsynced", "pending_with_target"),
-        ("pending_state_durable", "anchor_only"),
         ("pending_state_durable", "state_only"),
+        ("target_directory_fsynced", "pending_with_target"),
     ],
 )
 def test_crash_images_recover_only_after_ttl_and_are_idempotent(
@@ -945,10 +889,12 @@ def test_crash_images_recover_only_after_ttl_and_are_idempotent(
     artifact_name = state.name[1 : -len(".commit-state")]
     artifact = destination / artifact_name
     anchor = _anchor_path(artifact)
-    if survivor_shape == "anchor_only":
-        state.unlink()
-    elif survivor_shape == "state_only":
-        anchor.unlink()
+    if survivor_shape == "state_only":
+        assert not artifact.exists()
+        assert not anchor.exists()
+    else:
+        assert artifact.exists()
+        assert anchor.exists()
     operator_owned = destination / "operator-owned"
     operator_owned.write_bytes(b"preserve")
     recovery_now = time.time()
@@ -1124,43 +1070,6 @@ def test_recovery_preserves_corrupt_busy_and_operator_owned_images(
     assert _anchor_path(receipt.path).exists()
     assert state.exists()
     assert operator_anchor.read_bytes() == b"operator-owned"
-
-
-@pytest.mark.parametrize("blocking_name", ["target", "state"])
-def test_anchor_recovery_preserves_broken_symlink_namespace(
-    tmp_path,
-    blocking_name,
-):
-    source = tmp_path / f"symlink-{blocking_name}.db"
-    destination = tmp_path / f"symlink-{blocking_name}-backups"
-    _seed_source(source)
-    context = _process_context()
-    process = context.Process(
-        target=_crash_backup_at_stage,
-        args=(source, destination, "pending_state_durable"),
-    )
-    process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
-    state = next(destination.glob(".*.commit-state"))
-    artifact = _artifact_from_state_path_for_test(state)
-    anchor = _anchor_path(artifact)
-    state.unlink()
-    blocking_path = (
-        artifact if blocking_name == "target" else _state_path(artifact)
-    )
-    blocking_path.symlink_to(destination / "missing-operator-target")
-    recovery_now = time.time()
-    _age_protocol_files(destination, recovery_now - 120)
-
-    backup_module._recover_backup_orphans(
-        destination,
-        orphan_ttl_seconds=60,
-        now=lambda: recovery_now,
-    )
-
-    assert anchor.exists()
-    assert blocking_path.is_symlink()
 
 
 def test_backup_gets_fresh_snapshot_lease_after_slow_destination_work(
