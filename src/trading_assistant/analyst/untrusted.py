@@ -42,6 +42,7 @@ _MAX_SOURCE_NAME_CHARACTERS = 256
 _MAX_ENCODED_CANDIDATE_CHARACTERS = 4_096
 _MAX_DECODED_PAYLOAD_BYTES = 3_072
 _MAX_CANONICALIZATION_PASSES = 4
+_MAX_ACTION_CUE_SEPARATOR_CHARACTERS = 8
 
 SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
 FindingSeverity = Literal["low", "medium", "high"]
@@ -99,22 +100,73 @@ _MARKDOWN_IMAGE_RE = re.compile(
     r"!\[[^\]\r\n]{0,1024}\]\((?:[^()\r\n]|\([^)\r\n]*\)){0,4096}\)"
 )
 _DATA_URL_RE = re.compile(r"(?is)\bdata:[^\s<>'\"\])]{1,8192}")
+_ACTION_CUE_JOIN_PATTERN = (
+    rf"[\W_]{{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+)
+_ACTION_CUE_PUNCTUATION_PATTERN = (
+    rf"(?:[^\w\s]|_){{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+)
+_ACTION_CUE_STRONG_TERMINAL_PATTERN = (
+    rf"(?:"
+    rf"\s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+    rf"{_ACTION_CUE_PUNCTUATION_PATTERN}"
+    rf"\s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+    rf"|\s{{1,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}"
+    rf")"
+)
+_ACTION_CUE_FILLER_PATTERN = (
+    rf"(?:this|the{_ACTION_CUE_JOIN_PATTERN}following)"
+)
+_ACTION_CUE_OBJECT_PATTERN = (
+    r"(?:base64|payload|instruction|content|data)"
+)
+_ACTION_CUE_OBJECTS_PATTERN = (
+    rf"{_ACTION_CUE_OBJECT_PATTERN}"
+    rf"(?:{_ACTION_CUE_JOIN_PATTERN}{_ACTION_CUE_OBJECT_PATTERN})?"
+)
 _ENCODED_ACTION_CUE_RE = re.compile(
-    r"""
+    rf"""
     \b(?:
-        decode\s{1,8}and\s{1,8}obey
-            (?:\s{1,8}(?:this|the\s{1,8}following))?
-            (?:\s{1,8}(?:base64|payload|data|instruction)){0,2}
-        |decode
-            (?:\s{1,8}(?:this|the\s{1,8}following))?
-            (?:\s{1,8}(?:base64|payload|data|instruction)){1,2}
-        |encoded\s{1,8}
-            (?:base64\s{1,8})?(?:payload|data|instruction)
-        |base64(?:\s{1,8}(?:payload|data|instruction))?
-        |encode(?:d)?
-        |decode
+        (?>
+            decode{_ACTION_CUE_JOIN_PATTERN}and
+                {_ACTION_CUE_JOIN_PATTERN}obey
+                (?:{_ACTION_CUE_JOIN_PATTERN}
+                    {_ACTION_CUE_FILLER_PATTERN})?
+                (?:{_ACTION_CUE_JOIN_PATTERN}
+                    {_ACTION_CUE_OBJECTS_PATTERN})?
+            |(?:decode|encode){_ACTION_CUE_JOIN_PATTERN}
+                {_ACTION_CUE_FILLER_PATTERN}
+                {_ACTION_CUE_JOIN_PATTERN}
+                {_ACTION_CUE_OBJECTS_PATTERN}
+            |(?:decode|encode){_ACTION_CUE_JOIN_PATTERN}
+                {_ACTION_CUE_OBJECTS_PATTERN}
+            |base64{_ACTION_CUE_JOIN_PATTERN}
+                (?:{_ACTION_CUE_FILLER_PATTERN}
+                    {_ACTION_CUE_JOIN_PATTERN})?
+                {_ACTION_CUE_OBJECTS_PATTERN}
+            |encoded{_ACTION_CUE_JOIN_PATTERN}
+                (?:{_ACTION_CUE_FILLER_PATTERN}
+                    {_ACTION_CUE_JOIN_PATTERN})?
+                (?:base64{_ACTION_CUE_JOIN_PATTERN})?
+                {_ACTION_CUE_OBJECTS_PATTERN}
+        )
+        (?>{_ACTION_CUE_STRONG_TERMINAL_PATTERN})
+        |
+        (?>
+            (?:decode|encode(?:d)?|base64)
+                {_ACTION_CUE_JOIN_PATTERN}
+                {_ACTION_CUE_FILLER_PATTERN}
+            |decode
+            |encode(?:d)?
+            |base64
+        )
+        (?>
+            \s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}
+            {_ACTION_CUE_PUNCTUATION_PATTERN}
+            \s{{0,{_MAX_ACTION_CUE_SEPARATOR_CHARACTERS}}}
+        )
     )
-    \s{0,8}(?:=>|->|:|=)\s{0,8}
+    (?=\S)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -426,10 +478,15 @@ def _decoded_instruction(candidate: str) -> bool:
 
 
 def _reject_cued_encoded_content(text: str) -> None:
+    """Reject cue-shaped content conservatively instead of parsing payloads.
+
+    False positives are intentional when untrusted prose resembles an
+    explicit encoded-action cue followed by content; standalone cue words
+    without a payload remain available to downstream analysis.
+    """
     detection_text = " ".join(text.split())
-    for cue in _ENCODED_ACTION_CUE_RE.finditer(detection_text):
-        if detection_text[cue.end() :].strip():
-            raise UntrustedContentError("ambiguous_encoding")
+    if _ENCODED_ACTION_CUE_RE.search(detection_text):
+        raise UntrustedContentError("ambiguous_encoding")
 
 
 def _strip_uncued_encoded_payloads(

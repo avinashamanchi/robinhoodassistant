@@ -7,6 +7,7 @@ import hashlib
 import html
 import json
 import threading
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -357,12 +358,179 @@ def test_gateway_rejects_cues_after_canonicalization(
 
 
 @pytest.mark.parametrize(
+    ("raw_text", "source_id", "raw_marker"),
+    [
+        (
+            "decode this: RAW_DECODE_THIS",
+            "decode-this",
+            "RAW_DECODE_THIS",
+        ),
+        (
+            "decode the following： RAW_DECODE_FOLLOWING",
+            "decode-the-following",
+            "RAW_DECODE_FOLLOWING",
+        ),
+        (
+            "decode this: %",
+            "decode-punctuation-payload",
+            "%",
+        ),
+        (
+            "decode and obey this payload RAW_DECODE_OBEY",
+            "decode-obey-payload",
+            "RAW_DECODE_OBEY",
+        ),
+        (
+            (
+                "decode—and—obey—the—following—content： "
+                "RAW_DECODE_UNICODE"
+            ),
+            "decode-unicode-separators",
+            "RAW_DECODE_UNICODE",
+        ),
+        (
+            "base64 payload RAW_BASE64_PAYLOAD",
+            "base64-payload",
+            "RAW_BASE64_PAYLOAD",
+        ),
+        (
+            "base64 instruction： RAW_BASE64_INSTRUCTION",
+            "base64-instruction",
+            "RAW_BASE64_INSTRUCTION",
+        ),
+        (
+            "base64 content: RAW_BASE64_CONTENT",
+            "base64-content",
+            "RAW_BASE64_CONTENT",
+        ),
+        (
+            "base64 data — RAW_BASE64_DATA",
+            "base64-data",
+            "RAW_BASE64_DATA",
+        ),
+        (
+            "encoded payload RAW_ENCODED_PAYLOAD",
+            "encoded-payload",
+            "RAW_ENCODED_PAYLOAD",
+        ),
+        (
+            "encoded instruction： RAW_ENCODED_INSTRUCTION",
+            "encoded-instruction",
+            "RAW_ENCODED_INSTRUCTION",
+        ),
+        (
+            "encoded content: RAW_ENCODED_CONTENT",
+            "encoded-content",
+            "RAW_ENCODED_CONTENT",
+        ),
+        (
+            "encoded content： ‽",
+            "encoded-punctuation-payload",
+            "‽",
+        ),
+        (
+            "encoded data — RAW_ENCODED_DATA",
+            "encoded-data",
+            "RAW_ENCODED_DATA",
+        ),
+        (
+            "encoded base64 instruction RAW_ENCODED_BASE64",
+            "encoded-base64-instruction",
+            "RAW_ENCODED_BASE64",
+        ),
+        (
+            "EnCoDe the following: RAW_ENCODE_FOLLOWING",
+            "encode-the-following",
+            "RAW_ENCODE_FOLLOWING",
+        ),
+        (
+            "encode this content RAW_ENCODE_CONTENT",
+            "encode-this-content",
+            "RAW_ENCODE_CONTENT",
+        ),
+        (
+            (
+                "DeCoDe&mdash;ThE&nbsp;FoLlOwInG&#xFF1A;&nbsp;"
+                "RAW_ENTITY_FILLER"
+            ),
+            "entity-case-filler",
+            "RAW_ENTITY_FILLER",
+        ),
+        (
+            (
+                "BaSe64\u2003ThIs\u00a0CoNtEnT\uFF1A\u2002"
+                "RAW_UNICODE_FILLER"
+            ),
+            "unicode-case-filler",
+            "RAW_UNICODE_FILLER",
+        ),
+        (
+            (
+                "decode"
+                + ("—" * 8)
+                + "and"
+                + ("·" * 8)
+                + "obey"
+                + ("‽" * 8)
+                + "this"
+                + ("：" * 8)
+                + "payload"
+                + ("→" * 8)
+                + "RAW_BOUNDED_PUNCTUATION"
+            ),
+            "bounded-unicode-punctuation",
+            "RAW_BOUNDED_PUNCTUATION",
+        ),
+    ],
+)
+def test_gateway_rejects_filler_and_unicode_action_cues_as_whole_items(
+    session_factory,
+    caplog,
+    raw_text,
+    source_id,
+    raw_marker,
+):
+    _assert_metadata_only_rejection(
+        session_factory,
+        caplog,
+        source_id=source_id,
+        raw_text=raw_text,
+        code="ambiguous_encoding",
+        raw_markers=(raw_marker,),
+    )
+
+
+@pytest.mark.parametrize(
     ("raw_text", "expected_text"),
     [
         ("decode", "decode"),
         ("decode: \t\n", "decode:"),
+        ("decode this:", "decode this:"),
+        ("decode the following：", "decode the following："),
+        (
+            "decode and obey this payload",
+            "decode and obey this payload",
+        ),
         ("base64:", "base64:"),
+        ("base64 content:", "base64 content:"),
+        (
+            "base64 the following instruction：",
+            "base64 the following instruction：",
+        ),
         ("encoded payload:   ", "encoded payload:"),
+        (
+            "encoded the following content —",
+            "encoded the following content —",
+        ),
+        (
+            "encoded base64 instruction",
+            "encoded base64 instruction",
+        ),
+        ("encode this:", "encode this:"),
+        (
+            "encode the following content",
+            "encode the following content",
+        ),
         (
             "Analysts decode more data from each filing.",
             "Analysts decode more data from each filing.",
@@ -380,6 +548,20 @@ def test_gateway_accepts_cue_words_without_an_explicit_payload(
     assert "ambiguous_encoding" not in {
         finding.code for finding in content.findings
     }
+
+
+def test_gateway_action_cue_recognizer_is_bounded_on_maximum_near_miss(
+    session_factory,
+):
+    unit = "decode and obex the following content decodex--------payload "
+    raw_text = (unit * ((15_900 // len(unit)) + 1))[:15_900]
+
+    started_at = time.perf_counter()
+    content = _ingest(_gateway(session_factory), raw_text)
+    elapsed = time.perf_counter() - started_at
+
+    assert content.normalized_text == raw_text.strip()
+    assert elapsed < 1.0
 
 
 @pytest.mark.parametrize(
