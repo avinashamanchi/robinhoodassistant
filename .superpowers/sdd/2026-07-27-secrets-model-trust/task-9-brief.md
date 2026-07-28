@@ -234,3 +234,22 @@ through deterministic fakes, with zero broker submission/cancellation calls.
 - Use temporary SQLite and deterministic fakes only. Do not start services,
   contact providers, read Keychain content, touch the ignored runtime database,
   trade, reset a breaker, push, or begin Task 10.
+
+## Review fix round 6 evidence contract
+
+- `RuleRepository.lease_group` accepts only a datetime whose `utcoffset()` is
+  exactly zero. Positive, negative, absent, invalid, or exception-raising
+  offsets fail closed before the repository opens a database session and
+  therefore cannot mutate a group or write audit/lifecycle proof.
+- Strict caller validation is separate from persisted timestamp
+  normalization. A SQLite-naive group timestamp is interpreted as persisted
+  UTC internally; a valid aware persisted timestamp may be converted to UTC.
+  Neither behavior permits a non-UTC caller sample.
+- Preserve exact UTC equality, fixed-clock worker/daemon behavior, and the
+  monotonic group-created/group-updated chronology from fix round 5.
+- Capture RED for the nonzero/malformed cases, pass focused rule/candidate/
+  worker/daemon tests, then run exactly one no-argument full suite and the
+  release static gate.
+- Use temporary SQLite and deterministic fakes only. Do not start services,
+  contact providers, read Keychain content, touch the ignored runtime database,
+  trade, reset a breaker, push, or begin Task 10.

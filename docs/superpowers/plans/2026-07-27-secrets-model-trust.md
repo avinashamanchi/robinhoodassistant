@@ -1560,8 +1560,8 @@ git commit -m "feat(analyst): isolate untrusted model context"
   reconciliation fill insert, promotion, supersession, deletion, or state
   change, including terminal-order and later-phase-failure boundaries.
 - [x] **FR5.2:** Reject invalid, naive, or backdated rule-lease clock samples
-  before any latch, lease, or proof write; normalize valid samples to UTC and
-  preserve exact-equality/restart behavior.
+  before any latch, lease, or proof write; require exact UTC caller samples
+  and preserve exact-equality/restart behavior.
 - [x] **FR5.3:** Route plan reconciliation-latch changes through shared
   proof-producing group mutations and prove audit failure rolls back the group
   changes.
@@ -1579,6 +1579,24 @@ helper now uses the injected rule-persistence clock, and the exact four plus
 the complete affected release/rule/daemon set pass focused verification.
 The suite was not rerun because this round explicitly permits exactly one full
 run, so no post-fix green no-argument-suite result is claimed.
+
+**Fix round 6**
+
+- [x] **FR6.1:** Require `RuleRepository.lease_group` caller samples to have
+  `utcoffset() == timedelta(0)`; reject every nonzero or malformed offset
+  before opening a database session or writing mutation/audit/proof state.
+- [x] **FR6.2:** Keep persisted timestamp handling separate from caller trust:
+  interpret SQLite-naive rule-group timestamps as stored UTC and normalize
+  valid aware persisted timestamps without weakening the strict caller gate.
+- [x] **FR6.3:** Preserve aware-UTC exact equality and fixed-clock worker/
+  daemon behavior while retaining the round-5 monotonic chronology check.
+- [x] **FR6.4:** Capture RED, pass the focused rule/candidate/worker/daemon
+  set, run exactly one green no-argument full suite, produce a review diff,
+  and pass the release static gate without runtime or external calls.
+
+Fix round 6 closes the round-5 full-suite caveat with a fresh post-correction
+run: `3239 passed, 1 skipped, 1 warning`. No Task 10 surface, schema, service,
+broker, provider, notification, or runtime behavior was added.
 
 ---
 

@@ -5,6 +5,8 @@
 Task 9 was implemented in `9a9327f`. Review fix round 1 is implemented in
 `9197ba8`. Review fix round 2 is implemented in `a092790`. Review fix round 3
 is implemented in `8bb5ab5`. Review fix round 4 is implemented in `b6af5fe`.
+Review fix round 5 is implemented in `a8dca94`. Review fix round 6 is
+implemented in `7d5aeb0`.
 
 General chat now has one immutable read-only tool registry plus two
 non-persisting draft tools. It cannot propose, create, cancel, approve, submit,
@@ -845,6 +847,90 @@ suite.
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-b7c5be6..a8dca94.diff`
 - Diff size: 1,317 lines / 45,746 bytes
 
+## Review fix round 6
+
+The one strict-UTC lease-boundary finding was addressed in implementation
+commit `7d5aeb0`:
+
+- `RuleRepository.lease_group` now accepts only caller samples whose
+  `utcoffset()` is exactly `timedelta(0)`. Positive, negative, absent, and
+  exception-raising offsets produce one stable fail-closed `ValueError`.
+- Caller validation still runs before `self.session_factory()` is invoked.
+  Rejected samples therefore cannot read or mutate a group, write an audit, or
+  create lifecycle proof.
+- Persisted timestamp handling uses a separate internal normalizer. A
+  SQLite-naive value is interpreted as persisted UTC, while a valid aware
+  persisted value is converted to UTC. This compatibility does not weaken the
+  strict caller boundary.
+- Exact aware-UTC equality remains accepted. The round-5 created/updated
+  monotonic chronology, worker lost-lease handling, and fixed-clock behavior
+  are unchanged.
+- No model, migration, route, candidate, broker, provider, daemon, or Task 10
+  production surface changed.
+
+### Fix-round-6 RED evidence
+
+The focused regressions were run before the implementation edit:
+
+```text
+uv run pytest -q \
+  tests/test_rule_leases.py::test_lease_group_rejects_non_utc_now_before_db_open_or_mutation \
+  tests/test_rule_leases.py::test_lease_group_accepts_utc_equal_time \
+  tests/test_rule_leases.py::test_persisted_rule_group_timestamps_normalize_as_utc_internally
+4 failed, 1 passed
+```
+
+Both valid nonzero offsets acquired a lease, the malformed offset exposed the
+old permissive validation contract, and the separate persisted-timestamp
+normalizer did not exist.
+
+### Fix-round-6 focused verification
+
+```text
+uv run pytest -q \
+  tests/test_rule_leases.py::test_lease_group_rejects_non_utc_now_before_db_open_or_mutation \
+  tests/test_rule_leases.py::test_lease_group_accepts_utc_equal_time \
+  tests/test_rule_leases.py::test_persisted_rule_group_timestamps_normalize_as_utc_internally \
+  tests/test_rule_leases.py::test_lease_group_rejects_non_aware_or_invalid_now_before_mutation \
+  tests/test_rule_leases.py::test_lease_group_rejects_now_before_group_creation
+8 passed
+
+uv run pytest -q tests/test_rule_models.py tests/test_rule_leases.py \
+  tests/test_rules_engine.py tests/test_plan_rules.py \
+  tests/test_candidate_boundary.py tests/test_planning.py \
+  tests/test_monitor.py tests/test_release_gate_branches.py
+406 passed, 1 warning
+
+git diff --check
+PASS
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning.
+
+### Fix-round-6 full and release gates
+
+Exactly one no-argument full suite was run for this round:
+
+```text
+uv run pytest
+3239 passed, 1 skipped, 1 warning in 248.98s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+This fresh green no-argument run closes the fix-round-5 post-correction
+full-suite caveat. It was not retried or rerun.
+
+### Fix-round-6 review package
+
+- Base: `d1fb3c5`
+- Implementation: `7d5aeb0`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-d1fb3c5..7d5aeb0.diff`
+- Diff size: 191 lines / 6,564 bytes
+
 ## Safety statement
 
 All tests used temporary SQLite databases and deterministic fakes. No app,
@@ -876,9 +962,8 @@ equity/crypto behavior.
 - The fix-round-4 review package is prepared but has not yet received a fresh
   independent review, so this report claims implementation-gate completion,
   not independent-review closure.
-- The fix-round-5 review package has not received independent review, and its
-  sole full suite was not green before the fixed-clock test correction. The
-  exact failures and complete affected adjacency are green, but no post-fix
-  no-argument-suite result is claimed.
+- The fix-round-5 and fix-round-6 review packages have not yet received a
+  fresh independent review. The round-6 green no-argument suite closes the
+  round-5 fixed-clock verification caveat but is not independent review.
 - Candidate queueing intentionally does not make profitability claims and does
   not weaken the separate recent-auth approval boundary.
