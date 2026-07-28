@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from threading import Barrier
 
@@ -28,6 +28,7 @@ from trading_assistant.db.models import (
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.rules.application import RuleApplicationService
 from trading_assistant.rules.models import RuleCommand
+from trading_assistant.rules import repository as rule_repository
 from trading_assistant.rules.repository import RuleRepository
 from trading_assistant.rules.worker import RuleWorker
 from trading_assistant.security.sensitive_fields import persist_sensitive
@@ -39,6 +40,14 @@ DEFAULT_RULE_CONTEXT = {
     "reason": "test conditional rule lifecycle",
     "request_id": "test-rule-lifecycle",
 }
+
+
+class _MalformedOffset(tzinfo):
+    def utcoffset(self, dt):
+        raise RuntimeError("malformed test offset")
+
+    def dst(self, dt):
+        return None
 
 
 def _command(
@@ -252,7 +261,63 @@ def test_backdated_lease_cannot_set_reconciliation_latch_before_rejection(
         ) == 0
 
 
-def test_lease_group_accepts_equal_time_and_normalizes_offset_to_utc(
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        NOW.astimezone(timezone(timedelta(hours=-7))),
+        NOW.astimezone(timezone(timedelta(minutes=1))),
+        datetime(2026, 7, 24, 12, tzinfo=_MalformedOffset()),
+    ],
+    ids=("negative-offset", "positive-offset", "malformed-offset"),
+)
+def test_lease_group_rejects_non_utc_now_before_db_open_or_mutation(
+    session_factory,
+    seeded_oco_group,
+    invalid_now,
+):
+    repository = RuleRepository(session_factory, owner="worker-a")
+    opened_sessions = 0
+
+    def tracked_session_factory():
+        nonlocal opened_sessions
+        opened_sessions += 1
+        return session_factory()
+
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        group.created_at = NOW
+        group.updated_at = NOW
+        session.commit()
+        initial_state = (
+            group.version,
+            group.lease_owner,
+            group.lease_expires_at,
+            session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+    repository.session_factory = tracked_session_factory
+
+    with pytest.raises(
+        ValueError,
+        match="rule lease now must be timezone-aware UTC",
+    ):
+        repository.lease_group(
+            seeded_oco_group,
+            now=invalid_now,
+            **DEFAULT_RULE_CONTEXT,
+        )
+
+    assert opened_sessions == 0
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        assert (
+            group.version,
+            group.lease_owner,
+            group.lease_expires_at,
+            session.scalar(select(func.count()).select_from(AuditEvent)),
+        ) == initial_state
+
+
+def test_lease_group_accepts_utc_equal_time(
     session_factory,
     seeded_oco_group,
 ):
@@ -262,11 +327,10 @@ def test_lease_group_accepts_equal_time_and_normalizes_offset_to_utc(
         group.created_at = NOW
         group.updated_at = NOW
         session.commit()
-    offset_now = NOW.astimezone(timezone(timedelta(hours=-4)))
 
     lease = repository.lease_group(
         seeded_oco_group,
-        now=offset_now,
+        now=NOW,
         **DEFAULT_RULE_CONTEXT,
     )
 
@@ -277,6 +341,20 @@ def test_lease_group_accepts_equal_time_and_normalizes_offset_to_utc(
         group = session.get(RuleGroup, seeded_oco_group)
         assert group.updated_at == NOW
         assert group.lease_expires_at == NOW + timedelta(seconds=30)
+
+
+def test_persisted_rule_group_timestamps_normalize_as_utc_internally():
+    naive_persisted_utc = NOW.replace(tzinfo=None)
+    persisted_offset = NOW.astimezone(
+        timezone(timedelta(hours=-7))
+    )
+
+    assert rule_repository._normalize_persisted_rule_timestamp(
+        naive_persisted_utc
+    ) == NOW
+    assert rule_repository._normalize_persisted_rule_timestamp(
+        persisted_offset
+    ) == NOW
 
 
 def test_expired_lease_can_be_recovered_with_a_new_owner(

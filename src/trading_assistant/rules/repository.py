@@ -254,14 +254,33 @@ def _require_context(
 
 def _require_aware_utc_lease_now(value: object) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
-        raise ValueError("rule lease now must be timezone-aware")
+        raise ValueError("rule lease now must be timezone-aware UTC")
     try:
         offset = value.utcoffset()
+    except Exception:
+        raise ValueError(
+            "rule lease now must be timezone-aware UTC"
+        ) from None
+    if offset != timedelta(0):
+        raise ValueError("rule lease now must be timezone-aware UTC")
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _normalize_persisted_rule_timestamp(value: object) -> datetime:
+    """Interpret durable SQLite timestamps as UTC without trusting callers."""
+    if not isinstance(value, datetime):
+        raise ValueError("persisted rule timestamp is invalid")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    try:
+        offset = value.utcoffset()
+        if offset is None:
+            raise ValueError
+        return (
+            value.replace(tzinfo=None) - offset
+        ).replace(tzinfo=timezone.utc)
     except (OverflowError, TypeError, ValueError):
-        offset = None
-    if offset is None:
-        raise ValueError("rule lease now must be timezone-aware")
-    return value.astimezone(timezone.utc)
+        raise ValueError("persisted rule timestamp is invalid") from None
 
 
 def _audit(
@@ -1641,10 +1660,10 @@ class RuleRepository:
             if group is None:
                 session.rollback()
                 return None
-            created_at = _require_aware_utc_lease_now(
+            created_at = _normalize_persisted_rule_timestamp(
                 group.created_at
             )
-            updated_at = _require_aware_utc_lease_now(
+            updated_at = _normalize_persisted_rule_timestamp(
                 group.updated_at
             )
             if (
