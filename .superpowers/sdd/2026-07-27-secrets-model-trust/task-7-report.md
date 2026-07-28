@@ -10,12 +10,16 @@
   `c5015cd4c4fa4de21e670014ca19f7a9c2e8ab0f`.
 - Reviewer fix-round-1 implementation commit:
   `953b36eca1545dc63d069a100d082a77595815f7`.
+- Reviewer fix-round-2 quarantine implementation commit:
+  `e3b6a8f5e7964fa8f4bbd50ac53e4345fd0bd22c`.
 - The Task 7 focused and affected suites are green.
 - The repository-wide full-suite gate is clean. The historical initial run
   exposed one reproducible panic-lease defect, and the historical confirmation
   after that fix passed with 2,848 passed. After reviewer fix round 1, exactly
   one new final full suite passed with 2,888 passed, 1 skipped, and 1 existing
-  third-party warning.
+  third-party warning. After quarantine-only reviewer fix round 2, exactly one
+  new final full suite passed with 2,898 passed, 1 skipped, and the same
+  existing third-party warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -54,10 +58,16 @@
   controls and active tags.
 - Detected and removed direct instruction phrases, indirect mutable-tool
   instructions, nested or malformed tool-call JSON fragments, and suspicious
-  standard or URL-safe Base64 payloads. Explicitly cued Base64 represented as
-  bounded four-character chunks separated by mixed whitespace is compacted
-  only for classification; malicious or malformed encoded spans are removed
-  from the transient output in their original form.
+  standard or URL-safe Base64 payloads. Explicit encode, decode, and Base64
+  cues now use a linear, bounded scanner that accepts arbitrary chunk lengths
+  and all Unicode whitespace recognized by `str.isspace()`, including NBSP
+  introduced by entity canonicalization. Payload text is compacted only for
+  classification; malicious or malformed exact spans are removed from the
+  transient output in their original form.
+- Padded, explicitly delimited, and end-of-item encoded spans have exact
+  boundaries. An unpadded fragmented span followed through whitespace by
+  Base64-compatible prose is rejected as `ambiguous_encoding`; the gateway
+  never searches shorter prefixes or mutates adjacent financial prose.
 - Base64 decoding is bounded and used only to assign a finding code. Decoded
   text is never returned, persisted, logged, fetched, opened, or rendered.
 - The gateway has no model, tool, connector, broker, file, or network
@@ -272,6 +282,84 @@ Full-suite chronology is preserved:
 
 No second full-suite run was performed for reviewer fix round 1.
 
+## Reviewer fix round 2 — quarantine only
+
+Two Important findings were reproduced against the round-1 implementation:
+
+1. The cued scanner accepted only 2–4-character later chunks and used an
+   ASCII-only inter-token separator, so arbitrary wrapping and NBSP introduced
+   by `&nbsp;` canonicalization could leave encoded instructions in output.
+2. Descending-prefix guessing could classify a longer unpadded prefix that
+   included an adjacent Base64-compatible prose token, changing
+   `No profit warning.` into `profit warning.`.
+
+TDD RED:
+
+- the focused reviewer selection produced
+  `9 failed, 6 passed, 49 deselected in 0.70s`;
+- failures covered Base64/decode/encode cues, entity-decoded NBSP and other
+  Unicode whitespace, 4/5/8-character and mixed wrapping, explicitly
+  delimited unpadded payloads, ambiguous financial negation, unpadded EOF
+  payloads, and token-bound behavior.
+
+The quarantine-only implementation:
+
+- replaces token-length assumptions and descending-prefix search with one
+  linear scan over the already bounded 16 KiB item;
+- bounds encoded span length at 8,192 characters, compact candidate length at
+  4,096 characters, token count at 1,024, and decoded bytes at 3,072;
+- uses `str.isspace()` for every payload separator decision, including NBSP,
+  em-space, tabs, and line breaks;
+- supports standard and URL-safe alphabets but treats a mixed alphabet,
+  internal/invalid padding, illegal characters, excessive spans, and excessive
+  token counts as stable `malformed_encoding` findings when an exact boundary
+  exists;
+- recognizes padding, explicit backtick/quote fences, and end-of-item as exact
+  boundaries;
+- raises stable `ambiguous_encoding` for an unpadded fragmented payload whose
+  boundary would require guessing, causing metadata-only rejection rather
+  than semantic mutation;
+- performs no fetch, render, open, tool call, model call, or persistence of
+  decoded content.
+
+GREEN evidence:
+
+- focused reviewer selection:
+  `15 passed, 49 deselected in 0.62s`;
+- complete quarantine module:
+  `64 passed in 1.85s`;
+- untrusted content, news, DB models, and migrations:
+  `237 passed, 1 warning in 30.67s`;
+- adversarial Base64 repeats:
+  20/20 fresh processes, 300/300 cases;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 16.09s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.69s`;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+Test-quality audit:
+
+- 10 new behavior cases were added, and the quarantine module collects 64
+  unique node IDs.
+- No duplicate names or node IDs, skips, xfails, placeholder `pass`, or dead
+  parameters were found.
+- Cue variants and malformed fixtures map to different parser branches;
+  padded, delimited, ambiguous, and EOF fixtures map to different boundary
+  proofs.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2898 passed, 1 skipped, 1 warning in 394.76s`.
+
+No second full-suite run was performed for reviewer fix round 2. No panic,
+lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
+broker, or runtime code changed in this round.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -288,6 +376,8 @@ No second full-suite run was performed for reviewer fix round 1.
   `review-515f87b..c5015cd.diff`
 - generated reviewer-fix-round-1 review package
   `review-0463078..953b36e.diff`
+- generated reviewer-fix-round-2 review package
+  `review-849b6ad..e3b6a8f.diff`
 
 ## Caveats
 
