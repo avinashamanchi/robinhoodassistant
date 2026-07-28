@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (review fix round 5/5)
+# Task 6 report — COMPLETE (exceptional post-round-5 hardening)
 
 ## Status and safety boundary
 
@@ -967,3 +967,155 @@
 - The sole test warning is an upstream deprecation unrelated to backup
   publication, migration authority, approval, execution safety, or broker
   truth.
+
+## Exceptional post-round-5 hardening
+
+### Status, scope, and commit
+
+- Exceptional-hardening baseline:
+  `256c5a28b11c517bcba0c78e660af073341b660a`.
+- Implementation commit:
+  `c4b6094660fda2ef5d31e0f48d9fbdabd2928dc3`
+  (`fix(security): harden Task 6 backup protocol`).
+- Work remained in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database activity used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  processes, network, external services, broker/provider/notification APIs,
+  the app, daemon, MCP server, breakers, and order APIs were not accessed.
+
+### Finding closure
+
+- Commit-state version 2 binds the complete encrypted artifact SHA-256 in
+  addition to name, device, inode, size, transaction, generation, and
+  state-file identity. The digest is computed through the exact fsynced anchor
+  descriptor.
+- Every official consumer opens state and artifact paths with `O_NOFOLLOW` and
+  `O_NONBLOCK`, validates regular type and exact fixed state size before
+  locking, and uses bounded nonblocking `flock` retries. FIFO/socket sidecars,
+  nonregular targets, and externally held locks therefore return stable
+  unavailable/busy outcomes within the bound rather than hanging.
+- Listing, header reads, retention, retirement, and verification hash through
+  the already-open artifact descriptor while the authoritative state lock is
+  held. They revalidate target, anchor, state path, descriptor identity,
+  size, timestamps, and digest after use; same-size corruption, length changes,
+  inode/hardlink/path/state swaps, and mutation between validation and use fail
+  closed.
+- Header parsing duplicates the already validated artifact descriptor instead
+  of reopening by path. Corrupt artifacts are never treated as valid retention
+  candidates.
+- COMMITTED and RETIRED transitions now write, fsync, reread, and prove the
+  exact state through the same still-open exclusively locked state descriptor.
+  A syscall that reports failure after the durable write is reconciled on that
+  descriptor before unlock. Once a valid durable transition and artifact have
+  been proved locally, later unlock, close, transient reader-lock, or cleanup
+  errors cannot reverse success or make the API raise.
+- If a COMMITTED transition cannot be proved, the protocol durably restores
+  PENDING. If that restoration also fails after a possible commit write, it
+  attempts and proves RETIRED through the same descriptor before propagating.
+  Official readers remain fail closed.
+- State I/O handles short reads, short writes, and `EINTR`; fixed-offset
+  `pread`/`pwrite` avoids descriptor-offset confusion. State records remain
+  canonical, fixed-size, checksummed, exact-version, and exact-name bound.
+- Conservative crash recovery runs only on exact protocol state/anchor names,
+  after a 24-hour default TTL. It takes bounded locks, revalidates age and exact
+  descriptor identities, and idempotently completes PENDING/RETIRED cleanup.
+  It covers anchor-only, state-only, targetless PENDING, target-linked PENDING,
+  and partial RETIRED images while preserving committed, recent, busy,
+  malformed, corrupt, symlinked, legacy, and unrelated/operator-owned files.
+- Operational backup performs destination-only recovery and retention before
+  source-engine creation and maintenance acquisition. It then acquires a fresh
+  full source lease immediately before snapshot work, so slow destination
+  cleanup cannot consume the no-renewal snapshot window.
+
+### Complexity and API audit
+
+- The large `backup.py` delta was explicitly audited before the full suite.
+  Reader validation, exclusive transition, and TTL recovery were retained as
+  three separate paths because they have materially different locking,
+  durability, and cleanup semantics.
+- Duplicate-looking identity/hash checks occur at distinct pre-use,
+  post-use, and post-transition race boundaries and are intentional.
+- The audit removed an unused writable reader mode, an unused transaction
+  filter, and a single-use boolean authority wrapper.
+- AST/reference inspection found no unreferenced private helper. Comparison
+  against the baseline found no added, removed, or signature-changed public
+  backup function. No restore consumer exists elsewhere in the codebase.
+
+### Changed files
+
+- Protocol implementation:
+  `src/trading_assistant/ops/backup.py`.
+- Regression coverage:
+  `tests/test_task6_round5.py` and new
+  `tests/test_task6_exceptional_hardening.py`.
+
+### TDD and focused evidence
+
+- Initial digest/reconciliation RED:
+  `12 failed, 4 passed` across 16 selected cases.
+- Additional focused RED probes independently demonstrated:
+  broken-symlink namespace cleanup (`2 failed`), descriptor-age recovery race
+  (`1 failed`), FIFO artifact blocking (`3 failed`), state-path swap during
+  header use (`1 failed`), and failed PENDING restoration exposing a later
+  COMMITTED listing (`1 failed`).
+- Final backup, migration, and adversarial group:
+  `143 passed in 10.93s`.
+- Final migration, runtime-tenure, startup-schema, release-static, and
+  submission-barrier adjacency group:
+  `307 passed in 117.66s (0:01:57)`.
+- These are `450` non-overlapping focused tests.
+- Ten repetitions of 14 highest-risk corruption, state-swap, durable-commit,
+  held-lock, child-crash recovery, and lease-sequencing cases passed:
+  `140/140`.
+
+### Final release gates
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan found no trailing whitespace and no
+  missing final newline.
+- Public backup API comparison: unchanged.
+- Private-helper reference audit: no dead helper found.
+
+### Full-suite chronology
+
+- The complete original-through-round-5 chronology is preserved above,
+  including both failed suites and every authorized confirmation run.
+- This exceptional hardening used exactly one new final full suite after all
+  focused, repeated-adversarial, compile, static, Alembic, API, diff, and
+  whitespace gates were green.
+- Credential/provider variables were explicitly removed from the command
+  environment, and the worktree had no `.env`.
+- Exact result:
+  `2738 passed, 1 skipped, 1 warning in 393.48s (0:06:33)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second exceptional-hardening full suite ran. No source or test changed
+  after this result; only this report, the progress ledger, and generated
+  review evidence were changed.
+
+### Remaining caveats
+
+- Commit-state SHA-256 and the record checksum detect accidental/adversarial
+  content replacement inside the tested filesystem race model; they are not a
+  keyed MAC. Authenticity against an attacker who can rewrite every artifact
+  and state byte still relies on the private mode-`0700` directory, mode-`0600`
+  files, and operating-system account boundary.
+- State version 1 and legacy target/anchor-only backups remain intentionally
+  invisible and are preserved. Adoption requires a separately reviewed,
+  authenticate-before-adopt procedure.
+- Orphan recovery is deliberately conservative and TTL-delayed. Busy,
+  malformed, ambiguous, or operator-owned names are preserved for manual
+  inspection rather than deleted.
+- In-place production migration of a non-empty schema predating durable
+  `runtime_tenures` remains intentionally refused.
+- The sole warning is an upstream deprecation unrelated to backup durability,
+  migration authority, approval, execution safety, or broker truth.
