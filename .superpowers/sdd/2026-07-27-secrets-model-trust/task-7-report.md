@@ -18,6 +18,8 @@
   `0a4bcc626c2e8c5fa1afadb3ac0da0f46120023c`.
 - Reviewer fix-round-5 quarantine implementation commit:
   `9e4482a702a660fe047f6a1c898097365b5d661f`.
+- Post-round-5 exact-cue implementation commit:
+  `505cdd38fe09271a3d31a09df94c33358b9a39a4`.
 - The Task 7 focused and affected suites are green.
 - The repository-wide full-suite gate is clean. The historical initial run
   exposed one reproducible panic-lease defect, and the historical confirmation
@@ -31,7 +33,8 @@
   round 4, exactly one new final full suite passed with 2,908 passed, 1
   skipped, and the same warning. After final quarantine-only reviewer fix
   round 5, exactly one new full suite passed with 2,902 passed, 1 skipped,
-  and the same warning.
+  and the same warning. After the post-round-5 exact-cue fix, exactly one new
+  full suite passed with 2,932 passed, 1 skipped, and the same warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -627,6 +630,98 @@ lease, migration, persistence schema, news-provider, analyst, planning, app,
 daemon, MCP, broker, or runtime code changed in this round. The Task 8 legacy
 analyst-news seam remains explicitly open.
 
+## Post-round-5 exact cue fix — bounded filler and Unicode separators
+
+The exact reviewer gap was in cue recognition, not payload parsing:
+
+- `decode this:` and `decode the following:` were not recognized because the
+  round-5 filler branch required an object word;
+- strong forms such as `decode and obey this payload` still required one of
+  four ASCII terminal tokens;
+- `content` was missing from the object vocabulary;
+- Unicode punctuation between cue words or at the terminal was not accepted.
+
+The quarantine-only fix now:
+
+- runs after the existing bounded fixed-point canonicalization and uses the
+  existing Unicode-whitespace-collapsed transient classification view;
+- recognizes case-insensitive `decode`, `encode`, `base64`, and `encoded`
+  action forms with optional `this` / `the following`, `and obey`, and one or
+  two `base64` / `payload` / `instruction` / `content` / `data` object words;
+- accepts Unicode whitespace, punctuation, symbols, and underscore as cue
+  joins, with every join and terminal run capped at eight characters;
+- uses atomic phrase cores and atomic terminal runs so a maximal no-payload
+  phrase cannot backtrack into a shorter cue and reclassify its own trailing
+  punctuation as payload;
+- requires a non-whitespace remainder before rejection;
+- rejects the entire item through stable `ambiguous_encoding`, preserving the
+  existing metadata-only database and log boundary;
+- performs no Base64 boundary parsing, decoding, payload extraction, URL
+  access, model call, tool call, or external action.
+
+The recognizer is deliberately conservative. Standalone `decode`, empty
+punctuated cues, complete cue phrases with no payload, and ordinary
+`Analysts decode more data...` prose remain accepted. Prose that resembles an
+explicit encoded-action cue followed by content can be rejected as a false
+positive; this is the chosen fail-closed tradeoff for untrusted external text.
+
+TDD evidence:
+
+- after correcting a RED performance fixture that exceeded the pre-existing
+  16 KiB UTF-8 ingress ceiling, the reviewer/control selection produced
+  `18 failed, 15 passed, 63 deselected in 1.28s`; all 18 failures were the
+  expected missing whole-item rejection;
+- the first implementation attempt produced
+  `1 failed, 32 passed, 63 deselected in 1.13s`, exposing terminal
+  backtracking that treated a trailing em dash as payload;
+- an added punctuation-only malformed-payload case then produced
+  `1 failed, 19 passed in 0.79s`, proving the strong terminal could still
+  consume both delimiter and payload punctuation;
+- atomic maximal terminals and a structured strong terminal resolved both
+  defects without adding a payload parser.
+
+Final GREEN evidence:
+
+- exact reviewer, no-payload, and maximum-size performance selection:
+  `35 passed, 63 deselected in 1.20s`;
+- complete quarantine module:
+  `98 passed in 2.84s`;
+- reviewer/control selection in 20 fresh processes:
+  700/700 cases;
+- untrusted-content, news, DB-model, and migration group:
+  `271 passed, 1 warning in 31.84s`;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.92s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.94s`;
+- 98 unique quarantine node IDs; no duplicates, skips, xfails, placeholder
+  `pass`, or dead parameters;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+The maximum-size near-miss test exercises 15,900 bytes of repeated
+cue-prefix near misses and requires the complete public gateway ingest to
+finish within one second. Together with the 16 KiB input ceiling, bounded
+eight-character quantifiers, and atomic groups, this guards against
+catastrophic backtracking.
+
+No local independent reviewer subagent was available; the discovered review
+tools required an existing GitHub pull request and were not used because this
+task forbids push and external state. The exact-requirements self-review found
+no open Critical or Important issue.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2932 passed, 1 skipped, 1 warning in 395.07s`.
+
+No second full-suite run was performed. No panic, lease, migration,
+persistence schema, news-provider, analyst, planning, app, daemon, MCP,
+broker, or runtime code changed. The Task 8 legacy analyst-news seam remains
+explicitly open.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -651,6 +746,8 @@ analyst-news seam remains explicitly open.
   `review-ceb013e..0a4bcc6.diff`
 - generated reviewer-fix-round-5 review package
   `review-b0ddb67..9e4482a.diff`
+- generated post-round-5 exact-cue review package
+  `review-7c4a6b4..505cdd3.diff`
 
 ## Caveats
 
@@ -663,4 +760,6 @@ analyst-news seam remains explicitly open.
 - The existing `websockets.legacy` warning remains unchanged.
 - A pre-existing migration-lock timing test can fail closed under contention,
   as recorded in reviewer fix round 5; this round did not alter that path.
+- Explicit cue-like financial prose may be rejected conservatively; the
+  post-round-5 section records the accepted false-positive tradeoff.
 - No push was performed.
