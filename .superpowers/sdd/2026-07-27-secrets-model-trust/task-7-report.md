@@ -14,6 +14,10 @@
   `e3b6a8f5e7964fa8f4bbd50ac53e4345fd0bd22c`.
 - Reviewer fix-round-3 quarantine implementation commit:
   `3833dd3ae52afb9dc714110e93fb6832c42a9119`.
+- Reviewer fix-round-4 quarantine implementation commit:
+  `0a4bcc626c2e8c5fa1afadb3ac0da0f46120023c`.
+- Reviewer fix-round-5 quarantine implementation commit:
+  `9e4482a702a660fe047f6a1c898097365b5d661f`.
 - The Task 7 focused and affected suites are green.
 - The repository-wide full-suite gate is clean. The historical initial run
   exposed one reproducible panic-lease defect, and the historical confirmation
@@ -23,7 +27,11 @@
   new final full suite passed with 2,898 passed, 1 skipped, and the same
   existing third-party warning. After quarantine-only reviewer fix round 3,
   exactly one new final full suite passed with 2,903 passed, 1 skipped, and
-  the same existing third-party warning.
+  the same existing third-party warning. After quarantine-only reviewer fix
+  round 4, exactly one new final full suite passed with 2,908 passed, 1
+  skipped, and the same warning. After final quarantine-only reviewer fix
+  round 5, exactly one new full suite passed with 2,902 passed, 1 skipped,
+  and the same warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -527,6 +535,98 @@ No second full-suite run was performed for reviewer fix round 4. No panic,
 lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
 broker, or runtime code changed in this round.
 
+## Reviewer fix round 5 FINAL — reject every cued encoded item
+
+The final reviewer direction intentionally replaced the increasingly fragile
+cued Base64 boundary grammar with a smaller fail-closed rule:
+
+- after bounded fixed-point canonicalization, an explicit case-insensitive
+  encode, decode, Base64, or encoded-payload/instruction cue with any
+  nonempty suffix rejects the entire item with stable
+  `ambiguous_encoding`;
+- classification uses a whitespace-collapsed transient view, so entity-decoded
+  NBSP, Unicode whitespace, line wrapping, case changes, and hidden-control
+  removal cannot reopen a fragmented boundary;
+- quoted, backticked, padded, unpadded, fragmented, malformed, mixed-alphabet,
+  multi-payload, and payload-plus-prose forms all take the same metadata-only
+  rejection path;
+- a cue with no payload remains ordinary sanitized text;
+- the bounded generic scanner remains only for uncued contiguous Base64.
+  Decoded bytes are classification-only, and a malicious exact candidate is
+  removed and flagged without forwarding decoded content;
+- no cued decoder, boundary guess, partial interval, URL fetch, render, tool
+  call, or external action remains.
+
+TDD RED evidence before the production simplification:
+
+- the initial reviewer selection produced
+  `12 failed, 4 passed, 74 deselected in 0.92s`;
+- the no-payload controls isolated the overbroad old behavior with
+  `3 failed, 2 passed, 87 deselected in 1.87s`;
+- a 32-separator Unicode-whitespace obfuscation then produced
+  `1 failed, 64 deselected in 0.19s`, proving the classification view still
+  needed bounded normalization.
+
+Final GREEN evidence:
+
+- final reviewer selection:
+  `23 passed, 45 deselected in 0.90s`;
+- complete quarantine module:
+  `68 passed in 1.97s`;
+- reviewer selection in 20 fresh processes:
+  460/460 cases;
+- final untrusted-content, news, and DB-model group:
+  `86 passed, 1 warning in 3.06s`;
+- final migration group:
+  `155 passed in 27.16s`;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.79s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.96s`;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+One adjacent migration-lock timing test exposed a pre-existing race during the
+focused gate:
+
+- the first combined DB/migration run produced
+  `1 failed, 237 passed, 1 warning in 30.77s`;
+- the exact case then passed once, followed by 13 fresh-process passes and the
+  same failure on iteration 14;
+- the failure was the migration's fail-closed
+  `sensitive_trust_downgrade_blocked` outcome rather than an unsafe
+  downgrade;
+- the complete migration file subsequently passed 155/155, and the exact
+  case also passed in the sole final repository run;
+- this final quarantine-only round did not change migration, lease, panic, or
+  runtime code, and the reproducible timing evidence is retained rather than
+  hidden by repeated full-suite runs.
+
+Simplification and test-quality audit:
+
+- removed the cued fragmented scanner, delimiter parser, bare parser, compact
+  candidate parser, span/token limits, alphabet/delimiter tables, and all
+  partial-interval logic;
+- removed obsolete tests that expected cued payload sanitization or trailing
+  prose preservation;
+- implementation changed by 25 additions and 196 deletions; tests changed by
+  114 additions and 447 deletions, for 504 net lines removed;
+- 68 unique quarantine node IDs were collected;
+- no duplicate node IDs, skips, xfails, placeholder `pass`, dead parameters,
+  or references to deleted parser helpers were found.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2902 passed, 1 skipped, 1 warning in 394.41s`.
+
+No second full-suite run was performed for reviewer fix round 5. No panic,
+lease, migration, persistence schema, news-provider, analyst, planning, app,
+daemon, MCP, broker, or runtime code changed in this round. The Task 8 legacy
+analyst-news seam remains explicitly open.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -549,6 +649,8 @@ broker, or runtime code changed in this round.
   `review-34f56c0..3833dd3.diff`
 - generated reviewer-fix-round-4 review package
   `review-ceb013e..0a4bcc6.diff`
+- generated reviewer-fix-round-5 review package
+  `review-b0ddb67..9e4482a.diff`
 
 ## Caveats
 
@@ -559,4 +661,6 @@ broker, or runtime code changed in this round.
 - Transient provenance is not durably human-readable; the database stores only
   hashes and stable codes, matching the approved privacy decision.
 - The existing `websockets.legacy` warning remains unchanged.
+- A pre-existing migration-lock timing test can fail closed under contention,
+  as recorded in reviewer fix round 5; this round did not alter that path.
 - No push was performed.
