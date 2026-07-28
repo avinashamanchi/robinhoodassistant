@@ -196,8 +196,16 @@ class UntrustedSummary(BaseModel):
 class UntrustedContentError(ValueError):
     """Stable redacted rejection raised at the quarantine boundary."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        additional_flag_codes: Sequence[str] = (),
+    ) -> None:
         self.code = code
+        self.additional_flag_codes = tuple(
+            sorted(set(additional_flag_codes))
+        )
         super().__init__(code)
 
 
@@ -263,18 +271,28 @@ def _strip_hidden_controls(
     findings: dict[str, InjectionFinding],
 ) -> str:
     output: list[str] = []
+    in_removed_run = False
     for character in text:
+        finding_code: str | None = None
         if character == "\x00":
-            _add_finding(findings, "nul_control", "high")
+            finding_code = "nul_control"
+        elif character in _BIDI_CONTROLS:
+            finding_code = "bidi_control"
+        elif (
+            unicodedata.category(character) in {"Cc", "Cf"}
+            and character not in {"\n", "\t"}
+        ):
+            finding_code = "hidden_control"
+
+        if finding_code is not None:
+            _add_finding(findings, finding_code, "high")
+            if not in_removed_run:
+                output.append(" ")
+            in_removed_run = True
             continue
-        if character in _BIDI_CONTROLS:
-            _add_finding(findings, "bidi_control", "high")
-            continue
-        category = unicodedata.category(character)
-        if category in {"Cc", "Cf"} and character not in {"\n", "\t"}:
-            _add_finding(findings, "hidden_control", "high")
-            continue
+
         output.append(character)
+        in_removed_run = False
     return "".join(output)
 
 
@@ -415,7 +433,10 @@ def _decoded_instruction(candidate: str) -> bool:
     )
 
 
-def _reject_cued_encoded_content(text: str) -> None:
+def _reject_cued_encoded_content(
+    text: str,
+    findings: Mapping[str, InjectionFinding],
+) -> None:
     """Reject simple action cues with content instead of parsing payloads.
 
     Any standalone ``decode``, ``encode``, or ``base64`` word is fail-closed
@@ -446,7 +467,10 @@ def _reject_cued_encoded_content(text: str) -> None:
             cue_end,
         )
         if remainder_start < len(detection_text):
-            raise UntrustedContentError("ambiguous_encoding")
+            raise UntrustedContentError(
+                "ambiguous_encoding",
+                additional_flag_codes=tuple(findings),
+            )
 
 
 def _skip_action_cue_separators(text: str, start: int) -> int:
@@ -544,7 +568,7 @@ def _strip_tool_json(
 def _sanitize(raw_text: str) -> tuple[str, tuple[InjectionFinding, ...]]:
     findings: dict[str, InjectionFinding] = {}
     text = _canonicalize_active_content(raw_text, findings)
-    _reject_cued_encoded_content(text)
+    _reject_cued_encoded_content(text, findings)
 
     text = _strip_tool_json(text, findings)
     if _DIRECT_INSTRUCTION_RE.search(text):
@@ -694,6 +718,7 @@ class UntrustedContentGateway:
                 len(raw_bytes),
                 exc.code,
                 observed_at,
+                additional_flag_codes=exc.additional_flag_codes,
             )
             raise
         normalized_bytes = normalized_text.encode("utf-8")
