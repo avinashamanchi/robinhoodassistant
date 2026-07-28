@@ -373,3 +373,135 @@
   green, but there is intentionally no second post-repair full-suite result.
 - The upstream `websockets.legacy` deprecation remains unrelated to tenure,
   backup, migration, rotation, approval authority, or mutation fencing.
+
+## Review fix round 2
+
+### Status, scope, and commit
+
+- Re-review baseline:
+  `a9ab7614953de257b919a873dcd5a975140bc9c4`.
+- Round-2 implementation commit:
+  `815d956450d85326b389ae64d786709c4f3046f6`
+  (`fix(security): close Task 6 re-review findings`).
+- Work was performed directly in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database execution used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  processes, network, external services, brokers/providers, notifications, the
+  real app/daemon/MCP, and live trading were not accessed.
+
+### Finding closure
+
+- All operational, sensitive-migration, rotation, and schema-upgrade backups
+  use one `BackupMaintenance` protocol. Maintenance is acquired with a bounded
+  TTL, but no renewal thread or source-database write runs during SQLite's
+  source snapshot. Snapshot progress performs only in-memory loss/deadline
+  checks. After both snapshot connections close, the exact owner/generation
+  renews once, periodic renewal starts, and ownership is checked through hash,
+  encrypt, verify, publication, and subsequent database work.
+- Snapshot expiry or exact-renewal loss aborts before publication and removes
+  snapshot, verification, encryption, WAL, and SHM temporaries. The real
+  operational path completes a greater-than-256-page 2 MiB WAL source inside
+  the 8-second bound, keeps the WAL bounded, and returns only after authenticated
+  decrypt/hash/`PRAGMA quick_check` verification.
+- Every online Alembic invocation now requires a caller-supplied exact
+  SQLAlchemy `Connection` plus a sealed, connection-bound, single-use migration
+  authority before migration context execution. A distinct bootstrap authority
+  is issued only after the wrapper proves the database has no tables.
+  Established upgrades use maintenance authority after verified encrypted
+  backup; offline production migration is refused.
+- Revision `0015` validates its authority at the first executable statement.
+  Maintenance upgrade/downgrade additionally requires the exact schema-fence
+  capability and ownership assertion. Direct plain-`Config` upgrade, no-op
+  upgrade, and downgrade refuse with no tenure and with each representable
+  app/daemon/MCP/validation/maintenance tenure. Tests fingerprint schema,
+  version, plan rows, tenure rows, and artifact state before and after refusal.
+  Validation tenure is tested on the `0015` schema because revision `0014`
+  cannot structurally represent that role.
+- Runtime PID birth identity is now versioned as `ps-lstart-v1`, obtained only
+  through exact `/bin/ps` under minimal fixed
+  `TZ=UTC`, `LC_ALL=C`, `LANG=C`. Cross-caller timezone/locale changes compare
+  as `SAME`; canonical mismatch proves PID reuse as `NOT_SAME`; live legacy
+  identity, `EPERM`, malformed/tool errors, and ambiguous results remain
+  `UNKNOWN`; only `os.kill(pid, 0)` `ESRCH` proves process absence.
+- The adjacent cooperative-stop process verifier now uses the same absolute,
+  fixed-environment, versioned birth identity. Legacy metadata therefore fails
+  closed rather than becoming a false match.
+- `RuntimeTenureGuard.start()` owns cleanup after thread-start failure.
+  Bootstrap honors the durable close result: confirmed release preserves the
+  original start exception, while only genuinely uncertain release becomes
+  `TenureUncertain`. The real database test proves the row is durably released
+  and no mutation-barrier listeners remain after confirmed failure.
+
+### Changed files
+
+- Migration boundary:
+  `migrations/env.py`,
+  `migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py`,
+  `src/trading_assistant/db/migrate.py`, and new
+  `src/trading_assistant/db/migration_authority.py`.
+- Backup/lifecycle boundary:
+  `src/trading_assistant/ops/backup.py`,
+  `src/trading_assistant/ops/encrypt_sensitive.py`,
+  `src/trading_assistant/ops/tenure.py`,
+  `src/trading_assistant/ops/control.py`, and
+  `src/trading_assistant/bootstrap.py`.
+- Regression coverage:
+  new `tests/safety_helpers.py`, plus
+  `tests/test_cooperative_control.py`, `tests/test_launch.py`,
+  `tests/test_migrations.py`, `tests/test_ops.py`,
+  `tests/test_runtime_tenure.py`, `tests/test_safety_drill.py`,
+  `tests/test_sensitive_migration.py`, and
+  `tests/test_startup_schema.py`.
+
+### Round-2 TDD evidence
+
+- Focused RED:
+  process identity/start cleanup `5 failed`; real 2 MiB operational backup
+  `1 failed` by the 8-second timeout with a zero-byte snapshot and growing WAL;
+  shared migrate/rotate/schema sequencing `3 failed`; direct Alembic authority
+  matrix `18 failed`; cooperative-control timezone/locale adjacency `1 failed`.
+- An adjacent safety-drill run exposed `14` failures caused by the new test-only
+  bootstrap helper leaving a closed fixture in WAL header mode without
+  sidecars. The helper was changed to match historical Alembic
+  `NullPool`/rollback-journal fixture semantics; production safety-drill copy
+  checks were not weakened.
+- Focused GREEN checkpoints:
+  process/start cleanup `9 passed`; real bounded backup `1 passed`;
+  shared sequencing `3 passed`; direct authority matrix `18 passed`;
+  snapshot-expiry plus real large backup `2 passed`; migration
+  refusal/loss matrix `18 passed`; cooperative control `9 passed`.
+- Consolidated runtime/backup/migration/Alembic/bootstrap/startup/launch/drill
+  convergence:
+  `456 passed, 1 warning in 66.25s`.
+- Pre-full gates:
+  `python -m compileall -q src tests` PASS;
+  `python scripts/check_release_safety.py` PASS;
+  `git diff --check` PASS; Alembic exactly
+  `20260727_0015 (head)`.
+
+### Exactly one round-2 full suite
+
+- Exactly one non-overlapping full suite ran after every focused check and
+  release gate was green. Its environment explicitly unset database, Alpaca,
+  Robinhood, LLM/provider, market-data, notification, candidate-signing,
+  field-encryption, backup-encryption, live-confirmation, Composio, Octen, and
+  OpenAI credential variables.
+- Result:
+  `2645 passed, 1 skipped, 1 warning in 370.17s (0:06:10)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second full-suite run was started. No production code or tests changed
+  after the full-suite result; only this report and its generated review
+  artifact remain for the evidence commit.
+
+### Round-2 concerns
+
+- No known production correctness or safety defect remains from the four
+  re-review findings or the adjacent process-identity caller.
+- The sole warning is an upstream deprecation unrelated to backup, migration
+  authority, process identity, tenure cleanup, approval, or execution safety.
