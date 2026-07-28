@@ -395,47 +395,54 @@ def test_crash_at_each_two_phase_boundary_remains_uncommitted(
         assert len(public_targets) == 1
 
 
-def test_commit_has_no_fallible_readback_after_durable_state_write(
+def test_commit_reconciliation_reads_same_locked_descriptor_before_unlock(
     tmp_path,
     monkeypatch,
 ):
-    source = tmp_path / "no-postcommit-readback.db"
-    destination = tmp_path / "no-postcommit-readback-backups"
+    source = tmp_path / "same-descriptor-readback.db"
+    destination = tmp_path / "same-descriptor-readback-backups"
     _seed_source(source)
     original_pwrite = os.pwrite
-    original_fsync = os.fsync
     original_pread = os.pread
-    commit_write_seen = False
-    commit_fsync_complete = False
-    fail_reads = True
+    original_flock = fcntl.flock
+    commit_descriptor: int | None = None
+    commit_readback_seen = False
+    commit_unlock_seen = False
 
     def observe_commit_write(descriptor, data, offset):
-        nonlocal commit_write_seen
+        nonlocal commit_descriptor
         written = original_pwrite(descriptor, data, offset)
         if b'"phase":"COMMITTED"' in data:
-            commit_write_seen = True
+            commit_descriptor = descriptor
         return written
 
-    def observe_commit_fsync(descriptor):
-        nonlocal commit_fsync_complete
-        result = original_fsync(descriptor)
-        if commit_write_seen:
-            commit_fsync_complete = True
-        return result
+    def observe_commit_readback(descriptor, length, offset):
+        nonlocal commit_readback_seen
+        encoded = original_pread(descriptor, length, offset)
+        if descriptor == commit_descriptor:
+            assert commit_unlock_seen is False
+            if b'"phase":"COMMITTED"' in encoded:
+                commit_readback_seen = True
+        return encoded
 
-    def reject_postcommit_readback(descriptor, length, offset):
-        if commit_fsync_complete and fail_reads:
-            raise OSError("postcommit readback is forbidden")
-        return original_pread(descriptor, length, offset)
+    def observe_unlock(descriptor, operation):
+        nonlocal commit_unlock_seen
+        if (
+            descriptor == commit_descriptor
+            and operation == fcntl.LOCK_UN
+        ):
+            commit_unlock_seen = True
+        return original_flock(descriptor, operation)
 
     monkeypatch.setattr(os, "pwrite", observe_commit_write)
-    monkeypatch.setattr(os, "fsync", observe_commit_fsync)
-    monkeypatch.setattr(os, "pread", reject_postcommit_readback)
+    monkeypatch.setattr(os, "pread", observe_commit_readback)
+    monkeypatch.setattr(fcntl, "flock", observe_unlock)
 
     receipt = _create(source, destination)
 
-    fail_reads = False
-    assert commit_fsync_complete is True
+    assert commit_readback_seen is True
+    assert commit_unlock_seen is True
+    commit_descriptor = None
     assert list_committed_backups(destination) == (receipt.path,)
 
 
@@ -470,7 +477,7 @@ def test_reader_cannot_observe_commit_before_state_fsync_returns(
     def observe_reader_lock(descriptor, operation):
         if (
             commit_fsync_entered.is_set()
-            and operation == fcntl.LOCK_SH
+            and operation & fcntl.LOCK_SH
         ):
             reader_attempted.set()
         return original_flock(descriptor, operation)
