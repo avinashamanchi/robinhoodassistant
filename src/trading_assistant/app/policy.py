@@ -16,12 +16,17 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Match, Mount, WebSocketRoute
 
-from trading_assistant.db.models import PanicReceipt, utcnow
+from trading_assistant.db.models import (
+    ConcurrencyLease,
+    PanicReceipt,
+    utcnow,
+)
 from trading_assistant.security.sensitive_fields import sensitive_store
 
 from .auth import RecentAuthenticationRequired, SessionPrincipal
@@ -94,6 +99,13 @@ class _PanicSnapshot:
 class _PanicClaim:
     claimed: bool
     snapshot: _PanicSnapshot
+
+
+@dataclass(frozen=True)
+class _PanicFenceObservation:
+    authoritative: bool
+    snapshot: _PanicSnapshot | None
+    wait_expires_at: datetime
 
 
 @dataclass
@@ -761,19 +773,6 @@ def _snapshot_from_row(row: PanicReceipt, session) -> _PanicSnapshot:
     )
 
 
-def _panic_snapshot(app: FastAPI) -> _PanicSnapshot | None:
-    try:
-        with app.state.session_auth.session_factory() as session:
-            row = session.get(PanicReceipt, "alpaca-paper")
-            return (
-                None if row is None else _snapshot_from_row(row, session)
-            )
-    except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
-        raise LimitStoreUnavailable(
-            "durable panic receipt store unavailable"
-        ) from exc
-
-
 def _start_panic_receipt(
     app: FastAPI,
     request_id: str,
@@ -830,6 +829,7 @@ def _start_panic_receipt(
 
 def _renew_panic_receipt(
     app: FastAPI,
+    lease_key: str,
     request_id: str,
     lease_generation: int,
     expires_at: datetime,
@@ -837,6 +837,17 @@ def _renew_panic_receipt(
     try:
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
+            first_proof_at = utcnow()
+            if not _panic_lease_is_authoritative(
+                session,
+                lease_key=lease_key,
+                owner=request_id,
+                generation=lease_generation,
+                expires_at=expires_at,
+                now=first_proof_at,
+            ):
+                session.rollback()
+                return False
             row = session.get(PanicReceipt, "alpaca-paper")
             if (
                 row is None
@@ -847,32 +858,87 @@ def _renew_panic_receipt(
                 session.rollback()
                 return False
             row.expires_at = expires_at
+            session.flush()
+            second_proof_at = utcnow()
+            if (
+                second_proof_at < first_proof_at
+                or not _panic_lease_is_authoritative(
+                    session,
+                    lease_key=lease_key,
+                    owner=request_id,
+                    generation=lease_generation,
+                    expires_at=expires_at,
+                    now=second_proof_at,
+                )
+            ):
+                session.rollback()
+                return False
             session.commit()
             return True
-    except (SQLAlchemyError, OSError) as exc:
+    except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
         raise LimitStoreUnavailable(
             "durable panic receipt store unavailable"
         ) from exc
 
 
+def _panic_lease_is_authoritative(
+    session: Session,
+    *,
+    lease_key: str,
+    owner: str,
+    generation: int,
+    expires_at: datetime,
+    now: datetime,
+) -> bool:
+    lease = session.execute(
+        select(
+            ConcurrencyLease.owner,
+            ConcurrencyLease.generation,
+            ConcurrencyLease.expires_at,
+        ).where(ConcurrencyLease.resource_key == lease_key)
+    ).one_or_none()
+    return bool(
+        lease is not None
+        and lease.owner == owner
+        and lease.generation == generation
+        and lease.expires_at == expires_at
+        and lease.expires_at > now
+    )
+
+
 def _finish_panic_receipt(
     app: FastAPI,
+    lease_key: str,
     request_id: str,
     *,
     lease_generation: int,
     response: dict[str, object] | None,
     expires_at: datetime,
 ) -> None:
-    now = utcnow()
     try:
         with app.state.session_auth.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
+            now = utcnow()
+            if not _panic_lease_is_authoritative(
+                session,
+                lease_key=lease_key,
+                owner=request_id,
+                generation=lease_generation,
+                expires_at=expires_at,
+                now=now,
+            ):
+                session.rollback()
+                raise LimitStoreUnavailable(
+                    "durable panic receipt ownership changed"
+                )
             row = session.get(PanicReceipt, "alpaca-paper")
             if (
                 row is None
                 or row.request_id != request_id
                 or row.lease_generation != lease_generation
+                or row.state != "started"
             ):
+                session.rollback()
                 raise LimitStoreUnavailable(
                     "durable panic receipt ownership changed"
                 )
@@ -893,13 +959,103 @@ def _finish_panic_receipt(
                 store.clear(row, {"response_json"})
             row.completed_at = now
             row.expires_at = expires_at
+            session.flush()
+            second_proof_at = utcnow()
+            if (
+                second_proof_at < now
+                or not _panic_lease_is_authoritative(
+                    session,
+                    lease_key=lease_key,
+                    owner=request_id,
+                    generation=lease_generation,
+                    expires_at=expires_at,
+                    now=second_proof_at,
+                )
+            ):
+                session.rollback()
+                raise LimitStoreUnavailable(
+                    "durable panic receipt ownership changed"
+                )
             session.commit()
     except LimitStoreUnavailable:
         raise
-    except (SQLAlchemyError, OSError, TypeError) as exc:
+    except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
         raise LimitStoreUnavailable(
             "durable panic receipt store unavailable"
         ) from exc
+
+
+def _observe_panic_fence(
+    app: FastAPI,
+    lease_key: str,
+    owner: str,
+    generation: int,
+) -> _PanicFenceObservation:
+    read_started_at = utcnow()
+    try:
+        with app.state.session_auth.session_factory() as session:
+            session.execute(text("BEGIN"))
+            receipt = session.get(PanicReceipt, "alpaca-paper")
+            lease = session.execute(
+                select(
+                    ConcurrencyLease.owner,
+                    ConcurrencyLease.generation,
+                    ConcurrencyLease.expires_at,
+                ).where(ConcurrencyLease.resource_key == lease_key)
+            ).one_or_none()
+            snapshot = (
+                None
+                if receipt is None
+                else _snapshot_from_row(receipt, session)
+            )
+            now = utcnow()
+            session.rollback()
+    except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
+        raise LimitStoreUnavailable(
+            "durable panic receipt store unavailable"
+        ) from exc
+
+    if now < read_started_at:
+        return _PanicFenceObservation(False, snapshot, now)
+    if lease is None:
+        return _PanicFenceObservation(False, snapshot, now)
+    if snapshot is not None and (
+        snapshot.request_id != owner
+        or snapshot.lease_generation != generation
+    ):
+        return _PanicFenceObservation(False, snapshot, now)
+
+    active = (
+        lease.owner == owner
+        and lease.generation == generation
+        and lease.expires_at > now
+    )
+    released_after_completion = bool(
+        snapshot is not None
+        and snapshot.state != "started"
+        and snapshot.expires_at > now
+        and lease.owner == ""
+        and lease.generation == generation + 1
+        and lease.expires_at <= now
+    )
+    if not active and not released_after_completion:
+        return _PanicFenceObservation(False, snapshot, lease.expires_at)
+    if (
+        snapshot is not None
+        and snapshot.state != "started"
+        and active
+        and snapshot.expires_at != lease.expires_at
+    ):
+        return _PanicFenceObservation(False, snapshot, lease.expires_at)
+    return _PanicFenceObservation(
+        True,
+        snapshot,
+        (
+            snapshot.expires_at
+            if released_after_completion and snapshot is not None
+            else lease.expires_at
+        ),
+    )
 
 
 def _mark_panic_uncertain(
@@ -1044,33 +1200,23 @@ async def _wait_for_panic_receipt(
         if request_remaining <= 0:
             return _panic_incomplete_response(request)
         try:
-            snapshot = await _offload(_panic_snapshot, app)
+            observation = await _offload(
+                _observe_panic_fence,
+                app,
+                lease_key,
+                observed.owner,
+                observed.generation,
+            )
         except LimitStoreUnavailable:
             return _policy_store_error_response(request)
-        if (
-            snapshot is not None
-            and (
-                snapshot.request_id != observed.owner
-                or snapshot.lease_generation != observed.generation
-            )
-        ):
+        if not observation.authoritative:
             return _panic_incomplete_response(request)
+        snapshot = observation.snapshot
         if snapshot is not None and snapshot.state != "started":
             return _panic_response(request, snapshot)
-        try:
-            current = await _offload(
-                app.state.leases.inspect,
-                lease_key,
-            )
-        except LimitStoreUnavailable:
-            return _policy_store_error_response(request)
-        if (
-            not current.acquired
-            or current.owner != observed.owner
-            or current.generation != observed.generation
-        ):
-            return _panic_incomplete_response(request)
-        remaining = (current.expires_at - utcnow()).total_seconds()
+        remaining = (
+            observation.wait_expires_at - utcnow()
+        ).total_seconds()
         if remaining <= 0:
             return _panic_incomplete_response(request)
         await asyncio.sleep(
@@ -1154,6 +1300,7 @@ async def _maintain_lease(
                         receipt_renewed = await _offload(
                             _renew_panic_receipt,
                             app,
+                            hold.resource_key,
                             panic_request_id,
                             hold.generation,
                             renewed.expires_at,
@@ -1847,6 +1994,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     await _offload(
                         _finish_panic_receipt,
                         app,
+                        hold.resource_key,
                         panic_request_id,
                         lease_generation=hold.generation,
                         response=receipt_response,

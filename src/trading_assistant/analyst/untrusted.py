@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import html
 import json
 import re
 import unicodedata
@@ -27,6 +28,7 @@ from pydantic import (
     ValidationError,
     field_validator,
 )
+from sqlalchemy import case, func, or_, text as sql_text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
@@ -38,6 +40,7 @@ MAX_NORMALIZED_CHARACTERS = 16_000
 _MAX_SOURCE_ID_CHARACTERS = 256
 _MAX_SOURCE_NAME_CHARACTERS = 256
 _MAX_ENCODED_CANDIDATE_CHARACTERS = 4_096
+_MAX_CANONICALIZATION_PASSES = 4
 
 SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
 FindingSeverity = Literal["low", "medium", "high"]
@@ -95,9 +98,14 @@ _MARKDOWN_IMAGE_RE = re.compile(
     r"!\[[^\]\r\n]{0,1024}\]\((?:[^()\r\n]|\([^)\r\n]*\)){0,4096}\)"
 )
 _DATA_URL_RE = re.compile(r"(?is)\bdata:[^\s<>'\"\])]{1,8192}")
-_EXPLICIT_BASE64_RE = re.compile(
-    r"(?is)\bbase64\s*:\s*([A-Za-z0-9_+/=-]{1,8192}|[^\s]{1,8192})"
+_ENCODED_PAYLOAD_CUE_RE = re.compile(
+    r"(?is)\b(?:"
+    r"base64"
+    r"|decode\s+and\s+obey"
+    r"(?:\s+(?:this|the\s+following)(?:\s+payload)?)?"
+    r")\s*:\s*"
 )
+_BASE64_TOKEN_RE = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
 _GENERIC_BASE64_RE = re.compile(
     rf"(?<![A-Za-z0-9_+/-])"
     rf"[A-Za-z0-9_+/-]{{16,{_MAX_ENCODED_CANDIDATE_CHARACTERS}}}={{0,2}}"
@@ -286,6 +294,55 @@ def _strip_html(
     return " ".join(parser.parts)
 
 
+def _enforce_canonical_bounds(
+    text: str,
+    code: str = "canonicalization_too_large",
+) -> None:
+    if (
+        len(text) > MAX_NORMALIZED_CHARACTERS
+        or len(text.encode("utf-8")) > MAX_CONTENT_BYTES
+    ):
+        raise UntrustedContentError(code)
+
+
+def _canonicalize_active_content_once(
+    text: str,
+    findings: dict[str, InjectionFinding],
+) -> str:
+    try:
+        text = html.unescape(text)
+    except Exception:
+        raise UntrustedContentError("canonicalization_failed") from None
+    _enforce_canonical_bounds(text)
+    text = unicodedata.normalize("NFC", text)
+    _enforce_canonical_bounds(text)
+    text = _strip_hidden_controls(text, findings)
+    text = _strip_html(text, findings)
+
+    if _DATA_URL_RE.search(text):
+        _add_finding(findings, "data_url", "high")
+    if _MARKDOWN_IMAGE_RE.search(text):
+        _add_finding(findings, "remote_image", "high")
+    text = _MARKDOWN_IMAGE_RE.sub(" ", text)
+    text = _DATA_URL_RE.sub(" ", text)
+    _enforce_canonical_bounds(text)
+    return text
+
+
+def _canonicalize_active_content(
+    raw_text: str,
+    findings: dict[str, InjectionFinding],
+) -> str:
+    text = unicodedata.normalize("NFC", raw_text)
+    _enforce_canonical_bounds(text, "normalized_content_too_large")
+    for _attempt in range(_MAX_CANONICALIZATION_PASSES):
+        canonical = _canonicalize_active_content_once(text, findings)
+        if canonical == text:
+            return canonical
+        text = canonical
+    raise UntrustedContentError("canonicalization_not_converged")
+
+
 def _decoded_instruction(candidate: str) -> bool:
     if len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS:
         return False
@@ -310,28 +367,126 @@ def _decoded_instruction(candidate: str) -> bool:
         decoded_text = decoded.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    folded = decoded_text.casefold()
+    decoded_findings: dict[str, InjectionFinding] = {}
+    try:
+        canonical = _canonicalize_active_content(
+            decoded_text,
+            decoded_findings,
+        )
+    except UntrustedContentError:
+        return True
+    folded = canonical.casefold()
     return bool(
-        _DIRECT_INSTRUCTION_RE.search(decoded_text)
-        or _INDIRECT_TOOL_RE.search(decoded_text)
-        or _TOOL_JSON_MARKER_RE.search(decoded_text)
+        _DIRECT_INSTRUCTION_RE.search(canonical)
+        or _INDIRECT_TOOL_RE.search(canonical)
+        or _TOOL_JSON_MARKER_RE.search(canonical)
         or any(name in folded for name in _MUTABLE_TOOL_NAMES)
+        or any(
+            finding.code
+            in {
+                "active_html",
+                "bidi_control",
+                "hidden_control",
+                "nul_control",
+            }
+            for finding in decoded_findings.values()
+        )
     )
+
+
+def _base64_tokens_after_cue(
+    text: str,
+    start: int,
+) -> tuple[list[tuple[str, int, int]], int]:
+    scan_end = min(len(text), start + MAX_CONTENT_BYTES)
+    position = start
+    while position < scan_end and text[position].isspace():
+        position += 1
+    first_start = position
+    tokens: list[tuple[str, int, int]] = []
+
+    while position < scan_end:
+        match = _BASE64_TOKEN_RE.match(text, position, scan_end)
+        if match is None:
+            break
+        token = match.group(0)
+        if tokens and len(token.rstrip("=")) not in {2, 3, 4}:
+            break
+        tokens.append((token, match.start(), match.end()))
+        position = match.end()
+        if len(tokens) == 1 and len(token.rstrip("=")) > 4:
+            break
+        if token.endswith("=") or position >= scan_end:
+            break
+        separator = re.match(r"[ \t\r\n]+", text[position:scan_end])
+        if separator is None:
+            break
+        position += separator.end()
+
+    if tokens:
+        return tokens, tokens[-1][2]
+    malformed_end = first_start
+    while (
+        malformed_end < scan_end
+        and not text[malformed_end].isspace()
+    ):
+        malformed_end += 1
+    return [], malformed_end
+
+
+def _malicious_fragmented_prefix(
+    tokens: Sequence[tuple[str, int, int]],
+) -> int | None:
+    if not tokens:
+        return None
+    if len(tokens) == 1:
+        return 1 if _decoded_instruction(tokens[0][0]) else None
+    compact = "".join(token for token, _start, _end in tokens)
+    if len(compact) > _MAX_ENCODED_CANDIDATE_CHARACTERS:
+        return None
+    prefix_lengths: list[int] = []
+    total = 0
+    for token, _start, _end in tokens:
+        total += len(token)
+        prefix_lengths.append(total)
+    for count in range(len(tokens), 3, -1):
+        candidate = compact[: prefix_lengths[count - 1]]
+        if _decoded_instruction(candidate):
+            return count
+    return None
+
+
+def _strip_cued_encoded_payloads(
+    text: str,
+    findings: dict[str, InjectionFinding],
+) -> str:
+    intervals: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        cue = _ENCODED_PAYLOAD_CUE_RE.search(text, cursor)
+        if cue is None:
+            break
+        tokens, candidate_end = _base64_tokens_after_cue(text, cue.end())
+        malicious_count = _malicious_fragmented_prefix(tokens)
+        if malicious_count is not None:
+            _add_finding(findings, "encoded_instruction", "high")
+            candidate_end = tokens[malicious_count - 1][2]
+        else:
+            _add_finding(findings, "malformed_encoding", "medium")
+        interval_end = max(cue.end(), candidate_end)
+        intervals.append((cue.start(), interval_end))
+        cursor = max(interval_end, cue.end())
+
+    for start, end in reversed(intervals):
+        text = text[:start] + " " + text[end:]
+    return text
 
 
 def _strip_encoded_payloads(
     text: str,
     findings: dict[str, InjectionFinding],
 ) -> str:
-    def replace_explicit(match: re.Match[str]) -> str:
-        candidate = match.group(1)
-        if _decoded_instruction(candidate):
-            _add_finding(findings, "encoded_instruction", "high")
-        else:
-            _add_finding(findings, "malformed_encoding", "medium")
-        return " "
-
-    text = _EXPLICIT_BASE64_RE.sub(replace_explicit, text)
+    text = _strip_cued_encoded_payloads(text, findings)
 
     def replace_generic(match: re.Match[str]) -> str:
         candidate = match.group(0)
@@ -404,16 +559,7 @@ def _strip_tool_json(
 
 def _sanitize(raw_text: str) -> tuple[str, tuple[InjectionFinding, ...]]:
     findings: dict[str, InjectionFinding] = {}
-    text = unicodedata.normalize("NFC", raw_text)
-    text = _strip_hidden_controls(text, findings)
-    text = _strip_html(text, findings)
-
-    if _DATA_URL_RE.search(text):
-        _add_finding(findings, "data_url", "high")
-        text = _DATA_URL_RE.sub(" ", text)
-    if _MARKDOWN_IMAGE_RE.search(text):
-        _add_finding(findings, "remote_image", "high")
-        text = _MARKDOWN_IMAGE_RE.sub(" ", text)
+    text = _canonicalize_active_content(raw_text, findings)
 
     text = _strip_tool_json(text, findings)
     if _DIRECT_INSTRUCTION_RE.search(text):
@@ -554,7 +700,17 @@ class UntrustedContentGateway:
             )
             raise UntrustedContentError("invalid_published_at")
 
-        normalized_text, findings = _sanitize(raw_text)
+        try:
+            normalized_text, findings = _sanitize(raw_text)
+        except UntrustedContentError as exc:
+            self._persist_rejection(
+                source_hash,
+                _sha256(raw_bytes),
+                len(raw_bytes),
+                exc.code,
+                observed_at,
+            )
+            raise
         normalized_bytes = normalized_text.encode("utf-8")
         if (
             len(normalized_bytes) > MAX_CONTENT_BYTES
@@ -590,6 +746,9 @@ class UntrustedContentGateway:
                 len(normalized_bytes),
                 code,
                 observed_at,
+                additional_flag_codes=[
+                    finding.code for finding in findings
+                ],
             )
             raise UntrustedContentError(code) from None
 
@@ -617,6 +776,8 @@ class UntrustedContentGateway:
         byte_length: int,
         code: str,
         received_at: datetime | None,
+        *,
+        additional_flag_codes: Sequence[str] = (),
     ) -> None:
         observed_at = received_at or self._clock()
         self._validate_timestamp(observed_at, "invalid_received_at")
@@ -624,7 +785,7 @@ class UntrustedContentGateway:
             source_hash=source_hash,
             content_hash=content_hash,
             byte_length=byte_length,
-            flag_codes=[code],
+            flag_codes=[code, *additional_flag_codes],
             state="rejected",
             received_at=observed_at,
         )
@@ -639,22 +800,52 @@ class UntrustedContentGateway:
         state: Literal["received", "rejected"],
         received_at: datetime,
     ) -> None:
-        statement = (
-            sqlite_insert(UntrustedIngestEvent)
-            .values(
-                source_hash=source_hash,
-                content_hash=content_hash,
-                byte_length=byte_length,
-                flags_json=json.dumps(
-                    list(flag_codes),
-                    separators=(",", ":"),
+        incoming = sqlite_insert(UntrustedIngestEvent).values(
+            source_hash=source_hash,
+            content_hash=content_hash,
+            byte_length=byte_length,
+            flags_json=json.dumps(
+                sorted(set(flag_codes)),
+                separators=(",", ":"),
+            ),
+            state=state,
+            received_at=received_at.astimezone(timezone.utc),
+        )
+        merged_flags = sql_text(
+            "("
+            "SELECT json_group_array(code) "
+            "FROM ("
+            "SELECT value AS code "
+            "FROM json_each(untrusted_ingest_events.flags_json) "
+            "UNION "
+            "SELECT value AS code "
+            "FROM json_each(excluded.flags_json) "
+            "ORDER BY code"
+            "))"
+        )
+        statement = incoming.on_conflict_do_update(
+            index_elements=["source_hash", "content_hash"],
+            set_={
+                "byte_length": func.max(
+                    UntrustedIngestEvent.byte_length,
+                    incoming.excluded.byte_length,
                 ),
-                state=state,
-                received_at=received_at.astimezone(timezone.utc),
-            )
-            .on_conflict_do_nothing(
-                index_elements=["source_hash", "content_hash"],
-            )
+                "flags_json": merged_flags,
+                "state": case(
+                    (
+                        or_(
+                            UntrustedIngestEvent.state == "rejected",
+                            incoming.excluded.state == "rejected",
+                        ),
+                        "rejected",
+                    ),
+                    else_="received",
+                ),
+                "received_at": func.min(
+                    UntrustedIngestEvent.received_at,
+                    incoming.excluded.received_at,
+                ),
+            },
         )
         with self._session_factory() as session:
             session.execute(statement)

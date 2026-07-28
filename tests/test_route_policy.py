@@ -11,9 +11,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from sqlalchemy.orm import sessionmaker
 
 import trading_assistant.app.limits as limits_module
 from trading_assistant.app.main import create_app
@@ -74,6 +75,73 @@ def _with_limit(
         update={"security": security}
     )
     return service
+
+
+def _persist_panic_fence(
+    service,
+    *,
+    lease_key: str,
+    lease_owner: str,
+    lease_generation: int,
+    lease_expires_at: datetime,
+    receipt_owner: str,
+    receipt_generation: int,
+    receipt_expires_at: datetime,
+    receipt_state: str = "started",
+    response: dict[str, object] | None = None,
+) -> None:
+    with service.session_factory() as session:
+        session.add(
+            ConcurrencyLease(
+                resource_key=lease_key,
+                owner=lease_owner,
+                generation=lease_generation,
+                expires_at=lease_expires_at,
+            )
+        )
+        persist_sensitive(
+            session,
+            PanicReceipt(
+                account_scope="alpaca-paper",
+                request_id=receipt_owner,
+                lease_generation=receipt_generation,
+                state=receipt_state,
+                started_at=utcnow(),
+                completed_at=(
+                    utcnow() if receipt_state != "started" else None
+                ),
+                expires_at=receipt_expires_at,
+            ),
+            {
+                "response_json": json.dumps(
+                    response or {},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            session_factory=service.session_factory,
+        )
+        session.commit()
+
+
+def _panic_request(app: FastAPI) -> Request:
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "POST",
+            "scheme": "https",
+            "path": "/panic",
+            "raw_path": b"/panic",
+            "query_string": b"",
+            "headers": [],
+            "server": ("localhost", 8020),
+            "client": ("127.0.0.1", 50000),
+            "root_path": "",
+        }
+    )
+    request.state.request_id = "panic-follower-test"
+    return request
 
 
 def test_every_api_route_has_exact_policy(make_service):
@@ -1524,6 +1592,514 @@ def test_cancelled_request_consumes_real_sync_worker_failure(
     assert leaked == []
 
 
+def test_panic_receipt_renewal_rejects_successor_lease_owner(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-renew-successor-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "d" * 64 + ":0"
+    original_expiry = utcnow() + timedelta(seconds=30)
+    successor_expiry = utcnow() + timedelta(seconds=60)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-b",
+        lease_generation=2,
+        lease_expires_at=successor_expiry,
+        receipt_owner="owner-a",
+        receipt_generation=1,
+        receipt_expires_at=original_expiry,
+    )
+
+    try:
+        renewed = policy_module._renew_panic_receipt(
+            app,
+            lease_key,
+            "owner-a",
+            1,
+            successor_expiry,
+        )
+    except TypeError as exc:
+        pytest.fail(f"renewal does not accept the lease fence: {exc}")
+
+    assert renewed is False
+    with service.session_factory() as session:
+        receipt = session.get(PanicReceipt, "alpaca-paper")
+        assert receipt.state == "started"
+        assert receipt.expires_at == original_expiry
+
+
+def test_panic_receipt_finish_rejects_successor_lease_owner(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-finish-successor-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "e" * 64 + ":0"
+    original_expiry = utcnow() + timedelta(seconds=30)
+    successor_expiry = utcnow() + timedelta(seconds=60)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-b",
+        lease_generation=2,
+        lease_expires_at=successor_expiry,
+        receipt_owner="owner-a",
+        receipt_generation=1,
+        receipt_expires_at=original_expiry,
+    )
+
+    try:
+        with pytest.raises(LimitStoreUnavailable):
+            policy_module._finish_panic_receipt(
+                app,
+                lease_key,
+                "owner-a",
+                lease_generation=1,
+                response={"safe": True, "owner": "owner-a"},
+                expires_at=successor_expiry,
+            )
+    except TypeError as exc:
+        pytest.fail(f"finish does not accept the lease fence: {exc}")
+
+    with service.session_factory() as session:
+        receipt = session.get(PanicReceipt, "alpaca-paper")
+        assert receipt.state == "started"
+        assert receipt.completed_at is None
+        assert json.loads(
+            decrypt_test_sensitive(receipt, "response_json")
+        ) == {}
+
+
+@pytest.mark.parametrize("operation", ["renew", "finish"])
+@pytest.mark.parametrize("clock_change", ["past_horizon", "backward"])
+def test_panic_receipt_write_rolls_back_if_post_flush_clock_is_unsafe(
+    make_service,
+    monkeypatch,
+    operation,
+    clock_change,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token=f"panic-delayed-{operation}-secret",
+        planning=None,
+    )
+    lease_key = "route:" + ("f" if operation == "renew" else "a") * 64 + ":0"
+    before = datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc)
+    horizon = before + timedelta(seconds=1)
+    original_expiry = before + timedelta(milliseconds=500)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-a",
+        lease_generation=7,
+        lease_expires_at=horizon,
+        receipt_owner="owner-a",
+        receipt_generation=7,
+        receipt_expires_at=original_expiry,
+    )
+    clock_calls = 0
+
+    def crossing_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 1:
+            return before
+        if clock_change == "backward":
+            return before - timedelta(microseconds=1)
+        return horizon + timedelta(microseconds=1)
+
+    monkeypatch.setattr(policy_module, "utcnow", crossing_clock)
+
+    try:
+        if operation == "renew":
+            result = policy_module._renew_panic_receipt(
+                app,
+                lease_key,
+                "owner-a",
+                7,
+                horizon,
+            )
+            assert result is False
+        else:
+            with pytest.raises(LimitStoreUnavailable):
+                policy_module._finish_panic_receipt(
+                    app,
+                    lease_key,
+                    "owner-a",
+                    lease_generation=7,
+                    response={"safe": True},
+                    expires_at=horizon,
+                )
+    except TypeError as exc:
+        pytest.fail(f"receipt write does not accept lease fence: {exc}")
+
+    assert clock_calls >= 2
+    with service.session_factory() as session:
+        receipt = session.get(PanicReceipt, "alpaca-paper")
+        assert receipt.state == "started"
+        assert receipt.completed_at is None
+        assert receipt.expires_at == original_expiry
+        assert json.loads(
+            decrypt_test_sensitive(receipt, "response_json")
+        ) == {}
+
+
+def test_panic_receipt_finish_fails_closed_when_sqlite_writer_is_busy(
+    make_service,
+    engine,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-busy-finish-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "b" * 64 + ":0"
+    horizon = utcnow() + timedelta(seconds=60)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-a",
+        lease_generation=9,
+        lease_expires_at=horizon,
+        receipt_owner="owner-a",
+        receipt_generation=9,
+        receipt_expires_at=horizon,
+    )
+    holder = engine.connect()
+    contender = engine.connect()
+    holder.exec_driver_sql("BEGIN IMMEDIATE")
+    contender.exec_driver_sql("PRAGMA busy_timeout=1")
+    app.state.session_auth.session_factory = sessionmaker(
+        bind=contender,
+        expire_on_commit=False,
+        future=True,
+    )
+
+    try:
+        try:
+            with pytest.raises(LimitStoreUnavailable):
+                policy_module._finish_panic_receipt(
+                    app,
+                    lease_key,
+                    "owner-a",
+                    lease_generation=9,
+                    response={"safe": True},
+                    expires_at=horizon,
+                )
+        except TypeError as exc:
+            pytest.fail(f"finish does not accept the lease fence: {exc}")
+    finally:
+        holder.rollback()
+        contender.close()
+        holder.close()
+
+    with service.session_factory() as session:
+        receipt = session.get(PanicReceipt, "alpaca-paper")
+        assert receipt.state == "started"
+
+
+def test_panic_follower_rejects_completed_a1_after_b2_takeover(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-stale-follower-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "c" * 64 + ":0"
+    expired = utcnow() - timedelta(seconds=1)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-b",
+        lease_generation=2,
+        lease_expires_at=utcnow() + timedelta(seconds=60),
+        receipt_owner="owner-a",
+        receipt_generation=1,
+        receipt_expires_at=expired,
+        receipt_state="completed",
+        response={"safe": True, "owner": "owner-a"},
+    )
+    observed = LeaseDecision(
+        acquired=True,
+        owner="owner-a",
+        generation=1,
+        expires_at=expired,
+        retry_after_seconds=0,
+    )
+
+    response = asyncio.run(
+        policy_module._wait_for_panic_receipt(
+            app,
+            _panic_request(app),
+            lease_key=lease_key,
+            observed=observed,
+        )
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body)["error"]["code"] == "panic_incomplete"
+
+
+def test_panic_follower_replays_completed_a1_after_exact_release(
+    make_service,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-released-follower-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "8" * 64 + ":0"
+    receipt_horizon = utcnow() + timedelta(seconds=60)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="",
+        lease_generation=2,
+        lease_expires_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+        receipt_owner="owner-a",
+        receipt_generation=1,
+        receipt_expires_at=receipt_horizon,
+        receipt_state="completed",
+        response={"safe": True, "owner": "owner-a"},
+    )
+    observed = LeaseDecision(
+        acquired=True,
+        owner="owner-a",
+        generation=1,
+        expires_at=receipt_horizon,
+        retry_after_seconds=60,
+    )
+
+    response = asyncio.run(
+        policy_module._wait_for_panic_receipt(
+            app,
+            _panic_request(app),
+            lease_key=lease_key,
+            observed=observed,
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "safe": True,
+        "owner": "owner-a",
+    }
+
+
+def test_panic_follower_rejects_receipt_if_horizon_expires_during_read(
+    make_service,
+    monkeypatch,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-expiring-follower-secret",
+        planning=None,
+    )
+    lease_key = "route:" + "7" * 64 + ":0"
+    before = datetime(2026, 7, 28, 17, 0, tzinfo=timezone.utc)
+    horizon = before + timedelta(seconds=1)
+    _persist_panic_fence(
+        service,
+        lease_key=lease_key,
+        lease_owner="owner-a",
+        lease_generation=1,
+        lease_expires_at=horizon,
+        receipt_owner="owner-a",
+        receipt_generation=1,
+        receipt_expires_at=horizon,
+        receipt_state="completed",
+        response={"safe": True, "owner": "owner-a"},
+    )
+    clock_calls = 0
+
+    def crossing_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return before if clock_calls == 1 else horizon + timedelta(microseconds=1)
+
+    monkeypatch.setattr(policy_module, "utcnow", crossing_clock)
+    observed = LeaseDecision(
+        acquired=True,
+        owner="owner-a",
+        generation=1,
+        expires_at=horizon,
+        retry_after_seconds=1,
+    )
+
+    response = asyncio.run(
+        policy_module._wait_for_panic_receipt(
+            app,
+            _panic_request(app),
+            lease_key=lease_key,
+            observed=observed,
+        )
+    )
+
+    assert clock_calls >= 2
+    assert response.status_code == 503
+    assert json.loads(response.body)["error"]["code"] == "panic_incomplete"
+
+
+def test_cancel_during_panic_finish_replays_fence_without_reexecution(
+    make_service,
+    monkeypatch,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-cancel-finish-secret",
+        planning=None,
+    )
+    calls = 0
+    finish_started = threading.Event()
+    release_finish = threading.Event()
+    original_finish = policy_module._finish_panic_receipt
+
+    def blocking_finish(*args, **kwargs):
+        finish_started.set()
+        assert release_finish.wait(timeout=5)
+        return original_finish(*args, **kwargs)
+
+    def panic(_context):
+        nonlocal calls
+        calls += 1
+        return {"safe": True, "owner": "cancelled-request"}
+
+    monkeypatch.setattr(
+        policy_module,
+        "_finish_panic_receipt",
+        blocking_finish,
+    )
+    app.state.operations.panic = panic
+
+    async def exercise():
+        leaked: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: leaked.append(context)
+        )
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="https://localhost:8020",
+            ) as client:
+                login = await client.post(
+                    "/auth/login",
+                    json={"secret": "panic-cancel-finish-secret"},
+                )
+                headers = {
+                    "X-CSRF-Token": login.json()["csrf_token"],
+                    "Idempotency-Key": "panic-cancel-finish-owner",
+                }
+                owner = asyncio.create_task(
+                    client.post(
+                        "/panic",
+                        json={"reason": "cancel while receipt flushes"},
+                        headers=headers,
+                    )
+                )
+                assert await asyncio.to_thread(finish_started.wait, 5)
+                owner.cancel()
+                await asyncio.sleep(0)
+                assert owner.done() is False
+                release_finish.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+                retry = await client.post(
+                    "/panic",
+                    json={"reason": "must not execute twice"},
+                    headers={
+                        "X-CSRF-Token": login.json()["csrf_token"],
+                        "Idempotency-Key": "panic-cancel-finish-retry",
+                    },
+                )
+                await asyncio.sleep(0)
+                return retry, leaked
+        finally:
+            release_finish.set()
+            loop.set_exception_handler(previous_handler)
+
+    retry, leaked = asyncio.run(exercise())
+
+    assert retry.status_code == 200
+    assert retry.json() == {
+        "safe": True,
+        "owner": "cancelled-request",
+    }
+    assert calls == 1
+    assert leaked == []
+    with service.session_factory() as session:
+        receipt = session.get(PanicReceipt, "alpaca-paper")
+        assert receipt.state == "completed"
+
+
+def test_panic_follower_store_unknown_fails_closed(
+    make_service,
+    monkeypatch,
+):
+    service = make_service()
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="panic-follower-store-secret",
+        planning=None,
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise LimitStoreUnavailable("unknown sqlite result")
+
+    monkeypatch.setattr(
+        policy_module,
+        "_observe_panic_fence",
+        unavailable,
+    )
+    observed = LeaseDecision(
+        acquired=True,
+        owner="owner-a",
+        generation=1,
+        expires_at=utcnow() + timedelta(seconds=60),
+        retry_after_seconds=60,
+    )
+
+    response = asyncio.run(
+        policy_module._wait_for_panic_receipt(
+            app,
+            _panic_request(app),
+            lease_key="route:" + "9" * 64 + ":0",
+            observed=observed,
+        )
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body)["error"]["code"] == (
+        "policy_store_unavailable"
+    )
+
+
 def test_panic_receipt_renewal_store_loss_stops_without_renewing_again(
     make_service,
     monkeypatch,
@@ -1665,12 +2241,14 @@ def test_panic_stop_after_lease_renewal_completes_receipt_fence(
 
     def renew_receipt(
         _app,
+        lease_key,
         request_id,
         generation,
         expires_at,
     ):
         nonlocal receipt_calls
         receipt_calls += 1
+        assert lease_key == hold.resource_key
         assert request_id == hold.owner
         assert generation == hold.generation
         assert expires_at == renewed_expires_at
@@ -1759,12 +2337,14 @@ def test_panic_receipt_fence_uses_successfully_renewed_horizon(
 
     def renew_receipt(
         _app,
+        lease_key,
         request_id,
         generation,
         expires_at,
     ):
         nonlocal receipt_calls
         receipt_calls += 1
+        assert lease_key == hold.resource_key
         assert request_id == hold.owner
         assert generation == hold.generation
         assert expires_at == renewed_expires_at
@@ -1838,12 +2418,14 @@ def test_panic_receipt_transient_store_busy_retries_with_same_fence(
 
     def transient_receipt_store(
         _app,
+        lease_key,
         request_id,
         generation,
         expires_at,
     ):
         nonlocal receipt_calls
         receipt_calls += 1
+        assert lease_key == hold.resource_key
         assert request_id == hold.owner
         assert generation == hold.generation
         assert expires_at == renewed_expires_at
