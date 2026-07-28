@@ -40,8 +40,6 @@ MAX_NORMALIZED_CHARACTERS = 16_000
 _MAX_SOURCE_ID_CHARACTERS = 256
 _MAX_SOURCE_NAME_CHARACTERS = 256
 _MAX_ENCODED_CANDIDATE_CHARACTERS = 4_096
-_MAX_ENCODED_SPAN_CHARACTERS = 8_192
-_MAX_ENCODED_TOKENS = 1_024
 _MAX_DECODED_PAYLOAD_BYTES = 3_072
 _MAX_CANONICALIZATION_PASSES = 4
 
@@ -101,24 +99,24 @@ _MARKDOWN_IMAGE_RE = re.compile(
     r"!\[[^\]\r\n]{0,1024}\]\((?:[^()\r\n]|\([^)\r\n]*\)){0,4096}\)"
 )
 _DATA_URL_RE = re.compile(r"(?is)\bdata:[^\s<>'\"\])]{1,8192}")
-_ENCODED_PAYLOAD_CUE_RE = re.compile(
-    r"(?is)\b(?:"
-    r"base64(?:\s+(?:payload|data))?"
-    r"|decode\s+and\s+obey"
-    r"(?:\s+(?:this|the\s+following)(?:\s+payload)?)?"
-    r"|(?:encode(?:d)?|decode)"
-    r"(?:\s+(?:this|the\s+following))?"
-    r"(?:\s+(?:base64|payload|data)){0,2}"
-    r")\s*:\s*"
-)
-_BASE64_ALPHABET = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_"
-)
-_ENCODED_DELIMITERS = (
-    ("```", "```"),
-    ("`", "`"),
-    ('"', '"'),
-    ("'", "'"),
+_ENCODED_ACTION_CUE_RE = re.compile(
+    r"""
+    \b(?:
+        decode\s{1,8}and\s{1,8}obey
+            (?:\s{1,8}(?:this|the\s{1,8}following))?
+            (?:\s{1,8}(?:base64|payload|data|instruction)){0,2}
+        |decode
+            (?:\s{1,8}(?:this|the\s{1,8}following))?
+            (?:\s{1,8}(?:base64|payload|data|instruction)){1,2}
+        |encoded\s{1,8}
+            (?:base64\s{1,8})?(?:payload|data|instruction)
+        |base64(?:\s{1,8}(?:payload|data|instruction))?
+        |encode(?:d)?
+        |decode
+    )
+    \s{0,8}(?:=>|->|:|=)\s{0,8}
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 _GENERIC_BASE64_RE = re.compile(
     rf"(?<![A-Za-z0-9_+/-])"
@@ -427,187 +425,17 @@ def _decoded_instruction(candidate: str) -> bool:
     )
 
 
-def _compact_exact_encoded_span(text: str) -> tuple[str, bool]:
-    compact: list[str] = []
-    token_count = 0
-    in_token = False
-    malformed = len(text) > _MAX_ENCODED_SPAN_CHARACTERS
-    for character in text:
-        if character.isspace():
-            in_token = False
-            continue
-        if not in_token:
-            token_count += 1
-            in_token = True
-            if token_count > _MAX_ENCODED_TOKENS:
-                malformed = True
-        if character not in _BASE64_ALPHABET and character != "=":
-            malformed = True
-        if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
-            compact.append(character)
-        else:
-            malformed = True
-    candidate = "".join(compact)
-    if (
-        not candidate
-        or len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS
-        or candidate.count("=") > 2
-        or (
-            "=" in candidate
-            and not candidate.endswith("=" * candidate.count("="))
-        )
-        or (
-            ("+" in candidate or "/" in candidate)
-            and ("-" in candidate or "_" in candidate)
-        )
-    ):
-        malformed = True
-    return candidate, malformed
-
-
-def _delimited_encoded_span(
-    text: str,
-    start: int,
-) -> tuple[int, str, bool] | None:
-    for opening, closing in _ENCODED_DELIMITERS:
-        if not text.startswith(opening, start):
-            continue
-        payload_start = start + len(opening)
-        close_at = text.find(closing, payload_start)
-        if close_at < 0:
+def _reject_cued_encoded_content(text: str) -> None:
+    detection_text = " ".join(text.split())
+    for cue in _ENCODED_ACTION_CUE_RE.finditer(detection_text):
+        if detection_text[cue.end() :].strip():
             raise UntrustedContentError("ambiguous_encoding")
-        candidate, malformed = _compact_exact_encoded_span(
-            text[payload_start:close_at]
-        )
-        return close_at + len(closing), candidate, malformed
-    return None
 
 
-def _bare_encoded_span(
-    text: str,
-    start: int,
-) -> tuple[int, str, bool]:
-    position = start
-    while position < len(text) and text[position].isspace():
-        position += 1
-    payload_start = position
-
-    if (
-        position >= len(text)
-        or (
-            text[position] not in _BASE64_ALPHABET
-            and text[position] != "="
-        )
-    ):
-        raise UntrustedContentError("malformed_encoding")
-
-    compact: list[str] = []
-    token_count = 0
-    in_token = False
-    malformed = False
-    padding_seen = False
-
-    while position < len(text):
-        character = text[position]
-        if character.isspace():
-            in_token = False
-            position += 1
-            continue
-        if padding_seen and character != "=":
-            prefix = "".join(compact)
-            code = (
-                "ambiguous_encoding"
-                if _decode_base64_candidate(prefix) is not None
-                else "malformed_encoding"
-            )
-            raise UntrustedContentError(code)
-        if character not in _BASE64_ALPHABET and character != "=":
-            code = (
-                "ambiguous_encoding"
-                if token_count > 1
-                else "malformed_encoding"
-            )
-            raise UntrustedContentError(code)
-        if not in_token:
-            token_count += 1
-            in_token = True
-            if token_count > _MAX_ENCODED_TOKENS:
-                malformed = True
-        if character == "=":
-            padding_seen = True
-        if len(compact) < _MAX_ENCODED_CANDIDATE_CHARACTERS + 1:
-            compact.append(character)
-        else:
-            malformed = True
-        position += 1
-
-    candidate = "".join(compact)
-    span_length = len(text) - payload_start
-    malformed = (
-        malformed
-        or not candidate
-        or span_length > _MAX_ENCODED_SPAN_CHARACTERS
-        or len(candidate) > _MAX_ENCODED_CANDIDATE_CHARACTERS
-        or candidate.count("=") > 2
-        or (
-            ("+" in candidate or "/" in candidate)
-            and ("-" in candidate or "_" in candidate)
-        )
-    )
-    return len(text), candidate, malformed
-
-
-def _encoded_span_after_cue(
-    text: str,
-    start: int,
-) -> tuple[int, str, bool]:
-    position = start
-    while position < len(text) and text[position].isspace():
-        position += 1
-    delimited = _delimited_encoded_span(text, position)
-    if delimited is not None:
-        return delimited
-    return _bare_encoded_span(text, position)
-
-
-def _strip_cued_encoded_payloads(
+def _strip_uncued_encoded_payloads(
     text: str,
     findings: dict[str, InjectionFinding],
 ) -> str:
-    intervals: list[tuple[int, int]] = []
-    cursor = 0
-    while True:
-        cue = _ENCODED_PAYLOAD_CUE_RE.search(text, cursor)
-        if cue is None:
-            break
-        candidate_end, candidate, malformed = _encoded_span_after_cue(
-            text,
-            cue.end(),
-        )
-        if malformed:
-            raise UntrustedContentError("malformed_encoding")
-        decoded = _decode_base64_candidate(candidate)
-        if decoded is None:
-            raise UntrustedContentError("malformed_encoding")
-        if _decoded_bytes_contain_instruction(decoded):
-            _add_finding(findings, "encoded_instruction", "high")
-        else:
-            _add_finding(findings, "malformed_encoding", "medium")
-        interval_end = max(cue.end(), candidate_end)
-        intervals.append((cue.start(), interval_end))
-        cursor = max(interval_end, cue.end())
-
-    for start, end in reversed(intervals):
-        text = text[:start] + " " + text[end:]
-    return text
-
-
-def _strip_encoded_payloads(
-    text: str,
-    findings: dict[str, InjectionFinding],
-) -> str:
-    text = _strip_cued_encoded_payloads(text, findings)
-
     def replace_generic(match: re.Match[str]) -> str:
         candidate = match.group(0)
         if not _decoded_instruction(candidate):
@@ -680,6 +508,7 @@ def _strip_tool_json(
 def _sanitize(raw_text: str) -> tuple[str, tuple[InjectionFinding, ...]]:
     findings: dict[str, InjectionFinding] = {}
     text = _canonicalize_active_content(raw_text, findings)
+    _reject_cued_encoded_content(text)
 
     text = _strip_tool_json(text, findings)
     if _DIRECT_INSTRUCTION_RE.search(text):
@@ -689,7 +518,7 @@ def _sanitize(raw_text: str) -> tuple[str, tuple[InjectionFinding, ...]]:
         _add_finding(findings, "indirect_tool_instruction", "high")
         text = _strip_suspicious_sentences(text, _INDIRECT_TOOL_RE)
 
-    text = _strip_encoded_payloads(text, findings)
+    text = _strip_uncued_encoded_payloads(text, findings)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
