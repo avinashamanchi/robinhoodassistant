@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (review fix round 1)
+# Task 6 report — COMPLETE (review fix round 4)
 
 ## Status and safety boundary
 
@@ -644,3 +644,163 @@
 - The sole test warning is an upstream deprecation unrelated to backup
   publication, migration authority, approval, execution safety, or broker
   truth.
+
+## Review fix round 4
+
+### Status, scope, and commit
+
+- Round-4 baseline:
+  `c8ee3d809c59df178e95979a47ed3742a3d09eca`.
+- Round-4 implementation commit:
+  `0fb34188a45400ccce877c3284fffd12a37c1765`
+  (`fix(security): close Task 6 round 4 findings`).
+- Work was performed directly in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- Every database probe used a pytest-created temporary SQLite database. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  operational processes, network, external services, brokers/providers,
+  notifications, the real app/daemon/MCP, breakers, and order APIs were not
+  accessed.
+
+### Finding closure
+
+- Migration authority now accepts only the exact concrete
+  `MigrationAuthority` type. Security decisions are made by non-overridable
+  module-level validation over sealed state; hostile subclasses are rejected
+  and authority is consumed on activation, assertion, completion,
+  wrong-connection, operation, destination, replay, or migration-step misuse.
+- Every authority is bound to one exact operation and destination. Empty
+  bootstrap is limited to one upgrade to the current head and revalidates
+  emptiness at use. Alembic reports structurally observed revision steps back
+  through `on_version_apply`; completion requires the expected start-to-head
+  transition and expected revision execution. `stamp`, downgrade, partial or
+  alternate destinations, no-revision execution, and issue-then-mutate misuse
+  cannot leave `SchemaStatus.ready` falsely true.
+- Maintenance upgrade and downgrade continue to require a real, unexpired,
+  connection-bound durable maintenance tenure at every DDL seam. Direct and
+  offline Alembic remain fail-closed. Exact-type validation is used throughout
+  issuance, activation, revision entry, observed-step handling, completion,
+  and replay handling; no user-overridable instance dispatch remains in the
+  authority path.
+- Encrypted backup uses hidden pending/committed semantics. Ciphertext remains
+  private while authenticated decrypt, plaintext hash verification,
+  `PRAGMA quick_check`, maintenance-ownership checks, hooks, private cleanup,
+  and required directory fsyncs run. The single atomic public-link operation is
+  the final commit point, and no fallible hook, ownership check, or cleanup
+  follows it.
+- Backup readers and retention enumerate only artifacts whose public name has
+  the expected same-inode pending anchor. Tenure loss at every verification
+  boundary, hostile cleanup failure, target collision, precommit callback
+  failure, and directory-fsync failure expose no committed artifact. A
+  successful artifact remains authenticated, decryptable, and quick-check
+  clean.
+- The two first-full-suite failures were a test synchronization defect, not
+  production lock contention. The checkpoint is emitted by test
+  instrumentation immediately before the child's blocking `flock`, and no
+  round-4 change touched the production submission barrier. Spawn scheduling
+  was incorrectly included in a two-second per-child ordering assertion.
+  Counted child processes now announce completed setup, wait on an explicit
+  parent start event, and report exact lock-attempt checkpoints. A bounded
+  helper waits on those events while detecting early child exit; elapsed time
+  is only a deadlock watchdog, not the ordering mechanism. Production barrier
+  semantics were not changed.
+
+### Changed files
+
+- Migration authority:
+  `migrations/env.py`,
+  `migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py`,
+  and `src/trading_assistant/db/migration_authority.py`.
+- Backup publication:
+  `src/trading_assistant/ops/backup.py`.
+- Regression infrastructure and tests:
+  `tests/safety_helpers.py`,
+  `tests/test_migrations.py`,
+  `tests/test_ops.py`,
+  `tests/test_sensitive_migration.py`,
+  `tests/test_submission_barrier.py`, and new
+  `tests/test_task6_round4.py`.
+
+### Round-4 TDD and focused evidence
+
+- Initial migration-authority RED:
+  `7 failed`. The probes demonstrated hostile-subclass authority, bootstrap
+  operation/destination confusion, `stamp` false-readiness, downgrade
+  reinterpretation, replay, wrong-connection, and no-observed-revision misuse.
+- Initial backup-publication RED failed during collection because the required
+  committed-artifact reader did not yet exist. This established that the old
+  public-name model could not express pending versus committed artifacts.
+- The dedicated round-4 regression file converged at `20 passed`.
+- Pre-full non-overlapping authority/backup/tenure/startup/static convergence:
+  `362 passed in 57.18s`. The final changed-area rerun was `82 passed`.
+- The first full suite exposed only the two multiprocessing timing assertions
+  described below. Before changing the tests, both exact cases passed alone
+  (`2 passed in 3.51s`), passed ten bounded isolated repetitions (`20/20`),
+  and the complete production-barrier module passed
+  `27 passed in 47.25s`. This evidence, plus the pre-`flock` checkpoint
+  location, ruled out production lock contention.
+- After deterministic child-ready/start synchronization, both exact cases
+  passed (`2 passed in 4.13s`), ten bounded repetitions passed (`20/20`), and
+  the complete barrier module passed `27 passed in 47.08s`.
+- Final affected focused groups:
+  `389 passed in 140.60s (0:02:20)`.
+
+### Full-suite round 1 — failed and preserved
+
+- The first full suite ran only after its then-current focused and release
+  gates were green, with database, Alpaca, Robinhood, LLM/provider,
+  market-data, notification, candidate-signing, field-encryption,
+  backup-encryption, live-confirmation, Composio, Octen, and OpenAI credential
+  variables explicitly unset.
+- Exact result:
+  `2 failed, 2675 passed, 1 skipped, 1 warning in 432.88s (0:07:12)`.
+- Failed nodes:
+  `test_submission_waiters_make_progress_without_invalidating_active_submission[3]`
+  and
+  `test_real_writer_has_priority_over_queued_submission_waiters_without_deadlock[3]`.
+  Both observed `[False, True, True]` from sequential two-second waits for
+  child pre-`flock` instrumentation. No migration-authority, backup,
+  production-barrier, or other safety test failed.
+- Per the prior one-suite rule, work stopped at that result. A new full-suite
+  round was run only after the user explicitly authorized systematic focused
+  diagnosis, a synchronization fix, fresh focused convergence, fresh release
+  gates, and exactly one confirmation suite.
+
+### Final release gates
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan found no trailing whitespace and no
+  missing final newline.
+
+### Full-suite round 2 — sole confirmation run
+
+- Exactly one new full suite ran after deterministic synchronization, all
+  affected focused groups, and every final release gate were green. Its
+  environment explicitly unset database, Alpaca, Robinhood, LLM/provider,
+  market-data, notification, candidate-signing, field-encryption,
+  backup-encryption, live-confirmation, Composio, Octen, and OpenAI credential
+  variables.
+- Exact result:
+  `2677 passed, 1 skipped, 1 warning in 398.82s (0:06:38)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No source or test changed after this result. Only this report, the progress
+  ledger, and generated review artifact were changed for the evidence commit.
+
+### Round-4 remaining caveats
+
+- No known production correctness or safety defect remains from the three
+  round-4 findings or the full-suite synchronization failure.
+- In-place production migration of a non-empty schema that predates durable
+  `runtime_tenures` remains intentionally refused and requires the separately
+  reviewed isolated-copy procedure.
+- The sole test warning is an upstream deprecation unrelated to migration
+  authority, backup publication, approval, execution safety, or broker truth.

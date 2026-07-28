@@ -1,0 +1,2090 @@
+diff --git a/migrations/env.py b/migrations/env.py
+index e55a76e..bab2504 100644
+--- a/migrations/env.py
++++ b/migrations/env.py
+@@ -7,0 +8,2 @@ from trading_assistant.db.migration_authority import (
++    finish_migration_authority,
++    observe_migration_step,
+@@ -30 +32,14 @@ def run_migrations_online() -> None:
+-        activate_migration_authority(authority, supplied_connection)
++        activate_migration_authority(
++            authority,
++            supplied_connection,
++            destination_revisions=context.get_revision_argument(),
++        )
++
++        def observe_step(*, step, heads, **_kwargs) -> None:
++            observe_migration_step(
++                authority,
++                supplied_connection,
++                step=step,
++                heads=heads,
++            )
++
+@@ -33,0 +49 @@ def run_migrations_online() -> None:
++            on_version_apply=observe_step,
+@@ -36,0 +53,4 @@ def run_migrations_online() -> None:
++            finish_migration_authority(
++                authority,
++                supplied_connection,
++            )
+diff --git a/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py b/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
+index 7570de0..476456a 100644
+--- a/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
++++ b/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
+@@ -12,0 +13 @@ from trading_assistant.db.migration_authority import (
++    migration_schema_fence,
+@@ -73 +74 @@ def upgrade() -> None:
+-    authority = assert_migration_authority(
++    assert_migration_authority(
+@@ -78 +78,0 @@ def upgrade() -> None:
+-    authority.assert_owned(connection)
+@@ -104,2 +104,6 @@ def upgrade() -> None:
+-    authority.assert_owned(connection)
+-    with authority.schema_fence(connection):
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"bootstrap", "maintenance"}),
++    )
++    with migration_schema_fence(authority, connection):
+@@ -134 +138,5 @@ def upgrade() -> None:
+-    authority.assert_owned(connection)
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"bootstrap", "maintenance"}),
++    )
+@@ -141 +149 @@ def downgrade() -> None:
+-    authority = assert_migration_authority(
++    assert_migration_authority(
+@@ -146 +153,0 @@ def downgrade() -> None:
+-    authority.assert_owned(connection)
+@@ -187,2 +194,6 @@ def downgrade() -> None:
+-    authority.assert_owned(connection)
+-    with authority.schema_fence(connection):
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"maintenance"}),
++    )
++    with migration_schema_fence(authority, connection):
+@@ -218 +229,5 @@ def downgrade() -> None:
+-    authority.assert_owned(connection)
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"maintenance"}),
++    )
+@@ -226 +241,5 @@ def downgrade() -> None:
+-    authority.assert_owned(connection)
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"maintenance"}),
++    )
+diff --git a/src/trading_assistant/db/migration_authority.py b/src/trading_assistant/db/migration_authority.py
+index 5d7e05d..4cf3e06 100644
+--- a/src/trading_assistant/db/migration_authority.py
++++ b/src/trading_assistant/db/migration_authority.py
+@@ -1 +1 @@
+-"""Connection-bound, single-use authority for one Alembic command."""
++"""Connection-bound, operation-bound authority for one Alembic command."""
+@@ -6 +6 @@ from contextlib import contextmanager
+-from typing import Iterator, Literal
++from typing import Iterator, Literal, NoReturn
+@@ -7,0 +8,4 @@ from typing import Iterator, Literal
++from alembic.config import Config
++from alembic.migration import MigrationContext
++from alembic.runtime.migration import MigrationInfo
++from alembic.script import ScriptDirectory
+@@ -19,0 +24 @@ MigrationAuthorityMode = Literal["bootstrap", "maintenance"]
++MigrationOperation = Literal["upgrade", "downgrade"]
+@@ -21,0 +27 @@ _MAINTENANCE_RESOURCE = "sensitive-migration:global"
++_AUTHORITY_ERROR = "schema_migration_authority_required"
+@@ -25 +31,5 @@ class MigrationAuthority:
+-    """A sealed one-shot authority bound to one exact connection."""
++    """Sealed passive state for one exact Alembic migration run.
++
++    Security decisions intentionally live in module-level functions. No
++    authority instance method participates in validation or schema fencing.
++    """
+@@ -29,0 +40 @@ class MigrationAuthority:
++        "_completed",
+@@ -30,0 +42 @@ class MigrationAuthority:
++        "_destination_revisions",
+@@ -32,0 +45,3 @@ class MigrationAuthority:
++        "_observed_heads",
++        "_observed_steps",
++        "_operation",
+@@ -34,0 +50 @@ class MigrationAuthority:
++        "_start_revisions",
+@@ -42,0 +59,2 @@ class MigrationAuthority:
++        operation: MigrationOperation,
++        destination_revisions: tuple[str, ...],
+@@ -47 +65 @@ class MigrationAuthority:
+-            raise RuntimeError("schema_migration_authority_required")
++            raise RuntimeError(_AUTHORITY_ERROR)
+@@ -50,0 +69,2 @@ class MigrationAuthority:
++        self._operation = operation
++        self._destination_revisions = destination_revisions
+@@ -53,0 +74 @@ class MigrationAuthority:
++        self._completed = False
+@@ -54,0 +76,3 @@ class MigrationAuthority:
++        self._start_revisions: tuple[str, ...] = ()
++        self._observed_heads: tuple[str, ...] = ()
++        self._observed_steps = 0
+@@ -56,3 +79,0 @@ class MigrationAuthority:
+-    @property
+-    def mode(self) -> MigrationAuthorityMode:
+-        return self._mode
+@@ -60,52 +81,7 @@ class MigrationAuthority:
+-    def _validate_maintenance_binding(
+-        self,
+-        connection: Connection,
+-    ) -> None:
+-        guard = self._guard
+-        barrier = self._barrier
+-        handle = (
+-            guard.handle
+-            if type(guard) is RuntimeTenureGuard
+-            else None
+-        )
+-        service = (
+-            handle._service
+-            if type(handle) is RuntimeTenureHandle
+-            else None
+-        )
+-        session_factory = getattr(service, "_session_factory", None)
+-        session_bind = getattr(session_factory, "kw", {}).get("bind")
+-        if (
+-            type(guard) is not RuntimeTenureGuard
+-            or type(barrier) is not RuntimeMutationBarrier
+-            or barrier.guard is not guard
+-            or barrier.engine is not connection.engine
+-            or barrier._closed
+-            or type(handle) is not RuntimeTenureHandle
+-            or type(service) is not RuntimeTenureService
+-            or session_bind is not connection.engine
+-            or handle.role != "maintenance"
+-            or handle.resource_key != _MAINTENANCE_RESOURCE
+-        ):
+-            raise RuntimeError("schema_migration_authority_required")
+-        guard.assert_owned_in_transaction(connection)
+-
+-    def assert_owned(self, connection: Connection) -> None:
+-        """Re-prove the durable lease on the exact migration connection."""
+-
+-        if (
+-            self._seal is not _SEAL
+-            or self._retired
+-            or not self._activated
+-            or self._connection is not connection
+-        ):
+-            raise RuntimeError("schema_migration_authority_required")
+-        if self._mode == "maintenance":
+-            self._validate_maintenance_binding(connection)
+-
+-    @contextmanager
+-    def schema_fence(
+-        self,
+-        connection: Connection,
+-    ) -> Iterator[None]:
+-        """Narrowly permit rebuilding the table that stores the lease."""
++# Keep a stable reference even if untrusted application code rebinds the
++# public module attribute.
++_AUTHORITY_TYPE = MigrationAuthority
++_SLOTS = {
++    name: _AUTHORITY_TYPE.__dict__[name]
++    for name in _AUTHORITY_TYPE.__slots__
++}
+@@ -113,9 +89,11 @@ class MigrationAuthority:
+-        self.assert_owned(connection)
+-        if self._mode == "bootstrap":
+-            yield
+-            return
+-        barrier = self._barrier
+-        if type(barrier) is not RuntimeMutationBarrier:
+-            raise RuntimeError("schema_migration_authority_required")
+-        option_name, option_value = barrier.fence_schema_execution_option
+-        connection.execution_options(**{option_name: option_value})
++
++def _read(authority: MigrationAuthority, name: str):
++    return _SLOTS[name].__get__(authority, _AUTHORITY_TYPE)
++
++
++def _write(authority: MigrationAuthority, name: str, value: object) -> None:
++    _SLOTS[name].__set__(authority, value)
++
++
++def _consume(authority: object) -> None:
++    if type(authority) is _AUTHORITY_TYPE:
+@@ -123,4 +101,41 @@ class MigrationAuthority:
+-            yield
+-        finally:
+-            connection.execution_options(**{option_name: None})
+-        self.assert_owned(connection)
++            _SLOTS["_retired"].__set__(authority, True)
++        except BaseException:
++            pass
++
++
++def _refuse(authority: object) -> NoReturn:
++    _consume(authority)
++    raise RuntimeError(_AUTHORITY_ERROR)
++
++
++def _script() -> ScriptDirectory:
++    return ScriptDirectory.from_config(Config("alembic.ini"))
++
++
++def _normalize_revisions(value: object) -> tuple[str, ...]:
++    if value is None:
++        return ()
++    if isinstance(value, str):
++        values: tuple[object, ...] = (value,)
++    elif isinstance(value, (tuple, list, set, frozenset)):
++        values = tuple(value)
++    else:
++        raise RuntimeError(_AUTHORITY_ERROR)
++    if any(not isinstance(item, str) or not item for item in values):
++        raise RuntimeError(_AUTHORITY_ERROR)
++    return tuple(sorted(values))
++
++
++def _head_revisions() -> tuple[str, ...]:
++    heads = tuple(_script().get_heads())
++    normalized = _normalize_revisions(heads)
++    if not normalized:
++        raise RuntimeError(_AUTHORITY_ERROR)
++    return normalized
++
++
++def _resolve_destination(revision: str) -> tuple[str, ...]:
++    if not isinstance(revision, str) or not revision:
++        raise RuntimeError(_AUTHORITY_ERROR)
++    resolved = _script().as_revision_number(revision)
++    return _normalize_revisions(resolved)
+@@ -133,0 +149,67 @@ def _rollback_inspection(connection: Connection) -> None:
++def _exact(authority: object) -> MigrationAuthority:
++    if type(authority) is not _AUTHORITY_TYPE:
++        _refuse(authority)
++    return authority
++
++
++def _validate_maintenance_binding(
++    authority: MigrationAuthority,
++    connection: Connection,
++) -> None:
++    guard = _read(authority, "_guard")
++    barrier = _read(authority, "_barrier")
++    handle = guard.handle if type(guard) is RuntimeTenureGuard else None
++    service = (
++        handle._service
++        if type(handle) is RuntimeTenureHandle
++        else None
++    )
++    session_factory = getattr(service, "_session_factory", None)
++    session_bind = getattr(session_factory, "kw", {}).get("bind")
++    if (
++        type(guard) is not RuntimeTenureGuard
++        or type(barrier) is not RuntimeMutationBarrier
++        or barrier.guard is not guard
++        or barrier.engine is not connection.engine
++        or barrier._closed
++        or type(handle) is not RuntimeTenureHandle
++        or type(service) is not RuntimeTenureService
++        or session_bind is not connection.engine
++        or handle.role != "maintenance"
++        or handle.resource_key != _MAINTENANCE_RESOURCE
++    ):
++        _refuse(authority)
++    try:
++        RuntimeTenureGuard.assert_owned_in_transaction(
++            guard,
++            connection,
++        )
++    except BaseException:
++        _consume(authority)
++        raise
++
++
++def _assert_active(
++    authority: object,
++    connection: Connection,
++    *,
++    allowed_modes: frozenset[MigrationAuthorityMode] | None = None,
++) -> MigrationAuthority:
++    exact = _exact(authority)
++    if (
++        _read(exact, "_seal") is not _SEAL
++        or _read(exact, "_connection") is not connection
++        or not _read(exact, "_activated")
++        or _read(exact, "_completed")
++        or _read(exact, "_retired")
++        or (
++            allowed_modes is not None
++            and _read(exact, "_mode") not in allowed_modes
++        )
++    ):
++        _refuse(exact)
++    if _read(exact, "_mode") == "maintenance":
++        _validate_maintenance_binding(exact, connection)
++    return exact
++
++
+@@ -137 +219 @@ def issue_bootstrap_authority(
+-    """Issue for a currently empty DB; activation re-proves emptiness."""
++    """Issue an upgrade-to-current-head token for a currently empty DB."""
+@@ -143 +225,7 @@ def issue_bootstrap_authority(
+-    return MigrationAuthority(_SEAL, connection, "bootstrap")
++    return _AUTHORITY_TYPE(
++        _SEAL,
++        connection,
++        "bootstrap",
++        operation="upgrade",
++        destination_revisions=_head_revisions(),
++    )
+@@ -152 +240,19 @@ def issue_maintenance_authority(
+-    """Issue only from a real held lease and its installed SQL fence."""
++    """Issue an upgrade-to-current-head token from a held maintenance lease."""
++
++    return _issue_maintenance_authority(
++        connection,
++        operation="upgrade",
++        destination_revisions=_head_revisions(),
++        guard=guard,
++        barrier=barrier,
++    )
++
++
++def issue_maintenance_downgrade_authority(
++    connection: Connection,
++    destination_revision: str,
++    *,
++    guard: RuntimeTenureGuard | None = None,
++    barrier: RuntimeMutationBarrier | None = None,
++) -> MigrationAuthority:
++    """Issue an exact-destination downgrade token for reviewed tooling."""
+@@ -153,0 +260,17 @@ def issue_maintenance_authority(
++    return _issue_maintenance_authority(
++        connection,
++        operation="downgrade",
++        destination_revisions=_resolve_destination(destination_revision),
++        guard=guard,
++        barrier=barrier,
++    )
++
++
++def _issue_maintenance_authority(
++    connection: Connection,
++    *,
++    operation: MigrationOperation,
++    destination_revisions: tuple[str, ...],
++    guard: RuntimeTenureGuard | None,
++    barrier: RuntimeMutationBarrier | None,
++) -> MigrationAuthority:
+@@ -155,2 +278,2 @@ def issue_maintenance_authority(
+-        raise RuntimeError("schema_migration_authority_required")
+-    authority = MigrationAuthority(
++        raise RuntimeError(_AUTHORITY_ERROR)
++    authority = _AUTHORITY_TYPE(
+@@ -159,0 +283,2 @@ def issue_maintenance_authority(
++        operation=operation,
++        destination_revisions=destination_revisions,
+@@ -164 +289,4 @@ def issue_maintenance_authority(
+-        authority._validate_maintenance_binding(connection)
++        _validate_maintenance_binding(authority, connection)
++    except BaseException:
++        _consume(authority)
++        raise
+@@ -172,0 +301,2 @@ def activate_migration_authority(
++    *,
++    destination_revisions: object,
+@@ -174 +304 @@ def activate_migration_authority(
+-    """Consume one authority and validate it before Alembic can run."""
++    """Consume and validate one token before Alembic can configure DDL."""
+@@ -175,0 +306 @@ def activate_migration_authority(
++    exact = _exact(authority)
+@@ -177,4 +308,4 @@ def activate_migration_authority(
+-        not isinstance(authority, MigrationAuthority)
+-        or authority._seal is not _SEAL
+-        or authority._activated
+-        or authority._retired
++        _read(exact, "_seal") is not _SEAL
++        or _read(exact, "_activated")
++        or _read(exact, "_completed")
++        or _read(exact, "_retired")
+@@ -182,8 +313,15 @@ def activate_migration_authority(
+-        raise RuntimeError("schema_migration_authority_required")
+-    # Any activation attempt consumes the token, including wrong-connection
+-    # misuse or failed bootstrap/lease validation.
+-    authority._activated = True
+-    if authority._connection is not connection:
+-        authority._retired = True
+-        raise RuntimeError("schema_migration_authority_required")
+-    if authority._mode == "bootstrap":
++        _refuse(exact)
++    _write(exact, "_activated", True)
++    try:
++        actual_destination = _normalize_revisions(
++            destination_revisions
++        )
++    except BaseException:
++        _refuse(exact)
++    if (
++        _read(exact, "_connection") is not connection
++        or actual_destination != _read(exact, "_destination_revisions")
++    ):
++        _refuse(exact)
++
++    if _read(exact, "_mode") == "bootstrap":
+@@ -193 +331 @@ def activate_migration_authority(
+-            authority._retired = True
++            _consume(exact)
+@@ -197,4 +335 @@ def activate_migration_authority(
+-            authority._validate_maintenance_binding(connection)
+-        except BaseException:
+-            authority._retired = True
+-            raise
++            _validate_maintenance_binding(exact, connection)
+@@ -203 +338,5 @@ def activate_migration_authority(
+-    return authority._mode
++
++    current = MigrationContext.configure(connection).get_current_heads()
++    _write(exact, "_start_revisions", _normalize_revisions(current))
++    _rollback_inspection(connection)
++    return _read(exact, "_mode")
+@@ -212 +351,7 @@ def assert_migration_authority(
+-    """Validate active authority and exact durable ownership at DDL time."""
++    """Re-prove exact authority and durable ownership at DDL boundaries."""
++
++    return _assert_active(
++        authority,
++        connection,
++        allowed_modes=allowed_modes,
++    )
+@@ -213,0 +359,77 @@ def assert_migration_authority(
++
++@contextmanager
++def migration_schema_fence(
++    authority: object,
++    connection: Connection,
++) -> Iterator[None]:
++    """Narrowly permit rebuilding the table that stores the lease."""
++
++    exact = _assert_active(authority, connection)
++    if _read(exact, "_mode") == "bootstrap":
++        try:
++            yield
++        except BaseException:
++            _consume(exact)
++            raise
++        _assert_active(exact, connection)
++        return
++    barrier = _read(exact, "_barrier")
++    if type(barrier) is not RuntimeMutationBarrier:
++        _refuse(exact)
++    option_name, option_value = (
++        RuntimeMutationBarrier.fence_schema_execution_option.fget(barrier)
++    )
++    connection.execution_options(**{option_name: option_value})
++    try:
++        yield
++    except BaseException:
++        _consume(exact)
++        raise
++    finally:
++        try:
++            connection.execution_options(**{option_name: None})
++        except BaseException:
++            _consume(exact)
++            raise
++    _assert_active(exact, connection)
++
++
++def observe_migration_step(
++    authority: object,
++    connection: Connection,
++    *,
++    step: object,
++    heads: object,
++) -> None:
++    """Accept only real migration steps in the token's bound direction."""
++
++    exact = _assert_active(authority, connection)
++    if type(step) is not MigrationInfo:
++        _refuse(exact)
++    expected_upgrade = _read(exact, "_operation") == "upgrade"
++    if step.is_stamp or step.is_upgrade is not expected_upgrade:
++        _refuse(exact)
++    observed_heads = _normalize_revisions(heads)
++    if observed_heads != _normalize_revisions(step.destination_revision_ids):
++        _refuse(exact)
++    count = _read(exact, "_observed_steps")
++    previous_heads = (
++        _read(exact, "_start_revisions")
++        if count == 0
++        else _read(exact, "_observed_heads")
++    )
++    if _normalize_revisions(step.source_revision_ids) != previous_heads:
++        _refuse(exact)
++    _write(exact, "_observed_heads", observed_heads)
++    _write(exact, "_observed_steps", count + 1)
++    _assert_active(exact, connection)
++
++
++def finish_migration_authority(
++    authority: object,
++    connection: Connection,
++) -> None:
++    """Prove a non-empty real migration ended at the bound destination."""
++
++    exact = _assert_active(authority, connection)
++    expected = _read(exact, "_destination_revisions")
+@@ -215,6 +437,2 @@ def assert_migration_authority(
+-        not isinstance(authority, MigrationAuthority)
+-        or authority._seal is not _SEAL
+-        or authority._connection is not connection
+-        or not authority._activated
+-        or authority._retired
+-        or authority._mode not in allowed_modes
++        _read(exact, "_observed_steps") <= 0
++        or _read(exact, "_observed_heads") != expected
+@@ -222,3 +440,8 @@ def assert_migration_authority(
+-        raise RuntimeError("schema_migration_authority_required")
+-    authority.assert_owned(connection)
+-    return authority
++        _refuse(exact)
++    actual = _normalize_revisions(
++        MigrationContext.configure(connection).get_current_heads()
++    )
++    if actual != expected:
++        _refuse(exact)
++    _assert_active(exact, connection)
++    _write(exact, "_completed", True)
+@@ -230,2 +453 @@ def retire_migration_authority(authority: object) -> None:
+-    if isinstance(authority, MigrationAuthority):
+-        authority._retired = True
++    _consume(authority)
+diff --git a/src/trading_assistant/ops/backup.py b/src/trading_assistant/ops/backup.py
+index faa2787..68bcc0e 100644
+--- a/src/trading_assistant/ops/backup.py
++++ b/src/trading_assistant/ops/backup.py
+@@ -13,0 +14 @@ import sqlite3
++import stat
+@@ -47,0 +49,5 @@ _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
++_COMMITTED_NAME = re.compile(
++    r"^\d{8}T\d{12}Z-"
++    r"(before-sensitive-v1|whole-database-v1)"
++    r"\.sqlite3\.aesgcm$"
++)
+@@ -156,0 +163,93 @@ def _unlink_private_temp(path: Path | None) -> None:
++def _pending_anchor(path: Path) -> Path:
++    return path.with_name(f".{path.name}.pending")
++
++
++def _is_committed_artifact(path: Path) -> bool:
++    if _COMMITTED_NAME.fullmatch(path.name) is None:
++        return False
++    anchor = _pending_anchor(path)
++    try:
++        artifact_stat = path.lstat()
++        anchor_stat = anchor.lstat()
++    except OSError:
++        return False
++    return (
++        stat.S_ISREG(artifact_stat.st_mode)
++        and stat.S_ISREG(anchor_stat.st_mode)
++        and artifact_stat.st_dev == anchor_stat.st_dev
++        and artifact_stat.st_ino == anchor_stat.st_ino
++    )
++
++
++def _open_committed_artifact(path: Path):
++    if _COMMITTED_NAME.fullmatch(path.name) is None:
++        raise EncryptedBackupError("encrypted_backup_not_committed")
++    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
++    descriptor: int | None = None
++    try:
++        descriptor = os.open(path, flags)
++        artifact_stat = os.fstat(descriptor)
++        anchor_stat = _pending_anchor(path).lstat()
++        if not (
++            stat.S_ISREG(artifact_stat.st_mode)
++            and stat.S_ISREG(anchor_stat.st_mode)
++            and artifact_stat.st_dev == anchor_stat.st_dev
++            and artifact_stat.st_ino == anchor_stat.st_ino
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_not_committed"
++            )
++        handle = os.fdopen(descriptor, "rb")
++        descriptor = None
++        return handle
++    except EncryptedBackupError:
++        raise
++    except OSError:
++        raise EncryptedBackupError(
++            "encrypted_backup_not_committed"
++        ) from None
++    finally:
++        if descriptor is not None:
++            os.close(descriptor)
++
++
++def list_committed_backups(
++    destination_dir: str | Path,
++    *,
++    artifact_label: Literal[
++        "before-sensitive-v1",
++        "whole-database-v1",
++    ]
++    | None = None,
++) -> tuple[Path, ...]:
++    """List only artifacts that crossed the atomic commit boundary."""
++
++    directory = Path(destination_dir).expanduser()
++    if not directory.exists():
++        return ()
++    if (
++        not directory.is_dir()
++        or directory.is_symlink()
++        or artifact_label
++        not in {
++            None,
++            "before-sensitive-v1",
++            "whole-database-v1",
++        }
++    ):
++        raise EncryptedBackupError("backup_directory_invalid")
++    suffix = (
++        None
++        if artifact_label is None
++        else f"-{artifact_label}.sqlite3.aesgcm"
++    )
++    return tuple(
++        sorted(
++            candidate
++            for candidate in directory.iterdir()
++            if (suffix is None or candidate.name.endswith(suffix))
++            and _is_committed_artifact(candidate)
++        )
++    )
++
++
+@@ -243,0 +343 @@ def read_encrypted_backup_header(path: str | Path) -> dict[str, object]:
++    artifact = Path(path)
+@@ -245 +345 @@ def read_encrypted_backup_header(path: str | Path) -> dict[str, object]:
+-        with Path(path).open("rb") as handle:
++        with _open_committed_artifact(artifact) as handle:
+@@ -266,0 +367 @@ def create_encrypted_database_backup(
++    before_commit: Callable[[], None] | None = None,
+@@ -323,2 +424,3 @@ def create_encrypted_database_backup(
+-    published = False
+-    succeeded = False
++    anchor: Path | None = None
++    anchor_created = False
++    committed = False
+@@ -495,0 +598 @@ def create_encrypted_database_backup(
++        maintain()
+@@ -499 +602,16 @@ def create_encrypted_database_backup(
+-        maintain()
++        anchor = _pending_anchor(target)
++        if (
++            target.exists()
++            or target.is_symlink()
++            or anchor.exists()
++            or anchor.is_symlink()
++        ):
++            raise EncryptedBackupError("encrypted_backup_exists")
++
++        # Every cleanup-prone operation happens while the artifact is still
++        # private. The encrypted anchor intentionally remains after success;
++        # the final hard link is the single public commit point.
++        _unlink_private_temp(snapshot)
++        snapshot = None
++        _unlink_private_temp(verification)
++        verification = None
+@@ -501 +619 @@ def create_encrypted_database_backup(
+-            os.link(encrypted_temp, target, follow_symlinks=False)
++            os.link(encrypted_temp, anchor, follow_symlinks=False)
+@@ -504,4 +622 @@ def create_encrypted_database_backup(
+-        published = True
+-        _fsync_directory(directory)
+-        hook("artifact_published")
+-        maintain()
++        anchor_created = True
+@@ -511,2 +626,5 @@ def create_encrypted_database_backup(
+-        succeeded = True
+-        return EncryptedBackupReceipt(
++        hook("before_artifact_commit")
++        maintain()
++        if before_commit is not None:
++            invoke(before_commit)
++        receipt = EncryptedBackupReceipt(
+@@ -522,0 +641,6 @@ def create_encrypted_database_backup(
++        try:
++            os.link(anchor, target, follow_symlinks=False)
++        except FileExistsError:
++            raise EncryptedBackupError("encrypted_backup_exists") from None
++        committed = True
++        return receipt
+@@ -523,0 +648,13 @@ def create_encrypted_database_backup(
++        cleanup_failure: BaseException | None = None
++        if not committed:
++            for private_path in (
++                snapshot,
++                encrypted_temp,
++                verification,
++                anchor if anchor_created else None,
++            ):
++                try:
++                    _unlink_private_temp(private_path)
++                except BaseException as cleanup_exc:
++                    if cleanup_failure is None:
++                        cleanup_failure = cleanup_exc
+@@ -525,17 +662,42 @@ def create_encrypted_database_backup(
+-            raise exc.cause
+-        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+-            raise
+-        if isinstance(exc, EncryptedBackupError):
+-            raise
+-        raise EncryptedBackupError("encrypted_backup_failed") from None
+-    finally:
+-        _unlink_private_temp(snapshot)
+-        _unlink_private_temp(encrypted_temp)
+-        _unlink_private_temp(verification)
+-        if published and not succeeded and target is not None:
+-            try:
+-                target.unlink(missing_ok=True)
+-                if directory is not None:
+-                    _fsync_directory(directory)
+-            except OSError:
+-                pass
++            failure = exc.cause
++        elif isinstance(
++            exc,
++            (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
++        ):
++            failure = exc
++        elif isinstance(exc, EncryptedBackupError):
++            failure = exc
++        else:
++            failure = EncryptedBackupError("encrypted_backup_failed")
++        if cleanup_failure is not None:
++            raise failure from cleanup_failure
++        raise failure from None
++
++
++def _prune_committed_backups(
++    destination_dir: str | Path,
++    *,
++    artifact_label: Literal[
++        "before-sensitive-v1",
++        "whole-database-v1",
++    ],
++    cutoff: float,
++) -> None:
++    destination = Path(destination_dir).expanduser()
++    if not destination.exists():
++        return
++    removed = False
++    for candidate in list_committed_backups(
++        destination,
++        artifact_label=artifact_label,
++    ):
++        if candidate.stat().st_mtime >= cutoff:
++            continue
++        # Removing the anchor first atomically makes the public name
++        # uncommitted even if the second unlink is interrupted.
++        _pending_anchor(candidate).unlink()
++        _fsync_directory(destination.resolve(strict=True))
++        candidate.unlink()
++        removed = True
++    if removed:
++        _fsync_directory(destination.resolve(strict=True))
+@@ -593,0 +756,13 @@ def backup_database(
++    released = False
++    disposed = False
++
++    def release_before_commit() -> None:
++        nonlocal released, disposed
++        if not guard.close():
++            raise EncryptedBackupError(
++                "backup_tenure_release_uncertain"
++            )
++        released = True
++        engine.dispose()
++        disposed = True
++
+@@ -594,0 +770,5 @@ def backup_database(
++        _prune_committed_backups(
++            destination_dir,
++            artifact_label="whole-database-v1",
++            cutoff=time.time() - retention_days * 86400,
++        )
+@@ -603,0 +784 @@ def backup_database(
++            before_commit=release_before_commit,
+@@ -609,21 +790,8 @@ def backup_database(
+-        released = guard.close()
+-        engine.dispose()
+-        if not released and not primary_failure:
+-            raise EncryptedBackupError(
+-                "backup_tenure_release_uncertain"
+-            )
+-
+-    destination = Path(destination_dir).expanduser().resolve(strict=True)
+-    cutoff = time.time() - retention_days * 86400
+-    removed = False
+-    for candidate in destination.glob(
+-        "*-whole-database-v1.sqlite3.aesgcm"
+-    ):
+-        if (
+-            candidate != receipt.path
+-            and candidate.stat().st_mtime < cutoff
+-        ):
+-            candidate.unlink()
+-            removed = True
+-    if removed:
+-        _fsync_directory(destination)
++        if not released and not guard.closed:
++            close_result = guard.close()
++            if not close_result and not primary_failure:
++                raise EncryptedBackupError(
++                    "backup_tenure_release_uncertain"
++                )
++        if not disposed:
++            engine.dispose()
+diff --git a/tests/safety_helpers.py b/tests/safety_helpers.py
+index df457d4..b39df21 100644
+--- a/tests/safety_helpers.py
++++ b/tests/safety_helpers.py
+@@ -6,0 +7 @@ import signal
++from unittest.mock import patch
+@@ -9,0 +11,2 @@ from alembic.config import Config
++from alembic.script import ScriptDirectory
++from sqlalchemy import inspect
+@@ -12,0 +16 @@ from sqlalchemy.pool import NullPool
++from trading_assistant.db import migration_authority as authority_module
+@@ -43,0 +48,75 @@ def operation_deadline(seconds: float):
++class _HistoricalBootstrapAuthority:
++    """Test-only authority for constructing a pre-head migration fixture."""
++
++    def __init__(self, connection, destination: str):
++        self.connection = connection
++        self.destination = destination
++        self.activated = False
++        self.observed = False
++        self.retired = False
++
++
++def _activate_historical(
++    authority,
++    connection,
++    *,
++    destination_revisions,
++):
++    normalized = (
++        destination_revisions
++        if isinstance(destination_revisions, str)
++        else tuple(destination_revisions or ())
++    )
++    if (
++        type(authority) is not _HistoricalBootstrapAuthority
++        or authority.connection is not connection
++        or authority.destination != normalized
++        or authority.activated
++        or authority.retired
++        or inspect(connection).get_table_names()
++    ):
++        if type(authority) is _HistoricalBootstrapAuthority:
++            authority.retired = True
++        raise RuntimeError("schema_migration_authority_required")
++    if connection.in_transaction():
++        connection.rollback()
++    authority.activated = True
++    return "bootstrap"
++
++
++def _observe_historical(
++    authority,
++    connection,
++    *,
++    step,
++    heads,
++):
++    del heads
++    if (
++        type(authority) is not _HistoricalBootstrapAuthority
++        or authority.connection is not connection
++        or not authority.activated
++        or authority.retired
++        or step.is_stamp
++        or not step.is_upgrade
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++    authority.observed = True
++
++
++def _finish_historical(authority, connection):
++    if (
++        type(authority) is not _HistoricalBootstrapAuthority
++        or authority.connection is not connection
++        or not authority.activated
++        or not authority.observed
++        or authority.retired
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++
++
++def _retire_historical(authority):
++    if type(authority) is _HistoricalBootstrapAuthority:
++        authority.retired = True
++
++
+@@ -63,4 +142,41 @@ def bootstrap_database_to_revision(
+-            config.attributes["migration_authority"] = (
+-                issue_bootstrap_authority(connection)
+-            )
+-            command.upgrade(config, revision)
++            head = ScriptDirectory.from_config(
++                config
++            ).get_current_head()
++            if revision == "head" or revision == head:
++                config.attributes["migration_authority"] = (
++                    issue_bootstrap_authority(connection)
++                )
++                command.upgrade(config, revision)
++            else:
++                destination = ScriptDirectory.from_config(
++                    config
++                ).as_revision_number(revision)
++                config.attributes["migration_authority"] = (
++                    _HistoricalBootstrapAuthority(
++                        connection,
++                        destination,
++                    )
++                )
++                with (
++                    patch.object(
++                        authority_module,
++                        "activate_migration_authority",
++                        _activate_historical,
++                    ),
++                    patch.object(
++                        authority_module,
++                        "observe_migration_step",
++                        _observe_historical,
++                    ),
++                    patch.object(
++                        authority_module,
++                        "finish_migration_authority",
++                        _finish_historical,
++                    ),
++                    patch.object(
++                        authority_module,
++                        "retire_migration_authority",
++                        _retire_historical,
++                    ),
++                ):
++                    command.upgrade(config, revision)
+diff --git a/tests/test_migrations.py b/tests/test_migrations.py
+index 937b649..e8f42c1 100644
+--- a/tests/test_migrations.py
++++ b/tests/test_migrations.py
+@@ -33,0 +34 @@ from trading_assistant.db.migration_authority import (
++    issue_maintenance_downgrade_authority,
+@@ -58,0 +60 @@ from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
++from tests.safety_helpers import bootstrap_database_to_revision
+@@ -81 +83,7 @@ def _url(path: Path) -> str:
+-def _held_migration_authority(engine, connection, *, pid: int):
++def _held_migration_authority(
++    engine,
++    connection,
++    *,
++    pid: int,
++    downgrade_to: str | None = None,
++):
+@@ -98,5 +106,15 @@ def _held_migration_authority(engine, connection, *, pid: int):
+-        yield issue_maintenance_authority(
+-            connection,
+-            guard=guard,
+-            barrier=barrier,
+-        ), guard
++        issuer = (
++            issue_maintenance_authority(
++                connection,
++                guard=guard,
++                barrier=barrier,
++            )
++            if downgrade_to is None
++            else issue_maintenance_downgrade_authority(
++                connection,
++                downgrade_to,
++                guard=guard,
++                barrier=barrier,
++            )
++        )
++        yield issuer, guard
+@@ -112 +130 @@ class _AuthorizedTestAlembic:
+-        def __init__(self, connection):
++        def __init__(self, connection, operation, destination):
+@@ -113,0 +132,2 @@ class _AuthorizedTestAlembic:
++            self.operation = operation
++            self.destination = destination
+@@ -114,0 +135 @@ class _AuthorizedTestAlembic:
++            self.observed = False
+@@ -117,14 +137,0 @@ class _AuthorizedTestAlembic:
+-        def assert_owned(self, connection) -> None:
+-            if (
+-                self.retired
+-                or not self.activated
+-                or self.connection is not connection
+-            ):
+-                raise RuntimeError("schema_migration_authority_required")
+-
+-        @contextmanager
+-        def schema_fence(self, connection):
+-            self.assert_owned(connection)
+-            yield
+-            self.assert_owned(connection)
+-
+@@ -132 +139,11 @@ class _AuthorizedTestAlembic:
+-    def _activate_historical(authority, connection):
++    def _activate_historical(
++        authority,
++        connection,
++        *,
++        destination_revisions,
++    ):
++        destination = (
++            destination_revisions
++            if isinstance(destination_revisions, str)
++            else tuple(destination_revisions or ())
++        )
+@@ -136,0 +154 @@ class _AuthorizedTestAlembic:
++            or authority.destination != destination
+@@ -151 +169,8 @@ class _AuthorizedTestAlembic:
+-        if "maintenance" not in allowed_modes:
++        del allowed_modes
++        if (
++            type(authority)
++            is not _AuthorizedTestAlembic._HistoricalAuthority
++            or authority.connection is not connection
++            or not authority.activated
++            or authority.retired
++        ):
+@@ -153 +177,0 @@ class _AuthorizedTestAlembic:
+-        authority.assert_owned(connection)
+@@ -157 +181,42 @@ class _AuthorizedTestAlembic:
+-    def _retire_historical(authority) -> None:
++    @contextmanager
++    def _schema_fence_historical(authority, connection):
++        if (
++            type(authority)
++            is not _AuthorizedTestAlembic._HistoricalAuthority
++            or authority.connection is not connection
++            or not authority.activated
++            or authority.retired
++        ):
++            raise RuntimeError("schema_migration_authority_required")
++        yield
++
++    @staticmethod
++    def _observe_historical(
++        authority,
++        connection,
++        *,
++        step,
++        heads,
++    ):
++        del heads
++        if (
++            type(authority)
++            is not _AuthorizedTestAlembic._HistoricalAuthority
++            or authority.connection is not connection
++            or not authority.activated
++            or authority.retired
++            or step.is_stamp != (authority.operation == "stamp")
++            or (
++                authority.operation == "upgrade"
++                and not step.is_upgrade
++            )
++            or (
++                authority.operation == "downgrade"
++                and step.is_upgrade
++            )
++        ):
++            raise RuntimeError("schema_migration_authority_required")
++        authority.observed = True
++
++    @staticmethod
++    def _finish_historical(authority, connection):
+@@ -160 +225,4 @@ class _AuthorizedTestAlembic:
+-            is _AuthorizedTestAlembic._HistoricalAuthority
++            is not _AuthorizedTestAlembic._HistoricalAuthority
++            or authority.connection is not connection
++            or not authority.activated
++            or authority.retired
+@@ -161,0 +230,5 @@ class _AuthorizedTestAlembic:
++            raise RuntimeError("schema_migration_authority_required")
++
++    @staticmethod
++    def _retire_historical(authority) -> None:
++        if type(authority) is _AuthorizedTestAlembic._HistoricalAuthority:
+@@ -180,4 +252,0 @@ class _AuthorizedTestAlembic:
+-                cfg.attributes["connection"] = connection
+-                has_tables = bool(
+-                    inspect(connection).get_table_names()
+-                )
+@@ -186,10 +255,17 @@ class _AuthorizedTestAlembic:
+-                if has_tables:
+-                    # Historical migration tests need to exercise old
+-                    # revisions whose schemas predate durable tenures. The
+-                    # production wrapper intentionally refuses that path.
+-                    # Keep this capability wholly inside the test process:
+-                    # no production flag, constructor, or Config assertion
+-                    # can mint it.
+-                    authority = cls._HistoricalAuthority(connection)
+-                else:
+-                    authority = issue_bootstrap_authority(connection)
++                cfg.attributes["connection"] = connection
++                operation_name = {
++                    _RAW_ALEMBIC_UPGRADE: "upgrade",
++                    _RAW_ALEMBIC_DOWNGRADE: "downgrade",
++                    _RAW_ALEMBIC_STAMP: "stamp",
++                }[operation]
++                destination = ScriptDirectory.from_config(
++                    cfg
++                ).as_revision_number(args[0])
++                # Historical tests intentionally build old schemas. This
++                # capability exists only through process-local monkeypatches;
++                # production exposes no Boolean or Config escape hatch.
++                authority = cls._HistoricalAuthority(
++                    connection,
++                    operation_name,
++                    destination,
++                )
+@@ -197,2 +272,0 @@ class _AuthorizedTestAlembic:
+-                if not has_tables:
+-                    return operation(cfg, *args, **kwargs)
+@@ -214,0 +289,10 @@ class _AuthorizedTestAlembic:
++                    patch.object(
++                        authority_module,
++                        "observe_migration_step",
++                        cls._observe_historical,
++                    ),
++                    patch.object(
++                        authority_module,
++                        "finish_migration_authority",
++                        cls._finish_historical,
++                    ),
+@@ -219,0 +304,5 @@ class _AuthorizedTestAlembic:
++                    patch.object(
++                        authority_module,
++                        "migration_schema_fence",
++                        cls._schema_fence_historical,
++                    ),
+@@ -224,0 +314,5 @@ class _AuthorizedTestAlembic:
++                    patch.object(
++                        revision_module,
++                        "migration_schema_fence",
++                        cls._schema_fence_historical,
++                    ),
+@@ -260,0 +355 @@ def _legacy_engine(path: Path):
++    bootstrap_database_to_revision(_url(path), "20260724_0001")
+@@ -262,8 +356,0 @@ def _legacy_engine(path: Path):
+-    cfg = Config("alembic.ini")
+-    cfg.set_main_option("sqlalchemy.url", _url(path))
+-    with engine.connect() as connection:
+-        cfg.attributes["connection"] = connection
+-        cfg.attributes["migration_authority"] = (
+-            issue_bootstrap_authority(connection)
+-        )
+-        _RAW_ALEMBIC_UPGRADE(cfg, "20260724_0001")
+@@ -275,0 +363 @@ def _engine_at_revision(path: Path, revision: str):
++    bootstrap_database_to_revision(_url(path), revision)
+@@ -277,8 +364,0 @@ def _engine_at_revision(path: Path, revision: str):
+-    cfg = Config("alembic.ini")
+-    cfg.set_main_option("sqlalchemy.url", _url(path))
+-    with engine.connect() as connection:
+-        cfg.attributes["connection"] = connection
+-        cfg.attributes["migration_authority"] = (
+-            issue_bootstrap_authority(connection)
+-        )
+-        _RAW_ALEMBIC_UPGRADE(cfg, revision)
+@@ -1239,0 +1320 @@ def test_held_maintenance_authority_supports_fenced_downgrade(
++            downgrade_to="20260727_0014",
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+index 4930a1b..ad72998 100644
+--- a/tests/test_ops.py
++++ b/tests/test_ops.py
+@@ -28,0 +29 @@ from trading_assistant.ops.backup import (
++    EncryptedBackupError,
+@@ -29,0 +31 @@ from trading_assistant.ops.backup import (
++    list_committed_backups,
+@@ -36,0 +39 @@ from trading_assistant.ops.tenure import (
++    RuntimeTenureGuard,
+@@ -120 +123,2 @@ def test_operational_backup_is_encrypted_for_every_migration_state(
+-    assert not any(path.name.startswith(".") for path in destination.iterdir())
++    assert list_committed_backups(destination) == (artifact,)
++    assert (destination / f".{artifact.name}.pending").samefile(artifact)
+@@ -162 +166 @@ def test_large_operational_backup_completes_without_source_renewal_livelock(
+-    assert not any(path.name.startswith(".") for path in destination.iterdir())
++    assert list_committed_backups(destination) == (receipt.path,)
+@@ -173,0 +178,2 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
++    old_anchor = destination / f".{old_match.name}.pending"
++    os.link(old_match, old_anchor)
+@@ -191,0 +198 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
++    assert not old_anchor.exists()
+@@ -223,0 +231,36 @@ def test_operational_backup_requires_exclusive_maintenance_tenure(tmp_path):
++def test_operational_backup_release_uncertainty_never_commits_artifact(
++    tmp_path,
++    monkeypatch,
++):
++    source = _operational_database(tmp_path, "required")
++    destination = tmp_path / "release-uncertain-backups"
++    original_close = RuntimeTenureGuard.close
++
++    def close_but_lose_confirmation(guard):
++        assert original_close(guard) is True
++        return False
++
++    monkeypatch.setattr(
++        RuntimeTenureGuard,
++        "close",
++        close_but_lose_confirmation,
++    )
++
++    with pytest.raises(
++        EncryptedBackupError,
++        match="^backup_tenure_release_uncertain$",
++    ):
++        backup_database(
++            source,
++            destination,
++            retention_days=14,
++            backup_key=BACKUP_KEY,
++            backup_key_id=BACKUP_KEY_ID,
++            process_identity=BACKUP_IDENTITY,
++            process_inspector=_OfflineInspector(),
++        )
++
++    assert list_committed_backups(destination) == ()
++    assert not tuple(destination.glob("*.aesgcm"))
++
++
+diff --git a/tests/test_sensitive_migration.py b/tests/test_sensitive_migration.py
+index 52752dc..aa1cdfd 100644
+--- a/tests/test_sensitive_migration.py
++++ b/tests/test_sensitive_migration.py
+@@ -43,0 +44 @@ from trading_assistant.ops.backup import (
++    list_committed_backups,
+@@ -299 +300,4 @@ def test_encrypted_backup_is_verified_private_and_contains_no_sqlite_markers(
+-    assert list(destination.iterdir()) == [artifact]
++    assert list_committed_backups(destination) == (artifact,)
++    pending = destination / f".{artifact.name}.pending"
++    assert pending.exists()
++    assert pending.samefile(artifact)
+@@ -342 +346 @@ def test_backup_final_path_is_absent_until_private_verification_completes(
+-        "artifact_published"
++        "before_artifact_commit"
+@@ -344 +348 @@ def test_backup_final_path_is_absent_until_private_verification_completes(
+-    assert tuple(destination.iterdir()) == (receipt.path,)
++    assert list_committed_backups(destination) == (receipt.path,)
+@@ -558 +562 @@ def test_backup_refuses_overwrite_and_preserves_first_artifact(tmp_path):
+-    assert list(destination.iterdir()) == [first.path]
++    assert list_committed_backups(destination) == (first.path,)
+@@ -569 +573 @@ def test_backup_refuses_overwrite_and_preserves_first_artifact(tmp_path):
+-        "artifact_published",
++        "before_artifact_commit",
+@@ -604 +608 @@ def test_backup_cancellation_removes_plaintext_and_unpublished_artifact(
+-        if stage == "artifact_published":
++        if stage == "before_artifact_commit":
+diff --git a/tests/test_submission_barrier.py b/tests/test_submission_barrier.py
+index d2d3bda..fce61c7 100644
+--- a/tests/test_submission_barrier.py
++++ b/tests/test_submission_barrier.py
+@@ -1034,0 +1035,2 @@ def _counted_submission_process(
++    process_ready,
++    begin_submission,
+@@ -1074,0 +1077,3 @@ def _counted_submission_process(
++        process_ready.set()
++        if not begin_submission.wait(timeout=10):
++            raise TimeoutError("test did not start counted submission")
+@@ -1454,0 +1460,32 @@ def _join(process, *release_events) -> None:
++def _wait_for_process_checkpoints(
++    processes,
++    checkpoints,
++    *,
++    phase,
++) -> None:
++    """Wait for exact child state, using time only as a deadlock watchdog."""
++    pending = set(range(len(checkpoints)))
++    deadline = time.monotonic() + 10
++    while pending:
++        for index in tuple(pending):
++            if checkpoints[index].is_set():
++                pending.remove(index)
++                continue
++            exitcode = processes[index].exitcode
++            if exitcode is not None:
++                processes[index].join()
++                pytest.fail(
++                    f"{processes[index].name} exited with {exitcode} "
++                    f"before {phase}"
++                )
++        if not pending:
++            return
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            waiting = ", ".join(
++                processes[index].name for index in sorted(pending)
++            )
++            pytest.fail(f"timed out waiting for {phase}: {waiting}")
++        checkpoints[next(iter(pending))].wait(timeout=min(0.05, remaining))
++
++
+@@ -2824,0 +2862,2 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++    process_ready = []
++    begin_submissions = []
+@@ -2830,0 +2870,2 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++        ready = context.Event()
++        begin_submission = context.Event()
+@@ -2841,0 +2883,2 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++                ready,
++                begin_submission,
+@@ -2848,0 +2892,2 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++        process_ready.append(ready)
++        begin_submissions.append(begin_submission)
+@@ -2852,0 +2898 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++    begin_submissions[0].set()
+@@ -2857,3 +2902,0 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
+-    followers_reached_main = [
+-        event.wait(timeout=2) for event in main_attempts[1:]
+-    ]
+@@ -2860,0 +2904,12 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++        _wait_for_process_checkpoints(
++            processes[1:],
++            process_ready[1:],
++            phase="follower initialization",
++        )
++        for begin_submission in begin_submissions[1:]:
++            begin_submission.set()
++        _wait_for_process_checkpoints(
++            processes[1:],
++            main_attempts[1:],
++            phase="follower main-lock attempts",
++        )
+@@ -2862,0 +2918,2 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
++        for begin_submission in begin_submissions:
++            begin_submission.set()
+@@ -2866 +2922,0 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
+-    assert all(followers_reached_main)
+@@ -2887,0 +2944,2 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++    process_ready = []
++    begin_submissions = []
+@@ -2893,0 +2952,2 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++        ready = context.Event()
++        begin_submission = context.Event()
+@@ -2904,0 +2965,2 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++                ready,
++                begin_submission,
+@@ -2911,0 +2974,2 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++        process_ready.append(ready)
++        begin_submissions.append(begin_submission)
+@@ -2915,0 +2980 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++    begin_submissions[0].set()
+@@ -2920,3 +2985,12 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
+-    followers_reached_main = [
+-        event.wait(timeout=2) for event in main_attempts[1:]
+-    ]
++    _wait_for_process_checkpoints(
++        submissions[1:],
++        process_ready[1:],
++        phase="follower initialization",
++    )
++    for begin_submission in begin_submissions[1:]:
++        begin_submission.set()
++    _wait_for_process_checkpoints(
++        submissions[1:],
++        main_attempts[1:],
++        phase="follower main-lock attempts",
++    )
+@@ -2939,2 +3012,0 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
+-    assert writer_started.wait(timeout=10)
+-    writer_advertised_before_release = writer_intent_acquired.wait(timeout=2)
+@@ -2941,0 +3014,10 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++        _wait_for_process_checkpoints(
++            [writer],
++            [writer_started],
++            phase="writer initialization",
++        )
++        _wait_for_process_checkpoints(
++            [writer],
++            [writer_intent_acquired],
++            phase="writer intent acquisition",
++        )
+@@ -2943,0 +3026,2 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
++        for begin_submission in begin_submissions:
++            begin_submission.set()
+@@ -2948,2 +3031,0 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
+-    assert all(followers_reached_main)
+-    assert writer_advertised_before_release is True
+diff --git a/tests/test_task6_round4.py b/tests/test_task6_round4.py
+new file mode 100644
+index 0000000..a3edc96
+--- /dev/null
++++ b/tests/test_task6_round4.py
+@@ -0,0 +1,650 @@
++"""Round-4 regressions for migration authority and backup publication."""
++
++from __future__ import annotations
++
++from contextlib import contextmanager
++from datetime import datetime, timezone
++from pathlib import Path
++import sqlite3
++
++import pytest
++from alembic import command
++from alembic.config import Config
++from sqlalchemy import inspect, text
++
++from tests.safety_helpers import bootstrap_database_to_revision
++from trading_assistant.db import migration_authority as authority_module
++from trading_assistant.db.migration_authority import (
++    MigrationAuthority,
++    issue_bootstrap_authority,
++    issue_maintenance_authority,
++)
++from trading_assistant.db.schema import schema_status
++from trading_assistant.db.session import (
++    create_db_engine,
++    make_session_factory,
++)
++from trading_assistant.ops.tenure import (
++    ProcessIdentity,
++    ProcessProof,
++    RuntimeTenureGuard,
++    RuntimeTenureService,
++    install_runtime_mutation_barrier,
++)
++from trading_assistant.ops import backup as backup_module
++from trading_assistant.ops.backup import (
++    EncryptedBackupError,
++    create_encrypted_database_backup,
++    list_committed_backups,
++    read_encrypted_backup_header,
++)
++from trading_assistant.ops.tenure import TenureLost
++
++
++BACKUP_KEY = b"r" * 32
++BACKUP_KEY_ID = "round4-backup-key"
++BACKUP_NOW = datetime(
++    2026,
++    7,
++    28,
++    12,
++    34,
++    56,
++    789012,
++    tzinfo=timezone.utc,
++)
++
++
++def _url(path: Path) -> str:
++    return f"sqlite:///{path}"
++
++
++def _config(path: Path, connection, authority: object) -> Config:
++    config = Config("alembic.ini")
++    config.set_main_option("sqlalchemy.url", _url(path))
++    config.attributes["connection"] = connection
++    config.attributes["migration_authority"] = authority
++    return config
++
++
++class _AbsentProcessInspector:
++    def inspect(self, _identity: ProcessIdentity) -> ProcessProof:
++        return ProcessProof.NOT_SAME
++
++
++@contextmanager
++def _held_authority(engine, connection, *, pid: int):
++    service = RuntimeTenureService(
++        make_session_factory(engine),
++        process_inspector=_AbsentProcessInspector(),
++    )
++    handle = service.acquire_maintenance(
++        ProcessIdentity(pid, f"round4-maintenance-{pid}"),
++        ttl_seconds=30,
++    )
++    guard = RuntimeTenureGuard(
++        handle,
++        ttl_seconds=30,
++        renewal_interval_seconds=5,
++    )
++    guard.start()
++    barrier = install_runtime_mutation_barrier(engine, guard)
++    try:
++        yield (
++            issue_maintenance_authority(
++                connection,
++                guard=guard,
++                barrier=barrier,
++            ),
++            guard,
++        )
++    finally:
++        barrier.close()
++        if not guard.closed:
++            guard.close()
++
++
++def _clone_as_hostile_subclass(
++    source: MigrationAuthority,
++    *,
++    connection,
++) -> MigrationAuthority:
++    class HostileMigrationAuthority(MigrationAuthority):
++        @property
++        def mode(self):
++            return "maintenance"
++
++        def _validate_maintenance_binding(self, _connection) -> None:
++            return None
++
++        def assert_owned(self, _connection) -> None:
++            return None
++
++        @contextmanager
++        def schema_fence(self, _connection):
++            yield
++
++    hostile = object.__new__(HostileMigrationAuthority)
++    for slot in MigrationAuthority.__slots__:
++        object.__setattr__(
++            hostile,
++            slot,
++            object.__getattribute__(source, slot),
++        )
++    object.__setattr__(hostile, "_connection", connection)
++    object.__setattr__(hostile, "_mode", "maintenance")
++    return hostile
++
++
++def _empty_bootstrap_token(tmp_path: Path) -> tuple[object, object]:
++    engine = create_db_engine(_url(tmp_path / "token-source.db"))
++    connection = engine.connect()
++    return engine, connection
++
++
++def _seed_backup_source(path: Path, *, payload_bytes: int = 0) -> None:
++    with sqlite3.connect(path) as connection:
++        connection.execute(
++            "CREATE TABLE round4_backup_probe "
++            "(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
++        )
++        connection.execute(
++            "INSERT INTO round4_backup_probe(payload) VALUES (?)",
++            (b"x" * payload_bytes,),
++        )
++
++
++def _create_backup(
++    source: Path,
++    destination: Path,
++    **kwargs,
++):
++    return create_encrypted_database_backup(
++        source,
++        destination,
++        backup_key=BACKUP_KEY,
++        backup_key_id=BACKUP_KEY_ID,
++        schema_head="20260727_0015",
++        now=lambda: BACKUP_NOW,
++        **kwargs,
++    )
++
++
++def test_hostile_authority_subclass_cannot_upgrade_without_maintenance_tenure(
++    tmp_path,
++):
++    path = tmp_path / "hostile-subclass.db"
++    bootstrap_database_to_revision(_url(path), "20260727_0014")
++    engine = create_db_engine(_url(path))
++    token_engine, token_connection = _empty_bootstrap_token(tmp_path)
++    try:
++        seed = issue_bootstrap_authority(token_connection)
++        with engine.connect() as connection:
++            hostile = _clone_as_hostile_subclass(
++                seed,
++                connection=connection,
++            )
++            before_version = connection.scalar(
++                text("SELECT version_num FROM alembic_version")
++            )
++            before_columns = tuple(
++                column["name"]
++                for column in inspect(connection).get_columns("trade_plans")
++            )
++            assert connection.scalar(
++                text(
++                    "SELECT count(*) FROM runtime_tenures "
++                    "WHERE resource_key='sensitive-migration:global' "
++                    "AND state='held'"
++                )
++            ) == 0
++
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.upgrade(
++                    _config(path, connection, hostile),
++                    "head",
++                )
++
++            assert connection.scalar(
++                text("SELECT version_num FROM alembic_version")
++            ) == before_version
++            assert tuple(
++                column["name"]
++                for column in inspect(connection).get_columns("trade_plans")
++            ) == before_columns
++
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.upgrade(
++                    _config(path, connection, hostile),
++                    "head",
++                )
++    finally:
++        token_connection.close()
++        token_engine.dispose()
++        engine.dispose()
++
++
++@pytest.mark.parametrize(
++    ("operation", "destination"),
++    [
++        ("stamp", "head"),
++        ("upgrade", "20260727_0014"),
++        ("upgrade", "base"),
++        ("downgrade", "base"),
++    ],
++)
++def test_bootstrap_authority_refuses_operation_or_destination_confusion(
++    tmp_path,
++    operation,
++    destination,
++):
++    path = tmp_path / f"bootstrap-{operation}-{destination}.db"
++    engine = create_db_engine(_url(path))
++    with engine.connect() as connection:
++        authority = issue_bootstrap_authority(connection)
++        config = _config(path, connection, authority)
++
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            getattr(command, operation)(config, destination)
++
++        status = schema_status(engine)
++        assert status.ready is False
++        if "alembic_version" in inspect(connection).get_table_names():
++            assert connection.scalar(
++                text("SELECT version_num FROM alembic_version")
++            ) is None
++
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            command.upgrade(config, "head")
++    engine.dispose()
++
++
++def test_upgrade_authority_cannot_be_reinterpreted_as_downgrade_authority(
++    tmp_path,
++):
++    path = tmp_path / "maintenance-operation-confusion.db"
++    bootstrap_database_to_revision(_url(path), "head")
++    engine = create_db_engine(_url(path))
++    with engine.connect() as connection:
++        with _held_authority(
++            engine,
++            connection,
++            pid=94801,
++        ) as (authority, _guard):
++            config = _config(path, connection, authority)
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.downgrade(config, "20260727_0014")
++
++            assert schema_status(engine).ready is True
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.upgrade(config, "head")
++    engine.dispose()
++
++
++def test_maintenance_upgrade_authority_rejects_stamp_without_version_drift(
++    tmp_path,
++):
++    path = tmp_path / "maintenance-stamp-confusion.db"
++    bootstrap_database_to_revision(_url(path), "20260727_0014")
++    engine = create_db_engine(_url(path))
++    with engine.connect() as connection:
++        before_columns = tuple(
++            column["name"]
++            for column in inspect(connection).get_columns("trade_plans")
++        )
++        connection.rollback()
++        with _held_authority(
++            engine,
++            connection,
++            pid=94803,
++        ) as (authority, _guard):
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.stamp(
++                    _config(path, connection, authority),
++                    "head",
++                )
++        assert connection.scalar(
++            text("SELECT version_num FROM alembic_version")
++        ) == "20260727_0014"
++        assert tuple(
++            column["name"]
++            for column in inspect(connection).get_columns("trade_plans")
++        ) == before_columns
++    engine.dispose()
++
++
++def test_hostile_subclass_is_rejected_by_every_authority_boundary(tmp_path):
++    engine, connection = _empty_bootstrap_token(tmp_path)
++    wrong_engine = create_db_engine(_url(tmp_path / "wrong.db"))
++    try:
++        seed = issue_bootstrap_authority(connection)
++        hostile = _clone_as_hostile_subclass(seed, connection=connection)
++        boundaries = (
++            lambda: authority_module.activate_migration_authority(
++                hostile,
++                connection,
++                destination_revisions=(
++                    schema_status(engine).head,
++                ),
++            ),
++            lambda: authority_module.assert_migration_authority(
++                hostile,
++                connection,
++                allowed_modes=frozenset({"bootstrap"}),
++            ),
++            lambda: authority_module.finish_migration_authority(
++                hostile,
++                connection,
++            ),
++        )
++        for boundary in boundaries:
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                boundary()
++
++        with wrong_engine.connect() as wrong_connection:
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                authority_module.activate_migration_authority(
++                    hostile,
++                    wrong_connection,
++                    destination_revisions=(
++                        schema_status(engine).head,
++                    ),
++                )
++
++        authority_module.retire_migration_authority(hostile)
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            authority_module.activate_migration_authority(
++                hostile,
++                connection,
++                destination_revisions=(
++                    schema_status(engine).head,
++                ),
++            )
++    finally:
++        connection.close()
++        engine.dispose()
++        wrong_engine.dispose()
++
++
++def test_exact_authority_is_consumed_by_assert_and_finish_misuse(tmp_path):
++    first_engine, first_connection = _empty_bootstrap_token(tmp_path)
++    wrong_engine = create_db_engine(_url(tmp_path / "assert-wrong.db"))
++    second_engine = create_db_engine(_url(tmp_path / "finish-source.db"))
++    second_connection = second_engine.connect()
++    try:
++        head = schema_status(first_engine).head
++        first = issue_bootstrap_authority(first_connection)
++        assert type(first) is MigrationAuthority
++        authority_module.activate_migration_authority(
++            first,
++            first_connection,
++            destination_revisions=(head,),
++        )
++        with wrong_engine.connect() as wrong_connection:
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                authority_module.assert_migration_authority(
++                    first,
++                    wrong_connection,
++                    allowed_modes=frozenset({"bootstrap"}),
++                )
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            authority_module.assert_migration_authority(
++                first,
++                first_connection,
++                allowed_modes=frozenset({"bootstrap"}),
++            )
++
++        second = issue_bootstrap_authority(second_connection)
++        authority_module.activate_migration_authority(
++            second,
++            second_connection,
++            destination_revisions=(head,),
++        )
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            authority_module.finish_migration_authority(
++                second,
++                second_connection,
++            )
++        with pytest.raises(
++            RuntimeError,
++            match="^schema_migration_authority_required$",
++        ):
++            authority_module.activate_migration_authority(
++                second,
++                second_connection,
++                destination_revisions=(head,),
++            )
++    finally:
++        first_connection.close()
++        first_engine.dispose()
++        wrong_engine.dispose()
++        second_connection.close()
++        second_engine.dispose()
++
++
++def test_maintenance_upgrade_with_no_revision_step_is_refused_and_spent(
++    tmp_path,
++):
++    path = tmp_path / "maintenance-no-step.db"
++    bootstrap_database_to_revision(_url(path), "head")
++    engine = create_db_engine(_url(path))
++    with engine.connect() as connection:
++        with _held_authority(
++            engine,
++            connection,
++            pid=94802,
++        ) as (authority, _guard):
++            config = _config(path, connection, authority)
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.upgrade(config, "head")
++            assert schema_status(engine).ready is True
++            with pytest.raises(
++                RuntimeError,
++                match="^schema_migration_authority_required$",
++            ):
++                command.upgrade(config, "head")
++    engine.dispose()
++
++
++@pytest.mark.parametrize(
++    "loss_stage",
++    [
++        "verification_opened",
++        "decrypt_chunk",
++        "verification_hashed",
++        "quick_check_complete",
++        "before_artifact_commit",
++    ],
++)
++def test_tenure_loss_at_every_verification_boundary_never_commits_backup(
++    tmp_path,
++    loss_stage,
++):
++    source = tmp_path / f"loss-{loss_stage}.db"
++    destination = tmp_path / f"loss-{loss_stage}-backups"
++    _seed_backup_source(source, payload_bytes=1_250_000)
++    lost = False
++
++    def lose(stage: str) -> None:
++        nonlocal lost
++        if stage == loss_stage:
++            lost = True
++
++    def ensure_owned() -> None:
++        if lost:
++            raise TenureLost()
++
++    with pytest.raises(TenureLost):
++        _create_backup(
++            source,
++            destination,
++            stage_hook=lose,
++            ensure_maintenance=ensure_owned,
++        )
++
++    assert list_committed_backups(destination) == ()
++    assert not tuple(destination.glob("*.aesgcm"))
++
++
++def test_cleanup_error_after_tenure_loss_cannot_expose_committed_backup(
++    tmp_path,
++    monkeypatch,
++):
++    source = tmp_path / "cleanup-loss.db"
++    destination = tmp_path / "cleanup-loss-backups"
++    _seed_backup_source(source)
++    armed = False
++    original_unlink = Path.unlink
++
++    def fail_cleanup(path: Path, *args, **kwargs):
++        if armed and path.parent == destination and path.name.startswith("."):
++            raise OSError("hostile cleanup refusal")
++        return original_unlink(path, *args, **kwargs)
++
++    def lose(stage: str) -> None:
++        nonlocal armed
++        if stage == "before_artifact_commit":
++            armed = True
++
++    def ensure_owned() -> None:
++        if armed:
++            raise TenureLost()
++
++    monkeypatch.setattr(Path, "unlink", fail_cleanup)
++
++    with pytest.raises(TenureLost):
++        _create_backup(
++            source,
++            destination,
++            stage_hook=lose,
++            ensure_maintenance=ensure_owned,
++        )
++
++    assert list_committed_backups(destination) == ()
++    assert not tuple(destination.glob("*.aesgcm"))
++
++
++def test_target_collision_is_not_a_committed_backup(tmp_path):
++    source = tmp_path / "collision.db"
++    destination = tmp_path / "collision-backups"
++    _seed_backup_source(source)
++    destination.mkdir()
++    collision = (
++        destination
++        / "20260728T123456789012Z-before-sensitive-v1.sqlite3.aesgcm"
++    )
++    collision.write_bytes(b"attacker-controlled collision")
++
++    with pytest.raises(EncryptedBackupError) as captured:
++        _create_backup(source, destination)
++
++    assert captured.value.stable_code == "encrypted_backup_exists"
++    assert list_committed_backups(destination) == ()
++    with pytest.raises(
++        EncryptedBackupError,
++        match="^encrypted_backup_not_committed$",
++    ):
++        read_encrypted_backup_header(collision)
++
++
++def test_directory_fsync_failure_occurs_before_committed_name_is_visible(
++    tmp_path,
++    monkeypatch,
++):
++    source = tmp_path / "fsync.db"
++    destination = tmp_path / "fsync-backups"
++    _seed_backup_source(source)
++    visible_during_fsync: list[tuple[str, ...]] = []
++
++    def fail_fsync(_directory: Path) -> None:
++        visible_during_fsync.append(
++            tuple(path.name for path in destination.glob("*.aesgcm"))
++        )
++        raise OSError("injected directory fsync failure")
++
++    monkeypatch.setattr(backup_module, "_fsync_directory", fail_fsync)
++
++    with pytest.raises(EncryptedBackupError) as captured:
++        _create_backup(source, destination)
++
++    assert captured.value.stable_code == "encrypted_backup_failed"
++    assert visible_during_fsync == [()]
++    assert list_committed_backups(destination) == ()
++
++
++def test_successful_backup_has_one_authenticated_committed_artifact(tmp_path):
++    source = tmp_path / "committed.db"
++    destination = tmp_path / "committed-backups"
++    _seed_backup_source(source)
++
++    receipt = _create_backup(source, destination)
++
++    assert list_committed_backups(destination) == (receipt.path,)
++    assert read_encrypted_backup_header(receipt.path)["source_sha256"] == (
++        receipt.source_sha256
++    )
++
++
++def test_final_precommit_callback_failure_never_commits_backup(tmp_path):
++    source = tmp_path / "precommit-failure.db"
++    destination = tmp_path / "precommit-failure-backups"
++    _seed_backup_source(source)
++    visible_at_callback: tuple[Path, ...] | None = None
++
++    def fail_before_commit() -> None:
++        nonlocal visible_at_callback
++        visible_at_callback = list_committed_backups(destination)
++        raise TenureLost()
++
++    with pytest.raises(TenureLost):
++        _create_backup(
++            source,
++            destination,
++            before_commit=fail_before_commit,
++        )
++
++    assert visible_at_callback == ()
++    assert list_committed_backups(destination) == ()
++    assert not tuple(destination.glob("*.aesgcm"))
