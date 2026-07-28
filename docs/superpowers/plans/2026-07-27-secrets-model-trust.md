@@ -1369,8 +1369,9 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - Produces strict `AgentReply(reply, candidates)`.
 - Produces `CandidateSigner.issue()`, `.verify()`, and
   `CandidateNonceStore.consume_once()`.
-- Produces durable `CandidateQueueReceipt` rows with
-  `reserved -> target_persisted -> completed` lifecycle.
+- Produces durable `CandidateQueueReceipt` rows whose new-write lifecycle is
+  `reserved -> completed`; `target_persisted` is retained for compatibility
+  recovery only.
 - Adds `POST /candidates/order/queue` and
   `POST /candidates/rule/queue`.
 - General chat has zero database-mutation tools.
@@ -1412,9 +1413,11 @@ git commit -m "feat(analyst): isolate untrusted model context"
   request identity, exact safe outcome/status, and target ID only—never raw
   tokens, idempotency keys, thesis, or narrative.
 - Reservation and nonce consumption are one `BEGIN IMMEDIATE` transaction.
-  Target and `target_persisted` receipt state commit atomically. Recovery trusts
-  only receipt state, validates the exact target, and uses secret-HMAC-derived
-  order/group keys. A reserved receipt plus any target is inconsistent.
+  New target persistence commits the target and `completed` receipt atomically.
+  `target_persisted` remains a compatibility-only recovery state for rows
+  written by the earlier Task 9 implementation. Recovery trusts only receipt
+  state, validates the exact target, and uses secret-HMAC-derived order/group
+  keys. A reserved receipt plus any target is inconsistent.
 - Rule rejection, warnings, breaker trips, and audit evidence are durable.
   Terminal retries replay their original HTTP status. All paths forbid approval,
   submission, cancellation, auto-enable, and execution.
@@ -1429,10 +1432,12 @@ git commit -m "feat(analyst): isolate untrusted model context"
   under the exact authenticated-session limit principal. Budget exhaustion,
   rate denial, and limit-store failure stop remaining dispatches and prevent
   another provider turn.
-- `target_persisted -> completed` recovery requires the exact initial target.
-  Once completed, a same-request replay validates immutable target provenance
-  but permits legal order/rule lifecycle progression. Rule recovery compares
-  the complete canonical `RuleCommand` persistence shape and exactly one rule.
+- `target_persisted -> completed` compatibility recovery validates canonical
+  initial fingerprints or a legally reachable forward lifecycle. Once
+  completed, a same-request replay validates immutable target provenance,
+  order reachability under `OrderStateMachine`, and consistent rule/group
+  lifecycle combinations. Rule recovery compares the complete canonical
+  `RuleCommand` persistence shape and exactly one rule.
 - Candidate expiry is exclusive: an observation at or after `expires_at` is
   expired.
 - MCP remains explicit and non-executing with its existing authenticated tool
@@ -1462,6 +1467,21 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - [x] **FR1.5:** Expire candidates when `observed >= expires_at`.
 - [x] **FR1.6:** Pass focused, repeated-concurrency, one full-suite, and
   release-static gates without runtime or external calls.
+
+**Fix round 2**
+
+- [x] **FR2.1:** Terminate chat locally when aggregate dispatched tool calls
+  exactly reach the reviewed cap, without another provider call.
+- [x] **FR2.2:** Validate completed order replay through the transitive legal
+  transition graph and reject legacy/backward states.
+- [x] **FR2.3:** Validate candidate rule/group lifecycle reachability,
+  consistency, terminal ownership, and version progression.
+- [x] **FR2.4:** Commit each new order/rule target and its completed receipt in
+  one SQLite transaction; prove pre-commit rollback and post-commit replay.
+- [x] **FR2.5:** Retain fail-closed `target_persisted` compatibility recovery
+  with pristine initial fingerprints plus legal-forward recovery.
+- [x] **FR2.6:** Pass focused, repeated-concurrency, exactly one full-suite,
+  diff, and release-static gates without runtime or external calls.
 
 ---
 

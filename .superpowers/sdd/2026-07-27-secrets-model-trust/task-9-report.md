@@ -3,7 +3,7 @@
 ## Outcome
 
 Task 9 was implemented in `9a9327f`. Review fix round 1 is implemented in
-`9197ba8`.
+`9197ba8`. Review fix round 2 is implemented in `a092790`.
 
 General chat now has one immutable read-only tool registry plus two
 non-persisting draft tools. It cannot propose, create, cancel, approve, submit,
@@ -35,17 +35,20 @@ the original request ID, lifecycle, safe outcome/status, and target ID only. It
 does not store raw session tokens, database session IDs, idempotency keys,
 candidate thesis, operator narrative, or signatures.
 
-The lifecycle is:
+New target writes use:
 
 ```text
-reserved -> target_persisted -> completed
+reserved -> completed
 ```
 
-Reservation and nonce insertion are one `BEGIN IMMEDIATE` transaction. Target
-and `target_persisted` receipt state commit atomically. Order/group recovery
-keys are derived with a secret metadata-HMAC subkey, not a visible nonce hash.
-Recovery trusts receipt state, validates the exact order or exactly one rule
-target, and treats `reserved + target` as inconsistent.
+Reservation and nonce insertion are one `BEGIN IMMEDIATE` transaction. Each
+new target and its completed receipt commit in one `BEGIN IMMEDIATE`
+transaction. A pre-commit crash rolls back both; a post-commit crash observes a
+completed receipt. `target_persisted` remains only as a compatibility recovery
+state for receipts written by the earlier Task 9 implementation. Order/group
+recovery keys are derived with a secret metadata-HMAC subkey, not a visible
+nonce hash. Recovery trusts receipt state, validates the exact order or exactly
+one rule target, and treats `reserved + target` as inconsistent.
 
 New attempts validate time/freshness/static policy before nonce consumption.
 Reserved retries revalidate and safely terminalize if the candidate or quote
@@ -262,6 +265,131 @@ full suite was not rerun.
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-352e9e6..9197ba8.diff`
 - Diff size: 1,636 lines / 56,923 bytes
 
+## Review fix round 2
+
+All three Important findings were addressed in implementation commit
+`a092790`:
+
+- A response that dispatches exactly the configured aggregate chat tool-call
+  cap now returns the stable local `tool_call_budget_exhausted` result after
+  servicing those allowed calls. It does not make another provider call.
+- `OrderStateMachine.is_reachable()` computes transitive reachability over the
+  existing legal transition graph. Completed receipt replay rejects the
+  deserialization-only `APPROVED` state and all other unreachable/backward
+  states while permitting legal forward progression.
+- Candidate-created rules accept only lifecycle combinations reachable from
+  the initial ACTIVE immediate/nonpreapproved state. ACTIVE, TRIGGERED, FAILED,
+  and CANCELED combinations validate rule/group agreement, terminal ownership,
+  lease pairing, reconciliation residue, and required version progression.
+  PENDING, PROCESSING, mismatched terminal states, and terminal states without
+  a version transition fail closed.
+- New order/rule target persistence writes the target and `completed` receipt
+  in the same `BEGIN IMMEDIATE` transaction. The test-only
+  `before_target_commit` crash point proves rollback leaves one reserved
+  receipt and no target; `after_target_commit` proves target plus completed
+  receipt are already durable and replay exactly once.
+- Compatibility-only `target_persisted` recovery validates the same immutable
+  order/rule provenance, exact canonical rule payload, exactly one rule,
+  pristine initial order broker/approval/submission/fill markers, pristine
+  initial rule-group terminal/version/lease/reconciliation fields, and legal
+  forward lifecycle progression.
+
+### Fix-round-2 RED evidence
+
+Production code was unchanged when this focused selector was run:
+
+```text
+uv run pytest -q \
+  tests/test_agent.py::test_agent_exact_tool_budget_returns_without_second_provider_call \
+  tests/test_order_state_machine.py::test_reachability_uses_the_legal_transition_graph_transitively \
+  tests/test_candidate_boundary.py::test_order_crash_windows_recover_original_target_without_duplication \
+  tests/test_candidate_boundary.py::test_order_crash_before_target_commit_rolls_back_target_and_completion \
+  tests/test_candidate_boundary.py::test_rule_target_commit_crash_recovers_unique_group_and_rule \
+  tests/test_candidate_boundary.py::test_rule_crash_before_target_commit_rolls_back_group_rule_and_completion \
+  tests/test_candidate_boundary.py::test_completed_order_receipt_rejects_unreachable_legacy_approved_state \
+  tests/test_candidate_boundary.py::test_completed_rule_receipt_rejects_backward_or_inconsistent_states \
+  tests/test_candidate_boundary.py::test_target_persisted_order_recovery_accepts_legal_forward_progression \
+  tests/test_candidate_boundary.py::test_target_persisted_initial_order_rejects_lifecycle_marker_tamper \
+  tests/test_candidate_boundary.py::test_target_persisted_rule_recovery_accepts_legal_forward_progression \
+  tests/test_candidate_boundary.py::test_rule_target_persisted_recovery_rejects_any_immutable_drift
+21 failed, 18 passed
+```
+
+The failures were the intended behaviors: one extra provider call at the exact
+cap, missing graph reachability, split target/completion commits, absent
+pre-commit crash rollback, acceptance of backward/inconsistent completed
+states, rejection of legal `target_persisted` forward states, and acceptance
+of unexpected initial lifecycle markers.
+
+One additional RED regression was captured after the first green slice:
+
+```text
+uv run pytest -q \
+  tests/test_candidate_boundary.py::test_completed_rule_receipt_rejects_terminal_state_without_version_progress
+1 failed
+```
+
+It proved that a terminal rule/group state with the initial group version was
+still accepted. Requiring a durable version transition made it green.
+
+### Fix-round-2 focused and concurrency evidence
+
+```text
+uv run pytest -q \
+  tests/test_agent.py::test_agent_exact_tool_budget_returns_without_second_provider_call \
+  tests/test_order_state_machine.py::test_reachability_uses_the_legal_transition_graph_transitively \
+  tests/test_candidate_boundary.py::test_order_crash_windows_recover_original_target_without_duplication \
+  tests/test_candidate_boundary.py::test_order_crash_before_target_commit_rolls_back_target_and_completion \
+  tests/test_candidate_boundary.py::test_rule_target_commit_crash_recovers_unique_group_and_rule \
+  tests/test_candidate_boundary.py::test_rule_crash_before_target_commit_rolls_back_group_rule_and_completion \
+  tests/test_candidate_boundary.py::test_completed_order_receipt_rejects_unreachable_legacy_approved_state \
+  tests/test_candidate_boundary.py::test_completed_rule_receipt_rejects_backward_or_inconsistent_states \
+  tests/test_candidate_boundary.py::test_target_persisted_order_recovery_accepts_legal_forward_progression \
+  tests/test_candidate_boundary.py::test_target_persisted_initial_order_rejects_lifecycle_marker_tamper \
+  tests/test_candidate_boundary.py::test_target_persisted_rule_recovery_accepts_legal_forward_progression \
+  tests/test_candidate_boundary.py::test_rule_target_persisted_recovery_rejects_any_immutable_drift
+39 passed
+
+uv run pytest tests/test_agent.py tests/test_candidate_boundary.py \
+  tests/test_order_state_machine.py tests/test_route_policy.py \
+  tests/test_api.py tests/test_mcp_tools.py tests/test_migrations.py \
+  tests/test_order_submission.py tests/test_submission_barrier.py
+591 passed, 1 warning in 91.09s
+
+for run_index in {1..10}; do uv run pytest -q \
+  tests/test_candidate_boundary.py::test_same_key_retries_and_concurrent_retries_return_exactly_one_target \
+  tests/test_candidate_boundary.py::test_candidate_route_lease_still_rejects_concurrent_execution \
+  tests/test_agent.py::test_concurrent_chats_share_atomic_broker_read_capacity \
+  || exit 1; done
+10 runs / 100 passed
+
+git diff --check
+PASS
+```
+
+### Fix-round-2 full and release gates
+
+Exactly one no-argument full suite was run for this implementation fix round:
+
+```text
+uv run pytest
+3115 passed, 1 skipped, 1 warning in 244.63s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+The warning remains the existing third-party `websockets.legacy` deprecation
+warning. The full suite was not rerun.
+
+### Fix-round-2 review package
+
+- Base: `826953c`
+- Implementation: `a092790`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-826953c..a092790.diff`
+- Diff size: 775 lines / 29,617 bytes
+
 ## Safety statement
 
 All tests used temporary SQLite databases and deterministic fakes. No app,
@@ -279,5 +407,8 @@ equity/crypto behavior.
 
 - Ruff is unavailable in the current environment, so no Ruff-specific result
   is claimed.
+- The schema retains `target_persisted` for fail-closed recovery of receipts
+  written before fix round 2. New code never writes that intermediate state;
+  removing it later requires operational proof that no compatible rows remain.
 - Candidate queueing intentionally does not make profitability claims and does
   not weaken the separate recent-auth approval boundary.

@@ -59,7 +59,9 @@ order, reset a breaker, or enable live/autonomous trading.
   across all model turns. Every broker-backed dispatch consumes one durable
   `broker_read` unit under the exact authenticated-session limit principal
   before broker work. Budget exhaustion, rate denial, or store failure stops
-  remaining dispatches and prevents another provider call.
+  remaining dispatches and prevents another provider call. Reaching the exact
+  aggregate cap after an otherwise valid tool response also terminates locally;
+  it never buys one more provider turn.
 
 ## Explicit queue boundary
 
@@ -96,17 +98,23 @@ order, reset a breaker, or enable live/autonomous trading.
   conflict. The same signed nonce under another key is `candidate_replayed`.
 - Receipt reservation and nonce insertion are atomic under
   `BEGIN IMMEDIATE` and unique constraints.
-- Lifecycle is `reserved -> target_persisted -> completed`. Target and
-  `target_persisted` commit in the same transaction.
+- New writes use `reserved -> completed`: the target and completed receipt
+  commit in the same transaction. `target_persisted` remains accepted only as
+  a compatibility/recovery state for receipts written before fix round 2.
 - Order idempotency and rule group keys are deterministic secret-HMAC-derived
   values. Recovery never searches for a target from a visible raw nonce hash.
   It trusts only receipt state and validates exact order fields or exactly one
   matching rule target.
-- `target_persisted -> completed` validates the exact initial lifecycle and all
-  immutable target fields. A completed same-request replay still validates
-  immutable provenance but permits legal order/rule lifecycle progression.
-  Rule recovery reconstructs the canonical `RuleCommand` and compares ticker,
-  group, kind, canonical condition/action JSON, sizing/limit fields,
+- `target_persisted -> completed` compatibility recovery validates pristine
+  initial lifecycle fingerprints or a legally reachable forward lifecycle,
+  plus all immutable target fields. A completed same-request replay validates
+  immutable provenance, transitive order reachability under the existing
+  `OrderStateMachine`, and consistent rule/group lifecycle combinations.
+  Initial orders have no broker-order, approval, submission, reconciliation,
+  cancellation, version, or fill markers. Initial active rule groups have the
+  expected zero version, no terminal owner, no lease, and no reconciliation
+  residue. Rule recovery reconstructs the canonical `RuleCommand` and compares
+  ticker, group, kind, canonical condition/action JSON, sizing/limit fields,
   activation, preapproval, terminal behavior, fraction/HWM/deadline, plan
   ownership, payload version, and exactly one rule.
 - Completed and target-persisted receipts may replay after envelope expiry.
@@ -123,10 +131,13 @@ order, reset a breaker, or enable live/autonomous trading.
   canonicalization, future/quote timestamps, reauthentication/actor/kind
   mismatch, stale quote before envelope expiry, reason binding, rate denial,
   fresh full-risk snapshot, rule safety evidence, crash windows, target
-  integrity, exact terminal status, same-key concurrency, and nonce replay.
+  integrity, exact terminal status, atomic target/completed receipt rollback,
+  legal-forward and backward lifecycle replay, same-key concurrency, and nonce
+  replay.
 - Agent tests prove immutable read-only specs, no mutable names, stable unknown
   errors, prose-only behavior, local candidate collection, bearer-envelope
-  withholding, and four-candidate cap before a fifth quote read.
+  withholding, four-candidate cap before a fifth quote read, and exact aggregate
+  tool-cap termination without an extra provider call.
 - API/policy tests prove CSRF/idempotency, broker-read classification, duplicate
   JSON rejection, pre-work rate denial, and zero approve/submit/cancel.
 - Migration tests prove head 0016, metadata-only receipt schema, constraints,
@@ -136,5 +147,5 @@ order, reset a breaker, or enable live/autonomous trading.
   full `uv run pytest` for this implementation round.
 - Run `scripts/check_release_safety.py` because Task 9 changes agent, route,
   migration, and safety-enforced surfaces.
-- Commit implementation/tests/migration/plan first. Then create the review
-  diff, task report, and progress evidence in a second docs-only commit.
+- Commit implementation/tests first. Then create the review diff and update the
+  plan, task report, brief, and progress evidence in a second docs-only commit.

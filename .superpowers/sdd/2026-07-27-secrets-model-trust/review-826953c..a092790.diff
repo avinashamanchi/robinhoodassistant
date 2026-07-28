@@ -1,0 +1,775 @@
+diff --git a/src/trading_assistant/app/agent.py b/src/trading_assistant/app/agent.py
+index b207b80..c750ee6 100644
+--- a/src/trading_assistant/app/agent.py
++++ b/src/trading_assistant/app/agent.py
+@@ -449,6 +449,11 @@ class Agent:
+                             }
+                         )
+                 messages.append({"role": "user", "content": results})
++                if (
++                    stop_code is None
++                    and dispatched_tool_calls >= self.max_tool_calls
++                ):
++                    stop_code = "tool_call_budget_exhausted"
+                 if stop_code is not None:
+                     final_text = _TOOL_STOP_REPLIES[stop_code]
+                     break
+diff --git a/src/trading_assistant/db/models.py b/src/trading_assistant/db/models.py
+index 8ea1c79..1182fdc 100644
+--- a/src/trading_assistant/db/models.py
++++ b/src/trading_assistant/db/models.py
+@@ -162,6 +162,24 @@ class OrderStateMachine:
+     def can_transition(current: OrderStatus, new: OrderStatus) -> bool:
+         return new in _LEGAL_TRANSITIONS.get(current, frozenset())
+ 
++    @staticmethod
++    def is_reachable(initial: OrderStatus, current: OrderStatus) -> bool:
++        """Return whether ``current`` is reachable without bypassing the graph."""
++
++        if initial == current:
++            return True
++        visited = {initial}
++        pending = [initial]
++        while pending:
++            state = pending.pop()
++            for successor in _LEGAL_TRANSITIONS.get(state, frozenset()):
++                if successor == current:
++                    return True
++                if successor not in visited:
++                    visited.add(successor)
++                    pending.append(successor)
++        return False
++
+     @staticmethod
+     def transition(order: "Order", new: OrderStatus) -> None:
+         current = OrderStatus(order.status)
+diff --git a/src/trading_assistant/security/candidates.py b/src/trading_assistant/security/candidates.py
+index 1eb2470..c7f1d69 100644
+--- a/src/trading_assistant/security/candidates.py
++++ b/src/trading_assistant/security/candidates.py
+@@ -43,7 +43,9 @@ from trading_assistant.db.models import (
+     AuditEvent,
+     CandidateNonce,
+     CandidateQueueReceipt,
++    Fill,
+     Order,
++    OrderStateMachine,
+     Proposal,
+     RiskEvent,
+     Rule,
+@@ -53,7 +55,7 @@ from trading_assistant.db.models import (
+ from trading_assistant.dependencies import RequiredDependencyUnavailable
+ from trading_assistant.identity import canonical_request_id
+ from trading_assistant.risk.breakers import trip_in_session
+-from trading_assistant.rules.models import RuleAction, RuleCommand
++from trading_assistant.rules.models import RuleAction, RuleCommand, RuleState
+ from trading_assistant.security.secrets import (
+     RuntimeSecrets,
+     validate_base64_key,
+@@ -928,6 +930,16 @@ class CandidateQueueService:
+                 candidate.payload,
+                 order_key,
+             )
++            try:
++                initial_status = OrderStatus(receipt.outcome_code)
++                current_status = (
++                    OrderStatus(target.status)
++                    if target is not None
++                    else None
++                )
++            except ValueError:
++                initial_status = None
++                current_status = None
+             if (
+                 target is None
+                 or target.idempotency_key != order_key
+@@ -938,9 +950,19 @@ class CandidateQueueService:
+                 or target.notional != expected.notional
+                 or target.limit_price != expected.limit_price
+                 or receipt.outcome_code not in {"proposed", "rejected"}
+-                or (
+-                    require_initial_lifecycle
+-                    and target.status != receipt.outcome_code
++                or initial_status is None
++                or current_status is None
++                or not OrderStateMachine.is_reachable(
++                    initial_status,
++                    current_status,
++                )
++            ):
++                raise CandidateError("candidate_receipt_inconsistent")
++            if (
++                current_status == initial_status
++                and not self._order_initial_lifecycle_is_pristine(
++                    session,
++                    target,
+                 )
+             ):
+                 raise CandidateError("candidate_receipt_inconsistent")
+@@ -972,36 +994,117 @@ class CandidateQueueService:
+             if group is not None
+             else []
+         )
++        rule = rules[0] if len(rules) == 1 else None
+         if (
+             group is None
+-            or len(rules) != 1
+-            or rules[0].id != receipt.target_id
+-            or rules[0].payload_version != 1
+-            or rules[0].ticker != command.ticker
+-            or rules[0].kind != command.kind.value
+-            or rules[0].condition_json != expected_condition
+-            or rules[0].action_json != expected_action
+-            or rules[0].plan_id is not None
+-            or rules[0].fraction != command.fraction
+-            or rules[0].hwm != command.high_water_mark
+-            or rules[0].deadline is not None
+-            or rules[0].pre_approved != command.pre_approved
+-            or rules[0].activation != command.activation
++            or rule is None
++            or rule.id != receipt.target_id
++            or rule.payload_version != 1
++            or rule.ticker != command.ticker
++            or rule.kind != command.kind.value
++            or rule.condition_json != expected_condition
++            or rule.action_json != expected_action
++            or rule.plan_id is not None
++            or rule.fraction != command.fraction
++            or rule.hwm != command.high_water_mark
++            or rule.deadline is not None
++            or rule.pre_approved != command.pre_approved
++            or rule.activation != command.activation
+             or (
+-                rules[0].terminal_on_trigger
++                rule.terminal_on_trigger
+                 != command.terminal_on_trigger
+             )
+             or receipt.outcome_code != "queued"
+-            or (
+-                require_initial_lifecycle
+-                and (
+-                    group.state != "active"
+-                    or rules[0].state != "active"
+-                )
++            or not self._rule_lifecycle_is_consistent(
++                group,
++                rule,
++                require_initial_lifecycle=require_initial_lifecycle,
+             )
+         ):
+             raise CandidateError("candidate_receipt_inconsistent")
+ 
++    @staticmethod
++    def _order_initial_lifecycle_is_pristine(
++        session,
++        order: Order,
++    ) -> bool:
++        fill_count = session.scalar(
++            select(func.count())
++            .select_from(Fill)
++            .where(Fill.order_id == order.id)
++        )
++        return bool(
++            order.broker_order_id is None
++            and order.approval_actor is None
++            and order.approved_at is None
++            and order.submission_kind == "simple"
++            and order.submission_payload_json == "{}"
++            and order.submission_attempt == 0
++            and order.submission_started_at is None
++            and order.acceptance_state == "not_started"
++            and order.last_reconciled_at is None
++            and order.last_error_code == ""
++            and order.plan_cancel_state == "none"
++            and order.version == 0
++            and fill_count == 0
++        )
++
++    @staticmethod
++    def _rule_lifecycle_is_consistent(
++        group: RuleGroup,
++        rule: Rule,
++        *,
++        require_initial_lifecycle: bool,
++    ) -> bool:
++        try:
++            group_state = RuleState(group.state)
++            rule_state = RuleState(rule.state)
++        except ValueError:
++            return False
++        lease_is_consistent = (
++            (group.lease_owner is None)
++            == (group.lease_expires_at is None)
++        )
++        if not lease_is_consistent or group.version < 0:
++            return False
++        if (
++            group_state is RuleState.ACTIVE
++            and rule_state is RuleState.ACTIVE
++        ):
++            if group.terminal_rule_id is not None:
++                return False
++            if require_initial_lifecycle:
++                return bool(
++                    group.version == 0
++                    and group.lease_owner is None
++                    and group.lease_expires_at is None
++                    and not group.reconciliation_required
++                )
++            if group.version == 0:
++                return bool(
++                    group.lease_owner is None
++                    and group.lease_expires_at is None
++                    and not group.reconciliation_required
++                )
++            return True
++        if group.lease_owner is not None or group.lease_expires_at is not None:
++            return False
++        if group.reconciliation_required:
++            return False
++        if group_state in {RuleState.TRIGGERED, RuleState.FAILED}:
++            return bool(
++                rule_state is group_state
++                and group.terminal_rule_id == rule.id
++                and group.version >= 1
++            )
++        if group_state is RuleState.CANCELED:
++            return bool(
++                rule_state is RuleState.CANCELED
++                and group.terminal_rule_id in {None, rule.id}
++                and group.version >= 1
++            )
++        return False
++
+     def _complete(
+         self,
+         receipt_id: int,
+@@ -1154,8 +1257,10 @@ class CandidateQueueService:
+         now: datetime,
+     ) -> None:
+         with self.service.session_factory() as session:
++            session.execute(text("BEGIN IMMEDIATE"))
+             receipt = session.get(CandidateQueueReceipt, receipt_id)
+             if receipt is None or receipt.state != "reserved":
++                session.rollback()
+                 raise CandidateError("candidate_receipt_inconsistent")
+             existing = session.scalar(
+                 select(Order).where(
+@@ -1163,6 +1268,7 @@ class CandidateQueueService:
+                 )
+             )
+             if existing is not None:
++                session.rollback()
+                 raise CandidateError("candidate_target_conflict")
+             order = Order(
+                 idempotency_key=request.idempotency_key,
+@@ -1239,11 +1345,13 @@ class CandidateQueueService:
+                 ),
+                 {"reason": reason, "detail_json": "{}"},
+             )
+-            receipt.state = "target_persisted"
++            receipt.state = "completed"
+             receipt.target_id = order.id
+             receipt.outcome_code = order.status
+             receipt.http_status = 201
++            receipt.completed_at = now
+             receipt.updated_at = now
++            self._crash("before_target_commit")
+             session.commit()
+ 
+     def _persist_rule(
+@@ -1261,14 +1369,17 @@ class CandidateQueueService:
+         _order_key, group_key = self._target_keys(identity)
+         command = self._rule_command(payload, group_key)
+         with self.service.session_factory() as session:
++            session.execute(text("BEGIN IMMEDIATE"))
+             receipt = session.get(CandidateQueueReceipt, receipt_id)
+             if receipt is None or receipt.state != "reserved":
++                session.rollback()
+                 raise CandidateError("candidate_receipt_inconsistent")
+             if session.scalar(
+                 select(RuleGroup).where(
+                     RuleGroup.group_key == group_key
+                 )
+             ) is not None:
++                session.rollback()
+                 raise CandidateError("candidate_target_conflict")
+             rule = self.service.rule_application.persist_commands(
+                 session,
+@@ -1309,11 +1420,13 @@ class CandidateQueueService:
+                 ),
+                 {"reason": reason, "detail_json": "{}"},
+             )
+-            receipt.state = "target_persisted"
++            receipt.state = "completed"
+             receipt.target_id = rule.id
+             receipt.outcome_code = "queued"
+             receipt.http_status = 201
++            receipt.completed_at = now
+             receipt.updated_at = now
++            self._crash("before_target_commit")
+             session.commit()
+ 
+     @staticmethod
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index 8a58c8b..e997f9a 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -454,7 +454,7 @@ def test_agent_chat_survives_backend_error(make_service, caplog):
+ 
+ 
+ def test_agent_stops_at_max_turns(make_service):
+-    # Backend always asks for a tool -> loop must terminate at max_turns, not hang.
++    # Backend always asks for a tool -> terminate locally at the shared bound.
+     responses = [
+         _resp("tool_use", [_tool(f"t{i}", "get_account_summary", {})])
+         for i in range(20)
+@@ -462,7 +462,7 @@ def test_agent_stops_at_max_turns(make_service):
+     agent, svc = _agent(make_service, responses, max_turns=3)
+     out = _chat(agent, "loop forever")
+     assert agent.backend.calls == 3
+-    assert out.reply == ""  # never produced final text, but returned cleanly
++    assert out.reply == "Tool execution stopped: tool_call_budget_exhausted."
+ 
+ 
+ def test_prose_only_model_mention_does_not_create_candidate(make_service):
+@@ -567,6 +567,43 @@ def test_agent_hard_caps_48_tool_blocks_across_one_model_response(
+         assert len(calls) == 48
+ 
+ 
++def test_agent_exact_tool_budget_returns_without_second_provider_call(
++    make_service,
++):
++    agent, svc = _agent(
++        make_service,
++        [
++            _resp(
++                "tool_use",
++                [
++                    _tool(
++                        f"tool-{index}",
++                        "get_market_data",
++                        {"ticker": "AAPL"},
++                    )
++                    for index in range(3)
++                ],
++            )
++        ],
++        max_turns=3,
++    )
++    quote_calls = 0
++    original_get_quote = svc.broker.get_quote
++
++    def counted_get_quote(ticker):
++        nonlocal quote_calls
++        quote_calls += 1
++        return original_get_quote(ticker)
++
++    svc.broker.get_quote = counted_get_quote
++
++    reply = _chat(agent, "exactly exhaust the tool budget")
++
++    assert quote_calls == 3
++    assert agent.backend.calls == 1
++    assert reply.reply == "Tool execution stopped: tool_call_budget_exhausted."
++
++
+ def test_agent_tool_budget_is_aggregate_across_model_turns(make_service):
+     agent, svc = _agent(
+         make_service,
+diff --git a/tests/test_candidate_boundary.py b/tests/test_candidate_boundary.py
+index f3f8403..bd6eeec 100644
+--- a/tests/test_candidate_boundary.py
++++ b/tests/test_candidate_boundary.py
+@@ -22,6 +22,7 @@ from trading_assistant.db.models import (
+     AuditEvent,
+     CandidateNonce,
+     CircuitBreakerState,
++    Fill,
+     Order,
+     OrderStateMachine,
+     RiskEvent,
+@@ -221,6 +222,14 @@ def _queue_rule(
+     )
+ 
+ 
++def _mark_receipt_target_persisted(service) -> None:
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        receipt.state = "target_persisted"
++        receipt.completed_at = None
++        session.commit()
++
++
+ def test_candidate_models_are_strict_frozen_and_omit_rule_proposal_ttl():
+     api = _candidate_api()
+     order = api.OrderCandidate.model_validate(
+@@ -832,6 +841,16 @@ def test_order_crash_windows_recover_original_target_without_duplication(
+     with pytest.raises(RuntimeError, match=stage):
+         _queue_order(queue, envelope, binding)
+ 
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        if stage == "after_target_commit":
++            assert receipt.state == "completed"
++            assert receipt.completed_at == NOW
++            assert session.scalar(select(func.count()).select_from(Order)) == 1
++        else:
++            assert receipt.state == "reserved"
++            assert session.scalar(select(func.count()).select_from(Order)) == 0
++
+     recovered = _queue_order(queue, envelope, binding)
+     assert recovered.status == "proposed"
+     with service.session_factory() as session:
+@@ -842,6 +861,36 @@ def test_order_crash_windows_recover_original_target_without_duplication(
+         assert receipt.target_id == recovered.target_id
+ 
+ 
++def test_order_crash_before_target_commit_rolls_back_target_and_completion(
++    make_service,
++):
++    envelope, service, signer, binding = _order_envelope(make_service)
++    armed = {"value": True}
++
++    def crash_hook(stage):
++        if armed["value"] and stage == "before_target_commit":
++            armed["value"] = False
++            raise RuntimeError("simulated precommit crash")
++
++    queue = _queue(service, signer, crash_hook=crash_hook)
++    with pytest.raises(RuntimeError, match="precommit"):
++        _queue_order(queue, envelope, binding)
++
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "reserved"
++        assert receipt.target_id is None
++        assert session.scalar(select(func.count()).select_from(Order)) == 0
++
++    recovered = _queue_order(queue, envelope, binding)
++
++    assert recovered.status == "proposed"
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++        assert session.scalar(select(func.count()).select_from(Order)) == 1
++
++
+ def test_rule_target_commit_crash_recovers_unique_group_and_rule(make_service):
+     envelope, service, signer, binding = _rule_envelope(make_service)
+     armed = {"value": True}
+@@ -855,6 +904,13 @@ def test_rule_target_commit_crash_recovers_unique_group_and_rule(make_service):
+     with pytest.raises(RuntimeError, match="rule target"):
+         _queue_rule(queue, envelope, binding)
+ 
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++        assert receipt.completed_at == NOW
++        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
++        assert session.scalar(select(func.count()).select_from(Rule)) == 1
++
+     recovered = _queue_rule(queue, envelope, binding)
+     with service.session_factory() as session:
+         assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
+@@ -862,6 +918,38 @@ def test_rule_target_commit_crash_recovers_unique_group_and_rule(make_service):
+         assert session.get(Rule, recovered.target_id) is not None
+ 
+ 
++def test_rule_crash_before_target_commit_rolls_back_group_rule_and_completion(
++    make_service,
++):
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    armed = {"value": True}
++
++    def crash_hook(stage):
++        if armed["value"] and stage == "before_target_commit":
++            armed["value"] = False
++            raise RuntimeError("simulated rule precommit crash")
++
++    queue = _queue(service, signer, crash_hook=crash_hook)
++    with pytest.raises(RuntimeError, match="precommit"):
++        _queue_rule(queue, envelope, binding)
++
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "reserved"
++        assert receipt.target_id is None
++        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 0
++        assert session.scalar(select(func.count()).select_from(Rule)) == 0
++
++    recovered = _queue_rule(queue, envelope, binding)
++
++    assert recovered.status == "queued"
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++        assert session.scalar(select(func.count()).select_from(RuleGroup)) == 1
++        assert session.scalar(select(func.count()).select_from(Rule)) == 1
++
++
+ def test_receipt_binds_reason_and_reuses_original_request_identity(
+     make_service,
+ ):
+@@ -955,6 +1043,24 @@ def test_completed_order_receipt_replays_after_legal_status_progression(
+         assert session.get(Order, first.target_id).status == "expired"
+ 
+ 
++def test_completed_order_receipt_rejects_unreachable_legacy_approved_state(
++    make_service,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    with service.session_factory() as session:
++        session.get(Order, first.target_id).status = OrderStatus.APPROVED.value
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_order(queue, envelope, binding)
++
++
+ @pytest.mark.parametrize("progressed_state", ["triggered", "canceled"])
+ def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
+     make_service,
+@@ -968,6 +1074,7 @@ def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
+         group = session.get(RuleGroup, rule.group_id)
+         rule.state = progressed_state
+         group.state = progressed_state
++        group.version = 1
+         if progressed_state == "triggered":
+             group.terminal_rule_id = rule.id
+         session.commit()
+@@ -979,11 +1086,165 @@ def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
+         assert session.get(Rule, first.target_id).state == progressed_state
+ 
+ 
++@pytest.mark.parametrize(
++    ("group_state", "rule_state", "terminal_rule"),
++    [
++        ("pending", "pending", False),
++        ("triggered", "active", True),
++        ("active", "triggered", False),
++        ("canceled", "triggered", False),
++    ],
++)
++def test_completed_rule_receipt_rejects_backward_or_inconsistent_states(
++    make_service,
++    group_state,
++    rule_state,
++    terminal_rule,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        group.state = group_state
++        rule.state = rule_state
++        group.terminal_rule_id = rule.id if terminal_rule else None
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
++
++
++def test_completed_rule_receipt_rejects_terminal_state_without_version_progress(
++    make_service,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        group.state = "canceled"
++        rule.state = "canceled"
++        assert group.version == 0
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
++
++
++def test_target_persisted_order_recovery_accepts_legal_forward_progression(
++    make_service,
++):
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _mark_receipt_target_persisted(service)
++    with service.session_factory() as session:
++        order = session.get(Order, first.target_id)
++        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
++        session.commit()
++
++    replay = _queue_order(queue, envelope, binding)
++
++    assert replay == first
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++
++
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        "broker_order_id",
++        "approval_metadata",
++        "submission_markers",
++        "fill_marker",
++    ],
++)
++def test_target_persisted_initial_order_rejects_lifecycle_marker_tamper(
++    make_service,
++    tamper,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _mark_receipt_target_persisted(service)
++    with service.session_factory() as session:
++        order = session.get(Order, first.target_id)
++        if tamper == "broker_order_id":
++            order.broker_order_id = "unexpected-broker-order"
++        elif tamper == "approval_metadata":
++            order.approval_actor = "unexpected-approver"
++            order.approved_at = NOW
++        elif tamper == "submission_markers":
++            order.submission_attempt = 1
++            order.submission_started_at = NOW
++            order.acceptance_state = "started"
++        else:
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker=order.ticker,
++                    side=order.side,
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id="unexpected-candidate-fill",
++                    filled_at=NOW,
++                )
++            )
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_order(queue, envelope, binding)
++
++
++def test_target_persisted_rule_recovery_accepts_legal_forward_progression(
++    make_service,
++):
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _mark_receipt_target_persisted(service)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        rule.state = "triggered"
++        group.state = "triggered"
++        group.terminal_rule_id = rule.id
++        group.version = 1
++        session.commit()
++
++    replay = _queue_rule(queue, envelope, binding)
++
++    assert replay == first
++    with service.session_factory() as session:
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++
++
+ @pytest.mark.parametrize(
+     "tamper",
+     [
+         "group_key",
+         "group_initial_state",
++        "group_terminal_rule_id",
++        "group_version",
++        "group_lease",
++        "group_reconciliation",
+         "payload_version",
+         "ticker",
+         "kind",
+@@ -1007,16 +1268,9 @@ def test_rule_target_persisted_recovery_rejects_any_immutable_drift(
+ ):
+     api = _candidate_api()
+     envelope, service, signer, binding = _rule_envelope(make_service)
+-    armed = {"value": True}
+-
+-    def crash_hook(stage):
+-        if armed["value"] and stage == "after_target_commit":
+-            armed["value"] = False
+-            raise RuntimeError("target persisted")
+-
+-    queue = _queue(service, signer, crash_hook=crash_hook)
+-    with pytest.raises(RuntimeError, match="target persisted"):
+-        _queue_rule(queue, envelope, binding)
++    queue = _queue(service, signer)
++    _queue_rule(queue, envelope, binding)
++    _mark_receipt_target_persisted(service)
+ 
+     with service.session_factory() as session:
+         rule = session.scalar(select(Rule))
+@@ -1025,6 +1279,15 @@ def test_rule_target_persisted_recovery_rejects_any_immutable_drift(
+             group.group_key = "tampered-group-key"
+         elif tamper == "group_initial_state":
+             group.state = "triggered"
++        elif tamper == "group_terminal_rule_id":
++            group.terminal_rule_id = rule.id
++        elif tamper == "group_version":
++            group.version = 1
++        elif tamper == "group_lease":
++            group.lease_owner = "unexpected-worker"
++            group.lease_expires_at = NOW + timedelta(minutes=1)
++        elif tamper == "group_reconciliation":
++            group.reconciliation_required = True
+         elif tamper == "payload_version":
+             rule.payload_version = 2
+         elif tamper == "ticker":
+diff --git a/tests/test_order_state_machine.py b/tests/test_order_state_machine.py
+index 45fbe75..096c8e5 100644
+--- a/tests/test_order_state_machine.py
++++ b/tests/test_order_state_machine.py
+@@ -88,3 +88,22 @@ def test_terminal_states_have_no_exits(terminal):
+ def test_legacy_approved_has_no_runtime_transitions():
+     for target in OrderStatus:
+         assert not OrderStateMachine.can_transition(OrderStatus.APPROVED, target)
++
++
++def test_reachability_uses_the_legal_transition_graph_transitively():
++    assert OrderStateMachine.is_reachable(
++        OrderStatus.PROPOSED,
++        OrderStatus.FILLED,
++    )
++    assert OrderStateMachine.is_reachable(
++        OrderStatus.PROPOSED,
++        OrderStatus.PROPOSED,
++    )
++    assert not OrderStateMachine.is_reachable(
++        OrderStatus.PROPOSED,
++        OrderStatus.APPROVED,
++    )
++    assert not OrderStateMachine.is_reachable(
++        OrderStatus.REJECTED,
++        OrderStatus.PROPOSED,
++    )
