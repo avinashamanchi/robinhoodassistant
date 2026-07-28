@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
@@ -109,6 +111,9 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         "provider_reservations",
         "panic_receipts",
         "mutation_interlocks",
+        "sensitive_migration_state",
+        "candidate_nonces",
+        "untrusted_ingest_events",
     } <= set(inspect(engine).get_table_names())
     assert "alembic_version" in inspect(engine).get_table_names()
     rule_columns = {
@@ -143,6 +148,198 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         order_indexes["ix_orders_plan_cancel_state"]["unique"]
         == 0
     )
+
+
+def test_sensitive_trust_migration_is_successor_0013_and_preserves_not_null():
+    cfg = Config("alembic.ini")
+    script = ScriptDirectory.from_config(cfg)
+    revision = script.get_revision("20260727_0013")
+
+    assert script.get_current_head() == "20260727_0013"
+    assert revision is not None
+    assert revision.down_revision == "20260727_0012"
+    assert revision.path.endswith(
+        "20260727_0013_sensitive_trust_state.py"
+    )
+
+
+def test_sensitive_trust_schema_constraints_indexes_and_no_raw_text(tmp_path):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / "sensitive-trust-schema.db",
+        "head",
+    )
+    inspector = inspect(engine)
+    sensitive_fields = {
+        "orders": {"approval_reason"},
+        "audit_events": {"reason", "detail_json"},
+        "proposals": {"reasoning"},
+        "llm_decisions": {"prompt", "tool_calls_json", "reasoning_summary"},
+        "risk_events": {"reason"},
+        "analysis_reports": {"report_json"},
+        "trade_plans": {"plan_json", "sized_json"},
+        "circuit_breaker_state": {"reason"},
+        "startup_reconciliation_state": {"reason", "evidence_json"},
+        "panic_receipts": {"response_json"},
+    }
+    for table_name, field_names in sensitive_fields.items():
+        nullability = {
+            column["name"]: column["nullable"]
+            for column in inspector.get_columns(table_name)
+        }
+        assert all(not nullability[field] for field in field_names if not (
+            table_name == "panic_receipts" and field == "response_json"
+        ))
+        if table_name == "panic_receipts":
+            assert nullability["response_json"] is True
+
+    ingest_columns = {
+        column["name"]
+        for column in inspector.get_columns("untrusted_ingest_events")
+    }
+    assert ingest_columns == {
+        "id",
+        "source_hash",
+        "content_hash",
+        "byte_length",
+        "flags_json",
+        "state",
+        "received_at",
+        "summary_decision_id",
+    }
+    assert not ingest_columns & {
+        "raw_text",
+        "raw_content",
+        "content",
+        "prompt",
+        "response",
+    }
+    assert {
+        index["name"]
+        for index in inspector.get_indexes("candidate_nonces")
+    } >= {
+        "ix_candidate_nonces_expires_at",
+        "ix_candidate_nonces_request_id",
+        "ix_candidate_nonces_consumed_at",
+    }
+    assert {
+        index["name"]
+        for index in inspector.get_indexes("untrusted_ingest_events")
+    } >= {
+        "ix_untrusted_ingest_events_state",
+        "ix_untrusted_ingest_events_received_at",
+        "ix_untrusted_ingest_events_summary_decision_id",
+    }
+
+    with engine.connect() as connection:
+        state = connection.execute(
+            text(
+                "SELECT singleton_id,schema_version,state,rows_total,"
+                "rows_completed,started_at,completed_at "
+                "FROM sensitive_migration_state"
+            )
+        ).one()
+    assert state == (1, 1, "required", 0, 0, None, None)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO sensitive_migration_state "
+        "(singleton_id,schema_version,state,active_key_id,rows_total,"
+        "rows_completed,updated_at) VALUES "
+        "(2,1,'required','valid-key-2026',0,0,CURRENT_TIMESTAMP)",
+        "UPDATE sensitive_migration_state SET rows_total=-1",
+        "UPDATE sensitive_migration_state SET rows_completed=1",
+        "UPDATE sensitive_migration_state SET state='unknown'",
+        "UPDATE sensitive_migration_state SET active_key_id='bad key id'",
+        "UPDATE sensitive_migration_state SET schema_version=0",
+        "INSERT INTO candidate_nonces "
+        "(nonce_hash,actor,kind,expires_at,request_id) VALUES "
+        "('bad','operator','analysis',CURRENT_TIMESTAMP,'request-1')",
+        "INSERT INTO untrusted_ingest_events "
+        "(source_hash,content_hash,byte_length,flags_json,state,received_at) "
+        "VALUES "
+        "('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',"
+        "-1,'[]','received',CURRENT_TIMESTAMP)",
+        "INSERT INTO untrusted_ingest_events "
+        "(source_hash,content_hash,byte_length,flags_json,state,received_at) "
+        "VALUES "
+        "('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',"
+        "1,'not-json','received',CURRENT_TIMESTAMP)",
+    ],
+)
+def test_sensitive_trust_constraints_reject_invalid_state(tmp_path, statement):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / f"invalid-sensitive-{hashlib.sha256(statement.encode()).hexdigest()}.db",
+        "head",
+    )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(text(statement))
+
+
+def test_sensitive_trust_upgrade_and_downgrade_do_not_rewrite_narratives(
+    tmp_path,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "sensitive-no-rewrite.db",
+        "20260727_0012",
+    )
+    original = {
+        "reason": "legacy operator reason remains plaintext for Task 6",
+        "detail": '{"legacy":"audit detail"}',
+        "plan": '{"legacy":"trade plan"}',
+        "sized": '{"legacy":"sized plan"}',
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO audit_events "
+                "(actor,action,target_type,target_id,request_id,"
+                "idempotency_key,reason,result_code,latency_ms,detail_json,"
+                "created_at) VALUES "
+                "('operator:test','legacy','test','1','request-legacy','',"
+                ":reason,'recorded',0,:detail,CURRENT_TIMESTAMP)"
+            ),
+            original,
+        )
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(symbol,action,status,paper_only,shadow,plan_json,sized_json,"
+                "entry_filled_qty,exit_filled_qty,residual_generation,created_at) "
+                "VALUES "
+                "('AAPL','hold','proposed',1,0,:plan,:sized,0,0,0,"
+                "CURRENT_TIMESTAMP)"
+            ),
+            original,
+        )
+
+    command.upgrade(cfg, "head")
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT reason,detail_json FROM audit_events")
+        ).one() == (original["reason"], original["detail"])
+        assert connection.execute(
+            text("SELECT plan_json,sized_json FROM trade_plans")
+        ).one() == (original["plan"], original["sized"])
+
+    command.downgrade(cfg, "20260727_0012")
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0012"
+        assert connection.execute(
+            text("SELECT reason,detail_json FROM audit_events")
+        ).one() == (original["reason"], original["detail"])
+        assert {
+            "sensitive_migration_state",
+            "candidate_nonces",
+            "untrusted_ingest_events",
+        }.isdisjoint(inspect(engine).get_table_names())
 
 
 @pytest.mark.parametrize(
@@ -957,7 +1154,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260727_0012"
+    assert version == "20260727_0013"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -993,7 +1190,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0012"
+        ) == "20260727_0013"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -1034,7 +1231,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260727_0012"
+    assert version == "20260727_0013"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")

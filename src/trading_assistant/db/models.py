@@ -766,6 +766,184 @@ class ProviderReservation(Base):
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
 
 
+class SensitiveMigrationState(Base):
+    """Singleton proof of sensitive-field migration and active-key state."""
+
+    __tablename__ = "sensitive_migration_state"
+    __table_args__ = (
+        CheckConstraint(
+            "singleton_id = 1",
+            name="ck_sensitive_migration_state_singleton",
+        ),
+        CheckConstraint(
+            "schema_version > 0",
+            name="ck_sensitive_migration_state_schema_positive",
+        ),
+        CheckConstraint(
+            "state IN ('required','migrating','complete','rotating','failed')",
+            name="ck_sensitive_migration_state_state",
+        ),
+        CheckConstraint(
+            "length(active_key_id) BETWEEN 8 AND 64 "
+            "AND substr(active_key_id,1,1) GLOB '[A-Za-z0-9]' "
+            "AND active_key_id NOT GLOB '*[^A-Za-z0-9._-]*'",
+            name="ck_sensitive_migration_state_key_id",
+        ),
+        CheckConstraint(
+            "rows_total >= 0 AND rows_completed >= 0 "
+            "AND rows_completed <= rows_total",
+            name="ck_sensitive_migration_state_progress",
+        ),
+        CheckConstraint(
+            "backup_path_hash IS NULL OR "
+            "(length(backup_path_hash) = 64 "
+            "AND backup_path_hash NOT GLOB '*[^0-9a-f]*')",
+            name="ck_sensitive_migration_state_backup_hash",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR "
+            "(started_at IS NOT NULL AND completed_at >= started_at)",
+            name="ck_sensitive_migration_state_timestamp_order",
+        ),
+        CheckConstraint(
+            "(state = 'required' AND started_at IS NULL "
+            "AND completed_at IS NULL AND rows_completed = 0) OR "
+            "(state IN ('migrating','rotating','failed') "
+            "AND started_at IS NOT NULL AND completed_at IS NULL) OR "
+            "(state = 'complete' AND started_at IS NOT NULL "
+            "AND completed_at IS NOT NULL "
+            "AND rows_completed = rows_total "
+            "AND backup_path_hash IS NOT NULL)",
+            name="ck_sensitive_migration_state_lifecycle",
+        ),
+    )
+
+    singleton_id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    schema_version: Mapped[int] = mapped_column(default=1)
+    state: Mapped[str] = mapped_column(
+        String(16),
+        default="required",
+        index=True,
+    )
+    active_key_id: Mapped[str] = mapped_column(String(64))
+    rows_total: Mapped[int] = mapped_column(default=0)
+    rows_completed: Mapped[int] = mapped_column(default=0)
+    backup_path_hash: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utcnow,
+        index=True,
+    )
+
+
+class CandidateNonce(Base):
+    """Hashed, expiring replay protection for untrusted candidate actions."""
+
+    __tablename__ = "candidate_nonces"
+    __table_args__ = (
+        CheckConstraint(
+            "length(nonce_hash) = 64 "
+            "AND nonce_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_nonces_hash",
+        ),
+        CheckConstraint(
+            "length(actor) BETWEEN 1 AND 128",
+            name="ck_candidate_nonces_actor",
+        ),
+        CheckConstraint(
+            "length(kind) BETWEEN 1 AND 32",
+            name="ck_candidate_nonces_kind",
+        ),
+        CheckConstraint(
+            "length(request_id) BETWEEN 1 AND 64",
+            name="ck_candidate_nonces_request_id",
+        ),
+    )
+
+    nonce_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor: Mapped[str] = mapped_column(String(128), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+        index=True,
+    )
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+
+
+class UntrustedIngestEvent(Base):
+    """Metadata-only record; raw external text is never stored."""
+
+    __tablename__ = "untrusted_ingest_events"
+    __table_args__ = (
+        CheckConstraint(
+            "length(source_hash) = 64 "
+            "AND source_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_untrusted_ingest_events_source_hash",
+        ),
+        CheckConstraint(
+            "length(content_hash) = 64 "
+            "AND content_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_untrusted_ingest_events_content_hash",
+        ),
+        CheckConstraint(
+            "byte_length >= 0",
+            name="ck_untrusted_ingest_events_byte_length_nonnegative",
+        ),
+        CheckConstraint(
+            "json_valid(flags_json)",
+            name="ck_untrusted_ingest_events_flags_json",
+        ),
+        CheckConstraint(
+            "state IN ('received','summarized','rejected','failed')",
+            name="ck_untrusted_ingest_events_state",
+        ),
+        CheckConstraint(
+            "state != 'summarized' OR summary_decision_id IS NOT NULL",
+            name="ck_untrusted_ingest_events_summary",
+        ),
+        Index(
+            "ux_untrusted_ingest_source_content",
+            "source_hash",
+            "content_hash",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_hash: Mapped[str] = mapped_column(String(64), index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    byte_length: Mapped[int] = mapped_column()
+    flags_json: Mapped[str] = mapped_column(Text, default="[]")
+    state: Mapped[str] = mapped_column(
+        String(16),
+        default="received",
+        index=True,
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utcnow,
+        index=True,
+    )
+    summary_decision_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("llm_decisions.id"),
+        nullable=True,
+        index=True,
+    )
+
+
 class PanicReceipt(Base):
     __tablename__ = "panic_receipts"
 

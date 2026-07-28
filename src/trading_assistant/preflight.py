@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import datetime
+import re
 from uuid import uuid4
 
 from .config import BrokerKind, TradingMode, load_config
@@ -46,6 +48,118 @@ class StructuralCheck:
     @property
     def passed(self) -> bool:
         return self.status == "passed"
+
+
+class SensitiveEncryptionStateInspector:
+    """Read the singleton encryption state and fail closed on ambiguity."""
+
+    _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
+    _HASH = re.compile(r"[0-9a-f]{64}")
+    _BLOCKED_CODES = {
+        "required": "sensitive_migration_required",
+        "migrating": "sensitive_migration_migrating",
+        "rotating": "sensitive_migration_rotating",
+        "failed": "sensitive_migration_failed",
+    }
+
+    def __init__(
+        self,
+        engine,
+        *,
+        schema_version: int,
+        active_key_id: str,
+    ) -> None:
+        self._engine = engine
+        self._schema_version = schema_version
+        self._active_key_id = active_key_id
+
+    @staticmethod
+    def _blocked(code: str) -> StructuralCheck:
+        return StructuralCheck("encryption", "blocked", code)
+
+    @staticmethod
+    def _timestamp(value: object) -> bool:
+        return isinstance(value, datetime) and value.tzinfo is not None
+
+    def inspect(self) -> StructuralCheck:
+        try:
+            from sqlalchemy import select
+            from sqlalchemy.orm import Session
+
+            from .db.models import SensitiveMigrationState
+
+            with Session(self._engine) as session:
+                rows = session.scalars(
+                    select(SensitiveMigrationState)
+                ).all()
+        except Exception:
+            return self._blocked("sensitive_migration_state_invalid")
+
+        if len(rows) != 1 or rows[0].singleton_id != 1:
+            return self._blocked("sensitive_migration_state_invalid")
+        row = rows[0]
+        if (
+            isinstance(row.schema_version, bool)
+            or not isinstance(row.schema_version, int)
+            or row.schema_version <= 0
+        ):
+            return self._blocked("sensitive_migration_state_invalid")
+        if row.schema_version != self._schema_version:
+            return self._blocked("sensitive_schema_mismatch")
+        if (
+            not isinstance(row.active_key_id, str)
+            or self._KEY_ID.fullmatch(row.active_key_id) is None
+        ):
+            return self._blocked("sensitive_migration_state_invalid")
+        if row.active_key_id != self._active_key_id:
+            return self._blocked("sensitive_active_key_mismatch")
+        if (
+            row.state not in {
+                "required",
+                "migrating",
+                "complete",
+                "rotating",
+                "failed",
+            }
+            or isinstance(row.rows_total, bool)
+            or not isinstance(row.rows_total, int)
+            or isinstance(row.rows_completed, bool)
+            or not isinstance(row.rows_completed, int)
+            or row.rows_total < 0
+            or row.rows_completed < 0
+            or row.rows_completed > row.rows_total
+            or not self._timestamp(row.updated_at)
+        ):
+            return self._blocked("sensitive_migration_state_invalid")
+
+        if row.state == "required":
+            if (
+                row.started_at is not None
+                or row.completed_at is not None
+                or row.rows_completed != 0
+            ):
+                return self._blocked("sensitive_migration_state_invalid")
+            return self._blocked(self._BLOCKED_CODES[row.state])
+
+        if row.state in {"migrating", "rotating", "failed"}:
+            if (
+                not self._timestamp(row.started_at)
+                or row.completed_at is not None
+                or row.started_at > row.updated_at
+            ):
+                return self._blocked("sensitive_migration_state_invalid")
+            return self._blocked(self._BLOCKED_CODES[row.state])
+
+        if (
+            row.rows_completed != row.rows_total
+            or not self._timestamp(row.started_at)
+            or not self._timestamp(row.completed_at)
+            or not row.started_at < row.completed_at <= row.updated_at
+            or not isinstance(row.backup_path_hash, str)
+            or self._HASH.fullmatch(row.backup_path_hash) is None
+        ):
+            return self._blocked("sensitive_migration_state_invalid")
+        return StructuralCheck("encryption", "passed", "ok")
 
 
 def structural_runtime_check(config, secrets: RuntimeSecrets) -> StructuralCheck:

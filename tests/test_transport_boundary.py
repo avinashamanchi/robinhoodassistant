@@ -886,20 +886,31 @@ def test_tls_inspection_rejects_missing_loopback_sans_and_key_mismatch(
     assert "PRIVATE KEY" not in str(exc_info.value)
 
 
-def test_production_encryption_inspector_remains_blocked_until_task_five():
-    """Assuming encryption completion before its DB proof exists would fail open."""
-    from trading_assistant.ops.serve import EncryptionInspectorUnavailable
+def test_production_encryption_inspector_fails_closed_without_singleton(
+    tmp_path,
+):
+    """Missing durable encryption proof must remain a structural blocker."""
+    from trading_assistant.db.models import Base
+    from trading_assistant.db.session import create_db_engine
+    from trading_assistant.preflight import SensitiveEncryptionStateInspector
 
-    assert EncryptionInspectorUnavailable().inspect().code == (
-        "encryption_inspector_unavailable"
+    engine = create_db_engine(f"sqlite:///{tmp_path}/missing-state.db")
+    Base.metadata.create_all(engine)
+
+    assert SensitiveEncryptionStateInspector(
+        engine,
+        schema_version=1,
+        active_key_id="configured-key-2026",
+    ).inspect().code == (
+        "sensitive_migration_state_invalid"
     )
 
 
-def test_startup_guard_never_constructs_app_when_encryption_is_unavailable(
+def test_startup_guard_never_constructs_app_when_encryption_state_is_invalid(
     app_config,
     monkeypatch,
 ):
-    """Bypassing the unavailable inspector would violate the Task 5 sequencing gate."""
+    """Bypassing missing durable DB proof would fail open."""
     from trading_assistant.config import BrokerKind
     from trading_assistant.ops import serve
     from trading_assistant.preflight import StructuralCheck
@@ -932,7 +943,10 @@ def test_startup_guard_never_constructs_app_when_encryption_is_unavailable(
         lambda _secrets: StructuralCheck("database", "passed", "ok"),
     )
 
-    with pytest.raises(serve.StartupGuardBlocked, match="encryption_inspector_unavailable"):
+    with pytest.raises(
+        serve.StartupGuardBlocked,
+        match="sensitive_migration_state_invalid",
+    ):
         serve.run_startup_guard(config=config, secrets=secrets)
 
 

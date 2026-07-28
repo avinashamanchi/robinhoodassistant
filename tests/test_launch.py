@@ -3,26 +3,139 @@ full order lifecycle integration (B2)."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import plistlib
 from types import SimpleNamespace
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 
 from trading_assistant.app.main import create_app
 from trading_assistant.app.errors import ApiError
 from trading_assistant.assets import AssetClass
 from trading_assistant.broker.models import Account, Position
-from trading_assistant.config import Secrets
+from trading_assistant.config import BrokerKind, Secrets
 from trading_assistant.db.models import AuditEvent, Fill, Heartbeat, Order
+from trading_assistant.db.session import create_db_engine
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.operations import MutationContext, OperationsService
 from trading_assistant.operations.health import build_operational_health
 from trading_assistant.risk.breakers import BreakerScope
+
+
+def _sensitive_head_database(tmp_path, name: str) -> str:
+    path = tmp_path / name
+    url = f"sqlite:///{path}"
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, "head")
+    return url
+
+
+def test_startup_guard_uses_database_encryption_inspector_and_blocks_required(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.ops import serve
+    from trading_assistant.preflight import StructuralCheck
+
+    url = _sensitive_head_database(tmp_path, "startup-required.db")
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    engine = create_db_engine(url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE sensitive_migration_state "
+                "SET active_key_id=:active_key_id"
+            ),
+            {"active_key_id": config.encryption.active_key_id},
+        )
+    monkeypatch.setattr(
+        serve,
+        "_tls_check",
+        lambda _config: StructuralCheck("tls", "passed", "ok"),
+    )
+
+    with pytest.raises(serve.StartupGuardBlocked) as captured:
+        serve.run_startup_guard(
+            config=config,
+            secrets=Secrets(
+                database_url=url,
+                app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+            ),
+        )
+
+    codes = {check.code for check in captured.value.checks}
+    assert "sensitive_migration_required" in codes
+    assert "encryption_inspector_unavailable" not in codes
+
+
+def test_startup_guard_allows_only_internally_consistent_complete_encryption(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant.ops import serve
+    from trading_assistant.preflight import StructuralCheck
+
+    url = _sensitive_head_database(tmp_path, "startup-complete.db")
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    now = datetime.now(timezone.utc)
+    engine = create_db_engine(url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE sensitive_migration_state SET "
+                "state='complete',active_key_id=:active_key_id,"
+                "rows_total=0,rows_completed=0,backup_path_hash=:backup_hash,"
+                "started_at=:started_at,completed_at=:completed_at,"
+                "updated_at=:updated_at"
+            ),
+            {
+                "active_key_id": config.encryption.active_key_id,
+                "backup_hash": "a" * 64,
+                "started_at": now - timedelta(minutes=2),
+                "completed_at": now - timedelta(minutes=1),
+                "updated_at": now,
+            },
+        )
+    monkeypatch.setattr(
+        serve,
+        "_tls_check",
+        lambda _config: StructuralCheck("tls", "passed", "ok"),
+    )
+
+    checks = serve.run_startup_guard(
+        config=config,
+        secrets=Secrets(
+            database_url=url,
+            app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+        ),
+    )
+
+    assert all(check.passed for check in checks)
+    assert any(
+        check.name == "encryption" and check.code == "ok"
+        for check in checks
+    )
 
 
 def test_stop_uses_only_cooperative_control_and_never_targets_a_pid():

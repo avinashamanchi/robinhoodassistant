@@ -17,7 +17,11 @@ from sqlalchemy import text
 from ..config import load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine
-from ..preflight import StructuralCheck, structural_runtime_check
+from ..preflight import (
+    SensitiveEncryptionStateInspector,
+    StructuralCheck,
+    structural_runtime_check,
+)
 from ..security.secrets import RuntimeSecrets, load_role_secrets
 from ..security.transport import TransportPolicy
 from .control import start_app_control
@@ -25,20 +29,9 @@ from .tls import TLSMaterialError, validate_tls_material
 
 
 class EncryptionStateInspector(Protocol):
-    """Task 5 replaces this injected structural dependency with DB-backed proof."""
+    """Injectable encryption-state proof for focused local tests."""
 
     def inspect(self) -> StructuralCheck: ...
-
-
-class EncryptionInspectorUnavailable:
-    """Fail closed until Task 5 supplies durable encryption completion proof."""
-
-    def inspect(self) -> StructuralCheck:
-        return StructuralCheck(
-            "encryption",
-            "blocked",
-            "encryption_inspector_unavailable",
-        )
 
 
 class StartupGuardBlocked(RuntimeError):
@@ -102,13 +95,34 @@ def run_startup_guard(
                 StructuralCheck("keychain", "blocked", "keychain_unavailable"),
             )
             raise StartupGuardBlocked(checks) from None
-    inspector = encryption_inspector or EncryptionInspectorUnavailable()
+    if encryption_inspector is None:
+        try:
+            encryption_check = SensitiveEncryptionStateInspector(
+                create_db_engine(secrets.database_url),
+                schema_version=config.encryption.schema_version,
+                active_key_id=config.encryption.active_key_id,
+            ).inspect()
+        except Exception:
+            encryption_check = StructuralCheck(
+                "encryption",
+                "blocked",
+                "sensitive_migration_state_invalid",
+            )
+    else:
+        try:
+            encryption_check = encryption_inspector.inspect()
+        except Exception:
+            encryption_check = StructuralCheck(
+                "encryption",
+                "blocked",
+                "sensitive_migration_state_invalid",
+            )
     checks = (
         structural_runtime_check(config, secrets),
         _transport_check(config),
         _tls_check(config),
         _database_check(secrets),
-        inspector.inspect(),
+        encryption_check,
     )
     if any(not check.passed for check in checks):
         raise StartupGuardBlocked(checks)
