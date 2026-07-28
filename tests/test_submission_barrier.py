@@ -1032,6 +1032,8 @@ def _counted_submission_process(
     pause_after_first_evaluation,
     snapshot_evaluated,
     release_evaluation,
+    process_ready,
+    begin_submission,
     main_lock_attempted,
     broker_entered,
     outcome,
@@ -1072,6 +1074,9 @@ def _counted_submission_process(
         main_lock_attempted,
     )
     try:
+        process_ready.set()
+        if not begin_submission.wait(timeout=10):
+            raise TimeoutError("test did not start counted submission")
         result = _submit(service, order_id)
         outcome.put(("ok", result.status.value, risk.calls))
     except BaseException as exc:
@@ -1450,6 +1455,38 @@ def _join(process, *release_events) -> None:
         process.join(timeout=5)
         pytest.fail(f"process {process.name} did not terminate")
     assert process.exitcode == 0
+
+
+def _wait_for_process_checkpoints(
+    processes,
+    checkpoints,
+    *,
+    phase,
+) -> None:
+    """Wait for exact child state, using time only as a deadlock watchdog."""
+    pending = set(range(len(checkpoints)))
+    deadline = time.monotonic() + 10
+    while pending:
+        for index in tuple(pending):
+            if checkpoints[index].is_set():
+                pending.remove(index)
+                continue
+            exitcode = processes[index].exitcode
+            if exitcode is not None:
+                processes[index].join()
+                pytest.fail(
+                    f"{processes[index].name} exited with {exitcode} "
+                    f"before {phase}"
+                )
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            waiting = ", ".join(
+                processes[index].name for index in sorted(pending)
+            )
+            pytest.fail(f"timed out waiting for {phase}: {waiting}")
+        checkpoints[next(iter(pending))].wait(timeout=min(0.05, remaining))
 
 
 @pytest.mark.parametrize(
@@ -2822,12 +2859,16 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
     release_active = context.Event()
     processes = []
     snapshots = []
+    process_ready = []
+    begin_submissions = []
     main_attempts = []
     broker_calls = []
     outcomes = []
 
     for index, order_id in enumerate(order_ids):
         snapshot_evaluated = context.Event()
+        ready = context.Event()
+        begin_submission = context.Event()
         main_lock_attempted = context.Event()
         broker_entered = context.Event()
         outcome = context.Queue()
@@ -2839,6 +2880,8 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
                 index == 0,
                 snapshot_evaluated,
                 release_active,
+                ready,
+                begin_submission,
                 main_lock_attempted,
                 broker_entered,
                 outcome,
@@ -2846,24 +2889,37 @@ def test_submission_waiters_make_progress_without_invalidating_active_submission
         )
         processes.append(process)
         snapshots.append(snapshot_evaluated)
+        process_ready.append(ready)
+        begin_submissions.append(begin_submission)
         main_attempts.append(main_lock_attempted)
         broker_calls.append(broker_entered)
         outcomes.append(outcome)
 
+    begin_submissions[0].set()
     processes[0].start()
     assert snapshots[0].wait(timeout=10)
     for process in processes[1:]:
         process.start()
-    followers_reached_main = [
-        event.wait(timeout=2) for event in main_attempts[1:]
-    ]
     try:
+        _wait_for_process_checkpoints(
+            processes[1:],
+            process_ready[1:],
+            phase="follower initialization",
+        )
+        for begin_submission in begin_submissions[1:]:
+            begin_submission.set()
+        _wait_for_process_checkpoints(
+            processes[1:],
+            main_attempts[1:],
+            phase="follower main-lock attempts",
+        )
         release_active.set()
     finally:
+        for begin_submission in begin_submissions:
+            begin_submission.set()
         for process in processes:
             _join(process, release_active)
 
-    assert all(followers_reached_main)
     assert [queue.get(timeout=2) for queue in outcomes] == [
         ("ok", OrderStatus.SUBMITTED.value, 1)
         for _order_id in order_ids
@@ -2885,12 +2941,16 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
     release_active = context.Event()
     submissions = []
     snapshots = []
+    process_ready = []
+    begin_submissions = []
     main_attempts = []
     broker_calls = []
     submission_outcomes = []
 
     for index, order_id in enumerate(order_ids):
         snapshot_evaluated = context.Event()
+        ready = context.Event()
+        begin_submission = context.Event()
         main_lock_attempted = context.Event()
         broker_entered = context.Event()
         outcome = context.Queue()
@@ -2902,6 +2962,8 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
                 index == 0,
                 snapshot_evaluated,
                 release_active,
+                ready,
+                begin_submission,
                 main_lock_attempted,
                 broker_entered,
                 outcome,
@@ -2909,17 +2971,29 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
         )
         submissions.append(process)
         snapshots.append(snapshot_evaluated)
+        process_ready.append(ready)
+        begin_submissions.append(begin_submission)
         main_attempts.append(main_lock_attempted)
         broker_calls.append(broker_entered)
         submission_outcomes.append(outcome)
 
+    begin_submissions[0].set()
     submissions[0].start()
     assert snapshots[0].wait(timeout=10)
     for submission in submissions[1:]:
         submission.start()
-    followers_reached_main = [
-        event.wait(timeout=2) for event in main_attempts[1:]
-    ]
+    _wait_for_process_checkpoints(
+        submissions[1:],
+        process_ready[1:],
+        phase="follower initialization",
+    )
+    for begin_submission in begin_submissions[1:]:
+        begin_submission.set()
+    _wait_for_process_checkpoints(
+        submissions[1:],
+        main_attempts[1:],
+        phase="follower main-lock attempts",
+    )
 
     writer_started = context.Event()
     writer_intent_acquired = context.Event()
@@ -2936,17 +3010,25 @@ def test_real_writer_has_priority_over_queued_submission_waiters_without_deadloc
         ),
     )
     writer.start()
-    assert writer_started.wait(timeout=10)
-    writer_advertised_before_release = writer_intent_acquired.wait(timeout=2)
     try:
+        _wait_for_process_checkpoints(
+            [writer],
+            [writer_started],
+            phase="writer initialization",
+        )
+        _wait_for_process_checkpoints(
+            [writer],
+            [writer_intent_acquired],
+            phase="writer intent acquisition",
+        )
         release_active.set()
     finally:
+        for begin_submission in begin_submissions:
+            begin_submission.set()
         for submission in submissions:
             _join(submission, release_active)
         _join(writer)
 
-    assert all(followers_reached_main)
-    assert writer_advertised_before_release is True
     assert writer_outcome.get(timeout=2) == ("ok", "breaker")
     assert writer_finished.is_set() is True
     assert service.breakers.is_tripped(

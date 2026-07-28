@@ -26,7 +26,9 @@ from trading_assistant.db.session import (
     make_session_factory,
 )
 from trading_assistant.ops.backup import (
+    EncryptedBackupError,
     backup_database,
+    list_committed_backups,
     main as backup_main,
     read_encrypted_backup_header,
 )
@@ -34,6 +36,7 @@ from trading_assistant.ops.paper_drill import PaperDrillError, run_paper_drill
 from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
+    RuntimeTenureGuard,
     RuntimeTenureService,
     TenureUnavailable,
 )
@@ -117,7 +120,8 @@ def test_operational_backup_is_encrypted_for_every_migration_state(
     assert b"SQLite format 3" not in encrypted
     assert BACKUP_MARKER not in encrypted
     assert list(destination.glob("*.sqlite3")) == []
-    assert not any(path.name.startswith(".") for path in destination.iterdir())
+    assert list_committed_backups(destination) == (artifact,)
+    assert (destination / f".{artifact.name}.pending").samefile(artifact)
     assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
     assert stat.S_IMODE(destination.stat().st_mode) == 0o700
 
@@ -159,7 +163,7 @@ def test_large_operational_backup_completes_without_source_renewal_livelock(
     ] == receipt.source_sha256
     wal = source.with_name(f"{source.name}-wal")
     assert not wal.exists() or wal.stat().st_size < 1_048_576
-    assert not any(path.name.startswith(".") for path in destination.iterdir())
+    assert list_committed_backups(destination) == (receipt.path,)
 
 
 def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
@@ -171,6 +175,8 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
         / "20000101T000000000000Z-whole-database-v1.sqlite3.aesgcm"
     )
     old_match.write_bytes(b"old-encrypted-artifact")
+    old_anchor = destination / f".{old_match.name}.pending"
+    os.link(old_match, old_anchor)
     unrelated = destination / "keep-me.aesgcm"
     unrelated.write_bytes(b"unrelated")
     old_time = time.time() - 30 * 86400
@@ -189,6 +195,7 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
 
     assert receipt.path.exists()
     assert not old_match.exists()
+    assert not old_anchor.exists()
     assert unrelated.exists()
 
 
@@ -219,6 +226,42 @@ def test_operational_backup_requires_exclusive_maintenance_tenure(tmp_path):
 
     assert captured.value.stable_code == "runtime_tenure_active"
     assert not destination.exists() or list(destination.iterdir()) == []
+
+
+def test_operational_backup_release_uncertainty_never_commits_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    source = _operational_database(tmp_path, "required")
+    destination = tmp_path / "release-uncertain-backups"
+    original_close = RuntimeTenureGuard.close
+
+    def close_but_lose_confirmation(guard):
+        assert original_close(guard) is True
+        return False
+
+    monkeypatch.setattr(
+        RuntimeTenureGuard,
+        "close",
+        close_but_lose_confirmation,
+    )
+
+    with pytest.raises(
+        EncryptedBackupError,
+        match="^backup_tenure_release_uncertain$",
+    ):
+        backup_database(
+            source,
+            destination,
+            retention_days=14,
+            backup_key=BACKUP_KEY,
+            backup_key_id=BACKUP_KEY_ID,
+            process_identity=BACKUP_IDENTITY,
+            process_inspector=_OfflineInspector(),
+        )
+
+    assert list_committed_backups(destination) == ()
+    assert not tuple(destination.glob("*.aesgcm"))
 
 
 def test_operational_backup_cli_prints_only_stable_encrypted_receipt(

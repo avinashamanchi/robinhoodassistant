@@ -10,6 +10,7 @@ import sqlalchemy as sa
 
 from trading_assistant.db.migration_authority import (
     assert_migration_authority,
+    migration_schema_fence,
 )
 
 revision = "20260727_0015"
@@ -70,12 +71,11 @@ def upgrade() -> None:
     connection = op.get_bind()
     attributes = op.get_context().config.attributes
     authority = attributes.get("migration_authority")
-    authority = assert_migration_authority(
+    assert_migration_authority(
         authority,
         connection,
         allowed_modes=frozenset({"bootstrap", "maintenance"}),
     )
-    authority.assert_owned(connection)
 
     with op.batch_alter_table("trade_plans") as batch:
         batch.add_column(
@@ -101,8 +101,12 @@ def upgrade() -> None:
             "AND authority_digest NOT GLOB '*[^0-9a-f]*')",
         )
 
-    authority.assert_owned(connection)
-    with authority.schema_fence(connection):
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"bootstrap", "maintenance"}),
+    )
+    with migration_schema_fence(authority, connection):
         with op.batch_alter_table(
             "runtime_tenures",
             recreate="always",
@@ -131,19 +135,22 @@ def upgrade() -> None:
                 "ck_runtime_tenures_lifecycle",
                 _RUNTIME_LIFECYCLE,
             )
-    authority.assert_owned(connection)
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"bootstrap", "maintenance"}),
+    )
 
 
 def downgrade() -> None:
     connection = op.get_bind()
     attributes = op.get_context().config.attributes
     authority = attributes.get("migration_authority")
-    authority = assert_migration_authority(
+    assert_migration_authority(
         authority,
         connection,
         allowed_modes=frozenset({"maintenance"}),
     )
-    authority.assert_owned(connection)
     if connection.dialect.name != "sqlite":
         raise RuntimeError("runtime_tenure_downgrade_blocked")
     try:
@@ -184,8 +191,12 @@ def downgrade() -> None:
         )
     )
 
-    authority.assert_owned(connection)
-    with authority.schema_fence(connection):
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"maintenance"}),
+    )
+    with migration_schema_fence(authority, connection):
         with op.batch_alter_table(
             "runtime_tenures",
             recreate="always",
@@ -215,7 +226,11 @@ def downgrade() -> None:
                 _OLD_RUNTIME_LIFECYCLE,
             )
 
-    authority.assert_owned(connection)
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"maintenance"}),
+    )
     with op.batch_alter_table("trade_plans") as batch:
         batch.drop_constraint(
             "ck_trade_plans_authority_evidence",
@@ -223,4 +238,8 @@ def downgrade() -> None:
         )
         batch.drop_column("authority_digest")
         batch.drop_column("authority_version")
-    authority.assert_owned(connection)
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"maintenance"}),
+    )

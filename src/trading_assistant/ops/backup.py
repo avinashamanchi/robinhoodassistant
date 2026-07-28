@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import struct
 import tempfile
 import time
@@ -45,6 +46,11 @@ _TAG_BYTES = 16
 _CHUNK_BYTES = 1_048_576
 _MAX_HEADER_BYTES = 4096
 _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
+_COMMITTED_NAME = re.compile(
+    r"^\d{8}T\d{12}Z-"
+    r"(before-sensitive-v1|whole-database-v1)"
+    r"\.sqlite3\.aesgcm$"
+)
 
 
 class EncryptedBackupError(RuntimeError):
@@ -154,6 +160,99 @@ def _unlink_private_temp(path: Path | None) -> None:
     path.with_name(f"{path.name}-shm").unlink(missing_ok=True)
 
 
+def _pending_anchor(path: Path) -> Path:
+    return path.with_name(f".{path.name}.pending")
+
+
+def _is_committed_artifact(path: Path) -> bool:
+    if _COMMITTED_NAME.fullmatch(path.name) is None:
+        return False
+    anchor = _pending_anchor(path)
+    try:
+        artifact_stat = path.lstat()
+        anchor_stat = anchor.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(artifact_stat.st_mode)
+        and stat.S_ISREG(anchor_stat.st_mode)
+        and artifact_stat.st_dev == anchor_stat.st_dev
+        and artifact_stat.st_ino == anchor_stat.st_ino
+    )
+
+
+def _open_committed_artifact(path: Path):
+    if _COMMITTED_NAME.fullmatch(path.name) is None:
+        raise EncryptedBackupError("encrypted_backup_not_committed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        artifact_stat = os.fstat(descriptor)
+        anchor_stat = _pending_anchor(path).lstat()
+        if not (
+            stat.S_ISREG(artifact_stat.st_mode)
+            and stat.S_ISREG(anchor_stat.st_mode)
+            and artifact_stat.st_dev == anchor_stat.st_dev
+            and artifact_stat.st_ino == anchor_stat.st_ino
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_not_committed"
+            )
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+        return handle
+    except EncryptedBackupError:
+        raise
+    except OSError:
+        raise EncryptedBackupError(
+            "encrypted_backup_not_committed"
+        ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def list_committed_backups(
+    destination_dir: str | Path,
+    *,
+    artifact_label: Literal[
+        "before-sensitive-v1",
+        "whole-database-v1",
+    ]
+    | None = None,
+) -> tuple[Path, ...]:
+    """List only artifacts that crossed the atomic commit boundary."""
+
+    directory = Path(destination_dir).expanduser()
+    if not directory.exists():
+        return ()
+    if (
+        not directory.is_dir()
+        or directory.is_symlink()
+        or artifact_label
+        not in {
+            None,
+            "before-sensitive-v1",
+            "whole-database-v1",
+        }
+    ):
+        raise EncryptedBackupError("backup_directory_invalid")
+    suffix = (
+        None
+        if artifact_label is None
+        else f"-{artifact_label}.sqlite3.aesgcm"
+    )
+    return tuple(
+        sorted(
+            candidate
+            for candidate in directory.iterdir()
+            if (suffix is None or candidate.name.endswith(suffix))
+            and _is_committed_artifact(candidate)
+        )
+    )
+
+
 def _private_temp(directory: Path, prefix: str) -> Path:
     descriptor, name = tempfile.mkstemp(prefix=prefix, dir=directory)
     try:
@@ -241,8 +340,9 @@ def _parse_header_stream(handle) -> tuple[dict[str, object], bytes, bytes]:
 
 def read_encrypted_backup_header(path: str | Path) -> dict[str, object]:
     """Return only canonical non-secret metadata from an encrypted artifact."""
+    artifact = Path(path)
     try:
-        with Path(path).open("rb") as handle:
+        with _open_committed_artifact(artifact) as handle:
             header, _nonce, _aad = _parse_header_stream(handle)
         return header
     except EncryptedBackupError:
@@ -264,6 +364,7 @@ def create_encrypted_database_backup(
     ensure_maintenance: Callable[[], None] | None = None,
     maintenance: BackupMaintenance | None = None,
     stage_hook: Callable[[str], None] | None = None,
+    before_commit: Callable[[], None] | None = None,
     artifact_label: Literal[
         "before-sensitive-v1",
         "whole-database-v1",
@@ -320,8 +421,9 @@ def create_encrypted_database_backup(
     encrypted_temp: Path | None = None
     verification: Path | None = None
     target: Path | None = None
-    published = False
-    succeeded = False
+    anchor: Path | None = None
+    anchor_created = False
+    committed = False
     directory: Path | None = None
     try:
         source_path = Path(source).expanduser().resolve(strict=True)
@@ -493,23 +595,39 @@ def create_encrypted_database_backup(
         if check != ("ok",):
             raise EncryptedBackupError("encrypted_backup_quick_check_failed")
         hook("quick_check_complete")
+        maintain()
 
         stamp = created.strftime("%Y%m%dT%H%M%S%fZ")
         target = directory / f"{stamp}-{artifact_label}.sqlite3.aesgcm"
-        maintain()
+        anchor = _pending_anchor(target)
+        if (
+            target.exists()
+            or target.is_symlink()
+            or anchor.exists()
+            or anchor.is_symlink()
+        ):
+            raise EncryptedBackupError("encrypted_backup_exists")
+
+        # Every cleanup-prone operation happens while the artifact is still
+        # private. The encrypted anchor intentionally remains after success;
+        # the final hard link is the single public commit point.
+        _unlink_private_temp(snapshot)
+        snapshot = None
+        _unlink_private_temp(verification)
+        verification = None
         try:
-            os.link(encrypted_temp, target, follow_symlinks=False)
+            os.link(encrypted_temp, anchor, follow_symlinks=False)
         except FileExistsError:
             raise EncryptedBackupError("encrypted_backup_exists") from None
-        published = True
-        _fsync_directory(directory)
-        hook("artifact_published")
-        maintain()
+        anchor_created = True
         _unlink_private_temp(encrypted_temp)
         encrypted_temp = None
         _fsync_directory(directory)
-        succeeded = True
-        return EncryptedBackupReceipt(
+        hook("before_artifact_commit")
+        maintain()
+        if before_commit is not None:
+            invoke(before_commit)
+        receipt = EncryptedBackupReceipt(
             path=target,
             path_hash=hashlib.sha256(
                 str(target).encode("utf-8")
@@ -520,25 +638,69 @@ def create_encrypted_database_backup(
             backup_key_id=backup_key_id,
             verified=True,
         )
+        try:
+            os.link(anchor, target, follow_symlinks=False)
+        except FileExistsError:
+            raise EncryptedBackupError("encrypted_backup_exists") from None
+        committed = True
+        return receipt
     except BaseException as exc:
+        cleanup_failure: BaseException | None = None
+        if not committed:
+            for private_path in (
+                snapshot,
+                encrypted_temp,
+                verification,
+                anchor if anchor_created else None,
+            ):
+                try:
+                    _unlink_private_temp(private_path)
+                except BaseException as cleanup_exc:
+                    if cleanup_failure is None:
+                        cleanup_failure = cleanup_exc
         if isinstance(exc, _MaintenanceCallbackFailure):
-            raise exc.cause
-        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-            raise
-        if isinstance(exc, EncryptedBackupError):
-            raise
-        raise EncryptedBackupError("encrypted_backup_failed") from None
-    finally:
-        _unlink_private_temp(snapshot)
-        _unlink_private_temp(encrypted_temp)
-        _unlink_private_temp(verification)
-        if published and not succeeded and target is not None:
-            try:
-                target.unlink(missing_ok=True)
-                if directory is not None:
-                    _fsync_directory(directory)
-            except OSError:
-                pass
+            failure = exc.cause
+        elif isinstance(
+            exc,
+            (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+        ):
+            failure = exc
+        elif isinstance(exc, EncryptedBackupError):
+            failure = exc
+        else:
+            failure = EncryptedBackupError("encrypted_backup_failed")
+        if cleanup_failure is not None:
+            raise failure from cleanup_failure
+        raise failure from None
+
+
+def _prune_committed_backups(
+    destination_dir: str | Path,
+    *,
+    artifact_label: Literal[
+        "before-sensitive-v1",
+        "whole-database-v1",
+    ],
+    cutoff: float,
+) -> None:
+    destination = Path(destination_dir).expanduser()
+    if not destination.exists():
+        return
+    removed = False
+    for candidate in list_committed_backups(
+        destination,
+        artifact_label=artifact_label,
+    ):
+        if candidate.stat().st_mtime >= cutoff:
+            continue
+        # Removing the anchor first atomically makes the public name
+        # uncommitted even if the second unlink is interrupted.
+        _pending_anchor(candidate).unlink()
+        _fsync_directory(destination.resolve(strict=True))
+        candidate.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(destination.resolve(strict=True))
 
 
 def backup_database(
@@ -591,7 +753,25 @@ def backup_database(
         ttl_seconds=30,
     )
     primary_failure = False
+    released = False
+    disposed = False
+
+    def release_before_commit() -> None:
+        nonlocal released, disposed
+        if not guard.close():
+            raise EncryptedBackupError(
+                "backup_tenure_release_uncertain"
+            )
+        released = True
+        engine.dispose()
+        disposed = True
+
     try:
+        _prune_committed_backups(
+            destination_dir,
+            artifact_label="whole-database-v1",
+            cutoff=time.time() - retention_days * 86400,
+        )
         receipt = create_encrypted_database_backup(
             source_path,
             destination_dir,
@@ -601,32 +781,20 @@ def backup_database(
             now=now,
             maintenance=maintenance,
             artifact_label="whole-database-v1",
+            before_commit=release_before_commit,
         )
     except BaseException:
         primary_failure = True
         raise
     finally:
-        released = guard.close()
-        engine.dispose()
-        if not released and not primary_failure:
-            raise EncryptedBackupError(
-                "backup_tenure_release_uncertain"
-            )
-
-    destination = Path(destination_dir).expanduser().resolve(strict=True)
-    cutoff = time.time() - retention_days * 86400
-    removed = False
-    for candidate in destination.glob(
-        "*-whole-database-v1.sqlite3.aesgcm"
-    ):
-        if (
-            candidate != receipt.path
-            and candidate.stat().st_mtime < cutoff
-        ):
-            candidate.unlink()
-            removed = True
-    if removed:
-        _fsync_directory(destination)
+        if not released and not guard.closed:
+            close_result = guard.close()
+            if not close_result and not primary_failure:
+                raise EncryptedBackupError(
+                    "backup_tenure_release_uncertain"
+                )
+        if not disposed:
+            engine.dispose()
     return receipt
 
 

@@ -41,6 +41,7 @@ from trading_assistant.ops.backup import (
     EncryptedBackupError,
     create_encrypted_database_backup,
     guarded_backup_maintenance,
+    list_committed_backups,
     read_encrypted_backup_header,
 )
 from trading_assistant.ops.encrypt_sensitive import (
@@ -296,7 +297,10 @@ def test_encrypted_backup_is_verified_private_and_contains_no_sqlite_markers(
     }
     assert receipt.verified is True
     assert receipt.path_hash != receipt.source_sha256
-    assert list(destination.iterdir()) == [artifact]
+    assert list_committed_backups(destination) == (artifact,)
+    pending = destination / f".{artifact.name}.pending"
+    assert pending.exists()
+    assert pending.samefile(artifact)
 
 
 def test_backup_streams_more_than_two_mebibytes_in_bounded_chunks(tmp_path):
@@ -339,9 +343,9 @@ def test_backup_final_path_is_absent_until_private_verification_completes(
     assert published_during_verification
     assert set(published_during_verification.values()) == {()}
     assert stages.index("quick_check_complete") < stages.index(
-        "artifact_published"
+        "before_artifact_commit"
     )
-    assert tuple(destination.iterdir()) == (receipt.path,)
+    assert list_committed_backups(destination) == (receipt.path,)
 
 
 def test_ownership_loss_during_private_verification_never_publishes(
@@ -555,7 +559,7 @@ def test_backup_refuses_overwrite_and_preserves_first_artifact(tmp_path):
 
     assert exc.value.stable_code == "encrypted_backup_exists"
     assert first.path.read_bytes() == original
-    assert list(destination.iterdir()) == [first.path]
+    assert list_committed_backups(destination) == (first.path,)
 
 
 @pytest.mark.parametrize(
@@ -566,7 +570,7 @@ def test_backup_refuses_overwrite_and_preserves_first_artifact(tmp_path):
         "header_written",
         "encrypt_chunk",
         "ciphertext_fsynced",
-        "artifact_published",
+        "before_artifact_commit",
         "verification_opened",
         "decrypt_chunk",
         "verification_hashed",
@@ -601,7 +605,7 @@ def test_backup_cancellation_removes_plaintext_and_unpublished_artifact(
     _seed_database(source)
 
     def cancel(stage: str) -> None:
-        if stage == "artifact_published":
+        if stage == "before_artifact_commit":
             raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
