@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (review fix round 4)
+# Task 6 report — COMPLETE (review fix round 5/5)
 
 ## Status and safety boundary
 
@@ -804,3 +804,166 @@
   reviewed isolated-copy procedure.
 - The sole test warning is an upstream deprecation unrelated to migration
   authority, backup publication, approval, execution safety, or broker truth.
+
+## Review fix round 5/5
+
+### Status, scope, and commit
+
+- Round-5 baseline:
+  `b100c349a9c26d66b9006f2a83b57e07071a715e`.
+- Round-5 implementation commit:
+  `9f520f6894212a3c46bb27163adda8abba002b2c`
+  (`fix(security): close Task 6 round 5 finding`).
+- Work was performed directly in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- Every database probe used a pytest-created temporary SQLite database. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  operational processes, network, external services, brokers/providers,
+  notifications, the real app/daemon/MCP, breakers, and order APIs were not
+  accessed.
+
+### Finding closure
+
+- Backup publication is now an explicit recoverable two-phase commit. Every
+  artifact has a hidden, pre-existing, fixed-size commit-state file containing
+  a canonical checksummed record. The record binds the artifact name,
+  transaction ID, artifact device/inode/size, state-file device/inode, phase,
+  and monotonic generation.
+- State records have exactly three legal generations:
+  `PENDING:0`, `COMMITTED:1`, and `RETIRED:2`. Files are opened with
+  `O_NOFOLLOW` and synchronous write flags, locked exclusively for transitions
+  and shared for readers, written with one fixed-size `pwrite`, and explicitly
+  fsynced. Torn, corrupt, malformed, copied, wrong-name, wrong-inode,
+  wrong-size, missing, symlinked, or replaced state fails closed.
+- The encrypted data file is fsynced before its hidden anchor is linked.
+  Anchor publication and removal of the private name are directory-fsynced.
+  The PENDING state file is then created exclusively, file-fsynced, read-back
+  verified, and directory-fsynced before any public artifact name exists.
+- The public target is linked while the authoritative record is still
+  PENDING. Its parent directory is fsynced before the fixed, pre-existing state
+  record transitions to COMMITTED. Official listing and header readers require
+  a valid COMMITTED record plus exact target/anchor/state inode agreement;
+  target plus anchor alone is never sufficient.
+- Reader shared locks cannot cross the writer's exclusive transition lock.
+  The state descriptor uses synchronous writes and explicit fsync, so readers
+  cannot observe COMMITTED before the durability syscall completes. There is
+  no post-COMMITTED hook, maintenance check, state readback, deletion, or other
+  application-level fallible action.
+- If a commit syscall or descriptor cleanup reports an exception after the
+  durable state transition, publication reconciles against the exact
+  transaction's authoritative record. Valid COMMITTED returns the already
+  verified receipt; PENDING, torn, corrupt, mismatched, missing, or unknown
+  state never becomes officially visible and the original cancellation or
+  failure propagates.
+- Failure cleanup is limited to explicitly tracked private paths and exact
+  device/inode identities. Cleanup success is not part of the safety proof:
+  ambiguous target links and crash images can remain on disk while PENDING or
+  invalid state keeps listing and header reads fail closed. Unrelated or
+  attacker-controlled names are never broadly deleted.
+- Retention first performs and fsyncs the exact COMMITTED-to-RETIRED state
+  transition. Only then does it remove the exact artifact and anchor, fsync the
+  directory, remove the exact state file, and fsync again. Any partial deletion
+  remains officially uncommitted. Legacy target-plus-anchor artifacts without
+  state are ignored and preserved rather than silently adopted or pruned.
+- The existing codebase has no encrypted-backup restore entry point. Its two
+  official consumers—listing and canonical header reads—both enforce the new
+  state protocol; direct internal backup callers receive a receipt only after
+  durable COMMITTED publication.
+
+### Changed files
+
+- Protocol implementation:
+  `src/trading_assistant/ops/backup.py`.
+- Adversarial and retention coverage:
+  new `tests/test_task6_round5.py` and updated `tests/test_ops.py`.
+
+### Round-5 TDD and adversarial evidence
+
+- Initial focused RED:
+  `12 failed in 0.19s`. The failures reproduced the real-link-then-cancel
+  exposure, absent post-link directory fsync, absent commit record,
+  state-independent listing/header reads, absent crash boundaries,
+  anchor-only retention, and absent unique state ownership.
+- First protocol GREEN:
+  `12 passed in 0.16s`.
+- A second focused RED proved that a fallible state readback still occurred
+  after the COMMITTED write and fsync:
+  `1 failed`. Removing post-COMMITTED readback made the exact test
+  `1 passed`.
+- A third focused RED supplied a correctly checksummed record with an
+  unhashable malformed phase. Listing raised `TypeError` instead of failing
+  closed. Exact type validation made the probe `1 passed`.
+- Additional adversarial coverage proves:
+  real `os.link` followed by `CancelledError` with all owned cleanup blocked;
+  target-directory fsync refusal; full durable commit write followed by
+  exception and receipt reconciliation; torn commit write with cleanup blocked;
+  missing, corrupt, torn, malformed, copied, mismatched, and inode-replaced
+  state; crash images after every PENDING/link/directory-fsync boundary;
+  deterministic reader blocking through commit fsync; exact retention
+  uncommit-before-delete; unrelated-file preservation; and concurrent
+  same-name collision with exactly one artifact/state transaction.
+- The four highest-risk link/commit/reader/collision probes passed twenty
+  bounded repetitions each:
+  `80/80 passed`.
+- Final complete Task-6-focused convergence:
+  `407 passed in 81.44s (0:01:21)`.
+
+### Final release gates
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan found no trailing whitespace and no
+  missing final newline.
+
+### Full-suite chronology
+
+- Original Task 6:
+  `2546 passed, 1 skipped, 1 warning in 326.97s (0:05:26)`.
+- Review fix round 1:
+  `2 failed, 2615 passed, 1 skipped, 1 warning in 350.54s (0:05:50)`.
+  Both failures were stale test fixtures; their exact and adjacent focused
+  repairs passed, and the then-active exactly-one rule correctly prevented a
+  rerun.
+- Review fix round 2:
+  `2645 passed, 1 skipped, 1 warning in 370.17s (0:06:10)`.
+- Review fix round 3:
+  `2656 passed, 1 skipped, 1 warning in 377.03s (0:06:17)`.
+- Review fix round 4 first run:
+  `2 failed, 2675 passed, 1 skipped, 1 warning in 432.88s (0:07:12)`.
+  The failures were brittle spawned-child readiness timing assertions.
+- Review fix round 4, after explicit authorization for one confirmation run:
+  `2677 passed, 1 skipped, 1 warning in 398.82s (0:06:38)`.
+- Review fix round 5 used exactly one final credential-stripped full suite
+  after every focused and release gate was green:
+  `2695 passed, 1 skipped, 1 warning in 225.51s (0:03:45)`.
+- Every listed suite removed real database, Alpaca, Robinhood, LLM/provider,
+  market-data, notification, candidate-signing, field-encryption,
+  backup-encryption, live-confirmation, Composio, Octen, and OpenAI credential
+  variables as applicable. The skip is the opt-in real Alpaca paper
+  integration. The warning is the existing third-party `websockets.legacy`
+  deprecation.
+- No source or test changed after the round-5 full-suite result. Only this
+  report, the progress ledger, and generated review artifact were changed for
+  the evidence commit.
+
+### Round-5 remaining caveats
+
+- No known production correctness or safety defect remains from the final
+  atomicity finding.
+- Legacy backup names created before round 5 do not have authoritative state
+  records and are intentionally invisible to official readers and automatic
+  retention. Recovery or adoption requires a separately reviewed,
+  authenticate-before-adopt procedure; this round does not silently trust
+  them.
+- In-place production migration of a non-empty schema that predates durable
+  `runtime_tenures` remains intentionally refused and requires the separately
+  reviewed isolated-copy procedure.
+- The sole test warning is an upstream deprecation unrelated to backup
+  publication, migration authority, approval, execution safety, or broker
+  truth.
