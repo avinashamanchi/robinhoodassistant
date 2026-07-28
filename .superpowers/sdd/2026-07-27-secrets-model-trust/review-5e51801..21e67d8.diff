@@ -1,0 +1,405 @@
+diff --git a/src/trading_assistant/ops/backup_transaction.py b/src/trading_assistant/ops/backup_transaction.py
+index efd35084b0429d99cf6ecde328292aeb93dcab71..a159e6ff9764cde6de99e6bb1a87225f944203f3 100644
+--- a/src/trading_assistant/ops/backup_transaction.py
++++ b/src/trading_assistant/ops/backup_transaction.py
+@@ -604,0 +605,59 @@ def validate_backup_transaction(
++def _open_recovery_members(
++    transaction: BackupTransaction,
++) -> list[tuple[_BackupTransactionMember, int]]:
++    """Open only present manifest members; reject every ambiguous entry."""
++
++    _read_manifest(transaction)
++    recorded_names = {
++        member.name for member in transaction.manifest.members
++    }
++    namespace = set(os.listdir(transaction.directory_descriptor))
++    present_names = namespace - {TRANSACTION_MANIFEST_NAME}
++    if (
++        TRANSACTION_MANIFEST_NAME not in namespace
++        or not present_names <= recorded_names
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    opened: list[tuple[_BackupTransactionMember, int]] = []
++    try:
++        for member in transaction.manifest.members:
++            if member.name not in present_names:
++                continue
++            opened.append(
++                (
++                    member,
++                    _open_recorded_member(
++                        transaction,
++                        member,
++                        os.O_RDONLY,
++                    ),
++                )
++            )
++        if set(os.listdir(transaction.directory_descriptor)) != namespace:
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        for member, descriptor in opened:
++            descriptor_stat = os.fstat(descriptor)
++            path_stat = os.stat(
++                member.name,
++                dir_fd=transaction.directory_descriptor,
++                follow_symlinks=False,
++            )
++            if not _member_stat_matches(
++                descriptor_stat,
++                path_stat,
++                member,
++            ):
++                raise EncryptedBackupError(
++                    "encrypted_backup_transaction_invalid"
++                )
++        return opened
++    except BaseException:
++        for _member, descriptor in opened:
++            os.close(descriptor)
++        raise
++
++
+@@ -959 +1018,28 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
+-        for member, _descriptor in opened:
++        _unlink_opened_members(transaction, opened)
++    finally:
++        for _member, descriptor in opened:
++            os.close(descriptor)
++    _finish_backup_transaction_removal(transaction)
++
++
++def _unlink_opened_members(
++    transaction: BackupTransaction,
++    opened: list[tuple[_BackupTransactionMember, int]],
++) -> None:
++    failure: BaseException | None = None
++    for member, descriptor in opened:
++        try:
++            descriptor_stat = os.fstat(descriptor)
++            path_stat = os.stat(
++                member.name,
++                dir_fd=transaction.directory_descriptor,
++                follow_symlinks=False,
++            )
++            if not _member_stat_matches(
++                descriptor_stat,
++                path_stat,
++                member,
++            ):
++                raise EncryptedBackupError(
++                    "encrypted_backup_transaction_invalid"
++                )
+@@ -964,4 +1050,15 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
+-    finally:
+-        for _member, descriptor in opened:
+-            os.close(descriptor)
+-    retry_fsync(transaction.directory_descriptor)
++        except BaseException as exc:
++            failure = exc
++            break
++    try:
++        retry_fsync(transaction.directory_descriptor)
++    except BaseException as exc:
++        if failure is None:
++            failure = exc
++    if failure is not None:
++        raise failure
++
++
++def _finish_backup_transaction_removal(
++    transaction: BackupTransaction,
++) -> None:
+@@ -969,0 +1067,6 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
++    if set(os.listdir(transaction.directory_descriptor)) != {
++        TRANSACTION_MANIFEST_NAME
++    }:
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
+@@ -981,0 +1085,40 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
++def _remove_recovered_backup_transaction(
++    transaction: BackupTransaction,
++    *,
++    cutoff: float,
++    initial_directory_stat: os.stat_result,
++) -> bool:
++    opened = _open_recovery_members(transaction)
++    try:
++        if any(
++            os.fstat(descriptor).st_mtime >= cutoff
++            for _member, descriptor in opened
++        ):
++            return False
++        final_directory_stat = _directory_identity(transaction)
++        if not (
++            initial_directory_stat.st_mtime_ns
++            == final_directory_stat.st_mtime_ns
++            and initial_directory_stat.st_ctime_ns
++            == final_directory_stat.st_ctime_ns
++            and final_directory_stat.st_mtime < cutoff
++        ):
++            return False
++        expected_namespace = {
++            TRANSACTION_MANIFEST_NAME,
++            *(member.name for member, _descriptor in opened),
++        }
++        if set(os.listdir(transaction.directory_descriptor)) != (
++            expected_namespace
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        _unlink_opened_members(transaction, opened)
++    finally:
++        for _member, descriptor in opened:
++            os.close(descriptor)
++    _finish_backup_transaction_removal(transaction)
++    return True
++
++
+@@ -1102,18 +1245,4 @@ def recover_backup_transaction(
+-        members = validate_backup_transaction(transaction)
+-        if any(
+-            os.stat(
+-                member,
+-                dir_fd=directory_descriptor,
+-                follow_symlinks=False,
+-            ).st_mtime
+-            >= cutoff
+-            for member in members
+-        ):
+-            return
+-        final_directory_stat = _directory_identity(transaction)
+-        if not (
+-            directory_stat.st_mtime_ns
+-            == final_directory_stat.st_mtime_ns
+-            and directory_stat.st_ctime_ns
+-            == final_directory_stat.st_ctime_ns
+-            and final_directory_stat.st_mtime < cutoff
++        if not _remove_recovered_backup_transaction(
++            transaction,
++            cutoff=cutoff,
++            initial_directory_stat=directory_stat,
+@@ -1122 +1251 @@ def recover_backup_transaction(
+-        close_backup_transaction(transaction, remove=True)
++        close_backup_transaction(transaction, remove=False)
+diff --git a/tests/test_task6_transaction_directory_hardening.py b/tests/test_task6_transaction_directory_hardening.py
+index afa8aeb630c001d73df73b5037879c22e55cd6eb..c67ba75813663300c403787ab79a2d1c8979ca6f 100644
+--- a/tests/test_task6_transaction_directory_hardening.py
++++ b/tests/test_task6_transaction_directory_hardening.py
+@@ -17,0 +18 @@ from trading_assistant.ops import backup as backup_module
++from trading_assistant.ops import backup_transaction as transaction_module
+@@ -163,0 +165,24 @@ def _hold_manifest_lock(manifest: Path, ready, release) -> None:
++def _hold_partial_backup_transaction(
++    destination: Path,
++    ready,
++    release,
++) -> None:
++    destination.mkdir(mode=0o700)
++    transaction = transaction_module.create_backup_transaction(destination)
++    try:
++        os.unlink(
++            transaction_module.ENCRYPTED_NAME,
++            dir_fd=transaction.directory_descriptor,
++        )
++        transaction_module.retry_fsync(
++            transaction.directory_descriptor
++        )
++        ready.set()
++        release.wait(10)
++    finally:
++        transaction_module.close_backup_transaction(
++            transaction,
++            remove=False,
++        )
++
++
+@@ -333 +358,14 @@ def test_recovery_preserves_unrecorded_old_sidecar_name(
+-def test_recovery_preserves_directory_when_recorded_member_is_missing(
++@pytest.mark.parametrize(
++    "missing_names",
++    [
++        ("snapshot.sqlite3",),
++        ("snapshot.sqlite3", "verification.sqlite3"),
++        (
++            "snapshot.sqlite3",
++            "verification.sqlite3",
++            "encrypted.aesgcm",
++        ),
++    ],
++    ids=["one-absent", "two-absent", "all-absent"],
++)
++def test_recovery_converges_when_recorded_members_are_already_absent(
+@@ -334,0 +373 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
++    missing_names,
+@@ -336 +375 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
+-    """Partial membership must fail closed before any remaining member deletion."""
++    """Any absent recorded member means exact cleanup already completed."""
+@@ -350,5 +389,2 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
+-    (transaction / "snapshot.sqlite3").unlink()
+-    remaining = {
+-        candidate.name: candidate.stat().st_ino
+-        for candidate in transaction.iterdir()
+-    }
++    for name in missing_names:
++        (transaction / name).unlink()
+@@ -362,0 +399,47 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert not transaction.exists()
++    assert tuple(destination.iterdir()) == ()
++
++
++@pytest.mark.parametrize("damage", ["extra", "replacement"])
++def test_partial_recovery_preserves_extra_or_replaced_entries(
++    tmp_path,
++    damage,
++):
++    """Subset tolerance must not authorize extra or replaced content."""
++
++    source = tmp_path / f"partial-{damage}.db"
++    destination = tmp_path / f"partial-{damage}-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "quick_check_complete"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    (transaction / "encrypted.aesgcm").unlink()
++    if damage == "extra":
++        protected = transaction / "operator.txt"
++    else:
++        protected = transaction / "snapshot.sqlite3"
++        protected.unlink()
++    protected.write_bytes(b"operator-owned-content")
++    protected.chmod(0o600)
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++    before_recovery = _namespace_identities(transaction)
++
++    for _attempt in range(2):
++        backup_module._recover_backup_orphans(
++            destination,
++            orphan_ttl_seconds=60,
++            now=lambda: recovery_now,
++        )
+@@ -365,4 +448,45 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
+-    assert {
+-        candidate.name: candidate.stat().st_ino
+-        for candidate in transaction.iterdir()
+-    } == remaining
++    assert _namespace_identities(transaction) == before_recovery
++    assert protected.read_bytes() == b"operator-owned-content"
++
++
++def test_aged_partial_active_transaction_is_protected_by_manifest_lock(
++    tmp_path,
++):
++    """TTL alone cannot recover a partial transaction while its lock is held."""
++
++    destination = tmp_path / "active-partial-backups"
++    context = _process_context()
++    ready = context.Event()
++    release = context.Event()
++    process = context.Process(
++        target=_hold_partial_backup_transaction,
++        args=(destination, ready, release),
++    )
++    process.start()
++    assert ready.wait(timeout=5)
++    transaction = _transaction_directories(destination)[0]
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++    before_recovery = _namespace_identities(transaction)
++
++    started = time.monotonic()
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    elapsed = time.monotonic() - started
++
++    assert elapsed < 1.5
++    assert _namespace_identities(transaction) == before_recovery
++    release.set()
++    process.join(timeout=10)
++    assert process.exitcode == 0
++
++    for _attempt in range(2):
++        backup_module._recover_backup_orphans(
++            destination,
++            orphan_ttl_seconds=60,
++            now=lambda: recovery_now,
++        )
++    assert not transaction.exists()
+@@ -560 +684 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
+-def test_partial_cleanup_preserves_remaining_manifest_namespace(
++def test_partial_cleanup_recovery_converges_after_unlink_failure(
+@@ -564 +688 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
+-    """A partial unlink must not authorize deletion after membership diverges."""
++    """A transient member unlink failure must not strand plaintext forever."""
+@@ -580,0 +705 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
++    original_fsync = transaction_module.retry_fsync
+@@ -581,0 +707,2 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
++    directory_identity = transaction.stat()
++    directory_fsyncs = 0
+@@ -589,0 +717,10 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
++    def track_directory_fsync(descriptor):
++        nonlocal directory_fsyncs
++        identity = os.fstat(descriptor)
++        if (
++            identity.st_dev == directory_identity.st_dev
++            and identity.st_ino == directory_identity.st_ino
++        ):
++            directory_fsyncs += 1
++        return original_fsync(descriptor)
++
+@@ -590,0 +728,5 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
++    monkeypatch.setattr(
++        transaction_module,
++        "retry_fsync",
++        track_directory_fsync,
++    )
+@@ -599,3 +741,4 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
+-    remaining = {
+-        candidate.name: candidate.stat().st_ino
+-        for candidate in transaction.iterdir()
++    assert {candidate.name for candidate in transaction.iterdir()} == {
++        "manifest",
++        "snapshot.sqlite3",
++        "verification.sqlite3",
+@@ -603 +746 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
+-    assert "encrypted.aesgcm" not in remaining
++    assert directory_fsyncs >= 1
+@@ -606,10 +749,9 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
+-    backup_module._recover_backup_orphans(
+-        destination,
+-        orphan_ttl_seconds=60,
+-        now=lambda: recovery_now,
+-    )
+-    assert transaction.exists()
+-    assert {
+-        candidate.name: candidate.stat().st_ino
+-        for candidate in transaction.iterdir()
+-    } == remaining
++    delayed_recovery = recovery_now + 120
++    for _attempt in range(2):
++        backup_module._recover_backup_orphans(
++            destination,
++            orphan_ttl_seconds=60,
++            now=lambda: delayed_recovery,
++        )
++    assert not transaction.exists()
++    assert tuple(destination.iterdir()) == ()

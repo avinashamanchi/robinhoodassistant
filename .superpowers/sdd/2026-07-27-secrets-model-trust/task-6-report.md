@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (final manifest and lifecycle hardening)
+# Task 6 report — COMPLETE (partial-cleanup convergence hardening)
 
 ## Status and safety boundary
 
@@ -1452,3 +1452,132 @@
 - The sole warning is an upstream deprecation unrelated to backup durability,
   migration authority, session collectability, approval, execution safety, or
   broker truth.
+
+## Final partial-cleanup convergence hardening
+
+### Status and safety boundary
+
+- Review baseline:
+  `5e51801277923ef3af3581e328db3dffa74dba1b`.
+- Implementation commit:
+  `21e67d88b292d0c03e728b38c5a2416cf72f7585`
+  (`fix(security): recover partial backup cleanup`).
+- Work remained in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database activity used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, network,
+  external services, broker/provider/notification APIs, app, daemon, MCP
+  server, breakers, and order APIs were not accessed.
+
+### Root cause and protocol fix
+
+- Normal cleanup first validated the complete manifest namespace and then
+  unlinked exact recorded members sequentially. A transient unlink failure
+  after an earlier success left a valid manifest plus only a subset of its
+  recorded members.
+- Recovery called the same complete-namespace validator, so it treated an
+  already-deleted recorded member as ambiguity and could preserve the
+  remaining snapshot or verification plaintext forever.
+- Complete namespace validation remains mandatory for every active backup
+  operation. It was not relaxed.
+- A separate recovery-only validator runs only after the transaction
+  directory, manifest, and every present member are older than the TTL and
+  after acquiring the manifest's bounded exclusive lock.
+- In that recovery-only path, an absent manifest-recorded member means its
+  cleanup already completed. Every present entry must still be an exact
+  manifest-recorded name with the recorded regular-file type, mode, device,
+  and inode. Any extra, replacement, symlink, nonregular, or raced namespace
+  fails closed.
+- All present exact members are opened and validated before deletion and
+  checked again at the unlink seam. The directory is fsynced even when a later
+  unlink reports failure, making successful earlier deletions durable.
+- A later recovery can therefore validate the remaining subset and continue.
+  Once no operation members remain, recovery revalidates the locked manifest
+  and exact singleton namespace, removes the manifest and directory, and
+  fsyncs both directory boundaries.
+- An aged partial transaction with a live lock remains protected and returns
+  within the bounded lock deadline. After its owner releases the lock, repeated
+  recovery converges.
+
+### TDD and focused verification
+
+- Exact RED group:
+  `3 failed, 2 passed in 0.78s`.
+  The failures were the already-absent member, active partial transaction after
+  lock release, and transient partial-unlink convergence cases. Extra and
+  replacement preservation already passed.
+- Narrow GREEN:
+  `5/5 passed in 0.95s`.
+- Complete transaction/crash file after the initial fix:
+  `46/46 passed in 2.56s`.
+- Expanded one-, two-, and all-member absence plus directory-fsync coverage:
+  `48/48 passed in 1.45s`.
+- Complete backup, operations, sensitive-migration, round-4, round-5,
+  exceptional, and transaction-directory group:
+  `186/186 passed in 12.12s`.
+- Ten bounded repetitions of the seven subset, tamper, active-lock, and
+  transient-unlink cases:
+  `70/70`.
+- Migration, runtime-tenure, startup-schema, release-static, and
+  submission-barrier adjacency:
+  `307/307 passed in 114.85s`.
+
+### Complexity and API audit
+
+- `backup_transaction.py` is `1,283` lines after this fix.
+- Public classes, functions, and signatures are unchanged from the review
+  baseline. `backup.py` and its public API were not modified.
+- AST/reference checks found no duplicate top-level definition and no
+  zero-reference private helper.
+- Subset handling is isolated to `_open_recovery_members()` and
+  `_remove_recovered_backup_transaction()`. Existing
+  `validate_backup_transaction()` remains the strict complete-namespace gate
+  for all live operations.
+- Prevalidation and per-member revalidation are intentionally separate race
+  boundaries: no deletion begins before every present member is proven exact,
+  and each path is checked again immediately before unlink.
+
+### Release gates and sole full suite
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan:
+  `whitespace-eof: ok (2 files)`.
+- Exactly one full suite ran after all focused, repeated, API, compile, static,
+  Alembic, diff, and whitespace gates were green.
+- Database, broker, provider, market-data, notification, encryption, signing,
+  live-confirmation, runtime-instance, Composio, Octen, and OpenAI credential
+  variables were explicitly unset; no worktree `.env` existed.
+- Exact result:
+  `2781 passed, 1 skipped, 1 warning in 392.43s (0:06:32)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second full suite ran. No source or test changed after this result; only
+  this report, the progress ledger, and generated review evidence changed.
+
+### Changed files
+
+- Recovery protocol:
+  `src/trading_assistant/ops/backup_transaction.py`.
+- Exact subset, transient-unlink, tamper, fsync, and active-lock regressions:
+  `tests/test_task6_transaction_directory_hardening.py`.
+
+### Remaining caveats
+
+- Missing or corrupt manifests remain unowned and preserved. The protocol
+  writes no sensitive content before manifest durability.
+- Extra, replaced, symlinked, nonregular, busy, or recently modified
+  namespaces remain deliberately fail-closed for manual inspection.
+- Manifest and commit-state checksums and artifact SHA-256 remain unkeyed;
+  authenticity against an attacker able to rewrite every byte under the same
+  OS account relies on filesystem permissions and the operating-system account
+  boundary.
+- The sole warning remains an unrelated upstream
+  `websockets.legacy` deprecation.
