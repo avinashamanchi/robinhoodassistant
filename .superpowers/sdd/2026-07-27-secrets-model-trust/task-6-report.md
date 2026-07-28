@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (partial-cleanup convergence hardening)
+# Task 6 report — COMPLETE (atomic recovery isolation hardening)
 
 ## Status and safety boundary
 
@@ -1273,6 +1273,11 @@
   deprecation.
 - No second full suite ran. No source or test changed after this result; only
   this report, the progress ledger, and generated review evidence changed.
+- The generated implementation review artifact is
+  `review-03fe776..c3f1c44.diff`; byte comparison against
+  `git diff --binary --unified=0 03fe776..c3f1c44` passed.
+- Post-suite evidence checks passed `git diff --check` and the explicit
+  diff-aware EOF/trailing-whitespace scan for all three evidence files.
 
 ### Remaining caveats
 
@@ -1580,4 +1585,155 @@
   OS account relies on filesystem permissions and the operating-system account
   boundary.
 - The sole warning remains an unrelated upstream
+  `websockets.legacy` deprecation.
+
+## Atomic recovery isolation hardening
+
+### Status and safety boundary
+
+- Review baseline:
+  `03fe776a4b6006e70959b0798323daf0707f3b07`.
+- Implementation commit:
+  `c3f1c44aa96b38fb89613ff804b6996d4c067b93`
+  (`fix(security): isolate backup recovery cleanup`).
+- Work remained in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database activity used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, worktree `.env`, Keychain,
+  credentials, network, external services, broker/provider/notification APIs,
+  app, daemon, MCP server, breakers, and order APIs were not accessed.
+
+### Root cause and protocol fix
+
+- Recovery previously opened and validated each manifest-recorded member, then
+  performed a separate pathname `unlink`. A same-UID actor could replace
+  `encrypted.aesgcm` after the final identity check and before that unlink;
+  recovery would delete the replacement and then remove the transaction.
+- Recovery now acquires the existing bounded exclusive manifest lock and a
+  bounded exclusive lock on every present recorded member before any namespace
+  mutation. Busy members abort without mutation. Recovery also refuses a
+  multiply linked member, preventing transaction cleanup from leaving
+  sensitive bytes reachable through an external hard link.
+- The exact manifest-bound directory is atomically moved, through its parent
+  descriptor, to a fresh transaction-bound quarantine name using a
+  no-replace primitive. macOS uses `renameatx_np` with `RENAME_EXCL` and
+  `RENAME_NOFOLLOW_ANY`; Linux uses `renameat2` with `RENAME_NOREPLACE`.
+  Unsupported platforms fail closed.
+- The destination directory is fsynced immediately after isolation. Before
+  cleanup, recovery proves the original name is absent, the quarantine path
+  still names the held directory descriptor, the namespace is exactly the
+  manifest plus the present recorded subset, and every member path still
+  matches its held locked descriptor and pre-isolation stable identity.
+- Extra files, replacements, inode or metadata drift, an occupied original
+  name, rename ambiguity, or parent-fsync failure abort cleanup. The quarantine
+  is atomically restored to the original name only with the same no-replace
+  primitive and only when the original name is absent. A newly appeared
+  original path is never overwritten; both namespaces remain for inspection.
+- Cleanup accepts only an exact transaction-bound quarantine name and uses the
+  held directory descriptor for each exact member unlink. It revalidates the
+  remaining namespace before every deletion, fsyncs each durable partial
+  deletion, removes the locked manifest last, and fsyncs the quarantine and
+  parent boundaries.
+- A process death after the quarantine rename leaves an exact, scanner-visible
+  quarantine image. Recovery recognizes both original and quarantine protocol
+  names, preserves missing-member subset semantics, and converges
+  idempotently.
+
+### TDD and focused verification
+
+- Exact initial RED:
+  `2 failed`.
+  The replacement injected after the final identity proof was deleted, and an
+  exclusively locked member did not prevent transaction removal.
+- Exact initial GREEN:
+  `2/2 passed`.
+- Expanded hard-link, post-isolation extra/replacement, occupied-original, and
+  real child crash-after-rename group:
+  initial `1 failed, 4 passed`; the external hard-link case exposed the
+  adjacent ownership defect. After the single-link guard:
+  `5/5 passed`.
+- Rename-ambiguity and quarantine-parent-fsync probes:
+  `2/2 passed`.
+- Complete transaction/crash/recovery file:
+  `57/57 passed in 1.85s`.
+- Complete backup, operations, sensitive-migration, round-4, round-5,
+  exceptional, and transaction-directory group:
+  `195/195 passed in 12.56s`.
+- Five bounded repetitions of the 15 replacement, lock, hard-link,
+  quarantine, missing-subset, tamper, and partial-cleanup cases:
+  `75/75 passed`.
+- Migration, runtime-tenure, startup-schema, release-static, and
+  submission-barrier adjacency:
+  `307/307 passed in 114.90s`.
+
+### Complexity and API audit
+
+- Final sizes are `1,903` lines for `backup.py` and `1,753` lines for the
+  private `backup_transaction.py`.
+- AST comparison against the review baseline found no removed, added, or
+  changed public function/class signature in either module, no duplicate
+  top-level definition, and no zero-reference private helper.
+- `backup.py` changed only to route exact quarantine candidates into the
+  existing recovery entry point. Public backup APIs remain unchanged.
+- The added code is one coherent recovery state machine: platform no-replace
+  rename, member ownership handles, isolation/restore, isolated validation,
+  and isolated deletion. It does not duplicate committed-artifact state,
+  encryption, verification, retention, or live-operation cleanup.
+- A smaller collapse into the active cleanup helper was rejected because active
+  cleanup owns a complete live namespace, while crash recovery must support
+  missing subsets, bounded lock contention, quarantine restoration, and
+  scanner-visible crash images. Combining those paths would weaken the strict
+  complete-namespace gate used by live backups.
+
+### Release gates and sole full suite
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified-text scan:
+  `whitespace-eof: ok (3 files)`.
+- One malformed shell preflight placed an environment assignment before macOS
+  `env -u`; `env` exited `127` before pytest was invoked, so zero tests started.
+- Exactly one actual full suite then ran after all focused, repeated, API,
+  compile, static, Alembic, diff, and whitespace gates were green.
+- Database, broker, provider, market-data, notification, encryption, signing,
+  live-confirmation, runtime-instance, Composio, Octen, and OpenAI credential
+  variables were explicitly unset; the null keyring backend was forced.
+- Exact result:
+  `2790 passed, 1 skipped, 1 warning in 393.73s (0:06:33)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second full suite ran. No source or test changed after this result; only
+  this report, the progress ledger, and generated review evidence changed.
+
+### Changed files
+
+- Recovery candidate routing:
+  `src/trading_assistant/ops/backup.py`.
+- Bounded member ownership, atomic no-replace quarantine isolation,
+  revalidation, restoration, and crash recovery:
+  `src/trading_assistant/ops/backup_transaction.py`.
+- Replacement-race, busy-member, hard-link, pre/post-isolation ambiguity,
+  occupied-original, parent-fsync, child-crash, and repeated-recovery tests:
+  `tests/test_task6_transaction_directory_hardening.py`.
+
+### Remaining caveats
+
+- POSIX exposes no portable conditional inode-unlink operation. After atomic
+  namespace isolation, recovery relies on the held manifest/member locks as
+  its cooperative ownership boundary and revalidates immediately before each
+  dirfd-relative unlink. Deterministic same-UID replacement hooks before and
+  after isolation fail closed, but a malicious same-UID process that ignores
+  locks and wins the final revalidation-to-unlink instruction window remains
+  outside that cooperative boundary.
+- Ambiguous, busy, malformed, extra, replaced, multiply linked, or
+  original-name-occupied namespaces remain deliberately preserved for manual
+  inspection.
+- The sole warning remains the unrelated upstream
   `websockets.legacy` deprecation.
