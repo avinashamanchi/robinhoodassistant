@@ -276,3 +276,64 @@ needed. Only temporary SQLite test databases were used; no runtime database,
 Keychain, network, credentials, broker/provider, notification, order, breaker,
 app, daemon, or MCP state was accessed or changed. The compromised Composio
 credential was not read, used, logged, or modified. No push was performed.
+
+## Fix round 3 — expired unknown sweep
+
+Date: 2026-07-28
+
+Fix-round base: `d37e0274ce10192b70cdf1d4c00b935cd706d0cf`
+
+Implementation commit: `fe1bea5c844636e57de34b745cac6ba471dc6834`
+
+### Transactional expiry sweep
+
+- Reproduced the exact gap: a provider reservation marked `unknown` at
+  `t0+1` remained unlatchable when status or reserve swept at `t0+5`, because
+  maintenance selected only `started` rows.
+- The shared sweep now selects expired reservations in either `started` or
+  `unknown` state under the existing `BEGIN IMMEDIATE` transaction.
+- Expired `started` rows transition to `unknown` and increment the maintenance
+  return count. Already-`unknown` rows do not increment it. Both states invoke
+  the same atomic provider-day latch using
+  `provider_started_usage_unknown`.
+- Reserve, status, and explicit maintenance all use that sweep. Repeated
+  sweeps report zero new transitions while retaining the latch and every
+  charged call/input/output aggregate.
+- Tests cover both row-state insertion orders, concurrent sweepers, multiple
+  providers on different budget days, and adjacent settled/released rows.
+  Unexpired, settled, and released states remain unchanged.
+
+### Fix-round verification
+
+- Exact and adjacent RED slice before production change:
+  `5 failed, 2 passed`.
+- Dedicated reviewer regressions after the fix: `7 passed`.
+- Focused shared-budget and budget-review group: `199 passed`.
+- Exact status/reserve plus started/unknown concurrency repeats:
+  `80/80 passed`.
+- Affected Task 8/app/API/bootstrap/launch/release group:
+  `568 passed, 1 warning`.
+- Compile check: PASS.
+- Removed-private-symbol and scope searches: PASS; production changes are
+  restricted to `llm/budget.py`.
+- `git diff --check`: PASS.
+- Exactly one fix-round full-suite run:
+  `3009 passed, 1 skipped, 1 warning in 233.88s (0:03:53)`.
+
+The sole warning remains the existing third-party
+`websockets.legacy.__init__` deprecation warning under `.venv`.
+
+Review package:
+`review-d37e027..fe1bea5.diff` (20,099 bytes, one implementation commit).
+
+A fresh bounded acceptance review of the exact packaged diff found zero open
+correctness, security, or scope findings. Agent-dispatch controls were
+unavailable, so this was a manual packaged-diff review rather than a separately
+executed reviewer agent.
+
+PAPER mode, manual approval, kill switches, broker truth, news-disabled
+defaults, no-tools/raw-seam closure, copy-through validation, citation
+validation, and analyst behavior remain unchanged. No migration was needed.
+Only temporary SQLite test databases were used; no runtime database, Keychain,
+network, credentials, broker/provider, notification, order, breaker, app,
+daemon, or MCP state was accessed or changed. No push was performed.
