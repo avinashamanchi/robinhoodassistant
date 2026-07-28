@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..security.outbound import OutboundPolicy, new_httpx_client
+from ..security.outbound import (
+    OutboundPolicy,
+    new_async_httpx_client,
+    new_httpx_client,
+)
 from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
 from .payloads import (
     build_gemini_payload,
@@ -97,6 +101,11 @@ class GeminiBackend:
                         _GEMINI_POLICY,
                         read_timeout=self._timeout_seconds,
                     ),
+                    httpxAsyncClient=new_async_httpx_client(
+                        _GEMINI_POLICY,
+                        read_timeout=self._timeout_seconds,
+                    ),
+                    retryOptions=types.HttpRetryOptions(attempts=1),
                 ),
             )
         return self._client

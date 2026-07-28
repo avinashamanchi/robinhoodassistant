@@ -37,6 +37,7 @@ class AnthropicBackend:
                 api_key=self._api_key,
                 base_url=_ANTHROPIC_ORIGIN,
                 timeout=self._timeout_seconds,
+                max_retries=0,
                 http_client=new_httpx_client(
                     _ANTHROPIC_POLICY,
                     read_timeout=self._timeout_seconds,

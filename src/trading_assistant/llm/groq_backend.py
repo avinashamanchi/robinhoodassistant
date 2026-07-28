@@ -84,6 +84,7 @@ class GroqBackend:
                 api_key=self._api_key,
                 base_url=_GROQ_ORIGIN,
                 timeout=self._timeout_seconds,
+                max_retries=0,
                 http_client=new_httpx_client(
                     _GROQ_POLICY,
                     read_timeout=self._timeout_seconds,

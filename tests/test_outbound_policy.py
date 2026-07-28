@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import ssl
 
@@ -247,55 +248,339 @@ def test_httpx_transport_validates_response_url_and_rejects_redirect(outbound):
     assert "provider-secret" not in str(raised.value)
 
 
-def test_websocket_connector_pins_wss_origin_tls_and_finite_timeouts(outbound):
-    """The optional stream cannot switch to HTTPS, an IP, or an unverified TLS context."""
+def test_websocket_connector_uses_concrete_no_redirect_adapter(
+    monkeypatch, outbound
+):
+    """The production stream constructs the installed no-redirect adapter directly."""
     seen = {}
 
-    def connector(url, **kwargs):
-        seen["url"] = url
-        seen.update(kwargs)
-        return type("Handshake", (), {"status_code": 101})()
+    class Attempt:
+        def __init__(self, url, **kwargs):
+            seen["url"] = url
+            seen.update(kwargs)
 
-    policy = outbound.OutboundPolicy("wss://stream.data.alpaca.markets")
+        def __await__(self):
+            async def complete():
+                return object()
+
+            return complete().__await__()
+
+    monkeypatch.setattr(outbound, "_NoRedirectWebSocketConnect", Attempt)
     stream = outbound.PinnedWebSocket(
-        policy,
-        connector,
+        outbound.OutboundPolicy("wss://stream.data.alpaca.markets"),
         open_timeout=4.0,
         ping_timeout=5.0,
         close_timeout=6.0,
     )
 
-    stream.connect("wss://stream.data.alpaca.markets/v2/sip")
+    asyncio.run(stream.connect("wss://stream.data.alpaca.markets/v2/sip"))
 
     assert seen["url"] == "wss://stream.data.alpaca.markets/v2/sip"
+    assert seen["proxy"] is None
     assert seen["open_timeout"] == 4.0
+    assert seen["ping_interval"] == 5.0
     assert seen["ping_timeout"] == 5.0
     assert seen["close_timeout"] == 6.0
-    assert seen["ssl_context"].check_hostname is True
-    assert seen["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+    assert seen["ssl"].check_hostname is True
+    assert seen["ssl"].verify_mode == ssl.CERT_REQUIRED
     with pytest.raises(outbound.OutboundOriginDenied):
-        stream.connect("https://stream.data.alpaca.markets/v2/sip")
+        asyncio.run(stream.connect("https://stream.data.alpaca.markets/v2/sip"))
 
 
-def test_websocket_connector_rejects_redirect_handshake_without_leaking_location(outbound):
-    """A WSS redirect is rejected rather than delegating a second connection to a library."""
-    calls = []
-
-    def connector(_url, **_kwargs):
-        calls.append(1)
-        return type(
-            "Handshake",
-            (), {"status_code": 307, "location": "wss://evil.test/provider-secret"},
-        )()
-
-    stream = outbound.PinnedWebSocket(
-        outbound.OutboundPolicy("wss://stream.data.alpaca.markets"),
-        connector,
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_requests_prepared_send_rejects_redirect_before_a_second_request(
+    status, alpaca_policy, outbound
+):
+    """Calling Session.send directly cannot bypass the redirect boundary."""
+    adapter = _ResponseAdapter(
+        status=status,
+        headers={"Location": "https://evil.test/provider-secret"},
+    )
+    session = outbound.NoRedirectSession(
+        alpaca_policy,
+        read_timeout=7.5,
+        max_response_bytes=128,
+    )
+    session.mount("https://", adapter)
+    request = session.prepare_request(
+        requests.Request("GET", "https://paper-api.alpaca.markets/v2/account")
     )
 
     with pytest.raises(outbound.OutboundRedirectDenied) as raised:
-        stream.connect("wss://stream.data.alpaca.markets/v2/sip")
+        session.send(
+            request,
+            timeout=None,
+            verify=False,
+            proxies={"https": "http://caller-proxy.invalid"},
+        )
 
-    assert calls == [1]
+    assert len(adapter.calls) == 1
+    _, sent = adapter.calls[0]
+    assert sent["timeout"] == (5.0, 7.5)
+    assert sent["verify"] is True
+    assert sent["proxies"] == {}
     assert str(raised.value) == "outbound redirect rejected"
     assert "provider-secret" not in str(raised.value)
+
+
+def test_requests_prepared_send_applies_response_cap(alpaca_policy, outbound):
+    """PreparedRequest sends cannot bypass bounded direct response reads."""
+    secret = b"provider-secret-body"
+    adapter = _ResponseAdapter(body=secret)
+    session = outbound.NoRedirectSession(
+        alpaca_policy,
+        read_timeout=7.5,
+        max_response_bytes=4,
+    )
+    session.mount("https://", adapter)
+    request = session.prepare_request(
+        requests.Request("GET", "https://paper-api.alpaca.markets/v2/account")
+    )
+
+    with pytest.raises(outbound.OutboundResponseTooLarge) as raised:
+        session.send(request, stream=False)
+
+    assert len(adapter.calls) == 1
+    assert str(raised.value) == "outbound response too large"
+    assert secret.decode() not in str(raised.value)
+
+
+def test_requests_policy_ignores_proxy_and_ca_environment_markers(
+    monkeypatch, alpaca_policy, outbound
+):
+    """Environment proxy and CA settings cannot select this session's transport."""
+    marker = "/tmp/env-ca-marker.pem"
+    monkeypatch.setenv("HTTPS_PROXY", "http://env-proxy.invalid")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", marker)
+    monkeypatch.setenv("CURL_CA_BUNDLE", marker)
+    session = outbound.NoRedirectSession(alpaca_policy)
+
+    settings = session.merge_environment_settings(
+        "https://paper-api.alpaca.markets/v2/account",
+        {},
+        None,
+        True,
+        None,
+    )
+    adapter = session.get_adapter("https://paper-api.alpaca.markets")
+
+    assert session.trust_env is False
+    assert settings["proxies"] == {}
+    assert settings["verify"] is True
+    assert adapter._ssl_context.check_hostname is True
+    assert adapter._ssl_context.verify_mode == ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize("timeout", [None, float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_httpx_rejects_non_finite_or_non_positive_timeouts(outbound, timeout):
+    """A disabled, NaN, or infinite timeout cannot be installed on a provider client."""
+    with pytest.raises(ValueError):
+        outbound.new_httpx_client(
+            outbound.OutboundPolicy("https://api.example.test"),
+            read_timeout=timeout,
+        )
+
+
+@pytest.mark.parametrize(
+    "timeout_name",
+    ["connect_timeout", "write_timeout", "pool_timeout"],
+)
+def test_httpx_rejects_non_finite_configured_transport_timeouts(
+    outbound, timeout_name
+):
+    """Each named connect/write/pool timeout is independently fail-closed."""
+    policy = outbound.OutboundPolicy("https://api.example.test")
+    with pytest.raises(ValueError):
+        outbound.new_httpx_client(policy, **{timeout_name: float("inf")})
+    with pytest.raises(ValueError):
+        outbound.new_async_httpx_client(policy, **{timeout_name: float("nan")})
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("read_timeout", float("inf")),
+        ("open_timeout", float("inf")),
+        ("ping_timeout", float("nan")),
+        ("close_timeout", 0),
+    ],
+)
+def test_requests_and_websocket_reject_non_finite_timeouts(outbound, name, value):
+    """No inbound caller can disable a Requests or WebSocket timeout with a float."""
+    if name == "read_timeout":
+        with pytest.raises(ValueError):
+            outbound.NoRedirectSession(
+                outbound.OutboundPolicy("https://api.example.test"),
+                **{name: value},
+            )
+    else:
+        with pytest.raises(ValueError):
+            outbound.PinnedWebSocket(
+                outbound.OutboundPolicy("wss://stream.example.test"),
+                **{name: value},
+            )
+
+
+def test_httpx_direct_send_overwrites_prebuilt_timeout_and_redirect_flags(outbound):
+    """A prebuilt HTTPX request cannot retain a caller-controlled timeout policy."""
+    import httpx
+
+    seen = []
+
+    def transport(request):
+        seen.append(dict(request.extensions["timeout"]))
+        return httpx.Response(
+            302,
+            headers={"Location": "https://evil.test/provider-secret"},
+            request=request,
+        )
+
+    client = outbound.new_httpx_client(
+        outbound.OutboundPolicy("https://api.example.test"),
+        read_timeout=7.5,
+        transport=httpx.MockTransport(transport),
+    )
+    request = client.build_request(
+        "GET", "https://api.example.test/v1/data", timeout=None
+    )
+    request.extensions["timeout"] = {
+        "connect": float("inf"),
+        "read": float("inf"),
+        "write": float("inf"),
+        "pool": float("inf"),
+    }
+
+    try:
+        with pytest.raises(outbound.OutboundRedirectDenied):
+            client.send(request, follow_redirects=True)
+    finally:
+        client.close()
+
+    assert seen == [
+        {"connect": 5.0, "read": 7.5, "write": 7.5, "pool": 5.0}
+    ]
+
+
+def test_httpx_clients_ignore_proxy_and_ca_environment_markers(monkeypatch, outbound):
+    """Both HTTPX client types disable environment-derived proxy and trust roots."""
+    marker = "/tmp/env-ca-marker.pem"
+    monkeypatch.setenv("HTTPS_PROXY", "http://env-proxy.invalid")
+    monkeypatch.setenv("SSL_CERT_FILE", marker)
+    policy = outbound.OutboundPolicy("https://api.example.test")
+    sync_client = outbound.new_httpx_client(policy, read_timeout=7.5)
+    async_client = outbound.new_async_httpx_client(policy, read_timeout=7.5)
+
+    try:
+        assert sync_client._trust_env is False
+        assert async_client._trust_env is False
+        assert sync_client._transport._pool._ssl_context.check_hostname is True
+        assert sync_client._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+        assert async_client._transport._pool._ssl_context.check_hostname is True
+        assert async_client._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+    finally:
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+def test_async_httpx_direct_send_overwrites_prebuilt_timeout(outbound):
+    """An async prebuilt request cannot retain a disabled or infinite timeout."""
+    import httpx
+
+    seen = []
+
+    def transport(request):
+        seen.append(dict(request.extensions["timeout"]))
+        return httpx.Response(
+            302,
+            headers={"Location": "https://evil.test/provider-secret"},
+            request=request,
+        )
+
+    async def send_once():
+        client = outbound.new_async_httpx_client(
+            outbound.OutboundPolicy("https://api.example.test"),
+            read_timeout=7.5,
+            transport=httpx.MockTransport(transport),
+        )
+        request = client.build_request(
+            "GET", "https://api.example.test/v1/data", timeout=None
+        )
+        request.extensions["timeout"] = {
+            "connect": float("inf"),
+            "read": float("inf"),
+            "write": float("inf"),
+            "pool": float("inf"),
+        }
+        try:
+            with pytest.raises(outbound.OutboundRedirectDenied):
+                await client.send(request, follow_redirects=True)
+        finally:
+            await client.aclose()
+
+    asyncio.run(send_once())
+
+    assert seen == [
+        {"connect": 5.0, "read": 7.5, "write": 7.5, "pool": 5.0}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [
+        (301, "wss://stream.data.alpaca.markets/redirect-secret"),
+        (302, "wss://evil.test/redirect-secret"),
+        (307, "wss://stream.data.alpaca.markets/redirect-secret"),
+        (308, "wss://evil.test/redirect-secret"),
+    ],
+)
+def test_installed_websocket_redirect_loop_never_follows_a_handshake_redirect(
+    outbound, status, location
+):
+    """The installed websocket loop raises at its redirect hook after one handshake."""
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    attempts = []
+
+    class Transport:
+        def abort(self):
+            pass
+
+    class Connection:
+        transport = Transport()
+
+        async def handshake(self, _headers, _user_agent):
+            attempts.append(1)
+            raise InvalidStatus(
+                Response(
+                    status,
+                    "redirect",
+                    Headers([("Location", location)]),
+                )
+            )
+
+    connector = outbound._NoRedirectWebSocketConnect(
+        "wss://stream.data.alpaca.markets/v2/sip",
+        proxy=None,
+        ssl=ssl.create_default_context(),
+        open_timeout=4.0,
+        ping_interval=5.0,
+        ping_timeout=5.0,
+        close_timeout=6.0,
+    )
+
+    async def create_connection():
+        return Connection()
+
+    connector.create_connection = create_connection
+
+    async def run_connector():
+        return await connector
+
+    with pytest.raises(outbound.OutboundRedirectDenied) as raised:
+        asyncio.run(run_connector())
+
+    assert attempts == [1]
+    assert str(raised.value) == "outbound redirect rejected"
+    assert "redirect-secret" not in str(raised.value)

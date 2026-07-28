@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -360,6 +361,7 @@ def test_groq_client_uses_configured_timeout(monkeypatch):
     assert seen["http_client"].follow_redirects is False
     assert seen["http_client"].timeout.connect == 5.0
     assert seen["http_client"].timeout.read == 17
+    assert seen["max_retries"] == 0
 
 
 def test_anthropic_client_uses_configured_timeout(monkeypatch):
@@ -381,6 +383,7 @@ def test_anthropic_client_uses_configured_timeout(monkeypatch):
     assert seen["http_client"].follow_redirects is False
     assert seen["http_client"].timeout.connect == 5.0
     assert seen["http_client"].timeout.read == 19
+    assert seen["max_retries"] == 0
 
 
 def test_gemini_client_uses_configured_timeout(monkeypatch):
@@ -397,3 +400,106 @@ def test_gemini_client_uses_configured_timeout(monkeypatch):
     assert seen["http_options"].httpx_client.follow_redirects is False
     assert seen["http_options"].httpx_client.timeout.connect == 5.0
     assert seen["http_options"].httpx_client.timeout.read == 23
+    assert seen["http_options"].httpx_async_client.follow_redirects is False
+    assert seen["http_options"].httpx_async_client.timeout.connect == 5.0
+    assert seen["http_options"].httpx_async_client.timeout.read == 23
+    assert seen["http_options"].retry_options.attempts == 1
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "groq"])
+def test_provider_boundary_failure_makes_one_transport_attempt(monkeypatch, provider):
+    """A redirect boundary error must not be retried by either SDK."""
+    import httpx
+
+    from trading_assistant.security import outbound
+
+    if provider == "anthropic":
+        import trading_assistant.llm.anthropic_backend as module
+
+        backend = AnthropicBackend("key", "model", 100)
+        policy = module._ANTHROPIC_POLICY
+    else:
+        import trading_assistant.llm.groq_backend as module
+
+        backend = GroqBackend("key", "model")
+        policy = module._GROQ_POLICY
+
+    attempts = []
+
+    def transport(request):
+        attempts.append(request.url.host)
+        return httpx.Response(
+            302,
+            headers={"Location": "https://evil.test/provider-secret"},
+            request=request,
+        )
+
+    client = outbound.new_httpx_client(
+        policy,
+        transport=httpx.MockTransport(transport),
+    )
+    monkeypatch.setattr(module, "new_httpx_client", lambda *_args, **_kwargs: client)
+
+    try:
+        with pytest.raises(Exception) as raised:
+            backend.create(
+                system="s",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+            )
+    finally:
+        client.close()
+
+    assert attempts == [next(iter(policy.origins)).hostname]
+    assert backend._client.max_retries == 0
+    assert isinstance(raised.value.__cause__, outbound.OutboundRedirectDenied)
+    assert "provider-secret" not in str(raised.value)
+
+
+def test_gemini_retains_pinned_sync_and_async_httpx_clients(monkeypatch):
+    """The installed Gemini client retains both pinned HTTPX seams without I/O."""
+    import httpx
+
+    from trading_assistant.llm import gemini_backend as module
+    from trading_assistant.security import outbound
+
+    calls = []
+
+    def transport(request):
+        calls.append(request.url.host)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    sync_client = outbound.new_httpx_client(
+        module._GEMINI_POLICY,
+        read_timeout=23,
+        transport=httpx.MockTransport(transport),
+    )
+    async_client = outbound.new_async_httpx_client(
+        module._GEMINI_POLICY,
+        read_timeout=23,
+        transport=httpx.MockTransport(transport),
+    )
+    monkeypatch.setattr(module, "new_httpx_client", lambda *_args, **_kwargs: sync_client)
+    monkeypatch.setattr(
+        module,
+        "new_async_httpx_client",
+        lambda *_args, **_kwargs: async_client,
+        raising=False,
+    )
+
+    try:
+        client = GeminiBackend("key", "model", timeout_seconds=23)._get_client()
+        options = client._api_client._http_options
+        assert options.httpx_client is sync_client
+        assert options.httpx_async_client is async_client
+        assert sync_client._trust_env is False
+        assert async_client._trust_env is False
+        sync_client.get("https://generativelanguage.googleapis.com/v1/models")
+        asyncio.run(
+            async_client.get("https://generativelanguage.googleapis.com/v1/models")
+        )
+    finally:
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+    assert calls == ["generativelanguage.googleapis.com"] * 2

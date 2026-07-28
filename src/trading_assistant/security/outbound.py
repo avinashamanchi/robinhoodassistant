@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
+import numbers
 import ssl
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import SplitResult, urlsplit
 
+import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from websockets.asyncio.client import connect as _WebSocketConnect
 
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
@@ -21,6 +26,7 @@ DEFAULT_READ_TIMEOUT = 30.0
 DEFAULT_MAX_RESPONSE_BYTES = 1_000_000
 _SUPPORTED_SCHEMES = frozenset({"https", "wss"})
 _DEFAULT_PORTS = {"https": 443, "wss": 443}
+_UNSET = object()
 
 
 class OutboundError(Exception):
@@ -71,6 +77,52 @@ class OutboundConnectionFailed(OutboundError, RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("outbound connection failed")
+
+
+def _positive_finite(value: Any, *, name: str) -> float:
+    """Return a numeric timeout only when it is strictly positive and finite."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Real)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a positive finite number")
+    return float(value)
+
+
+def _verified_ssl_context() -> ssl.SSLContext:
+    """Build a verified TLS context without reading SSL_CERT_FILE or proxy env."""
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+class _VerifiedHTTPAdapter(HTTPAdapter):
+    """Requests adapter fixed to an explicit verified TLS context."""
+
+    def __init__(self, ssl_context: ssl.SSLContext) -> None:
+        self._ssl_context = ssl_context
+        super().__init__(max_retries=0)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["ssl_context"] = self._ssl_context
+        super().init_poolmanager(*args, **kwargs)
+
+    def build_connection_pool_key_attributes(
+        self,
+        request: Any,
+        verify: Any,
+        cert: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request,
+            True,
+            None,
+        )
+        pool_kwargs["ssl_context"] = self._ssl_context
+        pool_kwargs["cert_reqs"] = "CERT_REQUIRED"
+        for key in ("ca_certs", "ca_cert_dir", "cert_file", "key_file"):
+            pool_kwargs.pop(key, None)
+        return host_params, pool_kwargs
 
 
 def _deny() -> None:
@@ -244,6 +296,31 @@ def read_bounded_json(response: Any, *, max_response_bytes: int) -> Any:
         raise OutboundResponseInvalid() from None
 
 
+def _bound_httpx_response(response: Any, max_response_bytes: int) -> Any:
+    """Consume an HTTPX response once, retaining only a bounded in-memory body."""
+    length = _content_length(response.headers)
+    if length is not None and length > max_response_bytes:
+        raise OutboundResponseTooLarge()
+    response._content = _bounded_bytes(response.iter_bytes(), max_response_bytes)
+    return response
+
+
+async def _bound_async_httpx_response(response: Any, max_response_bytes: int) -> Any:
+    """Async equivalent of the HTTPX response cap without eager unbounded reads."""
+    length = _content_length(response.headers)
+    if length is not None and length > max_response_bytes:
+        raise OutboundResponseTooLarge()
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > max_response_bytes:
+            raise OutboundResponseTooLarge()
+    response._content = bytes(body)
+    return response
+
+
 class NoRedirectSession(requests.Session):
     """Requests session that pins its policy, TLS, timeouts, redirects, and body cap."""
 
@@ -254,22 +331,34 @@ class NoRedirectSession(requests.Session):
         read_timeout: float = DEFAULT_READ_TIMEOUT,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
-        if read_timeout <= 0:
-            raise ValueError("read_timeout must be positive")
+        read_timeout = _positive_finite(read_timeout, name="read_timeout")
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
         super().__init__()
         self._policy = policy
-        self._default_timeout = float(read_timeout)
+        self._default_timeout = read_timeout
         self._max_response_bytes = max_response_bytes
+        self.trust_env = False
+        self.proxies = {}
+        self.verify = True
+        self._ssl_context = _verified_ssl_context()
+        self.mount("https://", _VerifiedHTTPAdapter(self._ssl_context))
 
     def request(self, method: str, url: str, **kwargs: Any):
         self._policy.assert_url(url)
         kwargs["allow_redirects"] = False
+        return super().request(method, url, **kwargs)
+
+    def send(self, request: requests.PreparedRequest, **kwargs: Any):
+        """Enforce policy for direct PreparedRequest sends as well as request()."""
+        self._policy.assert_url(str(request.url))
+        kwargs["allow_redirects"] = False
         kwargs["timeout"] = (DEFAULT_CONNECT_TIMEOUT, self._default_timeout)
         kwargs["verify"] = True
         kwargs["stream"] = True
-        response = super().request(method, url, **kwargs)
+        kwargs["cert"] = None
+        kwargs["proxies"] = {}
+        response = super().send(request, **kwargs)
         try:
             self._policy.assert_response(response)
             length = _content_length(response.headers)
@@ -306,69 +395,155 @@ def install_pinned_session(
 def new_httpx_client(
     policy: OutboundPolicy,
     *,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_READ_TIMEOUT,
+    write_timeout: float | object = _UNSET,
+    pool_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     transport: Any = None,
 ):
-    """Create an httpx client that validates every send and never follows redirects."""
-    if read_timeout <= 0:
-        raise ValueError("read_timeout must be positive")
+    """Create an HTTPX client with immutable transport policy on every send."""
     import httpx
+
+    connect_timeout = _positive_finite(connect_timeout, name="connect_timeout")
+    read_timeout = _positive_finite(read_timeout, name="read_timeout")
+    if write_timeout is _UNSET:
+        write_timeout = read_timeout
+    write_timeout = _positive_finite(write_timeout, name="write_timeout")
+    pool_timeout = _positive_finite(pool_timeout, name="pool_timeout")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
+    )
 
     class _PinnedHTTPXClient(httpx.Client):
         def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
             policy.assert_url(str(request.url))
             kwargs["follow_redirects"] = False
+            kwargs["stream"] = True
+            request.extensions["timeout"] = timeout.as_dict()
             response = super().send(request, **kwargs)
             try:
                 policy.assert_response(response)
-                return response
+                return _bound_httpx_response(response, max_response_bytes)
             except Exception:
                 response.close()
                 raise
 
     options: dict[str, Any] = {
         "follow_redirects": False,
-        "verify": True,
-        "timeout": httpx.Timeout(
-            connect=DEFAULT_CONNECT_TIMEOUT,
-            read=read_timeout,
-            write=read_timeout,
-            pool=DEFAULT_CONNECT_TIMEOUT,
-        ),
+        "verify": _verified_ssl_context(),
+        "trust_env": False,
+        "proxy": None,
+        "timeout": timeout,
     }
     if transport is not None:
         options["transport"] = transport
     return _PinnedHTTPXClient(**options)
 
 
+def new_async_httpx_client(
+    policy: OutboundPolicy,
+    *,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
+    write_timeout: float | object = _UNSET,
+    pool_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    transport: Any = None,
+):
+    """Create the async counterpart with the same immutable send boundary."""
+    import httpx
+
+    connect_timeout = _positive_finite(connect_timeout, name="connect_timeout")
+    read_timeout = _positive_finite(read_timeout, name="read_timeout")
+    if write_timeout is _UNSET:
+        write_timeout = read_timeout
+    write_timeout = _positive_finite(write_timeout, name="write_timeout")
+    pool_timeout = _positive_finite(pool_timeout, name="pool_timeout")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
+    )
+
+    class _PinnedAsyncHTTPXClient(httpx.AsyncClient):
+        async def send(
+            self,
+            request: httpx.Request,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            policy.assert_url(str(request.url))
+            kwargs["follow_redirects"] = False
+            kwargs["stream"] = True
+            request.extensions["timeout"] = timeout.as_dict()
+            response = await super().send(request, **kwargs)
+            try:
+                policy.assert_response(response)
+                return await _bound_async_httpx_response(
+                    response,
+                    max_response_bytes,
+                )
+            except Exception:
+                await response.aclose()
+                raise
+
+    options: dict[str, Any] = {
+        "follow_redirects": False,
+        "verify": _verified_ssl_context(),
+        "trust_env": False,
+        "proxy": None,
+        "timeout": timeout,
+    }
+    if transport is not None:
+        options["transport"] = transport
+    return _PinnedAsyncHTTPXClient(**options)
+
+
+class _NoRedirectWebSocketConnect(_WebSocketConnect):
+    """Installed websockets redirect hook that refuses every handshake 3xx."""
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 300 <= status < 400:
+            raise OutboundRedirectDenied() from None
+        return exc
+
+
 class PinnedWebSocket:
-    """A connector adapter for the optional Alpaca stream, with no redirect path."""
+    """Concrete websocket boundary using the installed no-redirect connector."""
 
     def __init__(
         self,
         policy: OutboundPolicy,
-        connector: Any,
         *,
         open_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         ping_timeout: float = DEFAULT_READ_TIMEOUT,
         close_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     ) -> None:
-        if min(open_timeout, ping_timeout, close_timeout) <= 0:
-            raise ValueError("WebSocket timeouts must be positive")
         self._policy = policy
-        self._connector = connector
-        self._open_timeout = open_timeout
-        self._ping_timeout = ping_timeout
-        self._close_timeout = close_timeout
+        self._open_timeout = _positive_finite(open_timeout, name="open_timeout")
+        self._ping_timeout = _positive_finite(ping_timeout, name="ping_timeout")
+        self._close_timeout = _positive_finite(close_timeout, name="close_timeout")
 
-    def connect(self, url: str) -> Any:
+    async def connect(self, url: str) -> Any:
         self._policy.assert_url(url)
         tls_context = ssl.create_default_context()
         try:
-            handshake = self._connector(
+            return await _NoRedirectWebSocketConnect(
                 url,
-                ssl_context=tls_context,
+                proxy=None,
+                ssl=tls_context,
                 open_timeout=self._open_timeout,
+                ping_interval=self._ping_timeout,
                 ping_timeout=self._ping_timeout,
                 close_timeout=self._close_timeout,
             )
@@ -376,7 +551,3 @@ class PinnedWebSocket:
             raise
         except Exception:
             raise OutboundConnectionFailed() from None
-        status = getattr(handshake, "status_code", 101)
-        if isinstance(status, int) and 300 <= status < 400:
-            raise OutboundRedirectDenied()
-        return handshake

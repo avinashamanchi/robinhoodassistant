@@ -1,8 +1,9 @@
-"""Alpaca implementation of BrokerClient + AlpacaClock (Phase 2).
+"""Paper-only Alpaca implementation of BrokerClient + AlpacaClock (Phase 2).
 
-Paper vs live is chosen by the caller (config + double-lock). The clients are
-injected so the mapping logic is unit-testable without network access; use
-:meth:`AlpacaBroker.from_credentials` to build real SDK clients.
+Constructed execution clients use only official Alpaca paper; read-only data
+and the optional WSS boundary use separately committed origins. The clients are
+injected so mapping logic is unit-testable without network access;
+:meth:`AlpacaBroker.from_credentials` rejects non-paper use.
 
 Idempotency: every order carries ``client_order_id == idempotency_key``. Before
 submitting we look the key up at the broker and, if it already exists, return
@@ -88,16 +89,14 @@ _STREAM_POLICY = OutboundPolicy(_ALPACA_STREAM_URL)
 
 
 def build_alpaca_stream(
-    connector: Any,
     *,
     open_timeout: float = 5.0,
     ping_timeout: float = 30.0,
     close_timeout: float = 5.0,
 ) -> PinnedWebSocket:
-    """Build the optional Alpaca stream boundary without selecting a socket library."""
+    """Build the optional stream boundary with the concrete no-redirect adapter."""
     return PinnedWebSocket(
         _STREAM_POLICY,
-        connector,
         open_timeout=open_timeout,
         ping_timeout=ping_timeout,
         close_timeout=close_timeout,
@@ -127,7 +126,7 @@ _TRANSIENT = (ReqConnectionError, ReqTimeout)
 _T = TypeVar("_T")
 
 
-def _install_timeout(
+def _install_transport_policy(
     client: Any,
     timeout_seconds: float,
     policy: OutboundPolicy,
@@ -299,9 +298,9 @@ class AlpacaBroker(BrokerClient):
             secret_key,
             url_override=_ALPACA_DATA_URL,
         )
-        _install_timeout(trading, timeout_seconds, _PAPER_TRADING_POLICY)
-        _install_timeout(data, timeout_seconds, _DATA_POLICY)
-        _install_timeout(crypto_data, timeout_seconds, _DATA_POLICY)
+        _install_transport_policy(trading, timeout_seconds, _PAPER_TRADING_POLICY)
+        _install_transport_policy(data, timeout_seconds, _DATA_POLICY)
+        _install_transport_policy(crypto_data, timeout_seconds, _DATA_POLICY)
         return cls(trading, data, crypto_data)
 
     # ── market data ────────────────────────────────────────────
@@ -731,7 +730,7 @@ class AlpacaClock:
             paper=True,
             url_override=_OFFICIAL_PAPER_TRADING_URL,
         )
-        _install_timeout(client, timeout_seconds, _PAPER_TRADING_POLICY)
+        _install_transport_policy(client, timeout_seconds, _PAPER_TRADING_POLICY)
         return cls(client)
 
     def is_open(self, at=None) -> bool:

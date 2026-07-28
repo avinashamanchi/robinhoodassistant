@@ -242,22 +242,17 @@ def test_from_credentials_pins_paper_and_data_sdk_transports():
 
 
 def test_alpaca_stream_factory_pins_only_committed_wss_origin():
-    """Changing the stream origin must fail before a connector can open a socket."""
+    """Changing the stream origin must fail before the concrete adapter opens a socket."""
+    import asyncio
+
     from trading_assistant.broker.alpaca import build_alpaca_stream
     from trading_assistant.security.outbound import OutboundOriginDenied
 
-    calls = []
-
-    def connector(url, **_kwargs):
-        calls.append(url)
-        return type("Handshake", (), {"status_code": 101})()
-
-    stream = build_alpaca_stream(connector)
-    stream.connect("wss://stream.data.alpaca.markets/v2/sip")
+    stream = build_alpaca_stream()
     with pytest.raises(OutboundOriginDenied):
-        stream.connect("wss://stream.data.alpaca.markets.evil.test/v2/sip")
-
-    assert calls == ["wss://stream.data.alpaca.markets/v2/sip"]
+        asyncio.run(
+            stream.connect("wss://stream.data.alpaca.markets.evil.test/v2/sip")
+        )
 
 
 def test_execution_target_reflects_current_sdk_client_state():
