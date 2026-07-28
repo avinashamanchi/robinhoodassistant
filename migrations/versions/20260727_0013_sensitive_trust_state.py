@@ -22,6 +22,43 @@ def _hash_check(column: str) -> str:
     )
 
 
+def _require_pristine_downgrade_state() -> None:
+    connection = op.get_bind()
+    try:
+        states = connection.execute(
+            sa.text(
+                "SELECT singleton_id,schema_version,state,active_key_id,"
+                "rows_total,rows_completed,backup_path_hash,started_at,"
+                "completed_at FROM sensitive_migration_state"
+            )
+        ).mappings().all()
+        candidate_count = connection.scalar(
+            sa.text("SELECT count(*) FROM candidate_nonces")
+        )
+        ingest_count = connection.scalar(
+            sa.text("SELECT count(*) FROM untrusted_ingest_events")
+        )
+    except Exception:
+        raise RuntimeError("sensitive_trust_downgrade_blocked") from None
+
+    pristine = (
+        len(states) == 1
+        and states[0]["singleton_id"] == 1
+        and states[0]["schema_version"] == 1
+        and states[0]["state"] == "required"
+        and states[0]["active_key_id"] == "migration-required"
+        and states[0]["rows_total"] == 0
+        and states[0]["rows_completed"] == 0
+        and states[0]["backup_path_hash"] is None
+        and states[0]["started_at"] is None
+        and states[0]["completed_at"] is None
+        and candidate_count == 0
+        and ingest_count == 0
+    )
+    if not pristine:
+        raise RuntimeError("sensitive_trust_downgrade_blocked")
+
+
 def upgrade() -> None:
     op.create_table(
         "sensitive_migration_state",
@@ -265,6 +302,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _require_pristine_downgrade_state()
+
     op.drop_index(
         "ux_untrusted_ingest_source_content",
         table_name="untrusted_ingest_events",

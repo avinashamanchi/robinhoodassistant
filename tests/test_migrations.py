@@ -343,6 +343,137 @@ def test_sensitive_trust_upgrade_and_downgrade_do_not_rewrite_narratives(
 
 
 @pytest.mark.parametrize(
+    ("case", "statements"),
+    [
+        (
+            "missing-singleton",
+            ["DELETE FROM sensitive_migration_state"],
+        ),
+        (
+            "multiple-singletons",
+            [
+                "PRAGMA ignore_check_constraints=ON",
+                "INSERT INTO sensitive_migration_state "
+                "(singleton_id,schema_version,state,active_key_id,"
+                "rows_total,rows_completed,updated_at) VALUES "
+                "(2,1,'required','migration-required',0,0,CURRENT_TIMESTAMP)",
+                "PRAGMA ignore_check_constraints=OFF",
+            ],
+        ),
+        (
+            "schema-mismatch",
+            ["UPDATE sensitive_migration_state SET schema_version=2"],
+        ),
+        (
+            "active-key-mismatch",
+            [
+                "UPDATE sensitive_migration_state "
+                "SET active_key_id='configured-key-2026'"
+            ],
+        ),
+        (
+            "nonzero-total",
+            ["UPDATE sensitive_migration_state SET rows_total=1"],
+        ),
+        (
+            "nonzero-completed",
+            [
+                "UPDATE sensitive_migration_state "
+                "SET state='migrating',started_at=CURRENT_TIMESTAMP,"
+                "rows_total=1,rows_completed=1"
+            ],
+        ),
+        (
+            "backup-evidence",
+            [
+                "UPDATE sensitive_migration_state SET backup_path_hash='"
+                + "a" * 64
+                + "'"
+            ],
+        ),
+        (
+            "completion-evidence",
+            [
+                "PRAGMA ignore_check_constraints=ON",
+                "UPDATE sensitive_migration_state "
+                "SET completed_at=CURRENT_TIMESTAMP",
+                "PRAGMA ignore_check_constraints=OFF",
+            ],
+        ),
+        *[
+            pytest.param(
+                state,
+                [
+                    "UPDATE sensitive_migration_state "
+                    f"SET state='{state}',started_at=CURRENT_TIMESTAMP"
+                ],
+                id=state,
+            )
+            for state in ("migrating", "rotating", "failed")
+        ],
+        (
+            "complete",
+            [
+                "UPDATE sensitive_migration_state "
+                "SET state='complete',"
+                "active_key_id='configured-key-2026',"
+                "backup_path_hash='" + "b" * 64 + "',"
+                "started_at=CURRENT_TIMESTAMP,"
+                "completed_at=CURRENT_TIMESTAMP"
+            ],
+        ),
+        (
+            "candidate-nonce",
+            [
+                "INSERT INTO candidate_nonces "
+                "(nonce_hash,actor,kind,expires_at,request_id) VALUES "
+                "('" + "c" * 64 + "','operator:test','analysis',"
+                "CURRENT_TIMESTAMP,'downgrade-probe')"
+            ],
+        ),
+        (
+            "untrusted-ingest",
+            [
+                "INSERT INTO untrusted_ingest_events "
+                "(source_hash,content_hash,byte_length,flags_json,state,"
+                "received_at) VALUES "
+                "('" + "d" * 64 + "','" + "e" * 64 + "',1,'[]',"
+                "'received',CURRENT_TIMESTAMP)"
+            ],
+        ),
+    ],
+)
+def test_sensitive_trust_downgrade_refuses_unsafe_state_before_ddl(
+    tmp_path,
+    case,
+    statements,
+):
+    engine, cfg = _engine_at_revision(
+        tmp_path / f"unsafe-sensitive-downgrade-{case}.db",
+        "head",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+    with pytest.raises(
+        RuntimeError,
+        match="^sensitive_trust_downgrade_blocked$",
+    ):
+        command.downgrade(cfg, "20260727_0012")
+
+    assert {
+        "sensitive_migration_state",
+        "candidate_nonces",
+        "untrusted_ingest_events",
+    } <= set(inspect(engine).get_table_names())
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260727_0013"
+
+
+@pytest.mark.parametrize(
     ("counter_name", "statement"),
     [
         (

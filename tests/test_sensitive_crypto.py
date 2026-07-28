@@ -3,15 +3,30 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import SecretStr
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
+from sqlalchemy.orm import make_transient
 
 from trading_assistant.config import EncryptionConfig
-from trading_assistant.db.models import AuditEvent, Base
+from trading_assistant.db.models import (
+    AnalysisReportRow,
+    AuditEvent,
+    Base,
+    CircuitBreakerState,
+    LLMDecision,
+    Order,
+    PanicReceipt,
+    Proposal,
+    RiskEvent,
+    StartupReconciliationState,
+    TradePlanRow,
+)
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
@@ -50,6 +65,20 @@ def _audit_event() -> AuditEvent:
         request_id="request-1",
         result_code="recorded",
     )
+
+
+class _FailFinalCipher:
+    def __init__(self, cipher: SensitiveDataCipher) -> None:
+        self.cipher = cipher
+        self.fail_final = True
+
+    def encrypt(self, plaintext, ref):
+        if self.fail_final and not ref.row.startswith("pending:"):
+            raise RuntimeError("simulated_final_encryption_failure")
+        return self.cipher.encrypt(plaintext, ref)
+
+    def decrypt(self, envelope, ref):
+        return self.cipher.decrypt(envelope, ref)
 
 
 def _encoded_payload(envelope: str) -> bytes:
@@ -449,6 +478,160 @@ def test_manual_plaintext_flush_and_commit_fail_before_sql(
             session.commit()
 
 
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_guard_rejects_omitted_or_none_audit_defaults_before_insert(
+    cipher,
+    explicit_none,
+):
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    inserts: list[tuple[str, object]] = []
+
+    def capture_sql(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("INSERT INTO AUDIT_EVENTS"):
+            inserts.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        with session_factory() as session:
+            install_sensitive_field_guards(session, cipher)
+            row = _audit_event()
+            if explicit_none:
+                row.reason = None
+                row.detail_json = None
+            session.add(row)
+
+            with pytest.raises(
+                PlaintextSensitiveField,
+                match="^plaintext_sensitive_field$",
+            ):
+                session.commit()
+            session.rollback()
+
+            assert session.scalar(
+                select(func.count()).select_from(AuditEvent)
+            ) == 0
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    assert inserts == []
+    assert PLAINTEXT_MARKER not in repr(inserts)
+
+
+@pytest.mark.parametrize(
+    "instance_factory",
+    [
+        pytest.param(
+            lambda: Order(
+                id=1001,
+                idempotency_key="missing-order-reason",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+            ),
+            id="order-client-default",
+        ),
+        pytest.param(
+            lambda: Proposal(
+                id=1002,
+                order_id=1002,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            ),
+            id="proposal-client-default",
+        ),
+        pytest.param(
+            lambda: LLMDecision(id=1003),
+            id="llm-mixed-required-and-client-defaults",
+        ),
+        pytest.param(
+            lambda: RiskEvent(id=1004, event_type="rejection"),
+            id="risk-required",
+        ),
+        pytest.param(
+            lambda: AnalysisReportRow(
+                id=1005,
+                symbol="AAPL",
+                as_of=datetime.now(timezone.utc),
+                action="hold",
+                confidence=Decimal("0.5"),
+                analyst_version="v1",
+            ),
+            id="analysis-required",
+        ),
+        pytest.param(
+            lambda: TradePlanRow(
+                id=1006,
+                symbol="AAPL",
+                action="hold",
+            ),
+            id="plan-required",
+        ),
+        pytest.param(
+            lambda: CircuitBreakerState(
+                scope_key="missing-breaker-reason",
+                kind="global",
+            ),
+            id="breaker-client-default",
+        ),
+        pytest.param(
+            lambda: StartupReconciliationState(
+                broker="missing-startup-evidence",
+            ),
+            id="startup-client-defaults",
+        ),
+    ],
+)
+def test_guard_rejects_missing_sensitive_values_across_registered_models(
+    engine,
+    session_factory,
+    cipher,
+    instance_factory,
+):
+    inserts: list[tuple[str, object]] = []
+
+    def capture_sql(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().upper().startswith("INSERT"):
+            inserts.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        with session_factory() as session:
+            install_sensitive_field_guards(session, cipher)
+            session.add(instance_factory())
+
+            with pytest.raises(
+                PlaintextSensitiveField,
+                match="^plaintext_sensitive_field$",
+            ):
+                session.commit()
+            session.rollback()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    assert inserts == []
+
+
+def test_guard_allows_truly_nullable_no_default_sensitive_none(
+    session_factory,
+    cipher,
+):
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        install_sensitive_field_guards(session, cipher)
+        row = PanicReceipt(
+            account_scope="paper:test",
+            request_id="nullable-sensitive-none",
+            state="started",
+            response_json=None,
+            expires_at=now + timedelta(minutes=5),
+        )
+        session.add(row)
+        session.commit()
+
+        assert row.response_json is None
+
+
 def test_guard_rejects_forged_pending_envelope_and_session_metadata(
     session_factory,
     cipher,
@@ -483,18 +666,7 @@ def test_failure_between_flushes_cannot_commit_and_rollback_cleans_staging(
     session_factory,
     cipher,
 ):
-    class FailFinalCipher:
-        fail_final = True
-
-        def encrypt(self, plaintext, ref):
-            if self.fail_final and not ref.row.startswith("pending:"):
-                raise RuntimeError("simulated_final_encryption_failure")
-            return cipher.encrypt(plaintext, ref)
-
-        def decrypt(self, envelope, ref):
-            return cipher.decrypt(envelope, ref)
-
-    failing_cipher = FailFinalCipher()
+    failing_cipher = _FailFinalCipher(cipher)
     with session_factory() as session:
         store = SensitiveFieldStore(session, failing_cipher)
         with pytest.raises(RuntimeError, match="simulated_final"):
@@ -525,6 +697,157 @@ def test_failure_between_flushes_cannot_commit_and_rollback_cleans_staging(
         )
         session.commit()
         assert session.scalar(select(AuditEvent).where(AuditEvent.id == row.id))
+
+
+def test_final_flush_failure_latch_survives_detach_and_prevents_commit(
+    tmp_path,
+    cipher,
+):
+    database_path = tmp_path / "failed-final-flush.db"
+    engine = create_db_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    flush_count = 0
+    statements: list[tuple[str, object]] = []
+
+    def capture_sql(_conn, _cursor, statement, parameters, _context, _many):
+        statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        with session_factory() as session:
+            def fail_second_flush(_session, _context, _instances):
+                nonlocal flush_count
+                flush_count += 1
+                if flush_count == 2:
+                    raise RuntimeError("forced_final_flush_failure")
+
+            event.listen(session, "before_flush", fail_second_flush)
+            store = SensitiveFieldStore(session, cipher)
+            row = _audit_event()
+
+            with pytest.raises(
+                RuntimeError,
+                match="^forced_final_flush_failure$",
+            ):
+                store.write(
+                    row,
+                    {
+                        "reason": PLAINTEXT_MARKER,
+                        "detail_json": '{"stage":"inserted"}',
+                    },
+                )
+
+            session.expire(row)
+            session.expunge(row)
+            make_transient(row)
+            with pytest.raises(
+                PlaintextSensitiveField,
+                match="^plaintext_sensitive_field$",
+            ):
+                session.commit()
+            session.rollback()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    inserts = [
+        parameters
+        for statement, parameters in statements
+        if statement.lstrip().upper().startswith("INSERT INTO AUDIT_EVENTS")
+    ]
+    updates = [
+        parameters
+        for statement, parameters in statements
+        if statement.lstrip().upper().startswith("UPDATE AUDIT_EVENTS")
+    ]
+    assert len(inserts) == 1
+    assert repr(inserts[0]).count("enc:v1:") >= 2
+    assert updates == []
+    assert PLAINTEXT_MARKER not in repr(statements)
+    assert PLAINTEXT_MARKER.encode() not in _all_file_bytes(database_path)
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+
+
+def test_nested_rollback_cannot_clear_outer_staging_latch(
+    session_factory,
+    cipher,
+):
+    failing_cipher = _FailFinalCipher(cipher)
+    with session_factory() as session:
+        store = SensitiveFieldStore(session, failing_cipher)
+        with pytest.raises(RuntimeError, match="simulated_final"):
+            store.write(
+                _audit_event(),
+                {
+                    "reason": "outer staged",
+                    "detail_json": '{"scope":"outer"}',
+                },
+            )
+
+        nested = session.begin_nested()
+        nested.rollback()
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.commit()
+
+        session.rollback()
+        failing_cipher.fail_final = False
+        retry = _audit_event()
+        retry.request_id = "outer-rollback-clean-retry"
+        store.write(
+            retry,
+            {
+                "reason": "clean retry",
+                "detail_json": '{"retry":true}',
+            },
+        )
+        session.commit()
+        assert store.read(retry, "reason") == "clean retry"
+
+
+def test_savepoint_staging_requires_full_outer_rollback_before_retry(
+    session_factory,
+    cipher,
+):
+    failing_cipher = _FailFinalCipher(cipher)
+    with session_factory() as session:
+        store = SensitiveFieldStore(session, failing_cipher)
+        session.begin()
+        nested = session.begin_nested()
+
+        with pytest.raises(RuntimeError, match="simulated_final"):
+            store.write(
+                _audit_event(),
+                {
+                    "reason": "savepoint staged",
+                    "detail_json": '{"scope":"savepoint"}',
+                },
+            )
+        nested.rollback()
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.commit()
+
+        session.rollback()
+        failing_cipher.fail_final = False
+        retry = _audit_event()
+        retry.request_id = "savepoint-full-rollback-retry"
+        store.write(
+            retry,
+            {
+                "reason": "clean savepoint retry",
+                "detail_json": '{"retry":true}',
+            },
+        )
+        session.commit()
+        assert store.read(retry, "reason") == "clean savepoint retry"
 
 
 def test_guard_installation_is_idempotent_for_one_session(

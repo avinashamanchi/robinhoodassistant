@@ -47,6 +47,7 @@ class _StagedField:
     object_id: int
     column: str
     pending_ref: SensitiveFieldRef
+    final_ref: SensitiveFieldRef | None = None
 
 
 @dataclass
@@ -93,9 +94,18 @@ def _verify_registered_values(
             continue
         for column in columns:
             value = getattr(instance, column)
-            if value is None:
-                continue
             staged = state.staged.get((id(instance), column))
+            if value is None:
+                if staged is not None:
+                    raise PlaintextSensitiveField()
+                mapped_column = instance.__table__.c[column]
+                if (
+                    mapped_column.nullable
+                    and mapped_column.default is None
+                    and mapped_column.server_default is None
+                ):
+                    continue
+                raise PlaintextSensitiveField()
             try:
                 if staged is not None:
                     if (
@@ -110,7 +120,20 @@ def _verify_registered_values(
                         or not staged.pending_ref.row.startswith("pending:")
                     ):
                         raise SensitiveDataInvalid()
-                    cipher.decrypt(value, staged.pending_ref)
+                    verification_ref = staged.pending_ref
+                    if staged.final_ref is not None:
+                        row_id = _row_id(instance)
+                        if (
+                            row_id is None
+                            or staged.final_ref.table != table
+                            or staged.final_ref.row != row_id
+                            or staged.final_ref.column != column
+                            or staged.final_ref.schema_version
+                            != state.schema_version
+                        ):
+                            raise SensitiveDataInvalid()
+                        verification_ref = staged.final_ref
+                    cipher.decrypt(value, verification_ref)
                     continue
 
                 row_id = _row_id(instance)
@@ -175,18 +198,19 @@ def install_sensitive_field_guards(
             allow_staged=False,
         )
 
-    def after_rollback(_guarded_session: Session) -> None:
-        state.staged.clear()
-
     def after_soft_rollback(
-        _guarded_session: Session,
-        _previous_transaction,
+        guarded_session: Session,
+        previous_transaction,
     ) -> None:
-        state.staged.clear()
+        try:
+            is_outermost = previous_transaction.parent is None
+        except Exception:
+            return
+        if is_outermost and not guarded_session.in_transaction():
+            state.staged.clear()
 
     event.listen(session, "before_flush", before_flush)
     event.listen(session, "before_commit", before_commit)
-    event.listen(session, "after_rollback", after_rollback)
     event.listen(session, "after_soft_rollback", after_soft_rollback)
 
 
@@ -281,26 +305,60 @@ class SensitiveFieldStore:
                     if row_id is None:
                         raise PlaintextSensitiveField()
 
-                    final_envelopes = {
-                        column: self._cipher.encrypt(
-                            plaintext_values[column],
-                            SensitiveFieldRef(
-                                table=table,
-                                row=row_id,
-                                column=column,
-                                schema_version=self._schema_version,
-                            ),
+                    final_refs = {
+                        column: SensitiveFieldRef(
+                            table=table,
+                            row=row_id,
+                            column=column,
+                            schema_version=self._schema_version,
                         )
                         for column in field_names
                     }
+                    final_envelopes = {
+                        column: self._cipher.encrypt(
+                            plaintext_values[column],
+                            final_refs[column],
+                        )
+                        for column in field_names
+                    }
+                    for column in field_names:
+                        staged = self._guard_state.staged[
+                            (id(instance), column)
+                        ]
+                        self._guard_state.staged[(id(instance), column)] = (
+                            _StagedField(
+                                object_ref=staged.object_ref,
+                                object_id=staged.object_id,
+                                column=staged.column,
+                                pending_ref=staged.pending_ref,
+                                final_ref=final_refs[column],
+                            )
+                        )
                     for column, envelope in final_envelopes.items():
                         setattr(instance, column, envelope)
+                    self._session.flush([instance])
+                    for column in field_names:
+                        staged = self._guard_state.staged.get(
+                            (id(instance), column)
+                        )
+                        if (
+                            staged is None
+                            or staged.object_ref() is not instance
+                            or staged.final_ref != final_refs[column]
+                        ):
+                            raise PlaintextSensitiveField()
+                        try:
+                            self._cipher.decrypt(
+                                getattr(instance, column),
+                                final_refs[column],
+                            )
+                        except Exception:
+                            raise PlaintextSensitiveField() from None
                     for column in field_names:
                         self._guard_state.staged.pop(
                             (id(instance), column),
                             None,
                         )
-                    self._session.flush([instance])
                     return instance
 
                 final_envelopes = {
