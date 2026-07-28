@@ -1442,19 +1442,22 @@ git commit -m "feat(analyst): isolate untrusted model context"
   Its source fields and plan generation remain empty/zero, its TTL equals the
   current asset-class risk configuration, `created_at` equals the order
   creation time, and `expires_at` is exactly the configured interval later.
-  The encrypted proposal reasoning must decrypt successfully and its
-  metadata-HMAC must match the receipt-bound operator reason.
-- Order replay validates repository-producible lifecycle metadata, not graph
-  reachability alone. Approval, submission, broker identity, acceptance,
-  reconciliation, version, and fill-ledger relationships must match the
-  current state. Accepted fills must have canonical order identity and exact
-  quantity relationships while superseded legacy rows remain non-authoritative.
-- Candidate-created ACTIVE rules permit version zero without a lease, any
-  positive version with a paired lease, and version two or later after lease
-  release. Worker-triggered and worker-failed terminal groups require the
-  winning rule and version two or later. Direct cancellation has no terminal
-  winner and requires version one or later. Only a triggered group may carry
-  the linked-order reconciliation latch.
+  Replay never decrypts proposal reasoning or approval prose. The
+  candidate-origin audit binds the receipt reason metadata-HMAC and an exact
+  proposal snapshot containing only ordinary metadata plus a digest of the
+  encrypted envelope.
+- Order replay validates repository-produced lifecycle proof, not graph
+  reachability or a hand-written status whitelist alone. Approval,
+  submission, reconciliation, cancellation, broker identity, error state,
+  version, proposal, and authoritative fill rows are snapshotted into the
+  row-bound encrypted audit event in the same transaction as each mutation.
+  Replay requires both `OrderStateMachine` reachability and an exact match to
+  the latest durable proof.
+- Candidate rule replay likewise requires exact repository-produced rule and
+  group proofs. Lease owner/expiry/version chronology must match a real claim
+  or release, terminal/reconciliation states require the atomically linked
+  order and canonical `Proposal`, and cancellation/panic paths write proof
+  only after their target mutations.
 - Candidate expiry is exclusive: an observation at or after `expires_at` is
   expired.
 - MCP remains explicit and non-executing with its existing authenticated tool
@@ -1516,6 +1519,26 @@ git commit -m "feat(analyst): isolate untrusted model context"
   states.
 - [x] **FR3.5:** Pass focused Task 9 tests, exactly one full suite, diff,
   compile, and release-static gates without runtime or external calls.
+
+**Fix round 4**
+
+- [x] **FR4.1:** Replace broad replay heuristics with shared, encrypted,
+  repository-produced lifecycle proofs committed atomically with order/rule
+  mutations.
+- [x] **FR4.2:** Reject forged approval, direct cancellation, changed broker
+  identity, and unevidenced overfill state in completed and compatibility
+  receipt modes while accepting real reconciled terminal states.
+- [x] **FR4.3:** Require normalized lease ownership and exact claim/release
+  chronology, plus the worker-persisted linked order/proposal for terminal or
+  reconciliation rule states.
+- [x] **FR4.4:** Remove replay-time decryption of proposal reasoning and
+  approval prose; bind only encrypted-envelope digests and metadata-HMACs
+  inside row-bound encrypted audit proof.
+- [x] **FR4.5:** Prove legacy atomic approval and panic cancellation through
+  their real authoritative write paths.
+- [x] **FR4.6:** Pass RED/focused/repeated-adversarial verification, exactly
+  one full suite, review diff, compile/diff, and release-static gates without
+  runtime or external calls.
 
 ---
 

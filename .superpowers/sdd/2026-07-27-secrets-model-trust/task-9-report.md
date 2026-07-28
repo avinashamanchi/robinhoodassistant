@@ -4,7 +4,7 @@
 
 Task 9 was implemented in `9a9327f`. Review fix round 1 is implemented in
 `9197ba8`. Review fix round 2 is implemented in `a092790`. Review fix round 3
-is implemented in `8bb5ab5`.
+is implemented in `8bb5ab5`. Review fix round 4 is implemented in `b6af5fe`.
 
 General chat now has one immutable read-only tool registry plus two
 non-persisting draft tools. It cannot propose, create, cancel, approve, submit,
@@ -513,6 +513,149 @@ The full suite was not rerun.
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-3ca5ed5..8bb5ab5.diff`
 - Diff size: 1,281 lines / 46,092 bytes
 
+## Review fix round 4
+
+All three Important findings and the Minor finding from the adversarial review
+of `8bb5ab5` were addressed in implementation commit `b6af5fe`:
+
+- `db/lifecycle_proofs.py` is now the shared replay authority. Order, proposal,
+  fill, rule, and rule-group lifecycle state is snapshotted into the existing
+  row-bound encrypted `AuditEvent.detail_json` in the same transaction as each
+  authoritative mutation. Replay requires an exact match to the latest proof;
+  order replay additionally requires transitive reachability through
+  `OrderStateMachine`.
+- Approval, submission, reconciliation, direct cancellation, panic
+  cancellation, rule claim/release/terminal writes, and legacy
+  `approve_proposed` now emit proof only after their target mutation. A forged
+  actor/time/version, direct `PROPOSED -> CANCELED`, changed broker identity,
+  or direct overfill cannot acquire repository provenance.
+- Real broker reconciliation to `CANCELED`, `REJECTED`, or `EXPIRED` remains
+  replayable with `acceptance_state=submitted` and version four because its
+  exact repository-produced proof, not a broad state whitelist, is the
+  authority.
+- Rule replay requires normalized nonempty lease ownership, exact paired lease
+  chronology, an exact group/rule proof, and—for terminal or reconciliation
+  states—the single worker-linked order and canonical `Proposal` with matching
+  source group/rule IDs and action fields.
+- Proposal replay no longer decrypts `Proposal.reasoning` or
+  `Order.approval_reason`. Proof contains ordinary lifecycle fields and SHA-256
+  digests of the encrypted envelopes only. The candidate-origin audit also
+  carries the existing receipt-bound reason metadata-HMAC. The proof payload is
+  itself authenticated and row-bound by the existing AES-GCM sensitive-field
+  store. The threat model detects direct target-row edits and mismatched
+  repository state while the audit store and encryption key remain trusted; it
+  does not claim protection from an actor who can rewrite both target and audit
+  rows using valid encryption keys. No schema migration was required.
+
+### Fix-round-4 RED evidence
+
+The first focused selector ran before production implementation changed:
+
+```text
+uv run pytest -q tests/test_candidate_boundary.py -k \
+  'forged_approval_with_pending_reason or \
+   direct_unevidenced_cancellation or \
+   broker_identity_changed_after_submission or \
+   unevidenced_trusted_overfill or \
+   real_reconciled_terminal_with_submitted_acceptance or \
+   never_decrypts_proposal_reasoning or \
+   malformed_active_lease_chronology or \
+   terminal_reconciliation_without_linked_proposal or \
+   tampered_worker_linkage'
+27 failed
+```
+
+The failures reproduced every listed false accept, the real reconciled
+terminal false reject, missing worker linkage validation, and replay-time
+sensitive prose reads in both completed and compatibility receipt modes.
+
+Tracing the legacy approval and panic repositories exposed two more missing
+authoritative write sites. Their legal-path tests were captured RED before
+those sites changed:
+
+```text
+uv run pytest -q tests/test_candidate_boundary.py -k \
+  'real_panic_cancellation or legacy_atomic_approval_provenance'
+4 failed
+```
+
+Both unchanged selectors passed after the minimal transition-site proof writes.
+
+### Fix-round-4 focused and adversarial evidence
+
+```text
+uv run pytest tests/test_candidate_boundary.py \
+  tests/test_order_application.py tests/test_order_submission.py \
+  tests/test_reconciliation_service.py tests/test_rule_leases.py \
+  tests/test_rules_engine.py tests/test_submission_barrier.py \
+  tests/test_api.py tests/test_mcp_tools.py \
+  tests/test_sensitive_write_sites.py tests/test_sensitive_crypto.py \
+  tests/test_sensitive_migration.py tests/test_order_state_machine.py \
+  tests/test_startup_reconciliation.py
+672 passed, 1 warning in 64.85s
+
+for repeat in 1 2 3 4 5
+do
+  uv run pytest tests/test_candidate_boundary.py -k \
+    'forged_approval_with_pending_reason or \
+     direct_unevidenced_cancellation or \
+     broker_identity_changed_after_submission or \
+     unevidenced_trusted_overfill or \
+     real_reconciled_terminal_with_submitted_acceptance or \
+     never_decrypts_proposal_reasoning or \
+     malformed_active_lease_chronology or \
+     terminal_reconciliation_without_linked_proposal or \
+     tampered_worker_linkage or real_panic_cancellation or \
+     legacy_atomic_approval_provenance' || exit 1
+done
+5 runs / 155 passed
+
+uv run pytest tests/test_sensitive_crypto.py \
+  tests/test_sensitive_migration.py tests/test_sensitive_write_sites.py \
+  tests/test_order_state_machine.py tests/test_startup_reconciliation.py
+177 passed in 4.68s
+
+uv run python -m py_compile \
+  src/trading_assistant/db/lifecycle_proofs.py \
+  src/trading_assistant/db/models.py \
+  src/trading_assistant/orders/repository.py \
+  src/trading_assistant/orders/reconciliation.py \
+  src/trading_assistant/rules/application.py \
+  src/trading_assistant/rules/repository.py \
+  src/trading_assistant/security/candidates.py \
+  src/trading_assistant/service.py tests/test_candidate_boundary.py
+PASS
+
+git diff --check
+PASS
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning. `uv run ruff check ...` was attempted but Ruff is not installed in
+this environment, so no Ruff result is claimed.
+
+### Fix-round-4 full and release gates
+
+Exactly one no-argument full suite was run for this implementation fix round:
+
+```text
+uv run pytest
+3215 passed, 1 skipped, 1 warning in 251.36s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+The full suite was not rerun.
+
+### Fix-round-4 review package
+
+- Base: `0aac06b`
+- Implementation: `b6af5fe`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-0aac06b..b6af5fe.diff`
+- Diff size: 1,835 lines / 62,269 bytes
+
 ## Safety statement
 
 All tests used temporary SQLite databases and deterministic fakes. No app,
@@ -536,7 +679,12 @@ equity/crypto behavior.
 - The schema retains `target_persisted` for fail-closed recovery of receipts
   written before fix round 2. New code never writes that intermediate state;
   removing it later requires operational proof that no compatible rows remain.
-- The fix-round-3 review package is prepared but has not yet received a fresh
+- Encrypted-field rotation changes ciphertext envelopes. Because lifecycle
+  proof deliberately binds ciphertext digests and rotation does not rewrite
+  domain lifecycle proof, a post-rotation candidate replay conservatively fails
+  closed rather than trusting changed ciphertext. A separately authorized proof
+  refresh would be needed if replay availability across rotation is required.
+- The fix-round-4 review package is prepared but has not yet received a fresh
   independent review, so this report claims implementation-gate completion,
   not independent-review closure.
 - Candidate queueing intentionally does not make profitability claims and does

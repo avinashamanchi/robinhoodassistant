@@ -122,20 +122,21 @@ through deterministic fakes, with zero broker submission/cancellation calls.
 - Candidate-origin orders retain exactly one canonical proposal. Proposal
   source fields and plan generation are empty/zero, TTL comes from the current
   asset-class risk configuration, creation equals order creation, expiry is
-  exactly the configured interval later, and decrypted reasoning must match
-  the receipt-bound reason metadata-HMAC. Missing, duplicate, altered, or
-  cryptographically inconsistent proposal state fails closed.
-- Forward order replay requires a repository-producible state, not only a path
-  in the status graph. Approval identity/time, version, submission attempt/time,
-  broker identity, acceptance/reconciliation state, and authoritative fill
-  identity/quantity must agree with the status. Superseded legacy fill rows are
-  non-authoritative and do not inflate the accepted quantity.
-- Candidate rule lifecycle validation follows the actual repository paths.
-  Initial ACTIVE is version zero without a lease; an ACTIVE lease has paired
-  owner/expiry and positive version; a released ACTIVE group is version two or
-  later without a lease. TRIGGERED/FAILED require their terminal rule and
-  version two or later. Direct CANCELED has no terminal winner and version one
-  or later. A linked-order reconciliation latch is legal only after TRIGGERED.
+  exactly the configured interval later, and the candidate-origin audit binds
+  the receipt reason metadata-HMAC. Replay never decrypts proposal reasoning
+  or approval prose; it compares ordinary metadata and encrypted-envelope
+  digests inside the row-bound encrypted audit proof. Missing, duplicate,
+  altered, or cryptographically inconsistent proposal state fails closed.
+- Forward order replay requires exact repository-produced lifecycle proof,
+  not only a path in the status graph or a broad metadata whitelist.
+  Approval, submission, reconciliation, cancellation, broker identity, error
+  state, version, proposal, and authoritative fills are captured in the same
+  transaction as each mutation and must match the latest proof.
+- Candidate rule lifecycle validation uses the same proof authority. Lease
+  ownership and chronology must match a real claim/release. Terminal and
+  reconciliation states require the exact linked order/proposal persisted by
+  the worker, and direct/panic cancellation proofs are written only after
+  their target mutations.
 - Completed and target-persisted receipts may replay after envelope expiry.
   Reserved receipts must revalidate issue/expiry/quote age before resuming; a
   stale retry becomes a terminal exact-status receipt and creates no target.
@@ -180,6 +181,25 @@ through deterministic fakes, with zero broker submission/cancellation calls.
   worker trigger/failure, direct cancellation, and linked-order latch paths.
 - Run focused candidate/order/rule/submission and agent/API/MCP/policy tests,
   then exactly one no-argument full suite and the release static gate.
+- Use temporary SQLite and deterministic fakes only. Do not start services,
+  contact providers, read Keychain content, touch the ignored runtime database,
+  trade, reset a breaker, push, or begin Task 10.
+
+## Review fix round 4 evidence contract
+
+- Capture RED in both completed and compatibility receipt modes for forged
+  approval metadata, direct cancellation, changed broker identity,
+  unevidenced overfill, malformed lease chronology, missing/tampered
+  worker-linked proposal provenance, and replay-time sensitive prose reads.
+- Drive accepted approval, submission, reconciliation, terminal order,
+  worker-trigger, direct cancellation, lease, and panic-cancellation paths
+  through the real application/repository authorities.
+- Use one shared durable proof validator whose evidence is written atomically
+  at transition sites. Do not replace the prior broad whitelist with another
+  broad whitelist.
+- Run focused candidate/order/rule/reconciliation/API/MCP/sensitive-field
+  tests, adversarial repeats, exactly one no-argument full suite, and the
+  release static gate.
 - Use temporary SQLite and deterministic fakes only. Do not start services,
   contact providers, read Keychain content, touch the ignored runtime database,
   trade, reset a breaker, push, or begin Task 10.
