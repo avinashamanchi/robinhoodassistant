@@ -1,0 +1,1147 @@
+diff --git a/src/trading_assistant/ops/backup.py b/src/trading_assistant/ops/backup.py
+index 7e934f164104781a5b4e2a4950c762b0ee3409d7..a32361e422df7a03da9fd90294aa2b10f18af71f 100644
+--- a/src/trading_assistant/ops/backup.py
++++ b/src/trading_assistant/ops/backup.py
+@@ -47 +46,0 @@ from .backup_transaction import (
+-    create_transaction_member as _create_transaction_member,
+@@ -59,0 +59 @@ from .backup_transaction import (
++    transaction_member_path as _transaction_member_path,
+@@ -740 +739,0 @@ def _transition_commit_state(
+-    transition_proven = False
+@@ -746,2 +744,0 @@ def _transition_commit_state(
+-    primary_failure: BaseException | None = None
+-    cleanup_failure: BaseException | None = None
+@@ -749 +746 @@ def _transition_commit_state(
+-    def prove_state(state: _ArtifactCommitState) -> None:
++    def observe_state() -> _ArtifactCommitState:
+@@ -760,4 +757 @@ def _transition_commit_state(
+-        if observed != state:
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_invalid"
+-            )
++        return observed
+@@ -765 +759,3 @@ def _transition_commit_state(
+-    def persist_and_prove(state: _ArtifactCommitState) -> None:
++    def persist_and_prove(
++        state: _ArtifactCommitState,
++    ) -> _ArtifactCommitState:
+@@ -777,0 +774 @@ def _transition_commit_state(
++        observed: _ArtifactCommitState | None = None
+@@ -779 +776 @@ def _transition_commit_state(
+-            prove_state(state)
++            observed = observe_state()
+@@ -782,2 +779,2 @@ def _transition_commit_state(
+-        if proof_failure is None:
+-            return
++        if proof_failure is None and observed == state:
++            return observed
+@@ -785,0 +783,4 @@ def _transition_commit_state(
++        if proof_failure is None:
++            raise EncryptedBackupError(
++                "encrypted_backup_state_invalid"
++            )
+@@ -812 +813 @@ def _transition_commit_state(
+-            persist_and_prove(transitioned)
++            return persist_and_prove(transitioned)
+@@ -813,0 +815,14 @@ def _transition_commit_state(
++            # A BaseException can arrive after the durable readback but before
++            # the nested return reaches this frame. Re-read through the same
++            # still-locked descriptor before any restoration attempt. One
++            # retry covers an exception at the first reconciliation boundary.
++            for _attempt in range(2):
++                try:
++                    observed = observe_state()
++                except BaseException:
++                    continue
++                if observed == transitioned:
++                    return observed
++                if observed == expected:
++                    raise transition_failure
++                break
+@@ -833,3 +847,0 @@ def _transition_commit_state(
+-        transition_proven = True
+-    except BaseException as exc:
+-        primary_failure = exc
+@@ -840,2 +852,2 @@ def _transition_commit_state(
+-            except BaseException as exc:
+-                cleanup_failure = exc
++            except BaseException:
++                pass
+@@ -845,3 +857,2 @@ def _transition_commit_state(
+-            except BaseException as exc:
+-                if cleanup_failure is None:
+-                    cleanup_failure = exc
++            except BaseException:
++                pass
+@@ -851,16 +862,2 @@ def _transition_commit_state(
+-            except BaseException as exc:
+-                if cleanup_failure is None:
+-                    cleanup_failure = exc
+-
+-    # A proven transition is final. Unlock/close still release kernel
+-    # resources even when their wrappers report an error, so descriptor
+-    # cleanup cannot reverse or obscure the durable result.
+-    if transition_proven:
+-        return transitioned
+-    if primary_failure is None:
+-        primary_failure = EncryptedBackupError(
+-            "encrypted_backup_state_invalid"
+-        )
+-    if cleanup_failure is not None:
+-        raise primary_failure from cleanup_failure
+-    raise primary_failure
++            except BaseException:
++                pass
+@@ -1053,2 +1050,2 @@ def create_encrypted_database_backup(
+-        # The checksummed, inode-bound manifest is durable and exclusively
+-        # locked before the first plaintext member can exist.
++        # All operation members are precreated and inode-bound by the durable,
++        # checksummed manifest before any sensitive content can exist.
+@@ -1058 +1055 @@ def create_encrypted_database_backup(
+-        snapshot = _create_transaction_member(
++        snapshot = _transaction_member_path(
+@@ -1066,0 +1064,7 @@ def create_encrypted_database_backup(
++            if snapshot_connection.execute(
++                "PRAGMA journal_mode=OFF"
++            ).fetchone() != ("off",):
++                raise EncryptedBackupError(
++                    "encrypted_backup_transaction_invalid"
++                )
++            snapshot_connection.execute("PRAGMA temp_store=MEMORY")
+@@ -1074,3 +1078,6 @@ def create_encrypted_database_backup(
+-            snapshot_connection.execute(
+-                "PRAGMA journal_mode=DELETE"
+-            ).fetchone()
++            if snapshot_connection.execute(
++                "PRAGMA journal_mode=OFF"
++            ).fetchone() != ("off",):
++                raise EncryptedBackupError(
++                    "encrypted_backup_transaction_invalid"
++                )
+@@ -1108 +1114,0 @@ def create_encrypted_database_backup(
+-        _create_transaction_member(transaction, _ENCRYPTED_NAME)
+@@ -1133,0 +1140 @@ def create_encrypted_database_backup(
++            ciphertext.truncate(0)
+@@ -1152 +1159 @@ def create_encrypted_database_backup(
+-        verification = _create_transaction_member(
++        verification = _transaction_member_path(
+@@ -1176,0 +1184 @@ def create_encrypted_database_backup(
++            plaintext.truncate(0)
+diff --git a/src/trading_assistant/ops/backup_transaction.py b/src/trading_assistant/ops/backup_transaction.py
+index 6d16d9b2e637874d4f433de9b9ac455e6881a5be..efd35084b0429d99cf6ecde328292aeb93dcab71 100644
+--- a/src/trading_assistant/ops/backup_transaction.py
++++ b/src/trading_assistant/ops/backup_transaction.py
+@@ -25,2 +25,2 @@ TRANSACTION_MANIFEST_MAGIC = b"TA-BACKUP-TRANSACTION\x00"
+-TRANSACTION_MANIFEST_VERSION = 1
+-TRANSACTION_MANIFEST_BYTES = 512
++TRANSACTION_MANIFEST_VERSION = 2
++TRANSACTION_MANIFEST_BYTES = 2048
+@@ -30,0 +31,5 @@ ENCRYPTED_NAME = "encrypted.aesgcm"
++OPERATION_MEMBER_NAMES = (
++    SNAPSHOT_NAME,
++    VERIFICATION_NAME,
++    ENCRYPTED_NAME,
++)
+@@ -32,12 +37 @@ TRANSACTION_MEMBER_NAMES = frozenset(
+-    {
+-        TRANSACTION_MANIFEST_NAME,
+-        SNAPSHOT_NAME,
+-        f"{SNAPSHOT_NAME}-journal",
+-        f"{SNAPSHOT_NAME}-shm",
+-        f"{SNAPSHOT_NAME}-wal",
+-        VERIFICATION_NAME,
+-        f"{VERIFICATION_NAME}-journal",
+-        f"{VERIFICATION_NAME}-shm",
+-        f"{VERIFICATION_NAME}-wal",
+-        ENCRYPTED_NAME,
+-    }
++    {TRANSACTION_MANIFEST_NAME, *OPERATION_MEMBER_NAMES}
+@@ -58,0 +53,9 @@ class EncryptedBackupError(RuntimeError):
++@dataclass(frozen=True)
++class _BackupTransactionMember:
++    name: str
++    device: int
++    inode: int
++    file_type: str
++    mode: int
++
++
+@@ -64,0 +68,3 @@ class _BackupTransactionManifest:
++    manifest_device: int
++    manifest_inode: int
++    members: tuple[_BackupTransactionMember, ...]
+@@ -281,0 +288,12 @@ def _manifest_payload(
++        "manifest_device": manifest.manifest_device,
++        "manifest_inode": manifest.manifest_inode,
++        "members": [
++            {
++                "device": member.device,
++                "file_type": member.file_type,
++                "inode": member.inode,
++                "mode": member.mode,
++                "name": member.name,
++            }
++            for member in manifest.members
++        ],
+@@ -308,0 +327,3 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
++            "manifest_device",
++            "manifest_inode",
++            "members",
+@@ -319,0 +341 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
++    encoded_members = payload.get("members")
+@@ -327,0 +350,43 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
++        or not positive_record_integer(payload.get("manifest_device"))
++        or not positive_record_integer(payload.get("manifest_inode"))
++        or not isinstance(encoded_members, list)
++        or len(encoded_members) != len(OPERATION_MEMBER_NAMES)
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    members: list[_BackupTransactionMember] = []
++    for encoded_member in encoded_members:
++        if (
++            not isinstance(encoded_member, dict)
++            or set(encoded_member)
++            != {
++                "device",
++                "file_type",
++                "inode",
++                "mode",
++                "name",
++            }
++            or not isinstance(encoded_member.get("name"), str)
++            or encoded_member.get("name") not in OPERATION_MEMBER_NAMES
++            or encoded_member.get("file_type") != "regular"
++            or type(encoded_member.get("mode")) is not int
++            or encoded_member.get("mode") != 0o600
++            or not positive_record_integer(encoded_member.get("device"))
++            or not positive_record_integer(encoded_member.get("inode"))
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        members.append(
++            _BackupTransactionMember(
++                name=encoded_member["name"],
++                device=encoded_member["device"],
++                inode=encoded_member["inode"],
++                file_type=encoded_member["file_type"],
++                mode=encoded_member["mode"],
++            )
++        )
++    members.sort(key=lambda member: member.name)
++    if tuple(member.name for member in members) != tuple(
++        sorted(OPERATION_MEMBER_NAMES)
+@@ -336,0 +402,3 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
++        manifest_device=payload["manifest_device"],
++        manifest_inode=payload["manifest_inode"],
++        members=tuple(members),
+@@ -409,0 +478,4 @@ def _manifest_identity(
++        and descriptor_stat.st_dev
++        == transaction.manifest.manifest_device
++        and descriptor_stat.st_ino
++        == transaction.manifest.manifest_inode
+@@ -444,0 +517,63 @@ def _read_manifest(
++def _recorded_member(
++    manifest: _BackupTransactionManifest,
++    name: str,
++) -> _BackupTransactionMember:
++    for member in manifest.members:
++        if member.name == name:
++            return member
++    raise EncryptedBackupError(
++        "encrypted_backup_transaction_invalid"
++    )
++
++
++def _member_stat_matches(
++    descriptor_stat: os.stat_result,
++    path_stat: os.stat_result,
++    member: _BackupTransactionMember,
++) -> bool:
++    return (
++        member.file_type == "regular"
++        and stat.S_ISREG(descriptor_stat.st_mode)
++        and stat.S_ISREG(path_stat.st_mode)
++        and descriptor_stat.st_dev == path_stat.st_dev
++        and descriptor_stat.st_ino == path_stat.st_ino
++        and descriptor_stat.st_dev == member.device
++        and descriptor_stat.st_ino == member.inode
++        and stat.S_IMODE(descriptor_stat.st_mode) == member.mode
++        and stat.S_IMODE(path_stat.st_mode) == member.mode
++    )
++
++
++def _open_recorded_member(
++    transaction: BackupTransaction,
++    member: _BackupTransactionMember,
++    flags: int,
++) -> int:
++    descriptor = os.open(
++        member.name,
++        flags
++        | getattr(os, "O_NOFOLLOW", 0)
++        | getattr(os, "O_NONBLOCK", 0),
++        dir_fd=transaction.directory_descriptor,
++    )
++    try:
++        descriptor_stat = os.fstat(descriptor)
++        path_stat = os.stat(
++            member.name,
++            dir_fd=transaction.directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not _member_stat_matches(
++            descriptor_stat,
++            path_stat,
++            member,
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        return descriptor
++    except BaseException:
++        os.close(descriptor)
++        raise
++
++
+@@ -450,4 +585 @@ def validate_backup_transaction(
+-    if (
+-        TRANSACTION_MANIFEST_NAME not in members
+-        or not members <= TRANSACTION_MEMBER_NAMES
+-    ):
++    if members != TRANSACTION_MEMBER_NAMES:
+@@ -456,0 +589,13 @@ def validate_backup_transaction(
++    descriptors: list[int] = []
++    try:
++        for member in transaction.manifest.members:
++            descriptors.append(
++                _open_recorded_member(
++                    transaction,
++                    member,
++                    os.O_RDONLY,
++                )
++            )
++    finally:
++        for descriptor in descriptors:
++            os.close(descriptor)
+@@ -459,0 +605,53 @@ def validate_backup_transaction(
++def _capture_member(
++    directory_descriptor: int,
++    name: str,
++    descriptor: int,
++) -> _BackupTransactionMember:
++    descriptor_stat = os.fstat(descriptor)
++    path_stat = os.stat(
++        name,
++        dir_fd=directory_descriptor,
++        follow_symlinks=False,
++    )
++    mode = stat.S_IMODE(descriptor_stat.st_mode)
++    if not (
++        stat.S_ISREG(descriptor_stat.st_mode)
++        and stat.S_ISREG(path_stat.st_mode)
++        and descriptor_stat.st_dev == path_stat.st_dev
++        and descriptor_stat.st_ino == path_stat.st_ino
++        and mode == 0o600
++        and stat.S_IMODE(path_stat.st_mode) == mode
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return _BackupTransactionMember(
++        name=name,
++        device=descriptor_stat.st_dev,
++        inode=descriptor_stat.st_ino,
++        file_type="regular",
++        mode=mode,
++    )
++
++
++def _unlink_captured_member(
++    directory_descriptor: int,
++    member: _BackupTransactionMember,
++) -> None:
++    try:
++        path_stat = os.stat(
++            member.name,
++            dir_fd=directory_descriptor,
++            follow_symlinks=False,
++        )
++    except FileNotFoundError:
++        return
++    if (
++        stat.S_ISREG(path_stat.st_mode)
++        and path_stat.st_dev == member.device
++        and path_stat.st_ino == member.inode
++        and stat.S_IMODE(path_stat.st_mode) == member.mode
++    ):
++        os.unlink(member.name, dir_fd=directory_descriptor)
++
++
+@@ -465,0 +664,2 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
++    manifest_member: _BackupTransactionMember | None = None
++    operation_members: list[_BackupTransactionMember] = []
+@@ -496,6 +695,0 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
+-        manifest = _BackupTransactionManifest(
+-            transaction_id=transaction_id,
+-            directory_name=directory_name,
+-            directory_device=directory_stat.st_dev,
+-            directory_inode=directory_stat.st_ino,
+-        )
+@@ -515,0 +710,43 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
++        manifest_member = _capture_member(
++            directory_descriptor,
++            TRANSACTION_MANIFEST_NAME,
++            manifest_descriptor,
++        )
++        for name in OPERATION_MEMBER_NAMES:
++            descriptor = os.open(
++                name,
++                os.O_RDWR
++                | os.O_CREAT
++                | os.O_EXCL
++                | getattr(os, "O_NOFOLLOW", 0)
++                | getattr(os, "O_NONBLOCK", 0),
++                0o600,
++                dir_fd=directory_descriptor,
++            )
++            try:
++                os.fchmod(descriptor, 0o600)
++                retry_fsync(descriptor)
++                operation_members.append(
++                    _capture_member(
++                        directory_descriptor,
++                        name,
++                        descriptor,
++                    )
++                )
++            finally:
++                os.close(descriptor)
++        retry_fsync(directory_descriptor)
++        manifest = _BackupTransactionManifest(
++            transaction_id=transaction_id,
++            directory_name=directory_name,
++            directory_device=directory_stat.st_dev,
++            directory_inode=directory_stat.st_ino,
++            manifest_device=manifest_member.device,
++            manifest_inode=manifest_member.inode,
++            members=tuple(
++                sorted(
++                    operation_members,
++                    key=lambda member: member.name,
++                )
++            ),
++        )
+@@ -526,0 +764 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
++        validate_backup_transaction(transaction)
+@@ -530,0 +769,21 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
++        if directory_descriptor is not None:
++            for member in reversed(operation_members):
++                try:
++                    _unlink_captured_member(
++                        directory_descriptor,
++                        member,
++                    )
++                except OSError:
++                    pass
++            if manifest_member is not None:
++                try:
++                    _unlink_captured_member(
++                        directory_descriptor,
++                        manifest_member,
++                    )
++                except OSError:
++                    pass
++            try:
++                retry_fsync(directory_descriptor)
++            except OSError:
++                pass
+@@ -542,7 +800,0 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
+-            try:
+-                os.unlink(
+-                    TRANSACTION_MANIFEST_NAME,
+-                    dir_fd=directory_descriptor,
+-                )
+-            except OSError:
+-                pass
+@@ -566 +818 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
+-def create_transaction_member(
++def transaction_member_path(
+@@ -570 +822 @@ def create_transaction_member(
+-    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
++    if name not in OPERATION_MEMBER_NAMES:
+@@ -575,17 +826,0 @@ def create_transaction_member(
+-    descriptor = os.open(
+-        name,
+-        os.O_RDWR
+-        | os.O_CREAT
+-        | os.O_EXCL
+-        | getattr(os, "O_NOFOLLOW", 0)
+-        | getattr(os, "O_NONBLOCK", 0),
+-        0o600,
+-        dir_fd=transaction.directory_descriptor,
+-    )
+-    try:
+-        os.fchmod(descriptor, 0o600)
+-        retry_fsync(descriptor)
+-    finally:
+-        os.close(descriptor)
+-    retry_fsync(transaction.directory_descriptor)
+-    validate_backup_transaction(transaction)
+@@ -600 +835 @@ def open_transaction_member(
+-    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
++    if name not in OPERATION_MEMBER_NAMES:
+@@ -605,6 +840,4 @@ def open_transaction_member(
+-    descriptor = os.open(
+-        name,
+-        flags
+-        | getattr(os, "O_NOFOLLOW", 0)
+-        | getattr(os, "O_NONBLOCK", 0),
+-        dir_fd=transaction.directory_descriptor,
++    return _open_recorded_member(
++        transaction,
++        _recorded_member(transaction.manifest, name),
++        flags,
+@@ -612,21 +844,0 @@ def open_transaction_member(
+-    try:
+-        descriptor_stat = os.fstat(descriptor)
+-        path_stat = os.stat(
+-            name,
+-            dir_fd=transaction.directory_descriptor,
+-            follow_symlinks=False,
+-        )
+-        if not (
+-            stat.S_ISREG(descriptor_stat.st_mode)
+-            and stat.S_ISREG(path_stat.st_mode)
+-            and descriptor_stat.st_dev == path_stat.st_dev
+-            and descriptor_stat.st_ino == path_stat.st_ino
+-            and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
+-        ):
+-            raise EncryptedBackupError(
+-                "encrypted_backup_transaction_invalid"
+-            )
+-        return descriptor
+-    except BaseException:
+-        os.close(descriptor)
+-        raise
+@@ -712,10 +924,16 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
+-    members = validate_backup_transaction(transaction)
+-    for name in sorted(members - {TRANSACTION_MANIFEST_NAME}):
+-        member_stat = os.stat(
+-            name,
+-            dir_fd=transaction.directory_descriptor,
+-            follow_symlinks=False,
+-        )
+-        if not (
+-            stat.S_ISREG(member_stat.st_mode)
+-            and stat.S_IMODE(member_stat.st_mode) == 0o600
++    validate_backup_transaction(transaction)
++    opened: list[tuple[_BackupTransactionMember, int]] = []
++    try:
++        for member in transaction.manifest.members:
++            opened.append(
++                (
++                    member,
++                    _open_recorded_member(
++                        transaction,
++                        member,
++                        os.O_RDONLY,
++                    ),
++                )
++            )
++        if set(os.listdir(transaction.directory_descriptor)) != (
++            TRANSACTION_MEMBER_NAMES
+@@ -726 +944,23 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
+-        os.unlink(name, dir_fd=transaction.directory_descriptor)
++        for member, descriptor in opened:
++            descriptor_stat = os.fstat(descriptor)
++            path_stat = os.stat(
++                member.name,
++                dir_fd=transaction.directory_descriptor,
++                follow_symlinks=False,
++            )
++            if not _member_stat_matches(
++                descriptor_stat,
++                path_stat,
++                member,
++            ):
++                raise EncryptedBackupError(
++                    "encrypted_backup_transaction_invalid"
++                )
++        for member, _descriptor in opened:
++            os.unlink(
++                member.name,
++                dir_fd=transaction.directory_descriptor,
++            )
++    finally:
++        for _member, descriptor in opened:
++            os.close(descriptor)
+diff --git a/tests/test_bootstrap.py b/tests/test_bootstrap.py
+index 1736259b95fbf4484f8d67d6271bdac3e05063c6..d4fad38a833a4000e748c72172e220cb26e4dc36 100644
+--- a/tests/test_bootstrap.py
++++ b/tests/test_bootstrap.py
+@@ -6 +6 @@ import base64
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+@@ -178,0 +179,15 @@ def _paper_alpaca_broker() -> tuple[AlpacaBroker, _MutationTradingClient]:
++@contextmanager
++def _closed_runtime_container(container):
++    """Give direct-container tests exact ownership of their renewal worker."""
++    guard = container.runtime_tenure_guard
++    assert guard is not None
++    worker = guard._thread
++    assert worker is not None
++    try:
++        yield container
++    finally:
++        guard.close()
++        assert guard.closed
++        assert not worker.is_alive()
++
++
+@@ -215,8 +230,4 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+-    container = bootstrap.build_container(
+-        _alpaca_config(app_config),
+-        _migrated_secrets(tmp_path),
+-    )
+-    with container.session_factory() as session:
+-        startup = session.get(
+-            StartupReconciliationState,
+-            broker.reconciliation_key,
++    with _closed_runtime_container(
++        bootstrap.build_container(
++            _alpaca_config(app_config),
++            _migrated_secrets(tmp_path),
+@@ -224,18 +235,9 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+-        assert startup is not None
+-        assert startup.status == "current"
+-        assert startup.completed_generation == startup.generation
+-
+-    submitted = container.broker.submit_order(_market_order("paper-submit"))
+-    bracket = container.broker.submit_bracket(
+-        _bracket_order("paper-bracket"),
+-        Decimal("110"),
+-        Decimal("95"),
+-    )
+-    container.broker.cancel_order(submitted.broker_order_id)
+-    assert bracket.broker_order_id is not None
+-    assert trading.submit_calls == 2
+-    assert trading.cancel_calls == 1
+-
+-    trading._sandbox = False
+-    trading._base_url = "https://api.alpaca.markets"
+-    writes_before = (trading.submit_calls, trading.cancel_calls)
++    ) as container:
++        with container.session_factory() as session:
++            startup = session.get(
++                StartupReconciliationState,
++                broker.reconciliation_key,
++            )
++            assert startup is not None
++            assert startup.status == "current"
++            assert startup.completed_generation == startup.generation
+@@ -243,11 +245,5 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+-    with pytest.raises(
+-        BrokerSubmissionRejected,
+-        match="not official Alpaca paper",
+-    ):
+-        container.broker.submit_order(_market_order("blocked-submit"))
+-    with pytest.raises(
+-        BrokerSubmissionRejected,
+-        match="not official Alpaca paper",
+-    ):
+-        container.broker.submit_bracket(
+-            _bracket_order("blocked-bracket"),
++        submitted = container.broker.submit_order(
++            _market_order("paper-submit")
++        )
++        bracket = container.broker.submit_bracket(
++            _bracket_order("paper-bracket"),
+@@ -257,5 +253,30 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+-    with pytest.raises(
+-        BrokerSubmissionRejected,
+-        match="not official Alpaca paper",
+-    ):
+-        container.broker.cancel_order(bracket.broker_order_id)
++        container.broker.cancel_order(submitted.broker_order_id)
++        assert bracket.broker_order_id is not None
++        assert trading.submit_calls == 2
++        assert trading.cancel_calls == 1
++
++        trading._sandbox = False
++        trading._base_url = "https://api.alpaca.markets"
++        writes_before = (trading.submit_calls, trading.cancel_calls)
++
++        with pytest.raises(
++            BrokerSubmissionRejected,
++            match="not official Alpaca paper",
++        ):
++            container.broker.submit_order(
++                _market_order("blocked-submit")
++            )
++        with pytest.raises(
++            BrokerSubmissionRejected,
++            match="not official Alpaca paper",
++        ):
++            container.broker.submit_bracket(
++                _bracket_order("blocked-bracket"),
++                Decimal("110"),
++                Decimal("95"),
++            )
++        with pytest.raises(
++            BrokerSubmissionRejected,
++            match="not official Alpaca paper",
++        ):
++            container.broker.cancel_order(bracket.broker_order_id)
+@@ -263 +284 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+-    assert (trading.submit_calls, trading.cancel_calls) == writes_before
++        assert (trading.submit_calls, trading.cancel_calls) == writes_before
+@@ -370,10 +391,5 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
+-    container = bootstrap.build_container(
+-        _alpaca_config(app_config),
+-        _migrated_secrets(tmp_path),
+-        runtime_role="app",
+-    )
+-
+-    with container.session_factory() as session:
+-        state = session.get(
+-            StartupReconciliationState,
+-            broker.reconciliation_key,
++    with _closed_runtime_container(
++        bootstrap.build_container(
++            _alpaca_config(app_config),
++            _migrated_secrets(tmp_path),
++            runtime_role="app",
+@@ -381,8 +397,14 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
+-        assert state is not None
+-        assert state.status == "failed"
+-        assert state.completed_generation < state.generation
+-    assert container.operations.health().as_dict()[
+-        "startup_reconciliation"
+-    ]["status"] == "failed"
+-    assert trading.submit_calls == 0
+-    assert trading.cancel_calls == 0
++    ) as container:
++        with container.session_factory() as session:
++            state = session.get(
++                StartupReconciliationState,
++                broker.reconciliation_key,
++            )
++            assert state is not None
++            assert state.status == "failed"
++            assert state.completed_generation < state.generation
++        assert container.operations.health().as_dict()[
++            "startup_reconciliation"
++        ]["status"] == "failed"
++        assert trading.submit_calls == 0
++        assert trading.cancel_calls == 0
+@@ -2135,9 +2157,10 @@ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
+-    app = create_app(
+-        container=container,
+-        agent=_StubAgent(),
+-        planning=None,
+-    )
+-    shutdowns: list[str] = []
+-    app.state.install_controlled_shutdown(
+-        lambda: shutdowns.append("requested")
+-    )
++    with _closed_runtime_container(container):
++        app = create_app(
++            container=container,
++            agent=_StubAgent(),
++            planning=None,
++        )
++        shutdowns: list[str] = []
++        app.state.install_controlled_shutdown(
++            lambda: shutdowns.append("requested")
++        )
+@@ -2145,3 +2168,3 @@ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
+-    assert app.state.runtime_tenure_guard.renew_once() is False
+-    assert app.state.runtime_tenure_guard.lost is True
+-    assert shutdowns == ["requested"]
++        assert app.state.runtime_tenure_guard.renew_once() is False
++        assert app.state.runtime_tenure_guard.lost is True
++        assert shutdowns == ["requested"]
+diff --git a/tests/test_sensitive_crypto.py b/tests/test_sensitive_crypto.py
+index 6cc44dd1ebc8d25b2ec8649dd7b3ab700f7a0810..edf25677e53df5739cc903570cf3d3b3ee8daea6 100644
+--- a/tests/test_sensitive_crypto.py
++++ b/tests/test_sensitive_crypto.py
+@@ -1064,4 +1064,4 @@ def test_scoped_idempotent_guards_do_not_retain_closed_sessions(
+-    state_count = len(sensitive_field_module._STAGING_STATES)
+-    installation_count = len(
+-        sensitive_field_module._GUARD_INSTALLATIONS
+-    )
++    unrelated_session = session_factory()
++    install_sensitive_field_guards(unrelated_session, cipher)
++    unrelated_reference = weakref.ref(unrelated_session)
++
+@@ -1079,6 +1079,13 @@ def test_scoped_idempotent_guards_do_not_retain_closed_sessions(
+-    assert session_reference() is None
+-    assert len(sensitive_field_module._STAGING_STATES) == state_count
+-    assert (
+-        len(sensitive_field_module._GUARD_INSTALLATIONS)
+-        == installation_count
+-    )
++    try:
++        assert session_reference() is None
++        assert unrelated_session in sensitive_field_module._STAGING_STATES
++        assert (
++            unrelated_session
++            in sensitive_field_module._GUARD_INSTALLATIONS
++        )
++    finally:
++        unrelated_session.close()
++        del unrelated_session
++    gc.collect()
++
++    assert unrelated_reference() is None
+diff --git a/tests/test_task6_transaction_directory_hardening.py b/tests/test_task6_transaction_directory_hardening.py
+index f20f607a26673807d2fb3bcc5802305ed90df384..afa8aeb630c001d73df73b5037879c22e55cd6eb 100644
+--- a/tests/test_task6_transaction_directory_hardening.py
++++ b/tests/test_task6_transaction_directory_hardening.py
+@@ -11,0 +12 @@ import stat
++import sys
+@@ -30,3 +30,0 @@ _TRANSACTION_MEMBERS = {
+-    "snapshot.sqlite3-journal",
+-    "snapshot.sqlite3-shm",
+-    "snapshot.sqlite3-wal",
+@@ -34,3 +31,0 @@ _TRANSACTION_MEMBERS = {
+-    "verification.sqlite3-journal",
+-    "verification.sqlite3-shm",
+-    "verification.sqlite3-wal",
+@@ -38,0 +34,12 @@ _TRANSACTION_MEMBERS = {
++_CRASH_STAGES = [
++    "transaction_manifest_durable",
++    "snapshot_created",
++    "snapshot_hashed",
++    "header_written",
++    "encrypt_chunk",
++    "ciphertext_fsynced",
++    "verification_opened",
++    "decrypt_chunk",
++    "verification_hashed",
++    "quick_check_complete",
++]
+@@ -110,0 +118,15 @@ def _transaction_directories(destination: Path) -> tuple[Path, ...]:
++def _namespace_identities(
++    directory: Path,
++) -> dict[str, tuple[int, int, int, int]]:
++    result: dict[str, tuple[int, int, int, int]] = {}
++    for candidate in directory.iterdir():
++        identity = candidate.lstat()
++        result[candidate.name] = (
++            stat.S_IFMT(identity.st_mode),
++            identity.st_dev,
++            identity.st_ino,
++            identity.st_size,
++        )
++    return result
++
++
+@@ -144,12 +166 @@ def _hold_manifest_lock(manifest: Path, ready, release) -> None:
+-    [
+-        "transaction_manifest_durable",
+-        "snapshot_created",
+-        "snapshot_hashed",
+-        "header_written",
+-        "encrypt_chunk",
+-        "ciphertext_fsynced",
+-        "verification_opened",
+-        "decrypt_chunk",
+-        "verification_hashed",
+-        "quick_check_complete",
+-    ],
++    _CRASH_STAGES,
+@@ -180,2 +191 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
+-    assert "manifest" in members
+-    assert members <= _TRANSACTION_MEMBERS
++    assert members == _TRANSACTION_MEMBERS
+@@ -220,0 +231,140 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
++def test_manifest_is_durable_only_after_all_members_are_precreated(tmp_path):
++    """Creating a member after manifest durability leaves an adoption gap."""
++
++    source = tmp_path / "precreated-members.db"
++    destination = tmp_path / "precreated-members-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "transaction_manifest_durable"),
++    )
++    process.start()
++    process.join(timeout=10)
++
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    assert {candidate.name for candidate in transaction.iterdir()} == (
++        _TRANSACTION_MEMBERS
++    )
++    for name in _TRANSACTION_MEMBERS - {"manifest"}:
++        member = transaction / name
++        assert member.is_file()
++        assert member.stat().st_size == 0
++        assert stat.S_IMODE(member.stat().st_mode) == 0o600
++
++
++@pytest.mark.parametrize("stage", _CRASH_STAGES)
++def test_recovery_preserves_operator_replacement_at_every_crash_stage(
++    tmp_path,
++    stage,
++):
++    """Deleting an allowed-name replacement consumes operator-owned content."""
++
++    source = tmp_path / f"replacement-{stage}.db"
++    destination = tmp_path / f"replacement-{stage}-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, stage),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    replacement = transaction / "encrypted.aesgcm"
++    if replacement.exists() or replacement.is_symlink():
++        replacement.unlink()
++    replacement.write_bytes(b"operator-owned-replacement")
++    replacement.chmod(0o600)
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++    before_recovery = _namespace_identities(transaction)
++
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert transaction.exists()
++    assert _namespace_identities(transaction) == before_recovery
++    assert replacement.read_bytes() == b"operator-owned-replacement"
++
++
++@pytest.mark.parametrize("stage", _CRASH_STAGES)
++def test_recovery_preserves_unrecorded_old_sidecar_name(
++    tmp_path,
++    stage,
++):
++    """An old allowlist must not authorize deletion of an unrecorded sidecar."""
++
++    source = tmp_path / f"unrecorded-sidecar-{stage}.db"
++    destination = tmp_path / f"unrecorded-sidecar-{stage}-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, stage),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    sidecar = transaction / "snapshot.sqlite3-wal"
++    sidecar.write_bytes(b"operator-owned-sidecar")
++    sidecar.chmod(0o600)
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++    before_recovery = _namespace_identities(transaction)
++
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert transaction.exists()
++    assert _namespace_identities(transaction) == before_recovery
++    assert sidecar.read_bytes() == b"operator-owned-sidecar"
++
++
++def test_recovery_preserves_directory_when_recorded_member_is_missing(
++    tmp_path,
++):
++    """Partial membership must fail closed before any remaining member deletion."""
++
++    source = tmp_path / "missing-member.db"
++    destination = tmp_path / "missing-member-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "quick_check_complete"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    (transaction / "snapshot.sqlite3").unlink()
++    remaining = {
++        candidate.name: candidate.stat().st_ino
++        for candidate in transaction.iterdir()
++    }
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert transaction.exists()
++    assert {
++        candidate.name: candidate.stat().st_ino
++        for candidate in transaction.iterdir()
++    } == remaining
++
++
+@@ -293 +443,3 @@ def test_recovery_preserves_ambiguous_transaction_directories(
+-        (transaction / "encrypted.aesgcm").symlink_to(source)
++        encrypted = transaction / "encrypted.aesgcm"
++        encrypted.unlink()
++        encrypted.symlink_to(source)
+@@ -408,2 +560,5 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
+-def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
+-    """Deleting by broad glob or removing manifest first breaks retry safety."""
++def test_partial_cleanup_preserves_remaining_manifest_namespace(
++    tmp_path,
++    monkeypatch,
++):
++    """A partial unlink must not authorize deletion after membership diverges."""
+@@ -443,0 +599,5 @@ def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
++    remaining = {
++        candidate.name: candidate.stat().st_ino
++        for candidate in transaction.iterdir()
++    }
++    assert "encrypted.aesgcm" not in remaining
+@@ -451 +611,5 @@ def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
+-    assert not transaction.exists()
++    assert transaction.exists()
++    assert {
++        candidate.name: candidate.stat().st_ino
++        for candidate in transaction.iterdir()
++    } == remaining
+@@ -519,0 +684,119 @@ def test_committed_transition_has_no_fallible_postcommit_work(
++
++
++@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
++def test_interrupt_after_committed_readback_reconciles_without_restore(
++    tmp_path,
++    monkeypatch,
++    interrupt_type,
++):
++    """A return-boundary interrupt must not make a committed API call raise."""
++
++    source = tmp_path / f"return-gap-{interrupt_type.__name__}.db"
++    destination = (
++        tmp_path / f"return-gap-{interrupt_type.__name__}-backups"
++    )
++    _seed_source(source)
++    original_read = backup_module._read_commit_state
++    original_pwrite = os.pwrite
++    original_flock = fcntl.flock
++    original_close = os.close
++    original_unlink = Path.unlink
++    commit_descriptor: int | None = None
++    commit_written = False
++    interrupt_armed = False
++    interrupt_fired = False
++    reconciliation_read_failures = 0
++    restoration_writes = 0
++    unlock_failures = 0
++    close_failures = 0
++    cleanup_attempts = 0
++
++    def track_commit_write(descriptor, data, offset):
++        nonlocal commit_descriptor, commit_written, restoration_writes
++        if b'"phase":"COMMITTED"' in data:
++            commit_descriptor = descriptor
++            commit_written = True
++        elif commit_written and (
++            b'"phase":"PENDING"' in data or b'"phase":"RETIRED"' in data
++        ):
++            restoration_writes += 1
++            raise OSError("injected post-commit restoration failure")
++        return original_pwrite(descriptor, data, offset)
++
++    def arm_after_committed_readback(*args, **kwargs):
++        nonlocal interrupt_armed, reconciliation_read_failures
++        if interrupt_fired and reconciliation_read_failures == 0:
++            reconciliation_read_failures += 1
++            raise OSError("injected transient reconciliation read failure")
++        observed = original_read(*args, **kwargs)
++        if observed.phase == "COMMITTED" and not interrupt_fired:
++            interrupt_armed = True
++        return observed
++
++    def interrupt_successful_nested_return(frame, event, arg):
++        nonlocal interrupt_fired
++        if (
++            interrupt_armed
++            and not interrupt_fired
++            and event == "return"
++            and frame.f_code.co_name == "persist_and_prove"
++        ):
++            interrupt_fired = True
++            raise interrupt_type("injected committed-return interrupt")
++        return interrupt_successful_nested_return
++
++    def fail_unlock_after_commit(descriptor, operation):
++        nonlocal unlock_failures
++        if (
++            descriptor == commit_descriptor
++            and interrupt_fired
++            and operation == fcntl.LOCK_UN
++            and unlock_failures == 0
++        ):
++            original_flock(descriptor, operation)
++            unlock_failures += 1
++            raise OSError("injected post-commit unlock failure")
++        return original_flock(descriptor, operation)
++
++    def fail_close_after_commit(descriptor):
++        nonlocal close_failures
++        result = original_close(descriptor)
++        if (
++            descriptor == commit_descriptor
++            and interrupt_fired
++            and close_failures == 0
++        ):
++            close_failures += 1
++            raise OSError("injected post-commit close failure")
++        return result
++
++    def reject_postcommit_cleanup(path: Path, *args, **kwargs):
++        nonlocal cleanup_attempts
++        if interrupt_fired and path.parent == destination:
++            cleanup_attempts += 1
++            raise OSError("injected post-commit cleanup failure")
++        return original_unlink(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "pwrite", track_commit_write)
++    monkeypatch.setattr(
++        backup_module,
++        "_read_commit_state",
++        arm_after_committed_readback,
++    )
++    monkeypatch.setattr(fcntl, "flock", fail_unlock_after_commit)
++    monkeypatch.setattr(os, "close", fail_close_after_commit)
++    monkeypatch.setattr(Path, "unlink", reject_postcommit_cleanup)
++    previous_trace = sys.gettrace()
++    sys.settrace(interrupt_successful_nested_return)
++    try:
++        receipt = _create(source, destination)
++    finally:
++        sys.settrace(previous_trace)
++
++    assert interrupt_fired is True
++    assert reconciliation_read_failures == 1
++    assert restoration_writes == 0
++    assert unlock_failures == 1
++    assert close_failures == 1
++    assert cleanup_attempts == 0
++    assert list_committed_backups(destination) == (receipt.path,)

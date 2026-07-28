@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (exceptional crash-transaction hardening)
+# Task 6 report — COMPLETE (final manifest and lifecycle hardening)
 
 ## Status and safety boundary
 
@@ -1293,3 +1293,162 @@
   `runtime_tenures` remains intentionally refused.
 - The sole warning is an upstream deprecation unrelated to backup durability,
   migration authority, approval, execution safety, or broker truth.
+
+## Final manifest-identity, commit-reconciliation, and lifecycle hardening
+
+### Status, safety boundary, and implementation
+
+- Review baseline:
+  `c94d34770cac28dda159d0c1a08a7cdeae2ba5e3`.
+- Implementation commit:
+  `992e36a1198041477b6ee555048ca342b055e9f5`
+  (`fix(security): complete Task 6 hardening`).
+- Work remained in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database work used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, network,
+  external services, broker/provider/notification APIs, app, daemon, MCP
+  server, breakers, and order APIs were not accessed.
+
+### Finding closure
+
+- Transaction manifest version 2 now binds every fixed operation member
+  (`snapshot.sqlite3`, `verification.sqlite3`, and `encrypted.aesgcm`) by
+  exact name, regular-file type, mode, device, and inode.
+- All members are created mode `0600`, individually fsynced, captured, and
+  directory-fsynced before the checksummed manifest is written and fsynced.
+  Sensitive content therefore cannot precede durable ownership metadata.
+- Snapshot and verification SQLite connections use journal mode `OFF` and
+  memory temp storage, so no unmanifested WAL, SHM, or journal sidecar can be
+  created. Every open and cleanup revalidates the exact recorded member
+  through no-follow descriptors.
+- Recovery requires the complete exact namespace and all recorded identities.
+  A missing, replaced, injected, symlinked, or extra member preserves the
+  directory unchanged and fail-closed. Real child `_exit` tests cover all ten
+  plaintext/ciphertext lifecycle stages, replacement at every stage, and
+  unrecorded sidecars.
+- The durable COMMITTED transition no longer relies on a Python boolean.
+  Every `BaseException`, including one injected between the nested committed
+  readback and its caller assignment, reconciles through the same still-open,
+  exclusively locked state descriptor.
+- A valid durable COMMITTED record returns the already-built receipt even when
+  the injected chain also reports transient read, unlock, close, restoration,
+  and cleanup failures. No restoration or cleanup runs after committed proof.
+- If COMMITTED cannot be proved, the transition restores or retires state
+  durably before propagating. Official readers remain fail-closed.
+
+### Full-suite failure diagnosis
+
+- The first full suite in this hardening pass completed with:
+  `1 failed, 2775 passed, 1 skipped, 1 warning in 392.71s`.
+- The sole failure was
+  `tests/test_sensitive_crypto.py::test_scoped_idempotent_guards_do_not_retain_closed_sessions`.
+  Its suite-global registry-size assertion observed two guarded sessions
+  opened concurrently by stale `app-tenure-renewal` workers.
+- The target passed standalone, across its full file, and in likely predecessor
+  order. A per-test thread/session ownership probe then identified three
+  direct-container bootstrap tests that started real renewal workers without
+  closing their guards:
+  `test_production_container_arms_exact_dynamic_alpaca_paper_guard`,
+  `test_app_container_serves_console_with_failed_startup_reconciliation`, and
+  `test_app_wires_runtime_renewal_loss_to_controlled_shutdown`.
+- This was not classified as flaky. The scoped session was collectable; the
+  full-suite failure exposed real test-owned worker leaks plus an assertion
+  that incorrectly treated unrelated concurrent sessions as target retention.
+- Direct-container tests now use an exact ownership context that always closes
+  the guard and asserts its captured renewal worker is stopped. The complete
+  bootstrap file leaves no renewal worker according to the same ownership
+  probe.
+- The sensitive-session regression now keeps a separate guarded session alive
+  while proving the exact closed target is collectable, then proves the
+  unrelated session is also collectable after its own close. It does not clear
+  globals, use a `<=` allowance, or assume suite-global emptiness.
+
+### TDD and focused evidence
+
+- Deterministic ownership RED:
+  the exact sensitive-session test failed `1 failed` after an unrelated
+  guarded session was deliberately kept alive; the old assertion observed
+  registry size `1` versus baseline `0`.
+- Narrow lifecycle convergence:
+  `4/4` exact owner/target tests passed.
+- Complete bootstrap ownership probe:
+  `53/53` passed with zero surviving renewal workers.
+- Bootstrap, sensitive-field, and runtime-tenure group:
+  `161/161` passed (`53 + 59 + 49`).
+- Complete backup/operations/adversarial group before the first full suite:
+  `181/181` passed.
+- Post-diagnosis backup/adversarial confirmation:
+  `167/167 passed in 9.39s`.
+- Migration, runtime-tenure, startup-schema, release-static, and
+  submission-barrier adjacency:
+  `307/307 passed in 114.33s`.
+- Prior bounded transaction/crash repetitions remained green:
+  `129/129`; durable-commit repetitions remained green: `27/27`.
+
+### Complexity and public-API audit
+
+- Current sizes are `1,899` lines for `backup.py` and `1,154` lines for the
+  private `backup_transaction.py`.
+- `backup.py` retains the same public classes, functions, and signatures as
+  the review baseline. No source or test imports `backup_transaction.py`
+  directly; it remains the private filesystem-transaction implementation
+  behind `backup.py`.
+- AST and reference checks found no duplicate top-level definition and no
+  zero-reference private helper in either module.
+- The additional transaction code is one coherent responsibility: immutable
+  member identity capture/open/removal. It does not duplicate commit-state
+  reading, retention, or source-maintenance logic.
+
+### Final release gates and confirmation suite
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan:
+  `whitespace-eof: ok (5 files)`.
+- Exactly one confirmation full suite ran after the lifecycle fix and all
+  focused/static gates were green. Database, broker, provider, market-data,
+  notification, encryption, signing, live-confirmation, runtime-instance,
+  Composio, Octen, and OpenAI credential variables were explicitly unset; no
+  worktree `.env` existed.
+- Exact confirmation result:
+  `2776 passed, 1 skipped, 1 warning in 390.41s (0:06:30)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- Both full-suite rounds are recorded above. No source or test changed after
+  the green confirmation; only this report, the progress ledger, and generated
+  review evidence changed.
+
+### Changed files
+
+- Protocol:
+  `src/trading_assistant/ops/backup.py` and
+  `src/trading_assistant/ops/backup_transaction.py`.
+- Backup regressions:
+  `tests/test_task6_transaction_directory_hardening.py`.
+- Lifecycle and exact session-ownership regressions:
+  `tests/test_bootstrap.py` and `tests/test_sensitive_crypto.py`.
+
+### Remaining caveats
+
+- Manifest and commit-state checksums and artifact SHA-256 remain unkeyed.
+  Authenticity against an attacker able to rewrite every file under the same
+  OS account relies on the mode-`0700` directory, mode-`0600` files, and
+  operating-system account boundary.
+- A crash before the manifest becomes durable can leave only empty precreated
+  files in an exact-name transaction directory. Recovery preserves that
+  unprovable namespace; sensitive content is not written before manifest
+  durability.
+- Recovery remains deliberately conservative and TTL-delayed. Busy,
+  malformed, partial, or operator-modified namespaces require manual
+  inspection.
+- The sole warning is an upstream deprecation unrelated to backup durability,
+  migration authority, session collectability, approval, execution safety, or
+  broker truth.
