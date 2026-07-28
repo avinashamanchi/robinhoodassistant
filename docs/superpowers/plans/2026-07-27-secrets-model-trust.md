@@ -1640,7 +1640,7 @@ behavior was added.
 - Never returns a secret, filesystem-private-key content, raw external text, or
   decrypted narrative.
 
-- [ ] **Step 1: Write exact posture and failure tests**
+- [x] **Step 1: Write exact posture and failure tests**
 
 ```python
 def test_security_posture_reports_evidence_not_permission(client):
@@ -1658,7 +1658,7 @@ daemon stale, reconciliation stale, breaker tripped, quote stale, and posture
 store failure. A posture failure never resets, approves, submits, or starts
 anything.
 
-- [ ] **Step 2: Run and verify missing endpoint**
+- [x] **Step 2: Run and verify missing endpoint**
 
 ```bash
 uv run pytest tests/test_security_posture.py tests/test_ops.py -v
@@ -1666,7 +1666,7 @@ uv run pytest tests/test_security_posture.py tests/test_ops.py -v
 
 Expected: FAIL with route not found.
 
-- [ ] **Step 3: Implement immutable posture models**
+- [x] **Step 3: Implement immutable posture models**
 
 ```python
 class PostureCheck(BaseModel):
@@ -1691,7 +1691,7 @@ request/provider budgets/reset times, webhook and Composio disabled,
 quarantine counts, breakers by scope, daemon heartbeat, startup
 reconciliation, quote freshness, and broker paper mode.
 
-- [ ] **Step 4: Add route policy**
+- [x] **Step 4: Add route policy**
 
 ```python
 RoutePolicy(
@@ -1705,7 +1705,7 @@ RoutePolicy(
 Posture reads local state only; it does not perform a fresh broker/provider
 network call.
 
-- [ ] **Step 5: Run posture/route tests**
+- [x] **Step 5: Run posture/route tests**
 
 ```bash
 uv run pytest tests/test_security_posture.py tests/test_route_policy.py tests/test_ops.py -v
@@ -1713,7 +1713,7 @@ uv run pytest tests/test_security_posture.py tests/test_route_policy.py tests/te
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/trading_assistant/operations/security_posture.py src/trading_assistant/operations/service.py src/trading_assistant/bootstrap.py src/trading_assistant/app/main.py src/trading_assistant/app/policy.py tests/test_security_posture.py tests/test_route_policy.py tests/test_ops.py
