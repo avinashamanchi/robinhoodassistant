@@ -28,6 +28,7 @@ from trading_assistant.db.session import (
 from trading_assistant.ops.backup import (
     EncryptedBackupError,
     backup_database,
+    create_encrypted_database_backup,
     list_committed_backups,
     main as backup_main,
     read_encrypted_backup_header,
@@ -170,17 +171,30 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
     source = _operational_database(tmp_path, "required")
     destination = tmp_path / "backups"
     destination.mkdir()
-    old_match = (
+    old_receipt = create_encrypted_database_backup(
+        source,
+        destination,
+        backup_key=BACKUP_KEY,
+        backup_key_id=BACKUP_KEY_ID,
+        schema_head="20260727_0015",
+        now=lambda: utcnow() - timedelta(days=30),
+        artifact_label="whole-database-v1",
+    )
+    old_match = old_receipt.path
+    old_anchor = destination / f".{old_match.name}.pending"
+    old_state = destination / f".{old_match.name}.commit-state"
+    legacy_match = (
         destination
         / "20000101T000000000000Z-whole-database-v1.sqlite3.aesgcm"
     )
-    old_match.write_bytes(b"old-encrypted-artifact")
-    old_anchor = destination / f".{old_match.name}.pending"
-    os.link(old_match, old_anchor)
+    legacy_match.write_bytes(b"legacy-target-anchor-only")
+    legacy_anchor = destination / f".{legacy_match.name}.pending"
+    os.link(legacy_match, legacy_anchor)
     unrelated = destination / "keep-me.aesgcm"
     unrelated.write_bytes(b"unrelated")
     old_time = time.time() - 30 * 86400
     os.utime(old_match, (old_time, old_time))
+    os.utime(legacy_match, (old_time, old_time))
     os.utime(unrelated, (old_time, old_time))
 
     receipt = backup_database(
@@ -196,6 +210,9 @@ def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):
     assert receipt.path.exists()
     assert not old_match.exists()
     assert not old_anchor.exists()
+    assert not old_state.exists()
+    assert legacy_match.exists()
+    assert legacy_anchor.exists()
     assert unrelated.exists()
 
 
