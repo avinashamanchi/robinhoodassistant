@@ -1,0 +1,1281 @@
+diff --git a/src/trading_assistant/security/candidates.py b/src/trading_assistant/security/candidates.py
+index c7f1d69..2637b28 100644
+--- a/src/trading_assistant/security/candidates.py
++++ b/src/trading_assistant/security/candidates.py
+@@ -43,6 +43,7 @@ from trading_assistant.db.models import (
+     AuditEvent,
+     CandidateNonce,
+     CandidateQueueReceipt,
++    FILL_RECONCILIATION_SUPERSEDED,
+     Fill,
+     Order,
+     OrderStateMachine,
+@@ -50,6 +51,7 @@ from trading_assistant.db.models import (
+     RiskEvent,
+     Rule,
+     RuleGroup,
++    fill_has_trusted_identity,
+     utcnow,
+ )
+ from trading_assistant.dependencies import RequiredDependencyUnavailable
+@@ -60,7 +62,10 @@ from trading_assistant.security.secrets import (
+     RuntimeSecrets,
+     validate_base64_key,
+ )
+-from trading_assistant.security.sensitive_fields import persist_sensitive
++from trading_assistant.security.sensitive_fields import (
++    persist_sensitive,
++    sensitive_store,
++)
+ 
+ 
+ _CANONICAL_DECIMAL = re.compile(
+@@ -959,10 +964,15 @@ class CandidateQueueService:
+             ):
+                 raise CandidateError("candidate_receipt_inconsistent")
+             if (
+-                current_status == initial_status
+-                and not self._order_initial_lifecycle_is_pristine(
++                not self._proposal_is_canonical(
++                    session,
++                    target,
++                    receipt,
++                )
++                or not self._order_lifecycle_is_consistent(
+                     session,
+                     target,
++                    initial_status,
+                 )
+             ):
+                 raise CandidateError("candidate_receipt_inconsistent")
+@@ -1023,6 +1033,326 @@ class CandidateQueueService:
+         ):
+             raise CandidateError("candidate_receipt_inconsistent")
+ 
++    def _proposal_is_canonical(
++        self,
++        session,
++        order: Order,
++        receipt: CandidateQueueReceipt,
++    ) -> bool:
++        proposals = list(
++            session.scalars(
++                select(Proposal).where(Proposal.order_id == order.id)
++            )
++        )
++        if len(proposals) != 1:
++            return False
++        proposal = proposals[0]
++        ttl_minutes = self._risk_config(order.ticker).proposal_ttl_minutes
++        if (
++            proposal.source_rule_group_id is not None
++            or proposal.source_rule_id is not None
++            or proposal.plan_generation != 0
++            or proposal.ttl_minutes != ttl_minutes
++            or proposal.created_at != order.created_at
++            or proposal.expires_at
++            != proposal.created_at + timedelta(minutes=ttl_minutes)
++        ):
++            return False
++        try:
++            reasoning = sensitive_store(
++                session,
++                self.service.session_factory,
++            ).read(proposal, "reasoning")
++            reasoning_hash = self.signer.metadata_hash(
++                "reason",
++                reasoning,
++            )
++        except Exception:
++            return False
++        return hmac.compare_digest(
++            reasoning_hash,
++            receipt.reason_hash,
++        )
++
++    @classmethod
++    def _order_lifecycle_is_consistent(
++        cls,
++        session,
++        order: Order,
++        initial_status: OrderStatus,
++    ) -> bool:
++        try:
++            current_status = OrderStatus(order.status)
++        except ValueError:
++            return False
++        if not OrderStateMachine.is_reachable(
++            initial_status,
++            current_status,
++        ):
++            return False
++        if current_status == initial_status:
++            return cls._order_initial_lifecycle_is_pristine(
++                session,
++                order,
++            )
++
++        fills = list(
++            session.scalars(
++                select(Fill).where(Fill.order_id == order.id)
++            )
++        )
++        if any(
++            fill.ticker != order.ticker
++            or fill.side != order.side
++            or not fill.qty.is_finite()
++            or fill.qty <= 0
++            or not fill.price.is_finite()
++            or fill.price <= 0
++            or fill.filled_at < order.created_at
++            for fill in fills
++        ):
++            return False
++        approval_actor = (
++            order.approval_actor.strip()
++            if isinstance(order.approval_actor, str)
++            else ""
++        )
++        approval_present = bool(
++            approval_actor and order.approved_at is not None
++        )
++        approval_partial = bool(approval_actor) != bool(
++            order.approved_at is not None
++        )
++        if (
++            initial_status is not OrderStatus.PROPOSED
++            or approval_partial
++            or order.submission_kind != "simple"
++            or order.submission_payload_json != "{}"
++            or order.plan_cancel_state != "none"
++            or order.version < 0
++            or order.updated_at < order.created_at
++            or (
++                order.approved_at is not None
++                and order.approved_at < order.created_at
++            )
++            or order.submission_attempt not in {0, 1}
++            or (
++                (order.submission_attempt == 0)
++                != (order.submission_started_at is None)
++            )
++            or (
++                order.submission_started_at is not None
++                and (
++                    not approval_present
++                    or order.submission_started_at < order.approved_at
++                )
++            )
++            or (
++                order.last_reconciled_at is not None
++                and (
++                    order.submission_started_at is None
++                    or order.last_reconciled_at
++                    < order.submission_started_at
++                )
++            )
++            or (
++                order.broker_order_id is not None
++                and order.submission_attempt == 0
++            )
++            or (
++                fills
++                and (
++                    order.submission_attempt == 0
++                    or not order.broker_order_id
++                )
++            )
++        ):
++            return False
++
++        no_submission_state = bool(
++            order.submission_attempt == 0
++            and order.submission_started_at is None
++            and order.broker_order_id is None
++            and order.acceptance_state == "not_started"
++            and order.last_reconciled_at is None
++            and not fills
++        )
++        if current_status is OrderStatus.APPROVAL_RECORDED:
++            return bool(
++                approval_present
++                and no_submission_state
++                and order.last_error_code == ""
++                and order.version == 1
++            )
++        if current_status is OrderStatus.SUBMITTING:
++            return bool(
++                approval_present
++                and order.submission_attempt == 1
++                and order.submission_started_at is not None
++                and order.broker_order_id is None
++                and order.acceptance_state == "pending"
++                and order.last_reconciled_at is None
++                and order.last_error_code == ""
++                and not fills
++                and order.version == 2
++            )
++        if current_status is OrderStatus.SUBMITTED:
++            if not (
++                approval_present
++                and order.submission_attempt == 1
++                and order.submission_started_at is not None
++                and bool(order.broker_order_id)
++                and order.version >= 3
++                and order.acceptance_state
++                in {
++                    OrderStatus.SUBMITTED.value,
++                    "accepted",
++                    "fill_reconcile_required",
++                }
++            ):
++                return False
++            if (
++                order.acceptance_state == "accepted"
++                and (
++                    order.last_reconciled_at is None
++                    or not cls._accepted_fills_match_order(
++                        order,
++                        fills,
++                        current_status,
++                    )
++                )
++            ):
++                return False
++            return not (
++                fills
++                and order.acceptance_state
++                == OrderStatus.SUBMITTED.value
++            )
++        if current_status in {
++            OrderStatus.PARTIALLY_FILLED,
++            OrderStatus.FILLED,
++        }:
++            if not (
++                approval_present
++                and order.submission_attempt == 1
++                and order.submission_started_at is not None
++                and bool(order.broker_order_id)
++                and order.version >= 3
++                and order.acceptance_state
++                in {"accepted", "fill_reconcile_required"}
++            ):
++                return False
++            if order.acceptance_state != "accepted":
++                return True
++            return bool(
++                order.last_reconciled_at is not None
++                and cls._accepted_fills_match_order(
++                    order,
++                    fills,
++                    current_status,
++                )
++            )
++        if current_status is OrderStatus.ACCEPTANCE_UNKNOWN:
++            return bool(
++                approval_present
++                and order.submission_attempt == 1
++                and order.submission_started_at is not None
++                and order.version >= 3
++                and order.acceptance_state
++                in {
++                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
++                    "fill_reconcile_required",
++                }
++                and bool(order.last_error_code)
++            )
++        if current_status not in {
++            OrderStatus.REJECTED,
++            OrderStatus.EXPIRED,
++            OrderStatus.CANCELED,
++        }:
++            return False
++        if order.submission_attempt == 0:
++            if not no_submission_state:
++                return False
++            if approval_present:
++                if current_status not in {
++                    OrderStatus.REJECTED,
++                    OrderStatus.EXPIRED,
++                }:
++                    return False
++                return bool(
++                    order.version == 2
++                    and (
++                        current_status is OrderStatus.EXPIRED
++                        or order.last_error_code == "risk_rejected"
++                    )
++                )
++            expected_versions = {
++                OrderStatus.REJECTED: {0},
++                OrderStatus.EXPIRED: {1},
++                OrderStatus.CANCELED: {0},
++            }
++            return order.version in expected_versions[current_status]
++        if not (
++            approval_present
++            and order.submission_attempt == 1
++            and order.submission_started_at is not None
++            and order.version >= 3
++            and order.acceptance_state
++            in {
++                current_status.value,
++                "accepted",
++                "fill_reconcile_required",
++            }
++        ):
++            return False
++        return not (
++            order.acceptance_state == "accepted"
++            and (
++                order.last_reconciled_at is None
++                or not cls._accepted_fills_match_order(
++                    order,
++                    fills,
++                    current_status,
++                )
++            )
++        )
++
++    @staticmethod
++    def _accepted_fills_match_order(
++        order: Order,
++        fills: list[Fill],
++        status: OrderStatus,
++    ) -> bool:
++        trusted_fills = [
++            fill for fill in fills if fill_has_trusted_identity(fill)
++        ]
++        if any(
++            not fill_has_trusted_identity(fill)
++            and fill.reconciliation_state
++            != FILL_RECONCILIATION_SUPERSEDED
++            for fill in fills
++        ):
++            return False
++        filled_qty = sum(
++            (fill.qty for fill in trusted_fills),
++            Decimal(0),
++        )
++        if order.qty is not None:
++            if filled_qty > order.qty:
++                return False
++            if status is OrderStatus.FILLED:
++                return filled_qty == order.qty
++            if status is OrderStatus.PARTIALLY_FILLED:
++                return Decimal(0) < filled_qty < order.qty
++            return True
++        if status in {
++            OrderStatus.PARTIALLY_FILLED,
++            OrderStatus.FILLED,
++        }:
++            return filled_qty > 0
++        return True
++
+     @staticmethod
+     def _order_initial_lifecycle_is_pristine(
+         session,
+@@ -1071,37 +1401,40 @@ class CandidateQueueService:
+             group_state is RuleState.ACTIVE
+             and rule_state is RuleState.ACTIVE
+         ):
+-            if group.terminal_rule_id is not None:
++            if (
++                group.terminal_rule_id is not None
++                or group.reconciliation_required
++            ):
+                 return False
+-            if require_initial_lifecycle:
+-                return bool(
+-                    group.version == 0
+-                    and group.lease_owner is None
+-                    and group.lease_expires_at is None
+-                    and not group.reconciliation_required
+-                )
+             if group.version == 0:
+                 return bool(
+                     group.lease_owner is None
+                     and group.lease_expires_at is None
+-                    and not group.reconciliation_required
+                 )
+-            return True
++            if group.lease_owner is None:
++                return bool(
++                    group.lease_expires_at is None
++                    and group.version >= 2
++                )
++            return group.version >= 1
+         if group.lease_owner is not None or group.lease_expires_at is not None:
+             return False
+-        if group.reconciliation_required:
+-            return False
+         if group_state in {RuleState.TRIGGERED, RuleState.FAILED}:
+             return bool(
+                 rule_state is group_state
+                 and group.terminal_rule_id == rule.id
+-                and group.version >= 1
++                and group.version >= 2
++                and (
++                    group_state is RuleState.TRIGGERED
++                    or not group.reconciliation_required
++                )
+             )
+         if group_state is RuleState.CANCELED:
+             return bool(
+                 rule_state is RuleState.CANCELED
+-                and group.terminal_rule_id in {None, rule.id}
++                and group.terminal_rule_id is None
+                 and group.version >= 1
++                and not group.reconciliation_required
+             )
+         return False
+ 
+diff --git a/tests/test_candidate_boundary.py b/tests/test_candidate_boundary.py
+index bd6eeec..59e6c8b 100644
+--- a/tests/test_candidate_boundary.py
++++ b/tests/test_candidate_boundary.py
+@@ -14,6 +14,7 @@ import pytest
+ from fastapi.testclient import TestClient
+ from pydantic import ValidationError
+ from sqlalchemy import event, func, select
++from sqlalchemy.exc import IntegrityError
+ 
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.app.main import create_app
+@@ -24,15 +25,18 @@ from trading_assistant.db.models import (
+     CircuitBreakerState,
+     Fill,
+     Order,
+-    OrderStateMachine,
++    Proposal,
+     RiskEvent,
+     Rule,
+     RuleGroup,
+ )
+ from trading_assistant.broker.models import OrderStatus
++from trading_assistant.orders.application import ApprovalCommand
+ from trading_assistant.risk.breakers import BreakerScope
+ from trading_assistant.risk.engine import BreakerTripIntent, RiskResult
++from trading_assistant.rules.models import RuleState
+ from trading_assistant.rules.worker import RuleWorker
++from trading_assistant.security.sensitive_fields import sensitive_store
+ 
+ 
+ NOW = datetime(2026, 7, 28, 17, 0, tzinfo=timezone.utc)
+@@ -230,6 +234,80 @@ def _mark_receipt_target_persisted(service) -> None:
+         session.commit()
+ 
+ 
++def _set_receipt_recovery_mode(service, receipt_state: str) -> None:
++    if receipt_state == "target_persisted":
++        _mark_receipt_target_persisted(service)
++
++
++def _approve_candidate_order(service, order_id: int) -> None:
++    service.order_application.approve(
++        ApprovalCommand(
++            order_id=order_id,
++            actor=ACTOR,
++            reason="explicit candidate approval for lifecycle test",
++            now=NOW + timedelta(seconds=1),
++            request_id="candidate-order-approval-progression",
++        )
++    )
++
++
++def _submit_candidate_order(service, order_id: int) -> None:
++    _approve_candidate_order(service, order_id)
++    repository = service.order_application.repository
++    assert repository.claim_submission(
++        order_id,
++        NOW + timedelta(seconds=2),
++        ("operator_global", "equity"),
++        actor=ACTOR,
++        reason="claim candidate submission for lifecycle test",
++        request_id="candidate-order-submission-claim",
++    )
++    assert (
++        repository.record_submission_result(
++            order_id,
++            OrderStatus.SUBMITTED,
++            "paper-candidate-order",
++            "",
++            NOW + timedelta(seconds=3),
++            actor=ACTOR,
++            reason="record synthetic paper submission result",
++            request_id="candidate-order-submission-result",
++        )
++        is OrderStatus.SUBMITTED
++    )
++
++
++def _trigger_candidate_rule(
++    service,
++    *,
++    risk_rejected: bool = False,
++) -> None:
++    if risk_rejected:
++        service._risk_for(AssetClass.EQUITY).check = (
++            lambda _order, _snapshot: RiskResult(
++                approved=False,
++                reasons=["synthetic worker risk rejection"],
++            )
++        )
++    worker = RuleWorker(
++        service,
++        service.rule_repository,
++        service.rule_application,
++        now=lambda: NOW,
++    )
++    outcomes = worker.tick(
++        actor=ACTOR,
++        reason="exercise real candidate rule worker lifecycle",
++        request_id=(
++            "candidate-rule-worker-failed"
++            if risk_rejected
++            else "candidate-rule-worker-triggered"
++        ),
++    )
++    assert len(outcomes) == 1
++    assert outcomes[0].proposal is not None
++
++
+ def test_candidate_models_are_strict_frozen_and_omit_rule_proposal_ttl():
+     api = _candidate_api()
+     order = api.OrderCandidate.model_validate(
+@@ -1031,10 +1109,16 @@ def test_completed_order_receipt_replays_after_legal_status_progression(
+     envelope, service, signer, binding = _order_envelope(make_service)
+     queue = _queue(service, signer)
+     first = _queue_order(queue, envelope, binding)
+-    with service.session_factory() as session:
+-        order = session.get(Order, first.target_id)
+-        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
+-        session.commit()
++    assert (
++        service.order_application.repository.expire_if_eligible(
++            first.target_id,
++            NOW + timedelta(minutes=16),
++            actor=ACTOR,
++            reason="expire candidate through repository authority",
++            request_id="candidate-order-expire-progression",
++        )
++        is OrderStatus.EXPIRED
++    )
+ 
+     replay = _queue_order(queue, envelope, binding)
+ 
+@@ -1061,29 +1145,66 @@ def test_completed_order_receipt_rejects_unreachable_legacy_approved_state(
+         _queue_order(queue, envelope, binding)
+ 
+ 
+-@pytest.mark.parametrize("progressed_state", ["triggered", "canceled"])
+-def test_completed_rule_receipt_replays_after_trigger_lifecycle_progression(
++def test_completed_rule_receipt_replays_after_real_worker_trigger(
+     make_service,
+-    progressed_state,
+ ):
+-    envelope, service, signer, binding = _rule_envelope(make_service)
++    envelope, service, signer, binding = _rule_envelope(
++        make_service,
++        tool_input={
++            "ticker": "AAPL",
++            "condition": {
++                "comparator": "price_above",
++                "trigger_price": "90",
++            },
++            "action": {
++                "side": "buy",
++                "order_type": "market",
++                "notional": "100",
++            },
++            "thesis": "Exercise the real worker terminal transition.",
++        },
++    )
+     queue = _queue(service, signer)
+     first = _queue_rule(queue, envelope, binding)
++    _trigger_candidate_rule(service)
++
++    replay = _queue_rule(queue, envelope, binding)
++
++    assert replay == first
+     with service.session_factory() as session:
+         rule = session.get(Rule, first.target_id)
+         group = session.get(RuleGroup, rule.group_id)
+-        rule.state = progressed_state
+-        group.state = progressed_state
+-        group.version = 1
+-        if progressed_state == "triggered":
+-            group.terminal_rule_id = rule.id
+-        session.commit()
++        assert rule.state == RuleState.TRIGGERED.value
++        assert group.state == RuleState.TRIGGERED.value
++        assert group.terminal_rule_id == rule.id
++        assert group.version == 2
++
++
++def test_completed_rule_receipt_replays_after_real_direct_cancellation(
++    make_service,
++):
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++
++    canceled = service.cancel_rule(
++        first.target_id,
++        actor=ACTOR,
++        reason="cancel candidate through application authority",
++        request_id="candidate-rule-direct-cancel",
++    )
++    assert canceled["canceled"] is True
+ 
+     replay = _queue_rule(queue, envelope, binding)
+ 
+     assert replay == first
+     with service.session_factory() as session:
+-        assert session.get(Rule, first.target_id).state == progressed_state
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        assert rule.state == RuleState.CANCELED.value
++        assert group.state == RuleState.CANCELED.value
++        assert group.terminal_rule_id is None
++        assert group.version == 1
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -1149,10 +1270,7 @@ def test_target_persisted_order_recovery_accepts_legal_forward_progression(
+     queue = _queue(service, signer)
+     first = _queue_order(queue, envelope, binding)
+     _mark_receipt_target_persisted(service)
+-    with service.session_factory() as session:
+-        order = session.get(Order, first.target_id)
+-        OrderStateMachine.transition(order, OrderStatus.EXPIRED)
+-        session.commit()
++    _submit_candidate_order(service, first.target_id)
+ 
+     replay = _queue_order(queue, envelope, binding)
+ 
+@@ -1160,6 +1278,326 @@ def test_target_persisted_order_recovery_accepts_legal_forward_progression(
+     with service.session_factory() as session:
+         receipt = session.scalar(select(_receipt_model()))
+         assert receipt.state == "completed"
++        order = session.get(Order, first.target_id)
++        assert order.status == OrderStatus.SUBMITTED.value
++        assert order.approval_actor == ACTOR
++        assert order.broker_order_id == "paper-candidate-order"
++        assert order.submission_attempt == 1
++        assert order.version == 3
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        "missing",
++        "ttl",
++        "created_at",
++        "expires_at",
++        "source_group",
++        "plan_generation",
++        "reasoning",
++    ],
++)
++def test_order_receipt_rejects_missing_or_tampered_canonical_proposal(
++    make_service,
++    receipt_state,
++    tamper,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++
++    with service.session_factory() as session:
++        proposal = session.scalar(
++            select(Proposal).where(Proposal.order_id == first.target_id)
++        )
++        assert proposal is not None
++        if tamper == "missing":
++            sensitive_store(session).delete(proposal)
++        elif tamper == "ttl":
++            proposal.ttl_minutes += 1
++        elif tamper == "created_at":
++            proposal.created_at += timedelta(seconds=1)
++        elif tamper == "expires_at":
++            proposal.expires_at += timedelta(seconds=1)
++        elif tamper == "source_group":
++            group = RuleGroup(
++                group_key=f"proposal-tamper-{receipt_state}",
++                state=RuleState.ACTIVE.value,
++            )
++            session.add(group)
++            session.flush()
++            proposal.source_rule_group_id = group.id
++        elif tamper == "plan_generation":
++            proposal.plan_generation = 1
++        else:
++            sensitive_store(session).write_many(
++                proposal,
++                {"reasoning": "tampered but validly encrypted reasoning"},
++            )
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_order(queue, envelope, binding)
++
++
++def test_candidate_order_schema_forbids_an_extra_proposal(make_service):
++    envelope, service, signer, binding = _order_envelope(make_service)
++    first = _queue_order(_queue(service, signer), envelope, binding)
++    with service.session_factory() as session:
++        duplicate = Proposal(
++            order_id=first.target_id,
++            ttl_minutes=service.config.risk.proposal_ttl_minutes,
++            created_at=NOW,
++            expires_at=(
++                NOW
++                + timedelta(
++                    minutes=service.config.risk.proposal_ttl_minutes,
++                )
++            ),
++        )
++        with pytest.raises(IntegrityError):
++            sensitive_store(session).write_many(
++                duplicate,
++                {"reasoning": REASON},
++            )
++        session.rollback()
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        "approval_without_metadata",
++        "approval_without_version",
++        "submitted_without_approval",
++        "submitted_without_broker_identity",
++        "accepted_fill_state_without_fill",
++        "fill_without_broker_identity",
++        "accepted_fill_with_wrong_identity",
++    ],
++)
++def test_order_receipt_rejects_impossible_advanced_lifecycle_metadata(
++    make_service,
++    receipt_state,
++    tamper,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++
++    with service.session_factory() as session:
++        order = session.get(Order, first.target_id)
++        if tamper == "approval_without_metadata":
++            order.status = OrderStatus.APPROVAL_RECORDED.value
++        elif tamper == "approval_without_version":
++            order.status = OrderStatus.APPROVAL_RECORDED.value
++            order.approval_actor = ACTOR
++            order.approved_at = NOW + timedelta(seconds=1)
++        elif tamper == "submitted_without_approval":
++            order.status = OrderStatus.SUBMITTED.value
++            order.submission_attempt = 1
++            order.submission_started_at = NOW + timedelta(seconds=2)
++            order.acceptance_state = OrderStatus.SUBMITTED.value
++            order.broker_order_id = "forged-paper-order"
++            order.version = 3
++        elif tamper == "submitted_without_broker_identity":
++            order.status = OrderStatus.SUBMITTED.value
++            order.approval_actor = ACTOR
++            order.approved_at = NOW + timedelta(seconds=1)
++            order.submission_attempt = 1
++            order.submission_started_at = NOW + timedelta(seconds=2)
++            order.acceptance_state = OrderStatus.SUBMITTED.value
++            order.version = 3
++        elif tamper == "accepted_fill_state_without_fill":
++            order.status = OrderStatus.FILLED.value
++            order.approval_actor = ACTOR
++            order.approved_at = NOW + timedelta(seconds=1)
++            order.submission_attempt = 1
++            order.submission_started_at = NOW + timedelta(seconds=2)
++            order.acceptance_state = "accepted"
++            order.broker_order_id = "forged-paper-order"
++            order.last_reconciled_at = NOW + timedelta(seconds=3)
++            order.version = 4
++        elif tamper == "fill_without_broker_identity":
++            order.status = OrderStatus.FILLED.value
++            order.approval_actor = ACTOR
++            order.approved_at = NOW + timedelta(seconds=1)
++            order.submission_attempt = 1
++            order.submission_started_at = NOW + timedelta(seconds=2)
++            order.acceptance_state = "fill_reconcile_required"
++            order.version = 3
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker=order.ticker,
++                    side=order.side,
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id="forged-fill-without-order-identity",
++                    filled_at=NOW + timedelta(seconds=3),
++                )
++            )
++        else:
++            order.status = OrderStatus.FILLED.value
++            order.approval_actor = ACTOR
++            order.approved_at = NOW + timedelta(seconds=1)
++            order.submission_attempt = 1
++            order.submission_started_at = NOW + timedelta(seconds=2)
++            order.acceptance_state = "accepted"
++            order.broker_order_id = "forged-paper-order"
++            order.last_reconciled_at = NOW + timedelta(seconds=3)
++            order.version = 4
++            session.add(
++                Fill(
++                    order_id=order.id,
++                    ticker="MSFT",
++                    side="sell",
++                    qty=Decimal("1"),
++                    price=Decimal("100"),
++                    broker_fill_id="forged-wrong-identity-fill",
++                    filled_at=NOW + timedelta(seconds=3),
++                )
++            )
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_order(queue, envelope, binding)
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_order_receipt_rejects_filled_quantity_inconsistent_with_order(
++    make_service,
++    receipt_state,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _order_envelope(
++        make_service,
++        tool_input={
++            "ticker": "AAPL",
++            "side": "buy",
++            "order_type": "market",
++            "quantity": "2",
++            "thesis": "Quantity-bounded candidate for fill integrity.",
++        },
++    )
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    with service.session_factory() as session:
++        order = session.get(Order, first.target_id)
++        order.status = OrderStatus.FILLED.value
++        order.approval_actor = ACTOR
++        order.approved_at = NOW + timedelta(seconds=1)
++        order.submission_attempt = 1
++        order.submission_started_at = NOW + timedelta(seconds=2)
++        order.acceptance_state = "accepted"
++        order.broker_order_id = "forged-paper-order"
++        order.last_reconciled_at = NOW + timedelta(seconds=3)
++        order.version = 4
++        session.add(
++            Fill(
++                order_id=order.id,
++                ticker=order.ticker,
++                side=order.side,
++                qty=Decimal("1"),
++                price=Decimal("100"),
++                broker_fill_id="forged-short-filled-quantity",
++                filled_at=NOW + timedelta(seconds=3),
++            )
++        )
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_order(queue, envelope, binding)
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize("progression", ["approval_recorded", "submitted"])
++def test_order_receipt_accepts_real_repository_lifecycle_progression(
++    make_service,
++    receipt_state,
++    progression,
++):
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++
++    if progression == "approval_recorded":
++        _approve_candidate_order(service, first.target_id)
++    else:
++        _submit_candidate_order(service, first.target_id)
++
++    assert _queue_order(queue, envelope, binding) == first
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    ("status", "broker_order_id", "error_code"),
++    [
++        (OrderStatus.PARTIALLY_FILLED, "paper-partial", ""),
++        (OrderStatus.FILLED, "paper-filled", ""),
++        (
++            OrderStatus.ACCEPTANCE_UNKNOWN,
++            None,
++            "broker_submission_unknown",
++        ),
++        (OrderStatus.REJECTED, None, "paper_rejected"),
++        (OrderStatus.CANCELED, "paper-canceled", ""),
++        (OrderStatus.EXPIRED, "paper-expired", ""),
++    ],
++)
++def test_order_receipt_accepts_real_repository_submission_outcomes(
++    make_service,
++    receipt_state,
++    status,
++    broker_order_id,
++    error_code,
++):
++    envelope, service, signer, binding = _order_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_order(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    _approve_candidate_order(service, first.target_id)
++    repository = service.order_application.repository
++    assert repository.claim_submission(
++        first.target_id,
++        NOW + timedelta(seconds=2),
++        ("operator_global", "equity"),
++        actor=ACTOR,
++        reason="claim candidate for repository outcome",
++        request_id="candidate-order-outcome-claim",
++    )
++    assert (
++        repository.record_submission_result(
++            first.target_id,
++            status,
++            broker_order_id,
++            error_code,
++            NOW + timedelta(seconds=3),
++            actor=ACTOR,
++            reason="record repository outcome without broker IO",
++            request_id=f"candidate-order-outcome-{status.value}",
++        )
++        is status
++    )
++
++    assert _queue_order(queue, envelope, binding) == first
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -1215,25 +1653,290 @@ def test_target_persisted_initial_order_rejects_lifecycle_marker_tamper(
+ def test_target_persisted_rule_recovery_accepts_legal_forward_progression(
+     make_service,
+ ):
+-    envelope, service, signer, binding = _rule_envelope(make_service)
++    envelope, service, signer, binding = _rule_envelope(
++        make_service,
++        tool_input={
++            "ticker": "AAPL",
++            "condition": {
++                "comparator": "price_above",
++                "trigger_price": "90",
++            },
++            "action": {
++                "side": "buy",
++                "order_type": "market",
++                "notional": "100",
++            },
++            "thesis": "Exercise legacy recovery after a real trigger.",
++        },
++    )
+     queue = _queue(service, signer)
+     first = _queue_rule(queue, envelope, binding)
+     _mark_receipt_target_persisted(service)
++    _trigger_candidate_rule(service)
++
++    replay = _queue_rule(queue, envelope, binding)
++
++    assert replay == first
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        assert rule.state == RuleState.TRIGGERED.value
++        assert group.state == RuleState.TRIGGERED.value
++        assert group.terminal_rule_id == rule.id
++        assert group.version == 2
++        receipt = session.scalar(select(_receipt_model()))
++        assert receipt.state == "completed"
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    "terminal_state",
++    [RuleState.TRIGGERED, RuleState.FAILED],
++)
++def test_rule_receipt_rejects_worker_impossible_terminal_version_one(
++    make_service,
++    receipt_state,
++    terminal_state,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++
+     with service.session_factory() as session:
+         rule = session.get(Rule, first.target_id)
+         group = session.get(RuleGroup, rule.group_id)
+-        rule.state = "triggered"
+-        group.state = "triggered"
++        rule.state = terminal_state.value
++        group.state = terminal_state.value
+         group.terminal_rule_id = rule.id
+         group.version = 1
+         session.commit()
+ 
+-    replay = _queue_rule(queue, envelope, binding)
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
+ 
+-    assert replay == first
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize(
++    "terminal_state",
++    [RuleState.FAILED, RuleState.CANCELED],
++)
++def test_rule_receipt_rejects_terminal_reconciliation_state_worker_cannot_make(
++    make_service,
++    receipt_state,
++    terminal_state,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
+     with service.session_factory() as session:
+-        receipt = session.scalar(select(_receipt_model()))
+-        assert receipt.state == "completed"
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        rule.state = terminal_state.value
++        group.state = terminal_state.value
++        group.terminal_rule_id = (
++            rule.id if terminal_state is RuleState.FAILED else None
++        )
++        group.version = (
++            2 if terminal_state is RuleState.FAILED else 1
++        )
++        group.reconciliation_required = True
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_rule_receipt_rejects_canceled_candidate_with_terminal_winner(
++    make_service,
++    receipt_state,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        rule.state = RuleState.CANCELED.value
++        group.state = RuleState.CANCELED.value
++        group.terminal_rule_id = rule.id
++        group.version = 2
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_rule_receipt_rejects_active_version_one_without_lease(
++    make_service,
++    receipt_state,
++):
++    api = _candidate_api()
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        assert group.state == RuleState.ACTIVE.value
++        assert group.lease_owner is None
++        group.version = 1
++        session.commit()
++
++    with pytest.raises(
++        api.CandidateError,
++        match="candidate_receipt_inconsistent",
++    ):
++        _queue_rule(queue, envelope, binding)
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize("released", [False, True])
++def test_rule_receipt_accepts_real_active_lease_or_release_state(
++    make_service,
++    receipt_state,
++    released,
++):
++    envelope, service, signer, binding = _rule_envelope(make_service)
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group_id = rule.group_id
++    lease = service.rule_repository.lease_group(
++        group_id,
++        NOW,
++        actor=ACTOR,
++        reason="exercise candidate rule lease lifecycle",
++        request_id="candidate-rule-real-lease",
++    )
++    assert lease is not None
++    assert lease.version == 1
++    if released:
++        assert service.rule_repository.release_group(
++            lease,
++            now=NOW + timedelta(seconds=1),
++            actor=ACTOR,
++            reason="exercise candidate rule release lifecycle",
++            request_id="candidate-rule-real-release",
++        )
++
++    assert _queue_rule(queue, envelope, binding) == first
++    with service.session_factory() as session:
++        group = session.get(RuleGroup, group_id)
++        assert group.state == RuleState.ACTIVE.value
++        assert group.version == (2 if released else 1)
++        assert (group.lease_owner is None) is released
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++@pytest.mark.parametrize("risk_rejected", [False, True])
++def test_rule_receipt_accepts_real_worker_terminal_version_two(
++    make_service,
++    receipt_state,
++    risk_rejected,
++):
++    envelope, service, signer, binding = _rule_envelope(
++        make_service,
++        tool_input={
++            "ticker": "AAPL",
++            "condition": {
++                "comparator": "price_above",
++                "trigger_price": "90",
++            },
++            "action": {
++                "side": "buy",
++                "order_type": "market",
++                "notional": "100",
++            },
++            "thesis": "Exercise a real worker terminal lifecycle.",
++        },
++    )
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    _trigger_candidate_rule(service, risk_rejected=risk_rejected)
++
++    assert _queue_rule(queue, envelope, binding) == first
++    expected_state = (
++        RuleState.FAILED if risk_rejected else RuleState.TRIGGERED
++    )
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        assert rule.state == expected_state.value
++        assert group.state == expected_state.value
++        assert group.terminal_rule_id == rule.id
++        assert group.version == 2
++
++
++@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
++def test_rule_receipt_accepts_terminal_reconciliation_latch_from_linked_order(
++    make_service,
++    receipt_state,
++):
++    envelope, service, signer, binding = _rule_envelope(
++        make_service,
++        tool_input={
++            "ticker": "AAPL",
++            "condition": {
++                "comparator": "price_above",
++                "trigger_price": "90",
++            },
++            "action": {
++                "side": "buy",
++                "order_type": "market",
++                "notional": "100",
++            },
++            "thesis": "Exercise a real linked-order reconciliation latch.",
++        },
++    )
++    queue = _queue(service, signer)
++    first = _queue_rule(queue, envelope, binding)
++    _set_receipt_recovery_mode(service, receipt_state)
++    _trigger_candidate_rule(service)
++    with service.session_factory() as session:
++        linked_order_id = session.scalar(
++            select(Proposal.order_id).where(
++                Proposal.source_rule_id == first.target_id
++            )
++        )
++    assert linked_order_id is not None
++    _approve_candidate_order(service, linked_order_id)
++    assert service.order_application.repository.claim_submission(
++        linked_order_id,
++        NOW + timedelta(seconds=2),
++        ("operator_global", "equity"),
++        actor=ACTOR,
++        reason="latch linked candidate order reconciliation",
++        request_id="candidate-rule-linked-order-claim",
++    )
++
++    assert _queue_rule(queue, envelope, binding) == first
++    with service.session_factory() as session:
++        rule = session.get(Rule, first.target_id)
++        group = session.get(RuleGroup, rule.group_id)
++        assert group.state == RuleState.TRIGGERED.value
++        assert group.version == 2
++        assert group.reconciliation_required is True
+ 
+ 
+ @pytest.mark.parametrize(

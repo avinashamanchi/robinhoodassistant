@@ -1438,6 +1438,23 @@ git commit -m "feat(analyst): isolate untrusted model context"
   order reachability under `OrderStateMachine`, and consistent rule/group
   lifecycle combinations. Rule recovery compares the complete canonical
   `RuleCommand` persistence shape and exactly one rule.
+- Candidate-origin order replay requires exactly one canonical `Proposal`.
+  Its source fields and plan generation remain empty/zero, its TTL equals the
+  current asset-class risk configuration, `created_at` equals the order
+  creation time, and `expires_at` is exactly the configured interval later.
+  The encrypted proposal reasoning must decrypt successfully and its
+  metadata-HMAC must match the receipt-bound operator reason.
+- Order replay validates repository-producible lifecycle metadata, not graph
+  reachability alone. Approval, submission, broker identity, acceptance,
+  reconciliation, version, and fill-ledger relationships must match the
+  current state. Accepted fills must have canonical order identity and exact
+  quantity relationships while superseded legacy rows remain non-authoritative.
+- Candidate-created ACTIVE rules permit version zero without a lease, any
+  positive version with a paired lease, and version two or later after lease
+  release. Worker-triggered and worker-failed terminal groups require the
+  winning rule and version two or later. Direct cancellation has no terminal
+  winner and requires version one or later. Only a triggered group may carry
+  the linked-order reconciliation latch.
 - Candidate expiry is exclusive: an observation at or after `expires_at` is
   expired.
 - MCP remains explicit and non-executing with its existing authenticated tool
@@ -1482,6 +1499,23 @@ git commit -m "feat(analyst): isolate untrusted model context"
   with pristine initial fingerprints plus legal-forward recovery.
 - [x] **FR2.6:** Pass focused, repeated-concurrency, exactly one full-suite,
   diff, and release-static gates without runtime or external calls.
+
+**Fix round 3**
+
+- [x] **FR3.1:** Validate exactly one canonical candidate-origin `Proposal`,
+  including configured TTL, exact timestamps, source/plan provenance, and
+  encrypted reasoning bound to the receipt reason hash.
+- [x] **FR3.2:** Validate state-specific order approval, submission,
+  acceptance, broker, version, reconciliation, and fill invariants for both
+  completed replay and compatibility `target_persisted` recovery.
+- [x] **FR3.3:** Replace broad candidate-rule version ranges with lifecycle
+  combinations proven by real lease, release, worker terminal, cancellation,
+  and linked-order reconciliation paths.
+- [x] **FR3.4:** Prove legal progression through real application/repository
+  helpers and reject direct proposal/order/rule tampering in both receipt
+  states.
+- [x] **FR3.5:** Pass focused Task 9 tests, exactly one full suite, diff,
+  compile, and release-static gates without runtime or external calls.
 
 ---
 

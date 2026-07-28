@@ -8,8 +8,10 @@ consume a signed candidate, refresh broker truth, run full deterministic risk,
 and persist a reviewable order or standing rule.
 
 MCP keeps its existing explicit, authenticated, non-executing contract. This
-task does not start any runtime, contact a provider, approve/cancel/submit an
-order, reset a breaker, or enable live/autonomous trading.
+task does not start any runtime, contact a provider, approve/cancel/submit any
+real/runtime order, reset a breaker, or enable live/autonomous trading.
+Lifecycle tests may exercise synthetic state transitions in temporary SQLite
+through deterministic fakes, with zero broker submission/cancellation calls.
 
 ## Files
 
@@ -117,6 +119,23 @@ order, reset a breaker, or enable live/autonomous trading.
   ticker, group, kind, canonical condition/action JSON, sizing/limit fields,
   activation, preapproval, terminal behavior, fraction/HWM/deadline, plan
   ownership, payload version, and exactly one rule.
+- Candidate-origin orders retain exactly one canonical proposal. Proposal
+  source fields and plan generation are empty/zero, TTL comes from the current
+  asset-class risk configuration, creation equals order creation, expiry is
+  exactly the configured interval later, and decrypted reasoning must match
+  the receipt-bound reason metadata-HMAC. Missing, duplicate, altered, or
+  cryptographically inconsistent proposal state fails closed.
+- Forward order replay requires a repository-producible state, not only a path
+  in the status graph. Approval identity/time, version, submission attempt/time,
+  broker identity, acceptance/reconciliation state, and authoritative fill
+  identity/quantity must agree with the status. Superseded legacy fill rows are
+  non-authoritative and do not inflate the accepted quantity.
+- Candidate rule lifecycle validation follows the actual repository paths.
+  Initial ACTIVE is version zero without a lease; an ACTIVE lease has paired
+  owner/expiry and positive version; a released ACTIVE group is version two or
+  later without a lease. TRIGGERED/FAILED require their terminal rule and
+  version two or later. Direct CANCELED has no terminal winner and version one
+  or later. A linked-order reconciliation latch is legal only after TRIGGERED.
 - Completed and target-persisted receipts may replay after envelope expiry.
   Reserved receipts must revalidate issue/expiry/quote age before resuming; a
   stale retry becomes a terminal exact-status receipt and creates no target.
@@ -149,3 +168,18 @@ order, reset a breaker, or enable live/autonomous trading.
   migration, and safety-enforced surfaces.
 - Commit implementation/tests first. Then create the review diff and update the
   plan, task report, brief, and progress evidence in a second docs-only commit.
+
+## Review fix round 3 evidence contract
+
+- Capture RED for proposal deletion/TTL/timestamp/reason tampering, impossible
+  approval/submission/fill metadata, terminal version one, invalid active
+  version/lease combinations, invalid reconciliation residue, and canceled
+  terminal ownership in both completed and compatibility receipt states.
+- Drive accepted order progress through `OrderApplicationService` and
+  `OrderRepository`; drive accepted rule progress through real lease, release,
+  worker trigger/failure, direct cancellation, and linked-order latch paths.
+- Run focused candidate/order/rule/submission and agent/API/MCP/policy tests,
+  then exactly one no-argument full suite and the release static gate.
+- Use temporary SQLite and deterministic fakes only. Do not start services,
+  contact providers, read Keychain content, touch the ignored runtime database,
+  trade, reset a breaker, push, or begin Task 10.

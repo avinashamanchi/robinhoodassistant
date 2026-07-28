@@ -3,7 +3,8 @@
 ## Outcome
 
 Task 9 was implemented in `9a9327f`. Review fix round 1 is implemented in
-`9197ba8`. Review fix round 2 is implemented in `a092790`.
+`9197ba8`. Review fix round 2 is implemented in `a092790`. Review fix round 3
+is implemented in `8bb5ab5`.
 
 General chat now has one immutable read-only tool registry plus two
 non-persisting draft tools. It cannot propose, create, cancel, approve, submit,
@@ -390,14 +391,139 @@ warning. The full suite was not rerun.
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-826953c..a092790.diff`
 - Diff size: 775 lines / 29,617 bytes
 
+## Review fix round 3
+
+Both Important findings from the adversarial review of `a092790` were
+addressed in implementation commit `8bb5ab5`:
+
+- Order receipt replay now requires exactly one canonical candidate-origin
+  `Proposal`. Its source rule IDs are absent, plan generation is zero, TTL
+  equals the relevant asset-class risk configuration, `created_at` equals the
+  order creation time, and `expires_at` is exactly the configured interval
+  later. The encrypted proposal reasoning is authenticated by the sensitive
+  store and compared, through the signer metadata-HMAC, with the receipt-bound
+  operator reason. No plaintext narrative is returned or persisted in receipt
+  metadata.
+- Forward order replay now validates state-specific repository invariants in
+  addition to `OrderStateMachine` reachability. Approval identity/time,
+  submission attempt/time, broker identity, acceptance/reconciliation state,
+  version, and fill identity/quantity must be mutually producible. Accepted
+  fill totals use only trusted identities; superseded legacy rows remain
+  non-authoritative.
+- Candidate rule lifecycle validation now matches traced repository paths.
+  ACTIVE version zero has no lease; ACTIVE positive versions require a paired
+  lease unless a release advanced the version to at least two. Worker
+  TRIGGERED/FAILED states require the terminal rule and version at least two.
+  Direct CANCELED state requires no terminal winner and version at least one.
+  The linked-order reconciliation latch is accepted only for TRIGGERED.
+- Legal tests use `OrderApplicationService`, `OrderRepository`,
+  `RuleRepository`, `RuleWorker`, and the real cancellation application path.
+  Direct database probes cover completed and compatibility
+  `target_persisted` receipts.
+
+### Fix-round-3 RED evidence
+
+The first focused selector was run before the proposal/order/rule replay
+implementation changed:
+
+```text
+uv run pytest tests/test_candidate_boundary.py -q -k \
+  'order_receipt_rejects_missing_or_tampered_canonical_proposal or \
+   order_receipt_rejects_impossible_advanced_lifecycle_metadata or \
+   rule_receipt_rejects_worker_impossible_terminal_version_one or \
+   rule_receipt_rejects_active_version_one_without_lease'
+31 failed, 1 passed
+```
+
+The failures proved that completed and compatibility receipts accepted missing
+or altered proposal TTL/timestamps/provenance/reasoning, impossible approval
+and submission metadata, terminal rule version one, and ACTIVE version one
+without a lease. After the first implementation slice, the same selector
+passed 32 tests.
+
+Two follow-up RED slices closed fill and reconciliation combinations exposed
+while tracing the real repositories:
+
+```text
+uv run pytest tests/test_candidate_boundary.py -q -k \
+  'accepted_fill_with_wrong_identity or filled_quantity_inconsistent'
+4 failed
+
+uv run pytest tests/test_candidate_boundary.py -q -k \
+  'terminal_reconciliation_state_worker_cannot_make or \
+   canceled_candidate_with_terminal_winner'
+6 failed
+```
+
+The first proved accepted replay still trusted wrong-symbol/side fills and a
+short final quantity. The second proved FAILED/CANCELED reconciliation residue
+and a canceled terminal winner were still accepted. The unchanged selectors
+passed 4 and 6 tests respectively after the minimal fixes.
+
+### Fix-round-3 focused verification
+
+```text
+uv run pytest -o addopts='' tests/test_candidate_boundary.py
+160 passed in 6.64s
+
+uv run pytest -o addopts='' \
+  tests/test_candidate_boundary.py tests/test_order_application.py \
+  tests/test_order_state_machine.py tests/test_order_submission.py \
+  tests/test_rule_leases.py tests/test_rule_models.py \
+  tests/test_rules_engine.py tests/test_submission_barrier.py
+317 passed in 41.50s
+
+uv run pytest -o addopts='' \
+  tests/test_agent.py tests/test_api.py tests/test_mcp_tools.py \
+  tests/test_route_policy.py
+238 passed, 1 warning in 18.66s
+
+git diff --check
+PASS
+
+uv run python -m compileall -q \
+  src/trading_assistant/security/candidates.py \
+  tests/test_candidate_boundary.py
+PASS
+```
+
+The candidate suite includes its permanent eight independent four-thread
+same-key concurrency races. The warning is the existing third-party
+`websockets.legacy` deprecation warning.
+
+### Fix-round-3 full and release gates
+
+Exactly one no-argument full suite was run for this implementation fix round:
+
+```text
+uv run pytest
+3184 passed, 1 skipped, 1 warning in 242.38s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+The full suite was not rerun.
+
+### Fix-round-3 review package
+
+- Base: `3ca5ed5`
+- Implementation: `8bb5ab5`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-3ca5ed5..8bb5ab5.diff`
+- Diff size: 1,281 lines / 46,092 bytes
+
 ## Safety statement
 
 All tests used temporary SQLite databases and deterministic fakes. No app,
 daemon, MCP server, broker runtime, provider client, notification client, or
 network stream was started. No real credential or Keychain content was read,
 used, logged, or stored. The ignored runtime `trading_assistant.db` was not
-touched. No breaker was reset. No order was approved, submitted, canceled, or
-executed. No live/autonomous trading was enabled. Nothing was pushed.
+touched. No breaker was reset. No real/runtime order was approved, submitted,
+canceled, or executed. Focused tests exercised synthetic approval/submission
+state transitions and synthetic rule cancellation only in temporary SQLite
+through deterministic fakes; they made zero broker submission/cancellation
+calls. No live/autonomous trading was enabled. Nothing was pushed.
 
 The implementation remains Alpaca PAPER-only and preserves manual approval,
 execution-time broker truth, risk authority, circuit breakers, and existing
@@ -410,5 +536,8 @@ equity/crypto behavior.
 - The schema retains `target_persisted` for fail-closed recovery of receipts
   written before fix round 2. New code never writes that intermediate state;
   removing it later requires operational proof that no compatible rows remain.
+- The fix-round-3 review package is prepared but has not yet received a fresh
+  independent review, so this report claims implementation-gate completion,
+  not independent-review closure.
 - Candidate queueing intentionally does not make profitability claims and does
   not weaken the separate recent-auth approval boundary.
