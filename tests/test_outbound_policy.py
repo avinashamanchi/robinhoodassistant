@@ -524,6 +524,159 @@ def test_async_httpx_direct_send_overwrites_prebuilt_timeout(outbound):
     ]
 
 
+def test_async_httpx_cancellation_closes_acquired_streaming_response(outbound):
+    """Cancelling during buffering must close the acquired response before re-raising."""
+    import httpx
+
+    buffering = asyncio.Event()
+    release = asyncio.Event()
+    stream_closed = asyncio.Event()
+    close_calls = []
+    responses = []
+
+    class BlockingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            buffering.set()
+            await release.wait()
+            yield b"body"
+
+        async def aclose(self):
+            close_calls.append(1)
+            stream_closed.set()
+
+    def transport(request):
+        response = httpx.Response(200, stream=BlockingStream(), request=request)
+        responses.append(response)
+        return response
+
+    async def cancel_while_buffering():
+        client = outbound.new_async_httpx_client(
+            outbound.OutboundPolicy("https://api.example.test"),
+            transport=httpx.MockTransport(transport),
+        )
+        task = asyncio.create_task(client.get("https://api.example.test/v1/data"))
+        try:
+            await buffering.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert responses[0].is_closed is True
+            assert stream_closed.is_set()
+            assert close_calls == [1]
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await client.aclose()
+
+    asyncio.run(cancel_while_buffering())
+
+
+def test_async_httpx_second_cancellation_waits_for_shielded_cleanup(outbound):
+    """A second cancellation cannot interrupt the one required response close."""
+    import httpx
+
+    buffering = asyncio.Event()
+    close_started = asyncio.Event()
+    finish_close = asyncio.Event()
+    close_calls = []
+
+    class BlockingCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            buffering.set()
+            await asyncio.Event().wait()
+            yield b"unreachable"
+
+        async def aclose(self):
+            close_calls.append(1)
+            close_started.set()
+            await finish_close.wait()
+
+    def transport(request):
+        return httpx.Response(200, stream=BlockingCloseStream(), request=request)
+
+    async def cancel_twice():
+        client = outbound.new_async_httpx_client(
+            outbound.OutboundPolicy("https://api.example.test"),
+            transport=httpx.MockTransport(transport),
+        )
+        task = asyncio.create_task(client.get("https://api.example.test/v1/data"))
+        try:
+            await buffering.wait()
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert close_started.is_set()
+            task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not task.done()
+            finish_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert close_calls == [1]
+        finally:
+            finish_close.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await client.aclose()
+
+    asyncio.run(cancel_twice())
+
+
+def test_async_httpx_buffer_exception_closes_once_and_success_stays_buffered(outbound):
+    """Ordinary buffer errors close once while successful buffered responses remain usable."""
+    import httpx
+
+    failed_close_calls = []
+    success_close_calls = []
+
+    class FailingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise RuntimeError("buffer failure")
+            yield b"unreachable"
+
+        async def aclose(self):
+            failed_close_calls.append(1)
+
+    class SuccessfulStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"ready"
+
+        async def aclose(self):
+            success_close_calls.append(1)
+
+    calls = []
+
+    def transport(request):
+        stream = FailingStream() if not calls else SuccessfulStream()
+        calls.append(1)
+        return httpx.Response(200, stream=stream, request=request)
+
+    async def exercise_paths():
+        client = outbound.new_async_httpx_client(
+            outbound.OutboundPolicy("https://api.example.test"),
+            transport=httpx.MockTransport(transport),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="buffer failure"):
+                await client.get("https://api.example.test/v1/error")
+            response = await client.get("https://api.example.test/v1/success")
+            assert response.content == b"ready"
+            await response.aclose()
+        finally:
+            await client.aclose()
+
+    asyncio.run(exercise_paths())
+
+    assert failed_close_calls == [1]
+    assert success_close_calls == [1]
+
+
 @pytest.mark.parametrize(
     ("status", "location"),
     [

@@ -6,6 +6,7 @@ extend an already-approved origin, but never select a destination themselves.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import math
@@ -321,6 +322,24 @@ async def _bound_async_httpx_response(response: Any, max_response_bytes: int) ->
     return response
 
 
+async def _aclose_async_response_shielded(response: Any) -> None:
+    """Finish exactly one async response close despite repeated task cancellation."""
+    close_task = asyncio.ensure_future(response.aclose())
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            # The caller's cancellation must still propagate after the response
+            # is closed; shield keeps this separate cleanup task running.
+            continue
+    try:
+        close_task.result()
+    except BaseException:
+        # A cleanup failure must not replace the original boundary error or
+        # cancellation that entered the caller's except BaseException branch.
+        pass
+
+
 class NoRedirectSession(requests.Session):
     """Requests session that pins its policy, TLS, timeouts, redirects, and body cap."""
 
@@ -342,7 +361,7 @@ class NoRedirectSession(requests.Session):
         self.proxies = {}
         self.verify = True
         self._ssl_context = _verified_ssl_context()
-        self.mount("https://", _VerifiedHTTPAdapter(self._ssl_context))
+        self.adapters["https://"] = _VerifiedHTTPAdapter(self._ssl_context)
 
     def request(self, method: str, url: str, **kwargs: Any):
         self._policy.assert_url(url)
@@ -491,8 +510,8 @@ def new_async_httpx_client(
                     response,
                     max_response_bytes,
                 )
-            except Exception:
-                await response.aclose()
+            except BaseException:
+                await _aclose_async_response_shielded(response)
                 raise
 
     options: dict[str, Any] = {
