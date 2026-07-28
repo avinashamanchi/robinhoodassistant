@@ -409,10 +409,118 @@ def test_quarantine_rejects_source_phrase_copied_into_uncertainty(
     assert len(delegate.calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("source_text", "copied_fact"),
+    [
+        (
+            "Revenue rose. COPYTHROUGHMARKER",
+            "copy-through-marker",
+        ),
+        (
+            "Revenue rose. prefixCOPYTHROUGHMARKERsuffix",
+            "copy-through-marker",
+        ),
+        (
+            "hyperdimensionalmarketmarker",
+            "hyperdimensional",
+        ),
+        (
+            "COPYTHROUGHMARKER",
+            "prefix-copy-through-marker-suffix",
+        ),
+        (
+            "ＭＡＲＫＥＴ—ＳＩＧＮＡＬ",
+            "marketsignal",
+        ),
+    ],
+    ids=[
+        "punctuation-compaction",
+        "output-substring-of-source",
+        "long-source-prefix-substring",
+        "source-window-inside-prefixed-output",
+        "nfkc-compatibility-compaction",
+    ],
+)
+def test_quarantine_repairs_compact_source_copy_before_privileged_use(
+    session_factory,
+    source_text,
+    copied_fact,
+):
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(_summary_json(fact=copied_fact)),
+        _text_response(_summary_json()),
+    )
+
+    summary = summarizer.summarize(
+        (_content(text=source_text),),
+        request_id="quarantine-compact-copy-through",
+    )
+
+    assert summary is not None
+    assert summary.facts[0].text == "Revenue increased according to the source."
+    assert len(delegate.calls) == 2
+    privileged = AnalystBackend("submit_analysis", ANALYSIS_INPUT)
+    Analyst(privileged, max_attempts=1).analyze(
+        _features(),
+        untrusted_summary=summary,
+        request_id="analysis-after-compact-copy-repair",
+    )
+    privileged_payload = json.dumps(
+        privileged.calls,
+        ensure_ascii=False,
+        default=str,
+    ).casefold()
+    assert copied_fact.casefold() not in privileged_payload
+    assert "copythroughmarker" not in privileged_payload
+    assert "hyperdimensional" not in privileged_payload
+
+
+def test_quarantine_repairs_compact_copy_in_uncertainty(
+    session_factory,
+):
+    copied_uncertainty = "hyperdimensional"
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(
+            _summary_json(uncertainty=copied_uncertainty)
+        ),
+        _text_response(_summary_json()),
+    )
+
+    summary = summarizer.summarize(
+        (_content(text="hyperdimensionalmarketmarker"),),
+        request_id="quarantine-compact-uncertainty-copy",
+    )
+
+    assert summary is not None
+    assert copied_uncertainty not in summary.uncertainties
+    assert len(delegate.calls) == 2
+
+
+def test_quarantine_allows_rewritten_short_ticker_and_number_fact(
+    session_factory,
+):
+    fact = "AAPL rose 12%."
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(_summary_json(fact=fact)),
+    )
+
+    summary = summarizer.summarize(
+        (_content(text="AAPL gained 12 percent."),),
+        request_id="quarantine-short-ticker-number-control",
+    )
+
+    assert summary is not None
+    assert summary.facts[0].text == fact
+    assert len(delegate.calls) == 1
+
+
 def test_quarantine_allows_standalone_short_ticker_company_name_and_number(
     session_factory,
 ):
-    fact = "AAPL and Apple Inc disclosed 123456789012345."
+    fact = "AAPL and Apple Inc disclosed 12345."
     summarizer, delegate = _summarizer(
         session_factory,
         _text_response(_summary_json(fact=fact)),
@@ -422,7 +530,7 @@ def test_quarantine_allows_standalone_short_ticker_company_name_and_number(
         (
             _content(
                 text=(
-                    "AAPL Apple Inc reported 123456789012345 in "
+                    "AAPL Apple Inc reported 12345 in "
                     "notional volume."
                 )
             ),

@@ -474,8 +474,11 @@ class ProviderBudgetService:
     def mark_unknown(
         self,
         reservation_id: str,
+        *,
+        now: datetime | None = None,
     ) -> None:
         _require_text("reservation_id", reservation_id)
+        current = _as_utc(now or self._clock())
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
             reservation = session.get(
@@ -492,15 +495,26 @@ class ProviderBudgetService:
                 session,
                 reservation.provider,
             )
-            if reservation.state in {"unknown", "settled"}:
+            if reservation.state == "settled":
                 session.commit()
                 return
-            if reservation.state != "started":
+            if reservation.state not in {"started", "unknown"}:
                 session.rollback()
                 raise ProviderBudgetUnavailable(
                     "provider reservation cannot be marked unknown"
                 )
-            reservation.state = "unknown"
+            if current < _as_utc(reservation.started_at):
+                session.rollback()
+                raise ProviderBudgetUnavailable(
+                    "provider reservation cannot be marked unknown"
+                )
+            if reservation.state == "started":
+                reservation.state = "unknown"
+            self._latch_expired_unknown_reconciliation(
+                session,
+                reservation,
+                current,
+            )
             session.flush()
             self._validate_provider_aggregates(
                 session,
@@ -607,20 +621,12 @@ class ProviderBudgetService:
         affected_providers: set[str] = set()
         for reservation in reservations:
             cls._validate_reservation(reservation)
-            day = session.get(
-                ProviderBudgetDay,
-                (reservation.provider, reservation.budget_day),
-            )
-            if day is None:
-                raise ProviderBudgetUnavailable(
-                    "provider budget day is unavailable"
-                )
-            cls._validate_day(day)
             reservation.state = "unknown"
-            if not day.reconciliation_required:
-                day.reconciliation_required = True
-                day.reconciliation_code = _STALE_STARTED_CODE
-            day.updated_at = current
+            cls._latch_expired_unknown_reconciliation(
+                session,
+                reservation,
+                current,
+            )
             affected_providers.add(reservation.provider)
         session.flush()
         for affected_provider in affected_providers:
@@ -629,6 +635,35 @@ class ProviderBudgetService:
                 affected_provider,
             )
         return len(reservations)
+
+    @classmethod
+    def _latch_expired_unknown_reconciliation(
+        cls,
+        session: Session,
+        reservation: ProviderReservation,
+        current: datetime,
+    ) -> None:
+        """Atomically fail closed once unknown provider usage reaches expiry."""
+
+        cls._validate_reservation(reservation)
+        if (
+            reservation.state != "unknown"
+            or _as_utc(reservation.expires_at) > current
+        ):
+            return
+        day = session.get(
+            ProviderBudgetDay,
+            (reservation.provider, reservation.budget_day),
+        )
+        if day is None:
+            raise ProviderBudgetUnavailable(
+                "provider budget day is unavailable"
+            )
+        cls._validate_day(day)
+        if not day.reconciliation_required:
+            day.reconciliation_required = True
+            day.reconciliation_code = _STALE_STARTED_CODE
+        day.updated_at = current
 
     def status(
         self,

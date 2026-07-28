@@ -1217,6 +1217,26 @@ git commit -m "feat(analyst): quarantine external text"
   the trade-plan store boundary. Alternate analyst implementations and direct
   store callers cannot bypass summary/reference validation.
 
+**Fix round 2 hardening:**
+
+- In addition to 3–5-token lexical fingerprints, copy-through validation
+  computes bounded NFKC/casefolded forms containing only Unicode alphanumerics.
+  An output of at least 12 compact characters is rejected when it appears in a
+  source, and fixed-width compact source windows reject copied material hidden
+  inside output prefixes or suffixes. Source/output characters, comparisons,
+  and windows all have explicit ceilings. This deliberately conservative
+  boundary may reject a legitimate shared phrase or long proper noun; short
+  tickers and ordinary short numbers remain allowed because preventing raw
+  instruction copy-through takes priority over recall.
+- `mark_unknown(now=...)` and stale-started maintenance use the same helper
+  under their existing `BEGIN IMMEDIATE` transaction. Whether failure marking
+  or reaping acquires the lock first, an unknown reservation at or after
+  `expires_at` atomically latches its provider day with
+  `provider_started_usage_unknown`, retains all call/token charges, and denies
+  new reservations until reconciliation. Repeated calls are idempotent,
+  unexpired started calls are not reaped, and settled reservations remain
+  final.
+
 - [ ] **Step 1: Write no-tools and no-raw-forwarding tests**
 
 ```python

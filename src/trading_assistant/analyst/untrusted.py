@@ -56,6 +56,18 @@ _COPY_MAX_FINGERPRINT_OPERATIONS = (
     _COPY_MAX_TOTAL_TOKENS
     * (1 + _COPY_NGRAM_MAX_TOKENS - _COPY_NGRAM_MIN_TOKENS + 1)
 )
+_COMPACT_COPY_MIN_CHARACTERS = 12
+_COMPACT_MAX_CHARACTERS_PER_SOURCE = MAX_NORMALIZED_CHARACTERS
+_COMPACT_MAX_TOTAL_SOURCE_CHARACTERS = (
+    MAX_ITEMS_PER_REQUEST * _COMPACT_MAX_CHARACTERS_PER_SOURCE
+)
+_COMPACT_MAX_OUTPUT_VALUES = 30
+_COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS = 50_000
+_COMPACT_MAX_SOURCE_COMPARISONS = (
+    MAX_ITEMS_PER_REQUEST * _COMPACT_MAX_OUTPUT_VALUES
+)
+_COMPACT_MAX_SOURCE_WINDOWS = _COMPACT_MAX_TOTAL_SOURCE_CHARACTERS
+_COMPACT_MAX_OUTPUT_WINDOWS = _COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS
 
 SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
 FindingSeverity = Literal["low", "medium", "high"]
@@ -702,6 +714,60 @@ def _copy_fingerprint(parts: Sequence[str]) -> bytes:
     ).digest()
 
 
+def _compact_alphanumeric(value: str) -> str:
+    normalized = unicodedata.normalize(
+        "NFKC",
+        unicodedata.normalize("NFKC", value).casefold(),
+    )
+    return "".join(
+        character
+        for character in normalized
+        if character.isalnum()
+    )
+
+
+def _source_compact_fingerprints(
+    source_texts: Sequence[str],
+) -> tuple[tuple[str, ...], frozenset[bytes]]:
+    """Return bounded compact forms and fixed-width source windows.
+
+    Fixed-width hashes make reverse substring checks linear in the bounded
+    source/output sizes. A collision can only conservatively reject output.
+    """
+    compact_sources: list[str] = []
+    source_windows: set[bytes] = set()
+    total_characters = 0
+    window_operations = 0
+    for source_text in source_texts:
+        compact = _compact_alphanumeric(source_text)
+        if len(compact) > _COMPACT_MAX_CHARACTERS_PER_SOURCE:
+            raise ValueError("untrusted summary source is too complex")
+        total_characters += len(compact)
+        if total_characters > _COMPACT_MAX_TOTAL_SOURCE_CHARACTERS:
+            raise ValueError("untrusted summary sources are too complex")
+        compact_sources.append(compact)
+        for start in range(
+            0,
+            max(0, len(compact) - _COMPACT_COPY_MIN_CHARACTERS + 1),
+        ):
+            window_operations += 1
+            if window_operations > _COMPACT_MAX_SOURCE_WINDOWS:
+                raise ValueError(
+                    "untrusted summary sources are too complex"
+                )
+            source_windows.add(
+                _copy_fingerprint(
+                    (
+                        compact[
+                            start : start
+                            + _COMPACT_COPY_MIN_CHARACTERS
+                        ],
+                    )
+                )
+            )
+    return tuple(compact_sources), frozenset(source_windows)
+
+
 def _source_lexical_fingerprints(
     source_texts: Sequence[str],
 ) -> tuple[frozenset[bytes], frozenset[bytes]]:
@@ -750,6 +816,40 @@ def _source_lexical_fingerprints(
         if operations > _COPY_MAX_FINGERPRINT_OPERATIONS:
             raise ValueError("untrusted summary sources are too complex")
     return frozenset(long_tokens), frozenset(ngrams)
+
+
+def _reject_source_compact_copy(
+    compact_value: str,
+    *,
+    compact_sources: tuple[str, ...],
+    source_windows: frozenset[bytes],
+) -> tuple[int, int]:
+    if len(compact_value) < _COMPACT_COPY_MIN_CHARACTERS:
+        return 0, 0
+    comparisons = len(compact_sources)
+    if any(
+        compact_value in compact_source
+        for compact_source in compact_sources
+    ):
+        raise ValueError("untrusted summary copied raw content")
+    output_windows = 0
+    for start in range(
+        0,
+        len(compact_value) - _COMPACT_COPY_MIN_CHARACTERS + 1,
+    ):
+        output_windows += 1
+        if (
+            _copy_fingerprint(
+                (
+                    compact_value[
+                        start : start + _COMPACT_COPY_MIN_CHARACTERS
+                    ],
+                )
+            )
+            in source_windows
+        ):
+            raise ValueError("untrusted summary copied raw content")
+    return comparisons, output_windows
 
 
 def _reject_source_lexical_copy(
@@ -809,7 +909,16 @@ def validate_summary_for_privileged_use(
     long_tokens, source_ngrams = _source_lexical_fingerprints(
         source_texts
     )
-    for value in _summary_strings(summary):
+    compact_sources, source_compact_windows = (
+        _source_compact_fingerprints(source_texts)
+    )
+    summary_values = _summary_strings(summary)
+    if len(summary_values) > _COMPACT_MAX_OUTPUT_VALUES:
+        raise ValueError("untrusted summary output is too complex")
+    compact_output_characters = 0
+    compact_source_comparisons = 0
+    compact_output_windows = 0
+    for value in summary_values:
         try:
             normalized, findings = _sanitize(value)
         except UntrustedContentError:
@@ -819,6 +928,26 @@ def validate_summary_for_privileged_use(
         folded_value = value.casefold()
         if any(token in folded_value for token in marker_tokens):
             raise ValueError("untrusted summary copied raw marker")
+        compact_value = _compact_alphanumeric(value)
+        compact_output_characters += len(compact_value)
+        if (
+            compact_output_characters
+            > _COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS
+        ):
+            raise ValueError("untrusted summary output is too complex")
+        comparisons, output_windows = _reject_source_compact_copy(
+            compact_value,
+            compact_sources=compact_sources,
+            source_windows=source_compact_windows,
+        )
+        compact_source_comparisons += comparisons
+        compact_output_windows += output_windows
+        if (
+            compact_source_comparisons
+            > _COMPACT_MAX_SOURCE_COMPARISONS
+            or compact_output_windows > _COMPACT_MAX_OUTPUT_WINDOWS
+        ):
+            raise ValueError("untrusted summary output is too complex")
         _reject_source_lexical_copy(
             value,
             long_tokens=long_tokens,
