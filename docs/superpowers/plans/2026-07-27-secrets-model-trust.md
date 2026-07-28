@@ -1349,15 +1349,19 @@ git commit -m "feat(analyst): isolate untrusted model context"
 **Files:**
 
 - Create: `src/trading_assistant/security/candidates.py`
+- Create: `migrations/versions/20260728_0016_candidate_queue_receipts.py`
 - Modify: `src/trading_assistant/app/agent.py`
 - Modify: `src/trading_assistant/app/main.py`
 - Modify: `src/trading_assistant/app/policy.py`
+- Modify: `src/trading_assistant/app/limits.py`
 - Modify: `src/trading_assistant/bootstrap.py`
+- Modify: `src/trading_assistant/db/models.py`
 - Modify: `tests/test_agent.py`
 - Create: `tests/test_candidate_boundary.py`
 - Modify: `tests/test_route_policy.py`
 - Modify: `tests/test_api.py`
 - Modify: `tests/test_mcp_tools.py`
+- Modify: `tests/test_migrations.py`
 
 **Interfaces:**
 
@@ -1365,204 +1369,70 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - Produces strict `AgentReply(reply, candidates)`.
 - Produces `CandidateSigner.issue()`, `.verify()`, and
   `CandidateNonceStore.consume_once()`.
+- Produces durable `CandidateQueueReceipt` rows with
+  `reserved -> target_persisted -> completed` lifecycle.
 - Adds `POST /candidates/order/queue` and
   `POST /candidates/rule/queue`.
 - General chat has zero database-mutation tools.
 
-- [ ] **Step 1: Write mutable-tool absence and signed-queue tests**
+**Approved amendments and invariants:**
 
-```python
-def test_general_chat_has_no_mutable_tools():
-    names = {tool["name"] for tool in READ_ONLY_TOOL_SPECS}
-    assert "propose_order" not in names
-    assert "create_conditional_rule" not in names
-    assert "cancel_rule" not in names
-    assert names <= {
-        "get_market_data",
-        "get_account_summary",
-        "get_open_orders",
-        "get_order_status",
-        "list_rules",
-        "draft_order_candidate",
-        "draft_rule_candidate",
-    }
+- `READ_ONLY_TOOL_SPECS` is an immutable tuple containing read-only queries plus
+  `draft_order_candidate` and `draft_rule_candidate`. General chat has no
+  proposal, create-rule, cancel, approval, submission, or execution tool.
+- Draft tool arguments omit every server trust field. Drafting may perform only
+  a bounded quote read and signing; it performs no database mutation. Tool
+  results returned to the model contain only a stable drafted status, never the
+  signed bearer envelope.
+- Candidate models are strict/frozen. Model strings use canonical fixed-point
+  decimals; trusted typed broker `Decimal` values are normalized before
+  canonical signing. Timestamps are aware UTC. Nonces, signatures, and opaque
+  session bindings are strict unpadded base64url.
+- HMAC-SHA256 signs canonical JSON with domain-separated signing, session, and
+  metadata subkeys derived from `RuntimeSecrets.candidate_signing_key`.
+  Verification uses `compare_digest` and binds kind, actor, current session ID,
+  and authentication epoch without exposing a token or raw database session ID.
+- Envelope TTL is at most five minutes. A new receipt validates envelope time,
+  execution-grade signed-quote freshness, allowlist, and static cap before
+  nonce consumption. A reserved retry must revalidate time/freshness; completed
+  or target-persisted same-key receipts may replay after envelope expiry.
+- `RuleCandidate` does not contain `proposal_ttl_minutes`. Triggered proposals
+  use the asset-class risk configuration TTL. Ignored signed intent is
+  forbidden.
+- The queue refreshes complete broker truth with
+  `PortfolioSnapshotService.assemble_for_confirmation` and runs the full pure
+  risk engine before persistence. Provider I/O never occurs in a SQLite write
+  transaction.
+- Explicit order queueing creates only `PROPOSED` or `REJECTED`. Explicit rule
+  queueing creates one ACTIVE `activation="immediate"` standing rule with
+  `pre_approved=False`; a trigger can create only a pending proposal and cannot
+  execute.
+- Durable receipts bind opaque session hash, kind, hashed idempotency key,
+  candidate hash, nonce hash, actor hash, and reason hash. They persist original
+  request identity, exact safe outcome/status, and target ID only—never raw
+  tokens, idempotency keys, thesis, or narrative.
+- Reservation and nonce consumption are one `BEGIN IMMEDIATE` transaction.
+  Target and `target_persisted` receipt state commit atomically. Recovery trusts
+  only receipt state, validates the exact target, and uses secret-HMAC-derived
+  order/group keys. A reserved receipt plus any target is inconsistent.
+- Rule rejection, warnings, breaker trips, and audit evidence are durable.
+  Terminal retries replay their original HTTP status. All paths forbid approval,
+  submission, cancellation, auto-enable, and execution.
+- `/chat` and both queue routes are marked broker-read. Queue routes require
+  CSRF and idempotency and use explicit `candidate_queue` mutation policy.
+- MCP remains explicit and non-executing with its existing authenticated tool
+  contract.
 
-
-def test_queue_requires_explicit_signed_candidate(client, signed_order):
-    response = client.post(
-        "/candidates/order/queue",
-        json={"candidate": signed_order, "reason": "operator queue"},
-        headers=mutation_headers(),
-    )
-    assert response.status_code == 201
-    assert response.json()["status"] == "proposed"
-    assert broker(client).submitted_orders == []
-```
-
-Add tests for signature tamper, expiry, wrong actor/session binding, wrong kind,
-non-finite numbers, unknown symbol, stale price, missing reason, replayed nonce,
-concurrent replay, rate denial, risk rejection, and model-only draft. Assert
-zero order submission in every queue case.
-
-- [ ] **Step 2: Run and verify mutable chat tools**
-
-```bash
-uv run pytest tests/test_agent.py tests/test_candidate_boundary.py tests/test_api.py -v
-```
-
-Expected: FAIL because chat can call proposal/rule mutations directly.
-
-- [ ] **Step 3: Implement strict candidate schemas**
-
-```python
-class OrderCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, frozen=True)
-
-    ticker: str = Field(pattern=r"^[A-Z][A-Z0-9./-]{0,14}$")
-    side: Literal["buy", "sell"]
-    quantity: Decimal | None = Field(default=None, gt=0)
-    notional: Decimal | None = Field(default=None, gt=0)
-    order_type: Literal["market", "limit"]
-    limit_price: Decimal | None = Field(default=None, gt=0)
-    reference_price: Decimal = Field(gt=0)
-    quote_as_of: datetime
-    thesis: str = Field(min_length=1, max_length=2_000)
-
-
-class RuleConditionCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, frozen=True)
-
-    comparator: Literal["price_below", "price_above"]
-    trigger_price: Decimal = Field(gt=0)
-
-
-class RuleActionCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, frozen=True)
-
-    side: Literal["buy", "sell"]
-    quantity: Decimal | None = Field(default=None, gt=0)
-    notional: Decimal | None = Field(default=None, gt=0)
-    order_type: Literal["market", "limit"]
-    limit_price: Decimal | None = Field(default=None, gt=0)
-
-
-class RuleCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, frozen=True)
-
-    ticker: str = Field(pattern=r"^[A-Z][A-Z0-9./-]{0,14}$")
-    condition: RuleConditionCandidate
-    action: RuleActionCandidate
-    reference_price: Decimal = Field(gt=0)
-    quote_as_of: datetime
-    proposal_ttl_minutes: int = Field(ge=1, le=60)
-    thesis: str = Field(min_length=1, max_length=2_000)
-
-
-class SignedCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    version: Literal[1]
-    kind: Literal["order", "rule"]
-    actor: str
-    session_binding: str
-    issued_at: datetime
-    expires_at: datetime
-    nonce: str
-    payload: dict[str, object]
-    signature: str
-```
-
-Enforce exactly one of quantity/notional, limit-price consistency, UTC
-timestamps, and five-minute TTL. `session_binding` is an HMAC-derived opaque
-binding, never the raw session token or database session ID.
-
-- [ ] **Step 4: Sign canonical payloads and consume nonces atomically**
-
-HMAC-SHA256 covers canonical JSON excluding `signature`. Use the independent
-Keychain `candidate_signing_key`. Verify with `hmac.compare_digest`.
-
-`CandidateNonceStore.consume_once()` hashes the nonce and performs one
-`INSERT ... ON CONFLICT DO NOTHING`; zero inserted rows returns
-`409 candidate_replayed`. It records actor, kind, request ID, expiry, and
-consumption time but not candidate narrative.
-
-- [ ] **Step 5: Replace mutable model tools**
-
-`draft_order_candidate` and `draft_rule_candidate` validate input and return a
-signed envelope. Their model-callable arguments omit `quote_as_of`,
-`reference_price`, `actor`, `session_binding`, `issued_at`, `expires_at`,
-`nonce`, and `signature`; the server supplies all of those. Before signing an
-order draft, deterministic code:
-
-1. normalizes and checks the ticker against the asset-class allowlist;
-2. enforces exactly one size form and the configured per-order static cap;
-3. validates order/limit-price shape and finite decimals;
-4. obtains a bounded fresh server quote through the read-only broker path;
-5. stamps quote price/time and the current opaque session binding.
-
-Draft tools perform no database write. Remove proposal, create-rule, and
-cancel-rule dispatch from `ToolRouter` and reject unknown names.
-
-`Agent.chat()` collects successfully issued envelopes from draft-tool results
-and returns:
-
-```python
-class AgentReply(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    reply: str = Field(max_length=20_000)
-    candidates: tuple[SignedCandidate, ...] = Field(max_length=4)
-```
-
-The HTTP `/chat` route serializes this model directly. A model mention of an
-order that did not pass through a draft tool remains prose and produces no
-candidate.
-
-Keep MCP's existing `propose_order` non-executing behavior for explicit MCP
-clients, but do not expose that tool to the chat model. MCP cancellation remains
-an authenticated explicit client action and still follows its existing
-deterministic boundary.
-
-- [ ] **Step 6: Add explicit queue routes and policies**
-
-Route policies:
-
-```python
-RoutePolicy(
-    "POST", "/candidates/order/queue", AuthLevel.CSRF, "mutation",
-    requires_idempotency=True, audit_mutation=True,
-    broker_read=True, concurrency_scope="principal",
-)
-RoutePolicy(
-    "POST", "/candidates/rule/queue", AuthLevel.CSRF, "mutation",
-    requires_idempotency=True, audit_mutation=True,
-    broker_read=True, concurrency_scope="principal",
-)
-```
-
-The endpoint verifies signature/TTL/actor/current-session binding/nonce,
-refreshes quote/snapshot, validates allowlist and full risk, then calls the
-existing proposal/rule application service. It cannot approve or execute.
-Request idempotency is resolved before nonce consumption: a retry with the same
-idempotency key returns its original receipt, while the same candidate under a
-different key returns `409 candidate_replayed`. Order execution still requires
-the separate recent-auth `/approve/{order_id}` flow and execution-time risk
-check.
-
-- [ ] **Step 7: Run candidate, agent, and MCP tests**
-
-```bash
-uv run pytest tests/test_agent.py tests/test_candidate_boundary.py tests/test_route_policy.py tests/test_api.py tests/test_mcp_tools.py tests/test_submission_barrier.py -v
-```
-
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/trading_assistant/security/candidates.py src/trading_assistant/app/agent.py src/trading_assistant/app/main.py src/trading_assistant/app/policy.py src/trading_assistant/bootstrap.py tests/test_agent.py tests/test_candidate_boundary.py tests/test_route_policy.py tests/test_api.py tests/test_mcp_tools.py
-git commit -m "feat(agent): require explicit signed candidate queueing"
-```
+- [x] **Step 1: Capture focused RED before implementation**
+- [x] **Step 2: Implement strict schemas, canonical signing, and opaque binding**
+- [x] **Step 3: Replace mutable chat tools with bounded drafts and AgentReply**
+- [x] **Step 4: Add durable receipts, migration 0016, and crash recovery**
+- [x] **Step 5: Add explicit queue routes, CSRF/idempotency/rate policies**
+- [x] **Step 6: Require fresh broker truth and full risk for orders and rules**
+- [x] **Step 7: Prove active non-preapproved rules only propose on trigger**
+- [x] **Step 8: Pass focused candidate/agent/API/MCP/migration/submission tests**
+- [x] **Step 9: Run exactly one full suite for the implementation round**
+- [ ] **Step 10: Commit implementation, then package evidence in docs-only commit**
 
 ---
 

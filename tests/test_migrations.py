@@ -273,8 +273,13 @@ class _AuthorizedTestAlembic:
                 revision = ScriptDirectory.from_config(cfg).get_revision(
                     "20260727_0015"
                 )
+                candidate_revision = ScriptDirectory.from_config(
+                    cfg
+                ).get_revision("20260728_0016")
                 assert revision is not None
+                assert candidate_revision is not None
                 revision_module = revision.module
+                candidate_revision_module = candidate_revision.module
                 with (
                     patch.object(
                         authority_module,
@@ -313,6 +318,16 @@ class _AuthorizedTestAlembic:
                     ),
                     patch.object(
                         revision_module,
+                        "migration_schema_fence",
+                        cls._schema_fence_historical,
+                    ),
+                    patch.object(
+                        candidate_revision_module,
+                        "assert_migration_authority",
+                        cls._assert_historical,
+                    ),
+                    patch.object(
+                        candidate_revision_module,
                         "migration_schema_fence",
                         cls._schema_fence_historical,
                     ),
@@ -479,6 +494,7 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         "mutation_interlocks",
         "sensitive_migration_state",
         "candidate_nonces",
+        "candidate_queue_receipts",
         "untrusted_ingest_events",
         "runtime_tenures",
     } <= set(inspect(engine).get_table_names())
@@ -840,7 +856,7 @@ def test_runtime_tenure_migration_is_successor_0014():
     sensitive_revision = script.get_revision("20260727_0013")
     tenure_revision = script.get_revision("20260727_0014")
 
-    assert script.get_current_head() == "20260727_0015"
+    assert script.get_current_head() == "20260728_0016"
     assert sensitive_revision is not None
     assert sensitive_revision.down_revision == "20260727_0012"
     assert sensitive_revision.path.endswith(
@@ -858,12 +874,66 @@ def test_plan_authority_migration_is_successor_0015():
     script = ScriptDirectory.from_config(cfg)
     authority_revision = script.get_revision("20260727_0015")
 
-    assert script.get_current_head() == "20260727_0015"
+    assert script.get_current_head() == "20260728_0016"
     assert authority_revision is not None
     assert authority_revision.down_revision == "20260727_0014"
     assert authority_revision.path.endswith(
         "20260727_0015_plan_authority_and_validation_tenure.py"
     )
+
+
+def test_candidate_queue_receipt_migration_is_successor_0016():
+    cfg = Config("alembic.ini")
+    script = ScriptDirectory.from_config(cfg)
+    receipt_revision = script.get_revision("20260728_0016")
+
+    assert script.get_current_head() == "20260728_0016"
+    assert receipt_revision is not None
+    assert receipt_revision.down_revision == "20260727_0015"
+    assert receipt_revision.path.endswith(
+        "20260728_0016_candidate_queue_receipts.py"
+    )
+
+
+def test_candidate_queue_receipt_downgrade_refuses_durable_state(
+    tmp_path,
+):
+    database_path = tmp_path / "candidate-receipt-downgrade.db"
+    engine, cfg = _engine_at_revision(database_path, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO candidate_queue_receipts "
+                "(session_binding_hash,actor_hash,kind,"
+                "idempotency_key_hash,candidate_hash,reason_hash,nonce_hash,"
+                "state,outcome_code,target_id,http_status,request_id,"
+                "created_at,updated_at,completed_at) VALUES "
+                "(:session_hash,:actor_hash,'order',:idempotency_hash,"
+                ":candidate_hash,:reason_hash,:nonce_hash,'completed',"
+                "'candidate_expired',NULL,409,'candidate-downgrade',"
+                "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            {
+                "session_hash": "a" * 64,
+                "actor_hash": "b" * 64,
+                "idempotency_hash": "c" * 64,
+                "candidate_hash": "d" * 64,
+                "reason_hash": "f" * 64,
+                "nonce_hash": "e" * 64,
+            },
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^candidate_queue_receipt_downgrade_blocked$",
+    ):
+        command.downgrade(cfg, "20260727_0015")
+
+    assert "candidate_queue_receipts" in inspect(engine).get_table_names()
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM candidate_queue_receipts"))
+    command.downgrade(cfg, "20260727_0015")
+    assert "candidate_queue_receipts" not in inspect(engine).get_table_names()
 
 
 @pytest.mark.parametrize(
@@ -1561,6 +1631,49 @@ def test_sensitive_trust_schema_constraints_indexes_and_no_raw_text(tmp_path):
         "ix_candidate_nonces_request_id",
         "ix_candidate_nonces_consumed_at",
     }
+    receipt_columns = {
+        column["name"]
+        for column in inspector.get_columns("candidate_queue_receipts")
+    }
+    assert receipt_columns == {
+        "id",
+        "session_binding_hash",
+        "actor_hash",
+        "kind",
+        "idempotency_key_hash",
+        "candidate_hash",
+        "reason_hash",
+        "nonce_hash",
+        "state",
+        "outcome_code",
+        "target_id",
+        "http_status",
+        "request_id",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    }
+    assert not receipt_columns & {
+        "candidate",
+        "payload",
+        "thesis",
+        "narrative",
+        "token",
+        "idempotency_key",
+    }
+    assert {
+        index["name"]
+        for index in inspector.get_indexes(
+            "candidate_queue_receipts"
+        )
+    } >= {
+        "ix_candidate_queue_receipts_session_binding_hash",
+        "ix_candidate_queue_receipts_actor_hash",
+        "ix_candidate_queue_receipts_kind",
+        "ix_candidate_queue_receipts_nonce_hash",
+        "ix_candidate_queue_receipts_state",
+        "ix_candidate_queue_receipts_request_id",
+    }
     assert {
         index["name"]
         for index in inspector.get_indexes("untrusted_ingest_events")
@@ -1970,7 +2083,7 @@ def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0015"
+        ) == "20260728_0016"
         assert connection.scalar(
             text("SELECT count(*) FROM candidate_nonces")
         ) == 1
@@ -2788,7 +2901,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260727_0015"
+    assert version == "20260728_0016"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -2824,7 +2937,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0015"
+        ) == "20260728_0016"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -2865,7 +2978,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260727_0015"
+    assert version == "20260728_0016"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")

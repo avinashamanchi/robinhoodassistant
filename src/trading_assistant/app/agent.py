@@ -1,9 +1,9 @@
 """The agentic loop.
 
-Flow: user message -> Claude (native tool use) -> intercept tool calls -> route to
-TradingService -> feed results back -> final text. The LLM only sees read-only +
-propose + rule tools; it has NO execution tool. Every decision is persisted to
-``llm_decisions``.
+Flow: user message -> Claude (native tool use) -> intercept tool calls -> route
+read-only queries or signed candidate drafts -> feed results back -> final text.
+The LLM has no database-mutation or execution tool. Every decision is persisted
+to ``llm_decisions``.
 
 The Anthropic client is abstracted behind :class:`LLMBackend` so tests run a
 scripted backend with no API key.
@@ -13,27 +13,33 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..db.models import LLMDecision
 from ..identity import canonical_request_id
 from ..security.sensitive_fields import sensitive_store
+from ..security.candidates import (
+    AgentReply,
+    CandidateDraftService,
+    CandidateError,
+    SignedCandidate,
+)
 from ..service import TradingService
 
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a trading assistant. You can look up market data and account info, "
-    "and you can PROPOSE orders and conditional rules. You can never execute a "
-    "trade: proposing only queues an order for a human to approve. Always size "
-    "orders explicitly with either qty (shares) or notional (USD), never both. "
-    "Be concise and state clearly when you have created a proposal."
+    "and you can DRAFT signed order or conditional-rule candidates for the "
+    "operator to inspect. Drafting never queues, approves, or executes anything. "
+    "Always size candidates explicitly with either quantity or notional, never "
+    "both. Never claim that prose created a candidate."
 )
 
-# Anthropic tool schemas. These mirror the MCP tools; the LLM sees no execute tool.
-TOOL_SPECS: list[dict[str, Any]] = [
+# The general chat surface is read-only except for non-persisting draft tools.
+READ_ONLY_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "get_market_data",
         "description": "Latest price, bid/ask, and day change for a ticker.",
@@ -63,10 +69,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "propose_order",
+        "name": "draft_order_candidate",
         "description": (
-            "Propose an order for human approval. Does NOT execute. Provide exactly "
-            "one of qty or notional."
+            "Draft a signed order candidate for explicit operator queueing. "
+            "Does not persist or execute. Provide exactly one size form."
         ),
         "input_schema": {
             "type": "object",
@@ -74,24 +80,56 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "ticker": {"type": "string"},
                 "side": {"type": "string", "enum": ["buy", "sell"]},
                 "order_type": {"type": "string", "enum": ["market", "limit"]},
-                "qty": {"type": "string"},
+                "quantity": {"type": "string"},
                 "notional": {"type": "string"},
                 "limit_price": {"type": "string"},
+                "thesis": {"type": "string"},
             },
-            "required": ["ticker", "side", "order_type"],
+            "required": ["ticker", "side", "order_type", "thesis"],
+            "additionalProperties": False,
         },
     },
     {
-        "name": "create_conditional_rule",
-        "description": "Store a standing rule, e.g. condition {price_below: 175}.",
+        "name": "draft_rule_candidate",
+        "description": (
+            "Draft a signed conditional-rule candidate for explicit operator "
+            "queueing. This draft does not persist a rule."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "ticker": {"type": "string"},
-                "condition": {"type": "object"},
-                "action": {"type": "object"},
+                "condition": {
+                    "type": "object",
+                    "properties": {
+                        "comparator": {
+                            "type": "string",
+                            "enum": ["price_below", "price_above"],
+                        },
+                        "trigger_price": {"type": "string"},
+                    },
+                    "required": ["comparator", "trigger_price"],
+                    "additionalProperties": False,
+                },
+                "action": {
+                    "type": "object",
+                    "properties": {
+                        "side": {"type": "string", "enum": ["buy", "sell"]},
+                        "order_type": {
+                            "type": "string",
+                            "enum": ["market", "limit"],
+                        },
+                        "quantity": {"type": "string"},
+                        "notional": {"type": "string"},
+                        "limit_price": {"type": "string"},
+                    },
+                    "required": ["side", "order_type"],
+                    "additionalProperties": False,
+                },
+                "thesis": {"type": "string"},
             },
-            "required": ["ticker", "condition", "action"],
+            "required": ["ticker", "condition", "action", "thesis"],
+            "additionalProperties": False,
         },
     },
     {
@@ -99,16 +137,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "description": "List all standing conditional rules.",
         "input_schema": {"type": "object", "properties": {}},
     },
-    {
-        "name": "cancel_rule",
-        "description": "Cancel a standing conditional rule by id.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"rule_id": {"type": "integer"}},
-            "required": ["rule_id"],
-        },
-    },
-]
+)
 
 
 class LLMBackend(Protocol):
@@ -125,8 +154,13 @@ class LLMBackend(Protocol):
 class ToolRouter:
     """Maps a tool name + input to the corresponding TradingService method."""
 
-    def __init__(self, service: TradingService) -> None:
+    def __init__(
+        self,
+        service: TradingService,
+        candidate_drafts: CandidateDraftService | None = None,
+    ) -> None:
         self.service = service
+        self.candidate_drafts = candidate_drafts
 
     def dispatch(
         self,
@@ -136,13 +170,9 @@ class ToolRouter:
         actor: str,
         reason: str,
         request_id: str,
+        session_binding: str,
     ) -> dict[str, Any]:
         s = self.service
-        mutation_context = {
-            "actor": actor,
-            "reason": reason,
-            "request_id": request_id,
-        }
         table = {
             "get_market_data": lambda: s.get_market_data(tool_input["ticker"]),
             "get_account_summary": lambda: s.get_account_summary(),
@@ -150,32 +180,60 @@ class ToolRouter:
             "get_order_status": lambda: (
                 s.get_order_status(tool_input["order_id"]) or {"error": "not found"}
             ),
-            "propose_order": lambda: s.propose_order(
-                **tool_input,
-                **mutation_context,
+            "draft_order_candidate": lambda: self._draft(
+                "order",
+                tool_input,
+                actor=actor,
+                session_binding=session_binding,
             ),
-            "create_conditional_rule": lambda: s.create_conditional_rule(
-                tool_input["ticker"],
-                tool_input["condition"],
-                tool_input["action"],
-                **mutation_context,
+            "draft_rule_candidate": lambda: self._draft(
+                "rule",
+                tool_input,
+                actor=actor,
+                session_binding=session_binding,
             ),
             "list_rules": lambda: {"rules": s.list_rules()},
-            "cancel_rule": lambda: s.cancel_rule(
-                tool_input["rule_id"],
-                **mutation_context,
-            ),
         }
         if name not in table:
-            return {"error": f"unknown tool {name}"}
+            return {"error": "unknown_tool"}
         try:
             return table[name]()
+        except CandidateError as exc:
+            return {"error": exc.code}
         except Exception:  # stable failure: never return provider/domain text
             log.error(
                 "agent tool failed code=tool_failed tool=%s",
                 name,
             )
             return {"error": "tool_failed"}
+
+    def _draft(
+        self,
+        kind: Literal["order", "rule"],
+        tool_input: dict[str, Any],
+        *,
+        actor: str,
+        session_binding: str,
+    ) -> dict[str, Any]:
+        if self.candidate_drafts is None or not session_binding:
+            raise CandidateError(
+                "candidate_drafting_unavailable",
+                status_code=503,
+            )
+        envelope = (
+            self.candidate_drafts.draft_order(
+                tool_input,
+                actor=actor,
+                session_binding=session_binding,
+            )
+            if kind == "order"
+            else self.candidate_drafts.draft_rule(
+                tool_input,
+                actor=actor,
+                session_binding=session_binding,
+            )
+        )
+        return {"candidate": envelope.model_dump(mode="json")}
 
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
@@ -202,6 +260,7 @@ class Agent:
         max_tokens: int,
         *,
         max_turns: int,
+        candidate_drafts: CandidateDraftService | None = None,
     ) -> None:
         if (
             not isinstance(max_turns, int)
@@ -210,7 +269,7 @@ class Agent:
         ):
             raise ValueError("max_turns must be a positive integer")
         self.backend = backend
-        self.router = ToolRouter(service)
+        self.router = ToolRouter(service, candidate_drafts)
         self.session_factory = session_factory
         self.model = model
         self.max_tokens = max_tokens
@@ -223,7 +282,8 @@ class Agent:
         actor: str,
         reason: str,
         request_id: str,
-    ) -> dict[str, Any]:
+        session_binding: str = "",
+    ) -> AgentReply:
         actor = actor.strip()
         reason = reason.strip()
         request_id = canonical_request_id(request_id)
@@ -235,13 +295,14 @@ class Agent:
         tool_calls: list[dict[str, Any]] = []
         final_text = ""
         last_resp = None
+        candidates: list[SignedCandidate] = []
 
         for _ in range(self.max_turns):
             try:
                 resp = self.backend.create(
                     system=SYSTEM_PROMPT,
                     messages=messages,
-                    tools=TOOL_SPECS,
+                    tools=READ_ONLY_TOOL_SPECS,
                     request_id=request_id,
                 )
             except Exception:  # noqa: BLE001 — never 500 the chat endpoint on an LLM error
@@ -261,13 +322,38 @@ class Agent:
                 results = []
                 for block in resp.content:
                     if getattr(block, "type", None) == "tool_use":
-                        output = self.router.dispatch(
-                            block.name,
-                            dict(block.input),
-                            actor=actor,
-                            reason=reason,
-                            request_id=request_id,
-                        )
+                        is_draft = block.name in {
+                            "draft_order_candidate",
+                            "draft_rule_candidate",
+                        }
+                        if is_draft and len(candidates) >= 4:
+                            output = {"error": "candidate_limit_reached"}
+                        else:
+                            output = self.router.dispatch(
+                                block.name,
+                                dict(block.input),
+                                actor=actor,
+                                reason=reason,
+                                request_id=request_id,
+                                session_binding=session_binding,
+                            )
+                        raw_candidate = output.get("candidate")
+                        if raw_candidate is not None:
+                            try:
+                                validated_candidate = (
+                                    SignedCandidate.model_validate(
+                                        raw_candidate
+                                    )
+                                )
+                                candidates.append(validated_candidate)
+                                output = {
+                                    "status": "candidate_drafted",
+                                    "kind": validated_candidate.kind,
+                                }
+                            except Exception:
+                                output = {
+                                    "error": "candidate_draft_invalid"
+                                }
                         tool_calls.append(
                             {"name": block.name, "input": block.input, "output": output}
                         )
@@ -287,7 +373,10 @@ class Agent:
             break
 
         self._record(user_message, tool_calls, final_text, last_resp)
-        return {"reply": final_text, "tool_calls": tool_calls}
+        return AgentReply(
+            reply=final_text,
+            candidates=tuple(candidates),
+        )
 
     def _record(self, prompt, tool_calls, reply, resp) -> None:
         usage = getattr(resp, "usage", None)

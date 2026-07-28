@@ -12,10 +12,11 @@ from copy import deepcopy
 from datetime import date, timedelta
 from functools import wraps
 import inspect
+import json
 from pathlib import Path
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -53,6 +54,12 @@ from ..security.secrets import (
 from ..security.transport import (
     TransportBoundaryMiddleware,
     TransportPolicy,
+)
+from ..security.candidates import (
+    CandidateError,
+    CandidateQueueService,
+    CandidateSigner,
+    SignedCandidate,
 )
 from .agent import Agent
 from .auth import SessionAuth, SessionPrincipal
@@ -145,6 +152,45 @@ class ChatIn(BaseModel):
         if not value.strip():
             raise ValueError("message must be non-empty")
         return value.strip()
+
+
+class CandidateQueueIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate: SignedCandidate
+    reason: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
+
+
+def _reject_duplicate_json_pairs(pairs):
+    parsed = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError("duplicate JSON key")
+        parsed[key] = value
+    return parsed
+
+
+async def _candidate_queue_body(request: Request) -> CandidateQueueIn:
+    try:
+        raw = await request.body()
+        payload = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
+        return CandidateQueueIn.model_validate(payload)
+    except Exception:
+        raise ApiError(
+            "invalid_request",
+            422,
+            "Request validation failed",
+        ) from None
 
 
 class BacktestRunIn(BaseModel):
@@ -292,6 +338,7 @@ def _build_agent(container) -> Agent:
         max_turns=(
             config.security.provider_budget.max_chat_tool_turns
         ),
+        candidate_drafts=getattr(container, "candidate_drafts", None),
     )
     return agent
 
@@ -313,6 +360,8 @@ def _create_app(
     auth_now: Callable | None = None,
     bind_host: str | None = None,
     transport_policy: TransportPolicy | None = None,
+    candidate_signer: CandidateSigner | None = None,
+    candidate_queue: CandidateQueueService | None = None,
 ) -> FastAPI:
     if container is None and ((service is None) != (agent is None)):
         raise RuntimeError(
@@ -335,6 +384,18 @@ def _create_app(
                 "container and runtime Secrets do not match"
             )
         runtime_secrets = container.secrets
+        if candidate_signer is None:
+            candidate_signer = getattr(
+                container,
+                "candidate_signer",
+                None,
+            )
+        if candidate_queue is None:
+            candidate_queue = getattr(
+                container,
+                "candidate_queue",
+                None,
+            )
         if api_token is None:
             api_token = runtime_secrets.app_api_token
     if api_token is None or not secret_is_set(api_token):
@@ -458,6 +519,8 @@ def _create_app(
         if container is not None
         else None
     )
+    app.state.candidate_signer = candidate_signer
+    app.state.candidate_queue = candidate_queue
     app.state.account_cache = account_cache
     app.state.transport_policy = transport_policy
     app.state.controlled_shutdown = None
@@ -578,11 +641,94 @@ def _create_app(
             "conversation",
             "active",
         )
+        binding = (
+            candidate_signer.session_binding(
+                actor=principal.actor,
+                session_id=principal.session_id,
+                authenticated_at=principal.authenticated_at,
+            )
+            if candidate_signer is not None
+            else ""
+        )
         return agent.chat(
             body.message,
             actor=context.actor,
             reason=context.reason,
             request_id=context.request_id,
+            session_binding=binding,
+        )
+
+    def _queue_candidate(
+        *,
+        expected_kind: Literal["order", "rule"],
+        body: CandidateQueueIn,
+        request: Request,
+        principal: SessionPrincipal,
+    ):
+        if candidate_signer is None or candidate_queue is None:
+            raise ApiError(
+                "candidate_queue_unavailable",
+                503,
+                "Candidate queue is unavailable",
+            )
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            f"http.candidate.{expected_kind}.queue",
+            "candidate",
+            expected_kind,
+        )
+        binding = candidate_signer.session_binding(
+            actor=principal.actor,
+            session_id=principal.session_id,
+            authenticated_at=principal.authenticated_at,
+        )
+        try:
+            result = candidate_queue.queue(
+                body.candidate,
+                expected_kind=expected_kind,
+                actor=context.actor,
+                session_binding=binding,
+                idempotency_key=request.state.idempotency_key,
+                reason=context.reason,
+                request_id=context.request_id,
+            )
+        except CandidateError as exc:
+            raise ApiError(
+                exc.code,
+                exc.status_code,
+                "Candidate queue request was rejected",
+            ) from None
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=201,
+            content=result.model_dump(mode="json"),
+        )
+
+    @app.post("/candidates/order/queue")
+    async def queue_order_candidate(
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        return _queue_candidate(
+            expected_kind="order",
+            body=await _candidate_queue_body(request),
+            request=request,
+            principal=principal,
+        )
+
+    @app.post("/candidates/rule/queue")
+    async def queue_rule_candidate(
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        return _queue_candidate(
+            expected_kind="rule",
+            body=await _candidate_queue_body(request),
+            request=request,
+            principal=principal,
         )
 
     @app.get("/health")

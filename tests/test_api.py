@@ -3320,11 +3320,23 @@ def test_chat_and_rate_limit(client):
         "actor": "operator:local",
         "reason": "hi",
         "request_id": response.headers["X-Request-ID"],
+        "session_binding": "",
     }
     c.post("/chat", json={"message": "again"})       # 2nd allowed (limit=2)
+    broker_reads = []
+
+    def forbidden_read(*_args, **_kwargs):
+        broker_reads.append("called")
+        raise AssertionError("rate-denied chat must not read the broker")
+
+    svc.broker.get_quote = forbidden_read
+    svc.broker.get_account = forbidden_read
+    svc.broker.get_positions = forbidden_read
+    svc.broker.get_open_orders = forbidden_read
     r = c.post("/chat", json={"message": "third"})   # 3rd blocked
     assert r.status_code == 429
     assert agent.calls == 2
+    assert broker_reads == []
 
 
 def test_http_request_id_canonicalizes_once_for_response_audit_and_provider(

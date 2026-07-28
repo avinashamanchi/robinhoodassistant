@@ -56,6 +56,11 @@ from .security.crypto import (
     SensitiveDataCipher,
     build_sensitive_data_cipher,
 )
+from .security.candidates import (
+    CandidateDraftService,
+    CandidateQueueService,
+    CandidateSigner,
+)
 from .security.secrets import RuntimeSecrets, secret_is_set
 from .security.sensitive_fields import bind_sensitive_cipher
 from .service import TradingService
@@ -99,6 +104,9 @@ class ApplicationContainer:
     sensitive_cipher: SensitiveDataCipher | None = None
     runtime_tenure_guard: RuntimeTenureGuard | None = None
     quarantine_summarizer: QuarantineSummarizer | None = None
+    candidate_signer: CandidateSigner | None = None
+    candidate_drafts: CandidateDraftService | None = None
+    candidate_queue: CandidateQueueService | None = None
 
 
 def prepare_database_runtime(
@@ -424,6 +432,21 @@ def _finish_container(
         external_source=None,
         require_startup_reconciliation=production_broker,
     )
+    candidate_signer = (
+        CandidateSigner.from_runtime_secrets(secrets)
+        if secret_is_set(secrets.candidate_signing_key)
+        else None
+    )
+    candidate_drafts = (
+        CandidateDraftService(service, candidate_signer)
+        if candidate_signer is not None
+        else None
+    )
+    candidate_queue = (
+        CandidateQueueService(service, candidate_signer)
+        if candidate_signer is not None
+        else None
+    )
     if production_broker:
         if runtime_tenure_guard is not None:
             runtime_tenure_guard.ensure_owned()
@@ -497,4 +520,7 @@ def _finish_container(
         sensitive_cipher=sensitive_cipher,
         runtime_tenure_guard=runtime_tenure_guard,
         quarantine_summarizer=quarantine_summarizer,
+        candidate_signer=candidate_signer,
+        candidate_drafts=candidate_drafts,
+        candidate_queue=candidate_queue,
     )

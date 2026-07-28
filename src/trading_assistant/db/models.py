@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
+    UniqueConstraint,
     update,
 )
 from sqlalchemy.orm import (
@@ -722,7 +723,8 @@ class MutationInterlock(Base):
             "operation IN ("
             "'order_approve','order_reject','breaker_reset','order_cancel',"
             "'portfolio_reconcile','order_sync','panic','analysis',"
-            "'plan_approve','plan_cancel','proposal_batch','backtest'"
+            "'plan_approve','plan_cancel','proposal_batch','backtest',"
+            "'candidate_queue'"
             ")",
             name="ck_mutation_interlocks_operation",
         ),
@@ -969,6 +971,114 @@ class CandidateNonce(Base):
         index=True,
     )
     request_id: Mapped[str] = mapped_column(String(64), index=True)
+
+
+class CandidateQueueReceipt(Base):
+    """Metadata-only recovery receipt for one explicit signed queue action."""
+
+    __tablename__ = "candidate_queue_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_binding_hash",
+            "kind",
+            "idempotency_key_hash",
+            name="uq_candidate_queue_receipt_identity",
+        ),
+        UniqueConstraint(
+            "nonce_hash",
+            name="uq_candidate_queue_receipt_nonce",
+        ),
+        CheckConstraint(
+            "length(session_binding_hash) = 64 "
+            "AND session_binding_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_session_hash",
+        ),
+        CheckConstraint(
+            "length(actor_hash) = 64 "
+            "AND actor_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_actor_hash",
+        ),
+        CheckConstraint(
+            "kind IN ('order','rule')",
+            name="ck_candidate_queue_receipts_kind",
+        ),
+        CheckConstraint(
+            "length(idempotency_key_hash) = 64 "
+            "AND idempotency_key_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_idempotency_hash",
+        ),
+        CheckConstraint(
+            "length(candidate_hash) = 64 "
+            "AND candidate_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_candidate_hash",
+        ),
+        CheckConstraint(
+            "length(reason_hash) = 64 "
+            "AND reason_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_reason_hash",
+        ),
+        CheckConstraint(
+            "length(nonce_hash) = 64 "
+            "AND nonce_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_candidate_queue_receipts_nonce_hash",
+        ),
+        CheckConstraint(
+            "state IN ('reserved','target_persisted','completed')",
+            name="ck_candidate_queue_receipts_state",
+        ),
+        CheckConstraint(
+            "length(request_id) BETWEEN 1 AND 64",
+            name="ck_candidate_queue_receipts_request_id",
+        ),
+        CheckConstraint(
+            "outcome_code IS NULL OR "
+            "length(outcome_code) BETWEEN 1 AND 64",
+            name="ck_candidate_queue_receipts_outcome",
+        ),
+        CheckConstraint(
+            "target_id IS NULL OR target_id > 0",
+            name="ck_candidate_queue_receipts_target_id",
+        ),
+        CheckConstraint(
+            "http_status IS NULL OR http_status BETWEEN 100 AND 599",
+            name="ck_candidate_queue_receipts_http_status",
+        ),
+        CheckConstraint(
+            "(state = 'reserved' AND target_id IS NULL "
+            "AND outcome_code IS NULL AND http_status IS NULL "
+            "AND completed_at IS NULL) OR "
+            "(state = 'target_persisted' AND target_id IS NOT NULL "
+            "AND outcome_code IS NOT NULL AND http_status IS NOT NULL "
+            "AND completed_at IS NULL) OR "
+            "(state = 'completed' AND outcome_code IS NOT NULL "
+            "AND http_status IS NOT NULL "
+            "AND completed_at IS NOT NULL)",
+            name="ck_candidate_queue_receipts_lifecycle",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_binding_hash: Mapped[str] = mapped_column(String(64), index=True)
+    actor_hash: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(8), index=True)
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64))
+    candidate_hash: Mapped[str] = mapped_column(String(64))
+    reason_hash: Mapped[str] = mapped_column(String(64))
+    nonce_hash: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(24), default="reserved", index=True)
+    outcome_code: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    target_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(nullable=True)
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
 
 
 class UntrustedIngestEvent(Base):

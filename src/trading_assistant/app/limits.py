@@ -111,6 +111,7 @@ _MUTATION_OPERATIONS = frozenset(
         "plan_cancel",
         "proposal_batch",
         "backtest",
+        "candidate_queue",
     }
 )
 _UNCERTAIN_OUTCOMES = frozenset(

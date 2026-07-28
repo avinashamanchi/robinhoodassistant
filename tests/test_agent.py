@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from copy import deepcopy
+from datetime import datetime, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
 
-from trading_assistant.app.agent import Agent
-from trading_assistant.db.models import AuditEvent, LLMDecision
-from trading_assistant.security.sensitive_fields import sensitive_store
+from trading_assistant.app.agent import Agent, READ_ONLY_TOOL_SPECS
+from trading_assistant.db.models import AuditEvent, LLMDecision, Order, Rule
+from trading_assistant.security.candidates import (
+    CandidateDraftService,
+    CandidateSigner,
+)
 
 
 def _text(t):
@@ -37,6 +42,7 @@ class ScriptedBackend:
         self._responses = list(responses)
         self.calls = 0
         self.request_ids: list[str] = []
+        self.message_snapshots: list[list[dict]] = []
 
     def create(
         self,
@@ -49,20 +55,30 @@ class ScriptedBackend:
     ):
         self.calls += 1
         self.request_ids.append(request_id)
+        self.message_snapshots.append(deepcopy(messages))
         return self._responses.pop(0)
 
 
 def _agent(make_service, responses, *, max_turns=8):
     svc = make_service()
     backend = ScriptedBackend(responses)
-    return Agent(
+    signer = CandidateSigner(b"k" * 32)
+    drafts = CandidateDraftService(svc, signer)
+    agent = Agent(
         backend,
         svc,
         svc.session_factory,
         model="mock",
         max_tokens=100,
         max_turns=max_turns,
-    ), svc
+        candidate_drafts=drafts,
+    )
+    agent.test_session_binding = signer.session_binding(
+        actor="operator:test",
+        session_id=7,
+        authenticated_at=datetime.now(timezone.utc),
+    )
+    return agent, svc
 
 
 def _chat(agent, message):
@@ -71,7 +87,13 @@ def _chat(agent, message):
         actor="operator:test",
         reason=message,
         request_id="agent-test-request",
+        session_binding=getattr(agent, "test_session_binding", ""),
     )
+
+
+def _first_tool_output(backend: ScriptedBackend) -> dict:
+    raw = backend.message_snapshots[1][-1]["content"][0]["content"]
+    return json.loads(raw)
 
 
 def test_agent_calls_tool_then_replies(make_service):
@@ -83,9 +105,9 @@ def test_agent_calls_tool_then_replies(make_service):
         ],
     )
     out = _chat(agent, "what's AAPL at?")
-    assert out["reply"] == "AAPL is trading at 100."
-    assert out["tool_calls"][0]["name"] == "get_market_data"
-    assert out["tool_calls"][0]["output"]["last"] == "100"
+    assert out.reply == "AAPL is trading at 100."
+    assert out.candidates == ()
+    assert _first_tool_output(agent.backend)["last"] == "100"
     assert agent.backend.request_ids == [
         "agent-test-request",
         "agent-test-request",
@@ -103,17 +125,12 @@ def test_agent_uses_one_normalized_request_id_for_provider_turns_and_audit(
                 [
                     _tool(
                         "t1",
-                        "propose_order",
-                        {
-                            "ticker": "AAPL",
-                            "side": "buy",
-                            "order_type": "market",
-                            "notional": "100",
-                        },
+                        "get_market_data",
+                        {"ticker": "AAPL"},
                     )
                 ],
             ),
-            _resp("end_turn", [_text("Proposed for review.")]),
+            _resp("end_turn", [_text("Read-only lookup complete.")]),
         ],
     )
 
@@ -129,10 +146,9 @@ def test_agent_uses_one_normalized_request_id_for_provider_turns_and_audit(
         "http-request-123",
     ]
     with svc.session_factory() as session:
-        audit = session.scalar(
-            select(AuditEvent).where(AuditEvent.action == "order.propose")
-        )
-    assert audit.request_id == "http-request-123"
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
 
 
 @pytest.mark.parametrize(
@@ -208,7 +224,78 @@ def test_agent_module_does_not_expose_a_raw_anthropic_backend():
     assert not hasattr(agent_module, "AnthropicBackend")
 
 
-def test_agent_proposes_order_but_does_not_execute(make_service):
+def test_general_chat_surface_has_no_mutating_tools():
+    assert isinstance(READ_ONLY_TOOL_SPECS, tuple)
+    names = {tool["name"] for tool in READ_ONLY_TOOL_SPECS}
+
+    assert {
+        "propose_order",
+        "create_conditional_rule",
+        "cancel_rule",
+    }.isdisjoint(names)
+    assert {
+        "draft_order_candidate",
+        "draft_rule_candidate",
+    }.issubset(names)
+    server_fields = {
+        "reference_price",
+        "quote_as_of",
+        "actor",
+        "session_binding",
+        "issued_at",
+        "expires_at",
+        "nonce",
+        "signature",
+    }
+    for tool in READ_ONLY_TOOL_SPECS:
+        if tool["name"].startswith("draft_"):
+            assert server_fields.isdisjoint(
+                tool["input_schema"]["properties"]
+            )
+
+
+def test_agent_drafts_signed_order_without_persisting_or_executing(make_service):
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(
+                        "t1",
+                        "draft_order_candidate",
+                        {
+                            "ticker": "AAPL",
+                            "side": "buy",
+                            "order_type": "market",
+                            "notional": "100",
+                            "thesis": "operator should inspect this draft",
+                        },
+                    )
+                ],
+            ),
+            _resp("end_turn", [_text("Drafted for your inspection.")]),
+        ],
+    )
+    out = _chat(agent, "buy $100 of AAPL")
+    assert out.reply == "Drafted for your inspection."
+    assert len(out.candidates) == 1
+    assert out.candidates[0].kind == "order"
+    assert out.candidates[0].payload.notional == 100
+    assert _first_tool_output(agent.backend) == {
+        "status": "candidate_drafted",
+        "kind": "order",
+    }
+    assert "signature" not in json.dumps(
+        agent.backend.message_snapshots[1]
+    )
+    assert svc.broker.submit_calls == 0
+    with svc.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Order)) == 0
+        assert session.scalar(select(func.count()).select_from(Rule)) == 0
+
+
+def test_agent_rejects_removed_mutation_tools_without_state_change(make_service):
     agent, svc = _agent(
         make_service,
         [
@@ -227,79 +314,21 @@ def test_agent_proposes_order_but_does_not_execute(make_service):
                     )
                 ],
             ),
-            _resp("end_turn", [_text("Proposed. Awaiting your approval.")]),
-        ],
-    )
-    out = _chat(agent, "buy $100 of AAPL")
-    assert out["tool_calls"][0]["output"]["status"] == "proposed"
-    assert out["tool_calls"][0]["output"]["executed"] is False
-    assert svc.broker.submit_calls == 0
-    assert len(svc.get_pending()) == 1
-
-
-def test_agent_mutating_tools_preserve_operator_provenance(make_service):
-    agent, svc = _agent(
-        make_service,
-        [
-            _resp(
-                "tool_use",
-                [
-                    _tool(
-                        "t1",
-                        "propose_order",
-                        {
-                            "ticker": "AAPL",
-                            "side": "buy",
-                            "order_type": "market",
-                            "notional": "100",
-                        },
-                    ),
-                    _tool(
-                        "t2",
-                        "create_conditional_rule",
-                        {
-                            "ticker": "AAPL",
-                            "condition": {"price_below": 90},
-                            "action": {"side": "buy", "notional": "50"},
-                        },
-                    ),
-                ],
-            ),
-            _resp(
-                "tool_use",
-                [_tool("t3", "cancel_rule", {"rule_id": 1})],
-            ),
-            _resp("end_turn", [_text("Mutations queued for human review.")]),
+            _resp("end_turn", [_text("No mutation was performed.")]),
         ],
     )
 
-    agent.chat(
-        "Queue a $100 AAPL proposal and a $50 rule, then cancel the rule",
-        actor="operator:local",
-        reason="operator requested these exact chat mutations",
-        request_id="chat-request-123",
-    )
+    out = _chat(agent, "try a removed mutation")
 
     with svc.session_factory() as session:
-        audits = session.query(AuditEvent).filter(
-            AuditEvent.action.in_(
-                ("order.propose", "rule.create", "rule.cancel")
-            )
-        ).all()
-        audit_reasons = {
-            sensitive_store(session).read(audit, "reason")
-            for audit in audits
-        }
-    assert {audit.action for audit in audits} == {
-        "order.propose",
-        "rule.create",
-        "rule.cancel",
-    }
-    assert {audit.actor for audit in audits} == {"operator:local"}
-    assert audit_reasons == {
-        "operator requested these exact chat mutations"
-    }
-    assert {audit.request_id for audit in audits} == {"chat-request-123"}
+        assert session.scalar(select(func.count()).select_from(Order)) == 0
+        assert session.scalar(select(func.count()).select_from(Rule)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+    assert out.candidates == ()
+    assert _first_tool_output(agent.backend) == {"error": "unknown_tool"}
+    assert svc.broker.submit_calls == 0
 
 
 def test_agent_tool_failure_does_not_return_raw_exception_text(
@@ -314,31 +343,26 @@ def test_agent_tool_failure_does_not_return_raw_exception_text(
                 [
                     _tool(
                         "t1",
-                        "propose_order",
-                        {
-                            "ticker": "AAPL",
-                            "side": "buy",
-                            "order_type": "market",
-                            "notional": "100",
-                        },
+                        "get_market_data",
+                        {"ticker": "AAPL"},
                     )
                 ],
             ),
-            _resp("end_turn", [_text("Proposal failed safely.")]),
+            _resp("end_turn", [_text("Lookup failed safely.")]),
         ],
     )
-    svc.propose_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+    svc.get_market_data = lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError("raw provider tool detail")
     )
 
     result = agent.chat(
-        "Propose $100 of AAPL",
+        "Look up AAPL",
         actor="operator:local",
-        reason="operator requested an AAPL proposal",
+        reason="operator requested an AAPL lookup",
         request_id="chat-request-failure",
     )
 
-    output = result["tool_calls"][0]["output"]
+    output = _first_tool_output(agent.backend)
     assert output == {"error": "tool_failed"}
     assert "raw provider tool detail" not in str(result)
     assert "raw provider tool detail" not in caplog.text
@@ -375,8 +399,8 @@ def test_agent_chat_survives_backend_error(make_service, caplog):
         max_turns=8,
     )
     out = _chat(agent, "hi")
-    assert out["tool_calls"] == []
-    assert "couldn't complete" in out["reply"].lower()
+    assert out.candidates == ()
+    assert "couldn't complete" in out.reply.lower()
     # Still records the (failed) decision — no crash on the None response.
     with svc.session_factory() as s:
         assert s.execute(select(func.count()).select_from(LLMDecision)).scalar_one() == 1
@@ -392,4 +416,55 @@ def test_agent_stops_at_max_turns(make_service):
     agent, svc = _agent(make_service, responses, max_turns=3)
     out = _chat(agent, "loop forever")
     assert agent.backend.calls == 3
-    assert out["reply"] == ""  # never produced final text, but returned cleanly
+    assert out.reply == ""  # never produced final text, but returned cleanly
+
+
+def test_prose_only_model_mention_does_not_create_candidate(make_service):
+    agent, svc = _agent(
+        make_service,
+        [_resp("end_turn", [_text("I could draft an AAPL order.")])],
+    )
+
+    out = _chat(agent, "discuss an AAPL order")
+
+    assert out.candidates == ()
+    with svc.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Order)) == 0
+        assert session.scalar(select(func.count()).select_from(Rule)) == 0
+
+
+def test_agent_caps_candidates_before_fifth_quote_read(make_service):
+    draft = {
+        "ticker": "AAPL",
+        "side": "buy",
+        "order_type": "market",
+        "notional": "100",
+        "thesis": "bounded draft",
+    }
+    agent, svc = _agent(
+        make_service,
+        [
+            _resp(
+                "tool_use",
+                [
+                    _tool(f"t{index}", "draft_order_candidate", draft)
+                    for index in range(5)
+                ],
+            ),
+            _resp("end_turn", [_text("Four drafts returned.")]),
+        ],
+    )
+    quote_calls = 0
+    original_get_quote = svc.broker.get_quote
+
+    def counted_get_quote(ticker):
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_get_quote(ticker)
+
+    svc.broker.get_quote = counted_get_quote
+
+    out = _chat(agent, "draft at most four")
+
+    assert len(out.candidates) == 4
+    assert quote_calls == 4

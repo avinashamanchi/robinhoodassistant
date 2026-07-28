@@ -160,7 +160,9 @@ def test_every_api_route_has_exact_policy(make_service):
         registry.get("POST", "/approve/{order_id}").auth
         is AuthLevel.RECENT
     )
-    assert registry.get("POST", "/chat").limit_name == "chat"
+    chat = registry.get("POST", "/chat")
+    assert chat.limit_name == "chat"
+    assert chat.broker_read is True
     assert registry.get("POST", "/backtests/run").limit_name == "backtest"
     positions = registry.get("GET", "/positions")
     assert positions.limit_name == "broker_read"
@@ -173,6 +175,17 @@ def test_every_api_route_has_exact_policy(make_service):
         registry.get("GET", "/health/live").auth
         is AuthLevel.PUBLIC
     )
+    for path in (
+        "/candidates/order/queue",
+        "/candidates/rule/queue",
+    ):
+        candidate = registry.get("POST", path)
+        assert candidate.auth is AuthLevel.CSRF
+        assert candidate.requires_idempotency is True
+        assert candidate.audit_mutation is True
+        assert candidate.broker_read is True
+        assert candidate.concurrency_scope == "principal"
+        assert candidate.mutation_operation == "candidate_queue"
 
 
 def test_duplicate_and_unclassified_routes_fail_inventory_validation():
