@@ -1,9 +1,12 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
 
 from trading_assistant.db.models import Base
+from trading_assistant.db.migration_authority import (
+    activate_migration_authority,
+    retire_migration_authority,
+)
 
 
 config = context.config
@@ -15,40 +18,24 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
-    context.configure(
-        url=url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
+    raise RuntimeError("schema_migration_offline_refused")
 
 
 def run_migrations_online() -> None:
     supplied_connection = config.attributes.get("connection")
-    if supplied_connection is not None:
+    authority = config.attributes.get("migration_authority")
+    if supplied_connection is None or authority is None:
+        raise RuntimeError("schema_migration_authority_required")
+    activate_migration_authority(authority, supplied_connection)
+    try:
         context.configure(
             connection=supplied_connection,
             target_metadata=target_metadata,
         )
         with context.begin_transaction():
             context.run_migrations()
-        return
-
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-
-        with context.begin_transaction():
-            context.run_migrations()
+    finally:
+        retire_migration_authority(authority)
 
 
 if context.is_offline_mode():

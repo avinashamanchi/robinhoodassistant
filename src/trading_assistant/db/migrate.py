@@ -15,8 +15,10 @@ from trading_assistant.security.secrets import (
     validate_base64_key,
 )
 from trading_assistant.ops.backup import (
+    BackupMaintenance,
     EncryptedBackupReceipt,
     create_encrypted_database_backup,
+    guarded_backup_maintenance,
 )
 from trading_assistant.ops.tenure import (
     LocalProcessInspector,
@@ -29,6 +31,10 @@ from trading_assistant.ops.tenure import (
 )
 
 from .schema import SchemaOutOfDate, require_current_schema, schema_status
+from .migration_authority import (
+    issue_bootstrap_authority,
+    issue_maintenance_authority,
+)
 from .models import utcnow
 from .session import create_db_engine, make_session_factory
 
@@ -39,6 +45,16 @@ def _config(engine: Engine) -> Config:
     return cfg
 
 
+def _run_bootstrap_upgrade(engine: Engine) -> None:
+    with engine.connect() as connection:
+        cfg = _config(engine)
+        cfg.attributes["connection"] = connection
+        cfg.attributes["migration_authority"] = (
+            issue_bootstrap_authority(connection)
+        )
+        command.upgrade(cfg, "head")
+
+
 def _backup(
     engine: Engine,
     *,
@@ -46,7 +62,7 @@ def _backup(
     backup_key_id: str | None,
     backup_directory: str | Path | None,
     schema_head: str,
-    ensure_maintenance=None,
+    maintenance: BackupMaintenance,
 ) -> EncryptedBackupReceipt:
     url = make_url(str(engine.url))
     if (
@@ -65,7 +81,7 @@ def _backup(
         backup_key=backup_key,
         backup_key_id=backup_key_id,
         schema_head=schema_head,
-        ensure_maintenance=ensure_maintenance,
+        maintenance=maintenance,
     )
 
 
@@ -98,7 +114,7 @@ def upgrade(
     if not status.versioned and tables:
         raise RuntimeError("schema_maintenance_bootstrap_required")
     if not tables:
-        command.upgrade(_config(engine), "head")
+        _run_bootstrap_upgrade(engine)
         require_current_schema(engine)
         return None
     if status.ready:
@@ -123,36 +139,30 @@ def upgrade(
         ttl_seconds=30,
         renewal_interval_seconds=5,
     )
-    try:
-        guard.start()
-        barrier = install_runtime_mutation_barrier(engine, guard)
-    except BaseException:
-        if not guard.closed:
-            try:
-                if not guard.close():
-                    raise TenureUncertain()
-            except BaseException:
-                raise TenureUncertain() from None
-        raise
+    maintenance = guarded_backup_maintenance(
+        guard,
+        ttl_seconds=30,
+    )
+    barrier = None
     primary_failure = False
     released = False
     try:
-        def renew_maintenance() -> None:
-            if not guard.renew_once():
-                raise TenureUncertain()
-
         backup = _backup(
             engine,
             backup_key=backup_key,
             backup_key_id=backup_key_id,
             backup_directory=backup_directory,
             schema_head=status.current or BASELINE,
-            ensure_maintenance=renew_maintenance,
+            maintenance=maintenance,
         )
+        barrier = install_runtime_mutation_barrier(engine, guard)
         guard.ensure_owned()
         with engine.connect() as connection:
             cfg = _config(engine)
             cfg.attributes["connection"] = connection
+            cfg.attributes["migration_authority"] = (
+                issue_maintenance_authority(connection)
+            )
             cfg.attributes["runtime_tenure_fence_schema"] = (
                 barrier.fence_schema_execution_option
             )
@@ -177,7 +187,8 @@ def upgrade(
             except BaseException:
                 if not primary_failure:
                     raise
-        barrier.close()
+        if barrier is not None:
+            barrier.close()
 
 
 def _print_result(

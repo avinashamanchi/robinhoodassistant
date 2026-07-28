@@ -46,6 +46,12 @@ _INTERNAL_TENURE_SQL = "_trading_assistant_tenure_internal"
 _FENCE_SCHEMA_REBUILD_SQL = (
     "_trading_assistant_tenure_fence_schema_rebuild"
 )
+_PROCESS_START_IDENTITY_PREFIX = "ps-lstart-v1:"
+_PROCESS_INSPECTION_ENV = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "TZ": "UTC",
+}
 
 
 class ProcessProof(str, Enum):
@@ -146,6 +152,7 @@ class LocalProcessInspector:
                 capture_output=True,
                 text=True,
                 timeout=1.0,
+                env=dict(_PROCESS_INSPECTION_ENV),
             )
         except (OSError, subprocess.SubprocessError):
             return ProcessProof.UNKNOWN, None
@@ -161,7 +168,10 @@ class LocalProcessInspector:
         value = " ".join(result.stdout.split())
         if not value:
             return ProcessProof.UNKNOWN, None
-        return ProcessProof.SAME, value
+        return (
+            ProcessProof.SAME,
+            f"{_PROCESS_START_IDENTITY_PREFIX}{value}",
+        )
 
     def current(self) -> ProcessIdentity:
         pid = os.getpid()
@@ -178,6 +188,10 @@ class LocalProcessInspector:
         proof, current_start = self._read_start(identity.pid)
         if proof is not ProcessProof.SAME:
             return proof
+        if not identity.start_identity.startswith(
+            _PROCESS_START_IDENTITY_PREFIX
+        ):
+            return ProcessProof.UNKNOWN
         return (
             ProcessProof.SAME
             if current_start == identity.start_identity

@@ -27,6 +27,10 @@ from trading_assistant.db.models import (
     RuleGroup,
 )
 from trading_assistant.db.migrate import adopt_existing, upgrade
+from trading_assistant.db.migration_authority import (
+    issue_bootstrap_authority,
+    issue_maintenance_authority,
+)
 from trading_assistant.db.schema import SchemaOutOfDate, require_current_schema
 from trading_assistant.db.session import (
     create_db_engine,
@@ -37,6 +41,7 @@ from trading_assistant.orders.repository import OrderRepository
 from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
+    RuntimeTenureGuard,
     RuntimeTenureService,
     TenureLost,
     TenureUnavailable,
@@ -50,6 +55,9 @@ from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
 
 MIGRATION_BACKUP_KEY = b"m" * 32
 MIGRATION_BACKUP_KEY_ID = "migration-backup-key-2026"
+_RAW_ALEMBIC_UPGRADE = command.upgrade
+_RAW_ALEMBIC_DOWNGRADE = command.downgrade
+_RAW_ALEMBIC_STAMP = command.stamp
 
 
 def _migration_backup_args(tmp_path: Path) -> dict[str, object]:
@@ -64,21 +72,159 @@ def _url(path: Path) -> str:
     return f"sqlite:///{path}"
 
 
+class _AuthorizedTestAlembic:
+    """Run historical migration fixtures with an explicit test-only capability."""
+
+    @staticmethod
+    def _run(operation, cfg, *args, **kwargs):
+        if (
+            cfg.attributes.get("connection") is not None
+            and cfg.attributes.get("migration_authority") is not None
+        ):
+            return operation(cfg, *args, **kwargs)
+        engine = create_db_engine(
+            cfg.get_main_option("sqlalchemy.url")
+        )
+        original = dict(cfg.attributes)
+        try:
+            with engine.connect() as connection:
+                connection.exec_driver_sql(
+                    "PRAGMA foreign_keys=OFF"
+                )
+                cfg.attributes["connection"] = connection
+                has_tables = bool(
+                    inspect(connection).get_table_names()
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if has_tables:
+                    authority = issue_maintenance_authority(connection)
+                else:
+                    authority = issue_bootstrap_authority(connection)
+                cfg.attributes["migration_authority"] = authority
+                cfg.attributes["runtime_tenure_fence_schema"] = (
+                    "_pytest_schema_fence",
+                    object(),
+                )
+                cfg.attributes["runtime_tenure_assert_owned"] = (
+                    lambda _connection: None
+                )
+                return operation(cfg, *args, **kwargs)
+        finally:
+            cfg.attributes.clear()
+            cfg.attributes.update(original)
+            engine.dispose()
+
+    def upgrade(self, cfg, *args, **kwargs):
+        return self._run(
+            _RAW_ALEMBIC_UPGRADE,
+            cfg,
+            *args,
+            **kwargs,
+        )
+
+    def downgrade(self, cfg, *args, **kwargs):
+        return self._run(
+            _RAW_ALEMBIC_DOWNGRADE,
+            cfg,
+            *args,
+            **kwargs,
+        )
+
+    def stamp(self, cfg, *args, **kwargs):
+        return self._run(
+            _RAW_ALEMBIC_STAMP,
+            cfg,
+            *args,
+            **kwargs,
+        )
+
+
+command = _AuthorizedTestAlembic()
+
+
 def _legacy_engine(path: Path):
+    engine = create_db_engine(_url(path))
     cfg = Config("alembic.ini")
     cfg.set_main_option("sqlalchemy.url", _url(path))
-    command.upgrade(cfg, "20260724_0001")
-    engine = create_db_engine(_url(path))
+    with engine.connect() as connection:
+        cfg.attributes["connection"] = connection
+        cfg.attributes["migration_authority"] = (
+            issue_bootstrap_authority(connection)
+        )
+        _RAW_ALEMBIC_UPGRADE(cfg, "20260724_0001")
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE alembic_version"))
     return engine
 
 
 def _engine_at_revision(path: Path, revision: str):
+    engine = create_db_engine(_url(path))
     cfg = Config("alembic.ini")
     cfg.set_main_option("sqlalchemy.url", _url(path))
-    command.upgrade(cfg, revision)
-    return create_db_engine(_url(path)), cfg
+    with engine.connect() as connection:
+        cfg.attributes["connection"] = connection
+        cfg.attributes["migration_authority"] = (
+            issue_bootstrap_authority(connection)
+        )
+        _RAW_ALEMBIC_UPGRADE(cfg, revision)
+    direct_cfg = Config("alembic.ini")
+    direct_cfg.set_main_option("sqlalchemy.url", _url(path))
+    return engine, direct_cfg
+
+
+def _database_fingerprint(engine) -> tuple[object, ...]:
+    with engine.connect() as connection:
+        version = connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        )
+        schema = tuple(
+            connection.execute(
+                text(
+                    "SELECT type,name,coalesce(sql,'') "
+                    "FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' "
+                    "ORDER BY type,name"
+                )
+            )
+        )
+        tenures = (
+            tuple(
+                connection.execute(
+                    text(
+                        "SELECT resource_key,role,state,owner_id,generation "
+                        "FROM runtime_tenures ORDER BY resource_key"
+                    )
+                )
+            )
+            if "runtime_tenures" in inspect(engine).get_table_names()
+            else ()
+        )
+        plans = (
+            tuple(
+                connection.execute(
+                    text("SELECT * FROM trade_plans ORDER BY id")
+                )
+            )
+            if "trade_plans" in inspect(engine).get_table_names()
+            else ()
+        )
+    return version, schema, tenures, plans
+
+
+def _seed_migration_refusal_row(engine, marker: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trade_plans "
+                "(symbol,action,status,paper_only,shadow,plan_json,sized_json,"
+                "entry_filled_qty,exit_filled_qty,residual_generation,"
+                "created_at) VALUES "
+                "('AAPL','hold','proposed',1,0,:marker,:marker,"
+                "0,0,0,CURRENT_TIMESTAMP)"
+            ),
+            {"marker": marker},
+        )
 
 
 def _insert_legacy_rule(
@@ -305,6 +451,63 @@ def test_schema_upgrade_holds_maintenance_through_backup_and_ddl(
     assert successor.role == "app"
 
 
+def test_schema_upgrade_starts_renewal_only_after_snapshot_closes(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.db import migrate as migrate_module
+
+    engine = create_db_engine(_url(tmp_path / "ordered-upgrade.db"))
+    upgrade(engine)
+    starts: list[str] = []
+    backup_receipt = object()
+
+    monkeypatch.setattr(
+        migrate_module,
+        "schema_status",
+        lambda _engine: SimpleNamespace(
+            versioned=True,
+            ready=False,
+            current="20260727_0014",
+        ),
+    )
+    monkeypatch.setattr(
+        RuntimeTenureGuard,
+        "start",
+        lambda _guard: starts.append("started"),
+    )
+
+    def snapshot_probe(*_args, **kwargs):
+        assert starts == []
+        assert "ensure_maintenance" not in kwargs
+        maintenance = kwargs["maintenance"]
+        maintenance.check_snapshot()
+        assert starts == []
+        maintenance.complete_snapshot()
+        assert starts == ["started"]
+        return backup_receipt
+
+    monkeypatch.setattr(migrate_module, "_backup", snapshot_probe)
+    monkeypatch.setattr(
+        migrate_module.command,
+        "upgrade",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("stop-after-backup")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="stop-after-backup"):
+        upgrade(
+            engine,
+            **_migration_backup_args(tmp_path),
+            process_identity=ProcessIdentity(
+                8015,
+                "schema-ordered-maintenance",
+            ),
+            process_inspector=_AbsentProcessInspector(),
+        )
+
+
 def test_schema_upgrade_ddl_is_source_fenced_after_successor_generation(
     tmp_path,
     monkeypatch,
@@ -467,6 +670,151 @@ def test_plan_authority_migration_is_successor_0015():
     assert authority_revision.path.endswith(
         "20260727_0015_plan_authority_and_validation_tenure.py"
     )
+
+
+@pytest.mark.parametrize(
+    "role",
+    [None, "app", "daemon", "mcp", "maintenance"],
+)
+def test_direct_alembic_upgrade_from_0014_requires_opaque_authority(
+    tmp_path,
+    role,
+):
+    path = tmp_path / f"direct-upgrade-{role or 'none'}.db"
+    engine, cfg = _engine_at_revision(path, "20260727_0014")
+    _seed_migration_refusal_row(engine, f"upgrade-{role or 'none'}")
+    if role is not None:
+        service = RuntimeTenureService(
+            make_session_factory(engine),
+            process_inspector=_AbsentProcessInspector(),
+        )
+        identity = ProcessIdentity(
+            8400 + len(role),
+            f"direct-upgrade-{role}",
+        )
+        if role == "maintenance":
+            service.acquire_maintenance(identity, ttl_seconds=30)
+        else:
+            service.acquire_runtime(role, identity, ttl_seconds=30)
+    before = _database_fingerprint(engine)
+    artifact_directory = tmp_path / "direct-upgrade-artifacts"
+    artifact_directory.mkdir()
+    existing_artifact = artifact_directory / "existing.aesgcm"
+    existing_artifact.write_bytes(b"unchanged")
+    artifacts_before = tuple(
+        (path.name, path.read_bytes())
+        for path in sorted(artifact_directory.iterdir())
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_migration_authority_required$",
+    ):
+        _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    assert _database_fingerprint(engine) == before
+    assert tuple(
+        (path.name, path.read_bytes())
+        for path in sorted(artifact_directory.iterdir())
+    ) == artifacts_before
+
+
+@pytest.mark.parametrize(
+    "role",
+    [None, "app", "daemon", "mcp", "validation", "maintenance"],
+)
+def test_direct_alembic_head_upgrade_requires_opaque_authority(
+    tmp_path,
+    role,
+):
+    path = tmp_path / f"direct-head-upgrade-{role or 'none'}.db"
+    engine = create_db_engine(_url(path))
+    assert upgrade(engine) is None
+    _seed_migration_refusal_row(engine, f"head-{role or 'none'}")
+    if role is not None:
+        service = RuntimeTenureService(
+            make_session_factory(engine),
+            process_inspector=_AbsentProcessInspector(),
+        )
+        identity = ProcessIdentity(
+            8500 + len(role),
+            f"direct-head-upgrade-{role}",
+        )
+        if role == "maintenance":
+            service.acquire_maintenance(identity, ttl_seconds=30)
+        else:
+            service.acquire_runtime(role, identity, ttl_seconds=30)
+    before = _database_fingerprint(engine)
+    artifact_directory = tmp_path / "direct-head-upgrade-artifacts"
+    assert not artifact_directory.exists()
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_migration_authority_required$",
+    ):
+        _RAW_ALEMBIC_UPGRADE(cfg, "head")
+
+    assert _database_fingerprint(engine) == before
+    assert not artifact_directory.exists()
+
+
+@pytest.mark.parametrize(
+    "role",
+    [None, "app", "daemon", "mcp", "validation", "maintenance"],
+)
+def test_direct_alembic_downgrade_requires_opaque_authority(
+    tmp_path,
+    role,
+):
+    path = tmp_path / f"direct-downgrade-{role or 'none'}.db"
+    engine = create_db_engine(_url(path))
+    assert upgrade(engine) is None
+    _seed_migration_refusal_row(engine, f"downgrade-{role or 'none'}")
+    if role is not None:
+        service = RuntimeTenureService(
+            make_session_factory(engine),
+            process_inspector=_AbsentProcessInspector(),
+        )
+        identity = ProcessIdentity(
+            8600 + len(role),
+            f"direct-downgrade-{role}",
+        )
+        if role == "maintenance":
+            service.acquire_maintenance(identity, ttl_seconds=30)
+        else:
+            service.acquire_runtime(role, identity, ttl_seconds=30)
+    before = _database_fingerprint(engine)
+    artifact_directory = tmp_path / "direct-downgrade-artifacts"
+    assert not artifact_directory.exists()
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_migration_authority_required$",
+    ):
+        _RAW_ALEMBIC_DOWNGRADE(cfg, "20260727_0014")
+
+    assert _database_fingerprint(engine) == before
+    assert not artifact_directory.exists()
+
+
+def test_offline_alembic_migration_is_refused_before_sql_generation(
+    tmp_path,
+):
+    path = tmp_path / "offline-refused.db"
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", _url(path))
+
+    with pytest.raises(
+        RuntimeError,
+        match="^schema_migration_offline_refused$",
+    ):
+        _RAW_ALEMBIC_UPGRADE(cfg, "head", sql=True)
+
+    assert not path.exists()
 
 
 def test_plan_authority_upgrade_preserves_legacy_rows_under_maintenance(

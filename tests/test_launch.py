@@ -11,8 +11,6 @@ import plistlib
 from types import SimpleNamespace
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select, text
 
@@ -31,6 +29,7 @@ from trading_assistant.security.sensitive_fields import (
     persist_sensitive,
     sensitive_store,
 )
+from tests.safety_helpers import bootstrap_database_to_revision
 
 
 def _persist_audit_fixture(session, event: AuditEvent) -> AuditEvent:
@@ -52,9 +51,7 @@ def _persist_order_fixture(session, order: Order) -> Order:
 def _sensitive_head_database(tmp_path, name: str) -> str:
     path = tmp_path / name
     url = f"sqlite:///{path}"
-    cfg = Config("alembic.ini")
-    cfg.set_main_option("sqlalchemy.url", url)
-    command.upgrade(cfg, "head")
+    bootstrap_database_to_revision(url, "head")
     return url
 
 

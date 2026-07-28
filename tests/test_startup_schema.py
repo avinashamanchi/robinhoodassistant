@@ -8,8 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from sqlalchemy import inspect, text
 
 import trading_assistant.logging as app_logging
@@ -19,6 +17,7 @@ from trading_assistant.db.session import create_db_engine
 from trading_assistant.preflight import SensitiveEncryptionStateInspector
 from trading_assistant.security.crypto import SensitiveDataCipher
 from trading_assistant.security.secrets import RuntimeSecrets
+from tests.safety_helpers import bootstrap_database_to_revision
 
 
 TEST_FIELD_KEY_ID = "configured-key-2026"
@@ -31,18 +30,14 @@ TEST_CIPHER = SensitiveDataCipher(
 def _revision_0004(tmp_path, name="startup.db"):
     path = tmp_path / name
     url = f"sqlite:///{path}"
-    cfg = Config("alembic.ini")
-    cfg.set_main_option("sqlalchemy.url", url)
-    command.upgrade(cfg, "20260724_0004")
+    bootstrap_database_to_revision(url, "20260724_0004")
     return create_db_engine(url), url
 
 
 def _head_database(tmp_path, name="sensitive-head.db"):
     path = tmp_path / name
     url = f"sqlite:///{path}"
-    cfg = Config("alembic.ini")
-    cfg.set_main_option("sqlalchemy.url", url)
-    command.upgrade(cfg, "head")
+    bootstrap_database_to_revision(url, "head")
     return create_db_engine(url), url
 
 

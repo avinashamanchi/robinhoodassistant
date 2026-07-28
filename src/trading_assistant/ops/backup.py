@@ -71,6 +71,63 @@ class EncryptedBackupReceipt:
     verified: bool
 
 
+@dataclass(frozen=True)
+class BackupMaintenance:
+    """Three-phase maintenance callbacks for one SQLite source snapshot."""
+
+    check_snapshot: Callable[[], None]
+    complete_snapshot: Callable[[], None]
+    ensure_owned: Callable[[], None]
+
+
+def guarded_backup_maintenance(
+    guard: RuntimeTenureGuard,
+    *,
+    ttl_seconds: int,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> BackupMaintenance:
+    """Delay source-writing renewal until the SQLite snapshot is closed."""
+
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds <= 1
+    ):
+        raise ValueError("backup_tenure_ttl_invalid")
+    deadline = monotonic() + max(1.0, ttl_seconds - 1.0)
+    snapshot_completed = False
+
+    def check_snapshot() -> None:
+        guard.ensure_owned()
+        if snapshot_completed or monotonic() >= deadline:
+            raise EncryptedBackupError("backup_snapshot_tenure_expired")
+
+    def complete_snapshot() -> None:
+        nonlocal snapshot_completed
+        if snapshot_completed:
+            raise EncryptedBackupError(
+                "backup_snapshot_transition_invalid"
+            )
+        check_snapshot()
+        if not guard.renew_once():
+            raise EncryptedBackupError("backup_tenure_lost")
+        guard.start()
+        snapshot_completed = True
+
+    def ensure_owned() -> None:
+        if not snapshot_completed:
+            raise EncryptedBackupError(
+                "backup_snapshot_transition_invalid"
+            )
+        guard.ensure_owned()
+
+    return BackupMaintenance(
+        check_snapshot=check_snapshot,
+        complete_snapshot=complete_snapshot,
+        ensure_owned=ensure_owned,
+    )
+
+
 def _canonical_json(value: dict[str, object]) -> bytes:
     return json.dumps(
         value,
@@ -205,6 +262,7 @@ def create_encrypted_database_backup(
     schema_head: str,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ensure_maintenance: Callable[[], None] | None = None,
+    maintenance: BackupMaintenance | None = None,
     stage_hook: Callable[[str], None] | None = None,
     artifact_label: Literal[
         "before-sensitive-v1",
@@ -225,14 +283,39 @@ def create_encrypted_database_backup(
         not in {"before-sensitive-v1", "whole-database-v1"}
     ):
         raise EncryptedBackupError("backup_metadata_invalid")
+    if maintenance is not None and ensure_maintenance is not None:
+        raise EncryptedBackupError("backup_maintenance_invalid")
     hook = stage_hook or (lambda _stage: None)
-    maintain_callback = ensure_maintenance or (lambda: None)
+    maintain_callback = (
+        maintenance.ensure_owned
+        if maintenance is not None
+        else ensure_maintenance or (lambda: None)
+    )
+    snapshot_check_callback = (
+        maintenance.check_snapshot
+        if maintenance is not None
+        else (lambda: None)
+    )
+    snapshot_complete_callback = (
+        maintenance.complete_snapshot
+        if maintenance is not None
+        else (lambda: None)
+    )
 
-    def maintain() -> None:
+    def invoke(callback: Callable[[], None]) -> None:
         try:
-            maintain_callback()
+            callback()
         except BaseException as exc:
             raise _MaintenanceCallbackFailure(exc) from None
+
+    def maintain() -> None:
+        invoke(maintain_callback)
+
+    def check_snapshot() -> None:
+        invoke(snapshot_check_callback)
+
+    def complete_snapshot() -> None:
+        invoke(snapshot_complete_callback)
     snapshot: Path | None = None
     encrypted_temp: Path | None = None
     verification: Path | None = None
@@ -253,7 +336,7 @@ def create_encrypted_database_backup(
             raise EncryptedBackupError("backup_directory_invalid")
         os.chmod(directory, 0o700)
 
-        maintain()
+        check_snapshot()
         snapshot = _private_temp(directory, ".sensitive-snapshot-")
         source_uri = f"{source_path.as_uri()}?mode=ro"
         with (
@@ -263,12 +346,15 @@ def create_encrypted_database_backup(
             source_connection.backup(
                 snapshot_connection,
                 pages=256,
-                progress=lambda _status, _remaining, _total: maintain(),
+                progress=lambda _status, _remaining, _total: (
+                    check_snapshot()
+                ),
             )
             snapshot_connection.execute(
                 "PRAGMA journal_mode=DELETE"
             ).fetchone()
         os.chmod(snapshot, 0o600)
+        complete_snapshot()
         hook("snapshot_created")
         maintain()
 
@@ -499,13 +585,12 @@ def backup_database(
         ttl_seconds=30,
         renewal_interval_seconds=5,
     )
-    guard.start()
+    maintenance = guarded_backup_maintenance(
+        guard,
+        ttl_seconds=30,
+    )
     primary_failure = False
     try:
-        def maintain() -> None:
-            if not guard.renew_once():
-                raise EncryptedBackupError("backup_tenure_lost")
-
         receipt = create_encrypted_database_backup(
             source_path,
             destination_dir,
@@ -513,7 +598,7 @@ def backup_database(
             backup_key_id=backup_key_id,
             schema_head=head,
             now=now,
-            ensure_maintenance=maintain,
+            maintenance=maintenance,
             artifact_label="whole-database-v1",
         )
     except BaseException:

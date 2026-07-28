@@ -8,6 +8,9 @@ Create Date: 2026-07-27
 from alembic import op
 import sqlalchemy as sa
 
+from trading_assistant.db.migration_authority import (
+    assert_migration_authority,
+)
 
 revision = "20260727_0015"
 down_revision = "20260727_0014"
@@ -64,6 +67,29 @@ _OLD_RUNTIME_LIFECYCLE = (
 
 
 def upgrade() -> None:
+    connection = op.get_bind()
+    attributes = op.get_context().config.attributes
+    authority = attributes.get("migration_authority")
+    mode = assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"bootstrap", "maintenance"}),
+    )
+    schema_capability = attributes.get(
+        "runtime_tenure_fence_schema"
+    )
+    assert_owned = attributes.get(
+        "runtime_tenure_assert_owned"
+    )
+    if mode == "maintenance" and (
+        not isinstance(schema_capability, tuple)
+        or len(schema_capability) != 2
+        or not callable(assert_owned)
+    ):
+        raise RuntimeError("schema_migration_authority_required")
+    if mode == "maintenance":
+        assert_owned(connection)
+
     with op.batch_alter_table("trade_plans") as batch:
         batch.add_column(
             sa.Column(
@@ -88,15 +114,7 @@ def upgrade() -> None:
             "AND authority_digest NOT GLOB '*[^0-9a-f]*')",
         )
 
-    connection = op.get_bind()
-    attributes = op.get_context().config.attributes
-    schema_capability = attributes.get(
-        "runtime_tenure_fence_schema"
-    )
-    assert_owned = attributes.get(
-        "runtime_tenure_assert_owned"
-    )
-    if schema_capability is not None:
+    if mode == "maintenance":
         option_name, option_value = schema_capability
         assert_owned(connection)
         connection.execution_options(
@@ -132,14 +150,34 @@ def upgrade() -> None:
                 _RUNTIME_LIFECYCLE,
             )
     finally:
-        if schema_capability is not None:
+        if mode == "maintenance":
             connection.execution_options(**{option_name: None})
-    if schema_capability is not None:
+    if mode == "maintenance":
         assert_owned(connection)
 
 
 def downgrade() -> None:
     connection = op.get_bind()
+    attributes = op.get_context().config.attributes
+    authority = attributes.get("migration_authority")
+    assert_migration_authority(
+        authority,
+        connection,
+        allowed_modes=frozenset({"maintenance"}),
+    )
+    schema_capability = attributes.get(
+        "runtime_tenure_fence_schema"
+    )
+    assert_owned = attributes.get(
+        "runtime_tenure_assert_owned"
+    )
+    if (
+        not isinstance(schema_capability, tuple)
+        or len(schema_capability) != 2
+        or not callable(assert_owned)
+    ):
+        raise RuntimeError("schema_migration_authority_required")
+    assert_owned(connection)
     if connection.dialect.name != "sqlite":
         raise RuntimeError("runtime_tenure_downgrade_blocked")
     try:

@@ -12,8 +12,6 @@ from pathlib import Path
 
 import pytest
 from alpaca.trading.client import TradingClient
-from alembic import command
-from alembic.config import Config
 from pydantic import SecretStr
 from sqlalchemy import select, text
 
@@ -56,6 +54,7 @@ from trading_assistant.security.sensitive_fields import (
 )
 from trading_assistant.security.secrets import RuntimeSecrets
 from trading_assistant.service import TradingService
+from tests.safety_helpers import bootstrap_database_to_revision
 
 
 _PAPER_PREEXISTING_FILLED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -72,9 +71,7 @@ _DRILL_CIPHER = SensitiveDataCipher(
 
 
 def _upgrade_database(path) -> None:
-    config = Config("alembic.ini")
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{path}")
-    command.upgrade(config, "head")
+    bootstrap_database_to_revision(f"sqlite:///{path}", "head")
 
 
 def _safe_config(app_config):

@@ -35,7 +35,11 @@ from ..security.sensitive_fields import (
     _bind_sensitive_sql_boundary,
     _sensitive_write_authority,
 )
-from .backup import create_encrypted_database_backup
+from .backup import (
+    create_encrypted_database_backup,
+    EncryptedBackupError,
+    guarded_backup_maintenance,
+)
 from .tenure import (
     ProcessIdentity,
     ProcessInspector,
@@ -807,7 +811,6 @@ def _acquire_maintenance(
             ttl_seconds=_MAINTENANCE_TTL_SECONDS,
             renewal_interval_seconds=5,
         )
-        guard.start()
         return guard
     except (TenureUnavailable, TenureUncertain) as exc:
         code = getattr(exc, "stable_code", "tenure_uncertain")
@@ -895,15 +898,29 @@ def migrate_sensitive_fields(
     primary_failure = False
     try:
         specs = _registry(engine)
-        backup = create_encrypted_database_backup(
-            source,
-            backup_directory,
-            backup_key=backup_key,
-            backup_key_id=backup_key_id,
-            schema_head=schema_status(engine).head,
-            now=now,
-            ensure_maintenance=lambda: _renew(handle),
+        backup_maintenance = guarded_backup_maintenance(
+            handle,
+            ttl_seconds=_MAINTENANCE_TTL_SECONDS,
         )
+        try:
+            backup = create_encrypted_database_backup(
+                source,
+                backup_directory,
+                backup_key=backup_key,
+                backup_key_id=backup_key_id,
+                schema_head=schema_status(engine).head,
+                now=now,
+                maintenance=backup_maintenance,
+            )
+        except EncryptedBackupError as exc:
+            if exc.stable_code in {
+                "backup_tenure_lost",
+                "backup_snapshot_tenure_expired",
+            }:
+                raise SensitiveMigrationError(
+                    "sensitive_migration_tenure_lost"
+                ) from None
+            raise
         hook("backup_verified")
         initial = _scan(
             engine,
@@ -1058,15 +1075,29 @@ def rotate_sensitive_fields(
     primary_failure = False
     try:
         specs = _registry(engine)
-        backup = create_encrypted_database_backup(
-            source,
-            backup_directory,
-            backup_key=backup_key,
-            backup_key_id=backup_key_id,
-            schema_head=schema_status(engine).head,
-            now=now,
-            ensure_maintenance=lambda: _renew(handle),
+        backup_maintenance = guarded_backup_maintenance(
+            handle,
+            ttl_seconds=_MAINTENANCE_TTL_SECONDS,
         )
+        try:
+            backup = create_encrypted_database_backup(
+                source,
+                backup_directory,
+                backup_key=backup_key,
+                backup_key_id=backup_key_id,
+                schema_head=schema_status(engine).head,
+                now=now,
+                maintenance=backup_maintenance,
+            )
+        except EncryptedBackupError as exc:
+            if exc.stable_code in {
+                "backup_tenure_lost",
+                "backup_snapshot_tenure_expired",
+            }:
+                raise SensitiveMigrationError(
+                    "sensitive_migration_tenure_lost"
+                ) from None
+            raise
         hook("backup_verified")
         initial = _scan(
             engine,

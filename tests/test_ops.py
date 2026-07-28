@@ -39,6 +39,7 @@ from trading_assistant.ops.tenure import (
 )
 from trading_assistant.security.sensitive_fields import sensitive_store
 from trading_assistant.security.secrets import RuntimeSecrets
+from tests.safety_helpers import operation_deadline
 
 
 class _StubAgent:
@@ -119,6 +120,46 @@ def test_operational_backup_is_encrypted_for_every_migration_state(
     assert not any(path.name.startswith(".") for path in destination.iterdir())
     assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
     assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+
+def test_large_operational_backup_completes_without_source_renewal_livelock(
+    tmp_path,
+):
+    source = _operational_database(tmp_path, "required")
+    with sqlite3.connect(source) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE large_backup_probe (payload BLOB NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO large_backup_probe(payload) "
+            "VALUES (zeroblob(2097152))"
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    destination = tmp_path / "large-backups"
+
+    started = time.monotonic()
+    with operation_deadline(8.0):
+        receipt = backup_database(
+            source,
+            destination,
+            retention_days=14,
+            backup_key=BACKUP_KEY,
+            backup_key_id=BACKUP_KEY_ID,
+            process_identity=BACKUP_IDENTITY,
+            process_inspector=_OfflineInspector(),
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 8.0
+    assert receipt.verified is True
+    assert read_encrypted_backup_header(receipt.path)[
+        "source_sha256"
+    ] == receipt.source_sha256
+    wal = source.with_name(f"{source.name}-wal")
+    assert not wal.exists() or wal.stat().st_size < 1_048_576
+    assert not any(path.name.startswith(".") for path in destination.iterdir())
 
 
 def test_operational_backup_rotates_only_its_encrypted_artifacts(tmp_path):

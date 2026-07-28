@@ -12,6 +12,10 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from trading_assistant.bootstrap import (
+    DatabaseRuntime,
+    acquire_runtime_guard,
+)
 from trading_assistant.db.models import Base, RuntimeTenure
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.ops.tenure import (
@@ -29,9 +33,11 @@ from trading_assistant.ops.tenure import (
 )
 
 _LOCAL_PROCESS_INSPECT = LocalProcessInspector.inspect
+_LOCAL_PROCESS_CURRENT = LocalProcessInspector.current
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+CANONICAL_START = "ps-lstart-v1:Sun Jul 27 20:00:00 2026"
 APP = ProcessIdentity(pid=4101, start_identity="app-start-20260727T120000Z")
 DAEMON = ProcessIdentity(
     pid=4102,
@@ -453,6 +459,50 @@ def test_guard_start_failure_releases_exact_ownership(
     assert handle.release_calls == 1
 
 
+def test_acquire_runtime_guard_preserves_confirmed_thread_start_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import trading_assistant.ops.tenure as tenure_module
+
+    class BrokenThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread-start-failed")
+
+        def is_alive(self):
+            return False
+
+    engine = create_db_engine(f"sqlite:///{tmp_path}/start-failure.db")
+    Base.metadata.create_all(engine)
+    runtime = DatabaseRuntime(
+        engine=engine,
+        session_factory=make_session_factory(engine),
+    )
+    monkeypatch.setattr(tenure_module, "Thread", BrokenThread)
+
+    with pytest.raises(RuntimeError, match="thread-start-failed"):
+        acquire_runtime_guard(
+            runtime,
+            "app",
+            process_identity=APP,
+            process_inspector=FakeProcessInspector(),
+            tenure_clock=lambda: NOW,
+        )
+
+    with Session(engine) as session:
+        row = session.get(RuntimeTenure, "runtime:app")
+        assert row is not None
+        assert row.state == "released"
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE listener_cleanup_probe "
+            "(id INTEGER PRIMARY KEY)"
+        )
+
+
 def test_guard_close_preserves_uncertain_cleanup_result_across_rechecks():
     class UncertainReleaseHandle:
         role = "app"
@@ -855,13 +905,13 @@ def test_successor_generation_fences_mutation_at_statement_source(
 def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
     monkeypatch,
 ):
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def runner(argv, **_kwargs):
-        calls.append(argv)
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
         return SimpleNamespace(
             returncode=0,
-            stdout="Sun Jul 27 12:00:00 2026\n",
+            stdout="Sun Jul 27 20:00:00 2026\n",
             stderr="",
         )
 
@@ -871,8 +921,63 @@ def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
         process_probe=lambda _pid: None,
     )
 
-    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
-    assert calls[0][0] == "/bin/ps"
+    assert (
+        _LOCAL_PROCESS_INSPECT(
+            inspector,
+            ProcessIdentity(APP.pid, CANONICAL_START),
+        )
+        is ProcessProof.SAME
+    )
+    assert calls[0][0][0] == "/bin/ps"
+    assert calls[0][1]["env"] == {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TZ": "UTC",
+    }
+
+
+def test_process_inspector_is_stable_across_caller_timezone_and_locale(
+    monkeypatch,
+):
+    observed_environments: list[dict[str, str]] = []
+
+    def runner(_argv, **kwargs):
+        observed_environments.append(kwargs["env"])
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Sun Jul 27 20:00:00 2026\n",
+            stderr="",
+        )
+
+    inspector = LocalProcessInspector(
+        runner=runner,
+        process_probe=lambda _pid: None,
+    )
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    first = _LOCAL_PROCESS_CURRENT(inspector)
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, first) is ProcessProof.SAME
+    assert first.start_identity == CANONICAL_START
+    assert observed_environments == [
+        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+    ]
+
+
+def test_process_inspector_treats_legacy_unversioned_identity_as_unknown():
+    inspector = LocalProcessInspector(
+        runner=lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Sun Jul 27 20:00:00 2026\n",
+            stderr="",
+        ),
+        process_probe=lambda _pid: None,
+    )
+
+    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.UNKNOWN
 
 
 def test_process_inspector_rc1_with_stderr_is_unknown():
@@ -926,7 +1031,39 @@ def test_process_inspector_detects_pid_reuse_by_start_identity():
         process_probe=lambda _pid: None,
     )
 
-    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
+    assert (
+        _LOCAL_PROCESS_INSPECT(
+            inspector,
+            ProcessIdentity(APP.pid, CANONICAL_START),
+        )
+        is ProcessProof.NOT_SAME
+    )
+
+
+def test_expired_live_owner_with_canonical_identity_blocks_maintenance(
+    tenure_service,
+):
+    service, clock, _inspector = tenure_service
+    runner = lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0,
+        stdout="Sun Jul 27 20:00:00 2026\n",
+        stderr="",
+    )
+    local = LocalProcessInspector(
+        runner=runner,
+        process_probe=lambda _pid: None,
+    )
+    service._process_inspector = SimpleNamespace(
+        inspect=lambda identity: _LOCAL_PROCESS_INSPECT(local, identity)
+    )
+    live = ProcessIdentity(pid=APP.pid, start_identity=CANONICAL_START)
+    service.acquire_runtime("app", live, ttl_seconds=10)
+    clock.advance(11)
+
+    with pytest.raises(TenureUnavailable) as captured:
+        service.acquire_maintenance(MAINTENANCE, ttl_seconds=30)
+
+    assert captured.value.stable_code == "runtime_process_live"
 
 
 def test_guarded_broker_does_not_expose_raw_broker_or_unknown_methods():

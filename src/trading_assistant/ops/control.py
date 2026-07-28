@@ -20,6 +20,12 @@ from typing import Callable, Mapping
 _INSTANCE_ID_BYTES = 32
 _MAX_MESSAGE_BYTES = 4096
 _SOCKET_NAME = "app-control.sock"
+_PROCESS_START_IDENTITY_PREFIX = "ps-lstart-v1:"
+_PROCESS_INSPECTION_ENV = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "TZ": "UTC",
+}
 
 
 @dataclass(frozen=True)
@@ -86,18 +92,23 @@ def _runtime_paths(project: Path) -> tuple[Path, Path, Path, Path]:
 def _process_output(pid: int, field: str) -> str | None:
     try:
         result = subprocess.run(
-            ["ps", "-ww", "-p", str(pid), "-o", f"{field}="],
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", f"{field}="],
             check=False,
             capture_output=True,
             text=True,
             timeout=1.0,
+            env=dict(_PROCESS_INSPECTION_ENV),
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
     value = _trim(result.stdout)
-    return value or None
+    if not value:
+        return None
+    if field == "lstart":
+        return f"{_PROCESS_START_IDENTITY_PREFIX}{' '.join(value.split())}"
+    return value
 
 
 def inspect_process(pid: int) -> ProcessSnapshot | None:

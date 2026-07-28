@@ -37,8 +37,10 @@ from trading_assistant.db.session import (
     make_session_factory,
 )
 from trading_assistant.ops.backup import (
+    EncryptedBackupReceipt,
     EncryptedBackupError,
     create_encrypted_database_backup,
+    guarded_backup_maintenance,
     read_encrypted_backup_header,
 )
 from trading_assistant.ops.encrypt_sensitive import (
@@ -53,6 +55,7 @@ from trading_assistant.ops.encrypt_sensitive import (
 from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
+    RuntimeTenureGuard,
     RuntimeTenureService,
     TenureUncertain,
 )
@@ -307,6 +310,45 @@ def test_backup_streams_more_than_two_mebibytes_in_bounded_chunks(tmp_path):
     assert stages.count("decrypt_chunk") >= 3
 
 
+def test_large_snapshot_expiry_aborts_before_publication_and_cleans_temps(
+    tmp_path,
+):
+    source = tmp_path / "large-expired.db"
+    destination = tmp_path / "expired-backups"
+    _seed_database(source, payload_bytes=2_500_000)
+    monotonic_values = iter((0.0, 0.0, 30.0))
+
+    class InMemoryGuard:
+        renewals = 0
+        starts = 0
+
+        def ensure_owned(self):
+            return None
+
+        def renew_once(self):
+            self.renewals += 1
+            return True
+
+        def start(self):
+            self.starts += 1
+
+    guard = InMemoryGuard()
+    maintenance = guarded_backup_maintenance(
+        guard,
+        ttl_seconds=30,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(EncryptedBackupError) as captured:
+        _create(source, destination, maintenance=maintenance)
+
+    assert captured.value.stable_code == "backup_snapshot_tenure_expired"
+    assert guard.renewals == 0
+    assert guard.starts == 0
+    assert destination.exists()
+    assert not list(destination.iterdir())
+
+
 def test_backup_renews_maintenance_within_large_snapshot_hash(tmp_path):
     source = tmp_path / "large-hash.db"
     destination = tmp_path / "hash-backups"
@@ -333,6 +375,102 @@ def test_backup_renews_maintenance_within_large_snapshot_hash(tmp_path):
     )
 
     assert len(hash_renewals) >= 4
+
+
+@pytest.mark.parametrize("operation", ["migrate", "rotate"])
+def test_sensitive_operations_start_renewal_only_after_snapshot_closes(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    import trading_assistant.ops.encrypt_sensitive as module
+
+    engine, path = _legacy_engine(tmp_path)
+    starts: list[str] = []
+    original_start = RuntimeTenureGuard.start
+
+    def record_start(_guard):
+        starts.append("started")
+
+    def snapshot_probe(
+        _source,
+        destination,
+        **kwargs,
+    ):
+        assert starts == []
+        assert "ensure_maintenance" not in kwargs
+        maintenance = kwargs["maintenance"]
+        maintenance.check_snapshot()
+        assert starts == []
+        maintenance.complete_snapshot()
+        assert starts == ["started"]
+        return EncryptedBackupReceipt(
+            path=Path(destination) / "probe.sqlite3.aesgcm",
+            path_hash="a" * 64,
+            source_sha256="b" * 64,
+            created_at=NOW.isoformat(),
+            schema_head=SCHEMA_HEAD,
+            backup_key_id=BACKUP_KEY_ID,
+            verified=True,
+        )
+
+    def stop_after_backup(stage):
+        if stage == "backup_verified":
+            raise _Interrupted()
+
+    monkeypatch.setattr(RuntimeTenureGuard, "start", record_start)
+    monkeypatch.setattr(
+        module,
+        "create_encrypted_database_backup",
+        snapshot_probe,
+    )
+    try:
+        with pytest.raises(_Interrupted):
+            if operation == "migrate":
+                migrate_sensitive_fields(
+                    engine,
+                    SensitiveDataCipher(
+                        {OLD_KEY_ID: OLD_KEY},
+                        active_key_id=OLD_KEY_ID,
+                    ),
+                    **_migration_kwargs(
+                        path,
+                        tmp_path / "migrate-backups",
+                        stage_hook=stop_after_backup,
+                    ),
+                )
+            else:
+                monkeypatch.setattr(
+                    module,
+                    "_state",
+                    lambda _engine: SimpleNamespace(
+                        state="complete",
+                        active_key_id=OLD_KEY_ID,
+                    ),
+                )
+                rotate_sensitive_fields(
+                    engine,
+                    old_cipher=SensitiveDataCipher(
+                        {OLD_KEY_ID: OLD_KEY},
+                        active_key_id=OLD_KEY_ID,
+                    ),
+                    new_cipher=SensitiveDataCipher(
+                        {
+                            OLD_KEY_ID: OLD_KEY,
+                            NEW_KEY_ID: NEW_KEY,
+                        },
+                        active_key_id=NEW_KEY_ID,
+                    ),
+                    new_key_id=NEW_KEY_ID,
+                    retained_key_ids=[NEW_KEY_ID],
+                    **_migration_kwargs(
+                        path,
+                        tmp_path / "rotate-backups",
+                        stage_hook=stop_after_backup,
+                    ),
+                )
+    finally:
+        monkeypatch.setattr(RuntimeTenureGuard, "start", original_start)
 
 
 def test_backup_refuses_overwrite_and_preserves_first_artifact(tmp_path):
@@ -684,6 +822,9 @@ def test_maintenance_renewal_loss_durably_fails_before_mutation(
                 "WHERE idempotency_key='legacy-order'"
             )
         ) == "legacy-order-reason"
+    backup_directory = tmp_path / "renewal-loss-backups"
+    assert backup_directory.exists()
+    assert not list(backup_directory.iterdir())
 
 
 def test_maintenance_release_uncertainty_durably_blocks_startup(

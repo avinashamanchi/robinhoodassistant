@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +50,42 @@ def _snapshot(metadata, **updates):
     }
     values.update(updates)
     return ProcessSnapshot(**values)
+
+
+def test_process_start_identity_uses_absolute_ps_and_fixed_environment(
+    monkeypatch,
+):
+    from trading_assistant.ops import control
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Sun Jul 27 20:00:00 2026\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(control.subprocess, "run", runner)
+    monkeypatch.setenv("PATH", "/tmp/attacker-controlled")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
+
+    first = control._process_output(4242, "lstart")
+    os.environ["TZ"] = "Asia/Kolkata"
+    os.environ["LC_ALL"] = "en_US.UTF-8"
+    second = control._process_output(4242, "lstart")
+
+    assert first == second == "ps-lstart-v1:Sun Jul 27 20:00:00 2026"
+    assert [call[0] for call in calls] == [
+        ["/bin/ps", "-ww", "-p", "4242", "-o", "lstart="],
+        ["/bin/ps", "-ww", "-p", "4242", "-o", "lstart="],
+    ]
+    assert [call[1]["env"] for call in calls] == [
+        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+    ]
 
 
 @pytest.mark.parametrize(

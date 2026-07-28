@@ -43,6 +43,7 @@ from .ops.tenure import (
     ProcessIdentity,
     RuntimeTenureGuard,
     RuntimeTenureService,
+    TenureCloseResult,
     TenureGuardedBroker,
     TenureUncertain,
     install_runtime_mutation_barrier,
@@ -162,6 +163,15 @@ def acquire_runtime_guard(
         guard.start()
         install_runtime_mutation_barrier(runtime.engine, guard)
     except BaseException:
+        close_result = getattr(
+            guard,
+            "close_result",
+            TenureCloseResult.NOT_ATTEMPTED,
+        )
+        if close_result is TenureCloseResult.CONFIRMED:
+            raise
+        if close_result is TenureCloseResult.UNCERTAIN:
+            raise TenureUncertain() from None
         try:
             released = guard.close()
         except BaseException:
