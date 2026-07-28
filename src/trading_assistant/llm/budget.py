@@ -259,7 +259,7 @@ class ProviderBudgetService:
                 current,
                 provider=provider,
             )
-            self._reap_expired_started(
+            self._sweep_expired_ambiguous(
                 session,
                 current,
                 provider=provider,
@@ -534,17 +534,18 @@ class ProviderBudgetService:
             return released
 
     def reconcile_expired_started(self, now: datetime) -> int:
-        """Fail closed any started attempt whose usage never reconciled.
+        """Fail closed expired attempts whose usage never reconciled.
 
         Unlike an unstarted reservation, a started call can never be refunded:
         provider acceptance is ambiguous. The charged reservation is retained
-        and the provider day is latched for explicit operator/provider
-        reconciliation.
+        and the provider day is latched even if failure handling already moved
+        the reservation to ``unknown`` before expiry. The return value counts
+        only newly transitioned ``started`` reservations.
         """
         current = _as_utc(now)
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            reaped = self._reap_expired_started(
+            reaped = self._sweep_expired_ambiguous(
                 session,
                 current,
             )
@@ -598,7 +599,7 @@ class ProviderBudgetService:
         return len(reservations)
 
     @classmethod
-    def _reap_expired_started(
+    def _sweep_expired_ambiguous(
         cls,
         session: Session,
         current: datetime,
@@ -610,7 +611,7 @@ class ProviderBudgetService:
         else:
             cls._validate_provider_aggregates(session, provider)
         statement = select(ProviderReservation).where(
-            ProviderReservation.state == "started",
+            ProviderReservation.state.in_(("started", "unknown")),
             ProviderReservation.expires_at <= current,
         )
         if provider is not None:
@@ -619,9 +620,12 @@ class ProviderBudgetService:
             )
         reservations = session.scalars(statement).all()
         affected_providers: set[str] = set()
+        transitioned = 0
         for reservation in reservations:
             cls._validate_reservation(reservation)
-            reservation.state = "unknown"
+            if reservation.state == "started":
+                reservation.state = "unknown"
+                transitioned += 1
             cls._latch_expired_unknown_reconciliation(
                 session,
                 reservation,
@@ -634,7 +638,7 @@ class ProviderBudgetService:
                 session,
                 affected_provider,
             )
-        return len(reservations)
+        return transitioned
 
     @classmethod
     def _latch_expired_unknown_reconciliation(
@@ -679,7 +683,7 @@ class ProviderBudgetService:
         budget_day = current.date()
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            self._reap_expired_started(
+            self._sweep_expired_ambiguous(
                 session,
                 current,
                 provider=provider,

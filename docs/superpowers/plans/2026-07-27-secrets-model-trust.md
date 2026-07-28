@@ -1237,6 +1237,17 @@ git commit -m "feat(analyst): quarantine external text"
   unexpired started calls are not reaped, and settled reservations remain
   final.
 
+**Fix round 3 hardening:**
+
+- The transactional expiry sweep selects both `started` and `unknown`
+  reservations. It transitions and counts only expired `started` rows, but
+  invokes the same provider-day reconciliation latch for both states. Thus a
+  provider failure marked `unknown` before its TTL cannot escape reconciliation
+  when a later reserve, status call, or explicit maintenance sweep reaches
+  `expires_at`. Repeated sweeps return zero new transitions while preserving
+  the latch and all charged aggregates; settled, released, and unexpired rows
+  remain untouched.
+
 - [ ] **Step 1: Write no-tools and no-raw-forwarding tests**
 
 ```python

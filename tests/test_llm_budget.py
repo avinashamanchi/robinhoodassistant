@@ -995,6 +995,376 @@ def test_unexpired_started_reservation_is_not_reaped(
     ) == "started"
 
 
+@pytest.mark.parametrize("trigger", ["status", "reserve"])
+def test_unknown_before_expiry_latches_on_later_budget_sweep(
+    trigger,
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id=f"request-unknown-before-expiry-{trigger}",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    service.mark_unknown(
+        reservation.reservation_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    with session_factory() as session:
+        day = session.scalar(select(ProviderBudgetDay))
+        charged = (
+            day.calls_used,
+            day.input_tokens_used,
+            day.output_tokens_used,
+        )
+        assert day.reconciliation_required is False
+
+    expired_at = NOW + timedelta(seconds=5)
+    later = _service(
+        session_factory,
+        limits,
+        now=expired_at,
+    )
+    if trigger == "status":
+        status = later.status("test")
+    else:
+        with pytest.raises(
+            ProviderBudgetExceeded,
+            match="reconciliation",
+        ):
+            later.reserve(
+                provider="test",
+                category="chat",
+                request_id="request-denied-after-unknown-expiry",
+                input_tokens=1,
+                output_tokens=1,
+            )
+        status = later.status("test")
+
+    assert status.reconciliation_required is True
+    assert (
+        status.reconciliation_code
+        == "provider_started_usage_unknown"
+    )
+    assert (
+        status.calls_used,
+        status.input_tokens_used,
+        status.output_tokens_used,
+    ) == charged
+    assert later.reconcile_expired_started(expired_at) == 0
+    repeated = later.status("test")
+    assert repeated.reconciliation_required is True
+    assert (
+        repeated.calls_used,
+        repeated.input_tokens_used,
+        repeated.output_tokens_used,
+    ) == charged
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(ProviderReservation)
+        ) == 1
+        persisted = session.get(
+            ProviderReservation,
+            reservation.reservation_id,
+        )
+    assert persisted.state == "unknown"
+
+
+@pytest.mark.parametrize(
+    "state_order",
+    [
+        ("started", "unknown"),
+        ("unknown", "started"),
+    ],
+)
+def test_expiry_sweep_counts_only_new_started_transition_in_both_state_orders(
+    state_order,
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=10,
+    )
+    service = _service(session_factory, limits)
+    reservations: dict[str, ProviderReservation] = {}
+    for index, state in enumerate(state_order):
+        created_at = NOW + timedelta(seconds=index * 2)
+        reservation = service.reserve(
+            provider="test",
+            category="chat",
+            request_id=f"request-state-order-{index}-{state}",
+            input_tokens=10,
+            output_tokens=10,
+            now=created_at,
+        )
+        service.mark_started(
+            reservation.reservation_id,
+            now=created_at,
+        )
+        if state == "unknown":
+            service.mark_unknown(
+                reservation.reservation_id,
+                now=created_at + timedelta(seconds=1),
+            )
+        reservations[state] = reservation
+    with session_factory() as session:
+        day = session.scalar(select(ProviderBudgetDay))
+        charged = (
+            day.calls_used,
+            day.input_tokens_used,
+            day.output_tokens_used,
+        )
+
+    expired_at = NOW + timedelta(seconds=12)
+    assert service.reconcile_expired_started(expired_at) == 1
+    assert service.reconcile_expired_started(expired_at) == 0
+    status = service.status("test", now=expired_at)
+
+    assert status.reconciliation_required is True
+    assert (
+        status.reconciliation_code
+        == "provider_started_usage_unknown"
+    )
+    assert (
+        status.calls_used,
+        status.input_tokens_used,
+        status.output_tokens_used,
+    ) == charged
+    assert {
+        state: _reservation_state(
+            session_factory,
+            reservation.reservation_id,
+        )
+        for state, reservation in reservations.items()
+    } == {
+        "started": "unknown",
+        "unknown": "unknown",
+    }
+
+
+def test_concurrent_expired_unknown_sweeps_latch_without_transition_count(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-concurrent-expired-unknown",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    service.mark_unknown(
+        reservation.reservation_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    expired_at = NOW + timedelta(seconds=5)
+    barrier = threading.Barrier(8)
+
+    def sweep_once(_index: int) -> int:
+        worker = _service(
+            session_factory,
+            limits,
+            now=expired_at,
+        )
+        barrier.wait()
+        return worker.reconcile_expired_started(expired_at)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(sweep_once, range(8)))
+
+    assert results == [0] * 8
+    status = service.status("test", now=expired_at)
+    assert status.reconciliation_required is True
+    assert (
+        status.reconciliation_code
+        == "provider_started_usage_unknown"
+    )
+    assert (
+        status.calls_used,
+        status.input_tokens_used,
+        status.output_tokens_used,
+    ) == (1, 10, 10)
+    assert _reservation_state(
+        session_factory,
+        reservation.reservation_id,
+    ) == "unknown"
+
+
+def test_expired_unknown_sweep_covers_multiple_providers_and_budget_days(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    cases = (
+        ("provider-one", NOW, 7, 3),
+        ("provider-two", NOW + timedelta(days=1), 11, 5),
+    )
+    reservation_ids: list[str] = []
+    for provider, created_at, input_tokens, output_tokens in cases:
+        reservation = service.reserve(
+            provider=provider,
+            category="chat",
+            request_id=f"request-{provider}-unknown",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            now=created_at,
+        )
+        service.mark_started(
+            reservation.reservation_id,
+            now=created_at,
+        )
+        service.mark_unknown(
+            reservation.reservation_id,
+            now=created_at + timedelta(seconds=1),
+        )
+        reservation_ids.append(reservation.reservation_id)
+    with session_factory() as session:
+        charged = {
+            (row.provider, row.budget_day): (
+                row.calls_used,
+                row.input_tokens_used,
+                row.output_tokens_used,
+            )
+            for row in session.scalars(select(ProviderBudgetDay))
+        }
+
+    sweep_at = NOW + timedelta(days=1, seconds=5)
+    assert service.reconcile_expired_started(sweep_at) == 0
+
+    with session_factory() as session:
+        days = {
+            (row.provider, row.budget_day): row
+            for row in session.scalars(select(ProviderBudgetDay))
+        }
+        states = {
+            reservation_id: session.get(
+                ProviderReservation,
+                reservation_id,
+            ).state
+            for reservation_id in reservation_ids
+        }
+    assert set(days) == {
+        ("provider-one", NOW.date()),
+        ("provider-two", (NOW + timedelta(days=1)).date()),
+    }
+    assert {
+        identity: (
+            row.calls_used,
+            row.input_tokens_used,
+            row.output_tokens_used,
+        )
+        for identity, row in days.items()
+    } == charged
+    assert all(row.reconciliation_required for row in days.values())
+    assert {
+        row.reconciliation_code for row in days.values()
+    } == {"provider_started_usage_unknown"}
+    assert set(states.values()) == {"unknown"}
+
+
+def test_expired_unknown_sweep_leaves_settled_and_released_rows_untouched(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    unknown = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-sweep-unknown",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    settled = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-sweep-settled",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    released = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-sweep-released",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    service.mark_started(unknown.reservation_id, now=NOW)
+    service.mark_unknown(
+        unknown.reservation_id,
+        now=NOW + timedelta(seconds=1),
+    )
+    service.mark_started(settled.reservation_id, now=NOW)
+    service.settle(
+        settled.reservation_id,
+        input_tokens=4,
+        output_tokens=3,
+        now=NOW + timedelta(seconds=1),
+    )
+    expired_at = NOW + timedelta(seconds=5)
+    assert service.release_expired_unstarted(expired_at) == 1
+    with session_factory() as session:
+        day = session.scalar(select(ProviderBudgetDay))
+        charged = (
+            day.calls_used,
+            day.input_tokens_used,
+            day.output_tokens_used,
+        )
+
+    assert service.reconcile_expired_started(expired_at) == 0
+    status = service.status("test", now=expired_at)
+
+    assert status.reconciliation_required is True
+    assert (
+        status.calls_used,
+        status.input_tokens_used,
+        status.output_tokens_used,
+    ) == charged == (2, 14, 13)
+    assert {
+        reservation.request_id: _reservation_state(
+            session_factory,
+            reservation.reservation_id,
+        )
+        for reservation in (unknown, settled, released)
+    } == {
+        "request-sweep-unknown": "unknown",
+        "request-sweep-settled": "settled",
+        "request-sweep-released": "released",
+    }
+
+
 def test_concurrent_expired_started_reapers_transition_exactly_once(
     session_factory,
 ):
