@@ -1432,7 +1432,7 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - [x] **Step 7: Prove active non-preapproved rules only propose on trigger**
 - [x] **Step 8: Pass focused candidate/agent/API/MCP/migration/submission tests**
 - [x] **Step 9: Run exactly one full suite for the implementation round**
-- [ ] **Step 10: Commit implementation, then package evidence in docs-only commit**
+- [x] **Step 10: Commit implementation, then package evidence in docs-only commit**
 
 ---
 
