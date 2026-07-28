@@ -12,6 +12,8 @@
   `953b36eca1545dc63d069a100d082a77595815f7`.
 - Reviewer fix-round-2 quarantine implementation commit:
   `e3b6a8f5e7964fa8f4bbd50ac53e4345fd0bd22c`.
+- Reviewer fix-round-3 quarantine implementation commit:
+  `3833dd3ae52afb9dc714110e93fb6832c42a9119`.
 - The Task 7 focused and affected suites are green.
 - The repository-wide full-suite gate is clean. The historical initial run
   exposed one reproducible panic-lease defect, and the historical confirmation
@@ -19,7 +21,9 @@
   one new final full suite passed with 2,888 passed, 1 skipped, and 1 existing
   third-party warning. After quarantine-only reviewer fix round 2, exactly one
   new final full suite passed with 2,898 passed, 1 skipped, and the same
-  existing third-party warning.
+  existing third-party warning. After quarantine-only reviewer fix round 3,
+  exactly one new final full suite passed with 2,903 passed, 1 skipped, and
+  the same existing third-party warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -62,8 +66,9 @@
   cues now use a linear, bounded scanner that accepts arbitrary chunk lengths
   and all Unicode whitespace recognized by `str.isspace()`, including NBSP
   introduced by entity canonicalization. Payload text is compacted only for
-  classification; malicious or malformed exact spans are removed from the
-  transient output in their original form.
+  classification. Syntactically valid malicious exact spans are removed from
+  transient output; malformed spans reject the entire item before any removal
+  interval is created.
 - Padded, explicitly delimited, and end-of-item encoded spans have exact
   boundaries. An unpadded fragmented span followed through whitespace by
   Base64-compatible prose is rejected as `ambiguous_encoding`; the gateway
@@ -360,6 +365,90 @@ No second full-suite run was performed for reviewer fix round 2. No panic,
 lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
 broker, or runtime code changed in this round.
 
+Round 3 below supersedes round 2's handling of exact-but-malformed spans:
+malformed cued content now rejects the item instead of returning sanitized
+content.
+
+## Reviewer fix round 3 — all-or-nothing cued payloads
+
+The exact reviewer finding was reproduced through two partial-removal paths:
+
+1. `decode: % <Unicode-whitespace-fragmented malicious Base64>` caused the
+   bare parser to return only the illegal prefix as a malformed interval.
+2. `decode: YWJj= <fragmented malicious instruction>` stopped at the early
+   padding and returned that prefix without validating it before removal.
+
+In both cases, the prefix was removed while the later fragmented malicious
+payload survived because the generic fallback scanner handles contiguous
+Base64 only.
+
+TDD RED:
+
+- the round-3 reviewer selection produced
+  `10 failed, 58 deselected in 0.61s`;
+- every failure returned sanitized content instead of raising a stable
+  metadata-only rejection;
+- RED cases covered both reviewer reproductions, illegal internal and suffix
+  characters, early/internal padding, standard/URL-safe alphabet mixing,
+  malformed delimited content, encoded-size limits, and fragment-token limits.
+
+The quarantine-only implementation now:
+
+- separates strict bounded Base64 decoding from decoded instruction
+  classification so syntax validity is proven before sanitization;
+- rejects illegal prefixes, illegal internal or suffix characters,
+  early/internal/invalid padding, mixed alphabets, malformed continuations,
+  excessive encoded spans, excessive compacted candidates, excessive token
+  counts, and excessive decoded payloads as stable `malformed_encoding`;
+- preserves stable `ambiguous_encoding` for Base64-compatible prose or another
+  remainder whose unpadded boundary cannot be proven;
+- raises before `_strip_cued_encoded_payloads()` appends a removal interval,
+  so a malformed cued span can never be partially removed and returned;
+- permits sanitization with trailing prose only for a syntactically valid
+  padded or explicitly delimited payload;
+- continues to permit a syntactically valid unpadded payload only when EOF
+  proves its boundary;
+- persists only source/content hashes, byte count, stable code, state, and
+  receipt time for rejected items. No raw or decoded marker reaches model
+  output, database text, exception text, or captured logs.
+
+GREEN evidence:
+
+- round-3 reviewer selection:
+  `11 passed, 58 deselected in 0.44s`;
+- complete quarantine module:
+  `69 passed in 2.00s`;
+- untrusted content, news, DB models, and migrations:
+  `242 passed, 1 warning in 31.12s`;
+- all-or-nothing rejection plus valid-boundary repeats:
+  20/20 fresh processes, 320/320 cases;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.97s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.71s`;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+Test-quality audit:
+
+- 11 round-3 behavior cases are exercised within 69 unique quarantine node
+  IDs.
+- No duplicate names or node IDs, skips, xfails, placeholder `pass`, or dead
+  parameters were found.
+- Reviewer repros, bare versus delimited corruption, each syntax failure, and
+  each valid boundary map to separate observable branches.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2903 passed, 1 skipped, 1 warning in 395.23s`.
+
+No second full-suite run was performed for reviewer fix round 3. No panic,
+lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
+broker, or runtime code changed in this round.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -378,6 +467,8 @@ broker, or runtime code changed in this round.
   `review-0463078..953b36e.diff`
 - generated reviewer-fix-round-2 review package
   `review-849b6ad..e3b6a8f.diff`
+- generated reviewer-fix-round-3 review package
+  `review-34f56c0..3833dd3.diff`
 
 ## Caveats
 
