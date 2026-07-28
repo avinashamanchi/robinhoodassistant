@@ -8,11 +8,14 @@
   `ac30a09c757bbf2d5f319f3510369ab41015da0c`.
 - Panic-lease gate fix commit:
   `c5015cd4c4fa4de21e670014ca19f7a9c2e8ab0f`.
+- Reviewer fix-round-1 implementation commit:
+  `953b36eca1545dc63d069a100d082a77595815f7`.
 - The Task 7 focused and affected suites are green.
-- The repository-wide full-suite gate is clean. The original run exposed one
-  reproducible panic-lease defect; after the specifically authorized
-  systematic-debugging/TDD fix, the single confirmation run passed with
-  2,848 passed, 1 skipped, and 1 existing third-party warning.
+- The repository-wide full-suite gate is clean. The historical initial run
+  exposed one reproducible panic-lease defect, and the historical confirmation
+  after that fix passed with 2,848 passed. After reviewer fix round 1, exactly
+  one new final full suite passed with 2,888 passed, 1 skipped, and 1 existing
+  third-party warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -41,13 +44,20 @@
   of 20 items per request.
 - Enforced 16 KiB UTF-8 limits before and after normalization, plus the
   planned 16,000-character normalized schema bound.
-- Applied Unicode NFC normalization and removed NUL, bidirectional, hidden
-  `Cc`, and hidden `Cf` controls before instruction detection.
-- Removed active HTML containers and their contents, remaining markup,
-  Markdown images, and embedded `data:` URLs.
+- Applied a bounded four-pass fixed-point canonicalization pipeline. Each pass
+  decodes HTML entities, enforces the UTF-8 bound, applies NFC, removes and
+  flags NUL, bidirectional, hidden `Cc`, and hidden `Cf` controls, and strips
+  active containers, remaining markup, Markdown images, and embedded `data:`
+  URLs. Non-convergence and entity expansion reject with stable codes.
+- Runs instruction and tool-content detection only after canonicalization has
+  reached a stable representation, including for encoded and double-encoded
+  controls and active tags.
 - Detected and removed direct instruction phrases, indirect mutable-tool
   instructions, nested or malformed tool-call JSON fragments, and suspicious
-  standard or URL-safe Base64 payloads.
+  standard or URL-safe Base64 payloads. Explicitly cued Base64 represented as
+  bounded four-character chunks separated by mixed whitespace is compacted
+  only for classification; malicious or malformed encoded spans are removed
+  from the transient output in their original form.
 - Base64 decoding is bounded and used only to assign a finding code. Decoded
   text is never returned, persisted, logged, fetched, opened, or rendered.
 - The gateway has no model, tool, connector, broker, file, or network
@@ -59,8 +69,12 @@
   needed.
 - Persisted only source SHA-256, normalized-content SHA-256, byte count,
   stable finding codes, state, and receipt time.
-- Used SQLite conflict-ignore against the existing source/content unique
-  index so identical ingestion is idempotent.
+- Used one atomic SQLite upsert against the existing source/content unique
+  index. Conflicts union and sort stable finding codes, rejection dominates
+  receipt, byte count resolves to the conservative maximum, and receipt time
+  resolves to the deterministic minimum. Receive-then-reject and
+  reject-then-receive therefore converge to identical metadata-only evidence,
+  including under concurrent writers.
 - Rejected oversize, invalid-URL, and invalid-publication-time inputs record
   metadata-only rejection evidence. Raw text, snippets, exception strings,
   URLs, publisher names, and human-readable source IDs never enter the row.
@@ -185,6 +199,79 @@ run:
 
 No additional full-suite run was performed.
 
+## Reviewer fix round 1
+
+All four quarantine findings were reproduced with RED tests before production
+changes:
+
+1. HTML entity decoding could introduce controls or active tags after the
+   corresponding passes.
+2. Whitespace-fragmented standard and URL-safe Base64 could evade bounded
+   classification.
+3. Conflict-ignore persistence made the first observation win, so later
+   rejection evidence could be lost.
+4. Panic receipt renewal, completion, and follower replay did not prove the
+   authoritative lease owner, generation, and live horizon in the same
+   transaction.
+
+The implementation now:
+
+- canonicalizes entity/control/markup layers to a bounded fixed point and
+  rejects non-convergence or expansion beyond the item bound;
+- classifies explicitly cued fragmented Base64 without retaining decoded
+  material and removes the entire original malicious encoded span;
+- merges metadata-only ingest evidence with a single atomic SQLite upsert and
+  conservative, order-independent conflict rules, without a migration;
+- validates the exact `ConcurrencyLease` key, owner, generation, and unexpired
+  horizon in each receipt write transaction, flushes the write, then proves
+  clock monotonicity and the lease fence again before commit;
+- reads receipt and lease as one follower snapshot, rejecting expired reads
+  and A1 receipts after B2 takeover while permitting replay after the exact
+  A1 release transition;
+- keeps genuine DB-busy, unknown-store, clock, cancellation, and tenure
+  uncertainty fail closed without allowing a second panic execution.
+
+Focused GREEN evidence after all production changes:
+
+- untrusted content, news, DB models, and migrations:
+  `227 passed, 1 warning in 30.49s`;
+- route policy, durable limits, and runtime tenure:
+  `220 passed in 19.08s`;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.97s`;
+- panic-fence critical selection:
+  10/10 fresh processes, 120/120 cases;
+- synchronized long-panic endpoint:
+  20/20 fresh processes;
+- concurrent ingest merge:
+  5/5 fresh processes, 60/60 races;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+Test-quality audit:
+
+- 41 new regression cases were added: 28 quarantine/persistence cases and 13
+  panic-fence cases.
+- The two modified test modules collect 157 unique node IDs.
+- No duplicate test names or node IDs, skips, xfails, placeholder `pass`,
+  unreachable definitions, or dead parameter values were found.
+- Similar-looking cases are intentionally distinct safety boundaries:
+  renew versus finish, takeover versus exact release, pre- versus post-flush
+  clock proof, sequential versus concurrent evidence merge, and contiguous
+  versus whitespace-fragmented Base64.
+
+Full-suite chronology is preserved:
+
+- original Task 7 gate:
+  `1 failed, 2824 passed, 1 skipped, 1 warning in 397.92s`;
+- historical confirmation after the panic-lease defect fix:
+  `2848 passed, 1 skipped, 1 warning in 391.10s`;
+- reviewer fix round 1, exactly one final full-suite run:
+  `2888 passed, 1 skipped, 1 warning in 394.41s`.
+
+No second full-suite run was performed for reviewer fix round 1.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -199,6 +286,8 @@ No additional full-suite run was performed.
   `review-2afe380..ac30a09.diff`
 - generated panic-gate review package
   `review-515f87b..c5015cd.diff`
+- generated reviewer-fix-round-1 review package
+  `review-0463078..953b36e.diff`
 
 ## Caveats
 
