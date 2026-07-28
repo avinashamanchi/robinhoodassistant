@@ -36,6 +36,7 @@ from ..security.secrets import (
 from .backup_transaction import (
     BACKUP_CHUNK_BYTES as _CHUNK_BYTES,
     ENCRYPTED_NAME as _ENCRYPTED_NAME,
+    QUARANTINE_DIRECTORY as _QUARANTINE_DIRECTORY,
     SNAPSHOT_NAME as _SNAPSHOT_NAME,
     TRANSACTION_DIRECTORY as _TRANSACTION_DIRECTORY,
     VERIFICATION_NAME as _VERIFICATION_NAME,
@@ -1661,7 +1662,10 @@ def _recover_backup_orphans(
     cutoff = now() - orphan_ttl_seconds
     candidates = tuple(destination.iterdir())
     for candidate in candidates:
-        if _TRANSACTION_DIRECTORY.fullmatch(candidate.name) is not None:
+        if (
+            _TRANSACTION_DIRECTORY.fullmatch(candidate.name) is not None
+            or _QUARANTINE_DIRECTORY.fullmatch(candidate.name) is not None
+        ):
             _recover_backup_transaction(
                 durable_directory,
                 candidate.name,

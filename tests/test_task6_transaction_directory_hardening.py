@@ -26,6 +26,7 @@ BACKUP_KEY = b"T" * 32
 BACKUP_KEY_ID = "transaction-directory-key"
 SCHEMA_HEAD = "20260727_0015"
 _TRANSACTION_PREFIX = ".backup-txn-"
+_QUARANTINE_PREFIX = ".backup-quarantine-"
 _TRANSACTION_MEMBERS = {
     "manifest",
     "snapshot.sqlite3",
@@ -91,6 +92,37 @@ def _crash_at_stage(
     os._exit(74)
 
 
+def _crash_after_quarantine_rename(
+    destination: Path,
+    recovery_now: float,
+) -> None:
+    original_rename = transaction_module._rename_no_replace
+
+    def rename_then_crash(
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        original_rename(
+            parent_descriptor,
+            source_name,
+            destination_name,
+        )
+        if (
+            source_name.startswith(_TRANSACTION_PREFIX)
+            and destination_name.startswith(_QUARANTINE_PREFIX)
+        ):
+            os._exit(79)
+
+    transaction_module._rename_no_replace = rename_then_crash
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+    os._exit(80)
+
+
 def _pause_then_crash(
     source: Path,
     destination: Path,
@@ -112,6 +144,15 @@ def _transaction_directories(destination: Path) -> tuple[Path, ...]:
         candidate
         for candidate in destination.iterdir()
         if candidate.name.startswith(_TRANSACTION_PREFIX)
+        and candidate.is_dir()
+    )
+
+
+def _quarantine_directories(destination: Path) -> tuple[Path, ...]:
+    return tuple(
+        candidate
+        for candidate in destination.iterdir()
+        if candidate.name.startswith(_QUARANTINE_PREFIX)
         and candidate.is_dir()
     )
 
@@ -149,6 +190,22 @@ def _age_tree(root: Path, timestamp: float) -> None:
 def _hold_manifest_lock(manifest: Path, ready, release) -> None:
     descriptor = os.open(
         manifest,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(10)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _hold_member_lock(member: Path, ready, release) -> None:
+    descriptor = os.open(
+        member,
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0),
@@ -754,6 +811,458 @@ def test_partial_cleanup_recovery_converges_after_unlink_failure(
             now=lambda: delayed_recovery,
         )
     assert not transaction.exists()
+    assert tuple(destination.iterdir()) == ()
+
+
+def test_recovery_preserves_replacement_at_identity_unlink_seam(
+    tmp_path,
+    monkeypatch,
+):
+    """A same-UID pathname swap after identity proof must not be unlinked."""
+
+    source = tmp_path / "unlink-seam.db"
+    destination = tmp_path / "unlink-seam-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    original_match = transaction_module._member_stat_matches
+    original_unlink = os.unlink
+    encrypted_checks = 0
+    replacement_written = False
+
+    def replace_after_identity_proof(
+        descriptor_stat,
+        path_stat,
+        member,
+    ):
+        nonlocal encrypted_checks, replacement_written
+        matched = original_match(descriptor_stat, path_stat, member)
+        if member.name == "encrypted.aesgcm" and matched:
+            encrypted_checks += 1
+            if encrypted_checks == 3:
+                replacement = transaction / member.name
+                original_unlink(replacement)
+                replacement.write_bytes(b"operator-owned-at-unlink-seam")
+                replacement.chmod(0o600)
+                replacement_written = True
+        return matched
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_member_stat_matches",
+        replace_after_identity_proof,
+    )
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    replacement = transaction / "encrypted.aesgcm"
+    assert replacement_written is True
+    assert transaction.exists()
+    assert replacement.read_bytes() == b"operator-owned-at-unlink-seam"
+
+
+def test_recovery_member_lock_is_bounded_and_preserves_namespace(tmp_path):
+    """Ignoring a busy member lock lets recovery mutate an in-use namespace."""
+
+    source = tmp_path / "busy-member.db"
+    destination = tmp_path / "busy-member-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_member_lock,
+        args=(transaction / "encrypted.aesgcm", ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=5)
+
+    started = time.monotonic()
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    release.set()
+    holder.join(timeout=10)
+    assert holder.exitcode == 0
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
+    assert not transaction.exists()
+    assert tuple(destination.iterdir()) == ()
+
+
+def test_recovery_preserves_external_hardlink_and_transaction(tmp_path):
+    """Treating a multiply linked member as owned can leak crash plaintext."""
+
+    source = tmp_path / "member-hardlink.db"
+    destination = tmp_path / "member-hardlink-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    operator_link = destination / "operator-snapshot-link"
+    os.link(transaction / "snapshot.sqlite3", operator_link)
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    assert operator_link.exists()
+    assert operator_link.stat().st_ino == (
+        transaction / "snapshot.sqlite3"
+    ).stat().st_ino
+
+
+@pytest.mark.parametrize("damage", ["extra", "replacement"])
+def test_post_isolation_ambiguity_restores_original_namespace(
+    tmp_path,
+    monkeypatch,
+    damage,
+):
+    """Post-rename extra or replacement content must abort exact cleanup."""
+
+    source = tmp_path / f"post-isolation-{damage}.db"
+    destination = tmp_path / f"post-isolation-{damage}-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    original_rename = transaction_module._rename_no_replace
+    injected = False
+
+    def rename_then_damage(
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected
+        original_rename(
+            parent_descriptor,
+            source_name,
+            destination_name,
+        )
+        if (
+            not injected
+            and source_name == transaction.name
+            and destination_name.startswith(_QUARANTINE_PREFIX)
+        ):
+            quarantine = destination / destination_name
+            protected = (
+                quarantine / "operator.txt"
+                if damage == "extra"
+                else quarantine / "encrypted.aesgcm"
+            )
+            if damage == "replacement":
+                protected.unlink()
+            protected.write_bytes(
+                f"operator-owned-{damage}".encode("ascii")
+            )
+            protected.chmod(0o600)
+            injected = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_rename_no_replace",
+        rename_then_damage,
+    )
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
+
+    assert injected is True
+    assert transaction.exists()
+    assert _quarantine_directories(destination) == ()
+    protected = (
+        transaction / "operator.txt"
+        if damage == "extra"
+        else transaction / "encrypted.aesgcm"
+    )
+    assert protected.read_bytes() == f"operator-owned-{damage}".encode(
+        "ascii"
+    )
+
+
+def test_new_original_name_after_isolation_is_never_overwritten(
+    tmp_path,
+    monkeypatch,
+):
+    """A newly occupied original name must preserve both namespaces."""
+
+    source = tmp_path / "new-original.db"
+    destination = tmp_path / "new-original-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    original_members = _namespace_identities(transaction)
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    original_rename = transaction_module._rename_no_replace
+    injected = False
+
+    def rename_then_occupy_original(
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected
+        original_rename(
+            parent_descriptor,
+            source_name,
+            destination_name,
+        )
+        if (
+            not injected
+            and source_name == transaction.name
+            and destination_name.startswith(_QUARANTINE_PREFIX)
+        ):
+            transaction.mkdir(mode=0o700)
+            (transaction / "operator.txt").write_bytes(
+                b"new-original-owner"
+            )
+            injected = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_rename_no_replace",
+        rename_then_occupy_original,
+    )
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
+
+    quarantines = _quarantine_directories(destination)
+    assert injected is True
+    assert (transaction / "operator.txt").read_bytes() == (
+        b"new-original-owner"
+    )
+    assert len(quarantines) == 1
+    assert _namespace_identities(quarantines[0]) == original_members
+
+
+def test_ambiguous_successful_isolation_is_restored_without_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    """A rename that succeeds and then raises must not authorize deletion."""
+
+    source = tmp_path / "ambiguous-isolation.db"
+    destination = tmp_path / "ambiguous-isolation-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+    original_rename = transaction_module._rename_no_replace
+    raised_after_rename = False
+
+    def rename_then_raise(
+        parent_descriptor: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        nonlocal raised_after_rename
+        original_rename(
+            parent_descriptor,
+            source_name,
+            destination_name,
+        )
+        if (
+            not raised_after_rename
+            and source_name == transaction.name
+            and destination_name.startswith(_QUARANTINE_PREFIX)
+        ):
+            raised_after_rename = True
+            raise OSError("injected ambiguous isolation")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_rename_no_replace",
+        rename_then_raise,
+    )
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert raised_after_rename is True
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    assert _quarantine_directories(destination) == ()
+
+
+def test_isolation_parent_fsync_failure_restores_without_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    """Cleanup cannot begin before the quarantine rename is parent-fsynced."""
+
+    source = tmp_path / "isolation-fsync.db"
+    destination = tmp_path / "isolation-fsync-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+    destination_stat = destination.stat()
+    original_fsync = transaction_module.retry_fsync
+    failed_parent_fsync = False
+
+    def fail_first_parent_fsync(descriptor: int) -> None:
+        nonlocal failed_parent_fsync
+        descriptor_stat = os.fstat(descriptor)
+        if (
+            not failed_parent_fsync
+            and descriptor_stat.st_dev == destination_stat.st_dev
+            and descriptor_stat.st_ino == destination_stat.st_ino
+        ):
+            failed_parent_fsync = True
+            raise OSError("injected quarantine parent fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "retry_fsync",
+        fail_first_parent_fsync,
+    )
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert failed_parent_fsync is True
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    assert _quarantine_directories(destination) == ()
+
+
+def test_real_crash_after_quarantine_rename_is_recoverable(tmp_path):
+    """A process death after isolation must leave an exact recoverable image."""
+
+    source = tmp_path / "quarantine-crash.db"
+    destination = tmp_path / "quarantine-crash-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    recovery = context.Process(
+        target=_crash_after_quarantine_rename,
+        args=(destination, recovery_now),
+    )
+    recovery.start()
+    recovery.join(timeout=10)
+
+    assert recovery.exitcode == 79
+    assert _transaction_directories(destination) == ()
+    quarantines = _quarantine_directories(destination)
+    assert len(quarantines) == 1
+    _age_tree(quarantines[0], recovery_now - 120)
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
+
     assert tuple(destination.iterdir()) == ()
 
 

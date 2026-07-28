@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import ctypes
 from dataclasses import dataclass
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -13,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import sys
 import time
 
 
@@ -20,6 +23,11 @@ BACKUP_CHUNK_BYTES = 1_048_576
 TRANSACTION_PREFIX = ".backup-txn-"
 TRANSACTION_DIRECTORY = re.compile(
     rf"{re.escape(TRANSACTION_PREFIX)}([0-9a-f]{{32}})"
+)
+QUARANTINE_PREFIX = ".backup-quarantine-"
+QUARANTINE_DIRECTORY = re.compile(
+    rf"{re.escape(QUARANTINE_PREFIX)}"
+    r"([0-9a-f]{32})-([0-9a-f]{32})"
 )
 TRANSACTION_MANIFEST_MAGIC = b"TA-BACKUP-TRANSACTION\x00"
 TRANSACTION_MANIFEST_VERSION = 2
@@ -40,6 +48,10 @@ _RECORD_DIGEST_BYTES = hashlib.sha256().digest_size
 _TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
 _LOCK_TIMEOUT_SECONDS = 0.25
 _LOCK_RETRY_SECONDS = 0.005
+_DARWIN_RENAME_EXCL = 0x00000004
+_DARWIN_RENAME_NOFOLLOW_ANY = 0x00000010
+_LINUX_RENAME_NOREPLACE = 1
+_QUARANTINE_NAME_ATTEMPTS = 8
 
 
 class EncryptedBackupError(RuntimeError):
@@ -79,6 +91,13 @@ class BackupTransaction:
     manifest_descriptor: int
     manifest: _BackupTransactionManifest
     manifest_locked: bool = True
+
+
+@dataclass(frozen=True)
+class _RecoveryMemberHandle:
+    member: _BackupTransactionMember
+    descriptor: int
+    initial_stat: os.stat_result
 
 
 def _canonical_json(value: dict[str, object]) -> bytes:
@@ -188,6 +207,89 @@ def acquire_bounded_lock(
             raise EncryptedBackupError(
                 "encrypted_backup_state_unavailable"
             ) from None
+
+
+def _rename_no_replace(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Rename one basename atomically without replacing an existing entry."""
+
+    if (
+        not source_name
+        or not destination_name
+        or "/" in source_name
+        or "/" in destination_name
+        or source_name in {".", ".."}
+        or destination_name in {".", ".."}
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        try:
+            rename = library.renameatx_np
+        except AttributeError:
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_unavailable"
+            ) from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        flags = _DARWIN_RENAME_EXCL | _DARWIN_RENAME_NOFOLLOW_ANY
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError:
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_unavailable"
+            ) from None
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        flags = _LINUX_RENAME_NOREPLACE
+    else:
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_unavailable"
+        )
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    while True:
+        ctypes.set_errno(0)
+        result = rename(
+            parent_descriptor,
+            source,
+            parent_descriptor,
+            destination,
+            flags,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number == errno.EINTR:
+            continue
+        if error_number <= 0:
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_unavailable"
+            )
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            source_name,
+            destination_name,
+        )
 
 
 def retry_fsync(descriptor: int) -> None:
@@ -431,16 +533,39 @@ def _destination_identity(
     return descriptor_stat
 
 
+def _namespace_belongs_to_transaction(
+    manifest: _BackupTransactionManifest,
+    namespace_name: str,
+) -> bool:
+    if namespace_name == manifest.directory_name:
+        return True
+    quarantine_match = QUARANTINE_DIRECTORY.fullmatch(namespace_name)
+    return (
+        quarantine_match is not None
+        and quarantine_match.group(1) == manifest.transaction_id
+    )
+
+
 def _directory_identity(
     transaction: BackupTransaction,
+    *,
+    namespace_name: str | None = None,
 ) -> os.stat_result:
     _destination_identity(
         transaction.destination,
         transaction.destination_descriptor,
     )
+    resolved_name = namespace_name or transaction.manifest.directory_name
+    if not _namespace_belongs_to_transaction(
+        transaction.manifest,
+        resolved_name,
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
     descriptor_stat = os.fstat(transaction.directory_descriptor)
     path_stat = os.stat(
-        transaction.manifest.directory_name,
+        resolved_name,
         dir_fd=transaction.destination_descriptor,
         follow_symlinks=False,
     )
@@ -490,8 +615,13 @@ def _manifest_identity(
 
 def _read_manifest(
     transaction: BackupTransaction,
+    *,
+    namespace_name: str | None = None,
 ) -> _BackupTransactionManifest:
-    _directory_identity(transaction)
+    _directory_identity(
+        transaction,
+        namespace_name=namespace_name,
+    )
     before = _manifest_identity(transaction)
     manifest = _decode_manifest(
         pread_exact(
@@ -541,6 +671,23 @@ def _member_stat_matches(
         and descriptor_stat.st_ino == member.inode
         and stat.S_IMODE(descriptor_stat.st_mode) == member.mode
         and stat.S_IMODE(path_stat.st_mode) == member.mode
+    )
+
+
+def _stable_member_identity_matches(
+    initial_stat: os.stat_result,
+    current_stat: os.stat_result,
+) -> bool:
+    return (
+        initial_stat.st_dev == current_stat.st_dev
+        and initial_stat.st_ino == current_stat.st_ino
+        and initial_stat.st_mode == current_stat.st_mode
+        and initial_stat.st_uid == current_stat.st_uid
+        and initial_stat.st_gid == current_stat.st_gid
+        and initial_stat.st_nlink == current_stat.st_nlink
+        and initial_stat.st_size == current_stat.st_size
+        and initial_stat.st_mtime_ns == current_stat.st_mtime_ns
+        and initial_stat.st_ctime_ns == current_stat.st_ctime_ns
     )
 
 
@@ -604,10 +751,15 @@ def validate_backup_transaction(
 
 def _open_recovery_members(
     transaction: BackupTransaction,
-) -> list[tuple[_BackupTransactionMember, int]]:
+    *,
+    namespace_name: str,
+) -> list[_RecoveryMemberHandle]:
     """Open only present manifest members; reject every ambiguous entry."""
 
-    _read_manifest(transaction)
+    _read_manifest(
+        transaction,
+        namespace_name=namespace_name,
+    )
     recorded_names = {
         member.name for member in transaction.manifest.members
     }
@@ -620,44 +772,59 @@ def _open_recovery_members(
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
         )
-    opened: list[tuple[_BackupTransactionMember, int]] = []
+    opened: list[_RecoveryMemberHandle] = []
     try:
         for member in transaction.manifest.members:
             if member.name not in present_names:
                 continue
-            opened.append(
-                (
-                    member,
-                    _open_recorded_member(
-                        transaction,
-                        member,
-                        os.O_RDONLY,
-                    ),
-                )
+            descriptor = _open_recorded_member(
+                transaction,
+                member,
+                os.O_RDONLY,
             )
+            try:
+                acquire_bounded_lock(descriptor, fcntl.LOCK_EX)
+                initial_stat = os.fstat(descriptor)
+                if initial_stat.st_nlink != 1:
+                    raise EncryptedBackupError(
+                        "encrypted_backup_transaction_invalid"
+                    )
+                opened.append(
+                    _RecoveryMemberHandle(
+                        member=member,
+                        descriptor=descriptor,
+                        initial_stat=initial_stat,
+                    )
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
         if set(os.listdir(transaction.directory_descriptor)) != namespace:
             raise EncryptedBackupError(
                 "encrypted_backup_transaction_invalid"
             )
-        for member, descriptor in opened:
-            descriptor_stat = os.fstat(descriptor)
+        for handle in opened:
+            descriptor_stat = os.fstat(handle.descriptor)
             path_stat = os.stat(
-                member.name,
+                handle.member.name,
                 dir_fd=transaction.directory_descriptor,
                 follow_symlinks=False,
             )
             if not _member_stat_matches(
                 descriptor_stat,
                 path_stat,
-                member,
+                handle.member,
+            ) or not _stable_member_identity_matches(
+                handle.initial_stat,
+                descriptor_stat,
             ):
                 raise EncryptedBackupError(
                     "encrypted_backup_transaction_invalid"
                 )
         return opened
     except BaseException:
-        for _member, descriptor in opened:
-            os.close(descriptor)
+        for handle in opened:
+            os.close(handle.descriptor)
         raise
 
 
@@ -1082,20 +1249,288 @@ def _finish_backup_transaction_removal(
     retry_fsync(transaction.destination_descriptor)
 
 
+def _namespace_stat(
+    transaction: BackupTransaction,
+    namespace_name: str,
+) -> os.stat_result | None:
+    try:
+        return os.stat(
+            namespace_name,
+            dir_fd=transaction.destination_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _namespace_matches_directory(
+    transaction: BackupTransaction,
+    namespace_stat: os.stat_result | None,
+) -> bool:
+    if namespace_stat is None:
+        return False
+    descriptor_stat = os.fstat(transaction.directory_descriptor)
+    return (
+        stat.S_ISDIR(namespace_stat.st_mode)
+        and descriptor_stat.st_dev == namespace_stat.st_dev
+        and descriptor_stat.st_ino == namespace_stat.st_ino
+        and descriptor_stat.st_dev
+        == transaction.manifest.directory_device
+        and descriptor_stat.st_ino
+        == transaction.manifest.directory_inode
+        and stat.S_IMODE(namespace_stat.st_mode) == 0o700
+    )
+
+
+def _validate_recovery_namespace(
+    transaction: BackupTransaction,
+    namespace_name: str,
+    opened: list[_RecoveryMemberHandle],
+) -> None:
+    if (
+        QUARANTINE_DIRECTORY.fullmatch(namespace_name) is not None
+        and _namespace_stat(
+            transaction,
+            transaction.manifest.directory_name,
+        )
+        is not None
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    _read_manifest(
+        transaction,
+        namespace_name=namespace_name,
+    )
+    expected_namespace = {
+        TRANSACTION_MANIFEST_NAME,
+        *(handle.member.name for handle in opened),
+    }
+    if set(os.listdir(transaction.directory_descriptor)) != (
+        expected_namespace
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    for handle in opened:
+        descriptor_stat = os.fstat(handle.descriptor)
+        path_stat = os.stat(
+            handle.member.name,
+            dir_fd=transaction.directory_descriptor,
+            follow_symlinks=False,
+        )
+        if not (
+            _member_stat_matches(
+                descriptor_stat,
+                path_stat,
+                handle.member,
+            )
+            and _stable_member_identity_matches(
+                handle.initial_stat,
+                descriptor_stat,
+            )
+            and _stable_member_identity_matches(
+                descriptor_stat,
+                path_stat,
+            )
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+
+
+def _restore_isolated_namespace(
+    transaction: BackupTransaction,
+    quarantine_name: str,
+) -> bool:
+    """Best-effort no-overwrite restoration after fail-closed isolation."""
+
+    quarantine_match = QUARANTINE_DIRECTORY.fullmatch(quarantine_name)
+    if (
+        quarantine_match is None
+        or quarantine_match.group(1) != transaction.manifest.transaction_id
+        or not _namespace_matches_directory(
+            transaction,
+            _namespace_stat(transaction, quarantine_name),
+        )
+        or _namespace_stat(
+            transaction,
+            transaction.manifest.directory_name,
+        )
+        is not None
+    ):
+        return False
+    try:
+        _rename_no_replace(
+            transaction.destination_descriptor,
+            quarantine_name,
+            transaction.manifest.directory_name,
+        )
+    except BaseException:
+        original_stat = _namespace_stat(
+            transaction,
+            transaction.manifest.directory_name,
+        )
+        quarantine_stat = _namespace_stat(
+            transaction,
+            quarantine_name,
+        )
+        if not (
+            _namespace_matches_directory(transaction, original_stat)
+            and quarantine_stat is None
+        ):
+            return False
+    try:
+        retry_fsync(transaction.destination_descriptor)
+    except BaseException:
+        pass
+    return (
+        _namespace_matches_directory(
+            transaction,
+            _namespace_stat(
+                transaction,
+                transaction.manifest.directory_name,
+            ),
+        )
+        and _namespace_stat(transaction, quarantine_name) is None
+    )
+
+
+def _isolate_recovery_namespace(
+    transaction: BackupTransaction,
+) -> str:
+    """Move the exact transaction directory to a private no-replace name."""
+
+    original_name = transaction.manifest.directory_name
+    _directory_identity(transaction, namespace_name=original_name)
+    for _attempt in range(_QUARANTINE_NAME_ATTEMPTS):
+        quarantine_name = (
+            f"{QUARANTINE_PREFIX}{transaction.manifest.transaction_id}-"
+            f"{os.urandom(16).hex()}"
+        )
+        try:
+            _rename_no_replace(
+                transaction.destination_descriptor,
+                original_name,
+                quarantine_name,
+            )
+        except BaseException as exc:
+            if isinstance(exc, OSError) and exc.errno == errno.EEXIST:
+                continue
+            if (
+                _namespace_stat(transaction, original_name) is None
+                and _namespace_matches_directory(
+                    transaction,
+                    _namespace_stat(transaction, quarantine_name),
+                )
+            ):
+                _restore_isolated_namespace(
+                    transaction,
+                    quarantine_name,
+                )
+            raise
+        try:
+            retry_fsync(transaction.destination_descriptor)
+            if _namespace_stat(transaction, original_name) is not None:
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            _directory_identity(
+                transaction,
+                namespace_name=quarantine_name,
+            )
+        except BaseException:
+            _restore_isolated_namespace(
+                transaction,
+                quarantine_name,
+            )
+            raise
+        return quarantine_name
+    raise EncryptedBackupError(
+        "encrypted_backup_transaction_unavailable"
+    )
+
+
+def _remove_isolated_recovery_namespace(
+    transaction: BackupTransaction,
+    quarantine_name: str,
+    opened: list[_RecoveryMemberHandle],
+) -> None:
+    """Delete only exact members through the isolated directory descriptor.
+
+    POSIX offers no conditional inode-unlink operation. Recovery therefore
+    relies on the held manifest/member locks as its cooperative ownership
+    boundary, isolates the namespace with an atomic no-replace rename, and
+    revalidates every descriptor immediately before each dirfd-relative
+    unlink. Any observed ambiguity leaves or restores the quarantine.
+    """
+
+    quarantine_match = QUARANTINE_DIRECTORY.fullmatch(quarantine_name)
+    if (
+        quarantine_match is None
+        or quarantine_match.group(1) != transaction.manifest.transaction_id
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    remaining = list(opened)
+    while remaining:
+        _validate_recovery_namespace(
+            transaction,
+            quarantine_name,
+            remaining,
+        )
+        handle = remaining[0]
+        os.unlink(
+            handle.member.name,
+            dir_fd=transaction.directory_descriptor,
+        )
+        retry_fsync(transaction.directory_descriptor)
+        remaining.pop(0)
+    _validate_recovery_namespace(
+        transaction,
+        quarantine_name,
+        [],
+    )
+    os.unlink(
+        TRANSACTION_MANIFEST_NAME,
+        dir_fd=transaction.directory_descriptor,
+    )
+    retry_fsync(transaction.directory_descriptor)
+    if os.listdir(transaction.directory_descriptor):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    os.rmdir(
+        quarantine_name,
+        dir_fd=transaction.destination_descriptor,
+    )
+    retry_fsync(transaction.destination_descriptor)
+
+
 def _remove_recovered_backup_transaction(
     transaction: BackupTransaction,
     *,
     cutoff: float,
     initial_directory_stat: os.stat_result,
+    namespace_name: str,
 ) -> bool:
-    opened = _open_recovery_members(transaction)
+    opened = _open_recovery_members(
+        transaction,
+        namespace_name=namespace_name,
+    )
+    quarantine_name: str | None = None
+    removed = False
     try:
         if any(
-            os.fstat(descriptor).st_mtime >= cutoff
-            for _member, descriptor in opened
+            os.fstat(handle.descriptor).st_mtime >= cutoff
+            for handle in opened
         ):
             return False
-        final_directory_stat = _directory_identity(transaction)
+        final_directory_stat = _directory_identity(
+            transaction,
+            namespace_name=namespace_name,
+        )
         if not (
             initial_directory_stat.st_mtime_ns
             == final_directory_stat.st_mtime_ns
@@ -1104,21 +1539,45 @@ def _remove_recovered_backup_transaction(
             and final_directory_stat.st_mtime < cutoff
         ):
             return False
-        expected_namespace = {
-            TRANSACTION_MANIFEST_NAME,
-            *(member.name for member, _descriptor in opened),
-        }
-        if set(os.listdir(transaction.directory_descriptor)) != (
-            expected_namespace
-        ):
-            raise EncryptedBackupError(
-                "encrypted_backup_transaction_invalid"
+        _validate_recovery_namespace(
+            transaction,
+            namespace_name,
+            opened,
+        )
+        if namespace_name == transaction.manifest.directory_name:
+            quarantine_name = _isolate_recovery_namespace(transaction)
+        else:
+            quarantine_match = QUARANTINE_DIRECTORY.fullmatch(
+                namespace_name
             )
-        _unlink_opened_members(transaction, opened)
+            if (
+                quarantine_match is None
+                or quarantine_match.group(1)
+                != transaction.manifest.transaction_id
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            quarantine_name = namespace_name
+        _validate_recovery_namespace(
+            transaction,
+            quarantine_name,
+            opened,
+        )
+        _remove_isolated_recovery_namespace(
+            transaction,
+            quarantine_name,
+            opened,
+        )
+        removed = True
     finally:
-        for _member, descriptor in opened:
-            os.close(descriptor)
-    _finish_backup_transaction_removal(transaction)
+        if quarantine_name is not None and not removed:
+            _restore_isolated_namespace(
+                transaction,
+                quarantine_name,
+            )
+        for handle in opened:
+            os.close(handle.descriptor)
     return True
 
 
@@ -1163,8 +1622,16 @@ def recover_backup_transaction(
     *,
     cutoff: float,
 ) -> None:
-    if TRANSACTION_DIRECTORY.fullmatch(directory_name) is None:
+    transaction_match = TRANSACTION_DIRECTORY.fullmatch(directory_name)
+    quarantine_match = QUARANTINE_DIRECTORY.fullmatch(directory_name)
+    if transaction_match is None and quarantine_match is None:
         return
+    transaction_id = (
+        transaction_match.group(1)
+        if transaction_match is not None
+        else quarantine_match.group(1)
+    )
+    original_directory_name = f"{TRANSACTION_PREFIX}{transaction_id}"
     destination_descriptor: int | None = None
     directory_descriptor: int | None = None
     manifest_descriptor: int | None = None
@@ -1215,6 +1682,7 @@ def recover_backup_transaction(
             and manifest_stat.st_dev == manifest_path_stat.st_dev
             and manifest_stat.st_ino == manifest_path_stat.st_ino
             and manifest_stat.st_size == TRANSACTION_MANIFEST_BYTES
+            and manifest_stat.st_nlink == 1
             and stat.S_IMODE(manifest_stat.st_mode) == 0o600
             and manifest_stat.st_mtime < cutoff
         ):
@@ -1229,7 +1697,8 @@ def recover_backup_transaction(
             )
         )
         if not (
-            manifest.directory_name == directory_name
+            manifest.directory_name == original_directory_name
+            and manifest.transaction_id == transaction_id
             and manifest.directory_device == directory_stat.st_dev
             and manifest.directory_inode == directory_stat.st_ino
         ):
@@ -1237,7 +1706,7 @@ def recover_backup_transaction(
         transaction = BackupTransaction(
             destination=destination,
             destination_descriptor=destination_descriptor,
-            directory=destination / directory_name,
+            directory=destination / original_directory_name,
             directory_descriptor=directory_descriptor,
             manifest_descriptor=manifest_descriptor,
             manifest=manifest,
@@ -1246,6 +1715,7 @@ def recover_backup_transaction(
             transaction,
             cutoff=cutoff,
             initial_directory_stat=directory_stat,
+            namespace_name=directory_name,
         ):
             return
         close_backup_transaction(transaction, remove=False)
