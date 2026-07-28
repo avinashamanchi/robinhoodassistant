@@ -40,6 +40,9 @@ from trading_assistant.db.models import (
     fill_has_trusted_identity,
     fill_requires_reconciliation,
 )
+from trading_assistant.db.lifecycle_proofs import (
+    augment_lifecycle_detail,
+)
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.risk.breakers import (
     BreakerScope,
@@ -117,6 +120,16 @@ def _audit_reconciliation_mutation(
     result_code: str,
     detail: dict[str, object] | None = None,
 ) -> None:
+    try:
+        normalized_target_id: int | str = int(target_id)
+    except (TypeError, ValueError):
+        normalized_target_id = target_id
+    lifecycle_detail = augment_lifecycle_detail(
+        session,
+        target_type=target_type,
+        target_id=normalized_target_id,
+        detail=detail,
+    )
     persist_sensitive(
         session,
         AuditEvent(
@@ -129,7 +142,11 @@ def _audit_reconciliation_mutation(
         ),
         {
             "reason": reason,
-            "detail_json": json.dumps(detail or {}, sort_keys=True),
+            "detail_json": json.dumps(
+                lifecycle_detail,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
         },
     )
 
@@ -1760,6 +1777,22 @@ class ReconciliationService:
                 )
                 .order_by(RuleGroup.id)
             ).all()
+            session.execute(
+                update(Rule)
+                .where(Rule.id.in_(rule_ids))
+                .values(state="canceled")
+            )
+            session.execute(
+                update(RuleGroup)
+                .where(RuleGroup.id.in_(group_ids))
+                .values(
+                    state="canceled",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    version=RuleGroup.version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
             for rule_id in rule_ids:
                 _audit_reconciliation_mutation(
                     session,
@@ -1782,22 +1815,6 @@ class ReconciliationService:
                     target_id=str(group_id),
                     result_code="canceled",
                 )
-            session.execute(
-                update(Rule)
-                .where(Rule.id.in_(rule_ids))
-                .values(state="canceled")
-            )
-            session.execute(
-                update(RuleGroup)
-                .where(RuleGroup.id.in_(group_ids))
-                .values(
-                    state="canceled",
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    version=RuleGroup.version + 1,
-                    updated_at=datetime.now(timezone.utc),
-                )
-            )
             _commit_reconciliation_mutations(session, actor, reason, request_id)
 
         self.reconcile_unknown(

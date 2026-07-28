@@ -27,6 +27,9 @@ from trading_assistant.db.models import (
     TradePlanRow,
     fill_has_trusted_identity,
 )
+from trading_assistant.db.lifecycle_proofs import (
+    augment_lifecycle_detail,
+)
 from trading_assistant.risk.breakers import (
     BreakerScope,
     trip_in_session,
@@ -256,6 +259,11 @@ def _audit(
     target_id: int,
     result_code: str,
 ) -> None:
+    detail = augment_lifecycle_detail(
+        session,
+        target_type=target_type,
+        target_id=target_id,
+    )
     persist_sensitive(
         session,
         AuditEvent(
@@ -266,7 +274,14 @@ def _audit(
             request_id=request_id,
             result_code=result_code,
         ),
-        {"reason": reason, "detail_json": "{}"},
+        {
+            "reason": reason,
+            "detail_json": json.dumps(
+                detail,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        },
     )
 
 

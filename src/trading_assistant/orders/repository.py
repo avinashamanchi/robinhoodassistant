@@ -27,6 +27,9 @@ from trading_assistant.db.models import (
     RuleGroup,
     fill_has_trusted_identity,
 )
+from trading_assistant.db.lifecycle_proofs import (
+    augment_lifecycle_detail,
+)
 from trading_assistant.risk.breakers import (
     BreakerScope,
     trip_in_session,
@@ -66,21 +69,34 @@ def _audit_order_mutation(
     action: str,
     result_code: str,
     detail: dict[str, object] | None = None,
+    idempotency_key: str = "",
+    latency_ms: int = 0,
 ) -> None:
     event = AuditEvent(
-            actor=actor,
-            action=action,
-            target_type="order",
-            target_id=str(order_id),
-            request_id=request_id,
-            result_code=result_code,
+        actor=actor,
+        action=action,
+        target_type="order",
+        target_id=str(order_id),
+        request_id=request_id,
+        idempotency_key=idempotency_key,
+        result_code=result_code,
+        latency_ms=latency_ms,
     )
     persist_sensitive(
         session,
         event,
         {
             "reason": reason,
-            "detail_json": json.dumps(detail or {}, sort_keys=True),
+            "detail_json": json.dumps(
+                augment_lifecycle_detail(
+                    session,
+                    target_type="order",
+                    target_id=order_id,
+                    detail=detail,
+                ),
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
         },
     )
 
@@ -96,17 +112,28 @@ def _audit_group_mutation(
     result_code: str,
 ) -> None:
     event = AuditEvent(
-            actor=actor,
-            action=action,
-            target_type="rule_group",
-            target_id=str(group_id),
-            request_id=request_id,
-            result_code=result_code,
+        actor=actor,
+        action=action,
+        target_type="rule_group",
+        target_id=str(group_id),
+        request_id=request_id,
+        result_code=result_code,
     )
     persist_sensitive(
         session,
         event,
-        {"reason": reason, "detail_json": "{}"},
+        {
+            "reason": reason,
+            "detail_json": json.dumps(
+                augment_lifecycle_detail(
+                    session,
+                    target_type="rule_group",
+                    target_id=group_id,
+                ),
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        },
     )
 
 
@@ -152,21 +179,16 @@ class OrderRepository:
                 self.session_factory,
             ).write_many(order, {"approval_reason": reason})
             elapsed_ms = round((time.perf_counter() - started) * 1000)
-            event = AuditEvent(
-                    actor=actor,
-                    action="order.approve",
-                    target_type="order",
-                    target_id=str(order_id),
-                    request_id=request_id,
-                    idempotency_key=idempotency_key,
-                    result_code=OrderStatus.APPROVAL_RECORDED.value,
-                    latency_ms=elapsed_ms,
-            )
-            persist_sensitive(
+            _audit_order_mutation(
                 session,
-                event,
-                {"reason": reason, "detail_json": "{}"},
-                session_factory=self.session_factory,
+                order_id=order_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+                action="order.approve",
+                result_code=OrderStatus.APPROVAL_RECORDED.value,
+                idempotency_key=idempotency_key,
+                latency_ms=elapsed_ms,
             )
             session.commit()
             return True

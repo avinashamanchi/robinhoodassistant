@@ -55,6 +55,7 @@ from .db.models import (
     fill_has_trusted_identity,
     utcnow,
 )
+from .db.lifecycle_proofs import augment_lifecycle_detail_json
 from .dependencies import RequiredDependencyUnavailable
 from .orders.application import (
     ApprovalCommand,
@@ -128,7 +129,15 @@ def _persist_audit(
     result_code: str,
     detail_json: str = "{}",
     created_at=None,
+    lifecycle_proof: bool = True,
 ) -> AuditEvent:
+    if lifecycle_proof:
+        detail_json = augment_lifecycle_detail_json(
+            session,
+            target_type=target_type,
+            target_id=target_id,
+            detail_json=detail_json,
+        )
     event = AuditEvent(
         actor=actor,
         action=action,
@@ -266,6 +275,7 @@ class TradingService:
                     reason=reason,
                     result_code="dependency_unavailable",
                     detail_json=json.dumps(detail, sort_keys=True),
+                    lifecycle_proof=False,
             )
             session.commit()
 

@@ -27,6 +27,9 @@ from trading_assistant.db.models import (
     TradePlanRow,
     utcnow,
 )
+from trading_assistant.db.lifecycle_proofs import (
+    augment_lifecycle_detail_json,
+)
 from trading_assistant.risk.submission_barrier import (
     serialized_writer,
 )
@@ -64,6 +67,12 @@ def _audit(
     detail_json: str = "{}",
     created_at=None,
 ) -> None:
+    detail_json = augment_lifecycle_detail_json(
+        session,
+        target_type=target_type,
+        target_id=target_id,
+        detail_json=detail_json,
+    )
     persist_sensitive(
         session,
         AuditEvent(

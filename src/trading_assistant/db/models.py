@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 from typing import Optional
 
 from sqlalchemy import (
@@ -1214,6 +1215,7 @@ def approve_proposed(
             f"order {order_id} was not in PROPOSED state (already decided?)"
         )
     from ..security.sensitive_fields import persist_sensitive
+    from .lifecycle_proofs import augment_lifecycle_detail
 
     order = session.get(Order, order_id)
     if order is None:
@@ -1234,5 +1236,16 @@ def approve_proposed(
             idempotency_key=idempotency_key,
             result_code=OrderStatus.APPROVAL_RECORDED.value,
         ),
-        {"reason": reason, "detail_json": "{}"},
+        {
+            "reason": reason,
+            "detail_json": json.dumps(
+                augment_lifecycle_detail(
+                    session,
+                    target_type="order",
+                    target_id=order_id,
+                ),
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        },
     )
