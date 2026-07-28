@@ -33,6 +33,9 @@ from trading_assistant.broker.models import (
     Position,
 )
 from trading_assistant.config import Secrets, TradingMode
+from trading_assistant.db.lifecycle_proofs import (
+    lifecycle_proof_matches,
+)
 from trading_assistant.db.models import (
     AuditEvent,
     FILL_RECONCILIATION_REQUIRED,
@@ -852,6 +855,133 @@ def test_reconciliation_commit_activates_exits_without_a_second_service_step(
         Decimal(json.loads(rule.action_json)["qty"])
         for rule in exits
     } == {qty}
+
+
+@pytest.mark.parametrize("audit_failure", [False, True])
+def test_untrusted_plan_fill_refreshes_every_changed_group_proof_atomically(
+    make_service,
+    audit_failure,
+):
+    broker = _FillAwareBroker()
+    service = make_service(broker=broker)
+    planning = _planning(service)
+    plan_id = _analyze(planning, "untrusted group proof")["plan_id"]
+    _approve(
+        planning,
+        plan_id,
+        actor="operator:test",
+        reason="review untrusted group proof",
+        request_id="planning-untrusted-group-proof-approval",
+    )
+    broker.set_price("AAPL", Decimal("98"))
+    proposal = _plan_worker(service).tick(
+        actor="daemon:test",
+        reason="create plan order for untrusted fill proof",
+        request_id="planning-untrusted-group-proof-proposal",
+    )[0].proposal
+    assert proposal is not None
+    with service.session_factory() as session:
+        group_ids = tuple(
+            session.scalars(
+                select(Rule.group_id)
+                .where(Rule.plan_id == plan_id)
+                .distinct()
+                .order_by(Rule.group_id)
+            ).all()
+        )
+        assert group_ids
+        assert all(
+            lifecycle_proof_matches(
+                session,
+                service.session_factory,
+                target_type="rule_group",
+                target_id=group_id,
+            )
+            for group_id in group_ids
+        )
+        order = session.get(Order, proposal["order_id"])
+        session.add(
+            Fill(
+                order_id=order.id,
+                ticker=order.ticker,
+                side=order.side,
+                qty=Decimal("1"),
+                price=Decimal("98"),
+                broker_fill_id=None,
+                filled_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    request_id = "planning-untrusted-group-proof-reconcile"
+    listener = _fail_audit_action(
+        "rule_group.reconciliation_required"
+    )
+    session_type = service.session_factory.class_
+    if audit_failure:
+        event.listen(session_type, "before_flush", listener)
+    try:
+        if audit_failure:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "injected rule_group.reconciliation_required "
+                    "audit failure"
+                ),
+            ):
+                service.rule_repository.refresh_fill_activated_rules(
+                    now=datetime.now(timezone.utc),
+                    actor="daemon:test",
+                    reason=(
+                        "rollback untrusted plan fill proof failure"
+                    ),
+                    request_id=request_id,
+                )
+        else:
+            service.rule_repository.refresh_fill_activated_rules(
+                now=datetime.now(timezone.utc),
+                actor="daemon:test",
+                reason=(
+                    "latch untrusted plan fill with exact group proof"
+                ),
+                request_id=request_id,
+            )
+    finally:
+        if audit_failure:
+            event.remove(session_type, "before_flush", listener)
+
+    with service.session_factory() as session:
+        groups = [
+            session.get(RuleGroup, group_id)
+            for group_id in group_ids
+        ]
+        audits = list(
+            session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.request_id == request_id,
+                    AuditEvent.action
+                    == "rule_group.reconciliation_required",
+                )
+                .order_by(AuditEvent.target_id)
+            )
+        )
+        assert all(
+            group.reconciliation_required is (not audit_failure)
+            for group in groups
+        )
+        assert [int(audit.target_id) for audit in audits] == (
+            [] if audit_failure else list(group_ids)
+        )
+        assert all(
+            lifecycle_proof_matches(
+                session,
+                service.session_factory,
+                target_type="rule_group",
+                target_id=group_id,
+            )
+            for group_id in group_ids
+        )
 
 
 def _multi_target_plan() -> TradePlan:

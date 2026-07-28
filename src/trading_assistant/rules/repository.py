@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 
 from sqlalchemy import exists, or_, select, update
@@ -56,6 +56,10 @@ class RuleGroupLease:
     owner: str
     expires_at: datetime
     version: int
+
+
+class RuleLeaseChronologyError(ValueError):
+    """The caller's clock sample predates durable group state."""
 
 
 @dataclass(frozen=True)
@@ -248,6 +252,18 @@ def _require_context(
     return actor, reason, request_id
 
 
+def _require_aware_utc_lease_now(value: object) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("rule lease now must be timezone-aware")
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, TypeError, ValueError):
+        offset = None
+    if offset is None:
+        raise ValueError("rule lease now must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
 def _audit(
     session: Session,
     *,
@@ -344,6 +360,33 @@ def _set_group_state(
         target_type="rule_group",
         target_id=group.id,
         result_code=state.value,
+    )
+    return True
+
+
+def _set_group_reconciliation_required(
+    session: Session,
+    group: RuleGroup,
+    required: bool,
+    *,
+    now: datetime,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> bool:
+    if group.reconciliation_required == required:
+        return False
+    group.reconciliation_required = required
+    group.updated_at = now
+    _audit(
+        session,
+        actor=actor,
+        reason=reason,
+        request_id=request_id,
+        action="rule_group.reconciliation_required",
+        target_type="rule_group",
+        target_id=group.id,
+        result_code="required" if required else "cleared",
     )
     return True
 
@@ -489,8 +532,15 @@ def reconcile_plan_lifecycle_in_session(
                 )
             )
             for group in groups.values():
-                group.reconciliation_required = True
-                group.updated_at = now
+                _set_group_reconciliation_required(
+                    session,
+                    group,
+                    True,
+                    now=now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
             trip_in_session(
                 session,
                 BreakerScope.broker_drift(),
@@ -725,8 +775,14 @@ def reconcile_plan_lifecycle_in_session(
                 ):
                     rules_activated += 1
                 group = groups[rule.group_id]
-                group.reconciliation_required = (
-                    plan_reconciliation_required
+                _set_group_reconciliation_required(
+                    session,
+                    group,
+                    plan_reconciliation_required,
+                    now=now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
                 )
                 _set_group_state(
                     session,
@@ -1571,10 +1627,34 @@ class RuleRepository:
         actor, reason, request_id = _require_context(
             actor, reason, request_id
         )
-        if ttl <= timedelta(0):
+        normalized_now = _require_aware_utc_lease_now(now)
+        if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
             raise ValueError("rule lease ttl must be positive")
-        expires_at = now + ttl
+        try:
+            expires_at = normalized_now + ttl
+        except (OverflowError, TypeError):
+            raise ValueError("rule lease ttl is invalid") from None
+        if expires_at <= normalized_now:
+            raise ValueError("rule lease expiry must follow now")
         with self.session_factory() as session:
+            group = session.get(RuleGroup, group_id)
+            if group is None:
+                session.rollback()
+                return None
+            created_at = _require_aware_utc_lease_now(
+                group.created_at
+            )
+            updated_at = _require_aware_utc_lease_now(
+                group.updated_at
+            )
+            if (
+                normalized_now < created_at
+                or normalized_now < updated_at
+            ):
+                session.rollback()
+                raise RuleLeaseChronologyError(
+                    "rule lease now precedes durable group state"
+                )
             unresolved = exists(
                 select(Order.id)
                 .join(Proposal, Proposal.order_id == Order.id)
@@ -1592,12 +1672,14 @@ class RuleRepository:
                 update(RuleGroup)
                 .where(
                     RuleGroup.id == group_id,
+                    RuleGroup.created_at <= normalized_now,
+                    RuleGroup.updated_at <= normalized_now,
                     RuleGroup.reconciliation_required.is_(False),
                     unresolved,
                 )
                 .values(
                     reconciliation_required=True,
-                    updated_at=now,
+                    updated_at=normalized_now,
                 )
             )
             if latch.rowcount:
@@ -1615,18 +1697,20 @@ class RuleRepository:
                 update(RuleGroup)
                 .where(
                     RuleGroup.id == group_id,
+                    RuleGroup.created_at <= normalized_now,
+                    RuleGroup.updated_at <= normalized_now,
                     RuleGroup.state == RuleState.ACTIVE.value,
                     RuleGroup.reconciliation_required.is_(False),
                     or_(
                         RuleGroup.lease_expires_at.is_(None),
-                        RuleGroup.lease_expires_at <= now,
+                        RuleGroup.lease_expires_at <= normalized_now,
                     ),
                 )
                 .values(
                     lease_owner=self.owner,
                     lease_expires_at=expires_at,
                     version=RuleGroup.version + 1,
-                    updated_at=now,
+                    updated_at=normalized_now,
                 )
                 .returning(RuleGroup.version)
             ).scalar_one_or_none()

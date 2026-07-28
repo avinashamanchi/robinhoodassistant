@@ -29,7 +29,11 @@ from .models import (
     TimeCondition,
     TrailingCondition,
 )
-from .repository import RuleRepository, StoredRule
+from .repository import (
+    RuleLeaseChronologyError,
+    RuleRepository,
+    StoredRule,
+)
 
 log = logging.getLogger(__name__)
 
@@ -99,13 +103,19 @@ class RuleWorker:
         )
         for group_id in self.repository.active_group_ids():
             tick_now = self.now()
-            lease = self.repository.lease_group(
-                group_id,
-                now=tick_now,
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-            )
+            try:
+                lease = self.repository.lease_group(
+                    group_id,
+                    now=tick_now,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            except RuleLeaseChronologyError:
+                # Another serialized writer advanced the group after this
+                # worker sampled its clock. Treat that stale sample exactly
+                # like a lost lease and evaluate nothing.
+                continue
             if lease is None:
                 continue
             try:

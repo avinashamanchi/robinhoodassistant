@@ -71,7 +71,11 @@ def _command(
 def _seed_group(session_factory, *commands: RuleCommand) -> tuple[int, list[int]]:
     assert commands
     with session_factory() as session:
-        group = RuleGroup(group_key=commands[0].group_key)
+        group = RuleGroup(
+            group_key=commands[0].group_key,
+            created_at=NOW - timedelta(minutes=1),
+            updated_at=NOW - timedelta(minutes=1),
+        )
         session.add(group)
         session.flush()
         rule_ids = []
@@ -88,6 +92,7 @@ def _seed_group(session_factory, *commands: RuleCommand) -> tuple[int, list[int]
                 pre_approved=command.pre_approved,
                 fraction=command.fraction,
                 hwm=command.high_water_mark,
+                created_at=NOW - timedelta(minutes=1),
             )
             session.add(rule)
             session.flush()
@@ -116,6 +121,162 @@ def test_two_workers_cannot_lease_sibling_rules(session_factory, seeded_oco_grou
     assert repo_b.lease_group(
         seeded_oco_group, now=NOW, **DEFAULT_RULE_CONTEXT
     ) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [NOW.replace(tzinfo=None), "not-a-datetime"],
+)
+def test_lease_group_rejects_non_aware_or_invalid_now_before_mutation(
+    session_factory,
+    seeded_oco_group,
+    invalid_now,
+):
+    repository = RuleRepository(session_factory, owner="worker-a")
+
+    with pytest.raises(
+        ValueError,
+        match="rule lease now must be timezone-aware",
+    ):
+        repository.lease_group(
+            seeded_oco_group,
+            now=invalid_now,
+            **DEFAULT_RULE_CONTEXT,
+        )
+
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        assert group.version == 0
+        assert group.lease_owner is None
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == DEFAULT_RULE_CONTEXT["request_id"]
+            )
+        ) == 0
+
+
+def test_lease_group_rejects_now_before_group_creation(
+    session_factory,
+    seeded_oco_group,
+):
+    repository = RuleRepository(session_factory, owner="worker-a")
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        group.created_at = NOW
+        group.updated_at = NOW
+        session.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="rule lease now precedes durable group state",
+    ):
+        repository.lease_group(
+            seeded_oco_group,
+            now=NOW - timedelta(microseconds=1),
+            **DEFAULT_RULE_CONTEXT,
+        )
+
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        assert group.created_at == NOW
+        assert group.updated_at == NOW
+        assert group.version == 0
+        assert group.lease_owner is None
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == DEFAULT_RULE_CONTEXT["request_id"]
+            )
+        ) == 0
+
+
+def test_backdated_lease_cannot_set_reconciliation_latch_before_rejection(
+    session_factory,
+    seeded_oco_group,
+):
+    repository = RuleRepository(session_factory, owner="worker-a")
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        group.updated_at = NOW + timedelta(seconds=1)
+        order = persist_sensitive(
+            session,
+            Order(
+                idempotency_key="backdated-lease-unresolved-order",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                notional=Decimal("100"),
+                status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
+            ),
+            {"approval_reason": "backdated lease fixture"},
+        )
+        persist_sensitive(
+            session,
+            Proposal(
+                order_id=order.id,
+                source_rule_group_id=seeded_oco_group,
+                expires_at=NOW + timedelta(minutes=15),
+            ),
+            {"reasoning": "backdated lease unresolved fixture"},
+        )
+        session.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="rule lease now precedes durable group state",
+    ):
+        repository.lease_group(
+            seeded_oco_group,
+            now=NOW,
+            **DEFAULT_RULE_CONTEXT,
+        )
+
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        assert group.updated_at == NOW + timedelta(seconds=1)
+        assert group.reconciliation_required is False
+        assert group.version == 0
+        assert group.lease_owner is None
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == DEFAULT_RULE_CONTEXT["request_id"]
+            )
+        ) == 0
+
+
+def test_lease_group_accepts_equal_time_and_normalizes_offset_to_utc(
+    session_factory,
+    seeded_oco_group,
+):
+    repository = RuleRepository(session_factory, owner="worker-a")
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        group.created_at = NOW
+        group.updated_at = NOW
+        session.commit()
+    offset_now = NOW.astimezone(timezone(timedelta(hours=-4)))
+
+    lease = repository.lease_group(
+        seeded_oco_group,
+        now=offset_now,
+        **DEFAULT_RULE_CONTEXT,
+    )
+
+    assert lease is not None
+    assert lease.expires_at == NOW + timedelta(seconds=30)
+    assert lease.expires_at.utcoffset() == timedelta(0)
+    with session_factory() as session:
+        group = session.get(RuleGroup, seeded_oco_group)
+        assert group.updated_at == NOW
+        assert group.lease_expires_at == NOW + timedelta(seconds=30)
 
 
 def test_expired_lease_can_be_recovered_with_a_new_owner(
@@ -499,8 +660,10 @@ def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
         reason="rule lease acceptance recovery",
         request_id="rule-lease-recovery",
     ) == (1, ())
+    with svc.session_factory() as session:
+        recovery_now = session.get(RuleGroup, group_id).updated_at
     assert recovering.lease_group(
-        group_id, now=NOW, **DEFAULT_RULE_CONTEXT
+        group_id, now=recovery_now, **DEFAULT_RULE_CONTEXT
     ) is not None
     with svc.session_factory() as session:
         assert session.get(RuleGroup, group_id).reconciliation_required is False

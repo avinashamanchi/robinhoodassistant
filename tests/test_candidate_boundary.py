@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from trading_assistant.assets import AssetClass
 from trading_assistant.app.main import create_app
 from trading_assistant.app.limits import InterlockDecision
+from trading_assistant.broker.mock import MockBroker
 from trading_assistant.db.models import (
     AuditEvent,
     CandidateNonce,
@@ -31,7 +32,15 @@ from trading_assistant.db.models import (
     RuleGroup,
     approve_proposed,
 )
-from trading_assistant.broker.models import OrderResult, OrderStatus
+from trading_assistant.broker.models import (
+    BrokerFill,
+    OrderResult,
+    OrderStatus,
+)
+from trading_assistant.db.lifecycle_proofs import (
+    lifecycle_proof_matches,
+)
+from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import BreakerTripIntent, RiskResult
@@ -48,6 +57,21 @@ ACTOR = "operator:local"
 REASON = "operator explicitly queued this candidate"
 REQUEST_ID = "candidate-boundary-request"
 IDEMPOTENCY_KEY = "candidate-boundary-once"
+
+
+class _CandidateActivityBroker(MockBroker):
+    def __init__(self) -> None:
+        super().__init__(now=lambda: NOW)
+        self.activities: list[BrokerFill] = []
+        self.fail_status_for: str | None = None
+
+    def get_fill_activities(self, after=None):
+        return list(self.activities)
+
+    def get_order_status(self, order_id: str) -> OrderResult:
+        if order_id == self.fail_status_for:
+            raise ConnectionError("synthetic status dependency failure")
+        return super().get_order_status(order_id)
 
 
 def _candidate_api():
@@ -303,6 +327,69 @@ def _reconcile_candidate_order_terminal(
         reason=f"reconcile candidate order to {status.value}",
         request_id=f"candidate-order-reconcile-{status.value}",
     )
+
+
+def _stage_late_candidate_fill(
+    service,
+    broker: _CandidateActivityBroker,
+    order_id: int,
+    *,
+    broker_fill_id: str,
+) -> None:
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        broker.activities = [
+            BrokerFill(
+                broker_fill_id=broker_fill_id,
+                broker_order_id=order.broker_order_id,
+                ticker=order.ticker,
+                side=order.side,
+                qty=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=NOW + timedelta(seconds=4),
+            )
+        ]
+
+
+def _assert_exact_parent_fill_proof(
+    service,
+    order_id: int,
+    *,
+    request_id: str,
+    broker_fill_id: str,
+) -> None:
+    with service.session_factory() as session:
+        audits = list(
+            session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "order.fill_reconcile",
+                    AuditEvent.target_type == "order",
+                    AuditEvent.target_id == str(order_id),
+                    AuditEvent.request_id == request_id,
+                )
+            )
+        )
+        assert len(audits) == 1
+        detail = json.loads(
+            sensitive_store(session).read(
+                audits[0],
+                "detail_json",
+            )
+        )
+        proof = detail["lifecycle_proof"]
+        fills = proof["snapshot"]["fills"]
+        assert proof["target_type"] == "order"
+        assert proof["target_id"] == order_id
+        assert len(fills) == 1
+        assert fills[0]["order_id"] == order_id
+        assert fills[0]["broker_fill_id"] == broker_fill_id
+        assert fills[0]["reconciliation_state"] == "trusted"
+        assert lifecycle_proof_matches(
+            session,
+            service.session_factory,
+            target_type="order",
+            target_id=order_id,
+        )
 
 
 def _trigger_candidate_rule(
@@ -1352,6 +1439,140 @@ def test_order_receipt_accepts_real_reconciled_terminal_with_submitted_acceptanc
         assert order.version == 4
 
 
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_terminal_late_fill_refreshes_one_complete_parent_order_proof(
+    make_service,
+    receipt_state,
+):
+    broker = _CandidateActivityBroker()
+    envelope, service, signer, binding = _order_envelope(
+        make_service,
+        service=_service_at(make_service, broker=broker),
+    )
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    _reconcile_candidate_order_terminal(
+        service,
+        first.target_id,
+        OrderStatus.CANCELED,
+    )
+    fill_id = f"late-terminal-{receipt_state}"
+    request_id = f"candidate-late-fill-{receipt_state}"
+    _stage_late_candidate_fill(
+        service,
+        broker,
+        first.target_id,
+        broker_fill_id=fill_id,
+    )
+
+    first_reconcile = service.reconciliation.reconcile(
+        actor=ACTOR,
+        reason="persist terminal late fill with parent proof",
+        request_id=request_id,
+    )
+    replay_reconcile = service.reconciliation.reconcile(
+        actor=ACTOR,
+        reason="replay terminal late fill without duplicate proof",
+        request_id=request_id,
+    )
+
+    assert first_reconcile.inserted_fills == 1
+    assert first_reconcile.synced_orders == 0
+    assert replay_reconcile.inserted_fills == 0
+    assert replay_reconcile.synced_orders == 0
+    _assert_exact_parent_fill_proof(
+        service,
+        first.target_id,
+        request_id=request_id,
+        broker_fill_id=fill_id,
+    )
+    assert _queue_order(queue, envelope, binding) == first
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["between_fill_and_status", "status_dependency"],
+)
+def test_late_fill_parent_proof_survives_later_reconciliation_phase_failure(
+    make_service,
+    monkeypatch,
+    receipt_state,
+    failure_phase,
+):
+    broker = _CandidateActivityBroker()
+    envelope, service, signer, binding = _order_envelope(
+        make_service,
+        service=_service_at(make_service, broker=broker),
+    )
+    queue = _queue(service, signer)
+    first = _queue_order(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    _reconcile_candidate_order_terminal(
+        service,
+        first.target_id,
+        OrderStatus.CANCELED,
+    )
+    fill_id = f"late-{failure_phase}-{receipt_state}"
+    request_id = f"candidate-{failure_phase}-{receipt_state}"
+    _stage_late_candidate_fill(
+        service,
+        broker,
+        first.target_id,
+        broker_fill_id=fill_id,
+    )
+
+    if failure_phase == "between_fill_and_status":
+        def fail_between_phases(*args, **kwargs):
+            raise RuntimeError("synthetic inter-phase crash")
+
+        monkeypatch.setattr(
+            service.reconciliation,
+            "_reconcile_statuses",
+            fail_between_phases,
+        )
+        expected_error = RuntimeError
+        expected_message = "synthetic inter-phase crash"
+    else:
+        with service.session_factory() as session:
+            unrelated = Order(
+                idempotency_key=f"status-failure-{receipt_state}",
+                ticker="MSFT",
+                side="buy",
+                order_type="market",
+                notional=Decimal("10"),
+                status=OrderStatus.SUBMITTED.value,
+                broker_order_id=f"status-failure-{receipt_state}",
+                acceptance_state=OrderStatus.SUBMITTED.value,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            sensitive_store(session).write_many(
+                unrelated,
+                {"approval_reason": "synthetic status dependency fixture"},
+            )
+            session.commit()
+        broker.fail_status_for = f"status-failure-{receipt_state}"
+        expected_error = RequiredDependencyUnavailable
+        expected_message = None
+
+    with pytest.raises(expected_error, match=expected_message):
+        service.reconciliation.reconcile(
+            actor=ACTOR,
+            reason="prove committed fill proof survives later phase failure",
+            request_id=request_id,
+        )
+
+    _assert_exact_parent_fill_proof(
+        service,
+        first.target_id,
+        request_id=request_id,
+        broker_fill_id=fill_id,
+    )
+    assert _queue_order(queue, envelope, binding) == first
+
+
 def test_order_replay_never_decrypts_proposal_reasoning(
     make_service,
     monkeypatch,
@@ -2218,6 +2439,50 @@ def test_rule_receipt_accepts_terminal_reconciliation_latch_from_linked_order(
         assert group.state == RuleState.TRIGGERED.value
         assert group.version == 2
         assert group.reconciliation_required is True
+
+
+@pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])
+def test_rule_receipt_backdated_lease_is_rejected_before_mutation_or_proof(
+    make_service,
+    receipt_state,
+):
+    envelope, service, signer, binding = _rule_envelope(make_service)
+    queue = _queue(service, signer)
+    first = _queue_rule(queue, envelope, binding)
+    _set_receipt_recovery_mode(service, receipt_state)
+    with service.session_factory() as session:
+        rule = session.get(Rule, first.target_id)
+        group = session.get(RuleGroup, rule.group_id)
+        group_id = group.id
+        backdated = group.created_at - timedelta(microseconds=1)
+
+    with pytest.raises(
+        ValueError,
+        match="rule lease now precedes durable group state",
+    ):
+        service.rule_repository.lease_group(
+            group_id,
+            now=backdated,
+            actor=ACTOR,
+            reason="reject backdated candidate rule lease",
+            request_id=f"candidate-backdated-lease-{receipt_state}",
+        )
+
+    with service.session_factory() as session:
+        group = session.get(RuleGroup, group_id)
+        assert group.state == RuleState.ACTIVE.value
+        assert group.version == 0
+        assert group.lease_owner is None
+        assert group.lease_expires_at is None
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.request_id
+                == f"candidate-backdated-lease-{receipt_state}"
+            )
+        ) == 0
+    assert _queue_rule(queue, envelope, binding) == first
 
 
 @pytest.mark.parametrize("receipt_state", ["completed", "target_persisted"])

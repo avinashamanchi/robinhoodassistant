@@ -427,6 +427,7 @@ def _rule_command(group_key: str, *, price="101") -> dict:
 def _group_with_rule(service, key: str) -> tuple[int, int]:
     rule_id = service.rule_application.create_rule(
         _rule_command(key),
+        now=NOW,
         **MUTATION,
     )
     with service.session_factory() as session:

@@ -139,6 +139,7 @@ class RuleApplicationService:
         reason: str,
         request_id: str,
         plan_id: int | None = None,
+        now: datetime | None = None,
     ) -> int:
         with self.service.session_factory() as session:
             rows = self.persist_commands(
@@ -148,6 +149,7 @@ class RuleApplicationService:
                 reason=reason,
                 request_id=request_id,
                 plan_id=plan_id,
+                now=now,
             )
             session.commit()
             return rows[0].id
@@ -161,6 +163,7 @@ class RuleApplicationService:
         reason: str,
         request_id: str,
         plan_id: int | None = None,
+        now: datetime | None = None,
     ) -> list[Rule]:
         actor = actor.strip()
         reason = reason.strip()
@@ -170,6 +173,16 @@ class RuleApplicationService:
                 "rule persistence actor, reason, and request_id "
                 "must be non-empty"
             )
+        observed_at = now or utcnow()
+        if (
+            not isinstance(observed_at, datetime)
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+        ):
+            raise ValueError(
+                "rule persistence now must be timezone-aware"
+            )
+        observed_at = observed_at.astimezone(timezone.utc)
         validated = [self._validated(command) for command in commands]
         if not validated:
             return []
@@ -202,6 +215,8 @@ class RuleApplicationService:
                     group = RuleGroup(
                         group_key=group_key,
                         state=desired_group_state,
+                        created_at=observed_at,
+                        updated_at=observed_at,
                     )
                     session.add(group)
                     session.flush()
@@ -214,6 +229,7 @@ class RuleApplicationService:
                             request_id=request_id,
                             reason=reason,
                             result_code=group.state,
+                            created_at=observed_at,
                     )
                 elif (
                     command.activation == "immediate"
@@ -290,6 +306,7 @@ class RuleApplicationService:
                 pre_approved=command.pre_approved,
                 activation=command.activation,
                 terminal_on_trigger=command.terminal_on_trigger,
+                created_at=observed_at,
             )
             session.add(row)
             session.flush()
@@ -302,6 +319,7 @@ class RuleApplicationService:
                     request_id=request_id,
                     reason=reason,
                     result_code=row.state,
+                    created_at=observed_at,
             )
             rows.append(row)
         return rows

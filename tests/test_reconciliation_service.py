@@ -21,6 +21,9 @@ from trading_assistant.broker.models import (
     Position,
 )
 from trading_assistant.db import models as db_models
+from trading_assistant.db.lifecycle_proofs import (
+    lifecycle_proof_matches,
+)
 from trading_assistant.db.models import (
     FILL_RECONCILIATION_QUARANTINED,
     FILL_RECONCILIATION_REQUIRED,
@@ -1810,6 +1813,154 @@ class ActivityBroker(MockBroker):
         return list(self.activities)
 
 
+@pytest.mark.parametrize(
+    "mutation_kind",
+    ("insert", "promote", "supersede", "delete_synthetic"),
+)
+def test_each_fill_mutation_batch_refreshes_one_complete_parent_order_proof(
+    make_service,
+    monkeypatch,
+    mutation_kind,
+):
+    broker = ActivityBroker()
+    service = make_service(broker=broker)
+    observed_at = utcnow()
+    broker_order_id = f"proof-fill-{mutation_kind}"
+    exact_fill_id = f"proof-exact-{mutation_kind}"
+    with service.session_factory() as session:
+        order = _persist_order(
+            session,
+            Order(
+                idempotency_key=f"proof-client-{mutation_kind}",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                qty=Decimal("1"),
+                status=OrderStatus.CANCELED.value,
+                broker_order_id=broker_order_id,
+                acceptance_state="accepted",
+                created_at=observed_at - timedelta(minutes=1),
+                updated_at=observed_at - timedelta(minutes=1),
+            ),
+        )
+        session.flush()
+        if mutation_kind == "promote":
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id=exact_fill_id,
+                    reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
+                    filled_at=observed_at - timedelta(seconds=30),
+                )
+            )
+        elif mutation_kind == "supersede":
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id="proof-legacy-superseded",
+                    reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
+                    filled_at=observed_at - timedelta(seconds=30),
+                )
+            )
+        elif mutation_kind == "delete_synthetic":
+            session.add(
+                Fill(
+                    order_id=order.id,
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("1"),
+                    price=Decimal("100"),
+                    broker_fill_id=f"{broker_order_id}:1",
+                    filled_at=observed_at - timedelta(seconds=30),
+                )
+            )
+        session.commit()
+        order_id = order.id
+
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id=exact_fill_id,
+            broker_order_id=broker_order_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            filled_at=observed_at,
+        )
+    ]
+    context = _mutation(f"proof fill batch {mutation_kind}")
+
+    def fail_after_fill_phase(*args, **kwargs):
+        raise RuntimeError("synthetic status phase failure")
+
+    monkeypatch.setattr(
+        service.reconciliation,
+        "_reconcile_statuses",
+        fail_after_fill_phase,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic status phase failure",
+    ):
+        service.reconciliation.reconcile(**context)
+
+    with service.session_factory() as session:
+        parent_audits = list(
+            session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "order.fill_reconcile",
+                    AuditEvent.target_type == "order",
+                    AuditEvent.target_id == str(order_id),
+                    AuditEvent.request_id == context["request_id"],
+                )
+            )
+        )
+        fills = list(
+            session.scalars(
+                select(Fill)
+                .where(Fill.order_id == order_id)
+                .order_by(Fill.id)
+            )
+        )
+        assert len(parent_audits) == 1
+        assert lifecycle_proof_matches(
+            session,
+            service.session_factory,
+            target_type="order",
+            target_id=order_id,
+        )
+        assert [
+            (fill.broker_fill_id, fill.reconciliation_state)
+            for fill in fills
+        ] == (
+            [
+                (
+                    exact_fill_id,
+                    "trusted",
+                )
+            ]
+            if mutation_kind in {"insert", "promote", "delete_synthetic"}
+            else [
+                (
+                    "proof-legacy-superseded",
+                    "superseded",
+                ),
+                (
+                    exact_fill_id,
+                    "trusted",
+                ),
+            ]
+        )
+
+
 def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
     make_service,
 ):
@@ -1881,8 +2032,13 @@ def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
     }
 
 
+@pytest.mark.parametrize(
+    "failed_action",
+    ("fill.reconcile", "order.fill_reconcile"),
+)
 def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
     make_service,
+    failed_action,
 ):
     broker = ActivityBroker()
     service = make_service(broker=broker)
@@ -1902,13 +2058,13 @@ def test_fill_and_cursor_mutations_roll_back_when_audit_flush_fails(
             )
         ]
 
-    listener = _audit_failure_listener("fill.reconcile")
+    listener = _audit_failure_listener(failed_action)
     session_type = service.session_factory.class_
     event.listen(session_type, "before_flush", listener)
     try:
         with pytest.raises(
             RuntimeError,
-            match="injected fill.reconcile audit failure",
+            match=f"injected {failed_action} audit failure",
         ):
             service.reconciliation.reconcile(
                 actor="operator:fill-rollback",

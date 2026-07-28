@@ -161,6 +161,7 @@ def _changed_columns(row: object) -> list[str]:
 
 _RECONCILIATION_CONTEXT = "reconciliation_mutation_context"
 _PENDING_RECONCILIATION_AUDITS = "pending_reconciliation_audits"
+_PENDING_PARENT_ORDER_PROOFS = "pending_reconciliation_parent_order_proofs"
 
 
 def _bind_reconciliation_context(
@@ -170,6 +171,23 @@ def _bind_reconciliation_context(
     request_id: str,
 ) -> None:
     session.info[_RECONCILIATION_CONTEXT] = (actor, reason, request_id)
+
+
+def _fill_parent_order_ids(fill: Fill) -> set[int]:
+    """Return every parent whose fill snapshot changes in this flush."""
+    candidates: set[object] = {fill.order_id}
+    history = sa_inspect(fill).attrs.order_id.history
+    candidates.update(history.added)
+    candidates.update(history.deleted)
+    return {
+        candidate
+        for candidate in candidates
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate > 0
+        )
+    }
 
 
 @event.listens_for(Session, "before_flush")
@@ -186,8 +204,10 @@ def _audit_reconciliation_flush(
     pending: list[
         tuple[object, str, str, str, dict[str, object]]
     ] = []
+    parent_order_ids: set[int] = set()
     for row in list(session.new):
         if isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
             pending.append(
                 (
                     row,
@@ -222,6 +242,7 @@ def _audit_reconciliation_flush(
                 )
             )
         elif isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
             pending.append(
                 (
                     row,
@@ -243,6 +264,7 @@ def _audit_reconciliation_flush(
             )
     for row in list(session.deleted):
         if isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
             pending.append(
                 (
                     row,
@@ -257,6 +279,11 @@ def _audit_reconciliation_flush(
         [],
     )
     audit_queue.extend(pending)
+    proof_queue = session.info.setdefault(
+        _PENDING_PARENT_ORDER_PROOFS,
+        set(),
+    )
+    proof_queue.update(parent_order_ids)
 
 
 def _persist_pending_reconciliation_audits(
@@ -267,6 +294,18 @@ def _persist_pending_reconciliation_audits(
     request_id: str,
 ) -> None:
     pending = session.info.pop(_PENDING_RECONCILIATION_AUDITS, [])
+    parent_order_ids = set(
+        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, set())
+    )
+    directly_audited_order_ids = {
+        row.id
+        for row, _action, target_type, _result_code, _detail in pending
+        if (
+            target_type == "order"
+            and isinstance(row, Order)
+            and isinstance(row.id, int)
+        )
+    }
     for row, action, target_type, result_code, detail in pending:
         if isinstance(row, ReconciliationCursor):
             target_id = f"{row.broker}:{row.stream}"
@@ -284,6 +323,20 @@ def _persist_pending_reconciliation_audits(
             target_id=target_id,
             result_code=result_code,
             detail=detail,
+        )
+    for order_id in sorted(
+        parent_order_ids - directly_audited_order_ids
+    ):
+        _audit_reconciliation_mutation(
+            session,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            action="order.fill_reconcile",
+            target_type="order",
+            target_id=str(order_id),
+            result_code="fills_reconciled",
+            detail={"changed_fields": ["fills"]},
         )
 
 
@@ -318,6 +371,7 @@ def _commit_reconciliation_mutations(
     finally:
         session.info.pop(_RECONCILIATION_CONTEXT, None)
         session.info.pop(_PENDING_RECONCILIATION_AUDITS, None)
+        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, None)
 
 
 @dataclass(frozen=True)

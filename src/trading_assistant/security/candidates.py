@@ -1581,6 +1581,7 @@ class CandidateQueueService:
                 actor=actor,
                 reason=reason,
                 request_id=request_id,
+                now=now,
             )[0]
             for warning in risk.warnings:
                 persist_sensitive(
