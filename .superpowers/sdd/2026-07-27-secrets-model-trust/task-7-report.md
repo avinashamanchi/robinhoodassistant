@@ -4,13 +4,15 @@
 
 - Task 7 implementation is complete in
   `/Users/avi/Desktop/robinhood/trading-assistant/.worktrees/safety-foundation`.
-- Implementation commit:
+- Quarantine implementation commit:
   `ac30a09c757bbf2d5f319f3510369ab41015da0c`.
+- Panic-lease gate fix commit:
+  `c5015cd4c4fa4de21e670014ca19f7a9c2e8ab0f`.
 - The Task 7 focused and affected suites are green.
-- The repository-wide full-suite gate is **not clean**. Its sole run ended
-  with 2,824 passed, 1 failed, 1 skipped, and 1 existing third-party warning.
-  The failure is the independently reproducible existing panic-lease timing
-  test documented below; no second full suite was run.
+- The repository-wide full-suite gate is clean. The original run exposed one
+  reproducible panic-lease defect; after the specifically authorized
+  systematic-debugging/TDD fix, the single confirmation run passed with
+  2,848 passed, 1 skipped, and 1 existing third-party warning.
 - PAPER-only trading, manual approval, kill switches, broker-truth checks, and
   the existing Task 8 sequencing boundary remain unchanged.
 - No runtime database, Keychain, real credential, network, broker, provider,
@@ -120,9 +122,9 @@ Final GREEN:
   `release static checks: PASS`.
 - `git diff --check`: passed.
 
-## Full-suite gate and diagnosis
+## Full-suite gate, diagnosis, and closure
 
-Exactly one full suite was run:
+The original Task 7 full suite was:
 
 - `uv run pytest`
 - Result:
@@ -140,25 +142,63 @@ Systematic focused diagnosis:
 - Twenty fresh focused repetitions produced `18/20 passed`; the same two
   failures logged `route_lease_renewal_uncertain`.
 - The test deliberately uses a one-second lease, 100 ms renewal interval, and
-  fixed sleeps. The failure is therefore independently reproducible timing
-  behavior in existing route-policy code rather than a Task 7 file change.
-- Task 7 owns only analyst quarantine/news files, so no route-policy or panic
-  lease code was changed. Per the explicit gate, no second full suite ran.
+  fixed sleeps.
+- Instrumentation separated successful durable lease renewal, receipt renewal,
+  follower waiting, and handler release. It showed no genuine tenure loss and
+  no required DB-busy condition: the durable concurrency lease could renew
+  successfully, then the owner handler could complete and set the stop event
+  before the paired panic receipt was renewed.
+- `_maintain_lease` incorrectly used the pre-renewal lease horizon for the
+  receipt deadline and returned `store` solely because the stop event was set.
+  That abandoned the second half of a successfully started two-part fence and
+  produced the follower 503.
 
-This means Task 7's implementation evidence is green, but the branch cannot be
-described as repository-wide green until the panic-lease defect is handled in
-its own authorized scope and a future release gate is run.
+The authorized fix:
+
+- uses the successfully renewed durable lease horizon for the paired receipt;
+- permits that already-started renewal to complete its matching receipt fence
+  even if the handler has just completed;
+- still returns `lost` on owner/generation mismatch;
+- still returns `store` when receipt persistence is genuinely uncertain after
+  stop, so uncertainty is not swallowed.
+
+Deterministic and bounded regression evidence:
+
+- the stop-between-fences and old-horizon tests failed before the fix and
+  passed afterward;
+- the exact fencing selection passed:
+  `25 passed in 2.12s`;
+- the synchronized long-panic endpoint regression passed in 20/20 fresh
+  subprocess repetitions;
+- route policy, durable limits, and runtime tenure passed:
+  `208 passed in 18.23s`;
+- Task 7 analyst, news, outbound, and release groups passed:
+  `220 passed, 1 warning in 16.64s`;
+- compile, release-static, and diff checks passed.
+
+After all focused gates were green, exactly one confirmation full suite was
+run:
+
+- `uv run pytest`
+- Result:
+  `2848 passed, 1 skipped, 1 warning in 391.10s`.
+
+No additional full-suite run was performed.
 
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
 - `src/trading_assistant/analyst/news.py`
+- `src/trading_assistant/app/policy.py`
 - `tests/test_untrusted_content.py`
 - `tests/test_news.py`
+- `tests/test_route_policy.py`
 - this Task 7 report
 - the progress ledger
 - generated review package
   `review-2afe380..ac30a09.diff`
+- generated panic-gate review package
+  `review-515f87b..c5015cd.diff`
 
 ## Caveats
 
