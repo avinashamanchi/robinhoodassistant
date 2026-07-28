@@ -1598,6 +1598,26 @@ Fix round 6 closes the round-5 full-suite caveat with a fresh post-correction
 run: `3239 passed, 1 skipped, 1 warning`. No Task 10 surface, schema, service,
 broker, provider, notification, or runtime behavior was added.
 
+**Fix round 7**
+
+- [x] **FR7.1:** Reject every lease-clock offset whose exact type is not the
+  base `datetime.timedelta`, preventing subclasses from overriding equality,
+  component attributes, or `total_seconds()` to impersonate UTC.
+- [x] **FR7.2:** For an exact base `timedelta`, require zero days, seconds,
+  microseconds, and exact equality with `timedelta(0)`; convert all offset
+  lookup/check exceptions to the stable fail-closed UTC validation error.
+- [x] **FR7.3:** Prove deceptive nonzero subclasses are rejected before the
+  repository opens a database session while standard `timezone.utc` and
+  `ZoneInfo("UTC")`, persisted-naive normalization, and fixed-clock equality
+  remain valid.
+- [x] **FR7.4:** Capture RED, pass the focused lease/rule/worker/candidate set,
+  run exactly one green no-argument full suite, pass the release static gate,
+  create a review package, and record an explicit clean-worktree checkpoint.
+
+Fix round 7 changes only the caller-side lease-offset validator and its tests.
+No Task 10 surface, schema, service, broker, provider, notification, or runtime
+behavior was added.
+
 ---
 
 ### Task 10: Expose redacted security posture without creating authority

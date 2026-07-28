@@ -1,0 +1,165 @@
+diff --git a/src/trading_assistant/rules/repository.py b/src/trading_assistant/rules/repository.py
+index d03e384..cfb43a5 100644
+--- a/src/trading_assistant/rules/repository.py
++++ b/src/trading_assistant/rules/repository.py
+@@ -261,7 +261,20 @@ def _require_aware_utc_lease_now(value: object) -> datetime:
+         raise ValueError(
+             "rule lease now must be timezone-aware UTC"
+         ) from None
+-    if offset != timedelta(0):
++    if type(offset) is not timedelta:
++        raise ValueError("rule lease now must be timezone-aware UTC")
++    try:
++        is_exact_zero = (
++            offset.days == 0
++            and offset.seconds == 0
++            and offset.microseconds == 0
++            and offset == timedelta(0)
++        )
++    except Exception:
++        raise ValueError(
++            "rule lease now must be timezone-aware UTC"
++        ) from None
++    if not is_exact_zero:
+         raise ValueError("rule lease now must be timezone-aware UTC")
+     return value.replace(tzinfo=timezone.utc)
+ 
+diff --git a/tests/test_rule_leases.py b/tests/test_rule_leases.py
+index 74d588d..ee07c8d 100644
+--- a/tests/test_rule_leases.py
++++ b/tests/test_rule_leases.py
+@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
+ from datetime import datetime, timedelta, timezone, tzinfo
+ from decimal import Decimal
+ from threading import Barrier
++from zoneinfo import ZoneInfo
+ 
+ import pytest
+ from pydantic import ValidationError
+@@ -50,6 +51,52 @@ class _MalformedOffset(tzinfo):
+         return None
+ 
+ 
++class _EqualityLiarOffset(timedelta):
++    def __eq__(self, other):
++        return True
++
++    def __ne__(self, other):
++        return False
++
++
++class _AttributeLiarOffset(_EqualityLiarOffset):
++    @property
++    def days(self):
++        return 0
++
++    @property
++    def seconds(self):
++        return 0
++
++    @property
++    def microseconds(self):
++        return 0
++
++
++class _TotalSecondsLiarOffset(_EqualityLiarOffset):
++    def total_seconds(self):
++        return 0.0
++
++
++class _ExplodingComparisonOffset(timedelta):
++    def __eq__(self, other):
++        raise RuntimeError("comparison must not run")
++
++    def __ne__(self, other):
++        raise RuntimeError("comparison must not run")
++
++
++class _OffsetZone(tzinfo):
++    def __init__(self, offset: timedelta) -> None:
++        self.offset = offset
++
++    def utcoffset(self, dt):
++        return self.offset
++
++    def dst(self, dt):
++        return None
++
++
+ def _command(
+     *,
+     group_key: str = "oco-aapl",
+@@ -267,8 +314,44 @@ def test_backdated_lease_cannot_set_reconciliation_latch_before_rejection(
+         NOW.astimezone(timezone(timedelta(hours=-7))),
+         NOW.astimezone(timezone(timedelta(minutes=1))),
+         datetime(2026, 7, 24, 12, tzinfo=_MalformedOffset()),
++        datetime(
++            2026,
++            7,
++            24,
++            12,
++            tzinfo=_OffsetZone(_EqualityLiarOffset(hours=1)),
++        ),
++        datetime(
++            2026,
++            7,
++            24,
++            12,
++            tzinfo=_OffsetZone(_AttributeLiarOffset(hours=1)),
++        ),
++        datetime(
++            2026,
++            7,
++            24,
++            12,
++            tzinfo=_OffsetZone(_TotalSecondsLiarOffset(hours=1)),
++        ),
++        datetime(
++            2026,
++            7,
++            24,
++            12,
++            tzinfo=_OffsetZone(_ExplodingComparisonOffset(hours=1)),
++        ),
+     ],
+-    ids=("negative-offset", "positive-offset", "malformed-offset"),
++    ids=(
++        "negative-offset",
++        "positive-offset",
++        "malformed-offset",
++        "timedelta-subclass-equality-liar",
++        "timedelta-subclass-attribute-liar",
++        "timedelta-subclass-total-seconds-liar",
++        "timedelta-subclass-exploding-comparison",
++    ),
+ )
+ def test_lease_group_rejects_non_utc_now_before_db_open_or_mutation(
+     session_factory,
+@@ -317,11 +400,18 @@ def test_lease_group_rejects_non_utc_now_before_db_open_or_mutation(
+         ) == initial_state
+ 
+ 
++@pytest.mark.parametrize(
++    "utc_zone",
++    [timezone.utc, ZoneInfo("UTC")],
++    ids=("timezone-utc", "zoneinfo-utc"),
++)
+ def test_lease_group_accepts_utc_equal_time(
+     session_factory,
+     seeded_oco_group,
++    utc_zone,
+ ):
+     repository = RuleRepository(session_factory, owner="worker-a")
++    utc_now = NOW.astimezone(utc_zone)
+     with session_factory() as session:
+         group = session.get(RuleGroup, seeded_oco_group)
+         group.created_at = NOW
+@@ -330,7 +420,7 @@ def test_lease_group_accepts_utc_equal_time(
+ 
+     lease = repository.lease_group(
+         seeded_oco_group,
+-        now=NOW,
++        now=utc_now,
+         **DEFAULT_RULE_CONTEXT,
+     )
+ 

@@ -253,3 +253,22 @@ through deterministic fakes, with zero broker submission/cancellation calls.
 - Use temporary SQLite and deterministic fakes only. Do not start services,
   contact providers, read Keychain content, touch the ignored runtime database,
   trade, reset a breaker, push, or begin Task 10.
+
+## Review fix round 7 evidence contract
+
+- The caller-side lease offset must have exact type `datetime.timedelta`.
+  Subclasses are rejected before any database session opens, even if they lie
+  through equality, inequality, component attributes, `total_seconds()`, or
+  exception-raising comparisons.
+- An exact base offset must have zero days, seconds, and microseconds and equal
+  `timedelta(0)`. Offset lookup or verification exceptions fail closed behind
+  the stable UTC validation error.
+- Standard `timezone.utc` and `ZoneInfo("UTC")` remain accepted. Persisted
+  SQLite-naive timestamp normalization stays a separate internal trust path,
+  and fixed-clock exact equality remains valid.
+- Capture RED for the deceptive subclasses, pass focused lease/rule/worker/
+  candidate tests, then run exactly one no-argument full suite, the release
+  static gate, and explicit clean-worktree checks.
+- Use temporary SQLite and deterministic fakes only. Do not start services,
+  contact providers, read Keychain content, touch the ignored runtime database,
+  trade, reset a breaker, push, or begin Task 10.
