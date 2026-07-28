@@ -602,6 +602,65 @@ def validate_backup_transaction(
     return members
 
 
+def _open_recovery_members(
+    transaction: BackupTransaction,
+) -> list[tuple[_BackupTransactionMember, int]]:
+    """Open only present manifest members; reject every ambiguous entry."""
+
+    _read_manifest(transaction)
+    recorded_names = {
+        member.name for member in transaction.manifest.members
+    }
+    namespace = set(os.listdir(transaction.directory_descriptor))
+    present_names = namespace - {TRANSACTION_MANIFEST_NAME}
+    if (
+        TRANSACTION_MANIFEST_NAME not in namespace
+        or not present_names <= recorded_names
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    opened: list[tuple[_BackupTransactionMember, int]] = []
+    try:
+        for member in transaction.manifest.members:
+            if member.name not in present_names:
+                continue
+            opened.append(
+                (
+                    member,
+                    _open_recorded_member(
+                        transaction,
+                        member,
+                        os.O_RDONLY,
+                    ),
+                )
+            )
+        if set(os.listdir(transaction.directory_descriptor)) != namespace:
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        for member, descriptor in opened:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = os.stat(
+                member.name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not _member_stat_matches(
+                descriptor_stat,
+                path_stat,
+                member,
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+        return opened
+    except BaseException:
+        for _member, descriptor in opened:
+            os.close(descriptor)
+        raise
+
+
 def _capture_member(
     directory_descriptor: int,
     name: str,
@@ -956,17 +1015,61 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
                 raise EncryptedBackupError(
                     "encrypted_backup_transaction_invalid"
                 )
-        for member, _descriptor in opened:
+        _unlink_opened_members(transaction, opened)
+    finally:
+        for _member, descriptor in opened:
+            os.close(descriptor)
+    _finish_backup_transaction_removal(transaction)
+
+
+def _unlink_opened_members(
+    transaction: BackupTransaction,
+    opened: list[tuple[_BackupTransactionMember, int]],
+) -> None:
+    failure: BaseException | None = None
+    for member, descriptor in opened:
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = os.stat(
+                member.name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not _member_stat_matches(
+                descriptor_stat,
+                path_stat,
+                member,
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
             os.unlink(
                 member.name,
                 dir_fd=transaction.directory_descriptor,
             )
-    finally:
-        for _member, descriptor in opened:
-            os.close(descriptor)
-    retry_fsync(transaction.directory_descriptor)
+        except BaseException as exc:
+            failure = exc
+            break
+    try:
+        retry_fsync(transaction.directory_descriptor)
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+    if failure is not None:
+        raise failure
+
+
+def _finish_backup_transaction_removal(
+    transaction: BackupTransaction,
+) -> None:
     _read_manifest(transaction)
     _directory_identity(transaction)
+    if set(os.listdir(transaction.directory_descriptor)) != {
+        TRANSACTION_MANIFEST_NAME
+    }:
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
     os.unlink(
         TRANSACTION_MANIFEST_NAME,
         dir_fd=transaction.directory_descriptor,
@@ -977,6 +1080,46 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
         dir_fd=transaction.destination_descriptor,
     )
     retry_fsync(transaction.destination_descriptor)
+
+
+def _remove_recovered_backup_transaction(
+    transaction: BackupTransaction,
+    *,
+    cutoff: float,
+    initial_directory_stat: os.stat_result,
+) -> bool:
+    opened = _open_recovery_members(transaction)
+    try:
+        if any(
+            os.fstat(descriptor).st_mtime >= cutoff
+            for _member, descriptor in opened
+        ):
+            return False
+        final_directory_stat = _directory_identity(transaction)
+        if not (
+            initial_directory_stat.st_mtime_ns
+            == final_directory_stat.st_mtime_ns
+            and initial_directory_stat.st_ctime_ns
+            == final_directory_stat.st_ctime_ns
+            and final_directory_stat.st_mtime < cutoff
+        ):
+            return False
+        expected_namespace = {
+            TRANSACTION_MANIFEST_NAME,
+            *(member.name for member, _descriptor in opened),
+        }
+        if set(os.listdir(transaction.directory_descriptor)) != (
+            expected_namespace
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        _unlink_opened_members(transaction, opened)
+    finally:
+        for _member, descriptor in opened:
+            os.close(descriptor)
+    _finish_backup_transaction_removal(transaction)
+    return True
 
 
 def close_backup_transaction(
@@ -1099,27 +1242,13 @@ def recover_backup_transaction(
             manifest_descriptor=manifest_descriptor,
             manifest=manifest,
         )
-        members = validate_backup_transaction(transaction)
-        if any(
-            os.stat(
-                member,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            ).st_mtime
-            >= cutoff
-            for member in members
+        if not _remove_recovered_backup_transaction(
+            transaction,
+            cutoff=cutoff,
+            initial_directory_stat=directory_stat,
         ):
             return
-        final_directory_stat = _directory_identity(transaction)
-        if not (
-            directory_stat.st_mtime_ns
-            == final_directory_stat.st_mtime_ns
-            and directory_stat.st_ctime_ns
-            == final_directory_stat.st_ctime_ns
-            and final_directory_stat.st_mtime < cutoff
-        ):
-            return
-        close_backup_transaction(transaction, remove=True)
+        close_backup_transaction(transaction, remove=False)
         transaction = None
         destination_descriptor = None
         directory_descriptor = None

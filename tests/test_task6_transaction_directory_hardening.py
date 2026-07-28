@@ -15,6 +15,7 @@ import time
 import pytest
 
 from trading_assistant.ops import backup as backup_module
+from trading_assistant.ops import backup_transaction as transaction_module
 from trading_assistant.ops.backup import (
     create_encrypted_database_backup,
     list_committed_backups,
@@ -159,6 +160,30 @@ def _hold_manifest_lock(manifest: Path, ready, release) -> None:
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _hold_partial_backup_transaction(
+    destination: Path,
+    ready,
+    release,
+) -> None:
+    destination.mkdir(mode=0o700)
+    transaction = transaction_module.create_backup_transaction(destination)
+    try:
+        os.unlink(
+            transaction_module.ENCRYPTED_NAME,
+            dir_fd=transaction.directory_descriptor,
+        )
+        transaction_module.retry_fsync(
+            transaction.directory_descriptor
+        )
+        ready.set()
+        release.wait(10)
+    finally:
+        transaction_module.close_backup_transaction(
+            transaction,
+            remove=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -330,10 +355,24 @@ def test_recovery_preserves_unrecorded_old_sidecar_name(
     assert sidecar.read_bytes() == b"operator-owned-sidecar"
 
 
-def test_recovery_preserves_directory_when_recorded_member_is_missing(
+@pytest.mark.parametrize(
+    "missing_names",
+    [
+        ("snapshot.sqlite3",),
+        ("snapshot.sqlite3", "verification.sqlite3"),
+        (
+            "snapshot.sqlite3",
+            "verification.sqlite3",
+            "encrypted.aesgcm",
+        ),
+    ],
+    ids=["one-absent", "two-absent", "all-absent"],
+)
+def test_recovery_converges_when_recorded_members_are_already_absent(
     tmp_path,
+    missing_names,
 ):
-    """Partial membership must fail closed before any remaining member deletion."""
+    """Any absent recorded member means exact cleanup already completed."""
 
     source = tmp_path / "missing-member.db"
     destination = tmp_path / "missing-member-backups"
@@ -347,11 +386,8 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
     process.join(timeout=10)
     assert process.exitcode == 73
     transaction = _transaction_directories(destination)[0]
-    (transaction / "snapshot.sqlite3").unlink()
-    remaining = {
-        candidate.name: candidate.stat().st_ino
-        for candidate in transaction.iterdir()
-    }
+    for name in missing_names:
+        (transaction / name).unlink()
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
 
@@ -360,12 +396,100 @@ def test_recovery_preserves_directory_when_recorded_member_is_missing(
         orphan_ttl_seconds=60,
         now=lambda: recovery_now,
     )
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert not transaction.exists()
+    assert tuple(destination.iterdir()) == ()
+
+
+@pytest.mark.parametrize("damage", ["extra", "replacement"])
+def test_partial_recovery_preserves_extra_or_replaced_entries(
+    tmp_path,
+    damage,
+):
+    """Subset tolerance must not authorize extra or replaced content."""
+
+    source = tmp_path / f"partial-{damage}.db"
+    destination = tmp_path / f"partial-{damage}-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    (transaction / "encrypted.aesgcm").unlink()
+    if damage == "extra":
+        protected = transaction / "operator.txt"
+    else:
+        protected = transaction / "snapshot.sqlite3"
+        protected.unlink()
+    protected.write_bytes(b"operator-owned-content")
+    protected.chmod(0o600)
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
 
     assert transaction.exists()
-    assert {
-        candidate.name: candidate.stat().st_ino
-        for candidate in transaction.iterdir()
-    } == remaining
+    assert _namespace_identities(transaction) == before_recovery
+    assert protected.read_bytes() == b"operator-owned-content"
+
+
+def test_aged_partial_active_transaction_is_protected_by_manifest_lock(
+    tmp_path,
+):
+    """TTL alone cannot recover a partial transaction while its lock is held."""
+
+    destination = tmp_path / "active-partial-backups"
+    context = _process_context()
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_partial_backup_transaction,
+        args=(destination, ready, release),
+    )
+    process.start()
+    assert ready.wait(timeout=5)
+    transaction = _transaction_directories(destination)[0]
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+
+    started = time.monotonic()
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert _namespace_identities(transaction) == before_recovery
+    release.set()
+    process.join(timeout=10)
+    assert process.exitcode == 0
+
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: recovery_now,
+        )
+    assert not transaction.exists()
 
 
 def test_busy_transaction_manifest_is_bounded_and_preserved(tmp_path):
@@ -557,11 +681,11 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
     assert tuple(destination.iterdir()) == ()
 
 
-def test_partial_cleanup_preserves_remaining_manifest_namespace(
+def test_partial_cleanup_recovery_converges_after_unlink_failure(
     tmp_path,
     monkeypatch,
 ):
-    """A partial unlink must not authorize deletion after membership diverges."""
+    """A transient member unlink failure must not strand plaintext forever."""
 
     source = tmp_path / "partial-cleanup.db"
     destination = tmp_path / "partial-cleanup-backups"
@@ -578,7 +702,10 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
     original_unlink = os.unlink
+    original_fsync = transaction_module.retry_fsync
     failed_once = False
+    directory_identity = transaction.stat()
+    directory_fsyncs = 0
 
     def fail_one_member(path, *args, **kwargs):
         nonlocal failed_once
@@ -587,7 +714,22 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
             raise OSError("injected partial cleanup failure")
         return original_unlink(path, *args, **kwargs)
 
+    def track_directory_fsync(descriptor):
+        nonlocal directory_fsyncs
+        identity = os.fstat(descriptor)
+        if (
+            identity.st_dev == directory_identity.st_dev
+            and identity.st_ino == directory_identity.st_ino
+        ):
+            directory_fsyncs += 1
+        return original_fsync(descriptor)
+
     monkeypatch.setattr(os, "unlink", fail_one_member)
+    monkeypatch.setattr(
+        transaction_module,
+        "retry_fsync",
+        track_directory_fsync,
+    )
     backup_module._recover_backup_orphans(
         destination,
         orphan_ttl_seconds=60,
@@ -596,23 +738,23 @@ def test_partial_cleanup_preserves_remaining_manifest_namespace(
     assert failed_once is True
     assert transaction.exists()
     assert (transaction / "manifest").exists()
-    remaining = {
-        candidate.name: candidate.stat().st_ino
-        for candidate in transaction.iterdir()
+    assert {candidate.name for candidate in transaction.iterdir()} == {
+        "manifest",
+        "snapshot.sqlite3",
+        "verification.sqlite3",
     }
-    assert "encrypted.aesgcm" not in remaining
+    assert directory_fsyncs >= 1
 
     monkeypatch.setattr(os, "unlink", original_unlink)
-    backup_module._recover_backup_orphans(
-        destination,
-        orphan_ttl_seconds=60,
-        now=lambda: recovery_now,
-    )
-    assert transaction.exists()
-    assert {
-        candidate.name: candidate.stat().st_ino
-        for candidate in transaction.iterdir()
-    } == remaining
+    delayed_recovery = recovery_now + 120
+    for _attempt in range(2):
+        backup_module._recover_backup_orphans(
+            destination,
+            orphan_ttl_seconds=60,
+            now=lambda: delayed_recovery,
+        )
+    assert not transaction.exists()
+    assert tuple(destination.iterdir()) == ()
 
 
 def test_committed_transition_has_no_fallible_postcommit_work(
