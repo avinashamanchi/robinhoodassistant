@@ -21,6 +21,7 @@ from ..app.limits import PolicyStoreMaintenance
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
 from ..operations import MutationContext
+from ..ops.tenure import TenureUncertain
 from ..rules.worker import RuleWorker
 from ..service import TradingService
 
@@ -49,6 +50,7 @@ class Monitor:
         leases=None,
         provider_budget=None,
         policy_store_maintenance=None,
+        runtime_tenure_guard=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
@@ -68,6 +70,7 @@ class Monitor:
         self.leases = leases
         self.provider_budget = provider_budget
         self.policy_store_maintenance = policy_store_maintenance
+        self.runtime_tenure_guard = runtime_tenure_guard
         if (
             self.policy_store_maintenance is None
             and rate_limiter is not None
@@ -254,36 +257,64 @@ class Monitor:
 
     # ── async loop with exponential backoff (A4) ───────────────
     async def run(self, stop_event: Optional[asyncio.Event] = None) -> None:
-        startup = await asyncio.wait_for(
-            asyncio.to_thread(self.reconcile), timeout=self.cycle_timeout
-        )
-        if (
-            startup["order_sync"].get("failed", 0)
-            or not startup["position_reconciliation"].get("reconciled", False)
-        ):
-            self.service.trip_all_killswitches(
-                actor="daemon:startup",
-                reason="startup reconciliation failed",
-                request_id=uuid4().hex,
+        guard = self.runtime_tenure_guard
+        primary_failure = False
+        try:
+            if guard is not None:
+                guard.ensure_owned()
+            startup = await asyncio.wait_for(
+                asyncio.to_thread(self.reconcile),
+                timeout=self.cycle_timeout,
             )
-            raise RuntimeError("startup reconciliation failed; kill switches tripped")
-        while not (stop_event and stop_event.is_set()):
-            try:
-                await self._bounded_core_cycle()
-                self.service.write_heartbeat("daemon")  # liveness for /health (D3)
-                # Shadow analysis and the digest run independently. They can time
-                # out or fail without delaying order sync, rules, or heartbeats.
-                self._schedule_daily_tasks()
-                await asyncio.sleep(self.poll_interval)
-            except Exception as exc:
-                if not isinstance(exc, _KillSwitchesAlreadyTripped):
-                    self.service.trip_all_killswitches(
-                        actor="daemon:monitor",
-                        reason="daemon mutating cycle failed",
-                        request_id=uuid4().hex,
-                    )
-                log.error(
-                    "monitor tick failed code=monitor_cycle_failed "
-                    "result=process_exit",
+            if (
+                startup["order_sync"].get("failed", 0)
+                or not startup["position_reconciliation"].get(
+                    "reconciled",
+                    False,
                 )
-                raise
+            ):
+                self.service.trip_all_killswitches(
+                    actor="daemon:startup",
+                    reason="startup reconciliation failed",
+                    request_id=uuid4().hex,
+                )
+                raise RuntimeError(
+                    "startup reconciliation failed; kill switches tripped"
+                )
+            while not (stop_event and stop_event.is_set()):
+                if guard is not None:
+                    guard.ensure_owned()
+                try:
+                    await self._bounded_core_cycle()
+                    self.service.write_heartbeat("daemon")
+                    # Daily analysis is isolated from safety heartbeats.
+                    self._schedule_daily_tasks()
+                    await asyncio.sleep(self.poll_interval)
+                except Exception as exc:
+                    if not isinstance(
+                        exc,
+                        _KillSwitchesAlreadyTripped,
+                    ):
+                        self.service.trip_all_killswitches(
+                            actor="daemon:monitor",
+                            reason="daemon mutating cycle failed",
+                            request_id=uuid4().hex,
+                        )
+                    log.error(
+                        "monitor tick failed code=monitor_cycle_failed "
+                        "result=process_exit",
+                    )
+                    raise
+        except BaseException:
+            primary_failure = True
+            raise
+        finally:
+            if guard is not None:
+                try:
+                    released = guard.close()
+                except BaseException:
+                    if not primary_failure:
+                        raise TenureUncertain() from None
+                else:
+                    if not released and not primary_failure:
+                        raise TenureUncertain()

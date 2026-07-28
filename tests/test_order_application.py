@@ -15,6 +15,7 @@ from trading_assistant.orders.application import (
     ApprovalConflict,
     OrderApplicationService,
 )
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 def _proposed_order_id(make_service) -> tuple[object, int]:
@@ -60,7 +61,10 @@ def test_approval_records_actor_reason_and_audit(make_service):
     with service.session_factory() as session:
         row = session.get(Order, order_id)
         assert row.approval_actor == "operator:avi"
-        assert row.approval_reason == "reviewed receipt"
+        assert (
+            sensitive_store(session).read(row, "approval_reason")
+            == "reviewed receipt"
+        )
         assert session.query(AuditEvent).filter_by(action="order.approve").count() == 1
 
 
@@ -248,10 +252,11 @@ def test_expired_human_approval_has_exact_atomic_status_audit(make_service):
                 AuditEvent.target_id == str(order_id),
             )
         )
+        audit_reason = sensitive_store(session).read(audit, "reason")
     assert order.status == OrderStatus.EXPIRED.value
     assert (
         audit.actor,
-        audit.reason,
+        audit_reason,
         audit.request_id,
         audit.result_code,
     ) == (

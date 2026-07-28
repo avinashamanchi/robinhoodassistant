@@ -9,6 +9,7 @@ from typing import Mapping
 
 from ..db.models import AuditEvent
 from ..logging import redact
+from ..security.sensitive_fields import sensitive_store
 
 _IDENTITY_LIMIT = 64
 _ACTOR_LIMIT = 128
@@ -70,19 +71,25 @@ class AuditRecorder:
             json.dumps(detail or {}, sort_keys=True, default=str)
         )
         with self.session_factory() as session:
-            session.add(
-                AuditEvent(
-                    actor=context.actor,
-                    action=action[:64],
-                    target_type=target_type[:32],
-                    target_id=target_id[:64],
-                    request_id=context.request_id,
-                    idempotency_key=context.idempotency_key,
-                    reason=redact(context.reason),
-                    result_code=result_code[:64],
-                    latency_ms=elapsed_ms,
-                    detail_json=detail_json,
-                )
+            event = AuditEvent(
+                actor=context.actor,
+                action=action[:64],
+                target_type=target_type[:32],
+                target_id=target_id[:64],
+                request_id=context.request_id,
+                idempotency_key=context.idempotency_key,
+                result_code=result_code[:64],
+                latency_ms=elapsed_ms,
+            )
+            sensitive_store(
+                session,
+                self.session_factory,
+            ).write_many(
+                event,
+                {
+                    "reason": redact(context.reason),
+                    "detail_json": detail_json,
+                },
             )
             session.commit()
 

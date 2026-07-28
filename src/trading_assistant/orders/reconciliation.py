@@ -50,6 +50,7 @@ from trading_assistant.risk.staleness import (
     DEFAULT_MAX_FUTURE_SKEW_SECONDS,
 )
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 from .repository import OrderRepository
 from .safety_state import (
@@ -116,17 +117,20 @@ def _audit_reconciliation_mutation(
     result_code: str,
     detail: dict[str, object] | None = None,
 ) -> None:
-    session.add(
+    persist_sensitive(
+        session,
         AuditEvent(
             actor=actor,
             action=action,
             target_type=target_type,
             target_id=target_id,
             request_id=request_id,
-            reason=reason,
             result_code=result_code,
-            detail_json=json.dumps(detail or {}, sort_keys=True),
-        )
+        ),
+        {
+            "reason": reason,
+            "detail_json": json.dumps(detail or {}, sort_keys=True),
+        },
     )
 
 
@@ -139,6 +143,7 @@ def _changed_columns(row: object) -> list[str]:
 
 
 _RECONCILIATION_CONTEXT = "reconciliation_mutation_context"
+_PENDING_RECONCILIATION_AUDITS = "pending_reconciliation_audits"
 
 
 def _bind_reconciliation_context(
@@ -156,7 +161,7 @@ def _audit_reconciliation_flush(
     flush_context,
     instances,
 ) -> None:
-    """Attach one audit before every reconciliation-owned object write."""
+    """Capture audit evidence without recursively flushing sensitive rows."""
     context = session.info.get(_RECONCILIATION_CONTEXT)
     if context is None:
         return
@@ -230,6 +235,21 @@ def _audit_reconciliation_flush(
                     {"changed_fields": ["delete"]},
                 )
             )
+    audit_queue = session.info.setdefault(
+        _PENDING_RECONCILIATION_AUDITS,
+        [],
+    )
+    audit_queue.extend(pending)
+
+
+def _persist_pending_reconciliation_audits(
+    session: Session,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> None:
+    pending = session.info.pop(_PENDING_RECONCILIATION_AUDITS, [])
     for row, action, target_type, result_code, detail in pending:
         if isinstance(row, ReconciliationCursor):
             target_id = f"{row.broker}:{row.stream}"
@@ -269,7 +289,18 @@ def _commit_reconciliation_mutations(
         reason=reason,
         request_id=request_id,
     )
-    session.commit()
+    try:
+        session.flush()
+        _persist_pending_reconciliation_audits(
+            session,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        session.commit()
+    finally:
+        session.info.pop(_RECONCILIATION_CONTEXT, None)
+        session.info.pop(_PENDING_RECONCILIATION_AUDITS, None)
 
 
 @dataclass(frozen=True)

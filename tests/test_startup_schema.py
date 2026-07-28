@@ -17,7 +17,15 @@ from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.schema import SchemaOutOfDate
 from trading_assistant.db.session import create_db_engine
 from trading_assistant.preflight import SensitiveEncryptionStateInspector
+from trading_assistant.security.crypto import SensitiveDataCipher
 from trading_assistant.security.secrets import RuntimeSecrets
+
+
+TEST_FIELD_KEY_ID = "configured-key-2026"
+TEST_CIPHER = SensitiveDataCipher(
+    {TEST_FIELD_KEY_ID: b"s" * 32},
+    active_key_id=TEST_FIELD_KEY_ID,
+)
 
 
 def _revision_0004(tmp_path, name="startup.db"):
@@ -111,7 +119,12 @@ def test_api_startup_fails_on_0004_without_mutating_schema_and_upgrade_preserves
     assert set(inspect(engine).get_table_names()) == before
     assert "circuit_breaker_state" not in before
 
-    upgrade(engine)
+    upgrade(
+        engine,
+        backup_key=b"u" * 32,
+        backup_key_id="startup-schema-backup-2026",
+        backup_directory=tmp_path / "encrypted-backups",
+    )
 
     with engine.connect() as connection:
         rows = connection.execute(
@@ -158,7 +171,7 @@ def test_mcp_startup_fails_on_0004_before_constructing_service(
     _patch_common_startup(monkeypatch, server, url)
 
     with pytest.raises(SchemaOutOfDate, match="run .*upgrade"):
-        server.build_default_service()
+        server.build_default_container()
 
 
 def test_preflight_reports_outdated_schema_without_mutating_it(tmp_path):
@@ -232,7 +245,7 @@ def test_sensitive_encryption_inspector_passes_only_consistent_complete_state(
                 "UPDATE sensitive_migration_state SET "
                 "schema_version=1,state='complete',"
                 "active_key_id='configured-key-2026',"
-                "rows_total=7,rows_completed=7,"
+                "rows_total=0,rows_completed=0,"
                 "backup_path_hash=:backup_hash,"
                 "started_at=:started_at,completed_at=:completed_at,"
                 "updated_at=:updated_at"
@@ -249,6 +262,7 @@ def test_sensitive_encryption_inspector_passes_only_consistent_complete_state(
         engine,
         schema_version=1,
         active_key_id="configured-key-2026",
+        cipher=TEST_CIPHER,
     ).inspect()
 
     assert check.passed
@@ -315,7 +329,7 @@ def test_sensitive_encryption_inspector_fails_closed_on_inconsistent_complete(
                 "UPDATE sensitive_migration_state SET "
                 "schema_version=1,state='complete',"
                 "active_key_id='configured-key-2026',"
-                "rows_total=7,rows_completed=7,"
+                "rows_total=0,rows_completed=0,"
                 "backup_path_hash=:backup_hash,"
                 "started_at=:started_at,completed_at=:completed_at,"
                 "updated_at=:updated_at"
@@ -334,6 +348,7 @@ def test_sensitive_encryption_inspector_fails_closed_on_inconsistent_complete(
         engine,
         schema_version=schema_version,
         active_key_id=active_key_id,
+        cipher=TEST_CIPHER,
     ).inspect()
 
     assert check.status == "blocked"

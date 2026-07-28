@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisReportRow, GradedCallRow
+from ..security.sensitive_fields import sensitive_store
 from .models import AnalysisReport, AnalystAction, Grade
 from .promotion import can_promote
 from .scorecard import Scorecard, build_scorecard, grade
@@ -24,10 +25,11 @@ def save_report(session: Session, report: AnalysisReport, version: str = "v1") -
         action=report.action.value,
         confidence=Decimal(str(report.confidence)),
         analyst_version=version,
-        report_json=report.model_dump_json(),
     )
-    session.add(row)
-    session.flush()
+    sensitive_store(session).write_many(
+        row,
+        {"report_json": report.model_dump_json()},
+    )
     return row.id
 
 
@@ -36,7 +38,9 @@ def grade_report(session: Session, report_id: int, forward_return_pct: float) ->
     row = session.get(AnalysisReportRow, report_id)
     if row is None:
         raise KeyError(f"no analysis report {report_id}")
-    report = AnalysisReport.model_validate_json(row.report_json)
+    report = AnalysisReport.model_validate_json(
+        sensitive_store(session).read(row, "report_json")
+    )
     g = grade(report, forward_return_pct)
     if row.grade is None:
         session.add(
@@ -59,7 +63,9 @@ def build_scorecard_from_db(session: Session, version: str | None = None) -> Sco
     rows = session.execute(q).all()
     pairs = [
         (
-            AnalysisReport.model_validate_json(r.report_json),
+            AnalysisReport.model_validate_json(
+                sensitive_store(session).read(r, "report_json")
+            ),
             Grade(
                 correct=g.correct,
                 forward_return_pct=float(g.forward_return_pct),

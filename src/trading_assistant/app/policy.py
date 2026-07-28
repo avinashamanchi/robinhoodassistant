@@ -22,6 +22,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Match, Mount, WebSocketRoute
 
 from trading_assistant.db.models import PanicReceipt, utcnow
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 from .auth import RecentAuthenticationRequired, SessionPrincipal
 from .errors import ApiError
@@ -745,9 +746,9 @@ def _is_safe_static_asset(request: Request) -> bool:
     )
 
 
-def _snapshot_from_row(row: PanicReceipt) -> _PanicSnapshot:
+def _snapshot_from_row(row: PanicReceipt, session) -> _PanicSnapshot:
     payload = (
-        json.loads(row.response_json)
+        json.loads(sensitive_store(session).read(row, "response_json"))
         if row.response_json is not None
         else None
     )
@@ -764,7 +765,9 @@ def _panic_snapshot(app: FastAPI) -> _PanicSnapshot | None:
     try:
         with app.state.session_auth.session_factory() as session:
             row = session.get(PanicReceipt, "alpaca-paper")
-            return None if row is None else _snapshot_from_row(row)
+            return (
+                None if row is None else _snapshot_from_row(row, session)
+            )
     except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
         raise LimitStoreUnavailable(
             "durable panic receipt store unavailable"
@@ -790,7 +793,7 @@ def _start_panic_receipt(
                 session.rollback()
                 return _PanicClaim(
                     claimed=False,
-                    snapshot=_snapshot_from_row(row),
+                    snapshot=_snapshot_from_row(row, session),
                 )
             if row is None:
                 row = PanicReceipt(account_scope="alpaca-paper")
@@ -798,14 +801,15 @@ def _start_panic_receipt(
             row.request_id = request_id
             row.lease_generation = lease_generation
             row.state = "started"
-            row.response_json = None
+            if row.response_json is not None:
+                sensitive_store(session).clear(row, {"response_json"})
             row.started_at = now
             row.completed_at = None
             row.expires_at = expires_at
             session.commit()
             return _PanicClaim(
                 claimed=True,
-                snapshot=_snapshot_from_row(row),
+                snapshot=_snapshot_from_row(row, session),
             )
     except (SQLAlchemyError, OSError, ValueError, TypeError) as exc:
         raise LimitStoreUnavailable(
@@ -862,15 +866,20 @@ def _finish_panic_receipt(
                     "durable panic receipt ownership changed"
                 )
             row.state = "completed" if response is not None else "failed"
-            row.response_json = (
-                json.dumps(
-                    response,
-                    sort_keys=True,
-                    separators=(",", ":"),
+            store = sensitive_store(session)
+            if response is not None:
+                store.write_many(
+                    row,
+                    {
+                        "response_json": json.dumps(
+                            response,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
                 )
-                if response is not None
-                else None
-            )
+            elif row.response_json is not None:
+                store.clear(row, {"response_json"})
             row.completed_at = now
             row.expires_at = expires_at
             session.commit()
@@ -907,15 +916,20 @@ def _mark_panic_uncertain(
                 session.rollback()
                 return False
             row.state = "failed"
-            row.response_json = (
-                json.dumps(
-                    response,
-                    sort_keys=True,
-                    separators=(",", ":"),
+            store = sensitive_store(session)
+            if response is not None:
+                store.write_many(
+                    row,
+                    {
+                        "response_json": json.dumps(
+                            response,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
                 )
-                if response is not None
-                else None
-            )
+            elif row.response_json is not None:
+                store.clear(row, {"response_json"})
             row.completed_at = now
             row.expires_at = block_until
             session.commit()
@@ -1374,6 +1388,26 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
         request.state.route_policy = policy
         if policy.path == "/health/live":
             return await call_next(request)
+        runtime_tenure_guard = getattr(
+            app.state,
+            "runtime_tenure_guard",
+            None,
+        )
+        if (
+            request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+            and runtime_tenure_guard is not None
+        ):
+            try:
+                runtime_tenure_guard.ensure_owned()
+            except Exception:
+                return _policy_error_response(
+                    request,
+                    ApiError(
+                        "runtime_tenure_lost",
+                        503,
+                        "Runtime mutation authority is unavailable",
+                    ),
+                )
         try:
             principal = await _offload(
                 _authenticate,

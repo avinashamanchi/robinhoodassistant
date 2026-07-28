@@ -25,6 +25,7 @@ from trading_assistant.db.models import (
     Rule,
     RuleGroup,
 )
+from trading_assistant.security.sensitive_fields import persist_sensitive
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.engine import (
@@ -243,7 +244,8 @@ def test_get_open_orders_includes_every_nonterminal_outbox_state(
             [*nonterminal, OrderStatus.FILLED],
             start=1,
         ):
-            session.add(
+            persist_sensitive(
+                session,
                 Order(
                     idempotency_key=f"open-state-{index}",
                     ticker="AAPL",
@@ -251,7 +253,8 @@ def test_get_open_orders_includes_every_nonterminal_outbox_state(
                     order_type="market",
                     notional=Decimal("10"),
                     status=status.value,
-                )
+                ),
+                {"approval_reason": "test fixture"},
             )
         session.commit()
 

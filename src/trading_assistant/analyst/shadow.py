@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from sqlalchemy import select
 
 from ..identity import canonical_analyst_version, canonical_symbol
+from ..security.sensitive_fields import sensitive_store
 from . import screener
 from .models import AnalysisReport, AnalystAction, TradePlan
 from .store import grade_report, save_report
@@ -151,7 +152,9 @@ class ShadowRunner:
             with self.service.session_factory() as s:
                 row = s.get(TradePlanRow, plan_id)
                 row.shadow = True
-                plan = TradePlan.model_validate_json(row.plan_json)
+                plan = TradePlan.model_validate_json(
+                    sensitive_store(s).read(row, "plan_json")
+                )
                 report_id = save_report(
                     s,
                     _base_report(plan, symbol=symbol),

@@ -36,6 +36,7 @@ from trading_assistant.risk.breakers import (
 )
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.service import TradingService
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 def _submit(submission, order_id):
@@ -211,10 +212,11 @@ def test_execution_risk_rejection_has_exact_atomic_status_audit(make_service):
                 AuditEvent.target_id == str(order_id),
             )
         )
+        audit_reason = sensitive_store(session).read(audit, "reason")
     assert order.status == OrderStatus.REJECTED.value
     assert (
         audit.actor,
-        audit.reason,
+        audit_reason,
         audit.request_id,
         audit.result_code,
     ) == (
@@ -280,9 +282,10 @@ def test_approved_proposal_that_expires_before_submit_never_calls_broker(make_se
                 AuditEvent.target_id == str(order_id),
             )
         )
+        audit_reason = sensitive_store(session).read(audit, "reason")
     assert (
         audit.actor,
-        audit.reason,
+        audit_reason,
         audit.request_id,
         audit.result_code,
     ) == (
@@ -400,17 +403,23 @@ def test_only_definitive_broker_rejection_becomes_rejected(make_service):
                 AuditEvent.request_id
                 == f"order-submission-{order_id}"
             )
-        ).all()
+            ).all()
+        store = sensitive_store(session)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
     assert {
         audit.action for audit in audits
     } >= {
         "order.submission_claim",
         "order.submission_result",
     }
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             "operator:test",
             "order submission test",

@@ -10,11 +10,11 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from sqlalchemy import delete, select, update
-from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import AssetClass
 from ..db.models import AuditEvent, CircuitBreakerState, PanicReceipt
+from ..security.sensitive_fields import persist_sensitive, sensitive_store
 from .submission_barrier import SubmissionBarrier
 
 
@@ -164,11 +164,11 @@ def _now(value: datetime | None) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _state(row: CircuitBreakerState) -> BreakerState:
+def _state(row: CircuitBreakerState, session: Session) -> BreakerState:
     return BreakerState(
         scope=BreakerScope(BreakerKind(row.kind), row.target),
         tripped=row.tripped,
-        reason=row.reason,
+        reason=sensitive_store(session).read(row, "reason"),
         actor=row.actor,
         generation=row.generation,
         updated_at=row.updated_at,
@@ -187,20 +187,24 @@ def _audit(
     detail: Mapping[str, object] | None = None,
     now: datetime,
 ) -> None:
-    session.add(
-        AuditEvent(
+    event = AuditEvent(
             actor=actor,
             action=action,
             target_type="circuit_breaker",
             target_id=scope.key,
             request_id=request_id,
-            reason=reason,
             result_code=result_code,
-            detail_json=json.dumps(
+            created_at=now,
+    )
+    persist_sensitive(
+        session,
+        event,
+        {
+            "reason": reason,
+            "detail_json": json.dumps(
                 dict(detail or {}), sort_keys=True, default=str
             ),
-            created_at=now,
-        )
+        },
     )
 
 
@@ -229,33 +233,26 @@ def trip_in_session(
             CircuitBreakerState.scope_key == scope.key
         )
     )
-    statement = insert(CircuitBreakerState).values(
-        scope_key=scope.key,
-        kind=scope.kind.value,
-        target=scope.target,
-        tripped=True,
-        reason=reason,
-        actor=actor,
-        generation=1,
-        updated_at=timestamp,
-    )
-    session.execute(
-        statement.on_conflict_do_update(
-            index_elements=[CircuitBreakerState.scope_key],
-            set_={
-                "kind": scope.kind.value,
-                "target": scope.target,
-                "tripped": True,
-                "reason": reason,
-                "actor": actor,
-                "generation": CircuitBreakerState.generation + 1,
-                "updated_at": timestamp,
-            },
-        )
-    )
-    changed = prior_tripped is not True
     row = session.get(CircuitBreakerState, scope.key)
-    assert row is not None
+    if row is None:
+        row = CircuitBreakerState(
+            scope_key=scope.key,
+            kind=scope.kind.value,
+            target=scope.target,
+            tripped=True,
+            actor=actor,
+            generation=1,
+            updated_at=timestamp,
+        )
+    else:
+        row.kind = scope.kind.value
+        row.target = scope.target
+        row.tripped = True
+        row.actor = actor
+        row.generation += 1
+        row.updated_at = timestamp
+    persist_sensitive(session, row, {"reason": reason})
+    changed = prior_tripped is not True
     _audit(
         session,
         scope=scope,
@@ -267,7 +264,7 @@ def trip_in_session(
         detail={"generation": row.generation},
         now=timestamp,
     )
-    return _state(row), changed
+    return _state(row, session), changed
 
 
 def reset_in_session(
@@ -308,7 +305,6 @@ def reset_in_session(
             kind=scope.kind.value,
             target=scope.target,
             tripped=False,
-            reason=reason,
             actor=actor,
             generation=CircuitBreakerState.generation + 1,
             updated_at=timestamp,
@@ -316,7 +312,7 @@ def reset_in_session(
     )
     if result.rowcount != 1:
         row = session.get(CircuitBreakerState, scope.key)
-        current_state = _state(row) if row is not None else None
+        current_state = _state(row, session) if row is not None else None
         _audit(
             session,
             scope=scope,
@@ -348,6 +344,7 @@ def reset_in_session(
         )
     row = session.get(CircuitBreakerState, scope.key)
     assert row is not None
+    sensitive_store(session).write_many(row, {"reason": reason})
     session.execute(
         delete(PanicReceipt).where(
             PanicReceipt.account_scope == "alpaca-paper",
@@ -369,7 +366,7 @@ def reset_in_session(
         },
         now=timestamp,
     )
-    return _state(row)
+    return _state(row, session)
 
 
 class BreakerService:
@@ -414,7 +411,7 @@ class BreakerService:
     def get(self, scope: BreakerScope) -> BreakerState | None:
         with self.session_factory() as session:
             row = session.get(CircuitBreakerState, scope.key)
-            return _state(row) if row is not None else None
+            return _state(row, session) if row is not None else None
 
     def active_for_symbol(self, symbol: str) -> tuple[BreakerState, ...]:
         scope_keys = tuple(
@@ -429,7 +426,7 @@ class BreakerService:
                 )
                 .order_by(CircuitBreakerState.scope_key)
             ).all()
-            return tuple(_state(row) for row in rows)
+            return tuple(_state(row, session) for row in rows)
 
     def reset(
         self,

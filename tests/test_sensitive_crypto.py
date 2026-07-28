@@ -58,6 +58,12 @@ def cipher() -> SensitiveDataCipher:
     return SensitiveDataCipher({KEY_ID: KEY}, active_key_id=KEY_ID)
 
 
+@pytest.fixture
+def session_factory(engine):
+    """Task 5 guard tests install their own per-case cipher explicitly."""
+    return make_session_factory(engine)
+
+
 def _audit_event() -> AuditEvent:
     return AuditEvent(
         actor="operator:test",

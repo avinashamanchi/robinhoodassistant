@@ -965,7 +965,11 @@ def test_strict_launcher_stops_before_uvicorn_on_structural_failure(monkeypatch)
         "run_startup_guard",
         lambda **_kwargs: (_ for _ in ()).throw(blocked),
     )
-    monkeypatch.setattr(serve.uvicorn, "run", lambda *_args, **_kwargs: called.append(True))
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "Server",
+        lambda *_args, **_kwargs: called.append(True),
+    )
 
     with pytest.raises(serve.StartupGuardBlocked):
         serve.main()
@@ -985,8 +989,25 @@ def test_strict_launcher_uses_only_loopback_tls_and_disables_proxy_headers(
         tls_cert_path=Path(".local/tls/localhost.pem"),
         tls_key_path=Path(".local/tls/localhost-key.pem"),
     )
-    called: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    configured: list[dict[str, object]] = []
+    served: list[object] = []
     closed: list[bool] = []
+    shutdown_callbacks: list[object] = []
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            install_controlled_shutdown=shutdown_callbacks.append,
+        )
+    )
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            served.append(self)
+            shutdown_callbacks[0]()
 
     class FakeControl:
         def close(self):
@@ -995,26 +1016,80 @@ def test_strict_launcher_uses_only_loopback_tls_and_disables_proxy_headers(
     monkeypatch.setattr(serve, "load_config", lambda: SimpleNamespace(server=server))
     monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
     monkeypatch.setattr(serve, "start_app_control", lambda _project: FakeControl())
+    monkeypatch.setattr(serve, "create_app", lambda: app)
     monkeypatch.setattr(
         serve.uvicorn,
-        "run",
-        lambda *args, **kwargs: called.append((args, kwargs)),
+        "Config",
+        lambda _app, **kwargs: (
+            configured.append({"app": _app, **kwargs})
+            or SimpleNamespace(app=_app, kwargs=kwargs)
+        ),
     )
+    monkeypatch.setattr(serve.uvicorn, "Server", FakeServer)
 
     assert serve.main() == 0
-    assert called == [
-        (
-            ("trading_assistant.app.main:create_app",),
-            {
-                "factory": True,
-                "host": "127.0.0.1",
-                "port": 8020,
-                "ssl_certfile": ".local/tls/localhost.pem",
-                "ssl_keyfile": ".local/tls/localhost-key.pem",
-                "proxy_headers": False,
-                "forwarded_allow_ips": "",
-                "access_log": False,
-            },
-        )
-    ]
+    assert configured == [{
+        "app": app,
+        "host": "127.0.0.1",
+        "port": 8020,
+        "ssl_certfile": ".local/tls/localhost.pem",
+        "ssl_keyfile": ".local/tls/localhost-key.pem",
+        "proxy_headers": False,
+        "forwarded_allow_ips": "",
+        "access_log": False,
+    }]
+    assert len(served) == 1
+    assert served[0].should_exit is True
     assert closed == [True]
+
+
+def test_launcher_closes_running_tenure_if_server_construction_fails(
+    monkeypatch,
+):
+    from trading_assistant.ops import serve
+
+    server_config = SimpleNamespace(
+        bind_host="127.0.0.1",
+        port=8020,
+        tls_cert_path=Path(".local/tls/localhost.pem"),
+        tls_key_path=Path(".local/tls/localhost-key.pem"),
+    )
+
+    class Guard:
+        closed = False
+
+        def close(self):
+            self.closed = True
+            return True
+
+    guard = Guard()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            runtime_tenure_guard=guard,
+            install_controlled_shutdown=lambda _callback: None,
+        )
+    )
+    control = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(
+        serve,
+        "load_config",
+        lambda: SimpleNamespace(server=server_config),
+    )
+    monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
+    monkeypatch.setattr(serve, "start_app_control", lambda _project: control)
+    monkeypatch.setattr(serve, "create_app", lambda: app)
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "Config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "Server",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("server-failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="server-failed"):
+        serve.main()
+
+    assert guard.closed is True

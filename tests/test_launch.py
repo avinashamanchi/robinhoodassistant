@@ -3,6 +3,7 @@ full order lifecycle integration (B2)."""
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +27,26 @@ from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.operations import MutationContext, OperationsService
 from trading_assistant.operations.health import build_operational_health
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
+
+
+def _persist_audit_fixture(session, event: AuditEvent) -> AuditEvent:
+    return persist_sensitive(
+        session,
+        event,
+        {"reason": "test fixture", "detail_json": "{}"},
+    )
+
+
+def _persist_order_fixture(session, order: Order) -> Order:
+    return persist_sensitive(
+        session,
+        order,
+        {"approval_reason": "test fixture"},
+    )
 
 
 def _sensitive_head_database(tmp_path, name: str) -> str:
@@ -74,6 +95,11 @@ def test_startup_guard_uses_database_encryption_inspector_and_blocks_required(
             secrets=Secrets(
                 database_url=url,
                 app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+                field_encryption_keys={
+                    config.encryption.active_key_id: (
+                        base64.b64encode(b"l" * 32).decode()
+                    )
+                },
             ),
         )
 
@@ -128,6 +154,11 @@ def test_startup_guard_allows_only_internally_consistent_complete_encryption(
         secrets=Secrets(
             database_url=url,
             app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+            field_encryption_keys={
+                config.encryption.active_key_id: (
+                    base64.b64encode(b"l" * 32).decode()
+                )
+            },
         ),
     )
 
@@ -323,7 +354,8 @@ def test_operational_health_excludes_contact_committed_after_safety_snapshot(
             return
         interleaved = True
         with service.session_factory() as writer:
-            writer.add(
+            _persist_audit_fixture(
+                writer,
                 AuditEvent(
                     actor="daemon:test",
                     action="orders.sync",
@@ -331,7 +363,7 @@ def test_operational_health_excludes_contact_committed_after_safety_snapshot(
                     target_id="all",
                     request_id="interleaved-health-contact",
                     result_code="reconciled",
-                )
+                ),
             )
             writer.commit()
 
@@ -359,7 +391,8 @@ def test_operational_health_never_clamps_future_contact_to_zero(
 ):
     service = make_service()
     with service.session_factory() as session:
-        session.add(
+        _persist_audit_fixture(
+            session,
             AuditEvent(
                 actor="daemon:test",
                 action="positions.reconcile",
@@ -371,7 +404,7 @@ def test_operational_health_never_clamps_future_contact_to_zero(
                     service.snapshot_service.now()
                     + timedelta(days=1)
                 ),
-            )
+            ),
         )
         session.commit()
 
@@ -397,7 +430,8 @@ def test_operational_health_applies_configured_reconciliation_freshness(
 ):
     service = make_service()
     with service.session_factory() as session:
-        session.add(
+        _persist_audit_fixture(
+            session,
             AuditEvent(
                 actor="daemon:test",
                 action="positions.reconcile",
@@ -409,7 +443,7 @@ def test_operational_health_applies_configured_reconciliation_freshness(
                     service.snapshot_service.now()
                     - timedelta(seconds=age_seconds)
                 ),
-            )
+            ),
         )
         session.commit()
 
@@ -630,9 +664,13 @@ def test_http_mutation_provenance_matrix(
             action=action,
             request_id=request_id,
         ).one()
+        receipt_reason = sensitive_store(session).read(
+            receipt,
+            "reason",
+        )
     assert receipt.actor == "operator:local"
     assert receipt.idempotency_key == idempotency_key
-    assert receipt.reason == reason
+    assert receipt_reason == reason
     assert receipt.result_code == f"http_{expected_status}"
     assert receipt.latency_ms >= 0
 
@@ -1146,8 +1184,9 @@ def test_sync_surfaces_broker_status_outage_with_exact_failure_audit(
             request_id="launch-test-sync",
             result_code="dependency_unavailable",
         ).one()
+        audit_reason = sensitive_store(session).read(audit, "reason")
     assert audit.actor == "operator:test"
-    assert audit.reason == "launch test broker reconciliation"
+    assert audit_reason == "launch test broker reconciliation"
 
 
 def test_sync_reports_submitted_outbox_without_broker_id(make_service):
@@ -1155,7 +1194,8 @@ def test_sync_reports_submitted_outbox_without_broker_id(make_service):
 
     svc = make_service()
     with svc.session_factory() as session:
-        session.add(
+        _persist_order_fixture(
+            session,
             Order(
                 idempotency_key="unknown-acceptance",
                 ticker="AAPL",
@@ -1165,7 +1205,7 @@ def test_sync_reports_submitted_outbox_without_broker_id(make_service):
                 limit_price=Decimal("95"),
                 status="submitted",
                 broker_order_id=None,
-            )
+            ),
         )
         session.commit()
 

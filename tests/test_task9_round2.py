@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+from contextlib import nullcontext
 from decimal import Decimal
 import logging
 from pathlib import Path
@@ -202,10 +204,16 @@ def test_mcp_valid_startup_configures_exact_container_once(
 
     service = make_service()
     audit = object()
+    guard = SimpleNamespace(
+        lost=False,
+        set_on_lost=lambda _callback: None,
+        close=lambda: True,
+    )
     container = SimpleNamespace(
         service=service,
         audit=audit,
         secrets=Secrets(app_api_token="mcp-valid-startup-secret"),
+        runtime_tenure_guard=guard,
     )
     calls = {"build": 0, "run": 0}
 
@@ -219,11 +227,10 @@ def test_mcp_valid_startup_configures_exact_container_once(
         build_once,
         raising=False,
     )
-    monkeypatch.setattr(
-        server.mcp,
-        "run",
-        lambda: calls.__setitem__("run", calls["run"] + 1),
-    )
+    async def run_stdio_async():
+        calls["run"] += 1
+
+    monkeypatch.setattr(server.mcp, "run_stdio_async", run_stdio_async)
     server._service = None
     server._audit = None
 
@@ -243,21 +250,26 @@ def test_mcp_transport_startup_failure_is_in_role_log(
 
     marker = "mcp-transport-startup-secret"
     service = make_service()
+    guard = SimpleNamespace(
+        lost=False,
+        set_on_lost=lambda _callback: None,
+        close=lambda: True,
+    )
     container = SimpleNamespace(
         service=service,
         audit=object(),
         secrets=Secrets(app_api_token=marker),
+        runtime_tenure_guard=guard,
     )
     monkeypatch.setattr(
         server,
         "build_default_container",
         lambda: container,
     )
-    monkeypatch.setattr(
-        server.mcp,
-        "run",
-        lambda: (_ for _ in ()).throw(RuntimeError(marker)),
-    )
+    async def run_stdio_async():
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(server.mcp, "run_stdio_async", run_stdio_async)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(RuntimeError, match=marker):
@@ -321,8 +333,8 @@ def test_every_production_role_has_private_bounded_startup_log(
 @pytest.mark.parametrize(
     ("builder_name", "runtime_role"),
     [
-        ("preflight", "preflight"),
-        ("paper_drill", "paper-drill"),
+        ("preflight", "app"),
+        ("paper_drill", "app"),
     ],
 )
 def test_service_utility_roots_pass_exact_role_and_secrets(
@@ -343,15 +355,19 @@ def test_service_utility_roots_pass_exact_role_and_secrets(
         observed.append(
             (config, supplied_secrets, kwargs.get("runtime_role"))
         )
-        return SimpleNamespace(service=service)
+        return SimpleNamespace(
+            service=service,
+            runtime_tenure_guard=None,
+        )
 
     monkeypatch.setattr(bootstrap, "build_container", build)
     if builder_name == "preflight":
-        result = preflight._build_service(app_config, secrets)
+        owner = preflight._build_service(app_config, secrets)
     else:
-        result = paper_drill.build_paper_service(app_config, secrets)
+        owner = paper_drill.build_paper_service(app_config, secrets)
 
-    assert result is service
+    with owner as result:
+        assert result is service
     assert observed == [(app_config, secrets, runtime_role)]
 
 
@@ -559,7 +575,7 @@ def test_utility_main_reuses_one_secret_and_role_log(
                 observed.append(
                     (supplied_config, supplied_secrets)
                 )
-                or service
+                or nullcontext(service)
             ),
         )
         monkeypatch.setattr(
@@ -768,6 +784,11 @@ def _migrated_secrets(tmp_path):
     return Secrets(
         database_url=database_url,
         app_api_token="round2-bootstrap-secret",
+        field_encryption_keys={
+            "local-primary-2026-07": base64.b64encode(
+                b"r" * 32
+            ).decode("ascii")
+        },
     )
 
 

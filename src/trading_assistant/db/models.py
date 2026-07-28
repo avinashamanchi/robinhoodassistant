@@ -621,6 +621,76 @@ class ConcurrencyLease(Base):
     generation: Mapped[int] = mapped_column(default=0)
 
 
+class RuntimeTenure(Base):
+    """Fenced runtime ownership and exclusive sensitive maintenance."""
+
+    __tablename__ = "runtime_tenures"
+    __table_args__ = (
+        CheckConstraint(
+            "("
+            "resource_key = 'runtime:app' AND role = 'app'"
+            ") OR ("
+            "resource_key = 'runtime:daemon' AND role = 'daemon'"
+            ") OR ("
+            "resource_key = 'runtime:mcp' AND role = 'mcp'"
+            ") OR ("
+            "resource_key = 'sensitive-migration:global' "
+            "AND role = 'maintenance'"
+            ")",
+            name="ck_runtime_tenures_resource_role",
+        ),
+        CheckConstraint(
+            "state IN ('held','released')",
+            name="ck_runtime_tenures_state",
+        ),
+        CheckConstraint(
+            "generation > 0",
+            name="ck_runtime_tenures_generation_positive",
+        ),
+        CheckConstraint(
+            "length(owner_id) = 36",
+            name="ck_runtime_tenures_owner_id",
+        ),
+        CheckConstraint(
+            "pid > 0",
+            name="ck_runtime_tenures_pid_positive",
+        ),
+        CheckConstraint(
+            "length(process_start_identity) BETWEEN 1 AND 256",
+            name="ck_runtime_tenures_process_identity",
+        ),
+        CheckConstraint(
+            "acquired_at <= renewed_at AND renewed_at <= expires_at",
+            name="ck_runtime_tenures_timestamp_order",
+        ),
+        CheckConstraint(
+            "(state = 'held' AND released_at IS NULL "
+            "AND renewed_at < expires_at) OR "
+            "(state = 'released' AND released_at IS NOT NULL "
+            "AND released_at = expires_at)",
+            name="ck_runtime_tenures_lifecycle",
+        ),
+    )
+
+    resource_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), index=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    owner_id: Mapped[str] = mapped_column(String(36))
+    generation: Mapped[int] = mapped_column()
+    pid: Mapped[int] = mapped_column()
+    process_start_identity: Mapped[str] = mapped_column(String(256))
+    acquired_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    renewed_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        index=True,
+    )
+    released_at: Mapped[Optional[datetime]] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+
+
 class MutationInterlock(Base):
     """Non-expiring authority that fences one protected mutation resource."""
 
@@ -988,7 +1058,6 @@ def approve_proposed(
         .values(
             status=OrderStatus.APPROVAL_RECORDED.value,
             approval_actor=actor,
-            approval_reason=reason,
             approved_at=utcnow(),
             updated_at=utcnow(),
             version=Order.version + 1,
@@ -999,7 +1068,18 @@ def approve_proposed(
         raise ApprovalConflict(
             f"order {order_id} was not in PROPOSED state (already decided?)"
         )
-    session.add(
+    from ..security.sensitive_fields import persist_sensitive
+
+    order = session.get(Order, order_id)
+    if order is None:
+        raise ApprovalConflict(f"order {order_id} disappeared")
+    persist_sensitive(
+        session,
+        order,
+        {"approval_reason": reason},
+    )
+    persist_sensitive(
+        session,
         AuditEvent(
             actor=actor,
             action="order.approve",
@@ -1007,7 +1087,7 @@ def approve_proposed(
             target_id=str(order_id),
             request_id=request_id,
             idempotency_key=idempotency_key,
-            reason=reason,
             result_code=OrderStatus.APPROVAL_RECORDED.value,
-        )
+        ),
+        {"reason": reason, "detail_json": "{}"},
     )

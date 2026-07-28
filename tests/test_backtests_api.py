@@ -23,6 +23,7 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.strategies.base import SignalAction
+from tests.conftest import decrypt_test_sensitive
 
 TOKEN = "test-backtests-operator-secret"
 _STATIC = Path("src/trading_assistant/app/static")
@@ -143,7 +144,10 @@ def test_run_endpoint_persists(client, monkeypatch):
             target_id=str(res["run_id"]),
         ).one()
     assert audit.actor == "operator:local"
-    assert audit.reason == "compare synthetic strategies"
+    assert decrypt_test_sensitive(
+        audit,
+        "reason",
+    ) == "compare synthetic strategies"
     assert audit.request_id == response.headers["X-Request-ID"]
     assert audit.result_code == "succeeded"
 
@@ -186,9 +190,14 @@ def test_failed_backtest_launch_is_sanitized_and_audited(
             result_code="failed",
         ).one()
     assert audit.actor == "operator:local"
-    assert audit.reason == "failure-path review"
+    assert decrypt_test_sensitive(
+        audit,
+        "reason",
+    ) == "failure-path review"
     assert audit.request_id == response.headers["X-Request-ID"]
-    assert "provider-secret-backtest-prompt" not in audit.detail_json
+    assert "provider-secret-backtest-prompt" not in (
+        decrypt_test_sensitive(audit, "detail_json")
+    )
 
 
 def test_second_backtest_is_globally_busy_and_starts_no_runner(
@@ -610,7 +619,9 @@ def test_backtest_deadline_crossing_during_persistence_reconciles_same_run(
     assert len(audits) == 1
     assert audits[0].target_id == str(persisted_ids[0])
     assert audits[0].result_code == "timed_out"
-    assert json.loads(audits[0].detail_json)["stage"] == (
+    assert json.loads(
+        decrypt_test_sensitive(audits[0], "detail_json")
+    )["stage"] == (
         "post_persistence"
     )
 

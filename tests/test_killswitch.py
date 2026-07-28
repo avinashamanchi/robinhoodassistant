@@ -10,10 +10,12 @@ import pytest
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.killswitch import KillSwitch
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
+from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
 
 
-def test_trip_persists_across_restart(db_url, engine):
+def test_trip_persists_across_restart(db_url, engine, sensitive_cipher):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         assert KillSwitch.is_tripped(s) is False
     with factory() as s:
@@ -28,12 +30,17 @@ def test_trip_persists_across_restart(db_url, engine):
     # Simulate a process restart: brand-new engine + session on the same DB file.
     engine2 = create_db_engine(db_url)
     factory2 = make_session_factory(engine2)
+    bind_sensitive_cipher(factory2, sensitive_cipher)
     with factory2() as s:
         assert KillSwitch.is_tripped(s) is True
 
 
-def test_compatibility_trip_rejects_an_active_caller_transaction(engine):
+def test_compatibility_trip_rejects_an_active_caller_transaction(
+    engine,
+    sensitive_cipher,
+):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
 
     with factory() as session:
         KillSwitch.is_tripped(session)
@@ -48,8 +55,10 @@ def test_compatibility_trip_rejects_an_active_caller_transaction(engine):
 
 def test_compatibility_reset_is_explicitly_disabled_and_stays_tripped(
     engine,
+    sensitive_cipher,
 ):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         KillSwitch.trip(
             s,
@@ -73,7 +82,7 @@ def test_compatibility_reset_is_explicitly_disabled_and_stays_tripped(
         assert KillSwitch.is_tripped(s) is True
 
 
-def test_daily_loss_from_fills_trips_switch(engine):
+def test_daily_loss_from_fills_trips_switch(engine, sensitive_cipher):
     """Kill switch trips off a REAL FIFO computation, not a stubbed number (A2)."""
     now = datetime(2026, 7, 8, 18, 0, tzinfo=timezone.utc)
     fills = [
@@ -86,6 +95,7 @@ def test_daily_loss_from_fills_trips_switch(engine):
     assert loss == Decimal("-600")  # (40-100)*10
 
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
             s,
@@ -99,8 +109,9 @@ def test_daily_loss_from_fills_trips_switch(engine):
         assert KillSwitch.is_tripped(s) is True
 
 
-def test_small_loss_does_not_trip(engine):
+def test_small_loss_does_not_trip(engine, sensitive_cipher):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
             s,

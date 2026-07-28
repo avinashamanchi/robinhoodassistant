@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..db.models import LLMDecision
 from ..identity import canonical_request_id
+from ..security.sensitive_fields import sensitive_store
 from ..service import TradingService
 
 log = logging.getLogger(__name__)
@@ -291,16 +292,21 @@ class Agent:
     def _record(self, prompt, tool_calls, reply, resp) -> None:
         usage = getattr(resp, "usage", None)
         with self.session_factory() as s:
-            s.add(
-                LLMDecision(
-                    prompt=prompt,
-                    tool_calls_json=json.dumps(
+            row = LLMDecision(
+                model=self.model,
+                input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            )
+            sensitive_store(s, self.session_factory).write_many(
+                row,
+                {
+                    "prompt": prompt,
+                    "tool_calls_json": json.dumps(
                         [{"name": t["name"], "input": t["input"]} for t in tool_calls]
                     ),
-                    reasoning_summary=reply[:2000],
-                    model=self.model,
-                    input_tokens=getattr(usage, "input_tokens", 0) or 0,
-                    output_tokens=getattr(usage, "output_tokens", 0) or 0,
-                )
+                    "reasoning_summary": (
+                        reply[:2000] or "no final response"
+                    ),
+                },
             )
             s.commit()

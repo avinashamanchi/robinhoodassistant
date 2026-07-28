@@ -35,6 +35,7 @@ from trading_assistant.risk.submission_barrier import (
     SubmissionBarrier,
     serialized_writer,
 )
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 from .models import (
     RuleCommand,
@@ -255,16 +256,17 @@ def _audit(
     target_id: int,
     result_code: str,
 ) -> None:
-    session.add(
+    persist_sensitive(
+        session,
         AuditEvent(
             actor=actor,
             action=action,
             target_type=target_type,
             target_id=str(target_id),
             request_id=request_id,
-            reason=reason,
             result_code=result_code,
-        )
+        ),
+        {"reason": reason, "detail_json": "{}"},
     )
 
 

@@ -14,6 +14,7 @@ from trading_assistant.risk.breakers import (
     BreakerScope,
     BreakerService,
 )
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
@@ -207,14 +208,17 @@ def test_each_breaker_mutation_writes_an_audit_event(session_factory):
             .where(AuditEvent.target_id == scope.key)
             .order_by(AuditEvent.id)
         ).all()
+        store = sensitive_store(session)
+        reset_reason = store.read(events[1], "reason")
+        reset_detail = store.read(events[1], "detail_json")
 
     assert [event.action for event in events] == [
         "circuit_breaker.trip",
         "circuit_breaker.reset",
     ]
     assert [event.actor for event in events] == ["daemon", "operator:avi"]
-    assert events[1].reason == "spread normalized"
-    assert '"spread_pct": "0.2"' in events[1].detail_json
+    assert reset_reason == "spread normalized"
+    assert '"spread_pct": "0.2"' in reset_detail
 
 
 def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
@@ -264,14 +268,19 @@ def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
             )
             .order_by(AuditEvent.id.desc())
         ).first()
+        conflict_detail = (
+            sensitive_store(session).read(conflict, "detail_json")
+            if conflict is not None
+            else ""
+        )
 
     assert conflict is not None
     assert conflict.result_code == "conflict"
     assert f'"expected_generation": {observed.generation}' in (
-        conflict.detail_json
+        conflict_detail
     )
     assert f'"current_generation": {retripped.generation}' in (
-        conflict.detail_json
+        conflict_detail
     )
 
 

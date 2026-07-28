@@ -111,6 +111,7 @@ def test_valid_config_loads_and_normalizes(tmp_path):
     assert cfg.risk.require_broker_reconciled is True
     assert cfg.features.auto_execute_preapproved_rules is False
     assert cfg.execution.prefer_bracket_orders is False
+    assert cfg.encryption.backup_key_id == "local-backup-2026-07"
     assert cfg.security.session_hours == 8
     assert cfg.security.reauthentication_minutes == 5
     assert cfg.server.secure_cookies is True

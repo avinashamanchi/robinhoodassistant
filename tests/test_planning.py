@@ -61,6 +61,10 @@ from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.application import RuleApplicationService
 from trading_assistant.rules.repository import RuleRepository
 from trading_assistant.rules.worker import RuleWorker
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
 from trading_assistant.signals.models import MarketFeatures, Regime
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
@@ -1730,9 +1734,13 @@ def test_new_entry_fill_cancels_and_resizes_older_live_stop(
             broker_order_id="late-entry-with-live-stop-broker",
             acceptance_state=OrderStatus.FILLED.value,
         )
-        session.add(second_order)
-        session.flush()
-        session.add(
+        persist_sensitive(
+            session,
+            second_order,
+            {"approval_reason": "test fixture"},
+        )
+        persist_sensitive(
+            session,
             Proposal(
                 order_id=second_order.id,
                 source_rule_group_id=session.get(
@@ -1744,7 +1752,8 @@ def test_new_entry_fill_cancels_and_resizes_older_live_stop(
                 ttl_minutes=15,
                 expires_at=datetime.now(timezone.utc)
                 + timedelta(minutes=15),
-            )
+            ),
+            {"reasoning": "test fixture"},
         )
         session.add(
             Fill(
@@ -2625,6 +2634,15 @@ def test_cancel_plan_cancels_rules(make_service):
                 AuditEvent.request_id == "planning-cancel"
             )
         ).all()
+        store = sensitive_store(s)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
     assert [audit.action for audit in audits].count("plan.cancel") == 1
     assert [audit.action for audit in audits].count(
         "rule_group.cancel"
@@ -2632,10 +2650,7 @@ def test_cancel_plan_cancels_rules(make_service):
     assert [audit.action for audit in audits].count(
         "rule.cancel"
     ) == len(rules)
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             "operator:test",
             "cancel reviewed plan",
@@ -2742,6 +2757,15 @@ def test_plan_approval_retry_is_idempotent_and_lifecycle_audits_are_exact(
                 AuditEvent.request_id == context["request_id"]
             )
         ).all()
+        store = sensitive_store(session)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
     entry_count = sum(rule.kind == "entry" for rule in rules)
     assert len(group_ids) == entry_count + 1
     assert [audit.action for audit in audits].count("plan.approve") == 1
@@ -2751,10 +2775,7 @@ def test_plan_approval_retry_is_idempotent_and_lifecycle_audits_are_exact(
     assert [audit.action for audit in audits].count(
         "rule.create"
     ) == len(rules)
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             context["actor"],
             context["reason"],

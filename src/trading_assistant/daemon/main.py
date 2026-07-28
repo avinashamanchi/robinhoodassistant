@@ -44,7 +44,41 @@ def _build_monitor(
         secrets,
         runtime_role="daemon",
     )
+    try:
+        return _finish_monitor(
+            config,
+            secrets,
+            container=container,
+            historical_alpaca_client_factory=(
+                historical_alpaca_client_factory
+            ),
+            historical_coingecko_http=historical_coingecko_http,
+            historical_cache_dir=historical_cache_dir,
+        )
+    except BaseException:
+        guard = getattr(container, "runtime_tenure_guard", None)
+        if guard is not None and not guard.close():
+            raise RuntimeError(
+                "runtime_tenure_cleanup_uncertain"
+            ) from None
+        raise
+
+
+def _finish_monitor(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    container,
+    historical_alpaca_client_factory,
+    historical_coingecko_http,
+    historical_cache_dir,
+) -> Monitor:
     service = container.service
+    runtime_tenure_guard = getattr(
+        container,
+        "runtime_tenure_guard",
+        None,
+    )
     notifier = build_notifier(config, secrets)
     container.rule_worker.notifier = notifier
     shadow = None
@@ -143,6 +177,7 @@ def _build_monitor(
             "policy_store_maintenance",
             None,
         ),
+        runtime_tenure_guard=runtime_tenure_guard,
     )
 
 

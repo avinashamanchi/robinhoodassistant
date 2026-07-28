@@ -38,6 +38,10 @@ from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.staleness import (
     DEFAULT_MAX_FUTURE_SKEW_SECONDS,
 )
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
 
 
 def _mutation(reason):
@@ -46,6 +50,14 @@ def _mutation(reason):
         "reason": reason,
         "request_id": f"reconciliation-{reason.replace(' ', '-')}",
     }
+
+
+def _persist_order(session, order: Order) -> Order:
+    return persist_sensitive(
+        session,
+        order,
+        {"approval_reason": "test fixture"},
+    )
 
 
 def _submit(submission, order_id):
@@ -161,6 +173,15 @@ def test_panic_rule_and_group_cancellation_has_exact_atomic_audits(
                 ),
             )
         ).all()
+        store = sensitive_store(session)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
     assert stored_rule.state == "canceled"
     assert group.state == "canceled"
     assert {
@@ -170,10 +191,7 @@ def test_panic_rule_and_group_cancellation_has_exact_atomic_audits(
         ("rule.panic_cancel", str(rule["rule_id"])),
         ("rule_group.panic_cancel", str(group_id)),
     }
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             "operator:panic",
             "panic rule cancellation drill",
@@ -247,7 +265,7 @@ def test_panic_local_enumeration_includes_terminal_latch_and_orphan_fill(
             acceptance_state=FILL_RECONCILIATION_REQUIRED,
             last_error_code="waiting_for_exact_fill",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         quarantined = Fill(
             order_id=order.id,
@@ -522,19 +540,26 @@ def test_remote_canceled_status_has_transaction_local_exact_audit(
                 AuditEvent.target_id == str(order_id),
             )
         ).all()
+        store = sensitive_store(session)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
+        audit_detail = store.read(audits[0], "detail_json")
     assert order.status == OrderStatus.CANCELED.value
     assert len(audits) == 1
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             context["actor"],
             context["reason"],
             context["request_id"],
         )
     }
-    assert '"status"' in audits[0].detail_json
+    assert '"status"' in audit_detail
 
 
 def test_remote_status_mutation_rolls_back_when_audit_flush_fails(
@@ -659,7 +684,7 @@ def test_acceptance_recovery_keeps_broker_symbol_first_in_identity_check(
             notional=Decimal("100"),
             status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
         )
-        session.add(order)
+        _persist_order(session, order)
         session.commit()
         order_id = order.id
     broker._orders_by_key[order.idempotency_key] = OrderResult(
@@ -935,7 +960,7 @@ def test_acceptance_recovery_uses_canonical_fill_quantum(
             acceptance_state=initial_acceptance,
             submission_started_at=submitted_at,
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         if local_qty is not None:
             session.add(
@@ -1358,7 +1383,7 @@ def test_panic_keeps_broker_symbol_first_in_identity_check(make_service):
             broker_order_id="equity-direction-panic-broker",
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.commit()
         order_id = order.id
     remote = OrderResult(
@@ -1515,7 +1540,7 @@ def test_panic_never_guesses_a_cancel_id_for_unresolved_unknown(make_service):
             notional=Decimal("100"),
             status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
         )
-        session.add(unknown)
+        _persist_order(session, unknown)
         session.commit()
         unknown_id = unknown.id
 
@@ -1558,7 +1583,7 @@ def test_ordinary_reconciliation_keeps_broker_symbol_first_in_identity_check(
             broker_order_id="equity-direction-reconcile-broker",
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.commit()
         order_id = order.id
     remote = OrderResult(
@@ -1623,7 +1648,7 @@ def test_remote_open_order_matching_terminal_local_order_trips_drift_on_replay(
             broker_order_id=f"terminal-open-broker-{terminal_status.value}",
             acceptance_state="accepted",
         )
-        session.add(local)
+        _persist_order(session, local)
         session.commit()
         local_id = local.id
         broker_order_id = local.broker_order_id
@@ -1697,7 +1722,7 @@ def test_remote_open_order_with_conflicting_identity_trips_drift_on_replay(
             broker_order_id=broker_order_id,
             acceptance_state="accepted",
         )
-        session.add(local)
+        _persist_order(session, local)
         session.commit()
         local_id = local.id
     broker._orders_by_id[broker_order_id] = OrderResult(
@@ -1746,7 +1771,8 @@ def test_panic_remote_open_order_matching_terminal_local_order_trips_drift(
     )
     service = make_service(broker=broker)
     with service.session_factory() as session:
-        session.add(
+        _persist_order(
+            session,
             Order(
                 idempotency_key=remote.idempotency_key,
                 ticker="AAPL",
@@ -1829,6 +1855,15 @@ def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
                 ),
             )
         ).all()
+        store = sensitive_store(session)
+        audit_contexts = {
+            (
+                audit.actor,
+                store.read(audit, "reason"),
+                audit.request_id,
+            )
+            for audit in audits
+        }
     assert fill is not None
     assert {
         audit.action for audit in audits
@@ -1837,10 +1872,7 @@ def test_fill_cursor_and_order_mutations_have_exact_transaction_local_audits(
         "reconciliation_cursor.advance",
         "order.reconcile",
     }
-    assert {
-        (audit.actor, audit.reason, audit.request_id)
-        for audit in audits
-    } == {
+    assert audit_contexts == {
         (
             context["actor"],
             context["reason"],
@@ -2011,7 +2043,7 @@ def test_acceptance_recovery_never_clears_exact_quantity_overfill(
             last_error_code="waiting_for_exact_fill",
             submission_started_at=submitted_at,
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         order_id = order.id
         session.add_all(
@@ -2096,7 +2128,7 @@ def test_panic_never_clears_exact_quantity_overfill(make_service):
             last_error_code="waiting_for_exact_fill",
             submission_started_at=submitted_at,
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         order_id = order.id
         session.add_all(
@@ -2168,7 +2200,7 @@ def _crypto_order_with_remote_fill(
             submission_started_at=submitted_at,
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.commit()
         order_id = order.id
     remote = OrderResult(
@@ -2375,7 +2407,7 @@ def test_ordinary_reconciliation_uses_canonical_fill_quantum(
             ),
             submission_started_at=submitted_at,
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         order_id = order.id
         if local_qty is not None:
@@ -2914,7 +2946,7 @@ def test_crypto_precision_replay_is_noop_and_mutation_trips_drift(
             submission_started_at=submitted_at,
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.commit()
         order_id = order.id
         broker_order_id = order.broker_order_id
@@ -3249,7 +3281,7 @@ def test_partial_fill_expiration_preserves_pnl_and_releases_remainder(
             submission_started_at=now - timedelta(minutes=3),
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         session.add_all(
             [
@@ -3524,7 +3556,7 @@ def test_legacy_null_fill_is_quarantined_then_superseded_without_double_pnl(
             broker_order_id="legacy-null-fill-order",
             acceptance_state="accepted",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         session.add(
             Fill(
@@ -3646,7 +3678,7 @@ def test_pre_0005_supplied_fill_id_requires_exact_activity_then_replays_once(
             acceptance_state="fill_reconcile_required",
             last_error_code="legacy_unverified_fill",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         session.add(
             Fill(
@@ -3734,7 +3766,7 @@ def test_trusted_duplicate_replay_never_supersedes_additional_legacy_rows(
             acceptance_state="fill_reconcile_required",
             last_error_code="legacy_unverified_fill",
         )
-        session.add(order)
+        _persist_order(session, order)
         session.flush()
         for index in range(3):
             session.add(

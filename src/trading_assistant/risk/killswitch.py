@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..assets import AssetClass
 from ..db.models import CircuitBreakerState, RiskEvent
+from ..security.sensitive_fields import persist_sensitive
 from .breakers import (
     BreakerScope,
     trip_in_session,
@@ -77,11 +78,12 @@ class KillSwitch:
                     request_id=request_id,
                 )
                 if changed:
-                    session.add(
+                    persist_sensitive(
+                        session,
                         RiskEvent(
                             event_type="killswitch_trip",
-                            reason=f"[{scope.key}] {reason}",
-                        )
+                        ),
+                        {"reason": f"[{scope.key}] {reason}"},
                     )
                 session.commit()
             except BaseException:

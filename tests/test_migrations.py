@@ -1,5 +1,6 @@
 import json
 import hashlib
+import stat
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -33,6 +34,24 @@ from trading_assistant.db.session import (
 )
 from trading_assistant.orders.reconciliation import ReconciliationService
 from trading_assistant.orders.repository import OrderRepository
+from trading_assistant.ops.backup import read_encrypted_backup_header
+from trading_assistant.security.crypto import (
+    SensitiveDataCipher,
+    SensitiveFieldRef,
+)
+from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
+
+
+MIGRATION_BACKUP_KEY = b"m" * 32
+MIGRATION_BACKUP_KEY_ID = "migration-backup-key-2026"
+
+
+def _migration_backup_args(tmp_path: Path) -> dict[str, object]:
+    return {
+        "backup_key": MIGRATION_BACKUP_KEY,
+        "backup_key_id": MIGRATION_BACKUP_KEY_ID,
+        "backup_directory": tmp_path / "encrypted-migration-backups",
+    }
 
 
 def _url(path: Path) -> str:
@@ -115,6 +134,7 @@ def test_fresh_database_upgrades_to_head(tmp_path):
         "sensitive_migration_state",
         "candidate_nonces",
         "untrusted_ingest_events",
+        "runtime_tenures",
     } <= set(inspect(engine).get_table_names())
     assert "alembic_version" in inspect(engine).get_table_names()
     rule_columns = {
@@ -151,17 +171,82 @@ def test_fresh_database_upgrades_to_head(tmp_path):
     )
 
 
-def test_sensitive_trust_migration_is_successor_0013_and_preserves_not_null():
+def test_runtime_tenure_migration_is_successor_0014():
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
-    revision = script.get_revision("20260727_0013")
+    sensitive_revision = script.get_revision("20260727_0013")
+    tenure_revision = script.get_revision("20260727_0014")
 
-    assert script.get_current_head() == "20260727_0013"
-    assert revision is not None
-    assert revision.down_revision == "20260727_0012"
-    assert revision.path.endswith(
+    assert script.get_current_head() == "20260727_0014"
+    assert sensitive_revision is not None
+    assert sensitive_revision.down_revision == "20260727_0012"
+    assert sensitive_revision.path.endswith(
         "20260727_0013_sensitive_trust_state.py"
     )
+    assert tenure_revision is not None
+    assert tenure_revision.down_revision == "20260727_0013"
+    assert tenure_revision.path.endswith(
+        "20260727_0014_runtime_tenures.py"
+    )
+
+
+def test_runtime_tenure_schema_rejects_invalid_resource_role(tmp_path):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / "runtime-tenures-schema.db",
+        "head",
+    )
+    inspector = inspect(engine)
+
+    assert {
+        "resource_key",
+        "role",
+        "state",
+        "owner_id",
+        "generation",
+        "pid",
+        "process_start_identity",
+        "acquired_at",
+        "renewed_at",
+        "expires_at",
+        "released_at",
+    } == {
+        column["name"]
+        for column in inspector.get_columns("runtime_tenures")
+    }
+
+    with engine.begin() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO runtime_tenures "
+                    "(resource_key,role,state,owner_id,generation,pid,"
+                    "process_start_identity,acquired_at,renewed_at,"
+                    "expires_at,released_at) VALUES "
+                    "('runtime:app','daemon','held',"
+                    "'00000000-0000-4000-8000-000000000001',1,42,"
+                    "'stable-start','2026-07-27 12:00:00',"
+                    "'2026-07-27 12:00:00','2026-07-27 12:01:00',NULL)"
+                )
+            )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO runtime_tenures "
+                "(resource_key,role,state,owner_id,generation,pid,"
+                "process_start_identity,acquired_at,renewed_at,"
+                "expires_at,released_at) VALUES "
+                "('runtime:mcp','mcp','held',"
+                "'00000000-0000-4000-8000-000000000002',1,43,"
+                "'mcp-stable-start','2026-07-27 12:00:00',"
+                "'2026-07-27 12:00:00','2026-07-27 12:01:00',NULL)"
+            )
+        )
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM runtime_tenures "
+                "WHERE resource_key='runtime:mcp' AND role='mcp'"
+            )
+        ) == 1
 
 
 def test_sensitive_trust_schema_constraints_indexes_and_no_raw_text(tmp_path):
@@ -618,7 +703,7 @@ def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
         )
         with pytest.raises(
             RuntimeError,
-            match="^sensitive_trust_downgrade_blocked$",
+            match="^runtime_tenure_downgrade_blocked$",
         ):
             command.downgrade(cfg, "20260727_0012")
         blocker.commit()
@@ -631,7 +716,7 @@ def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0013"
+        ) == "20260727_0014"
         assert connection.scalar(
             text("SELECT count(*) FROM candidate_nonces")
         ) == 1
@@ -1449,7 +1534,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260727_0013"
+    assert version == "20260727_0014"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -1485,7 +1570,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260727_0013"
+        ) == "20260727_0014"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -1526,7 +1611,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260727_0013"
+    assert version == "20260727_0014"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")
@@ -1577,9 +1662,10 @@ def test_existing_unversioned_database_must_be_adopted(tmp_path):
     engine = _legacy_engine(path)
     with pytest.raises(SchemaOutOfDate, match="adopt-existing"):
         require_current_schema(engine)
-    backup = adopt_existing(engine)
-    assert backup.exists()
-    upgrade(engine)
+    backup_args = _migration_backup_args(tmp_path)
+    backup = adopt_existing(engine, **backup_args)
+    assert backup.path.exists()
+    upgrade(engine, **backup_args)
     require_current_schema(engine)
 
 
@@ -1590,81 +1676,41 @@ def test_adoption_backup_contains_committed_wal_rows(tmp_path):
         conn.execute(text("INSERT INTO orders "
                           "(idempotency_key,ticker,side,order_type,status,created_at,updated_at) "
                           "VALUES ('keep-me','AAPL','buy','market','proposed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
-    backup = adopt_existing(engine)
-    with create_db_engine(_url(backup)).connect() as conn:
-        assert conn.scalar(
-            text("SELECT count(*) FROM orders WHERE idempotency_key='keep-me'")
-        ) == 1
+    backup = adopt_existing(
+        engine,
+        **_migration_backup_args(tmp_path),
+    )
+    artifact = backup.path.read_bytes()
+    assert backup.verified is True
+    assert read_encrypted_backup_header(backup.path)["source_sha256"] == (
+        backup.source_sha256
+    )
+    assert b"SQLite format 3" not in artifact
+    assert b"keep-me" not in artifact
 
 
-def test_adoption_backup_does_not_follow_predictable_target_symlink(
-    tmp_path,
-    monkeypatch,
-):
-    from trading_assistant.db import migrate
-
+def test_adoption_requires_dedicated_encrypted_backup_key(tmp_path):
     path = tmp_path / "legacy.db"
     engine = _legacy_engine(path)
-    victim = tmp_path / "must-not-be-overwritten.txt"
-    victim.write_text("sentinel", encoding="utf-8")
-    frozen = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
 
-    class FrozenDateTime:
-        @classmethod
-        def now(cls, tz=None):
-            return frozen if tz is not None else frozen.replace(tzinfo=None)
-
-    monkeypatch.setattr(migrate, "datetime", FrozenDateTime)
-    predictable = path.with_name(
-        f"{path.name}.20260726T123456000000Z.pre-migration.bak"
-    )
-    predictable.symlink_to(victim)
-
-    backup = adopt_existing(engine)
-
-    assert backup != predictable
-    assert backup.exists()
-    assert not backup.is_symlink()
-    assert victim.read_text(encoding="utf-8") == "sentinel"
-    assert predictable.is_symlink()
-    assert not list(tmp_path.glob(f".{path.name}.migration-backup-*"))
+    with pytest.raises(
+        RuntimeError,
+        match="^encrypted_migration_backup_required$",
+    ):
+        adopt_existing(engine)
 
 
-def test_adoption_backup_publication_never_replaces_existing_name(
-    tmp_path,
-    monkeypatch,
-):
-    from trading_assistant.db import migrate
-
+def test_adoption_backup_is_private_and_leaves_no_plaintext_temp(tmp_path):
     path = tmp_path / "legacy.db"
     engine = _legacy_engine(path)
-    frozen = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
-
-    class FrozenDateTime:
-        @classmethod
-        def now(cls, tz=None):
-            return frozen if tz is not None else frozen.replace(tzinfo=None)
-
-    target_tokens = iter(("collision", "fresh"))
-
-    def token_hex(size):
-        if size == 16:
-            return "private-staging"
-        return next(target_tokens)
-
-    monkeypatch.setattr(migrate, "datetime", FrozenDateTime)
-    monkeypatch.setattr(migrate.secrets, "token_hex", token_hex)
-    collision = path.with_name(
-        f"{path.name}.20260726T123456000000Z.collision."
-        "pre-migration.bak"
+    backup = adopt_existing(
+        engine,
+        **_migration_backup_args(tmp_path),
     )
-    collision.write_text("sentinel", encoding="utf-8")
-
-    backup = adopt_existing(engine)
-
-    assert backup.name.endswith(".fresh.pre-migration.bak")
-    assert collision.read_text(encoding="utf-8") == "sentinel"
-    assert not list(tmp_path.glob(f".{path.name}.migration-backup-*"))
+    directory = backup.path.parent
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.path.stat().st_mode) == 0o600
+    assert list(directory.iterdir()) == [backup.path]
 
 
 def test_unknown_revision_is_rejected_at_startup(tmp_path):
@@ -1688,8 +1734,9 @@ def test_order_outbox_upgrade_preserves_and_maps_legacy_order(tmp_path):
             "VALUES ('legacy-approved','AAPL','buy','market','approved',"
             "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
         ))
-    adopt_existing(engine)
-    upgrade_backup = upgrade(engine)
+    backup_args = _migration_backup_args(tmp_path)
+    adopt_existing(engine, **backup_args)
+    upgrade_backup = upgrade(engine, **backup_args)
     assert upgrade_backup is not None
     with engine.connect() as conn:
         row = conn.execute(text(
@@ -2342,6 +2389,28 @@ def test_breaker_upgrade_resets_advanced_fill_cursor_for_full_recovery(
 
     broker = CursorAwareReplayBroker()
     factory = make_session_factory(engine)
+    cipher = SensitiveDataCipher(
+        {"migration-test-field-key": b"f" * 32},
+        active_key_id="migration-test-field-key",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE orders SET approval_reason=:reason WHERE id=1"
+            ),
+            {
+                "reason": cipher.encrypt(
+                    "legacy approval state",
+                    SensitiveFieldRef(
+                        "orders",
+                        "1",
+                        "approval_reason",
+                        1,
+                    ),
+                )
+            },
+        )
+    bind_sensitive_cipher(factory, cipher)
     reconciliation = ReconciliationService(
         factory,
         broker,

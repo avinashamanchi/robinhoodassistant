@@ -38,9 +38,25 @@ from .orders.reconciliation import ReconciliationService
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.submission import OrderSubmissionService
 from .operations import AuditRecorder, OperationsService
+from .ops.tenure import (
+    LocalProcessInspector,
+    ProcessIdentity,
+    RuntimeTenureGuard,
+    RuntimeTenureHandle,
+    RuntimeTenureService,
+    TenureGuardedBroker,
+    TenureUncertain,
+    install_runtime_mutation_barrier,
+)
 from .risk.breakers import BreakerService
 from .rules.worker import RuleWorker
+from .preflight import SensitiveEncryptionStateInspector
+from .security.crypto import (
+    SensitiveDataCipher,
+    build_sensitive_data_cipher,
+)
 from .security.secrets import RuntimeSecrets, secret_is_set
+from .security.sensitive_fields import bind_sensitive_cipher
 from .service import TradingService
 
 
@@ -48,6 +64,14 @@ from .service import TradingService
 class DatabaseRuntime:
     engine: Engine
     session_factory: sessionmaker[Session]
+
+
+class StartupEncryptionBlocked(RuntimeError):
+    """A stable, redacted local encryption prerequisite failed."""
+
+    def __init__(self, stable_code: str) -> None:
+        self.stable_code = stable_code
+        super().__init__(stable_code)
 
 
 @dataclass(frozen=True)
@@ -71,6 +95,8 @@ class ApplicationContainer:
     session_auth: SessionAuth
     audit: AuditRecorder
     operations: OperationsService
+    sensitive_cipher: SensitiveDataCipher | None = None
+    runtime_tenure_guard: RuntimeTenureGuard | None = None
 
 
 def prepare_database_runtime(
@@ -151,6 +177,10 @@ def build_container(
     secrets: RuntimeSecrets | None = None,
     *,
     runtime_role: str | None = None,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector=None,
+    tenure_clock=None,
+    tenure_owner_factory=None,
 ) -> ApplicationContainer:
     config = config or load_config()
     if secrets is None:
@@ -161,6 +191,10 @@ def build_container(
         config,
         secrets,
         runtime_role=runtime_role,
+        process_identity=process_identity,
+        process_inspector=process_inspector,
+        tenure_clock=tenure_clock,
+        tenure_owner_factory=tenure_owner_factory,
     )
 
 
@@ -177,6 +211,7 @@ def build_test_container(
         secrets,
         broker=broker,
         clock=clock,
+        enforce_runtime_tenure=False,
     )
 
 
@@ -187,13 +222,104 @@ def _build_container(
     runtime_role: str | None = None,
     broker: BrokerClient | None = None,
     clock=None,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector=None,
+    tenure_clock=None,
+    tenure_owner_factory=None,
+    enforce_runtime_tenure: bool = True,
 ) -> ApplicationContainer:
     _guard_runtime(config, secrets)
+    effective_role = runtime_role or "app"
+    if effective_role not in {"app", "daemon", "mcp"}:
+        raise ValueError("runtime_role_invalid")
     runtime = prepare_database_runtime(
         secrets,
-        runtime_role=runtime_role,
+        runtime_role=effective_role if enforce_runtime_tenure else None,
     )
     session_factory = runtime.session_factory
+    try:
+        sensitive_cipher = build_sensitive_data_cipher(
+            config.encryption,
+            secrets,
+        )
+    except Exception:
+        raise StartupEncryptionBlocked(
+            "sensitive_key_unavailable"
+        ) from None
+    bind_sensitive_cipher(session_factory, sensitive_cipher)
+    runtime_tenure: RuntimeTenureHandle | None = None
+    runtime_tenure_guard: RuntimeTenureGuard | None = None
+    if enforce_runtime_tenure:
+        inspector = process_inspector or LocalProcessInspector()
+        identity = process_identity
+        if identity is None:
+            try:
+                identity = inspector.current()
+            except Exception:
+                raise TenureUncertain() from None
+        service_kwargs = {"process_inspector": inspector}
+        if tenure_clock is not None:
+            service_kwargs["clock"] = tenure_clock
+        if tenure_owner_factory is not None:
+            service_kwargs["owner_factory"] = tenure_owner_factory
+        runtime_tenure = RuntimeTenureService(
+            session_factory,
+            **service_kwargs,
+        ).acquire_runtime(
+            effective_role,
+            identity,
+            ttl_seconds=30,
+        )
+        runtime_tenure_guard = RuntimeTenureGuard(
+            runtime_tenure,
+            ttl_seconds=30,
+            renewal_interval_seconds=5,
+        )
+        runtime_tenure_guard.start()
+        install_runtime_mutation_barrier(
+            runtime.engine,
+            runtime_tenure_guard,
+        )
+    try:
+        return _finish_container(
+            config,
+            secrets,
+            runtime=runtime,
+            runtime_role=effective_role,
+            broker=broker,
+            clock=clock,
+            sensitive_cipher=sensitive_cipher,
+            runtime_tenure_guard=runtime_tenure_guard,
+        )
+    except BaseException:
+        if runtime_tenure_guard is not None:
+            if not runtime_tenure_guard.close():
+                raise TenureUncertain() from None
+        raise
+
+
+def _finish_container(
+    config: AppConfig,
+    secrets: RuntimeSecrets,
+    *,
+    runtime: DatabaseRuntime,
+    runtime_role: str,
+    broker: BrokerClient | None,
+    clock,
+    sensitive_cipher: SensitiveDataCipher | None,
+    runtime_tenure_guard: RuntimeTenureGuard | None,
+) -> ApplicationContainer:
+    session_factory = runtime.session_factory
+    if runtime_tenure_guard is not None:
+        runtime_tenure_guard.ensure_owned()
+        check = SensitiveEncryptionStateInspector(
+            runtime.engine,
+            schema_version=config.encryption.schema_version,
+            active_key_id=config.encryption.active_key_id,
+            cipher=sensitive_cipher,
+        ).inspect()
+        if not check.passed:
+            raise StartupEncryptionBlocked(check.code)
     rate_limiter = DurableRateLimiter(session_factory)
     leases = ConcurrencyLeaseService(session_factory)
     policy_store_maintenance = PolicyStoreMaintenance(
@@ -204,6 +330,8 @@ def _build_container(
         source="startup",
         limit=500,
     )
+    if runtime_tenure_guard is not None:
+        runtime_tenure_guard.ensure_owned()
     provider_budget = build_provider_budget_service(
         config,
         session_factory,
@@ -211,8 +339,17 @@ def _build_container(
 
     production_broker = broker is None
     if broker is None:
+        if runtime_tenure_guard is not None:
+            runtime_tenure_guard.ensure_owned()
         broker = build_broker(config, secrets)
+        if runtime_tenure_guard is not None:
+            runtime_tenure_guard.ensure_owned()
         _arm_production_paper_broker(broker)
+        if runtime_tenure_guard is not None:
+            broker = TenureGuardedBroker(
+                broker,
+                runtime_tenure_guard,
+            )
     if clock is None:
         clock = build_clock(config, secrets)
     service = TradingService(
@@ -224,7 +361,9 @@ def _build_container(
         require_startup_reconciliation=production_broker,
     )
     if production_broker:
-        startup_actor = f"runtime:{runtime_role or 'bootstrap'}"
+        if runtime_tenure_guard is not None:
+            runtime_tenure_guard.ensure_owned()
+        startup_actor = f"runtime:{runtime_role}"
         generation = service.require_startup_reconciliation(
             actor=startup_actor,
             reason="production process startup requires fresh broker truth",
@@ -237,6 +376,8 @@ def _build_container(
                 reason="production process startup broker reconciliation",
                 request_id=uuid4().hex,
             )
+            if runtime_tenure_guard is not None:
+                runtime_tenure_guard.ensure_owned()
         except StartupReconciliationFailed:
             if runtime_role != "app":
                 raise
@@ -289,4 +430,6 @@ def _build_container(
         session_auth=session_auth,
         audit=audit,
         operations=operations,
+        sensitive_cipher=sensitive_cipher,
+        runtime_tenure_guard=runtime_tenure_guard,
     )

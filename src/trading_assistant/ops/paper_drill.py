@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from decimal import ROUND_UP, Decimal
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -19,17 +20,39 @@ class PaperDrillError(RuntimeError):
     """The paper drill could not complete without weakening a safety guardrail."""
 
 
+@contextmanager
 def build_paper_service(
     config: AppConfig,
     secrets: RuntimeSecrets,
-) -> "TradingService":
+):
     from ..bootstrap import build_container
 
-    return build_container(
+    container = build_container(
         config,
         secrets,
-        runtime_role="paper-drill",
-    ).service
+        runtime_role="app",
+    )
+    primary_failure = False
+    try:
+        yield container.service
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        guard = getattr(container, "runtime_tenure_guard", None)
+        if guard is not None:
+            try:
+                released = guard.close()
+            except BaseException:
+                if not primary_failure:
+                    raise RuntimeError(
+                        "runtime_tenure_cleanup_uncertain"
+                    ) from None
+            else:
+                if not released and not primary_failure:
+                    raise RuntimeError(
+                        "runtime_tenure_cleanup_uncertain"
+                    )
 
 
 def run_paper_drill(
@@ -144,12 +167,13 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     secrets = load_role_secrets("paper-drill", config=config)
     with runtime_startup("paper-drill", secrets):
-        result = run_paper_drill(
-            config,
-            build_paper_service(config, secrets),
-            symbol=args.symbol.upper(),
-            test_notional=args.notional,
-        )
+        with build_paper_service(config, secrets) as service:
+            result = run_paper_drill(
+                config,
+                service,
+                symbol=args.symbol.upper(),
+                test_notional=args.notional,
+            )
         print(result)
         return 0
 

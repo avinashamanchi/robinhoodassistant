@@ -32,6 +32,7 @@ from trading_assistant.db.models import (
 from trading_assistant.dependencies import RequiredDependencyUnavailable
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.signals.models import MarketFeatures, Regime
+from tests.conftest import decrypt_test_sensitive
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
 CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
@@ -239,7 +240,7 @@ def test_analyze_and_plan_flow(client):
             .one()
         )
     assert create_audit.actor == "operator:local"
-    assert create_audit.reason == "review AAPL planning inputs"
+    assert decrypt_test_sensitive(create_audit, "reason") == "review AAPL planning inputs"
     assert create_audit.request_id == response.headers["X-Request-ID"]
 
     assert any(p["plan_id"] == pid for p in c.get("/plans").json()["plans"])
@@ -262,7 +263,7 @@ def test_analyze_and_plan_flow(client):
             .one()
         )
     assert audit.actor == "operator:local"
-    assert audit.reason == "reviewed plan"
+    assert decrypt_test_sensitive(audit, "reason") == "reviewed plan"
     assert audit.request_id == approve_response.headers["X-Request-ID"]
 
     cancel_response = c.post(
@@ -279,7 +280,7 @@ def test_analyze_and_plan_flow(client):
             .one()
         )
     assert audit.actor == "operator:local"
-    assert audit.reason == "review complete"
+    assert decrypt_test_sensitive(audit, "reason") == "review complete"
     assert audit.request_id == cancel_response.headers["X-Request-ID"]
 
 
@@ -496,7 +497,7 @@ def test_propose_generates_plans(client):
         ).all()
     assert len(audits) == len(plan_ids)
     assert {
-        (audit.actor, audit.reason, audit.request_id)
+        (audit.actor, decrypt_test_sensitive(audit, "reason"), audit.request_id)
         for audit in audits
     } == {
         (
@@ -550,7 +551,7 @@ def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
     assert {
         (
             audit.actor,
-            audit.reason,
+            decrypt_test_sensitive(audit, "reason"),
             audit.target_type,
         )
         for audit in audits
@@ -562,7 +563,7 @@ def test_propose_returns_fixed_failure_code_without_provider_class_or_text(
         )
     }
     assert {
-        audit.detail_json for audit in audits
+        decrypt_test_sensitive(audit, "detail_json") for audit in audits
     } == {
         json.dumps({"stage": "analysis"}, sort_keys=True)
     }
@@ -613,11 +614,11 @@ def test_analyze_returns_stable_error_without_provider_class_or_text(
             request_id=response.headers["X-Request-ID"],
         ).one()
     assert audit.actor == "operator:local"
-    assert audit.reason == "provider failure plan probe"
+    assert decrypt_test_sensitive(audit, "reason") == "provider failure plan probe"
     assert audit.target_type == "trade_plan"
     assert audit.target_id == "AAPL"
     assert audit.result_code == "dependency_unavailable"
-    assert json.loads(audit.detail_json) == {"stage": "analysis"}
+    assert json.loads(decrypt_test_sensitive(audit, "detail_json")) == {"stage": "analysis"}
     assert "provider-secret-plan-analysis" not in str(audit)
 
 
@@ -700,19 +701,19 @@ def test_required_snapshot_clock_outage_preserves_route_contract_and_redacts_pro
         ).all()
         persisted_plans = session.query(TradePlanRow).count()
         risk_text = "\n".join(
-            event.reason for event in session.query(RiskEvent).all()
+            decrypt_test_sensitive(event, "reason") for event in session.query(RiskEvent).all()
         )
         breaker_text = "\n".join(
-            state.reason
+            decrypt_test_sensitive(state, "reason")
             for state in session.query(CircuitBreakerState).all()
         )
     assert {failure.target_id for failure in failures} == expected_targets
     assert {
         (
             failure.actor,
-            failure.reason,
+            decrypt_test_sensitive(failure, "reason"),
             failure.target_type,
-            failure.detail_json,
+            decrypt_test_sensitive(failure, "detail_json"),
         )
         for failure in failures
     } == {
@@ -727,7 +728,7 @@ def test_required_snapshot_clock_outage_preserves_route_contract_and_redacts_pro
     exposed = "\n".join(
         (
             response.text,
-            "\n".join(failure.detail_json for failure in failures),
+            "\n".join(decrypt_test_sensitive(failure, "detail_json") for failure in failures),
             risk_text,
             breaker_text,
             caplog.text,
@@ -806,15 +807,15 @@ def test_planning_workflows_reject_future_market_boundary_with_large_loss(
         ).all()
         assert session.query(TradePlanRow).count() == 0
         risk_text = "\n".join(
-            event.reason for event in session.query(RiskEvent).all()
+            decrypt_test_sensitive(event, "reason") for event in session.query(RiskEvent).all()
         )
         breaker_text = "\n".join(
-            state.reason
+            decrypt_test_sensitive(state, "reason")
             for state in session.query(CircuitBreakerState).all()
         )
     assert {failure.target_id for failure in failures} == expected_targets
     assert {
-        (failure.actor, failure.reason, failure.detail_json)
+        (failure.actor, decrypt_test_sensitive(failure, "reason"), decrypt_test_sensitive(failure, "detail_json"))
         for failure in failures
     } == {
         (
@@ -826,7 +827,7 @@ def test_planning_workflows_reject_future_market_boundary_with_large_loss(
     exposed = "\n".join(
         (
             response.text,
-            "\n".join(failure.detail_json for failure in failures),
+            "\n".join(decrypt_test_sensitive(failure, "detail_json") for failure in failures),
             risk_text,
             breaker_text,
             caplog.text,
@@ -907,7 +908,7 @@ def test_planning_workflows_reject_malformed_alpaca_calendar_and_redact_provider
         assert session.query(TradePlanRow).count() == 0
     assert {failure.target_id for failure in failures} == expected_targets
     assert {
-        (failure.actor, failure.reason, failure.detail_json)
+        (failure.actor, decrypt_test_sensitive(failure, "reason"), decrypt_test_sensitive(failure, "detail_json"))
         for failure in failures
     } == {
         (
@@ -919,7 +920,7 @@ def test_planning_workflows_reject_malformed_alpaca_calendar_and_redact_provider
     exposed = "\n".join(
         (
             response.text,
-            "\n".join(failure.detail_json for failure in failures),
+            "\n".join(decrypt_test_sensitive(failure, "detail_json") for failure in failures),
             caplog.text,
         )
     )

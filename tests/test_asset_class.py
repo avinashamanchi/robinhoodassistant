@@ -21,6 +21,7 @@ from trading_assistant.risk.pnl import (
     most_recent_daily_boundary,
     realized_pnl_today,
 )
+from tests.conftest import bind_test_sensitive_factory
 
 EQ = AssetClass.EQUITY
 CR = AssetClass.CRYPTO
@@ -41,7 +42,7 @@ def test_broker_symbol_equivalence_is_directional_from_local_canonical_form():
 
 # ── kill switch independence ────────────────────────────────────
 def test_kill_switches_trip_independently(engine):
-    f = make_session_factory(engine)
+    f = bind_test_sensitive_factory(make_session_factory(engine))
     with f() as s:
         KillSwitch.trip(
             s,
@@ -57,7 +58,7 @@ def test_kill_switches_trip_independently(engine):
 
 
 def test_crypto_trip_does_not_touch_equity(engine):
-    f = make_session_factory(engine)
+    f = bind_test_sensitive_factory(make_session_factory(engine))
     with f() as s:
         KillSwitch.trip(
             s,
@@ -73,7 +74,7 @@ def test_crypto_trip_does_not_touch_equity(engine):
 
 
 def test_compatibility_reset_cannot_clear_either_asset_class(engine):
-    f = make_session_factory(engine)
+    f = bind_test_sensitive_factory(make_session_factory(engine))
     with f() as s:
         KillSwitch.trip(
             s,
@@ -108,7 +109,7 @@ def test_compatibility_reset_cannot_clear_either_asset_class(engine):
 
 def test_default_asset_class_is_equity(engine):
     """Pre-Phase-7 call style (no asset_class) still targets equity."""
-    f = make_session_factory(engine)
+    f = bind_test_sensitive_factory(make_session_factory(engine))
     with f() as s:
         KillSwitch.trip(
             s,
@@ -123,7 +124,7 @@ def test_default_asset_class_is_equity(engine):
 
 
 def test_crypto_trip_persists_across_restart(db_url, engine):
-    f = make_session_factory(engine)
+    f = bind_test_sensitive_factory(make_session_factory(engine))
     with f() as s:
         KillSwitch.trip(
             s,
@@ -134,7 +135,10 @@ def test_crypto_trip_persists_across_restart(db_url, engine):
         )
         s.commit()
     engine2 = create_db_engine(db_url)
-    with make_session_factory(engine2)() as s:
+    restarted = bind_test_sensitive_factory(
+        make_session_factory(engine2)
+    )
+    with restarted() as s:
         assert KillSwitch.is_tripped(s, CR) is True
         assert KillSwitch.is_tripped(s, EQ) is False
 

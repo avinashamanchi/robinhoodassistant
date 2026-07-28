@@ -14,6 +14,7 @@ from trading_assistant.daemon import rules_engine
 from trading_assistant.daemon.monitor import Monitor
 from trading_assistant.db.models import Order, Rule, TradePlanRow
 from trading_assistant.notifications.base import NullNotifier
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 
 def _add_rule(svc, **kw):
@@ -29,16 +30,16 @@ def _add_rule(svc, **kw):
     if plan_id is not None:
         with svc.session_factory() as session:
             if session.get(TradePlanRow, plan_id) is None:
-                session.add(
+                persist_sensitive(
+                    session,
                     TradePlanRow(
                         id=plan_id,
                         symbol=ticker,
                         action="buy",
                         status="approved",
                         paper_only=True,
-                        plan_json="{}",
-                        sized_json="{}",
-                    )
+                    ),
+                    {"plan_json": "{}", "sized_json": "{}"},
                 )
                 session.commit()
     if kind == "time":
@@ -274,7 +275,8 @@ def test_full_exit_reserves_all_live_pending_same_side_orders(
         condition_json=json.dumps({"price_below": 95}),
     )
     with svc.session_factory() as session:
-        session.add(
+        persist_sensitive(
+            session,
             Order(
                 idempotency_key=f"reserved-{status}",
                 ticker="AAPL",
@@ -282,7 +284,8 @@ def test_full_exit_reserves_all_live_pending_same_side_orders(
                 order_type="market",
                 qty=reserved_qty,
                 status=status,
-            )
+            ),
+            {"approval_reason": "test fixture"},
         )
         session.commit()
     broker.set_price("AAPL", Decimal("90"))

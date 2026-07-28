@@ -13,6 +13,7 @@ from trading_assistant.db.models import Fill, Heartbeat, Order, utcnow
 from trading_assistant.orders.safety_state import (
     read_persisted_safety_truth,
 )
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 
 def _terminal_order(session_factory, key: str) -> int:
@@ -26,7 +27,11 @@ def _terminal_order(session_factory, key: str) -> int:
             status=OrderStatus.FILLED.value,
             acceptance_state="accepted",
         )
-        session.add(order)
+        persist_sensitive(
+            session,
+            order,
+            {"approval_reason": "safety state fixture"},
+        )
         session.commit()
         return order.id
 

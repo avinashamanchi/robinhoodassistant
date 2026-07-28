@@ -23,6 +23,7 @@ from ..config import live_trading_enabled
 from ..db.models import AuditEvent, TradePlanRow, utcnow
 from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
+from ..security.sensitive_fields import sensitive_store
 from ..rules.models import RuleCommand
 from ..signals.models import MarketFeatures
 from .models import PlanAction, TradePlan
@@ -113,25 +114,32 @@ class PlanningService:
                 symbol=plan.symbol,
                 action=plan.action.value,
                 status="proposed",
-                plan_json=plan.model_dump_json(),
-                sized_json=json.dumps(sized.to_dict()),
             )
-            s.add(row)
-            s.flush()
-            s.add(
-                AuditEvent(
-                    actor=actor,
-                    action="plan.create",
-                    target_type="trade_plan",
-                    target_id=str(row.id),
-                    request_id=request_id,
-                    reason=reason,
-                    result_code="proposed",
-                    detail_json=json.dumps(
+            store = sensitive_store(s, self.service.session_factory)
+            store.write_many(
+                row,
+                {
+                    "plan_json": plan.model_dump_json(),
+                    "sized_json": json.dumps(sized.to_dict()),
+                },
+            )
+            audit = AuditEvent(
+                actor=actor,
+                action="plan.create",
+                target_type="trade_plan",
+                target_id=str(row.id),
+                request_id=request_id,
+                result_code="proposed",
+            )
+            store.write_many(
+                audit,
+                {
+                    "reason": reason,
+                    "detail_json": json.dumps(
                         {"symbol": plan.symbol},
                         sort_keys=True,
                     ),
-                )
+                },
             )
             s.commit()
             return row.id
@@ -160,8 +168,11 @@ class PlanningService:
                 return {"plan_id": plan_id, "status": row.status,
                         "error": "only proposed plans can be approved"}
 
-            plan = TradePlan.model_validate_json(row.plan_json)
-            sized = json.loads(row.sized_json)
+            store = sensitive_store(s, self.service.session_factory)
+            plan = TradePlan.model_validate_json(
+                store.read(row, "plan_json")
+            )
+            sized = json.loads(store.read(row, "sized_json"))
             if plan.action not in (PlanAction.BUY, PlanAction.SELL) or Decimal(sized["total_shares"]) <= 0:
                 return {"plan_id": plan_id, "error": "plan has no sized entry to approve"}
 
@@ -213,16 +224,20 @@ class PlanningService:
                     request_id=request_id,
                     plan_id=plan_id,
                 )
-                s.add(
-                    AuditEvent(
-                        actor=actor,
-                        action="plan.approve",
-                        target_type="trade_plan",
-                        target_id=str(plan_id),
-                        request_id=request_id,
-                        reason=reason,
-                        result_code="approved",
-                    )
+                audit = AuditEvent(
+                    actor=actor,
+                    action="plan.approve",
+                    target_type="trade_plan",
+                    target_id=str(plan_id),
+                    request_id=request_id,
+                    result_code="approved",
+                )
+                sensitive_store(
+                    s,
+                    self.service.session_factory,
+                ).write_many(
+                    audit,
+                    {"reason": reason, "detail_json": "{}"},
                 )
                 s.commit()
                 return {
@@ -486,5 +501,10 @@ class PlanningService:
             return {
                 "plan_id": row.id, "symbol": row.symbol, "status": row.status,
                 "paper_only": row.paper_only,
-                "plan": json.loads(row.plan_json), "sized": json.loads(row.sized_json),
+                "plan": json.loads(
+                    sensitive_store(s).read(row, "plan_json")
+                ),
+                "sized": json.loads(
+                    sensitive_store(s).read(row, "sized_json")
+                ),
             }

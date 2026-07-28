@@ -16,6 +16,7 @@ from sqlalchemy import select
 from trading_assistant.broker.models import OrderStatus
 from trading_assistant.db.models import AuditEvent, Order, Proposal, utcnow
 from trading_assistant.risk.killswitch import KillSwitch
+from tests.conftest import decrypt_test_sensitive
 
 
 def _propose(svc, **kw):
@@ -50,7 +51,10 @@ def test_approve_runs_final_risk_check_then_submits(make_service):
     with svc.session_factory() as session:
         order = session.get(Order, order_id)
         assert order.approval_actor == "operator:test"
-        assert order.approval_reason == "test approval"
+        assert decrypt_test_sensitive(
+            order,
+            "approval_reason",
+        ) == "test approval"
         assert session.query(AuditEvent).filter_by(action="order.approve").count() == 1
 
 

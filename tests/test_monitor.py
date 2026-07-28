@@ -19,7 +19,9 @@ from trading_assistant.config import Secrets
 from trading_assistant.daemon.monitor import Monitor
 from trading_assistant.db.models import AuditEvent
 from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
+from trading_assistant.ops.tenure import TenureLost, TenureUncertain
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 def _rule(svc, cond, action=None):
@@ -52,8 +54,9 @@ def test_trigger_creates_proposal_and_notifies(make_service):
             action="order.propose",
             target_id=str(acted[0]["proposal"]["order_id"]),
         ).one()
+        audit_reason = sensitive_store(session).read(audit, "reason")
     assert audit.actor == "daemon:rules"
-    assert audit.reason == "daemon conditional rule evaluation"
+    assert audit_reason == "daemon conditional rule evaluation"
     assert audit.request_id
 
 
@@ -1315,3 +1318,64 @@ def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
     state = svc.breakers.get(BreakerScope.operator_global())
     assert state is not None and state.tripped is True
     assert state.actor == "daemon:startup"
+
+
+def test_daemon_tenure_loss_exits_before_startup_reconciliation(
+    make_service,
+):
+    calls: list[str] = []
+
+    class LostGuard:
+        def start(self):
+            calls.append("start")
+
+        def ensure_owned(self):
+            calls.append("ensure")
+            raise TenureLost()
+
+        def close(self):
+            calls.append("close")
+            return False
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        runtime_tenure_guard=LostGuard(),
+    )
+    monitor.reconcile = lambda: calls.append("reconcile")
+
+    with pytest.raises(TenureLost):
+        asyncio.run(monitor.run(asyncio.Event()))
+
+    assert calls == ["ensure", "close"]
+
+
+def test_daemon_normal_exit_fails_closed_when_release_is_uncertain(
+    make_service,
+):
+    calls: list[str] = []
+
+    class UncertainReleaseGuard:
+        def ensure_owned(self):
+            calls.append("ensure")
+
+        def close(self):
+            calls.append("close")
+            return False
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        runtime_tenure_guard=UncertainReleaseGuard(),
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    stop = asyncio.Event()
+    stop.set()
+
+    with pytest.raises(TenureUncertain):
+        asyncio.run(monitor.run(stop))
+
+    assert calls == ["ensure", "close"]

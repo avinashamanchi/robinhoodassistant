@@ -30,6 +30,8 @@ from trading_assistant.rules.application import RuleApplicationService
 from trading_assistant.rules.models import RuleCommand
 from trading_assistant.rules.repository import RuleRepository
 from trading_assistant.rules.worker import RuleWorker
+from trading_assistant.security.sensitive_fields import persist_sensitive
+from tests.conftest import decrypt_test_sensitive
 
 NOW = datetime(2026, 7, 24, 12, tzinfo=timezone.utc)
 DEFAULT_RULE_CONTEXT = {
@@ -255,7 +257,11 @@ def test_rule_lease_and_terminal_mutations_have_exact_per_target_audits(
         ("rule.cancel", "rule", str(rule_ids[1])),
     }
     assert {
-        (audit.actor, audit.reason, audit.request_id)
+        (
+            audit.actor,
+            decrypt_test_sensitive(audit, "reason"),
+            audit.request_id,
+        )
         for audit in audits
     } == {
         (
@@ -418,8 +424,14 @@ def test_rejected_rule_proposal_audit_preserves_operation_reason(
             )
         )
     assert proposal_audit.actor == "daemon:rejected-worker"
-    assert proposal_audit.reason == "evaluate rejected conditional rule"
-    assert "circuit breaker" not in proposal_audit.reason
+    assert decrypt_test_sensitive(
+        proposal_audit,
+        "reason",
+    ) == "evaluate rejected conditional rule"
+    assert "circuit breaker" not in decrypt_test_sensitive(
+        proposal_audit,
+        "reason",
+    )
 
 
 def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
@@ -442,14 +454,19 @@ def test_reconciliation_required_blocks_expired_recovery_until_client_id_truth(
             notional=Decimal("100"),
             status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
         )
-        session.add(order)
-        session.flush()
-        session.add(
+        persist_sensitive(
+            session,
+            order,
+            {"approval_reason": "rule reconciliation fixture"},
+        )
+        persist_sensitive(
+            session,
             Proposal(
                 order_id=order.id,
                 source_rule_group_id=group_id,
                 expires_at=NOW + timedelta(minutes=15),
-            )
+            ),
+            {"reasoning": "rule acceptance unknown fixture"},
         )
         session.commit()
 

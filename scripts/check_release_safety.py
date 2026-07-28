@@ -166,6 +166,50 @@ def _check_submission_paths(root: Path) -> None:
     for path in runtime.rglob("*.py"):
         relative = path.relative_to(root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        tenure_guarded_delegates: set[int] = set()
+        if relative == "src/trading_assistant/ops/tenure.py":
+            for class_node in tree.body:
+                if not (
+                    isinstance(class_node, ast.ClassDef)
+                    and class_node.name == "TenureGuardedBroker"
+                ):
+                    continue
+                for function in class_node.body:
+                    if not (
+                        isinstance(function, ast.FunctionDef)
+                        and function.name in submit_methods
+                    ):
+                        continue
+                    guarded = any(
+                        isinstance(candidate, ast.Call)
+                        and isinstance(candidate.func, ast.Attribute)
+                        and candidate.func.attr == "ensure_owned"
+                        and isinstance(candidate.func.value, ast.Attribute)
+                        and candidate.func.value.attr == "_guard"
+                        and isinstance(candidate.func.value.value, ast.Name)
+                        and candidate.func.value.value.id == "self"
+                        for candidate in ast.walk(function)
+                    )
+                    if not guarded:
+                        continue
+                    for candidate in ast.walk(function):
+                        if not (
+                            isinstance(candidate, ast.Call)
+                            and isinstance(candidate.func, ast.Attribute)
+                            and candidate.func.attr == function.name
+                            and isinstance(
+                                candidate.func.value,
+                                ast.Attribute,
+                            )
+                            and candidate.func.value.attr == "_broker"
+                            and isinstance(
+                                candidate.func.value.value,
+                                ast.Name,
+                            )
+                            and candidate.func.value.value.id == "self"
+                        ):
+                            continue
+                        tenure_guarded_delegates.add(candidate.lineno)
         aliases = _call_aliases(
             tree,
             submit_methods,
@@ -190,6 +234,11 @@ def _check_submission_paths(root: Path) -> None:
             if not (direct or aliased or via_getattr):
                 continue
             allowed_call = relative in allowed
+            if (
+                relative == "src/trading_assistant/ops/tenure.py"
+                and node.lineno in tenure_guarded_delegates
+            ):
+                allowed_call = True
             if relative == "src/trading_assistant/ops/safety_drill.py":
                 delegate = (
                     node.func.value
@@ -873,6 +922,33 @@ def _check_no_tracked_secret_files(root: Path) -> None:
         _fail("tracked secret-bearing file: " + ", ".join(offenders))
 
 
+def _check_sensitive_field_writes(root: Path) -> None:
+    source_root = root / "src" / "trading_assistant"
+    if not source_root.exists():
+        return
+    project_src = DEFAULT_ROOT / "src"
+    if str(project_src) not in sys.path:
+        sys.path.insert(0, str(project_src))
+    from trading_assistant.security.sensitive_write_scan import (
+        scan_sensitive_writes,
+    )
+
+    allowed = {
+        source_root / "security" / "sensitive_fields.py",
+        source_root / "ops" / "encrypt_sensitive.py",
+    }
+    offenders = scan_sensitive_writes(
+        path
+        for path in source_root.rglob("*.py")
+        if path not in allowed
+    )
+    if offenders:
+        _fail(
+            "sensitive field write bypass: "
+            + ", ".join(offenders)
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -888,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         _check_llm_escape_paths,
         _check_llm_construction_paths,
         _check_no_deleted_rate_limiter_import,
+        _check_sensitive_field_writes,
         _check_no_tracked_secret_files,
     )
     try:

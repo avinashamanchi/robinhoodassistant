@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -48,6 +49,11 @@ from trading_assistant.ops.safety_drill import (
 import trading_assistant.ops.safety_drill as safety_drill_module
 from trading_assistant.risk.clock import FakeClock
 from trading_assistant.rules.repository import RuleRepository
+from trading_assistant.security.crypto import SensitiveDataCipher
+from trading_assistant.security.sensitive_fields import (
+    bind_sensitive_cipher,
+    persist_sensitive,
+)
 from trading_assistant.security.secrets import RuntimeSecrets
 from trading_assistant.service import TradingService
 
@@ -58,6 +64,10 @@ _PAPER_PREEXISTING_SUBMITTED_AT = datetime(
     12,
     31,
     tzinfo=timezone.utc,
+)
+_DRILL_CIPHER = SensitiveDataCipher(
+    {"local-primary-2026-07": b"d" * 32},
+    active_key_id="local-primary-2026-07",
 )
 
 
@@ -125,7 +135,17 @@ def test_drill_copy_secrets_preserve_secretstr_masking(
 def _runtime_secrets_from_test_environment(
     base: RuntimeSecrets | None = None,
 ) -> RuntimeSecrets:
-    values = {}
+    current = base or RuntimeSecrets()
+    values = {
+        "field_encryption_keys": (
+            current.field_encryption_keys
+            or {
+                "local-primary-2026-07": base64.b64encode(
+                    b"d" * 32
+                ).decode("ascii")
+            }
+        )
+    }
     for env_name, field_name in (
         ("DATABASE_URL", "database_url"),
         ("APP_API_TOKEN", "app_api_token"),
@@ -136,7 +156,7 @@ def _runtime_secrets_from_test_environment(
         value = os.environ.get(env_name)
         if value is not None:
             values[field_name] = value
-    return (base or RuntimeSecrets()).model_copy(update=values)
+    return current.model_copy(update=values)
 
 
 def run_safety_drill(**kwargs):
@@ -1651,7 +1671,9 @@ class PaperStateBroker(AlpacaBroker):
 
 def _seed_preexisting_paper_order(primary: Path) -> None:
     engine = create_db_engine(f"sqlite:///{primary}")
-    with make_session_factory(engine)() as session:
+    factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, _DRILL_CIPHER)
+    with factory() as session:
         open_order = Order(
             idempotency_key="paper-preexisting-client",
             ticker="AAPL",
@@ -1678,8 +1700,16 @@ def _seed_preexisting_paper_order(primary: Path) -> None:
             created_at=_PAPER_PREEXISTING_SUBMITTED_AT,
             updated_at=_PAPER_PREEXISTING_SUBMITTED_AT,
         )
-        session.add_all((open_order, historical))
-        session.flush()
+        persist_sensitive(
+            session,
+            open_order,
+            {"approval_reason": "preexisting open paper order"},
+        )
+        persist_sensitive(
+            session,
+            historical,
+            {"approval_reason": "preexisting historical paper order"},
+        )
         session.add(
             Fill(
                 order_id=historical.id,

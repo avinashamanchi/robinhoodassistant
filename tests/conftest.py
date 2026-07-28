@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient as StarletteTestClient
+from sqlalchemy import inspect as sa_inspect
 
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import PortfolioSnapshot, Position, Quote
@@ -21,10 +22,41 @@ from trading_assistant.config import (
 )
 from trading_assistant.db.models import Base
 from trading_assistant.db.session import create_db_engine, make_session_factory
+from trading_assistant.security.crypto import (
+    SensitiveDataCipher,
+    SensitiveFieldRef,
+)
+from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
 import trading_assistant.security.secrets as secret_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_OPERATOR_TOKEN = "test-operator-secret"
+TEST_SENSITIVE_CIPHER = SensitiveDataCipher(
+    {"pytest-field-key-2026": b"t" * 32},
+    active_key_id="pytest-field-key-2026",
+)
+
+
+def bind_test_sensitive_factory(factory):
+    """Bind the deterministic fake cipher in spawned test workers."""
+    bind_sensitive_cipher(factory, TEST_SENSITIVE_CIPHER)
+    return factory
+
+
+def decrypt_test_sensitive(instance, column: str) -> str:
+    """Inspect one exact fake-cipher narrative without changing ORM behavior."""
+    primary_key = sa_inspect(instance).mapper.primary_key
+    assert len(primary_key) == 1
+    row_id = str(getattr(instance, primary_key[0].key))
+    return TEST_SENSITIVE_CIPHER.decrypt(
+        getattr(instance, column),
+        SensitiveFieldRef(
+            instance.__table__.name,
+            row_id,
+            column,
+            1,
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +93,30 @@ def _forbid_uninjected_native_keychain(monkeypatch):
             operation,
             forbidden_backend,
         )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_uninjected_process_inspection(monkeypatch):
+    """Keep every test independent of pre-existing workstation processes."""
+    from trading_assistant.ops.tenure import (
+        LocalProcessInspector,
+        ProcessIdentity,
+        ProcessProof,
+    )
+
+    monkeypatch.setattr(
+        LocalProcessInspector,
+        "current",
+        lambda _self: ProcessIdentity(
+            pid=87654,
+            start_identity="pytest-process-start",
+        ),
+    )
+    monkeypatch.setattr(
+        LocalProcessInspector,
+        "inspect",
+        lambda _self, _identity: ProcessProof.UNKNOWN,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +225,14 @@ def engine(db_url):
 
 @pytest.fixture
 def session_factory(engine):
-    return make_session_factory(engine)
+    factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, TEST_SENSITIVE_CIPHER)
+    return factory
+
+
+@pytest.fixture
+def sensitive_cipher():
+    return TEST_SENSITIVE_CIPHER
 
 
 @pytest.fixture

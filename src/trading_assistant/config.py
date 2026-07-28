@@ -75,6 +75,11 @@ class EncryptionConfig(_Strict):
     schema_version: Literal[1] = 1
     active_key_id: str = Field(min_length=8, max_length=64)
     retained_key_ids: list[str] = Field(default_factory=list)
+    backup_key_id: str = Field(
+        default="local-backup-2026-07",
+        min_length=8,
+        max_length=64,
+    )
     backup_directory: Path = Path(".local/encrypted-backups")
 
 

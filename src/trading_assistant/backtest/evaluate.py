@@ -20,6 +20,7 @@ from ..db.models import (
     HoldoutAccessLog,
 )
 from ..strategies.base import Strategy
+from ..security.sensitive_fields import persist_sensitive
 from ..strategies.buy_and_hold import BuyAndHold
 from .data import DataSource
 from .engine import run_backtest
@@ -172,16 +173,19 @@ def persist_report(
                     at=access.at, context=access.context, blocked=access.blocked
                 )
             )
-        s.add(
+        persist_sensitive(
+            s,
             AuditEvent(
                 actor=actor,
                 action="backtest.run",
                 target_type="backtest_run",
                 target_id=str(run.id),
                 request_id=request_id,
-                reason=reason,
                 result_code="succeeded",
-                detail_json=json.dumps(
+            ),
+            {
+                "reason": reason,
+                "detail_json": json.dumps(
                     {
                         "holdout_start": (
                             report.holdout_start.isoformat()
@@ -192,7 +196,7 @@ def persist_report(
                     },
                     sort_keys=True,
                 ),
-            )
+            },
         )
         s.commit()
         return run.id

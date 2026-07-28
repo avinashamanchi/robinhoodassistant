@@ -39,6 +39,8 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.security.sensitive_fields import persist_sensitive
+from tests.conftest import decrypt_test_sensitive
 
 
 class _StubAgent:
@@ -812,7 +814,9 @@ def test_concurrent_panic_requests_coalesce_to_durable_receipt(
         durable = session.get(PanicReceipt, "alpaca-paper")
         assert durable is not None
         assert durable.state == "completed"
-        assert json.loads(durable.response_json) == receipt
+        assert json.loads(
+            decrypt_test_sensitive(durable, "response_json")
+        ) == receipt
 
     repeated = owner_client.post(
         "/panic",
@@ -1697,7 +1701,10 @@ def test_reconcile_clears_only_after_proven_truth_and_atomic_audit(
     if reconciled:
         assert remaining is None
         assert len(reconciliation_audits) == 1
-        assert reconciliation_audits[0].reason == (
+        assert decrypt_test_sensitive(
+            reconciliation_audits[0],
+            "reason",
+        ) == (
             "portfolio_truth_reconciled"
         )
         assert reconciliation_audits[0].result_code == "cleared"
@@ -1803,8 +1810,14 @@ def test_panic_follower_never_accepts_replacement_owner_receipt(
             row.request_id = replacement_owner
             row.lease_generation = replacement_generation
             row.state = "completed"
-            row.response_json = json.dumps(
-                {"safe": True, "owner": "request-b"}
+            persist_sensitive(
+                session,
+                row,
+                {
+                    "response_json": json.dumps(
+                        {"safe": True, "owner": "request-b"}
+                    )
+                },
             )
             row.completed_at = utcnow()
             row.expires_at = utcnow() + timedelta(seconds=60)

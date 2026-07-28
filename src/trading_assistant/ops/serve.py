@@ -14,6 +14,7 @@ from typing import Protocol
 import uvicorn
 from sqlalchemy import text
 
+from ..app.main import create_app
 from ..config import load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine
@@ -22,6 +23,7 @@ from ..preflight import (
     StructuralCheck,
     structural_runtime_check,
 )
+from ..security.crypto import build_sensitive_data_cipher
 from ..security.secrets import RuntimeSecrets, load_role_secrets
 from ..security.transport import TransportPolicy
 from .control import start_app_control
@@ -97,10 +99,18 @@ def run_startup_guard(
             raise StartupGuardBlocked(checks) from None
     if encryption_inspector is None:
         try:
+            try:
+                cipher = build_sensitive_data_cipher(
+                    config.encryption,
+                    secrets,
+                )
+            except Exception:
+                cipher = None
             encryption_check = SensitiveEncryptionStateInspector(
                 create_db_engine(secrets.database_url),
                 schema_version=config.encryption.schema_version,
                 active_key_id=config.encryption.active_key_id,
+                cipher=cipher,
             ).inspect()
         except Exception:
             encryption_check = StructuralCheck(
@@ -135,20 +145,48 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     run_startup_guard(config=config)
     control = start_app_control(Path.cwd())
+    app = None
     try:
-        uvicorn.run(
-            "trading_assistant.app.main:create_app",
-            factory=True,
-            host=config.server.bind_host,
-            port=config.server.port,
-            ssl_certfile=str(config.server.tls_cert_path),
-            ssl_keyfile=str(config.server.tls_key_path),
-            proxy_headers=False,
-            forwarded_allow_ips="",
-            access_log=False,
+        app = create_app()
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host=config.server.bind_host,
+                port=config.server.port,
+                ssl_certfile=str(config.server.tls_cert_path),
+                ssl_keyfile=str(config.server.tls_key_path),
+                proxy_headers=False,
+                forwarded_allow_ips="",
+                access_log=False,
+            )
         )
+        install_shutdown = getattr(
+            app.state,
+            "install_controlled_shutdown",
+            None,
+        )
+        if not callable(install_shutdown):
+            raise RuntimeError("runtime_tenure_shutdown_owner_missing")
+        install_shutdown(lambda: setattr(server, "should_exit", True))
+        server.run()
     finally:
-        control.close()
+        try:
+            if app is not None:
+                guard = getattr(
+                    app.state,
+                    "runtime_tenure_guard",
+                    None,
+                )
+                if (
+                    guard is not None
+                    and not getattr(guard, "closed", False)
+                    and not guard.close()
+                ):
+                    raise RuntimeError(
+                        "runtime_tenure_cleanup_uncertain"
+                    )
+        finally:
+            control.close()
     return 0
 
 

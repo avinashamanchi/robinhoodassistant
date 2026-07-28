@@ -27,6 +27,7 @@ encryption:
   schema_version: 1
   active_key_id: local-primary-2026-07
   retained_key_ids: []
+  backup_key_id: local-backup-2026-07
   backup_directory: .local/encrypted-backups
 
 integrations:

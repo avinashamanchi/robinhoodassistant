@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event
+from sqlalchemy import event, inspect as sa_inspect
 
 from trading_assistant.app.main import create_app
 from trading_assistant.config import BrokerKind, TradingMode
@@ -42,10 +42,30 @@ from trading_assistant.db.models import (
 from trading_assistant.assets import AssetClass
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.clock import FakeClock
+from trading_assistant.security.crypto import (
+    SensitiveDataCipher,
+    SensitiveFieldRef,
+)
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 TOKEN = "test-api-operator-secret"
 CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
 _STATIC = Path("src/trading_assistant/app/static")
+_TEST_CIPHER = SensitiveDataCipher(
+    {"pytest-field-key-2026": b"t" * 32},
+    active_key_id="pytest-field-key-2026",
+)
+
+
+def _plaintext(instance, column: str) -> str:
+    table = instance.__table__.name
+    primary_key = sa_inspect(instance).mapper.primary_key
+    assert len(primary_key) == 1
+    row_id = str(getattr(instance, primary_key[0].key))
+    return _TEST_CIPHER.decrypt(
+        getattr(instance, column),
+        SensitiveFieldRef(table, row_id, column, 1),
+    )
 
 
 def _seed_clock_loss(service) -> None:
@@ -295,7 +315,7 @@ def test_pending_approve_flow(client):
     with svc.session_factory() as session:
         audit = session.query(AuditEvent).filter_by(action="order.approve").one()
         assert audit.actor == "operator:local"
-        assert audit.reason == "reviewed in API"
+        assert _plaintext(audit, "reason") == "reviewed in API"
         assert audit.request_id == approve_response.headers["X-Request-ID"]
 
     # No longer pending.
@@ -564,7 +584,7 @@ def test_reject_endpoint(client):
             .one()
         )
     assert audit.actor == "operator:local"
-    assert audit.reason == "thesis invalidated"
+    assert _plaintext(audit, "reason") == "thesis invalidated"
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
@@ -603,7 +623,7 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
             .one()
         )
     assert audit.actor == "operator:local"
-    assert audit.reason == "operator canceled stale intent"
+    assert _plaintext(audit, "reason") == "operator canceled stale intent"
     assert audit.request_id == response.headers["X-Request-ID"]
     with svc.session_factory() as session:
         sync_audit = (
@@ -614,7 +634,7 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
         )
     assert sync_audit is not None
     assert sync_audit.actor == audit.actor
-    assert sync_audit.reason == audit.reason
+    assert _plaintext(sync_audit, "reason") == _plaintext(audit, "reason")
     assert sync_audit.request_id == audit.request_id
 
 
@@ -1098,16 +1118,17 @@ def test_health_reports_every_active_breaker_and_global_generation(client):
 def test_health_marks_malformed_active_breaker_evidence_incomplete(client):
     c, service, _ = client
     with service.session_factory() as session:
-        session.add(
+        persist_sensitive(
+            session,
             CircuitBreakerState(
                 scope_key="operator_global",
                 kind="operator_global",
                 target="",
                 tripped=True,
-                reason="malformed persisted generation",
                 actor="operator:test",
                 generation=0,
-            )
+            ),
+            {"reason": "malformed persisted generation"},
         )
         session.commit()
 
@@ -1140,8 +1161,11 @@ def test_health_reports_terminal_latch_and_orphan_fill_after_reload(client):
             acceptance_state=FILL_RECONCILIATION_REQUIRED,
             last_error_code="waiting_for_exact_fill",
         )
-        session.add(order)
-        session.flush()
+        persist_sensitive(
+            session,
+            order,
+            {"approval_reason": "health fixture"},
+        )
         orphan = Fill(
             order_id=None,
             ticker="MSFT",
@@ -1333,7 +1357,7 @@ def test_approval_quote_outage_preserves_outbox_and_retries_safely(
     assert approval_count == 1
     assert (
         failure.actor,
-        failure.reason,
+        _plaintext(failure, "reason"),
         failure.result_code,
         failure.target_id,
     ) == (
@@ -1342,8 +1366,8 @@ def test_approval_quote_outage_preserves_outbox_and_retries_safely(
         "dependency_unavailable",
         str(order_id),
     )
-    assert marker not in failure.detail_json
-    assert "ConnectionError" not in failure.detail_json
+    assert marker not in _plaintext(failure, "detail_json")
+    assert "ConnectionError" not in _plaintext(failure, "detail_json")
 
     quote_available = True
     retried = client.post(
@@ -1421,10 +1445,10 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
             target_id=str(order_id),
         ).count()
         risk_text = "\n".join(
-            event.reason for event in session.query(RiskEvent).all()
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
         )
         breaker_text = "\n".join(
-            state.reason
+            _plaintext(state, "reason")
             for state in session.query(CircuitBreakerState).all()
         )
     assert order.status == OrderStatus.APPROVAL_RECORDED.value
@@ -1433,10 +1457,10 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
     failure = failures[0]
     assert (
         failure.actor,
-        failure.reason,
+        _plaintext(failure, "reason"),
         failure.target_type,
         failure.target_id,
-        failure.detail_json,
+        _plaintext(failure, "detail_json"),
     ) == (
         "operator:local",
         reason,
@@ -1447,7 +1471,7 @@ def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries
     exposed = "\n".join(
         (
             unavailable.text,
-            failure.detail_json,
+            _plaintext(failure, "detail_json"),
             risk_text,
             breaker_text,
             caplog.text,
@@ -1565,9 +1589,9 @@ def test_killswitch_reset_endpoint(client):
         )
     assert audit is not None
     assert audit.actor == "operator:local"
-    assert audit.reason == "account and broker checks are healthy"
+    assert _plaintext(audit, "reason") == "account and broker checks are healthy"
     assert audit.request_id == response.headers["X-Request-ID"]
-    health = json.loads(audit.detail_json)["prior_health"]
+    health = json.loads(_plaintext(audit, "detail_json"))["prior_health"]
     assert set(health) >= {
         "captured_at",
         "daily_pnl_complete",
@@ -1915,7 +1939,7 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
         ).one()
     assert (
         audit.actor,
-        audit.reason,
+        _plaintext(audit, "reason"),
         audit.result_code,
         audit.target_id,
     ) == (
@@ -1924,8 +1948,8 @@ def test_killswitch_reset_quote_failure_is_audited_hardened_503(
         "dependency_unavailable",
         BreakerScope.loss(AssetClass.EQUITY).key,
     )
-    assert marker not in audit.detail_json
-    assert "ConnectionError" not in audit.detail_json
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
 
 
 def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context(
@@ -1985,20 +2009,20 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
             result_code="dependency_unavailable",
         ).all()
         risk_text = "\n".join(
-            event.reason for event in session.query(RiskEvent).all()
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
         )
         breaker_text = "\n".join(
-            state.reason
+            _plaintext(state, "reason")
             for state in session.query(CircuitBreakerState).all()
         )
     assert len(failures) == 1
     failure = failures[0]
     assert (
         failure.actor,
-        failure.reason,
+        _plaintext(failure, "reason"),
         failure.target_type,
         failure.target_id,
-        failure.detail_json,
+        _plaintext(failure, "detail_json"),
     ) == (
         "operator:local",
         reason,
@@ -2016,7 +2040,7 @@ def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context
     exposed = "\n".join(
         (
             response.text,
-            failure.detail_json,
+            _plaintext(failure, "detail_json"),
             risk_text,
             breaker_text,
             caplog.text,
@@ -2100,10 +2124,10 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
             result_code="dependency_unavailable",
         ).one()
         risk_text = "\n".join(
-            event.reason for event in session.query(RiskEvent).all()
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
         )
         breaker_text = "\n".join(
-            state.reason
+            _plaintext(state, "reason")
             for state in session.query(CircuitBreakerState).all()
         )
         if order_id is not None:
@@ -2112,7 +2136,7 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
                 == OrderStatus.APPROVAL_RECORDED.value
             )
     assert failure.actor == "operator:local"
-    assert failure.reason == reason
+    assert _plaintext(failure, "reason") == reason
     assert service.broker.submit_calls == 0
     if observed is not None:
         current = service.breakers.get(
@@ -2124,7 +2148,7 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
     exposed = "\n".join(
         (
             response.text,
-            failure.detail_json,
+            _plaintext(failure, "detail_json"),
             risk_text,
             breaker_text,
             caplog.text,
@@ -2160,7 +2184,10 @@ def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
                 order_id=order_id,
                 event_type="rejection",
             ).one()
-        assert "daily total-loss limit reached" in risk.reason
+        assert "daily total-loss limit reached" in _plaintext(
+            risk,
+            "reason",
+        )
 
 
 @pytest.mark.parametrize("workflow", ["approve", "reset"])
@@ -2245,11 +2272,11 @@ def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider
                 == OrderStatus.APPROVAL_RECORDED.value
             )
     assert failure.actor == "operator:local"
-    assert failure.reason == reason
+    assert _plaintext(failure, "reason") == reason
     exposed = "\n".join(
         (
             response.text,
-            failure.detail_json,
+            _plaintext(failure, "detail_json"),
             caplog.text,
         )
     )
@@ -2439,7 +2466,7 @@ def test_killswitch_reset_rejects_every_incomplete_health_field(
             request_id=response.headers["X-Request-ID"],
             result_code="dependency_unavailable",
         ).one()
-    assert audit.reason == f"reject incomplete {incomplete_field}"
+    assert _plaintext(audit, "reason") == f"reject incomplete {incomplete_field}"
 
 
 def test_reset_snapshot_internal_failure_is_500_without_dependency_audit(
@@ -2772,7 +2799,12 @@ def test_panic_exception_fallback_enumerates_every_local_live_unknown_order(
             )
             for status in statuses
         ]
-        session.add_all(rows)
+        for row in rows:
+            persist_sensitive(
+                session,
+                row,
+                {"approval_reason": "panic fallback fixture"},
+            )
         session.commit()
         expected_ids = sorted(row.id for row in rows)
 
@@ -2960,7 +2992,7 @@ def test_reconcile_requires_reason_and_audits_operator_identity(client):
         )
     assert audit is not None
     assert audit.actor == "operator:local"
-    assert audit.reason == "reviewed broker and local positions"
+    assert _plaintext(audit, "reason") == "reviewed broker and local positions"
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
@@ -3004,7 +3036,7 @@ def test_reconcile_dependency_outage_is_audited_hardened_503(
         ).one()
     assert (
         audit.actor,
-        audit.reason,
+        _plaintext(audit, "reason"),
         audit.result_code,
         audit.target_id,
     ) == (
@@ -3013,8 +3045,8 @@ def test_reconcile_dependency_outage_is_audited_hardened_503(
         "dependency_unavailable",
         "all",
     )
-    assert marker not in audit.detail_json
-    assert "ConnectionError" not in audit.detail_json
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
 
 
 def test_sync_requires_reason_and_audits_operator_identity(client):
@@ -3041,7 +3073,7 @@ def test_sync_requires_reason_and_audits_operator_identity(client):
         )
     assert audit is not None
     assert audit.actor == "operator:local"
-    assert audit.reason == "manual broker status refresh"
+    assert _plaintext(audit, "reason") == "manual broker status refresh"
     assert audit.request_id == response.headers["X-Request-ID"]
 
 
@@ -3085,7 +3117,7 @@ def test_sync_dependency_outage_is_audited_hardened_503(
         ).one()
     assert (
         audit.actor,
-        audit.reason,
+        _plaintext(audit, "reason"),
         audit.result_code,
         audit.target_id,
     ) == (
@@ -3094,8 +3126,8 @@ def test_sync_dependency_outage_is_audited_hardened_503(
         "dependency_unavailable",
         "all",
     )
-    assert marker not in audit.detail_json
-    assert "ConnectionError" not in audit.detail_json
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
 
 
 def test_sync_cursor_conflict_is_stable_409_without_dependency_audit(
@@ -3267,14 +3299,17 @@ def test_sync_sanitizes_provider_integrity_text_everywhere(
             BreakerScope.broker_drift().key,
         )
     assert breaker is not None and breaker.tripped is True
-    assert marker not in breaker.reason
+    assert marker not in _plaintext(breaker, "reason")
     assert all(
-        marker not in audit.reason
-        and marker not in audit.detail_json
+        marker not in _plaintext(audit, "reason")
+        and marker not in _plaintext(audit, "detail_json")
         and marker not in audit.result_code
         for audit in audits
     )
-    assert all(marker not in event_row.reason for event_row in risk_events)
+    assert all(
+        marker not in _plaintext(event_row, "reason")
+        for event_row in risk_events
+    )
 
 
 def test_chat_and_rate_limit(client):

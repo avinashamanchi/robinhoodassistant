@@ -16,6 +16,8 @@ from trading_assistant.db.models import (
     approve_proposed,
     utcnow,
 )
+from trading_assistant.security.sensitive_fields import persist_sensitive
+from tests.conftest import decrypt_test_sensitive
 
 
 def _make_proposed(session_factory) -> int:
@@ -27,12 +29,18 @@ def _make_proposed(session_factory) -> int:
             order_type="market",
             status=OrderStatus.PROPOSED.value,
         )
-        s.add(order)
-        s.flush()
-        s.add(
+        persist_sensitive(
+            s,
+            order,
+            {"approval_reason": "approval pending"},
+        )
+        persist_sensitive(
+            s,
             Proposal(
-                order_id=order.id, expires_at=utcnow() + timedelta(minutes=15)
-            )
+                order_id=order.id,
+                expires_at=utcnow() + timedelta(minutes=15),
+            ),
+            {"reasoning": "atomic approval fixture"},
         )
         s.commit()
         return order.id
@@ -53,7 +61,10 @@ def test_first_approval_succeeds(session_factory):
         order = s.get(Order, oid)
         assert order.status == OrderStatus.APPROVAL_RECORDED.value
         assert order.approval_actor == "operator:avi"
-        assert order.approval_reason == "reviewed"
+        assert decrypt_test_sensitive(
+            order,
+            "approval_reason",
+        ) == "reviewed"
         assert s.query(AuditEvent).filter_by(action="order.approve").count() == 1
 
 

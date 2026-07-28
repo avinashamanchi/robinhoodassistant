@@ -125,6 +125,12 @@ def _static_fixture(
             "broker submission",
         ),
         (
+            "src/trading_assistant/sensitive_escape.py",
+            "from trading_assistant.db.models import AuditEvent\n"
+            "event = AuditEvent(reason='plain')\n",
+            "sensitive field write bypass",
+        ),
+        (
             "src/trading_assistant/app/static/index.html",
             "<input onfocus=\"steal()\">",
             "inline event handler",

@@ -25,11 +25,13 @@ from trading_assistant.db.models import (
     Rule,
     RuleGroup,
     TradePlanRow,
+    utcnow,
 )
 from trading_assistant.risk.submission_barrier import (
     serialized_writer,
 )
 from trading_assistant.risk.breakers import trip_in_session
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 from .models import (
     normalize_computed_order_decimal,
@@ -47,6 +49,48 @@ from .repository import (
 
 if TYPE_CHECKING:
     from trading_assistant.service import TradingService
+
+
+def _audit(
+    session: Session,
+    *,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    request_id: str,
+    reason: str,
+    result_code: str,
+    detail_json: str = "{}",
+    created_at=None,
+) -> None:
+    persist_sensitive(
+        session,
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            request_id=request_id,
+            result_code=result_code,
+            created_at=created_at or utcnow(),
+        ),
+        {"reason": reason, "detail_json": detail_json},
+    )
+
+
+def _risk_event(
+    session: Session,
+    *,
+    order_id: int | None,
+    event_type: str,
+    reason: str,
+) -> None:
+    persist_sensitive(
+        session,
+        RiskEvent(order_id=order_id, event_type=event_type),
+        {"reason": reason},
+    )
 
 
 class RuleApplicationService:
@@ -152,8 +196,8 @@ class RuleApplicationService:
                     )
                     session.add(group)
                     session.flush()
-                    session.add(
-                        AuditEvent(
+                    _audit(
+                            session,
                             actor=actor,
                             action="rule_group.create",
                             target_type="rule_group",
@@ -161,7 +205,6 @@ class RuleApplicationService:
                             request_id=request_id,
                             reason=reason,
                             result_code=group.state,
-                        )
                     )
                 elif (
                     command.activation == "immediate"
@@ -241,8 +284,8 @@ class RuleApplicationService:
             )
             session.add(row)
             session.flush()
-            session.add(
-                AuditEvent(
+            _audit(
+                    session,
                     actor=actor,
                     action="rule.create",
                     target_type="rule",
@@ -250,7 +293,6 @@ class RuleApplicationService:
                     request_id=request_id,
                     reason=reason,
                     result_code=row.state,
-                )
             )
             rows.append(row)
         return rows
@@ -487,8 +529,11 @@ class RuleApplicationService:
                     else OrderStatus.PROPOSED.value
                 ),
             )
-            session.add(order)
-            session.flush()
+            persist_sensitive(
+                session,
+                order,
+                {"approval_reason": "approval pending"},
+            )
             risk_config = (
                 self.service.config.crypto_risk
                 if asset_class.value == "crypto"
@@ -506,7 +551,8 @@ class RuleApplicationService:
                         error="plan_not_found",
                     )
                 plan_generation = plan.residual_generation
-            session.add(
+            persist_sensitive(
+                session,
                 Proposal(
                     order_id=order.id,
                     source_rule_group_id=lease.group_id,
@@ -515,23 +561,22 @@ class RuleApplicationService:
                     ttl_minutes=ttl,
                     created_at=now,
                     expires_at=now + timedelta(minutes=ttl),
-                )
+                ),
+                {"reasoning": operation_reason},
             )
             for risk_reason in risk.reasons:
-                session.add(
-                    RiskEvent(
+                _risk_event(
+                        session,
                         order_id=order.id,
                         event_type="rejection",
                         reason=risk_reason,
-                    )
                 )
             for warning in risk.warnings:
-                session.add(
-                    RiskEvent(
+                _risk_event(
+                        session,
                         order_id=order.id,
                         event_type="warning",
                         reason=warning,
-                    )
                 )
             for intent in risk.breaker_trips:
                 trip_in_session(
@@ -543,8 +588,8 @@ class RuleApplicationService:
                     now=now,
                     audit_reason=operation_reason,
                 )
-            session.add(
-                AuditEvent(
+            _audit(
+                    session,
                     actor=actor,
                     action="order.propose",
                     target_type="order",
@@ -561,7 +606,6 @@ class RuleApplicationService:
                         },
                         sort_keys=True,
                     ),
-                )
             )
             if stored.plan_id is not None:
                 reconcile_plan_lifecycle_in_session(

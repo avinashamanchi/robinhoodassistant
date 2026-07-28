@@ -35,6 +35,10 @@ from trading_assistant.risk.submission_barrier import (
     SubmissionBarrier,
     serialized_writer,
 )
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
 
 
 def _require_context(
@@ -63,17 +67,21 @@ def _audit_order_mutation(
     result_code: str,
     detail: dict[str, object] | None = None,
 ) -> None:
-    session.add(
-        AuditEvent(
+    event = AuditEvent(
             actor=actor,
             action=action,
             target_type="order",
             target_id=str(order_id),
             request_id=request_id,
-            reason=reason,
             result_code=result_code,
-            detail_json=json.dumps(detail or {}, sort_keys=True),
-        )
+    )
+    persist_sensitive(
+        session,
+        event,
+        {
+            "reason": reason,
+            "detail_json": json.dumps(detail or {}, sort_keys=True),
+        },
     )
 
 
@@ -87,16 +95,18 @@ def _audit_group_mutation(
     action: str,
     result_code: str,
 ) -> None:
-    session.add(
-        AuditEvent(
+    event = AuditEvent(
             actor=actor,
             action=action,
             target_type="rule_group",
             target_id=str(group_id),
             request_id=request_id,
-            reason=reason,
             result_code=result_code,
-        )
+    )
+    persist_sensitive(
+        session,
+        event,
+        {"reason": reason, "detail_json": "{}"},
     )
 
 
@@ -124,7 +134,6 @@ class OrderRepository:
                 .values(
                     status=OrderStatus.APPROVAL_RECORDED.value,
                     approval_actor=actor,
-                    approval_reason=reason,
                     approved_at=now,
                     updated_at=now,
                     version=Order.version + 1,
@@ -134,19 +143,30 @@ class OrderRepository:
             if idempotency_key is None:
                 session.rollback()
                 return False
+            order = session.get(Order, order_id)
+            if order is None:
+                session.rollback()
+                return False
+            sensitive_store(
+                session,
+                self.session_factory,
+            ).write_many(order, {"approval_reason": reason})
             elapsed_ms = round((time.perf_counter() - started) * 1000)
-            session.add(
-                AuditEvent(
+            event = AuditEvent(
                     actor=actor,
                     action="order.approve",
                     target_type="order",
                     target_id=str(order_id),
                     request_id=request_id,
                     idempotency_key=idempotency_key,
-                    reason=reason,
                     result_code=OrderStatus.APPROVAL_RECORDED.value,
                     latency_ms=elapsed_ms,
-                )
+            )
+            persist_sensitive(
+                session,
+                event,
+                {"reason": reason, "detail_json": "{}"},
+                session_factory=self.session_factory,
             )
             session.commit()
             return True
@@ -690,41 +710,48 @@ class OrderRepository:
                 if requires_fill_reconciliation or exact_fill_overflow
                 else "accepted"
             )
-            values: dict[str, object] = {
-                "broker_order_id": broker_order_id,
-                "acceptance_state": acceptance_state,
-                "last_reconciled_at": now,
-                "last_error_code": (
-                    "fill_quantity_exceeds_order"
-                    if exact_fill_overflow
+            last_error_code = (
+                "fill_quantity_exceeds_order"
+                if exact_fill_overflow
+                else (
+                    "invalid_cumulative_fill"
+                    if invalid_cumulative
                     else (
-                        "invalid_cumulative_fill"
-                        if invalid_cumulative
-                        else (
-                            "cumulative_fill_contradiction"
-                            if cumulative_contradiction
-                            else ""
-                        )
+                        "cumulative_fill_contradiction"
+                        if cumulative_contradiction
+                        else ""
+                    )
+                )
+            )
+            statement = update(Order).where(
+                Order.id == order_id,
+                Order.status.in_(
+                    (
+                        OrderStatus.SUBMITTING.value,
+                        OrderStatus.ACCEPTANCE_UNKNOWN.value,
                     )
                 ),
-                "updated_at": now,
-                "version": Order.version + 1,
-            }
-            if not cumulative_contradiction and not exact_fill_overflow:
-                values["status"] = status.value
-            result = session.execute(
-                update(Order)
-                .where(
-                    Order.id == order_id,
-                    Order.status.in_(
-                        (
-                            OrderStatus.SUBMITTING.value,
-                            OrderStatus.ACCEPTANCE_UNKNOWN.value,
-                        )
-                    ),
-                )
-                .values(**values)
             )
+            if not cumulative_contradiction and not exact_fill_overflow:
+                statement = statement.values(
+                    broker_order_id=broker_order_id,
+                    acceptance_state=acceptance_state,
+                    last_reconciled_at=now,
+                    last_error_code=last_error_code,
+                    updated_at=now,
+                    version=Order.version + 1,
+                    status=status.value,
+                )
+            else:
+                statement = statement.values(
+                    broker_order_id=broker_order_id,
+                    acceptance_state=acceptance_state,
+                    last_reconciled_at=now,
+                    last_error_code=last_error_code,
+                    updated_at=now,
+                    version=Order.version + 1,
+                )
+            result = session.execute(statement)
             if result.rowcount != 1:
                 session.rollback()
                 return False
@@ -808,12 +835,18 @@ class OrderRepository:
             )
             if result.rowcount != 1:
                 raise RuntimeError(f"order {order_id} changed during risk rejection")
-            session.add(
+            persist_sensitive(
+                session,
                 RiskEvent(
                     order_id=order_id,
                     event_type="rejection",
-                    reason="execution-time: " + "; ".join(reasons),
-                )
+                ),
+                {
+                    "reason": (
+                        "execution-time: " + "; ".join(reasons)
+                    )
+                },
+                session_factory=self.session_factory,
             )
             for intent in breaker_trips:
                 trip_in_session(

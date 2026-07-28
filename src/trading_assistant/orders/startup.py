@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone
 import re
 
-from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..db.models import (
@@ -14,6 +13,7 @@ from ..db.models import (
     StartupReconciliationState,
 )
 from ..risk.submission_barrier import SubmissionBarrier
+from ..security.sensitive_fields import persist_sensitive, sensitive_store
 
 
 class StartupReconciliationFailed(RuntimeError):
@@ -79,32 +79,38 @@ class StartupReconciliationGate:
                         generation=generation,
                         completed_generation=0,
                     )
-                    session.add(state)
                 else:
                     generation = state.generation + 1
                     state.generation = generation
                 state.status = "required"
                 state.actor = actor
-                state.reason = reason
                 state.request_id = request_id
-                state.evidence_json = "{}"
                 state.started_at = now
                 state.completed_at = None
                 state.updated_at = now
-                session.add(
+                store = sensitive_store(session, self.session_factory)
+                store.write_many(
+                    state,
+                    {"reason": reason, "evidence_json": "{}"},
+                )
+                persist_sensitive(
+                    session,
                     AuditEvent(
                         actor=actor,
                         action="startup_reconciliation.require",
                         target_type="broker",
                         target_id=self.broker_key,
                         request_id=request_id,
-                        reason=reason,
                         result_code="required",
-                        detail_json=json.dumps(
+                    ),
+                    {
+                        "reason": reason,
+                        "detail_json": json.dumps(
                             {"generation": generation},
                             sort_keys=True,
                         ),
-                    )
+                    },
+                    session_factory=self.session_factory,
                 )
                 session.commit()
                 return generation
@@ -139,39 +145,37 @@ class StartupReconciliationGate:
                     and state.completed_generation == generation
                 ):
                     return True
-                result = session.execute(
-                    update(StartupReconciliationState)
-                    .where(
-                        StartupReconciliationState.broker
-                        == self.broker_key,
-                        StartupReconciliationState.generation
-                        == generation,
-                    )
-                    .values(
-                        completed_generation=generation,
-                        status="current",
-                        actor=actor,
-                        reason=reason,
-                        request_id=request_id,
-                        evidence_json=encoded_evidence,
-                        completed_at=now,
-                        updated_at=now,
-                    )
+                state.completed_generation = generation
+                state.status = "current"
+                state.actor = actor
+                state.request_id = request_id
+                state.completed_at = now
+                state.updated_at = now
+                sensitive_store(
+                    session,
+                    self.session_factory,
+                ).write_many(
+                    state,
+                    {
+                        "reason": reason,
+                        "evidence_json": encoded_evidence,
+                    },
                 )
-                if result.rowcount != 1:
-                    session.rollback()
-                    return False
-                session.add(
+                persist_sensitive(
+                    session,
                     AuditEvent(
                         actor=actor,
                         action="startup_reconciliation.complete",
                         target_type="broker",
                         target_id=self.broker_key,
                         request_id=request_id,
-                        reason=reason,
                         result_code="current",
-                        detail_json=encoded_evidence,
-                    )
+                    ),
+                    {
+                        "reason": reason,
+                        "detail_json": encoded_evidence,
+                    },
+                    session_factory=self.session_factory,
                 )
                 session.commit()
                 return True
@@ -198,40 +202,47 @@ class StartupReconciliationGate:
         encoded_evidence = json.dumps(detail, sort_keys=True)
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
-                result = session.execute(
-                    update(StartupReconciliationState)
-                    .where(
-                        StartupReconciliationState.broker
-                        == self.broker_key,
-                        StartupReconciliationState.generation
-                        == generation,
-                        StartupReconciliationState.completed_generation
-                        < generation,
-                    )
-                    .values(
-                        status="failed",
-                        actor=actor,
-                        reason=failure_code,
-                        request_id=request_id,
-                        evidence_json=encoded_evidence,
-                        completed_at=None,
-                        updated_at=now,
-                    )
+                state = session.get(
+                    StartupReconciliationState,
+                    self.broker_key,
                 )
-                if result.rowcount != 1:
+                if (
+                    state is None
+                    or state.generation != generation
+                    or state.completed_generation >= generation
+                ):
                     session.rollback()
                     return False
-                session.add(
+                state.status = "failed"
+                state.actor = actor
+                state.request_id = request_id
+                state.completed_at = None
+                state.updated_at = now
+                sensitive_store(
+                    session,
+                    self.session_factory,
+                ).write_many(
+                    state,
+                    {
+                        "reason": failure_code,
+                        "evidence_json": encoded_evidence,
+                    },
+                )
+                persist_sensitive(
+                    session,
                     AuditEvent(
                         actor=actor,
                         action="startup_reconciliation.fail",
                         target_type="broker",
                         target_id=self.broker_key,
                         request_id=request_id,
-                        reason=reason,
                         result_code="failed",
-                        detail_json=encoded_evidence,
-                    )
+                    ),
+                    {
+                        "reason": reason,
+                        "detail_json": encoded_evidence,
+                    },
+                    session_factory=self.session_factory,
                 )
                 session.commit()
                 return True
@@ -259,7 +270,12 @@ class StartupReconciliationGate:
                 "generation": state.generation,
                 "completed_generation": state.completed_generation,
                 "failure_code": (
-                    state.reason if state.status == "failed" else None
+                    sensitive_store(
+                        session,
+                        self.session_factory,
+                    ).read(state, "reason")
+                    if state.status == "failed"
+                    else None
                 ),
             }
 

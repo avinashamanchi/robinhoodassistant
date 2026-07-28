@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import text
 
 from trading_assistant.app.auth import SessionAuth
 from trading_assistant.app.limits import (
@@ -28,8 +32,19 @@ from trading_assistant.config import BrokerKind, Secrets, TradingMode
 from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.models import StartupReconciliationState
 from trading_assistant.db.schema import SchemaOutOfDate
-from trading_assistant.db.session import create_db_engine
+from trading_assistant.db.session import (
+    create_db_engine,
+    make_session_factory,
+)
 from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
+from trading_assistant.ops.tenure import (
+    ProcessIdentity,
+    ProcessProof,
+    RuntimeTenureGuard,
+    RuntimeTenureService,
+    TenureUncertain,
+    TenureUnavailable,
+)
 from trading_assistant.operations import AuditRecorder, OperationsService
 from trading_assistant.orders.startup import StartupReconciliationFailed
 from trading_assistant.risk.clock import FakeClock
@@ -37,10 +52,33 @@ from trading_assistant.risk.clock import FakeClock
 
 def _migrated_secrets(tmp_path: Path) -> Secrets:
     database_url = f"sqlite:///{tmp_path}/runtime.db"
-    upgrade(create_db_engine(database_url))
+    engine = create_db_engine(database_url)
+    upgrade(engine)
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE sensitive_migration_state SET "
+                "state='complete',active_key_id='local-primary-2026-07',"
+                "rows_total=0,rows_completed=0,"
+                "backup_path_hash=:backup_hash,started_at=:started_at,"
+                "completed_at=:completed_at,updated_at=:updated_at"
+            ),
+            {
+                "backup_hash": "a" * 64,
+                "started_at": now - timedelta(minutes=2),
+                "completed_at": now - timedelta(minutes=1),
+                "updated_at": now,
+            },
+        )
     return Secrets(
         database_url=database_url,
         app_api_token="operator-secret-for-bootstrap-tests",
+        field_encryption_keys={
+            "local-primary-2026-07": base64.b64encode(
+                b"f" * 32
+            ).decode("ascii")
+        },
     )
 
 
@@ -295,6 +333,7 @@ def test_production_container_refuses_to_serve_unknown_remote_open_order(
         bootstrap.build_container(
             _alpaca_config(app_config),
             _migrated_secrets(tmp_path),
+            runtime_role="daemon",
         )
 
     assert trading.submit_calls == 0
@@ -597,13 +636,175 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
 
     assert app_main.build_default_container() is container
     assert daemon_main.build_monitor().service is service
-    assert mcp_server.build_default_service() is service
+    assert mcp_server.build_default_container() is container
     assert secret_reads == 3
     assert observed == [
         (config, secrets, "app"),
         (config, secrets, "daemon"),
         (config, secrets, "mcp"),
     ]
+
+
+def test_mcp_normal_exit_fails_closed_when_exact_release_is_uncertain(
+    monkeypatch,
+):
+    import trading_assistant.logging as runtime_logging
+    import trading_assistant.mcp_server.server as mcp_server
+
+    class Guard:
+        lost = False
+
+        def set_on_lost(self, callback):
+            self.callback = callback
+
+        def close(self):
+            # Match RuntimeTenureGuard.close(): uncertain release latches loss.
+            self.lost = True
+            return False
+
+    async def run_stdio_async():
+        return None
+
+    guard = Guard()
+    container = SimpleNamespace(
+        secrets=Secrets(app_api_token="mcp-lifecycle-secret"),
+        service=object(),
+        audit=object(),
+        runtime_tenure_guard=guard,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "build_default_container",
+        lambda: container,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "mcp",
+        SimpleNamespace(run_stdio_async=run_stdio_async),
+    )
+    monkeypatch.setattr(
+        runtime_logging,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    with pytest.raises(TenureUncertain) as exc:
+        mcp_server.main()
+
+    assert exc.value.stable_code == "runtime_tenure_uncertain"
+
+
+def test_mcp_server_failure_preserves_primary_error_during_uncertain_cleanup(
+    monkeypatch,
+):
+    import trading_assistant.logging as runtime_logging
+    import trading_assistant.mcp_server.server as mcp_server
+
+    class Guard:
+        lost = False
+        close_calls = 0
+
+        def set_on_lost(self, callback):
+            self.callback = callback
+
+        def close(self):
+            self.close_calls += 1
+            self.lost = True
+            return False
+
+    async def run_stdio_async():
+        raise RuntimeError("mcp-server-failed")
+
+    guard = Guard()
+    container = SimpleNamespace(
+        secrets=Secrets(app_api_token="mcp-primary-error-secret"),
+        service=object(),
+        audit=object(),
+        runtime_tenure_guard=guard,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "build_default_container",
+        lambda: container,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "mcp",
+        SimpleNamespace(run_stdio_async=run_stdio_async),
+    )
+    monkeypatch.setattr(
+        runtime_logging,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    with pytest.raises(RuntimeError, match="mcp-server-failed"):
+        mcp_server.main()
+
+    assert guard.close_calls == 1
+
+
+def test_mcp_tenure_loss_cancels_server_and_attempts_exact_cleanup(
+    monkeypatch,
+):
+    import trading_assistant.logging as runtime_logging
+    import trading_assistant.mcp_server.server as mcp_server
+    from trading_assistant.ops.tenure import TenureLost
+
+    class Guard:
+        lost = False
+        close_calls = 0
+
+        def set_on_lost(self, callback):
+            self.callback = callback
+
+        def lose(self):
+            self.lost = True
+            self.callback()
+
+        def close(self):
+            self.close_calls += 1
+            return False
+
+    cancelled: list[bool] = []
+    guard = Guard()
+
+    async def run_stdio_async():
+        import asyncio
+
+        guard.lose()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    container = SimpleNamespace(
+        secrets=Secrets(app_api_token="mcp-loss-secret"),
+        service=object(),
+        audit=object(),
+        runtime_tenure_guard=guard,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "build_default_container",
+        lambda: container,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "mcp",
+        SimpleNamespace(run_stdio_async=run_stdio_async),
+    )
+    monkeypatch.setattr(
+        runtime_logging,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    with pytest.raises(TenureLost):
+        mcp_server.main()
+
+    assert cancelled == [True]
+    assert guard.close_calls == 1
 
 
 def test_application_container_reuses_exact_trading_service_components(
@@ -1564,6 +1765,241 @@ def test_heartbeat_upserts_one_row_per_source(make_service):
 
     assert len(daemon) == 1
     assert len(app) == 1
+
+
+class _UnknownProcessInspector:
+    def inspect(self, _identity):
+        return ProcessProof.UNKNOWN
+
+
+def test_active_maintenance_blocks_bootstrap_before_broker_construction(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    secrets = _migrated_secrets(tmp_path)
+    engine = create_db_engine(secrets.database_url)
+    factory = make_session_factory(engine)
+    inspector = _UnknownProcessInspector()
+    maintenance = RuntimeTenureService(
+        factory,
+        process_inspector=inspector,
+    ).acquire_maintenance(
+        ProcessIdentity(5101, "maintenance-start"),
+        ttl_seconds=30,
+    )
+    broker_built = False
+
+    def forbidden_broker(*_args, **_kwargs):
+        nonlocal broker_built
+        broker_built = True
+        raise AssertionError("broker construction must follow runtime tenure")
+
+    monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
+
+    with pytest.raises(TenureUnavailable) as exc:
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            secrets,
+            runtime_role="app",
+            process_identity=ProcessIdentity(5102, "app-start"),
+            process_inspector=inspector,
+        )
+
+    assert exc.value.stable_code == "maintenance_tenure_active"
+    assert broker_built is False
+    assert maintenance.release() is True
+
+
+def test_plaintext_sensitive_field_blocks_before_broker_construction(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    secrets = _migrated_secrets(tmp_path)
+    engine = create_db_engine(secrets.database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO risk_events (event_type,reason,created_at) "
+                "VALUES ('rejection','legacy-plaintext',CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE sensitive_migration_state "
+                "SET rows_total=1,rows_completed=1"
+            )
+        )
+    broker_built = False
+
+    def forbidden_broker(*_args, **_kwargs):
+        nonlocal broker_built
+        broker_built = True
+        raise AssertionError("broker must follow full crypto scan")
+
+    monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
+
+    with pytest.raises(bootstrap.StartupEncryptionBlocked) as exc:
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            secrets,
+            runtime_role="app",
+            process_identity=ProcessIdentity(5110, "app-start"),
+            process_inspector=_UnknownProcessInspector(),
+        )
+
+    assert exc.value.stable_code == "sensitive_plaintext_detected"
+    assert "legacy-plaintext" not in str(exc.value)
+    assert broker_built is False
+
+
+def test_broker_constructor_observes_runtime_tenure_and_failure_releases_it(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from trading_assistant import bootstrap
+    from trading_assistant.db.models import RuntimeTenure
+
+    secrets = _migrated_secrets(tmp_path)
+    engine = create_db_engine(secrets.database_url)
+    factory = make_session_factory(engine)
+    inspector = _UnknownProcessInspector()
+    guard_started = False
+    real_guard = bootstrap.RuntimeTenureGuard
+
+    class ObservedGuard(real_guard):
+        def start(self):
+            nonlocal guard_started
+            guard_started = True
+            super().start()
+
+    monkeypatch.setattr(bootstrap, "RuntimeTenureGuard", ObservedGuard)
+
+    class ProviderProbe(RuntimeError):
+        pass
+
+    def observe_then_fail(*_args, **_kwargs):
+        assert guard_started is True
+        with factory() as session:
+            row = session.scalar(
+                select(RuntimeTenure).where(
+                    RuntimeTenure.resource_key == "runtime:daemon"
+                )
+            )
+            assert row is not None
+            assert row.state == "held"
+            assert row.role == "daemon"
+        raise ProviderProbe("provider-probe")
+
+    monkeypatch.setattr(bootstrap, "build_broker", observe_then_fail)
+
+    with pytest.raises(ProviderProbe, match="provider-probe"):
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            secrets,
+            runtime_role="daemon",
+            process_identity=ProcessIdentity(5103, "daemon-start"),
+            process_inspector=inspector,
+        )
+
+    with factory() as session:
+        row = session.scalar(
+            select(RuntimeTenure).where(
+                RuntimeTenure.resource_key == "runtime:daemon"
+            )
+        )
+        assert row is not None
+        assert row.state == "released"
+
+
+def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
+    make_service,
+):
+    service = make_service()
+    secrets = Secrets(
+        database_url=str(service.session_factory.kw["bind"].url),
+        app_api_token="operator-secret-for-bootstrap-tests",
+    )
+    container = _injected_container(service, secrets)
+
+    class FailingHandle:
+        role = "app"
+
+        def renew(self, *, ttl_seconds):
+            raise TenureUncertain()
+
+        def release(self):
+            return False
+
+    guard = RuntimeTenureGuard(
+        FailingHandle(),
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    guard.start()
+    container.runtime_tenure_guard = guard
+    app = create_app(
+        container=container,
+        agent=_StubAgent(),
+        planning=None,
+    )
+    shutdowns: list[str] = []
+    app.state.install_controlled_shutdown(
+        lambda: shutdowns.append("requested")
+    )
+
+    assert app.state.runtime_tenure_guard.renew_once() is False
+    assert app.state.runtime_tenure_guard.lost is True
+    assert shutdowns == ["requested"]
+
+
+def test_daemon_monitor_renews_the_container_runtime_tenure(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.daemon import main as daemon_main
+
+    service = make_service()
+    secrets = Secrets(
+        database_url=str(service.session_factory.kw["bind"].url),
+        app_api_token="operator-secret-for-bootstrap-tests",
+    )
+    container = _injected_container(service, secrets)
+    container.rule_worker = SimpleNamespace(notifier=None)
+    container.policy_store_maintenance = None
+    handle = SimpleNamespace(role="daemon")
+    guard = SimpleNamespace(handle=handle)
+    container.runtime_tenure_guard = guard
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args, **_kwargs: object(),
+    )
+    config = service.config.model_copy(
+        update={
+            "features": service.config.features.model_copy(
+                update={"shadow_mode": False}
+            )
+        }
+    )
+
+    monitor = daemon_main._build_monitor(config, secrets)
+
+    assert monitor.runtime_tenure_guard is guard
 
 
 def test_private_logging_is_idempotent_rotating_and_redacted(tmp_path):

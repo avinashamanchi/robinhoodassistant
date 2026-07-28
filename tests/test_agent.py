@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 
 from trading_assistant.app.agent import Agent
 from trading_assistant.db.models import AuditEvent, LLMDecision
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 def _text(t):
@@ -285,15 +286,19 @@ def test_agent_mutating_tools_preserve_operator_provenance(make_service):
                 ("order.propose", "rule.create", "rule.cancel")
             )
         ).all()
+        audit_reasons = {
+            sensitive_store(session).read(audit, "reason")
+            for audit in audits
+        }
     assert {audit.action for audit in audits} == {
         "order.propose",
         "rule.create",
         "rule.cancel",
     }
     assert {audit.actor for audit in audits} == {"operator:local"}
-    assert {
-        audit.reason for audit in audits
-    } == {"operator requested these exact chat mutations"}
+    assert audit_reasons == {
+        "operator requested these exact chat mutations"
+    }
     assert {audit.request_id for audit in audits} == {"chat-request-123"}
 
 

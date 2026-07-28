@@ -80,6 +80,7 @@ from .risk.submission_barrier import (
     SubmissionBarrier,
     serialized_writer,
 )
+from .security.sensitive_fields import persist_sensitive, sensitive_store
 
 # Every nonterminal state must remain visible to operators and MCP callers,
 # especially indeterminate outbox states that require reconciliation.
@@ -113,6 +114,48 @@ def _require_mutation_context(
             "mutation actor, reason, and request_id must be non-empty"
         )
     return actor, reason, request_id
+
+
+def _persist_audit(
+    session: Session,
+    *,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    request_id: str,
+    reason: str,
+    result_code: str,
+    detail_json: str = "{}",
+    created_at=None,
+) -> AuditEvent:
+    event = AuditEvent(
+        actor=actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        request_id=request_id,
+        result_code=result_code,
+        created_at=created_at or utcnow(),
+    )
+    persist_sensitive(
+        session,
+        event,
+        {"reason": reason, "detail_json": detail_json},
+    )
+    return event
+
+
+def _persist_risk(
+    session: Session,
+    *,
+    order_id: int | None = None,
+    event_type: str,
+    reason: str,
+) -> RiskEvent:
+    event = RiskEvent(order_id=order_id, event_type=event_type)
+    persist_sensitive(session, event, {"reason": reason})
+    return event
 
 
 class TradingService:
@@ -213,8 +256,8 @@ class TradingService:
     ) -> None:
         """Persist exact failed-mutation provenance without provider detail."""
         with self.session_factory() as session:
-            session.add(
-                AuditEvent(
+            _persist_audit(
+                    session,
                     actor=actor,
                     action=action,
                     target_type=target_type,
@@ -223,7 +266,6 @@ class TradingService:
                     reason=reason,
                     result_code="dependency_unavailable",
                     detail_json=json.dumps(detail, sort_keys=True),
-                )
             )
             session.commit()
 
@@ -453,31 +495,40 @@ class TradingService:
                     else "{}"
                 ),
             )
-            s.add(order)
-            s.flush()
+            persist_sensitive(
+                s,
+                order,
+                {"approval_reason": "approval pending"},
+            )
             risk_cfg = self.config.crypto_risk if ac is AssetClass.CRYPTO else self.config.risk
             ttl = (risk_cfg or self.config.risk).proposal_ttl_minutes
-            s.add(
+            persist_sensitive(
+                s,
                 Proposal(
                     order_id=order.id,
                     ttl_minutes=ttl,
                     expires_at=utcnow() + timedelta(minutes=ttl),
-                )
+                ),
+                {"reasoning": reason},
             )
 
             if result.rejected:
                 OrderStateMachine.transition(order, OrderStatus.REJECTED)
-                s.add(
-                    RiskEvent(
+                _persist_risk(
+                        s,
                         order_id=order.id,
                         event_type="rejection",
                         reason=result.reason_text(),
-                    )
                 )
             # Non-blocking warnings (e.g. cross-broker concentration) are logged
             # but never change the outcome.
             for warning in result.warnings:
-                s.add(RiskEvent(order_id=order.id, event_type="warning", reason=warning))
+                _persist_risk(
+                    s,
+                    order_id=order.id,
+                    event_type="warning",
+                    reason=warning,
+                )
             for intent in result.breaker_trips:
                 trip_in_session(
                     s,
@@ -487,8 +538,8 @@ class TradingService:
                     request_id=request_id,
                     audit_reason=reason,
                 )
-            s.add(
-                AuditEvent(
+            _persist_audit(
+                    s,
                     actor=actor,
                     action="order.propose",
                     target_type="order",
@@ -496,7 +547,6 @@ class TradingService:
                     request_id=request_id,
                     reason=reason,
                     result_code=order.status,
-                )
             )
 
             s.commit()
@@ -646,7 +696,11 @@ class TradingService:
                             }
                         ),
                     )
-                    s.add(order)
+                    persist_sensitive(
+                        s,
+                        order,
+                        {"approval_reason": "approval pending"},
+                    )
                     risk_cfg = (
                         self.config.crypto_risk
                         if self._asset_class(order_req.ticker)
@@ -656,8 +710,8 @@ class TradingService:
                     ttl = (
                         risk_cfg or self.config.risk
                     ).proposal_ttl_minutes
-                    s.flush()
-                    s.add(
+                    persist_sensitive(
+                        s,
                         Proposal(
                             order_id=order.id,
                             ttl_minutes=ttl,
@@ -665,10 +719,11 @@ class TradingService:
                                 utcnow()
                                 + timedelta(minutes=ttl)
                             ),
-                        )
+                        ),
+                        {"reasoning": reason},
                     )
-                    s.add(
-                        AuditEvent(
+                    _persist_audit(
+                            s,
                             actor=actor,
                             action="order.propose",
                             target_type="order",
@@ -686,7 +741,6 @@ class TradingService:
                                 },
                                 sort_keys=True,
                             ),
-                        )
                     )
                     s.commit()
                     order_id = order.id
@@ -730,15 +784,14 @@ class TradingService:
                     "error": "only PROPOSED orders can be rejected",
                 }
             OrderStateMachine.transition(order, OrderStatus.REJECTED)
-            s.add(
-                RiskEvent(
+            _persist_risk(
+                    s,
                     order_id=order.id,
                     event_type="rejection",
                     reason=reason,
-                )
             )
-            s.add(
-                AuditEvent(
+            _persist_audit(
+                    s,
                     actor=actor,
                     action="order.reject",
                     target_type="order",
@@ -746,7 +799,6 @@ class TradingService:
                     request_id=request_id,
                     reason=reason,
                     result_code=OrderStatus.REJECTED.value,
-                )
             )
             s.commit()
             return {"order_id": order_id, "status": order.status}
@@ -1496,8 +1548,8 @@ class TradingService:
                 audit_reason=reason,
             )
         with self.session_factory() as session:
-            session.add(
-                AuditEvent(
+            _persist_audit(
+                    session,
                     actor=actor,
                     action="orders.sync",
                     target_type="broker_orders",
@@ -1521,7 +1573,6 @@ class TradingService:
                         },
                         sort_keys=True,
                     ),
-                )
             )
             session.commit()
         return result
@@ -1773,8 +1824,8 @@ class TradingService:
                 request_id=request_id,
             )
             with self.session_factory() as session:
-                session.add(
-                    AuditEvent(
+                _persist_audit(
+                        session,
                         actor=actor,
                         action="order.cancel",
                         target_type="order",
@@ -1793,7 +1844,6 @@ class TradingService:
                             },
                             sort_keys=True,
                         ),
-                    )
                 )
                 session.commit()
             return result
@@ -1820,8 +1870,8 @@ class TradingService:
         order.plan_cancel_state = state
         order.updated_at = now
         order.version += 1
-        session.add(
-            AuditEvent(
+        _persist_audit(
+                session,
                 actor=actor,
                 action="order.plan_cancel_intent",
                 target_type="order",
@@ -1830,7 +1880,6 @@ class TradingService:
                 reason=reason,
                 result_code=state,
                 created_at=now,
-            )
         )
 
     @serialized_writer
@@ -1887,8 +1936,8 @@ class TradingService:
                         request_id=request_id,
                         now=utcnow(),
                     )
-                    session.add(
-                        AuditEvent(
+                    _persist_audit(
+                            session,
                             actor=actor,
                             action="order.plan_cancel",
                             target_type="order",
@@ -1896,7 +1945,6 @@ class TradingService:
                             request_id=request_id,
                             reason=reason,
                             result_code=target.value,
-                        )
                     )
                     session.commit()
                     canceled += 1
@@ -1947,8 +1995,8 @@ class TradingService:
                         request_id=request_id,
                         now=utcnow(),
                     )
-                session.add(
-                    AuditEvent(
+                _persist_audit(
+                        session,
                         actor=actor,
                         action="order.plan_broker_cancel",
                         target_type="order",
@@ -1956,7 +2004,6 @@ class TradingService:
                         request_id=request_id,
                         reason=reason,
                         result_code="requested",
-                    )
                 )
                 session.commit()
             outcome = self._cancel_live_order_under_writer(
@@ -2106,8 +2153,8 @@ class TradingService:
                             request_id=request_id,
                             now=utcnow(),
                         )
-                    session.add(
-                        AuditEvent(
+                    _persist_audit(
+                            session,
                             actor=actor,
                             action="order.plan_broker_cancel",
                             target_type="order",
@@ -2115,7 +2162,6 @@ class TradingService:
                             request_id=request_id,
                             reason=reason,
                             result_code="requested",
-                        )
                     )
                     session.commit()
                 outcome = self._cancel_live_order_under_writer(
@@ -2222,8 +2268,8 @@ class TradingService:
                     else:
                         order.updated_at = now
                         order.version += 1
-                    session.add(
-                        AuditEvent(
+                    _persist_audit(
+                            session,
                             actor=actor,
                             action="order.cancel_latch",
                             target_type="order",
@@ -2241,7 +2287,6 @@ class TradingService:
                                 sort_keys=True,
                             ),
                             created_at=now,
-                        )
                     )
                     session.commit()
                 return {
@@ -2408,11 +2453,10 @@ class TradingService:
                         }
                 if drift:
                     drift_detail = json.dumps(drift, sort_keys=True)
-                    session.add(
-                        RiskEvent(
+                    _persist_risk(
+                            session,
                             event_type="reconciliation",
                             reason=drift_detail,
-                        )
                     )
                     trip_in_session(
                         session,
@@ -2422,8 +2466,8 @@ class TradingService:
                         request_id=request_id,
                         audit_reason=reason,
                     )
-                session.add(
-                    AuditEvent(
+                _persist_audit(
+                        session,
                         actor=actor,
                         action="positions.reconcile",
                         target_type="portfolio",
@@ -2437,7 +2481,6 @@ class TradingService:
                             {"drift": drift},
                             sort_keys=True,
                         ),
-                    )
                 )
                 session.commit()
             return {"reconciled": not drift, "drift": drift}
@@ -2709,12 +2752,13 @@ class TradingService:
 
     def get_log(self, limit: int = 100) -> dict[str, Any]:
         with self.session_factory() as s:
+            store = sensitive_store(s, self.session_factory)
             risk_events = [
                 {
                     "id": e.id,
                     "order_id": e.order_id,
                     "type": e.event_type,
-                    "reason": e.reason,
+                    "reason": store.read(e, "reason"),
                     "at": e.created_at.isoformat(),
                 }
                 for e in s.execute(
@@ -2726,8 +2770,11 @@ class TradingService:
             decisions = [
                 {
                     "id": d.id,
-                    "prompt": d.prompt,
-                    "reasoning_summary": d.reasoning_summary,
+                    "prompt": store.read(d, "prompt"),
+                    "reasoning_summary": store.read(
+                        d,
+                        "reasoning_summary",
+                    ),
                     "model": d.model,
                     "at": d.created_at.isoformat(),
                 }
@@ -3031,8 +3078,8 @@ class TradingService:
                         "canceled": False,
                         "error": "rule group changed during cancellation",
                     }
-                s.add(
-                    AuditEvent(
+                _persist_audit(
+                        s,
                         actor=actor,
                         action="rule_group.cancel",
                         target_type="rule_group",
@@ -3040,10 +3087,9 @@ class TradingService:
                         request_id=request_id,
                         reason=reason,
                         result_code="canceled",
-                    )
                 )
-            s.add(
-                AuditEvent(
+            _persist_audit(
+                    s,
                     actor=actor,
                     action="rule.cancel",
                     target_type="rule",
@@ -3051,7 +3097,6 @@ class TradingService:
                     request_id=request_id,
                     reason=reason,
                     result_code="canceled",
-                )
             )
             s.commit()
             return {"rule_id": rule_id, "canceled": True}

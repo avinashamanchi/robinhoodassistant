@@ -23,6 +23,7 @@ from trading_assistant.dependencies import (
     RequiredDependencyUnavailable,
 )
 from trading_assistant.risk.breakers import BreakerScope
+from tests.conftest import decrypt_test_sensitive
 
 
 def _submitted(svc, notional="400") -> int:
@@ -151,22 +152,29 @@ def test_indeterminate_cancel_latch_has_exact_atomic_audit_and_sanitized_fault(
         )
         persisted_text = " ".join(
             [
-                *(row.detail_json for row in session.scalars(
-                    select(AuditEvent)
-                )),
-                *(row.reason for row in session.scalars(
-                    select(db_models.RiskEvent)
-                )),
-                *(row.reason for row in session.scalars(
-                    select(db_models.CircuitBreakerState)
-                )),
+                *(
+                    decrypt_test_sensitive(row, "detail_json")
+                    for row in session.scalars(select(AuditEvent))
+                ),
+                *(
+                    decrypt_test_sensitive(row, "reason")
+                    for row in session.scalars(
+                        select(db_models.RiskEvent)
+                    )
+                ),
+                *(
+                    decrypt_test_sensitive(row, "reason")
+                    for row in session.scalars(
+                        select(db_models.CircuitBreakerState)
+                    )
+                ),
             ]
         )
     assert order.acceptance_state == FILL_RECONCILIATION_REQUIRED
     assert order.last_error_code == "indeterminate_cancel"
     assert (
         latch_audit.actor,
-        latch_audit.reason,
+        decrypt_test_sensitive(latch_audit, "reason"),
         latch_audit.request_id,
         latch_audit.result_code,
     ) == (
@@ -239,7 +247,7 @@ def test_indeterminate_cancel_latch_rolls_back_on_audit_failure_but_breaker_stay
         after.last_error_code,
         after.version,
     ) == before_state
-    assert breaker.reason == (
+    assert decrypt_test_sensitive(breaker, "reason") == (
         f"indeterminate broker cancellation for order {order_id}"
     )
     assert latch_audits == []
@@ -296,7 +304,10 @@ def test_cancel_nested_reconciliation_fault_keeps_operator_provenance(
     }.issubset({audit.action for audit in audits})
     for audit in audits:
         assert audit.actor == "operator:avi"
-        assert audit.reason == "operator reviewed nested reconciliation"
+        assert decrypt_test_sensitive(
+            audit,
+            "reason",
+        ) == "operator reviewed nested reconciliation"
         assert audit.request_id == "cancel-nested-reconciliation"
 
 
@@ -512,7 +523,10 @@ def test_killswitch_drill(make_service):
         )
     assert audit is not None
     assert audit.actor == "daemon:daily-loss"
-    assert audit.reason == "scheduled daily loss enforcement"
+    assert decrypt_test_sensitive(
+        audit,
+        "reason",
+    ) == "scheduled daily loss enforcement"
     assert audit.request_id == "daily-loss-cycle"
 
     # New equity orders are now blocked...
@@ -573,7 +587,10 @@ def test_operational_trip_all_uses_process_safe_global_breaker(make_service):
             action="circuit_breaker.trip"
         ).one()
     assert audit.actor == "daemon:startup"
-    assert audit.reason == "startup reconciliation failed"
+    assert decrypt_test_sensitive(
+        audit,
+        "reason",
+    ) == "startup reconciliation failed"
     assert audit.request_id == "startup-reconciliation-failure"
 
 

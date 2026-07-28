@@ -8,6 +8,7 @@ NEEDS-ME item. Run this before starting the app + daemon each day.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,10 +69,12 @@ class SensitiveEncryptionStateInspector:
         *,
         schema_version: int,
         active_key_id: str,
+        cipher=None,
     ) -> None:
         self._engine = engine
         self._schema_version = schema_version
         self._active_key_id = active_key_id
+        self._cipher = cipher
 
     @staticmethod
     def _blocked(code: str) -> StructuralCheck:
@@ -154,11 +157,31 @@ class SensitiveEncryptionStateInspector:
             row.rows_completed != row.rows_total
             or not self._timestamp(row.started_at)
             or not self._timestamp(row.completed_at)
-            or not row.started_at < row.completed_at <= row.updated_at
+            or not row.started_at <= row.completed_at <= row.updated_at
             or not isinstance(row.backup_path_hash, str)
             or self._HASH.fullmatch(row.backup_path_hash) is None
         ):
             return self._blocked("sensitive_migration_state_invalid")
+        if self._cipher is None:
+            return self._blocked("sensitive_key_unavailable")
+        try:
+            from .ops.encrypt_sensitive import (
+                SensitiveMigrationError,
+                inspect_sensitive_envelopes,
+            )
+
+            rows_total = inspect_sensitive_envelopes(
+                self._engine,
+                self._cipher,
+                active_key_id=self._active_key_id,
+                schema_version=self._schema_version,
+            )
+        except SensitiveMigrationError as exc:
+            return self._blocked(exc.stable_code)
+        except Exception:
+            return self._blocked("sensitive_envelope_scan_invalid")
+        if rows_total != row.rows_total:
+            return self._blocked("sensitive_migration_evidence_invalid")
         return StructuralCheck("encryption", "passed", "ok")
 
 
@@ -399,14 +422,36 @@ def _reconciliation(service) -> Result:
         )
 
 
+@contextmanager
 def _build_service(config, secrets: RuntimeSecrets):
     from .bootstrap import build_container
 
-    return build_container(
+    container = build_container(
         config,
         secrets,
-        runtime_role="preflight",
-    ).service
+        runtime_role="app",
+    )
+    primary_failure = False
+    try:
+        yield container.service
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        guard = getattr(container, "runtime_tenure_guard", None)
+        if guard is not None:
+            try:
+                released = guard.close()
+            except BaseException:
+                if not primary_failure:
+                    raise RuntimeError(
+                        "runtime_tenure_cleanup_uncertain"
+                    ) from None
+            else:
+                if not released and not primary_failure:
+                    raise RuntimeError(
+                        "runtime_tenure_cleanup_uncertain"
+                    )
 
 
 def _llm_provider_configured(
@@ -632,7 +677,8 @@ def _run(
         secret_is_set(secrets.alpaca_api_key)
         and secret_is_set(secrets.alpaca_secret_key)
     ):
-        results.append(_reconciliation(_build_service(config, secrets)))
+        with _build_service(config, secrets) as service:
+            results.append(_reconciliation(service))
     else:
         results.append(
             Result(

@@ -20,6 +20,7 @@ from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.db.models import PanicReceipt, utcnow
 from trading_assistant.ops.backup import backup_database
 from trading_assistant.ops.paper_drill import PaperDrillError, run_paper_drill
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 class _StubAgent:
@@ -193,7 +194,9 @@ def test_concurrent_panic_requests_share_one_durable_90_second_receipt(
             durable.lease_generation
             == acquired_fences[0].generation
         )
-        assert json.loads(durable.response_json) == receipt
+        assert json.loads(
+            sensitive_store(session).read(durable, "response_json")
+        ) == receipt
         assert durable.completed_at is not None
         assert durable.expires_at >= started_before + timedelta(seconds=89)
 

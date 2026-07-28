@@ -38,6 +38,7 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.signals.models import MarketFeatures, Regime
+from tests.conftest import decrypt_test_sensitive
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
 
@@ -361,9 +362,13 @@ def test_shadow_canonicalizes_identity_once_across_restart_and_persistence(
         report_row = session.execute(select(AnalysisReportRow)).scalar_one()
         call = session.execute(select(ShadowCall)).scalar_one()
         assert plan_row.symbol == "AAPL"
-        assert json.loads(plan_row.plan_json)["symbol"] == "AAPL"
+        assert json.loads(
+            decrypt_test_sensitive(plan_row, "plan_json")
+        )["symbol"] == "AAPL"
         assert report_row.symbol == "AAPL"
-        assert json.loads(report_row.report_json)["symbol"] == "AAPL"
+        assert json.loads(
+            decrypt_test_sensitive(report_row, "report_json")
+        )["symbol"] == "AAPL"
         assert report_row.analyst_version == "v2"
         assert call.symbol == "AAPL"
 
@@ -656,7 +661,7 @@ def test_bracket_proposal_audit_is_exact_and_idempotent(make_service):
     assert len(proposals) == 1
     assert (
         audits[0].actor,
-        audits[0].reason,
+        decrypt_test_sensitive(audits[0], "reason"),
         audits[0].request_id,
         audits[0].result_code,
     ) == (
@@ -804,8 +809,12 @@ def test_concurrent_plan_approval_claims_exactly_once(make_service):
         stored = session.get(TradePlanRow, plan_id)
         expected_rule_count = len(
             planning._decompose(
-                TradePlan.model_validate_json(stored.plan_json),
-                json.loads(stored.sized_json),
+                TradePlan.model_validate_json(
+                    decrypt_test_sensitive(stored, "plan_json")
+                ),
+                json.loads(
+                    decrypt_test_sensitive(stored, "sized_json")
+                ),
                 plan_id,
             )
         )

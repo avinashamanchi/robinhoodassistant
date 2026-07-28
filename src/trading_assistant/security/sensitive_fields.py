@@ -9,7 +9,9 @@ import weakref
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import event, inspect as sa_inspect
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 
 from .crypto import (
     SensitiveDataCipher,
@@ -66,6 +68,87 @@ _STAGING_STATES: WeakKeyDictionary[Session, _StagingState] = (
 _GUARD_INSTALLATIONS: WeakKeyDictionary[Session, tuple[int, int]] = (
     WeakKeyDictionary()
 )
+_FACTORY_CIPHERS: WeakKeyDictionary[
+    sessionmaker[Session],
+    SensitiveDataCipher,
+] = WeakKeyDictionary()
+_ENGINE_CIPHERS: WeakKeyDictionary[Engine, SensitiveDataCipher] = (
+    WeakKeyDictionary()
+)
+_FACTORY_GUARD_CALLBACKS: WeakKeyDictionary[
+    sessionmaker[Session],
+    object,
+] = WeakKeyDictionary()
+
+
+def bind_sensitive_cipher(
+    session_factory: sessionmaker[Session],
+    cipher: SensitiveDataCipher,
+) -> None:
+    """Bind one validated cipher to a session factory without fallback."""
+    if not isinstance(cipher, SensitiveDataCipher):
+        raise SensitiveDataInvalid()
+    existing = _FACTORY_CIPHERS.get(session_factory)
+    if existing is not None and existing is not cipher:
+        raise SensitiveDataInvalid()
+    _FACTORY_CIPHERS[session_factory] = cipher
+    engine = session_factory.kw.get("bind")
+    if not isinstance(engine, Engine):
+        raise SensitiveDataInvalid()
+    existing_engine = _ENGINE_CIPHERS.get(engine)
+    if existing_engine is not None and existing_engine is not cipher:
+        raise SensitiveDataInvalid()
+    _ENGINE_CIPHERS[engine] = cipher
+    if session_factory not in _FACTORY_GUARD_CALLBACKS:
+        def install_factory_guard(
+            session: Session,
+            transaction,
+        ) -> None:
+            if transaction.parent is None:
+                install_sensitive_field_guards(session, cipher)
+
+        event.listen(
+            session_factory,
+            "after_transaction_create",
+            install_factory_guard,
+        )
+        _FACTORY_GUARD_CALLBACKS[session_factory] = install_factory_guard
+
+
+def sensitive_store(
+    session: Session,
+    session_factory: sessionmaker[Session] | None = None,
+) -> "SensitiveFieldStore":
+    """Resolve the exact factory-bound cipher for one domain transaction."""
+    cipher = (
+        _FACTORY_CIPHERS.get(session_factory)
+        if session_factory is not None
+        else None
+    )
+    if cipher is None:
+        bind = session.get_bind()
+        cipher = (
+            _ENGINE_CIPHERS.get(bind)
+            if isinstance(bind, Engine)
+            else None
+        )
+    if cipher is None:
+        raise SensitiveDataInvalid()
+    return SensitiveFieldStore(session, cipher)
+
+
+def persist_sensitive(
+    session: Session,
+    instance: object,
+    values: Mapping[str, str],
+    *,
+    session_factory: sessionmaker[Session] | None = None,
+) -> object:
+    """Persist one registered record through staged ciphertext only."""
+    return sensitive_store(session, session_factory).write_many(
+        instance,
+        values,
+    )
 
 
 def _table_name(instance: object) -> str | None:
@@ -419,6 +502,35 @@ class SensitiveFieldStore:
             ):
                 self._guard_state.active_operation = None
             plaintext_values.clear()
+
+    def write_many(
+        self,
+        instance: object,
+        values: Mapping[str, str],
+    ) -> object:
+        """Canonical multi-field spelling used by domain write sites."""
+        return self.write(instance, values)
+
+    def clear(self, instance: object, columns: set[str]) -> object:
+        """Clear only nullable registered fields through the guarded store."""
+        table = _table_name(instance)
+        registered = SENSITIVE_FIELDS.get(table or "")
+        row_id = _row_id(instance)
+        if (
+            registered is None
+            or row_id is None
+            or not columns
+            or not columns <= registered
+            or any(
+                not instance.__table__.c[column].nullable
+                for column in columns
+            )
+        ):
+            raise PlaintextSensitiveField()
+        for column in columns:
+            setattr(instance, column, None)
+        self._session.flush([instance])
+        return instance
 
     def read(self, instance: object, column: str) -> str:
         table = _table_name(instance)

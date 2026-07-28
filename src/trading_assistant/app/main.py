@@ -444,6 +444,39 @@ def _create_app(
     )
     app.state.account_cache = account_cache
     app.state.transport_policy = transport_policy
+    app.state.controlled_shutdown = None
+    runtime_tenure_guard = (
+        getattr(container, "runtime_tenure_guard", None)
+        if container is not None
+        else None
+    )
+    if runtime_tenure_guard is not None:
+        def request_controlled_shutdown() -> None:
+            callback = getattr(
+                app.state,
+                "controlled_shutdown",
+                None,
+            )
+            if callable(callback):
+                callback()
+
+        def install_controlled_shutdown(callback) -> None:
+            if not callable(callback):
+                raise TypeError("controlled_shutdown_callback_invalid")
+            app.state.controlled_shutdown = callback
+            if runtime_tenure_guard.lost:
+                callback()
+
+        runtime_tenure_guard.set_on_lost(request_controlled_shutdown)
+        app.state.runtime_tenure_guard = runtime_tenure_guard
+        app.state.install_controlled_shutdown = install_controlled_shutdown
+        app.router.add_event_handler(
+            "shutdown",
+            runtime_tenure_guard.close,
+        )
+    else:
+        app.state.runtime_tenure_guard = None
+        app.state.install_controlled_shutdown = None
 
     session_kwargs = {
         "ttl": timedelta(hours=security_config.session_hours),
@@ -1189,8 +1222,16 @@ def create_app(*args, **kwargs) -> FastAPI:
     bound.arguments["container"] = container
     from ..logging import runtime_startup
 
-    with runtime_startup("app", container.secrets):
-        return _create_app(*bound.args, **bound.kwargs)
+    try:
+        with runtime_startup("app", container.secrets):
+            return _create_app(*bound.args, **bound.kwargs)
+    except BaseException:
+        guard = getattr(container, "runtime_tenure_guard", None)
+        if guard is not None and not guard.close():
+            raise RuntimeError(
+                "runtime_tenure_cleanup_uncertain"
+            ) from None
+        raise
 
 
 # ── backtest DB helpers ────────────────────────────────────────

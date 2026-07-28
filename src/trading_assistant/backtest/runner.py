@@ -18,6 +18,7 @@ from sqlalchemy import select, text
 
 from ..config import BacktestConfig
 from ..db.models import AuditEvent, BacktestRun
+from ..security.sensitive_fields import persist_sensitive, sensitive_store
 from ..strategies.breakout import Breakout
 from ..strategies.rsi_reversion import RsiReversion
 from ..strategies.sma_crossover import SmaCrossover
@@ -281,9 +282,13 @@ class BacktestRunner:
                     target_type="backtest_run",
                     target_id=str(run.id),
                     request_id=request_id,
-                    reason=reason,
                 )
-                session.add(audit)
+                persist_sensitive(
+                    session,
+                    audit,
+                    {"reason": reason, "detail_json": "{}"},
+                    session_factory=self.session_factory,
+                )
             else:
                 run = session.get(BacktestRun, persisted_run_id)
                 audit = session.execute(
@@ -315,13 +320,21 @@ class BacktestRunner:
             )
             run.config_json = json.dumps(config, sort_keys=True)
             audit.result_code = "timed_out"
-            audit.detail_json = json.dumps(
+            sensitive_store(
+                session,
+                self.session_factory,
+            ).write_many(
+                audit,
                 {
-                    "runtime_seconds": self.runtime_seconds,
-                    "stage": stage,
-                    "symbol_count": len(symbols),
+                    "detail_json": json.dumps(
+                        {
+                            "runtime_seconds": self.runtime_seconds,
+                            "stage": stage,
+                            "symbol_count": len(symbols),
+                        },
+                        sort_keys=True,
+                    )
                 },
-                sort_keys=True,
             )
             session.commit()
             return run.id
@@ -335,23 +348,27 @@ class BacktestRunner:
         request_id: str,
     ) -> None:
         with self.session_factory() as session:
-            session.add(
+            persist_sensitive(
+                session,
                 AuditEvent(
                     actor=actor,
                     action="backtest.run",
                     target_type="backtest_run",
                     target_id="unpersisted",
                     request_id=request_id,
-                    reason=reason,
                     result_code="failed",
-                    detail_json=json.dumps(
+                ),
+                {
+                    "reason": reason,
+                    "detail_json": json.dumps(
                         {
                             "stage": "launch",
                             "symbol_count": len(symbols),
                         },
                         sort_keys=True,
                     ),
-                )
+                },
+                session_factory=self.session_factory,
             )
             session.commit()
 

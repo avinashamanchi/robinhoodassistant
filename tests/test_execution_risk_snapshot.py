@@ -30,6 +30,7 @@ from trading_assistant.orders.application import ApprovalCommand
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.clock import MarketClockObservation
 from trading_assistant.risk.engine import RiskEngine
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 
 NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
@@ -477,7 +478,11 @@ def _pending(
                 Decimal(limit_price) if limit_price is not None else None
             ),
         )
-        session.add(row)
+        persist_sensitive(
+            session,
+            row,
+            {"approval_reason": "pending exposure fixture"},
+        )
         session.commit()
         return row.id
 

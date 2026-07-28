@@ -23,6 +23,7 @@ from trading_assistant.db.models import (
     RateWindow,
     utcnow,
 )
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 
 UTC = timezone.utc
@@ -917,7 +918,8 @@ class MutationInterlockService:
             ):
                 session.rollback()
                 return False
-            session.add(
+            persist_sensitive(
+                session,
                 AuditEvent(
                     actor=actor,
                     action="mutation_interlock.reconcile",
@@ -927,12 +929,12 @@ class MutationInterlockService:
                     ).hexdigest(),
                     request_id=request_id,
                     idempotency_key="",
-                    reason=evidence_code,
                     result_code="cleared",
                     latency_ms=0,
-                    detail_json="{}",
                     created_at=utcnow(),
-                )
+                ),
+                {"reason": evidence_code, "detail_json": "{}"},
+                session_factory=self._session_factory,
             )
             session.delete(row)
             session.commit()

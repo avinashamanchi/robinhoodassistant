@@ -8,6 +8,8 @@ logic — it maps tool calls to :class:`TradingService` methods.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import logging
 from typing import Any, Optional
 from uuid import uuid4
@@ -18,6 +20,7 @@ from ..config import load_config
 from ..security.secrets import load_role_secrets
 from ..service import TradingService
 from ..operations import AuditRecorder, MutationContext
+from ..ops.tenure import TenureLost, TenureUncertain
 
 mcp = FastMCP("trading-assistant")
 _LOG = logging.getLogger(__name__)
@@ -51,16 +54,10 @@ def build_default_container():
         )
 
 
-def build_default_service() -> TradingService:
-    container = build_default_container()
-    configure(container.service, audit=container.audit)
-    return container.service
-
-
 def _svc() -> TradingService:
     global _service
     if _service is None:
-        _service = build_default_service()
+        raise RuntimeError("mcp_service_unconfigured")
     return _service
 
 
@@ -250,13 +247,56 @@ def get_external_dividends(days: int = 90) -> dict[str, Any]:
     return _svc().get_external_dividends(days)
 
 
+async def _run_owned_server(container) -> None:
+    """Run stdio until it exits or durable MCP ownership is lost."""
+    guard = getattr(container, "runtime_tenure_guard", None)
+    if guard is None:
+        raise TenureUncertain()
+    loop = asyncio.get_running_loop()
+    lost = asyncio.Event()
+    guard.set_on_lost(
+        lambda: loop.call_soon_threadsafe(lost.set)
+    )
+    server_task = asyncio.create_task(mcp.run_stdio_async())
+    loss_task = asyncio.create_task(lost.wait())
+    done, _pending = await asyncio.wait(
+        {server_task, loss_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if loss_task in done and guard.lost:
+        server_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await server_task
+        raise TenureLost()
+    loss_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await loss_task
+    await server_task
+
+
 def main() -> None:
     container = build_default_container()
     from ..logging import runtime_startup
 
     with runtime_startup("mcp", container.secrets):
-        configure(container.service, audit=container.audit)
-        mcp.run()
+        guard = getattr(container, "runtime_tenure_guard", None)
+        primary_failure = False
+        try:
+            configure(container.service, audit=container.audit)
+            asyncio.run(_run_owned_server(container))
+        except BaseException:
+            primary_failure = True
+            raise
+        finally:
+            if guard is not None:
+                try:
+                    released = guard.close()
+                except BaseException:
+                    if not primary_failure:
+                        raise TenureUncertain() from None
+                else:
+                    if not released and not primary_failure:
+                        raise TenureUncertain()
 
 
 if __name__ == "__main__":

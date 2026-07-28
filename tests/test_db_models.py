@@ -23,6 +23,10 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.db.session import create_db_engine
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
+)
 
 
 def test_order_proposal_fill_roundtrip(session_factory):
@@ -35,15 +39,19 @@ def test_order_proposal_fill_roundtrip(session_factory):
             notional=Decimal("100"),
             status=OrderStatus.PROPOSED.value,
         )
-        s.add(order)
-        s.flush()
-        s.add(
+        persist_sensitive(
+            s,
+            order,
+            {"approval_reason": "test fixture"},
+        )
+        persist_sensitive(
+            s,
             Proposal(
                 order_id=order.id,
-                reasoning="LLM says buy",
                 ttl_minutes=15,
                 expires_at=utcnow() + timedelta(minutes=15),
-            )
+            ),
+            {"reasoning": "LLM says buy"},
         )
         s.add(
             Fill(
@@ -60,7 +68,10 @@ def test_order_proposal_fill_roundtrip(session_factory):
     with session_factory() as s:
         order = s.get(Order, oid)
         assert order.idempotency_key == "idem-1"
-        assert order.proposal.reasoning == "LLM says buy"
+        assert (
+            sensitive_store(s).read(order.proposal, "reasoning")
+            == "LLM says buy"
+        )
         assert len(order.fills) == 1
         # Timestamps are timezone-aware (UTC).
         assert order.created_at.tzinfo is not None
@@ -68,16 +79,30 @@ def test_order_proposal_fill_roundtrip(session_factory):
 
 def test_idempotency_key_unique(session_factory):
     with session_factory() as s:
-        s.add(Order(idempotency_key="dup", ticker="AAPL", side="buy", order_type="market"))
+        persist_sensitive(
+            s,
+            Order(
+                idempotency_key="dup",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+            ),
+            {"approval_reason": "test fixture"},
+        )
         s.commit()
     with session_factory() as s:
-        s.add(Order(idempotency_key="dup", ticker="MSFT", side="buy", order_type="market"))
-        try:
+        with pytest.raises(Exception):
+            persist_sensitive(
+                s,
+                Order(
+                    idempotency_key="dup",
+                    ticker="MSFT",
+                    side="buy",
+                    order_type="market",
+                ),
+                {"approval_reason": "test fixture"},
+            )
             s.commit()
-            raised = False
-        except Exception:
-            raised = True
-        assert raised, "duplicate idempotency_key must violate the unique constraint"
 
 
 def test_auth_session_hash_is_unique(session_factory):

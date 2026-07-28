@@ -46,6 +46,8 @@ from trading_assistant.risk.engine import RiskEngine, RiskResult
 from trading_assistant.risk.killswitch import KillSwitch
 from trading_assistant.risk.submission_barrier import SubmissionBarrier
 from trading_assistant.service import TradingService
+from trading_assistant.security.sensitive_fields import persist_sensitive
+from tests.conftest import bind_test_sensitive_factory
 
 
 def _submit(submission, order_id):
@@ -441,7 +443,9 @@ def _risk_writer_submission_process(
     broker_entered,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     repository = OrderRepository(factory)
     broker = _QueuedSnapshotBroker(
         broker_entered,
@@ -497,7 +501,9 @@ def _risk_writer_submission_process(
 
 
 def _loss_fill_writer_process(db_url, started, finished, outcome):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     started.set()
     try:
         report = ReconciliationService(
@@ -517,7 +523,9 @@ def _loss_fill_writer_process(db_url, started, finished, outcome):
 
 
 def _higher_hwm_writer_process(db_url, started, finished, outcome):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     config = _process_risk_config()
     broker = MockBroker(
         prices={"AAPL": Decimal("100")},
@@ -550,7 +558,9 @@ def _drift_reconciliation_process(
     outcome,
     conflict_kind,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     broker = {
         "unknown": _DriftRaceBroker,
         "terminal": _TerminalDriftRaceBroker,
@@ -592,7 +602,9 @@ def _acceptance_contradiction_recovery_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     reconciliation = ReconciliationService(
         factory,
         _AcceptanceContradictionBroker(),
@@ -632,7 +644,9 @@ def _daily_loss_enforcement_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     service = TradingService(
         MockBroker(prices={"AAPL": Decimal("100")}),
         factory,
@@ -679,7 +693,9 @@ def _position_reconciliation_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     service = TradingService(
         _PositionDriftRaceBroker(drift_observed, release_drift),
         factory,
@@ -736,7 +752,9 @@ def _immediate_submission_process(
     broker_entered,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     service = OrderSubmissionService(
         OrderRepository(factory),
         factory,
@@ -761,7 +779,9 @@ def _invalid_submission_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     broker = (
         _InvalidIdentityProcessBroker()
         if fault_kind == "identity"
@@ -806,7 +826,9 @@ def _cancel_loss_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     with factory() as session:
         order = session.get(Order, cancel_order_id)
         broker_order_id = order.broker_order_id
@@ -853,7 +875,9 @@ def _indeterminate_cancel_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     with factory() as session:
         broker_order_id = session.get(Order, cancel_order_id).broker_order_id
     service = TradingService(
@@ -899,7 +923,9 @@ def _loss_checked_submission_process(
     broker_entered,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     config = _process_risk_config().model_copy(
         update={"max_daily_total_loss": 50}
     )
@@ -935,7 +961,9 @@ def _loss_checked_submission_process(
 
 
 def _writer_intent_path(db_url):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     barrier_path = SubmissionBarrier(factory).path
     return barrier_path.with_name(f"{barrier_path.name}.intent")
 
@@ -1008,7 +1036,9 @@ def _counted_submission_process(
     broker_entered,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     repository = OrderRepository(factory)
 
     class _CountingRisk:
@@ -1055,7 +1085,9 @@ def _observed_breaker_writer_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     breakers = BreakerService(factory)
     _observe_barrier_lock(
         breakers.submission_barrier,
@@ -1091,7 +1123,9 @@ def _queued_snapshot_submission_process(
     disconnect_after_acceptance,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     repository = OrderRepository(factory)
     if pause_before_claim:
         original_claim = repository.claim_submission
@@ -1155,7 +1189,9 @@ def _submission_process(
     release_broker,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     repository = OrderRepository(factory)
     if pause_after_claim:
         original_claim = repository.claim_submission
@@ -1185,7 +1221,9 @@ def _submission_process(
 
 
 def _writer_process(db_url, writer_kind, started, finished, outcome):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     repository = OrderRepository(factory)
     breakers = BreakerService(factory)
     started.set()
@@ -1233,7 +1271,9 @@ def _paused_panic_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     broker = _PausedProcessPanicBroker(
         panic_entered,
         release_panic,
@@ -1264,7 +1304,9 @@ def _bracket_submission_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     broker = _CountingProcessBracketBroker()
     service = TradingService(
         broker,
@@ -1352,7 +1394,9 @@ def _active_transaction_compatibility_writer_process(
     finished,
     outcome,
 ):
-    factory = make_session_factory(create_db_engine(db_url))
+    factory = bind_test_sensitive_factory(
+        make_session_factory(create_db_engine(db_url))
+    )
     try:
         with factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
@@ -1944,7 +1988,8 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
     order_id = _approved_order(service)
     if conflict_kind != "unknown":
         with service.session_factory() as session:
-            session.add(
+            persist_sensitive(
+                session,
                 Order(
                     idempotency_key=f"{conflict_kind}-drift-client",
                     ticker="AAPL",
@@ -1958,7 +2003,8 @@ def test_reconciliation_drift_is_durable_before_writer_interval_release(
                     ),
                     broker_order_id=f"{conflict_kind}-drift-order",
                     acceptance_state="accepted",
-                )
+                ),
+                {"approval_reason": "reconciliation drift fixture"},
             )
             session.commit()
     before_writer_release = context.Event()
@@ -2037,8 +2083,11 @@ def test_acceptance_contradiction_is_atomic_before_writer_interval_release(
             status=OrderStatus.ACCEPTANCE_UNKNOWN.value,
             acceptance_state=OrderStatus.ACCEPTANCE_UNKNOWN.value,
         )
-        session.add(contradicted)
-        session.flush()
+        persist_sensitive(
+            session,
+            contradicted,
+            {"approval_reason": "acceptance contradiction fixture"},
+        )
         session.add(
             Fill(
                 order_id=contradicted.id,
@@ -2311,7 +2360,11 @@ def test_cancel_loss_reconciliation_blocks_concurrent_submission(
             broker_order_id="cancel-loss-broker-order",
             acceptance_state="submitted",
         )
-        session.add(cancel_order)
+        persist_sensitive(
+            session,
+            cancel_order,
+            {"approval_reason": "cancel loss fixture"},
+        )
         session.commit()
         cancel_order_id = cancel_order.id
 
@@ -2403,7 +2456,11 @@ def test_indeterminate_cancel_latches_before_release_and_recovers_exactly_once(
             broker_order_id="indeterminate-cancel-broker-order",
             acceptance_state="submitted",
         )
-        session.add(cancel_order)
+        persist_sensitive(
+            session,
+            cancel_order,
+            {"approval_reason": "indeterminate cancel fixture"},
+        )
         session.commit()
         cancel_order_id = cancel_order.id
 
@@ -2627,7 +2684,8 @@ def test_loss_fill_writer_queued_after_snapshot_prevents_broker_send(
                 filled_at=utcnow(),
             )
         )
-        session.add(
+        persist_sensitive(
+            session,
             Order(
                 idempotency_key="loss-fill-risk-writer-client",
                 ticker="AAPL",
@@ -2637,7 +2695,8 @@ def test_loss_fill_writer_queued_after_snapshot_prevents_broker_send(
                 status=OrderStatus.SUBMITTED.value,
                 broker_order_id="loss-fill-risk-writer-order",
                 acceptance_state="submitted",
-            )
+            ),
+            {"approval_reason": "loss fill writer fixture"},
         )
         session.commit()
 
