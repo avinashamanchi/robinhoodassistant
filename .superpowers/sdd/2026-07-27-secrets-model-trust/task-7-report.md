@@ -449,6 +449,84 @@ No second full-suite run was performed for reviewer fix round 3. No panic,
 lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
 broker, or runtime code changed in this round.
 
+## Reviewer fix round 4 — bare cued payloads require EOF
+
+The exact reviewer finding was reproduced against the round-3 parser:
+
+- `decode: YWJjZA== <Unicode-whitespace-fragmented malicious Base64>`
+  treated the valid padding as the end of the bare payload;
+- the parser removed only the cue and padded prefix, then forwarded the
+  fragmented malicious continuation because the generic fallback scanner
+  handles contiguous Base64 only.
+
+TDD RED:
+
+- the round-4 reviewer selection produced
+  `3 failed, 6 passed, 65 deselected in 1.85s`;
+- all three failures returned sanitized content instead of rejecting the item;
+- the failing cases covered the exact padded-prefix continuation, a padded
+  malicious payload followed by financial prose, and a bare padded payload
+  followed by a second explicitly delimited payload;
+- explicit-delimiter and EOF-only control cases passed in the same RED run.
+
+The quarantine-only implementation now:
+
+- accepts an unquoted or unbackticked cued Base64 payload only when the bare
+  parser consumes the remainder of the item after Unicode-whitespace
+  normalization;
+- keeps scanning after valid padding and raises stable
+  `ambiguous_encoding` if any non-whitespace continuation follows;
+- keeps malformed prefixes and malformed padding classified as stable
+  `malformed_encoding`;
+- returns an interval ending at EOF for every accepted bare payload, so no
+  partial bare interval can be removed and returned;
+- permits trailing prose only when the payload is bounded by an explicit
+  quote or backtick delimiter;
+- safely sanitizes multiple explicitly delimited payloads while preserving
+  outside prose, but rejects the whole item if a bare payload is followed by
+  another payload;
+- continues to decode only for bounded classification and persists only
+  metadata hashes, byte count, stable codes, state, and receipt time.
+
+GREEN evidence:
+
+- round-4 reviewer selection:
+  `9 passed, 65 deselected in 0.35s`;
+- complete quarantine module:
+  `74 passed in 2.22s`;
+- untrusted content, news, DB models, and migrations:
+  `247 passed, 1 warning in 31.27s`;
+- round-4 rejection, delimiter, multiple-payload, financial-negation, and EOF
+  controls:
+  20/20 fresh processes, 220/220 cases;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  `182 passed in 15.95s`;
+- unchanged route policy, durable limits, and runtime tenure:
+  `220 passed in 18.66s`;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+Test-quality audit:
+
+- five round-4 behavior cases were added, producing 74 unique quarantine node
+  IDs;
+- no duplicate names or node IDs, skips, xfails, placeholder `pass`, or dead
+  parameters were found;
+- the padded-prefix continuation, padded financial prose, EOF-only padded
+  acceptance, multiple delimited preservation, and bare-then-delimited
+  rejection cases each exercise a separate observable boundary.
+
+Exactly one repository-wide suite was run after all focused gates were green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2908 passed, 1 skipped, 1 warning in 394.98s`.
+
+No second full-suite run was performed for reviewer fix round 4. No panic,
+lease, persistence schema, news-provider, analyst, planning, app, daemon, MCP,
+broker, or runtime code changed in this round.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -469,6 +547,8 @@ broker, or runtime code changed in this round.
   `review-849b6ad..e3b6a8f.diff`
 - generated reviewer-fix-round-3 review package
   `review-34f56c0..3833dd3.diff`
+- generated reviewer-fix-round-4 review package
+  `review-ceb013e..0a4bcc6.diff`
 
 ## Caveats
 
