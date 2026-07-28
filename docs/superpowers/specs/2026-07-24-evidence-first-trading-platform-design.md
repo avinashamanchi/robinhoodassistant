@@ -1,7 +1,7 @@
 # Evidence-First Trading Platform — Master Design
 
-**Date:** 2026-07-24  
-**Status:** Approved direction  
+**Date:** 2026-07-24
+**Status:** Approved direction
 **Operating posture:** Alpaca paper trading, human approval required, all autonomous and live capabilities off
 
 ## 1. Purpose

@@ -505,3 +505,142 @@
   re-review findings or the adjacent process-identity caller.
 - The sole warning is an upstream deprecation unrelated to backup, migration
   authority, process identity, tenure cleanup, approval, or execution safety.
+
+## Review fix round 3
+
+### Status, scope, and commit
+
+- Round-3 baseline:
+  `b1afd8584ec65db1e90ad6ff599b0780e96f7851`.
+- Round-3 implementation commit:
+  `2720dbf914ea11e638d8619e300b8c9a7e44649e`
+  (`fix(security): close Task 6 round 3 findings`).
+- Work was performed directly in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- Every database probe used a pytest-created temporary SQLite database. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  processes, network, external services, brokers/providers, notifications, the
+  real app/daemon/MCP, breakers, and order APIs were not accessed.
+
+### Finding closure
+
+- Non-empty migration authority can no longer be minted from caller assertions.
+  Issuance requires the exact maintenance guard, exact durable tenure handle,
+  real tenure service bound to the migration connection's engine, and its
+  installed mutation barrier. Exact owner/generation/unexpired ownership is
+  proved on that same connection at issuance, activation, revision entry,
+  every fenced DDL seam, and transaction mutation/commit boundaries. A forged
+  exact handle around a no-op service is explicitly rejected with zero held
+  tenures.
+- Migration authority is sealed, exact-connection-bound, and single-use.
+  Wrong-connection activation, failed validation, and completed use consume the
+  token. Revision `0015` derives ownership and its narrow schema-rebuild fence
+  from the authority object itself; caller-supplied Config fence/assertion
+  attributes are ignored. Direct and offline Alembic remain fail-closed before
+  DDL or version mutation.
+- Empty bootstrap authority rechecks actual emptiness at activation. An
+  issue-then-create attempt refuses without creating `alembic_version`,
+  preserves the injected table/row, and consumes the token. Connection misuse
+  and replay are also refused. Alembic now retires authority even when
+  activation itself fails.
+- Historical revision tests whose schemas predate `runtime_tenures` use a
+  context-scoped test-only adapter. It patches only the test process while the
+  command runs and exposes no production Config flag, Boolean capability, or
+  constructor. Reviewer probes and wrapper-success tests use the unpatched
+  production path with real durable tenures.
+- Encrypted backup ciphertext remains under a private dot-prefixed temporary
+  name through authenticated decryption, exact plaintext hash comparison, and
+  SQLite `PRAGMA quick_check`. The final artifact path does not exist during
+  verification. After verification, ownership is checked one final time and
+  the already-fsynced ciphertext is atomically linked into place. Verification
+  failure, ownership loss, cancellation, collision, or later publication
+  failure removes private temporaries and any incomplete final publication.
+- The tracked round-2 review artifact was regenerated in valid zero-context
+  form, and two legacy Markdown headers were mechanically stripped of trailing
+  spaces. The round-3 review artifact was also generated with zero context.
+  Neither artifact has trailing whitespace or a missing final newline.
+
+### Changed files
+
+- Implementation:
+  `migrations/env.py`,
+  `migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py`,
+  `src/trading_assistant/db/migrate.py`,
+  `src/trading_assistant/db/migration_authority.py`,
+  `src/trading_assistant/ops/backup.py`,
+  `tests/test_migrations.py`, and
+  `tests/test_sensitive_migration.py`.
+- Evidence and whitespace:
+  this report,
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/progress.md`,
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-a9ab761..815d956.diff`,
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-b1afd85..2720dbf.diff`,
+  `docs/superpowers/specs/2026-07-24-evidence-first-trading-platform-design.md`,
+  and
+  `docs/superpowers/specs/2026-07-24-safety-foundation-design.md`.
+
+### Round-3 TDD and focused evidence
+
+- Initial focused RED:
+  `6 failed in 1.23s`. The probes demonstrated zero-tenure forged
+  upgrade/downgrade, bootstrap issue-then-create/reuse, bootstrap
+  connection misuse, early final backup visibility, and ownership loss during
+  private verification.
+- First focused GREEN after the minimum authority/publication changes:
+  `6 passed in 0.63s`.
+- An adjacent forged-handle RED then proved that an exact
+  `RuntimeTenureHandle` wrapped around a caller no-op service could still mint
+  authority: `1 failed` with `DID NOT RAISE`. Requiring the real tenure service
+  and exact engine binding closed that path; the forged-handle plus valid
+  upgrade/downgrade and successor-loss selection became `5 passed`.
+- Maintenance wrong-connection, replay, post-issuance lease loss, and valid
+  fenced downgrade converged at `4 passed`. Two initial assertion failures in
+  that group were test fingerprint debt: a real acquired/released tenure
+  correctly changes durable tenure evidence. Schema, version, and protected
+  rows remained unchanged.
+- Complete focused files/groups:
+  migrations `155 passed`;
+  sensitive backup/migrate/rotate `48 passed`;
+  operational backup callers `13 passed`;
+  startup schema, runtime tenure, and release-static adjacency `125 passed`.
+  These are `341` non-overlapping focused tests.
+
+### Release gates
+
+- `python -m compileall -q src tests`: PASS.
+- `python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Tracked-text scans found no trailing whitespace and no missing final newline
+  after the artifact cleanup.
+
+### Exactly one round-3 full suite
+
+- Exactly one final full suite ran after every focused check and release gate
+  was green. Its environment explicitly unset database, Alpaca, Robinhood,
+  LLM/provider, market-data, notification, candidate-signing,
+  field-encryption, backup-encryption, live-confirmation, Composio, Octen, and
+  OpenAI credential variables.
+- Exact result:
+  `2656 passed, 1 skipped, 1 warning in 377.03s (0:06:17)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second full-suite run was started. No production code or tests changed
+  after this result; only this report, progress ledger, whitespace-only
+  documentation cleanup, and generated review evidence were changed.
+
+### Round-3 remaining caveats
+
+- No known production correctness or safety defect remains from the two
+  important findings or the minor whitespace finding.
+- In-place production migration of a non-empty schema that predates durable
+  `runtime_tenures` remains intentionally refused and requires the separately
+  reviewed isolated-copy procedure.
+- The sole test warning is an upstream deprecation unrelated to backup
+  publication, migration authority, approval, execution safety, or broker
+  truth.

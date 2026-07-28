@@ -1,7 +1,7 @@
 # Safety Foundation — Subproject Design
 
-**Date:** 2026-07-24  
-**Parent:** `2026-07-24-evidence-first-trading-platform-design.md`  
+**Date:** 2026-07-24
+**Parent:** `2026-07-24-evidence-first-trading-platform-design.md`
 **Status:** Approved for implementation
 
 ## 1. Objective
