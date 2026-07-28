@@ -1,0 +1,322 @@
+# Review package: 7cb4eb5..53ea34c
+
+## Commits
+53ea34c fix(security): preserve control token boundaries
+
+## Files changed
+ src/trading_assistant/analyst/untrusted.py |  49 +++++++++---
+ tests/test_untrusted_content.py            | 124 +++++++++++++++++++++++++++--
+ 2 files changed, 154 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/src/trading_assistant/analyst/untrusted.py b/src/trading_assistant/analyst/untrusted.py
+index 678e4fa..9a10802 100644
+--- a/src/trading_assistant/analyst/untrusted.py
++++ b/src/trading_assistant/analyst/untrusted.py
+@@ -196,8 +196,16 @@ class UntrustedSummary(BaseModel):
+ class UntrustedContentError(ValueError):
+     """Stable redacted rejection raised at the quarantine boundary."""
+
+-    def __init__(self, code: str) -> None:
++    def __init__(
++        self,
++        code: str,
++        *,
++        additional_flag_codes: Sequence[str] = (),
++    ) -> None:
+         self.code = code
++        self.additional_flag_codes = tuple(
++            sorted(set(additional_flag_codes))
++        )
+         super().__init__(code)
+
+
+@@ -263,18 +271,28 @@ def _strip_hidden_controls(
+     findings: dict[str, InjectionFinding],
+ ) -> str:
+     output: list[str] = []
++    in_removed_run = False
+     for character in text:
++        finding_code: str | None = None
+         if character == "\x00":
+-            _add_finding(findings, "nul_control", "high")
+-            continue
+-        if character in _BIDI_CONTROLS:
+-            _add_finding(findings, "bidi_control", "high")
+-            continue
+-        category = unicodedata.category(character)
+-        if category in {"Cc", "Cf"} and character not in {"\n", "\t"}:
+-            _add_finding(findings, "hidden_control", "high")
++            finding_code = "nul_control"
++        elif character in _BIDI_CONTROLS:
++            finding_code = "bidi_control"
++        elif (
++            unicodedata.category(character) in {"Cc", "Cf"}
++            and character not in {"\n", "\t"}
++        ):
++            finding_code = "hidden_control"
++
++        if finding_code is not None:
++            _add_finding(findings, finding_code, "high")
++            if not in_removed_run:
++                output.append(" ")
++            in_removed_run = True
+             continue
++
+         output.append(character)
++        in_removed_run = False
+     return "".join(output)
+
+
+@@ -415,7 +433,10 @@ def _decoded_instruction(candidate: str) -> bool:
+     )
+
+
+-def _reject_cued_encoded_content(text: str) -> None:
++def _reject_cued_encoded_content(
++    text: str,
++    findings: Mapping[str, InjectionFinding],
++) -> None:
+     """Reject simple action cues with content instead of parsing payloads.
+
+     Any standalone ``decode``, ``encode``, or ``base64`` word is fail-closed
+@@ -446,7 +467,10 @@ def _reject_cued_encoded_content(text: str) -> None:
+             cue_end,
+         )
+         if remainder_start < len(detection_text):
+-            raise UntrustedContentError("ambiguous_encoding")
++            raise UntrustedContentError(
++                "ambiguous_encoding",
++                additional_flag_codes=tuple(findings),
++            )
+
+
+ def _skip_action_cue_separators(text: str, start: int) -> int:
+@@ -544,7 +568,7 @@ def _strip_tool_json(
+ def _sanitize(raw_text: str) -> tuple[str, tuple[InjectionFinding, ...]]:
+     findings: dict[str, InjectionFinding] = {}
+     text = _canonicalize_active_content(raw_text, findings)
+-    _reject_cued_encoded_content(text)
++    _reject_cued_encoded_content(text, findings)
+
+     text = _strip_tool_json(text, findings)
+     if _DIRECT_INSTRUCTION_RE.search(text):
+@@ -694,6 +718,7 @@ class UntrustedContentGateway:
+                 len(raw_bytes),
+                 exc.code,
+                 observed_at,
++                additional_flag_codes=exc.additional_flag_codes,
+             )
+             raise
+         normalized_bytes = normalized_text.encode("utf-8")
+diff --git a/tests/test_untrusted_content.py b/tests/test_untrusted_content.py
+index 09400d1..276299f 100644
+--- a/tests/test_untrusted_content.py
++++ b/tests/test_untrusted_content.py
+@@ -79,6 +79,7 @@ def _assert_metadata_only_rejection(
+     raw_text: str,
+     code: str,
+     raw_markers: tuple[str, ...],
++    expected_flag_codes: tuple[str, ...] | None = None,
+ ) -> None:
+     gateway = _gateway(session_factory)
+
+@@ -95,7 +96,9 @@ def _assert_metadata_only_rejection(
+         assert len(rows) == 1
+         row = rows[0]
+         assert row.state == "rejected"
+-        assert json.loads(row.flags_json) == [code]
++        assert json.loads(row.flags_json) == sorted(
++            expected_flag_codes or (code,)
++        )
+         assert row.byte_length == len(raw_text.encode("utf-8"))
+         persisted = " ".join(
+             str(value)
+@@ -297,32 +300,37 @@ def test_gateway_rejects_every_nonempty_cued_encoding_shape(
+
+
+ @pytest.mark.parametrize(
+-    ("raw_text", "source_id", "raw_marker"),
++    ("raw_text", "source_id", "raw_marker", "expected_flag_codes"),
+     [
+         (
+             "DeCoDe&#58;&nbsp;RAW_ENTITY_CUE",
+             "entity-cue",
+             "RAW_ENTITY_CUE",
++            ("ambiguous_encoding",),
+         ),
+         (
+             "DECODE&#x200b; AND\u2003OBEY \t:\u00a0RAW_UNICODE_CUE",
+             "unicode-whitespace-cue",
+             "RAW_UNICODE_CUE",
++            ("ambiguous_encoding", "hidden_control"),
+         ),
+         (
+             "EnCoDeD\tPaYlOaD =&gt; RAW_CASE_CUE",
+             "case-and-arrow-cue",
+             "RAW_CASE_CUE",
++            ("ambiguous_encoding",),
+         ),
+         (
+             "BASE64&nbsp;DATA&nbsp;:&nbsp;RAW_NBSP_CUE",
+             "nbsp-cue",
+             "RAW_NBSP_CUE",
++            ("ambiguous_encoding",),
+         ),
+         (
+             "DeCoDe&amp;#58;&amp;nbsp;RAW_FIXED_POINT_CUE",
+             "fixed-point-entity-cue",
+             "RAW_FIXED_POINT_CUE",
++            ("ambiguous_encoding",),
+         ),
+         (
+             (
+@@ -338,6 +346,7 @@ def test_gateway_rejects_every_nonempty_cued_encoding_shape(
+             ),
+             "bounded-separator-cue",
+             "RAW_BOUNDED_SEPARATOR_CUE",
++            ("ambiguous_encoding",),
+         ),
+     ],
+ )
+@@ -347,6 +356,7 @@ def test_gateway_rejects_cues_after_canonicalization(
+     raw_text,
+     source_id,
+     raw_marker,
++    expected_flag_codes,
+ ):
+     _assert_metadata_only_rejection(
+         session_factory,
+@@ -355,6 +365,84 @@ def test_gateway_rejects_cues_after_canonicalization(
+         raw_text=raw_text,
+         code="ambiguous_encoding",
+         raw_markers=(raw_marker,),
++        expected_flag_codes=expected_flag_codes,
++    )
++
++
++@pytest.mark.parametrize(
++    ("raw_text", "source_id", "raw_marker", "expected_flag_codes"),
++    [
++        (
++            "decode\u200bRAW_HIDDEN_BOUNDARY",
++            "hidden-control-boundary",
++            "RAW_HIDDEN_BOUNDARY",
++            ("ambiguous_encoding", "hidden_control"),
++        ),
++        (
++            "decode\u00adRAW_SOFT_HYPHEN_BOUNDARY",
++            "soft-hyphen-boundary",
++            "RAW_SOFT_HYPHEN_BOUNDARY",
++            ("ambiguous_encoding", "hidden_control"),
++        ),
++        (
++            "decode\x00RAW_NUL_BOUNDARY",
++            "nul-control-boundary",
++            "RAW_NUL_BOUNDARY",
++            ("ambiguous_encoding", "nul_control"),
++        ),
++        (
++            "decode\u202eRAW_BIDI_BOUNDARY\u202c",
++            "bidi-control-boundary",
++            "RAW_BIDI_BOUNDARY",
++            ("ambiguous_encoding", "bidi_control"),
++        ),
++        (
++            "decode RA\u200bW_CONTROLLED_PAYLOAD",
++            "control-inside-payload",
++            "W_CONTROLLED_PAYLOAD",
++            ("ambiguous_encoding", "hidden_control"),
++        ),
++        (
++            "decode&#x200b;RAW_ENTITY_CONTROL",
++            "entity-control-boundary",
++            "RAW_ENTITY_CONTROL",
++            ("ambiguous_encoding", "hidden_control"),
++        ),
++        (
++            "decode&amp;#x200b;RAW_REPEATED_ENTITY_CONTROL",
++            "repeated-entity-control-boundary",
++            "RAW_REPEATED_ENTITY_CONTROL",
++            ("ambiguous_encoding", "hidden_control"),
++        ),
++        (
++            "decode\u200b\u00ad\x00\u202eRAW_MIXED_CONTROL_RUN",
++            "mixed-control-run-boundary",
++            "RAW_MIXED_CONTROL_RUN",
++            (
++                "ambiguous_encoding",
++                "bidi_control",
++                "hidden_control",
++                "nul_control",
++            ),
++        ),
++    ],
++)
++def test_gateway_rejects_control_separated_cue_payload_metadata_only(
++    session_factory,
++    caplog,
++    raw_text,
++    source_id,
++    raw_marker,
++    expected_flag_codes,
++):
++    _assert_metadata_only_rejection(
++        session_factory,
++        caplog,
++        source_id=source_id,
++        raw_text=raw_text,
++        code="ambiguous_encoding",
++        raw_markers=(raw_marker, raw_text),
++        expected_flag_codes=expected_flag_codes,
+     )
+
+
+@@ -512,20 +600,42 @@ def test_gateway_action_cue_recognizer_is_bounded_on_maximum_near_miss(
+
+
+ @pytest.mark.parametrize(
+-    ("raw_text", "expected_codes"),
++    ("raw_text", "expected_text", "expected_codes"),
+     [
+-        ("safe\u200btext", {"hidden_control"}),
+-        ("safe\u202etext\u202c", {"bidi_control"}),
+-        ("safe\x00text", {"nul_control"}),
++        ("safe\u200btext", "safe text", {"hidden_control"}),
++        ("safe\u202etext\u202c", "safe text", {"bidi_control"}),
++        ("safe\x00text", "safe text", {"nul_control"}),
++        (
++            "revenue\u200b\u00ad\x00\u202eguidance",
++            "revenue guidance",
++            {"hidden_control", "nul_control", "bidi_control"},
++        ),
++        (
++            "profit&amp;#x200b;warning",
++            "profit warning",
++            {"hidden_control"},
++        ),
++        (
++            "de\u200bcode outlook improved",
++            "de code outlook improved",
++            {"hidden_control"},
++        ),
++        (
++            "base\u00ad64 data point",
++            "base 64 data point",
++            {"hidden_control"},
++        ),
+     ],
+ )
+-def test_gateway_removes_hidden_unicode_controls(
++def test_gateway_replaces_control_runs_without_semantic_fusion(
+     session_factory,
+     raw_text,
++    expected_text,
+     expected_codes,
+ ):
+     content = _ingest(_gateway(session_factory), raw_text)
+
++    assert content.normalized_text == expected_text
+     assert expected_codes <= {finding.code for finding in content.findings}
+     assert "\u200b" not in content.normalized_text
+     assert "\u202e" not in content.normalized_text

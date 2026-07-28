@@ -823,6 +823,90 @@ persistence schema, news-provider, analyst, planning, app, daemon, MCP,
 broker, or runtime code changed. The Task 8 legacy analyst-news seam remains
 explicitly open.
 
+## Hidden-control token-boundary fix
+
+The exact post-review defect was reproduced at the public gateway:
+
+- canonicalization recorded Cc/Cf, bidi, and NUL findings but deleted the
+  corresponding characters;
+- deletion fused adjacent tokens, so `decode` plus a hidden-control plus a
+  payload became one unrecognized word;
+- the same mutation fused ordinary financial language such as
+  `profit` plus a hidden-control plus `warning`;
+- cue rejection persisted only `ambiguous_encoding`, discarding control
+  findings already produced during canonicalization.
+
+The narrow fix now:
+
+- replaces every contiguous run of removed Cc/Cf, bidi, or NUL controls with
+  exactly one ordinary ASCII space;
+- preserves the existing distinction that newline and tab are formatting
+  whitespace rather than removed hidden controls;
+- records every applicable stable control code in a mixed run while emitting
+  only one separator;
+- leaves the bounded four-pass entity/canonicalization fixed point unchanged;
+- performs action-cue detection only after canonicalization, so
+  `decode` separated from a payload by a raw, entity-decoded, or repeatedly
+  entity-decoded control is rejected as a cue with a nonempty remainder;
+- carries canonicalization findings on the stable redacted exception so a
+  rejected metadata row conservatively records both `ambiguous_encoding` and
+  its control evidence;
+- never returns a model for rejected content and persists no raw text, source
+  name, URL, snippet, or exception string.
+
+Controls inside an ordinary token are not deleted into a new word:
+`de<control>code` becomes `de code`, `base<control>64` becomes `base 64`,
+and financial terms remain separated. Controls inside a payload are also
+separated; when a standalone cue remains, the entire item rejects
+metadata-only. This preserves text semantics without treating sanitizer-made
+token fusion as trustworthy evidence.
+
+TDD evidence:
+
+- the initial exact public-gateway selection produced `15 failed`; cue/payload
+  boundary cases did not raise, adjacent text was fused, and controls inside
+  cue words could create false action cues;
+- after the minimal implementation, the same selection produced
+  `15 passed`;
+- the complete quarantine module produced 99/99 passing cases;
+- the exact selection passed in 20 fresh processes, 300/300 cases.
+
+Final focused and affected evidence:
+
+- untrusted-content, news, DB-model, and migration group: 272/272 passed with
+  the one existing third-party `websockets.legacy` warning;
+- analyst, analyst-v2, outbound policy, release static, and release branches:
+  182/182 passed;
+- unchanged route policy, durable limits, and runtime tenure: 220/220 passed;
+- 99 unique quarantine node IDs with no duplicates, skips, xfails,
+  placeholder `pass`, or dead parameters;
+- `python -m compileall`: passed;
+- `scripts/check_release_safety.py`: passed;
+- `git diff --check`: passed.
+
+The test matrix includes zero-width controls, soft hyphen, NUL, bidi controls,
+controls inside cue words and payloads, mixed contiguous control runs, direct
+entities, repeated entity decoding, financial-word boundaries, exact stable
+flag unions, raw byte counts, and absence of raw markers from the database,
+exception, captured logs, and returned models.
+
+No local independent reviewer subagent was available. The discovered review
+tools require an existing GitHub pull request, so they were not used under
+the no-push/no-external-state boundary. An exact-requirements self-review
+found no open Critical or Important issue.
+
+Exactly one repository-wide suite was run after every focused gate was green:
+
+- `uv run pytest -o addopts=''`
+- result:
+  `2933 passed, 1 skipped, 1 warning in 398.87s`.
+
+No second full-suite run was performed. Implementation commit: `53ea34c`.
+No panic, lease, migration, persistence schema, news-provider, analyst,
+planning, app, daemon, MCP, broker, or runtime code changed. The Task 8
+legacy analyst-news seam, PAPER mode, manual approval, kill switches, and
+broker-truth requirements remain unchanged.
+
 ## Changed files
 
 - `src/trading_assistant/analyst/untrusted.py`
@@ -851,6 +935,8 @@ explicitly open.
   `review-7c4a6b4..505cdd3.diff`
 - generated final cue-simplification review package
   `review-f8531aa..a4d0ead.diff`
+- generated hidden-control-boundary review package
+  `review-7cb4eb5..53ea34c.diff`
 
 ## Caveats
 
