@@ -1199,6 +1199,24 @@ git commit -m "feat(analyst): quarantine external text"
 - Makes started provider-budget reservations cancellation-safe and
   idempotently reconcilable as `unknown`.
 
+**Fix round 1 hardening:**
+
+- Summary copy-through protection uses bounded, source-derived lexical
+  fingerprints after NFKC/case/punctuation normalization: nonnumeric tokens of
+  at least 12 characters and contiguous 3–5-token n-grams. The conservative
+  policy intentionally permits standalone short tickers, ordinary two-token
+  company names, and pure numeric single tokens, while accepting false-positive
+  rejection of legitimate long proper nouns rather than forwarding raw text.
+- A reconciliation failure can leave a charged reservation `started`, but
+  reserve, status, and explicit maintenance atomically transition it to
+  `unknown` only after `expires_at`. The provider day is latched with
+  `provider_started_usage_unknown`; no call/token capacity is released and all
+  new calls remain blocked pending operator/provider reconciliation.
+- One shared source-citation validator runs inside `Analyst`, before
+  `save_report`, immediately after any planning analyst returns, and again at
+  the trade-plan store boundary. Alternate analyst implementations and direct
+  store callers cannot bypass summary/reference validation.
+
 - [ ] **Step 1: Write no-tools and no-raw-forwarding tests**
 
 ```python

@@ -15,6 +15,7 @@ from typing import Any, Optional, Protocol
 from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
 from ..signals.models import MarketFeatures
+from .citations import validate_source_citations
 from .models import AnalysisReport
 from .untrusted import (
     UntrustedSummary,
@@ -261,7 +262,7 @@ class Analyst:
             request_id=budget_request_id,
         )
         report = self._parse(resp, features)
-        self._enforce_source_citations(report, untrusted_summary)
+        validate_source_citations(report, untrusted_summary)
         self._enforce_quality(report, features)
         return self._apply_regime_filter(report, features)
 
@@ -330,7 +331,7 @@ class Analyst:
                 data["as_of"] = features.as_of
                 data["reference_price"] = Decimal(str(features.last_close or 0))
                 plan = TradePlan(**data)
-                self._enforce_source_citations(
+                validate_source_citations(
                     plan,
                     untrusted_summary,
                 )
@@ -364,29 +365,4 @@ class Analyst:
         if dte is not None and 0 <= dte <= EARNINGS_HORIZON_DAYS and not report.earnings_note:
             raise ValueError(
                 f"earnings in {dte}d but the analysis did not address earnings risk"
-            )
-
-    @staticmethod
-    def _enforce_source_citations(
-        report: AnalysisReport,
-        untrusted_summary: UntrustedSummary | None,
-    ) -> None:
-        cited = report.cited_source_refs
-        if len(set(cited)) != len(cited):
-            raise ValueError("source citations must be unique")
-        if untrusted_summary is None:
-            if cited:
-                raise ValueError(
-                    "source citations require an untrusted summary"
-                )
-            return
-        allowed = set(untrusted_summary.source_refs)
-        relevant = {
-            fact.source_ref for fact in untrusted_summary.facts
-        }
-        if any(ref not in allowed for ref in cited):
-            raise ValueError("source citation is not in the summary")
-        if untrusted_summary.facts and not relevant.intersection(cited):
-            raise ValueError(
-                "source citation is required for summarized facts"
             )

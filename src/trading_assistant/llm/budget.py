@@ -33,6 +33,7 @@ _RESERVATION_STATES = frozenset(
     {"reserved", "started", "settled", "unknown", "released"}
 )
 _USAGE_OVERRUN_CODE = "provider_usage_over_reservation"
+_STALE_STARTED_CODE = "provider_started_usage_unknown"
 
 
 class ProviderBudgetUnavailable(RuntimeError):
@@ -258,6 +259,11 @@ class ProviderBudgetService:
                 current,
                 provider=provider,
             )
+            self._reap_expired_started(
+                session,
+                current,
+                provider=provider,
+            )
 
             unresolved = session.scalar(
                 select(ProviderBudgetDay)
@@ -364,6 +370,14 @@ class ProviderBudgetService:
                 reservation.provider,
             )
             if reservation.state != "reserved":
+                session.rollback()
+                raise ProviderBudgetUnavailable(
+                    "provider reservation cannot be started"
+                )
+            if (
+                current < _as_utc(reservation.created_at)
+                or current >= _as_utc(reservation.expires_at)
+            ):
                 session.rollback()
                 raise ProviderBudgetUnavailable(
                     "provider reservation cannot be started"
@@ -505,6 +519,24 @@ class ProviderBudgetService:
             session.commit()
             return released
 
+    def reconcile_expired_started(self, now: datetime) -> int:
+        """Fail closed any started attempt whose usage never reconciled.
+
+        Unlike an unstarted reservation, a started call can never be refunded:
+        provider acceptance is ambiguous. The charged reservation is retained
+        and the provider day is latched for explicit operator/provider
+        reconciliation.
+        """
+        current = _as_utc(now)
+        with _budget_store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            reaped = self._reap_expired_started(
+                session,
+                current,
+            )
+            session.commit()
+            return reaped
+
     @classmethod
     def _release_expired_unstarted(
         cls,
@@ -551,6 +583,53 @@ class ProviderBudgetService:
             )
         return len(reservations)
 
+    @classmethod
+    def _reap_expired_started(
+        cls,
+        session: Session,
+        current: datetime,
+        *,
+        provider: str | None = None,
+    ) -> int:
+        if provider is None:
+            cls._validate_all_aggregates(session)
+        else:
+            cls._validate_provider_aggregates(session, provider)
+        statement = select(ProviderReservation).where(
+            ProviderReservation.state == "started",
+            ProviderReservation.expires_at <= current,
+        )
+        if provider is not None:
+            statement = statement.where(
+                ProviderReservation.provider == provider
+            )
+        reservations = session.scalars(statement).all()
+        affected_providers: set[str] = set()
+        for reservation in reservations:
+            cls._validate_reservation(reservation)
+            day = session.get(
+                ProviderBudgetDay,
+                (reservation.provider, reservation.budget_day),
+            )
+            if day is None:
+                raise ProviderBudgetUnavailable(
+                    "provider budget day is unavailable"
+                )
+            cls._validate_day(day)
+            reservation.state = "unknown"
+            if not day.reconciliation_required:
+                day.reconciliation_required = True
+                day.reconciliation_code = _STALE_STARTED_CODE
+            day.updated_at = current
+            affected_providers.add(reservation.provider)
+        session.flush()
+        for affected_provider in affected_providers:
+            cls._validate_provider_aggregates(
+                session,
+                affected_provider,
+            )
+        return len(reservations)
+
     def status(
         self,
         provider: str,
@@ -561,8 +640,15 @@ class ProviderBudgetService:
         _require_text("provider", provider)
         if model is not None:
             _require_text("model", model)
-        budget_day = _as_utc(now or self._clock()).date()
+        current = _as_utc(now or self._clock())
+        budget_day = current.date()
         with _budget_store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            self._reap_expired_started(
+                session,
+                current,
+                provider=provider,
+            )
             self._validate_provider_aggregates(session, provider)
             row = session.get(ProviderBudgetDay, (provider, budget_day))
             reconciliation = session.scalar(
@@ -574,9 +660,21 @@ class ProviderBudgetService:
                 .order_by(ProviderBudgetDay.budget_day)
                 .limit(1)
             )
-        calls_used = row.calls_used if row is not None else 0
-        input_used = row.input_tokens_used if row is not None else 0
-        output_used = row.output_tokens_used if row is not None else 0
+            calls_used = row.calls_used if row is not None else 0
+            input_used = row.input_tokens_used if row is not None else 0
+            output_used = row.output_tokens_used if row is not None else 0
+            reconciled_row = reconciliation or (
+                row
+                if row is not None and row.reconciliation_required
+                else None
+            )
+            reconciliation_required = reconciled_row is not None
+            reconciliation_code = (
+                reconciled_row.reconciliation_code
+                if reconciled_row is not None
+                else ""
+            )
+            session.commit()
         price = self._effective_price(
             provider,
             model=model,
@@ -593,11 +691,6 @@ class ProviderBudgetService:
                 + Decimal(output_used) * price.output_rate
             ) / _MILLION
 
-        reconciled_row = reconciliation or (
-            row
-            if row is not None and row.reconciliation_required
-            else None
-        )
         return BudgetStatus(
             provider=provider,
             budget_day=budget_day,
@@ -616,12 +709,8 @@ class ProviderBudgetService:
                 0,
                 self.limits.output_tokens - output_used,
             ),
-            reconciliation_required=reconciled_row is not None,
-            reconciliation_code=(
-                reconciled_row.reconciliation_code
-                if reconciled_row is not None
-                else ""
-            ),
+            reconciliation_required=reconciliation_required,
+            reconciliation_code=reconciliation_code,
             estimated_usd=estimated_usd,
             price_model=price_model,
             price_effective_date=price_effective_date,
@@ -817,7 +906,10 @@ class ProviderBudgetService:
             or expires_at <= created_at
             or (
                 reservation.started_at is not None
-                and _as_utc(reservation.started_at) < created_at
+                and (
+                    _as_utc(reservation.started_at) < created_at
+                    or _as_utc(reservation.started_at) >= expires_at
+                )
             )
             or (
                 reservation.settled_at is not None
@@ -891,6 +983,7 @@ class ProviderBudgetService:
         days_by_date: dict[date, ProviderBudgetDay] = {}
         expected: dict[date, list[int]] = {}
         overruns: dict[date, bool] = {}
+        stale_unknown_evidence: dict[date, bool] = {}
         for day in days:
             cls._validate_day(day)
             if day.provider != provider or day.budget_day in days_by_date:
@@ -900,6 +993,7 @@ class ProviderBudgetService:
             days_by_date[day.budget_day] = day
             expected[day.budget_day] = [0, 0, 0]
             overruns[day.budget_day] = False
+            stale_unknown_evidence[day.budget_day] = False
 
         for reservation in reservations:
             cls._validate_reservation(reservation)
@@ -930,6 +1024,14 @@ class ProviderBudgetService:
             else:
                 totals[1] += reservation.input_reserved
                 totals[2] += reservation.output_reserved
+                if (
+                    reservation.state == "unknown"
+                    and _as_utc(reservation.expires_at)
+                    <= _as_utc(day.updated_at)
+                ):
+                    stale_unknown_evidence[
+                        reservation.budget_day
+                    ] = True
 
         for budget_day, day in days_by_date.items():
             totals = expected[budget_day]
@@ -942,10 +1044,25 @@ class ProviderBudgetService:
                     "corrupt provider budget state"
                 )
             overrun = overruns[budget_day]
+            stale_started = stale_unknown_evidence[budget_day]
+            if overrun and (
+                not day.reconciliation_required
+                or day.reconciliation_code != _USAGE_OVERRUN_CODE
+            ):
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
+            if not overrun and day.reconciliation_required and (
+                day.reconciliation_code != _STALE_STARTED_CODE
+                or not stale_started
+            ):
+                raise ProviderBudgetUnavailable(
+                    "corrupt provider budget state"
+                )
             if (
-                day.reconciliation_required is not overrun
-                or day.reconciliation_code
-                != (_USAGE_OVERRUN_CODE if overrun else "")
+                not overrun
+                and not day.reconciliation_required
+                and day.reconciliation_code
             ):
                 raise ProviderBudgetUnavailable(
                     "corrupt provider budget state"

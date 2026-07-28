@@ -25,9 +25,10 @@ from ..config import live_trading_enabled
 from ..db.models import AuditEvent, TradePlanRow, utcnow
 from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
-from ..security.sensitive_fields import sensitive_store
 from ..rules.models import RuleCommand
+from ..security.sensitive_fields import sensitive_store
 from ..signals.models import MarketFeatures
+from .citations import validate_source_citations
 from .models import PlanAction, TradePlan
 from .promotion import can_promote
 from .scorecard import build_scorecard
@@ -149,6 +150,7 @@ class PlanningService:
             untrusted_summary=untrusted_summary,
             request_id=request_id,
         )
+        validate_source_citations(plan, untrusted_summary)
 
         ac = AssetClass.for_symbol(symbol)
         with self.service.session_factory() as s:
@@ -167,6 +169,7 @@ class PlanningService:
             actor=actor,
             reason=reason,
             request_id=request_id,
+            untrusted_summary=untrusted_summary,
         )
         return {
             "plan_id": plan_id,
@@ -189,7 +192,9 @@ class PlanningService:
         actor: str,
         reason: str,
         request_id: str,
+        untrusted_summary: UntrustedSummary | None = None,
     ) -> tuple[int, str]:
+        validate_source_citations(plan, untrusted_summary)
         sized_payload = sized.to_dict()
         authority_digest = _authority_digest(plan, sized_payload)
         with self.service.session_factory() as s:

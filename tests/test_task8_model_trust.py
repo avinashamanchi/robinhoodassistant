@@ -13,9 +13,14 @@ import pytest
 from sqlalchemy import func, select
 
 from trading_assistant.analyst.analyst import Analyst
-from trading_assistant.analyst.models import PlanAction
+from trading_assistant.analyst.models import (
+    AnalysisReport,
+    PlanAction,
+    TradePlan,
+)
 from trading_assistant.analyst.planning import PlanningService
 from trading_assistant.analyst.shadow import _base_report
+from trading_assistant.analyst.sizing import SizedTradePlan
 from trading_assistant.analyst.store import save_report
 from trading_assistant.analyst.untrusted import (
     InjectionFinding,
@@ -83,11 +88,12 @@ def _summary_json(
     fact_ref: str = "s1",
     source_refs: tuple[str, ...] = ("s1",),
     flags: tuple[str, ...] = (),
+    uncertainty: str = "Future demand remains uncertain.",
 ) -> str:
     return json.dumps(
         {
             "facts": [{"text": fact, "source_ref": fact_ref}],
-            "uncertainties": ["Future demand remains uncertain."],
+            "uncertainties": [uncertainty],
             "source_refs": list(source_refs),
             "injection_flags": list(flags),
         },
@@ -224,6 +230,25 @@ def _safe_summary() -> UntrustedSummary:
     )
 
 
+def _report_with_refs(refs: list[str]) -> AnalysisReport:
+    payload = dict(ANALYSIS_INPUT, cited_source_refs=refs)
+    return AnalysisReport(
+        **payload,
+        symbol="AAPL",
+        as_of=TS,
+    )
+
+
+def _plan_with_refs(refs: list[str]) -> TradePlan:
+    payload = dict(PLAN_INPUT, cited_source_refs=refs)
+    return TradePlan(
+        **payload,
+        symbol="AAPL",
+        as_of=TS,
+        reference_price=Decimal("100"),
+    )
+
+
 def test_quarantine_child_request_ids_are_bounded_deterministic_and_distinct():
     parent = "p" * 64
 
@@ -292,6 +317,122 @@ def test_quarantine_repairs_once_with_separate_budget_and_no_tools(
         rows = session.scalars(select(ProviderReservation)).all()
     assert len(rows) == 2
     assert {row.category for row in rows} == {"untrusted"}
+
+
+@pytest.mark.parametrize(
+    ("source_text", "copied_fact"),
+    [
+        (
+            "Revenue rose. COPYTHROUGHMARKER",
+            "COPYTHROUGHMARKER",
+        ),
+        (
+            "Revenue rose. COPY_THROUGH_MARKER",
+            "copy-through-marker",
+        ),
+        (
+            "The company raised full year revenue guidance after demand improved.",
+            "Full year revenue guidance increased.",
+        ),
+        (
+            "Demand for CAFE\u0301—SERVICES accelerated sharply.",
+            "café services accelerated.",
+        ),
+    ],
+    ids=[
+        "single-long-marker",
+        "punctuation-separated-marker",
+        "partial-three-to-five-token-phrase",
+        "punctuation-case-and-unicode-normalization",
+    ],
+)
+def test_quarantine_repairs_source_lexical_copy_through_before_privileged_use(
+    session_factory,
+    source_text,
+    copied_fact,
+):
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(_summary_json(fact=copied_fact)),
+        _text_response(_summary_json()),
+    )
+
+    summary = summarizer.summarize(
+        (_content(text=source_text),),
+        request_id="quarantine-source-copy-through",
+    )
+
+    assert summary is not None
+    assert summary.facts[0].text == "Revenue increased according to the source."
+    assert len(delegate.calls) == 2
+    privileged = AnalystBackend("submit_analysis", ANALYSIS_INPUT)
+    Analyst(privileged, max_attempts=1).analyze(
+        _features(),
+        untrusted_summary=summary,
+        request_id="analysis-after-copy-through-repair",
+    )
+    privileged_payload = json.dumps(
+        privileged.calls,
+        ensure_ascii=False,
+        default=str,
+    ).casefold()
+    assert copied_fact.casefold() not in privileged_payload
+    assert "copy_through_marker" not in privileged_payload
+
+
+def test_quarantine_rejects_source_phrase_copied_into_uncertainty(
+    session_factory,
+):
+    copied_uncertainty = "Supply chain pressure continued."
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(
+            _summary_json(uncertainty=copied_uncertainty)
+        ),
+        _text_response(_summary_json()),
+    )
+
+    summary = summarizer.summarize(
+        (
+            _content(
+                text=(
+                    "Management said supply chain pressure continued "
+                    "through the quarter."
+                )
+            ),
+        ),
+        request_id="quarantine-uncertainty-copy-through",
+    )
+
+    assert summary is not None
+    assert copied_uncertainty not in summary.uncertainties
+    assert len(delegate.calls) == 2
+
+
+def test_quarantine_allows_standalone_short_ticker_company_name_and_number(
+    session_factory,
+):
+    fact = "AAPL and Apple Inc disclosed 123456789012345."
+    summarizer, delegate = _summarizer(
+        session_factory,
+        _text_response(_summary_json(fact=fact)),
+    )
+
+    summary = summarizer.summarize(
+        (
+            _content(
+                text=(
+                    "AAPL Apple Inc reported 123456789012345 in "
+                    "notional volume."
+                )
+            ),
+        ),
+        request_id="quarantine-allowed-identifiers",
+    )
+
+    assert summary is not None
+    assert summary.facts[0].text == fact
+    assert len(delegate.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -743,6 +884,134 @@ def test_plan_rejects_unknown_source_before_planning_persists_candidate(
         ) == 0
 
 
+@pytest.mark.parametrize(
+    ("summary", "refs"),
+    [
+        (_safe_summary(), ["s9"]),
+        (None, ["s1"]),
+    ],
+    ids=["unknown-ref", "citation-without-summary"],
+)
+def test_save_report_revalidates_citations_before_any_row(
+    summary,
+    refs,
+    session_factory,
+):
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="source"):
+            save_report(
+                session,
+                _report_with_refs(refs),
+                version="v2",
+                untrusted_summary=summary,
+            )
+        assert session.scalar(
+            select(func.count()).select_from(AnalysisReportRow)
+        ) == 0
+
+
+def test_save_report_accepts_valid_summary_reference(
+    session_factory,
+):
+    with session_factory() as session:
+        report_id = save_report(
+            session,
+            _report_with_refs(["s1"]),
+            version="v2",
+            untrusted_summary=_safe_summary(),
+        )
+        session.commit()
+        assert session.get(AnalysisReportRow, report_id) is not None
+
+
+def test_planning_rejects_alternate_analyst_citation_before_risk_snapshot(
+    make_service,
+    monkeypatch,
+):
+    class AlternateAnalyst:
+        def analyze_plan(self, *_args, **_kwargs):
+            return _plan_with_refs(["s9"])
+
+    service = make_service()
+    snapshot_calls = 0
+
+    def forbidden_snapshot(*_args, **_kwargs):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        raise AssertionError("risk snapshot must not run")
+
+    monkeypatch.setattr(
+        service,
+        "assemble_snapshot",
+        forbidden_snapshot,
+    )
+    planning = PlanningService(
+        service,
+        AlternateAnalyst(),
+        lambda _symbol: _features(),
+        Secrets(),
+    )
+
+    with pytest.raises(ValueError, match="source"):
+        planning.analyze(
+            "AAPL",
+            actor="operator:test",
+            reason="reject alternate analyst source",
+            request_id="planning-alternate-invalid-source",
+            untrusted_summary=_safe_summary(),
+        )
+
+    assert snapshot_calls == 0
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(TradePlanRow)
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.action == "plan.create")
+        ) == 0
+
+
+def test_planning_store_revalidates_summary_before_row_or_audit(
+    make_service,
+):
+    service = make_service()
+    planning = PlanningService(
+        service,
+        object(),
+        lambda _symbol: _features(),
+        Secrets(),
+    )
+    sized = SizedTradePlan(
+        symbol="AAPL",
+        direction="none",
+        total_shares=Decimal(0),
+        risk_budget=Decimal(0),
+        zero_reason="test",
+    )
+
+    with pytest.raises(ValueError, match="source"):
+        planning._store(
+            _plan_with_refs(["s9"]),
+            sized,
+            actor="operator:test",
+            reason="reject direct invalid store",
+            request_id="planning-direct-invalid-store",
+            untrusted_summary=_safe_summary(),
+        )
+
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(TradePlanRow)
+        ) == 0
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.action == "plan.create")
+        ) == 0
+
+
 def test_validated_analysis_and_plan_persist_only_structured_citations(
     make_service,
 ):
@@ -755,7 +1024,12 @@ def test_validated_analysis_and_plan_persist_only_structured_citations(
         request_id="analysis-persist-structured-citation",
     )
     with service.session_factory() as session:
-        report_id = save_report(session, report, version="v2")
+        report_id = save_report(
+            session,
+            report,
+            version="v2",
+            untrusted_summary=summary,
+        )
         session.commit()
         report_row = session.get(AnalysisReportRow, report_id)
         persisted_report = sensitive_store(session).read(

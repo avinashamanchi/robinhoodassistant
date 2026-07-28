@@ -13,12 +13,21 @@ from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisReportRow, GradedCallRow
 from ..security.sensitive_fields import sensitive_store
+from .citations import validate_source_citations
 from .models import AnalysisReport, AnalystAction, Grade
 from .promotion import can_promote
 from .scorecard import Scorecard, build_scorecard, grade
+from .untrusted import UntrustedSummary
 
 
-def save_report(session: Session, report: AnalysisReport, version: str = "v1") -> int:
+def save_report(
+    session: Session,
+    report: AnalysisReport,
+    version: str = "v1",
+    *,
+    untrusted_summary: UntrustedSummary | None = None,
+) -> int:
+    validate_source_citations(report, untrusted_summary)
     row = AnalysisReportRow(
         symbol=report.symbol,
         as_of=report.as_of,

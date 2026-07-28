@@ -97,12 +97,12 @@ class BudgetedLLMBackend:
     ) -> None:
         try:
             self.budgets.mark_unknown(reservation_id)
-        except Exception:
+        except BaseException:
             try:
                 original_error.add_note(
                     "provider reservation reconciliation failed"
                 )
-            except Exception:
+            except BaseException:
                 pass
 
     def create(

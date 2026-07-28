@@ -801,12 +801,13 @@ def test_mark_unknown_is_idempotent_for_unknown_and_settled_reservations(
     ) == "settled"
 
 
-def test_reconciliation_keyboard_interrupt_is_never_swallowed(
+def test_reconciliation_baseexception_never_masks_original_cancellation(
     session_factory,
     monkeypatch,
 ):
     service = _service(session_factory)
-    delegate = ScriptedBackend([RuntimeError("provider failed")])
+    cancellation = asyncio.CancelledError("provider call cancelled")
+    delegate = ScriptedBackend([cancellation])
     backend = BudgetedLLMBackend(
         delegate,
         service,
@@ -815,10 +816,12 @@ def test_reconciliation_keyboard_interrupt_is_never_swallowed(
         max_output_tokens=10,
         estimator=Utf8ByteUpperBoundEstimator(),
     )
-    interruption = KeyboardInterrupt("operator interruption")
+    reconciliation_interrupt = KeyboardInterrupt(
+        "reconciliation interrupted"
+    )
 
     def interrupt_reconciliation(_reservation_id):
-        raise interruption
+        raise reconciliation_interrupt
 
     monkeypatch.setattr(
         service,
@@ -826,7 +829,7 @@ def test_reconciliation_keyboard_interrupt_is_never_swallowed(
         interrupt_reconciliation,
     )
 
-    with pytest.raises(KeyboardInterrupt) as failure:
+    with pytest.raises(asyncio.CancelledError) as failure:
         backend.create(
             system="s",
             messages=[],
@@ -834,7 +837,273 @@ def test_reconciliation_keyboard_interrupt_is_never_swallowed(
             request_id="request-reconciliation-interrupt",
         )
 
-    assert failure.value is interruption
+    assert failure.value is cancellation
+    assert any(
+        "reservation reconciliation failed" in note
+        for note in getattr(cancellation, "__notes__", ())
+    )
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+    assert reservation.state == "started"
+
+
+@pytest.mark.parametrize("trigger", ["status", "reserve"])
+def test_expired_started_reservation_converges_after_failed_reconciliation(
+    trigger,
+    session_factory,
+    monkeypatch,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100_000,
+        output_tokens=10_000,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    cancellation = asyncio.CancelledError("provider call cancelled")
+    delegate = ScriptedBackend([cancellation])
+    backend = BudgetedLLMBackend(
+        delegate,
+        service,
+        provider="test",
+        category="untrusted",
+        max_output_tokens=10,
+        estimator=Utf8ByteUpperBoundEstimator(),
+    )
+
+    def fail_reconciliation(_reservation_id):
+        raise ProviderBudgetUnavailable(
+            "transient durable store failure"
+        )
+
+    monkeypatch.setattr(service, "mark_unknown", fail_reconciliation)
+    with pytest.raises(asyncio.CancelledError) as failure:
+        backend.create(
+            system="s",
+            messages=[],
+            tools=[],
+            request_id=f"request-stale-started-{trigger}",
+        )
+    assert failure.value is cancellation
+
+    with session_factory() as session:
+        reservation = session.scalar(select(ProviderReservation))
+        day = session.scalar(select(ProviderBudgetDay))
+        charged = (
+            day.calls_used,
+            day.input_tokens_used,
+            day.output_tokens_used,
+        )
+    assert reservation.state == "started"
+
+    expired_at = NOW + timedelta(seconds=5)
+    later = _service(
+        session_factory,
+        limits,
+        now=expired_at,
+    )
+    if trigger == "status":
+        status = later.status("test")
+    else:
+        with pytest.raises(
+            ProviderBudgetExceeded,
+            match="reconciliation",
+        ):
+            later.reserve(
+                provider="test",
+                category="chat",
+                request_id="request-blocked-after-stale-start",
+                input_tokens=1,
+                output_tokens=1,
+            )
+        status = later.status("test")
+
+    assert status.reconciliation_required is True
+    assert (
+        status.reconciliation_code
+        == "provider_started_usage_unknown"
+    )
+    assert (
+        status.calls_used,
+        status.input_tokens_used,
+        status.output_tokens_used,
+    ) == charged
+    with session_factory() as session:
+        persisted = session.get(
+            ProviderReservation,
+            reservation.reservation_id,
+        )
+        count = session.scalar(
+            select(func.count()).select_from(ProviderReservation)
+        )
+    assert persisted.state == "unknown"
+    assert count == 1
+    with pytest.raises(ProviderBudgetUnavailable):
+        later.settle(
+            reservation.reservation_id,
+            input_tokens=1,
+            output_tokens=1,
+            now=expired_at,
+        )
+    with pytest.raises(
+        ProviderBudgetExceeded,
+        match="reconciliation",
+    ):
+        later.reserve(
+            provider="test",
+            category="chat",
+            request_id="request-no-capacity-reuse",
+            input_tokens=1,
+            output_tokens=1,
+            now=expired_at,
+        )
+
+
+def test_unexpired_started_reservation_is_not_reaped(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-active-start",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+
+    reaped = service.reconcile_expired_started(
+        NOW + timedelta(seconds=4)
+    )
+    status = service.status(
+        "test",
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert reaped == 0
+    assert status.reconciliation_required is False
+    assert _reservation_state(
+        session_factory,
+        reservation.reservation_id,
+    ) == "started"
+
+
+def test_concurrent_expired_started_reapers_transition_exactly_once(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-concurrent-stale-start",
+        input_tokens=10,
+        output_tokens=10,
+        now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    expired_at = NOW + timedelta(seconds=5)
+    barrier = threading.Barrier(8)
+
+    def reap_once(_index: int) -> int:
+        worker = _service(
+            session_factory,
+            limits,
+            now=expired_at,
+        )
+        barrier.wait()
+        return worker.reconcile_expired_started(expired_at)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(reap_once, range(8)))
+
+    assert sorted(results) == [0, 0, 0, 0, 0, 0, 0, 1]
+    status = service.status("test", now=expired_at)
+    assert status.calls_used == 1
+    assert status.input_tokens_used == 10
+    assert status.output_tokens_used == 10
+    assert status.reconciliation_required is True
+    assert _reservation_state(
+        session_factory,
+        reservation.reservation_id,
+    ) == "unknown"
+
+
+def test_provider_reservation_cannot_start_at_or_after_expiry(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-start-at-expiry",
+        input_tokens=1,
+        output_tokens=1,
+        now=NOW,
+    )
+
+    with pytest.raises(ProviderBudgetUnavailable):
+        service.mark_started(
+            reservation.reservation_id,
+            now=NOW + timedelta(seconds=5),
+        )
+
+    assert _reservation_state(
+        session_factory,
+        reservation.reservation_id,
+    ) == "reserved"
+
+
+def test_provider_budget_rejects_started_at_after_expiry(
+    session_factory,
+):
+    limits = BudgetLimits(
+        calls=10,
+        input_tokens=100,
+        output_tokens=100,
+        reservation_ttl_seconds=5,
+    )
+    service = _service(session_factory, limits)
+    reservation = service.reserve(
+        provider="test",
+        category="chat",
+        request_id="request-corrupt-started-at",
+        input_tokens=1,
+        output_tokens=1,
+        now=NOW,
+    )
+    with session_factory() as session:
+        row = session.get(
+            ProviderReservation,
+            reservation.reservation_id,
+        )
+        row.state = "started"
+        row.started_at = NOW + timedelta(seconds=6)
+        session.commit()
+
+    with pytest.raises(
+        ProviderBudgetUnavailable,
+        match="corrupt",
+    ):
+        service.status("test", now=NOW + timedelta(seconds=4))
 
 
 def test_missing_usage_leaves_reservation_fully_charged_and_unknown(

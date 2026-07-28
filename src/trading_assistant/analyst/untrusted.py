@@ -45,6 +45,17 @@ _MAX_ENCODED_CANDIDATE_CHARACTERS = 4_096
 _MAX_DECODED_PAYLOAD_BYTES = 3_072
 _MAX_CANONICALIZATION_PASSES = 4
 _MAX_ACTION_CUE_SEPARATOR_CHARACTERS = 8
+_COPY_LONG_TOKEN_MIN_CHARACTERS = 12
+_COPY_NGRAM_MIN_TOKENS = 3
+_COPY_NGRAM_MAX_TOKENS = 5
+_COPY_MAX_TOKENS_PER_SOURCE = (MAX_NORMALIZED_CHARACTERS + 1) // 2
+_COPY_MAX_TOTAL_TOKENS = (
+    MAX_ITEMS_PER_REQUEST * _COPY_MAX_TOKENS_PER_SOURCE
+)
+_COPY_MAX_FINGERPRINT_OPERATIONS = (
+    _COPY_MAX_TOTAL_TOKENS
+    * (1 + _COPY_NGRAM_MAX_TOKENS - _COPY_NGRAM_MIN_TOKENS + 1)
+)
 
 SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
 FindingSeverity = Literal["low", "medium", "high"]
@@ -121,6 +132,7 @@ _RAW_MARKER_TOKEN_RE = re.compile(
     r"[A-Za-z0-9_-]{3,64}\b",
     re.IGNORECASE,
 )
+_COPY_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _KNOWN_INJECTION_FLAG_CODES = frozenset(
     {
         "active_html",
@@ -672,6 +684,99 @@ def _summary_strings(summary: UntrustedSummary) -> tuple[str, ...]:
     )
 
 
+def _copy_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize(
+        "NFKC",
+        unicodedata.normalize("NFKC", value).casefold(),
+    )
+    return tuple(
+        match.group(0)
+        for match in _COPY_TOKEN_RE.finditer(normalized)
+    )
+
+
+def _copy_fingerprint(parts: Sequence[str]) -> bytes:
+    return hashlib.blake2s(
+        "\x1f".join(parts).encode("utf-8"),
+        digest_size=16,
+    ).digest()
+
+
+def _source_lexical_fingerprints(
+    source_texts: Sequence[str],
+) -> tuple[frozenset[bytes], frozenset[bytes]]:
+    """Build bounded lexical copy-through evidence.
+
+    This deliberately prefers false-positive rejection over raw-text
+    copy-through. Standalone short identifiers and pure numeric tokens are not
+    single-token fingerprints, but copied 3–5 token phrases still reject.
+    Hashes bound retained memory without weakening the conservative boundary:
+    a digest collision can only reject an otherwise safe summary.
+    """
+    if len(source_texts) > MAX_ITEMS_PER_REQUEST:
+        raise ValueError("too many untrusted summary sources")
+    long_tokens: set[bytes] = set()
+    ngrams: set[bytes] = set()
+    total_tokens = 0
+    operations = 0
+    for source_text in source_texts:
+        if (
+            type(source_text) is not str
+            or len(source_text) > MAX_NORMALIZED_CHARACTERS
+        ):
+            raise ValueError("untrusted summary source is invalid")
+        tokens = _copy_tokens(source_text)
+        if len(tokens) > _COPY_MAX_TOKENS_PER_SOURCE:
+            raise ValueError("untrusted summary source is too complex")
+        total_tokens += len(tokens)
+        if total_tokens > _COPY_MAX_TOTAL_TOKENS:
+            raise ValueError("untrusted summary sources are too complex")
+        for token in tokens:
+            operations += 1
+            if (
+                len(token) >= _COPY_LONG_TOKEN_MIN_CHARACTERS
+                and not token.isnumeric()
+            ):
+                long_tokens.add(_copy_fingerprint((token,)))
+        for width in range(
+            _COPY_NGRAM_MIN_TOKENS,
+            _COPY_NGRAM_MAX_TOKENS + 1,
+        ):
+            for start in range(0, max(0, len(tokens) - width + 1)):
+                operations += 1
+                ngrams.add(
+                    _copy_fingerprint(tokens[start : start + width])
+                )
+        if operations > _COPY_MAX_FINGERPRINT_OPERATIONS:
+            raise ValueError("untrusted summary sources are too complex")
+    return frozenset(long_tokens), frozenset(ngrams)
+
+
+def _reject_source_lexical_copy(
+    value: str,
+    *,
+    long_tokens: frozenset[bytes],
+    ngrams: frozenset[bytes],
+) -> None:
+    tokens = _copy_tokens(value)
+    if any(
+        len(token) >= _COPY_LONG_TOKEN_MIN_CHARACTERS
+        and not token.isnumeric()
+        and _copy_fingerprint((token,)) in long_tokens
+        for token in tokens
+    ):
+        raise ValueError("untrusted summary copied raw content")
+    for width in range(
+        _COPY_NGRAM_MIN_TOKENS,
+        _COPY_NGRAM_MAX_TOKENS + 1,
+    ):
+        if any(
+            _copy_fingerprint(tokens[start : start + width]) in ngrams
+            for start in range(0, max(0, len(tokens) - width + 1))
+        ):
+            raise ValueError("untrusted summary copied raw content")
+
+
 def validate_summary_for_privileged_use(
     summary: UntrustedSummary,
     *,
@@ -701,6 +806,9 @@ def validate_summary_for_privileged_use(
         for source_text in source_texts
         for match in _RAW_MARKER_TOKEN_RE.finditer(source_text)
     }
+    long_tokens, source_ngrams = _source_lexical_fingerprints(
+        source_texts
+    )
     for value in _summary_strings(summary):
         try:
             normalized, findings = _sanitize(value)
@@ -711,6 +819,11 @@ def validate_summary_for_privileged_use(
         folded_value = value.casefold()
         if any(token in folded_value for token in marker_tokens):
             raise ValueError("untrusted summary copied raw marker")
+        _reject_source_lexical_copy(
+            value,
+            long_tokens=long_tokens,
+            ngrams=source_ngrams,
+        )
         if any(
             source_text
             and len(source_text) >= 12
