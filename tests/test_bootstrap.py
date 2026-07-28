@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -176,6 +176,21 @@ def _paper_alpaca_broker() -> tuple[AlpacaBroker, _MutationTradingClient]:
     return broker, trading
 
 
+@contextmanager
+def _closed_runtime_container(container):
+    """Give direct-container tests exact ownership of their renewal worker."""
+    guard = container.runtime_tenure_guard
+    assert guard is not None
+    worker = guard._thread
+    assert worker is not None
+    try:
+        yield container
+    finally:
+        guard.close()
+        assert guard.closed
+        assert not worker.is_alive()
+
+
 def _market_order(key: str) -> OrderRequest:
     return OrderRequest(
         ticker="AAPL",
@@ -212,55 +227,61 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
         lambda *_args: FakeClock(is_open=True),
     )
 
-    container = bootstrap.build_container(
-        _alpaca_config(app_config),
-        _migrated_secrets(tmp_path),
-    )
-    with container.session_factory() as session:
-        startup = session.get(
-            StartupReconciliationState,
-            broker.reconciliation_key,
+    with _closed_runtime_container(
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
         )
-        assert startup is not None
-        assert startup.status == "current"
-        assert startup.completed_generation == startup.generation
+    ) as container:
+        with container.session_factory() as session:
+            startup = session.get(
+                StartupReconciliationState,
+                broker.reconciliation_key,
+            )
+            assert startup is not None
+            assert startup.status == "current"
+            assert startup.completed_generation == startup.generation
 
-    submitted = container.broker.submit_order(_market_order("paper-submit"))
-    bracket = container.broker.submit_bracket(
-        _bracket_order("paper-bracket"),
-        Decimal("110"),
-        Decimal("95"),
-    )
-    container.broker.cancel_order(submitted.broker_order_id)
-    assert bracket.broker_order_id is not None
-    assert trading.submit_calls == 2
-    assert trading.cancel_calls == 1
-
-    trading._sandbox = False
-    trading._base_url = "https://api.alpaca.markets"
-    writes_before = (trading.submit_calls, trading.cancel_calls)
-
-    with pytest.raises(
-        BrokerSubmissionRejected,
-        match="not official Alpaca paper",
-    ):
-        container.broker.submit_order(_market_order("blocked-submit"))
-    with pytest.raises(
-        BrokerSubmissionRejected,
-        match="not official Alpaca paper",
-    ):
-        container.broker.submit_bracket(
-            _bracket_order("blocked-bracket"),
+        submitted = container.broker.submit_order(
+            _market_order("paper-submit")
+        )
+        bracket = container.broker.submit_bracket(
+            _bracket_order("paper-bracket"),
             Decimal("110"),
             Decimal("95"),
         )
-    with pytest.raises(
-        BrokerSubmissionRejected,
-        match="not official Alpaca paper",
-    ):
-        container.broker.cancel_order(bracket.broker_order_id)
+        container.broker.cancel_order(submitted.broker_order_id)
+        assert bracket.broker_order_id is not None
+        assert trading.submit_calls == 2
+        assert trading.cancel_calls == 1
 
-    assert (trading.submit_calls, trading.cancel_calls) == writes_before
+        trading._sandbox = False
+        trading._base_url = "https://api.alpaca.markets"
+        writes_before = (trading.submit_calls, trading.cancel_calls)
+
+        with pytest.raises(
+            BrokerSubmissionRejected,
+            match="not official Alpaca paper",
+        ):
+            container.broker.submit_order(
+                _market_order("blocked-submit")
+            )
+        with pytest.raises(
+            BrokerSubmissionRejected,
+            match="not official Alpaca paper",
+        ):
+            container.broker.submit_bracket(
+                _bracket_order("blocked-bracket"),
+                Decimal("110"),
+                Decimal("95"),
+            )
+        with pytest.raises(
+            BrokerSubmissionRejected,
+            match="not official Alpaca paper",
+        ):
+            container.broker.cancel_order(bracket.broker_order_id)
+
+        assert (trading.submit_calls, trading.cancel_calls) == writes_before
 
 
 def test_production_container_rejects_non_alpaca_or_unsafe_target(
@@ -367,25 +388,26 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
         lambda *_args: FakeClock(is_open=True),
     )
 
-    container = bootstrap.build_container(
-        _alpaca_config(app_config),
-        _migrated_secrets(tmp_path),
-        runtime_role="app",
-    )
-
-    with container.session_factory() as session:
-        state = session.get(
-            StartupReconciliationState,
-            broker.reconciliation_key,
+    with _closed_runtime_container(
+        bootstrap.build_container(
+            _alpaca_config(app_config),
+            _migrated_secrets(tmp_path),
+            runtime_role="app",
         )
-        assert state is not None
-        assert state.status == "failed"
-        assert state.completed_generation < state.generation
-    assert container.operations.health().as_dict()[
-        "startup_reconciliation"
-    ]["status"] == "failed"
-    assert trading.submit_calls == 0
-    assert trading.cancel_calls == 0
+    ) as container:
+        with container.session_factory() as session:
+            state = session.get(
+                StartupReconciliationState,
+                broker.reconciliation_key,
+            )
+            assert state is not None
+            assert state.status == "failed"
+            assert state.completed_generation < state.generation
+        assert container.operations.health().as_dict()[
+            "startup_reconciliation"
+        ]["status"] == "failed"
+        assert trading.submit_calls == 0
+        assert trading.cancel_calls == 0
 
 
 def test_daemon_container_remains_fail_closed_on_startup_reconciliation_failure(
@@ -2132,19 +2154,20 @@ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
     )
     guard.start()
     container.runtime_tenure_guard = guard
-    app = create_app(
-        container=container,
-        agent=_StubAgent(),
-        planning=None,
-    )
-    shutdowns: list[str] = []
-    app.state.install_controlled_shutdown(
-        lambda: shutdowns.append("requested")
-    )
+    with _closed_runtime_container(container):
+        app = create_app(
+            container=container,
+            agent=_StubAgent(),
+            planning=None,
+        )
+        shutdowns: list[str] = []
+        app.state.install_controlled_shutdown(
+            lambda: shutdowns.append("requested")
+        )
 
-    assert app.state.runtime_tenure_guard.renew_once() is False
-    assert app.state.runtime_tenure_guard.lost is True
-    assert shutdowns == ["requested"]
+        assert app.state.runtime_tenure_guard.renew_once() is False
+        assert app.state.runtime_tenure_guard.lost is True
+        assert shutdowns == ["requested"]
 
 
 def test_daemon_monitor_renews_the_container_runtime_tenure(

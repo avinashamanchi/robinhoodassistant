@@ -44,7 +44,6 @@ from .backup_transaction import (
     acquire_bounded_lock as _acquire_bounded_lock,
     close_backup_transaction as _close_backup_transaction,
     create_backup_transaction as _create_backup_transaction,
-    create_transaction_member as _create_transaction_member,
     decode_checksummed_record as _decode_checksummed_record,
     encode_checksummed_record as _encode_checksummed_record,
     fsync_and_hash_transaction_artifact as _fsync_and_hash_transaction_artifact,
@@ -57,6 +56,7 @@ from .backup_transaction import (
     recover_backup_transaction as _recover_backup_transaction,
     retry_flock as _retry_flock,
     retry_fsync as _retry_fsync,
+    transaction_member_path as _transaction_member_path,
     validate_backup_transaction as _validate_backup_transaction,
 )
 from .tenure import (
@@ -737,16 +737,13 @@ def _transition_commit_state(
     state_descriptor: int | None = None
     artifact_descriptor: int | None = None
     locked = False
-    transition_proven = False
     transitioned = replace(
         expected,
         phase=phase,
         generation=next_generation,
     )
-    primary_failure: BaseException | None = None
-    cleanup_failure: BaseException | None = None
 
-    def prove_state(state: _ArtifactCommitState) -> None:
+    def observe_state() -> _ArtifactCommitState:
         assert state_descriptor is not None
         descriptor_stat = _state_descriptor_identity(
             state_descriptor,
@@ -757,12 +754,11 @@ def _transition_commit_state(
             descriptor_stat,
             state_path,
         )
-        if observed != state:
-            raise EncryptedBackupError(
-                "encrypted_backup_state_invalid"
-            )
+        return observed
 
-    def persist_and_prove(state: _ArtifactCommitState) -> None:
+    def persist_and_prove(
+        state: _ArtifactCommitState,
+    ) -> _ArtifactCommitState:
         assert state_descriptor is not None
         write_failure: BaseException | None = None
         try:
@@ -775,14 +771,19 @@ def _transition_commit_state(
         except BaseException as exc:
             write_failure = exc
         proof_failure: BaseException | None = None
+        observed: _ArtifactCommitState | None = None
         try:
-            prove_state(state)
+            observed = observe_state()
         except BaseException as exc:
             proof_failure = exc
-        if proof_failure is None:
-            return
+        if proof_failure is None and observed == state:
+            return observed
         if write_failure is not None:
             raise write_failure
+        if proof_failure is None:
+            raise EncryptedBackupError(
+                "encrypted_backup_state_invalid"
+            )
         raise proof_failure
 
     try:
@@ -809,8 +810,22 @@ def _transition_commit_state(
         # and same-descriptor readback below are the irrevocable commit point.
         artifact_descriptor = _open_matching_artifact(target, current)
         try:
-            persist_and_prove(transitioned)
+            return persist_and_prove(transitioned)
         except BaseException as transition_failure:
+            # A BaseException can arrive after the durable readback but before
+            # the nested return reaches this frame. Re-read through the same
+            # still-locked descriptor before any restoration attempt. One
+            # retry covers an exception at the first reconciliation boundary.
+            for _attempt in range(2):
+                try:
+                    observed = observe_state()
+                except BaseException:
+                    continue
+                if observed == transitioned:
+                    return observed
+                if observed == expected:
+                    raise transition_failure
+                break
             try:
                 persist_and_prove(expected)
             except BaseException as restore_failure:
@@ -830,40 +845,22 @@ def _transition_commit_state(
                         "encrypted_backup_state_uncertain"
                     ) from retire_failure
             raise transition_failure
-        transition_proven = True
-    except BaseException as exc:
-        primary_failure = exc
     finally:
         if artifact_descriptor is not None:
             try:
                 os.close(artifact_descriptor)
-            except BaseException as exc:
-                cleanup_failure = exc
+            except BaseException:
+                pass
         if state_descriptor is not None and locked:
             try:
                 _retry_flock(state_descriptor, fcntl.LOCK_UN)
-            except BaseException as exc:
-                if cleanup_failure is None:
-                    cleanup_failure = exc
+            except BaseException:
+                pass
         if state_descriptor is not None:
             try:
                 os.close(state_descriptor)
-            except BaseException as exc:
-                if cleanup_failure is None:
-                    cleanup_failure = exc
-
-    # A proven transition is final. Unlock/close still release kernel
-    # resources even when their wrappers report an error, so descriptor
-    # cleanup cannot reverse or obscure the durable result.
-    if transition_proven:
-        return transitioned
-    if primary_failure is None:
-        primary_failure = EncryptedBackupError(
-            "encrypted_backup_state_invalid"
-        )
-    if cleanup_failure is not None:
-        raise primary_failure from cleanup_failure
-    raise primary_failure
+            except BaseException:
+                pass
 
 
 def _matching_regular_file(
@@ -1050,12 +1047,12 @@ def create_encrypted_database_backup(
             raise EncryptedBackupError("backup_directory_invalid")
         os.chmod(directory, 0o700)
 
-        # The checksummed, inode-bound manifest is durable and exclusively
-        # locked before the first plaintext member can exist.
+        # All operation members are precreated and inode-bound by the durable,
+        # checksummed manifest before any sensitive content can exist.
         transaction = _create_backup_transaction(directory)
         hook("transaction_manifest_durable")
         check_snapshot()
-        snapshot = _create_transaction_member(
+        snapshot = _transaction_member_path(
             transaction,
             _SNAPSHOT_NAME,
         )
@@ -1064,6 +1061,13 @@ def create_encrypted_database_backup(
             sqlite3.connect(source_uri, uri=True) as source_connection,
             sqlite3.connect(snapshot) as snapshot_connection,
         ):
+            if snapshot_connection.execute(
+                "PRAGMA journal_mode=OFF"
+            ).fetchone() != ("off",):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            snapshot_connection.execute("PRAGMA temp_store=MEMORY")
             source_connection.backup(
                 snapshot_connection,
                 pages=256,
@@ -1071,9 +1075,12 @@ def create_encrypted_database_backup(
                     check_snapshot()
                 ),
             )
-            snapshot_connection.execute(
-                "PRAGMA journal_mode=DELETE"
-            ).fetchone()
+            if snapshot_connection.execute(
+                "PRAGMA journal_mode=OFF"
+            ).fetchone() != ("off",):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
         _validate_backup_transaction(transaction)
         snapshot_descriptor = _open_transaction_member(
             transaction,
@@ -1105,7 +1112,6 @@ def create_encrypted_database_backup(
         encoded_length = struct.pack(">I", len(encoded_header))
         aad = _ENCRYPTED_MAGIC + encoded_length + encoded_header
         nonce = os.urandom(_NONCE_BYTES)
-        _create_transaction_member(transaction, _ENCRYPTED_NAME)
         encryptor = Cipher(
             algorithms.AES(backup_key),
             modes.GCM(nonce),
@@ -1131,6 +1137,7 @@ def create_encrypted_database_backup(
                 buffering=0,
             ) as ciphertext,
         ):
+            ciphertext.truncate(0)
             ciphertext.write(aad)
             ciphertext.write(nonce)
             hook("header_written")
@@ -1149,7 +1156,7 @@ def create_encrypted_database_backup(
         hook("ciphertext_fsynced")
         maintain()
 
-        verification = _create_transaction_member(
+        verification = _transaction_member_path(
             transaction,
             _VERIFICATION_NAME,
         )
@@ -1174,6 +1181,7 @@ def create_encrypted_database_backup(
                 buffering=0,
             ) as plaintext,
         ):
+            plaintext.truncate(0)
             parsed_header, parsed_nonce, parsed_aad = _parse_header_stream(
                 ciphertext
             )

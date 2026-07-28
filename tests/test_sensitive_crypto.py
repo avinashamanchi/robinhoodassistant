@@ -1061,10 +1061,10 @@ def test_scoped_idempotent_guards_do_not_retain_closed_sessions(
     cipher,
 ):
     gc.collect()
-    state_count = len(sensitive_field_module._STAGING_STATES)
-    installation_count = len(
-        sensitive_field_module._GUARD_INSTALLATIONS
-    )
+    unrelated_session = session_factory()
+    install_sensitive_field_guards(unrelated_session, cipher)
+    unrelated_reference = weakref.ref(unrelated_session)
+
     session = session_factory()
     install_sensitive_field_guards(session, cipher)
     install_sensitive_field_guards(session, cipher)
@@ -1076,12 +1076,19 @@ def test_scoped_idempotent_guards_do_not_retain_closed_sessions(
     del session
     gc.collect()
 
-    assert session_reference() is None
-    assert len(sensitive_field_module._STAGING_STATES) == state_count
-    assert (
-        len(sensitive_field_module._GUARD_INSTALLATIONS)
-        == installation_count
-    )
+    try:
+        assert session_reference() is None
+        assert unrelated_session in sensitive_field_module._STAGING_STATES
+        assert (
+            unrelated_session
+            in sensitive_field_module._GUARD_INSTALLATIONS
+        )
+    finally:
+        unrelated_session.close()
+        del unrelated_session
+    gc.collect()
+
+    assert unrelated_reference() is None
 
 
 def test_nested_rollback_cannot_clear_outer_staging_latch(

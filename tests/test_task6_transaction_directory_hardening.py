@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import sys
 import time
 
 import pytest
@@ -27,15 +28,21 @@ _TRANSACTION_PREFIX = ".backup-txn-"
 _TRANSACTION_MEMBERS = {
     "manifest",
     "snapshot.sqlite3",
-    "snapshot.sqlite3-journal",
-    "snapshot.sqlite3-shm",
-    "snapshot.sqlite3-wal",
     "verification.sqlite3",
-    "verification.sqlite3-journal",
-    "verification.sqlite3-shm",
-    "verification.sqlite3-wal",
     "encrypted.aesgcm",
 }
+_CRASH_STAGES = [
+    "transaction_manifest_durable",
+    "snapshot_created",
+    "snapshot_hashed",
+    "header_written",
+    "encrypt_chunk",
+    "ciphertext_fsynced",
+    "verification_opened",
+    "decrypt_chunk",
+    "verification_hashed",
+    "quick_check_complete",
+]
 
 
 def _seed_source(path: Path) -> None:
@@ -108,6 +115,21 @@ def _transaction_directories(destination: Path) -> tuple[Path, ...]:
     )
 
 
+def _namespace_identities(
+    directory: Path,
+) -> dict[str, tuple[int, int, int, int]]:
+    result: dict[str, tuple[int, int, int, int]] = {}
+    for candidate in directory.iterdir():
+        identity = candidate.lstat()
+        result[candidate.name] = (
+            stat.S_IFMT(identity.st_mode),
+            identity.st_dev,
+            identity.st_ino,
+            identity.st_size,
+        )
+    return result
+
+
 def _age_tree(root: Path, timestamp: float) -> None:
     descendants = sorted(
         root.rglob("*"),
@@ -141,18 +163,7 @@ def _hold_manifest_lock(manifest: Path, ready, release) -> None:
 
 @pytest.mark.parametrize(
     "stage",
-    [
-        "transaction_manifest_durable",
-        "snapshot_created",
-        "snapshot_hashed",
-        "header_written",
-        "encrypt_chunk",
-        "ciphertext_fsynced",
-        "verification_opened",
-        "decrypt_chunk",
-        "verification_hashed",
-        "quick_check_complete",
-    ],
+    _CRASH_STAGES,
 )
 def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
     tmp_path,
@@ -177,8 +188,7 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
     transaction = transactions[0]
     assert stat.S_IMODE(transaction.stat().st_mode) == 0o700
     members = {candidate.name for candidate in transaction.iterdir()}
-    assert "manifest" in members
-    assert members <= _TRANSACTION_MEMBERS
+    assert members == _TRANSACTION_MEMBERS
     manifest = transaction / "manifest"
     assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
     assert manifest.read_bytes().startswith(b"TA-BACKUP-TRANSACTION\x00")
@@ -216,6 +226,146 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
     assert not transaction.exists()
     assert operator_owned.read_bytes() == b"preserve"
     assert list_committed_backups(destination) == ()
+
+
+def test_manifest_is_durable_only_after_all_members_are_precreated(tmp_path):
+    """Creating a member after manifest durability leaves an adoption gap."""
+
+    source = tmp_path / "precreated-members.db"
+    destination = tmp_path / "precreated-members-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "transaction_manifest_durable"),
+    )
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    assert {candidate.name for candidate in transaction.iterdir()} == (
+        _TRANSACTION_MEMBERS
+    )
+    for name in _TRANSACTION_MEMBERS - {"manifest"}:
+        member = transaction / name
+        assert member.is_file()
+        assert member.stat().st_size == 0
+        assert stat.S_IMODE(member.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("stage", _CRASH_STAGES)
+def test_recovery_preserves_operator_replacement_at_every_crash_stage(
+    tmp_path,
+    stage,
+):
+    """Deleting an allowed-name replacement consumes operator-owned content."""
+
+    source = tmp_path / f"replacement-{stage}.db"
+    destination = tmp_path / f"replacement-{stage}-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, stage),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    replacement = transaction / "encrypted.aesgcm"
+    if replacement.exists() or replacement.is_symlink():
+        replacement.unlink()
+    replacement.write_bytes(b"operator-owned-replacement")
+    replacement.chmod(0o600)
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    assert replacement.read_bytes() == b"operator-owned-replacement"
+
+
+@pytest.mark.parametrize("stage", _CRASH_STAGES)
+def test_recovery_preserves_unrecorded_old_sidecar_name(
+    tmp_path,
+    stage,
+):
+    """An old allowlist must not authorize deletion of an unrecorded sidecar."""
+
+    source = tmp_path / f"unrecorded-sidecar-{stage}.db"
+    destination = tmp_path / f"unrecorded-sidecar-{stage}-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, stage),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    sidecar = transaction / "snapshot.sqlite3-wal"
+    sidecar.write_bytes(b"operator-owned-sidecar")
+    sidecar.chmod(0o600)
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+    before_recovery = _namespace_identities(transaction)
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert transaction.exists()
+    assert _namespace_identities(transaction) == before_recovery
+    assert sidecar.read_bytes() == b"operator-owned-sidecar"
+
+
+def test_recovery_preserves_directory_when_recorded_member_is_missing(
+    tmp_path,
+):
+    """Partial membership must fail closed before any remaining member deletion."""
+
+    source = tmp_path / "missing-member.db"
+    destination = tmp_path / "missing-member-backups"
+    _seed_source(source)
+    context = _process_context()
+    process = context.Process(
+        target=_crash_at_stage,
+        args=(source, destination, "quick_check_complete"),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 73
+    transaction = _transaction_directories(destination)[0]
+    (transaction / "snapshot.sqlite3").unlink()
+    remaining = {
+        candidate.name: candidate.stat().st_ino
+        for candidate in transaction.iterdir()
+    }
+    recovery_now = time.time()
+    _age_tree(transaction, recovery_now - 120)
+
+    backup_module._recover_backup_orphans(
+        destination,
+        orphan_ttl_seconds=60,
+        now=lambda: recovery_now,
+    )
+
+    assert transaction.exists()
+    assert {
+        candidate.name: candidate.stat().st_ino
+        for candidate in transaction.iterdir()
+    } == remaining
 
 
 def test_busy_transaction_manifest_is_bounded_and_preserved(tmp_path):
@@ -290,7 +440,9 @@ def test_recovery_preserves_ambiguous_transaction_directories(
     elif damage == "extra_member":
         (transaction / "operator.txt").write_bytes(b"preserve")
     else:
-        (transaction / "encrypted.aesgcm").symlink_to(source)
+        encrypted = transaction / "encrypted.aesgcm"
+        encrypted.unlink()
+        encrypted.symlink_to(source)
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
 
@@ -405,8 +557,11 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
     assert tuple(destination.iterdir()) == ()
 
 
-def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
-    """Deleting by broad glob or removing manifest first breaks retry safety."""
+def test_partial_cleanup_preserves_remaining_manifest_namespace(
+    tmp_path,
+    monkeypatch,
+):
+    """A partial unlink must not authorize deletion after membership diverges."""
 
     source = tmp_path / "partial-cleanup.db"
     destination = tmp_path / "partial-cleanup-backups"
@@ -441,6 +596,11 @@ def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
     assert failed_once is True
     assert transaction.exists()
     assert (transaction / "manifest").exists()
+    remaining = {
+        candidate.name: candidate.stat().st_ino
+        for candidate in transaction.iterdir()
+    }
+    assert "encrypted.aesgcm" not in remaining
 
     monkeypatch.setattr(os, "unlink", original_unlink)
     backup_module._recover_backup_orphans(
@@ -448,7 +608,11 @@ def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
         orphan_ttl_seconds=60,
         now=lambda: recovery_now,
     )
-    assert not transaction.exists()
+    assert transaction.exists()
+    assert {
+        candidate.name: candidate.stat().st_ino
+        for candidate in transaction.iterdir()
+    } == remaining
 
 
 def test_committed_transition_has_no_fallible_postcommit_work(
@@ -516,4 +680,123 @@ def test_committed_transition_has_no_fallible_postcommit_work(
         original_verify,
     )
     monkeypatch.setattr(Path, "unlink", original_unlink)
+    assert list_committed_backups(destination) == (receipt.path,)
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_interrupt_after_committed_readback_reconciles_without_restore(
+    tmp_path,
+    monkeypatch,
+    interrupt_type,
+):
+    """A return-boundary interrupt must not make a committed API call raise."""
+
+    source = tmp_path / f"return-gap-{interrupt_type.__name__}.db"
+    destination = (
+        tmp_path / f"return-gap-{interrupt_type.__name__}-backups"
+    )
+    _seed_source(source)
+    original_read = backup_module._read_commit_state
+    original_pwrite = os.pwrite
+    original_flock = fcntl.flock
+    original_close = os.close
+    original_unlink = Path.unlink
+    commit_descriptor: int | None = None
+    commit_written = False
+    interrupt_armed = False
+    interrupt_fired = False
+    reconciliation_read_failures = 0
+    restoration_writes = 0
+    unlock_failures = 0
+    close_failures = 0
+    cleanup_attempts = 0
+
+    def track_commit_write(descriptor, data, offset):
+        nonlocal commit_descriptor, commit_written, restoration_writes
+        if b'"phase":"COMMITTED"' in data:
+            commit_descriptor = descriptor
+            commit_written = True
+        elif commit_written and (
+            b'"phase":"PENDING"' in data or b'"phase":"RETIRED"' in data
+        ):
+            restoration_writes += 1
+            raise OSError("injected post-commit restoration failure")
+        return original_pwrite(descriptor, data, offset)
+
+    def arm_after_committed_readback(*args, **kwargs):
+        nonlocal interrupt_armed, reconciliation_read_failures
+        if interrupt_fired and reconciliation_read_failures == 0:
+            reconciliation_read_failures += 1
+            raise OSError("injected transient reconciliation read failure")
+        observed = original_read(*args, **kwargs)
+        if observed.phase == "COMMITTED" and not interrupt_fired:
+            interrupt_armed = True
+        return observed
+
+    def interrupt_successful_nested_return(frame, event, arg):
+        nonlocal interrupt_fired
+        if (
+            interrupt_armed
+            and not interrupt_fired
+            and event == "return"
+            and frame.f_code.co_name == "persist_and_prove"
+        ):
+            interrupt_fired = True
+            raise interrupt_type("injected committed-return interrupt")
+        return interrupt_successful_nested_return
+
+    def fail_unlock_after_commit(descriptor, operation):
+        nonlocal unlock_failures
+        if (
+            descriptor == commit_descriptor
+            and interrupt_fired
+            and operation == fcntl.LOCK_UN
+            and unlock_failures == 0
+        ):
+            original_flock(descriptor, operation)
+            unlock_failures += 1
+            raise OSError("injected post-commit unlock failure")
+        return original_flock(descriptor, operation)
+
+    def fail_close_after_commit(descriptor):
+        nonlocal close_failures
+        result = original_close(descriptor)
+        if (
+            descriptor == commit_descriptor
+            and interrupt_fired
+            and close_failures == 0
+        ):
+            close_failures += 1
+            raise OSError("injected post-commit close failure")
+        return result
+
+    def reject_postcommit_cleanup(path: Path, *args, **kwargs):
+        nonlocal cleanup_attempts
+        if interrupt_fired and path.parent == destination:
+            cleanup_attempts += 1
+            raise OSError("injected post-commit cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "pwrite", track_commit_write)
+    monkeypatch.setattr(
+        backup_module,
+        "_read_commit_state",
+        arm_after_committed_readback,
+    )
+    monkeypatch.setattr(fcntl, "flock", fail_unlock_after_commit)
+    monkeypatch.setattr(os, "close", fail_close_after_commit)
+    monkeypatch.setattr(Path, "unlink", reject_postcommit_cleanup)
+    previous_trace = sys.gettrace()
+    sys.settrace(interrupt_successful_nested_return)
+    try:
+        receipt = _create(source, destination)
+    finally:
+        sys.settrace(previous_trace)
+
+    assert interrupt_fired is True
+    assert reconciliation_read_failures == 1
+    assert restoration_writes == 0
+    assert unlock_failures == 1
+    assert close_failures == 1
+    assert cleanup_attempts == 0
     assert list_committed_backups(destination) == (receipt.path,)

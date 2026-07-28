@@ -22,25 +22,19 @@ TRANSACTION_DIRECTORY = re.compile(
     rf"{re.escape(TRANSACTION_PREFIX)}([0-9a-f]{{32}})"
 )
 TRANSACTION_MANIFEST_MAGIC = b"TA-BACKUP-TRANSACTION\x00"
-TRANSACTION_MANIFEST_VERSION = 1
-TRANSACTION_MANIFEST_BYTES = 512
+TRANSACTION_MANIFEST_VERSION = 2
+TRANSACTION_MANIFEST_BYTES = 2048
 TRANSACTION_MANIFEST_NAME = "manifest"
 SNAPSHOT_NAME = "snapshot.sqlite3"
 VERIFICATION_NAME = "verification.sqlite3"
 ENCRYPTED_NAME = "encrypted.aesgcm"
+OPERATION_MEMBER_NAMES = (
+    SNAPSHOT_NAME,
+    VERIFICATION_NAME,
+    ENCRYPTED_NAME,
+)
 TRANSACTION_MEMBER_NAMES = frozenset(
-    {
-        TRANSACTION_MANIFEST_NAME,
-        SNAPSHOT_NAME,
-        f"{SNAPSHOT_NAME}-journal",
-        f"{SNAPSHOT_NAME}-shm",
-        f"{SNAPSHOT_NAME}-wal",
-        VERIFICATION_NAME,
-        f"{VERIFICATION_NAME}-journal",
-        f"{VERIFICATION_NAME}-shm",
-        f"{VERIFICATION_NAME}-wal",
-        ENCRYPTED_NAME,
-    }
+    {TRANSACTION_MANIFEST_NAME, *OPERATION_MEMBER_NAMES}
 )
 _RECORD_DIGEST_BYTES = hashlib.sha256().digest_size
 _TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
@@ -57,11 +51,23 @@ class EncryptedBackupError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class _BackupTransactionMember:
+    name: str
+    device: int
+    inode: int
+    file_type: str
+    mode: int
+
+
+@dataclass(frozen=True)
 class _BackupTransactionManifest:
     transaction_id: str
     directory_name: str
     directory_device: int
     directory_inode: int
+    manifest_device: int
+    manifest_inode: int
+    members: tuple[_BackupTransactionMember, ...]
 
 
 @dataclass
@@ -279,6 +285,18 @@ def _manifest_payload(
         "directory_device": manifest.directory_device,
         "directory_inode": manifest.directory_inode,
         "directory_name": manifest.directory_name,
+        "manifest_device": manifest.manifest_device,
+        "manifest_inode": manifest.manifest_inode,
+        "members": [
+            {
+                "device": member.device,
+                "file_type": member.file_type,
+                "inode": member.inode,
+                "mode": member.mode,
+                "name": member.name,
+            }
+            for member in manifest.members
+        ],
         "transaction_id": manifest.transaction_id,
         "version": TRANSACTION_MANIFEST_VERSION,
     }
@@ -306,6 +324,9 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
             "directory_device",
             "directory_inode",
             "directory_name",
+            "manifest_device",
+            "manifest_inode",
+            "members",
             "transaction_id",
             "version",
         }
@@ -317,6 +338,7 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
         )
     transaction_id = payload.get("transaction_id")
     directory_name = payload.get("directory_name")
+    encoded_members = payload.get("members")
     if (
         not isinstance(transaction_id, str)
         or _TRANSACTION_ID.fullmatch(transaction_id) is None
@@ -325,6 +347,49 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
         or directory_name != f"{TRANSACTION_PREFIX}{transaction_id}"
         or not positive_record_integer(payload.get("directory_device"))
         or not positive_record_integer(payload.get("directory_inode"))
+        or not positive_record_integer(payload.get("manifest_device"))
+        or not positive_record_integer(payload.get("manifest_inode"))
+        or not isinstance(encoded_members, list)
+        or len(encoded_members) != len(OPERATION_MEMBER_NAMES)
+    ):
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    members: list[_BackupTransactionMember] = []
+    for encoded_member in encoded_members:
+        if (
+            not isinstance(encoded_member, dict)
+            or set(encoded_member)
+            != {
+                "device",
+                "file_type",
+                "inode",
+                "mode",
+                "name",
+            }
+            or not isinstance(encoded_member.get("name"), str)
+            or encoded_member.get("name") not in OPERATION_MEMBER_NAMES
+            or encoded_member.get("file_type") != "regular"
+            or type(encoded_member.get("mode")) is not int
+            or encoded_member.get("mode") != 0o600
+            or not positive_record_integer(encoded_member.get("device"))
+            or not positive_record_integer(encoded_member.get("inode"))
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        members.append(
+            _BackupTransactionMember(
+                name=encoded_member["name"],
+                device=encoded_member["device"],
+                inode=encoded_member["inode"],
+                file_type=encoded_member["file_type"],
+                mode=encoded_member["mode"],
+            )
+        )
+    members.sort(key=lambda member: member.name)
+    if tuple(member.name for member in members) != tuple(
+        sorted(OPERATION_MEMBER_NAMES)
     ):
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
@@ -334,6 +399,9 @@ def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
         directory_name=directory_name,
         directory_device=payload["directory_device"],
         directory_inode=payload["directory_inode"],
+        manifest_device=payload["manifest_device"],
+        manifest_inode=payload["manifest_inode"],
+        members=tuple(members),
     )
 
 
@@ -407,6 +475,10 @@ def _manifest_identity(
         and stat.S_ISREG(path_stat.st_mode)
         and descriptor_stat.st_dev == path_stat.st_dev
         and descriptor_stat.st_ino == path_stat.st_ino
+        and descriptor_stat.st_dev
+        == transaction.manifest.manifest_device
+        and descriptor_stat.st_ino
+        == transaction.manifest.manifest_inode
         and descriptor_stat.st_size == TRANSACTION_MANIFEST_BYTES
         and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
     ):
@@ -442,19 +514,145 @@ def _read_manifest(
     return manifest
 
 
+def _recorded_member(
+    manifest: _BackupTransactionManifest,
+    name: str,
+) -> _BackupTransactionMember:
+    for member in manifest.members:
+        if member.name == name:
+            return member
+    raise EncryptedBackupError(
+        "encrypted_backup_transaction_invalid"
+    )
+
+
+def _member_stat_matches(
+    descriptor_stat: os.stat_result,
+    path_stat: os.stat_result,
+    member: _BackupTransactionMember,
+) -> bool:
+    return (
+        member.file_type == "regular"
+        and stat.S_ISREG(descriptor_stat.st_mode)
+        and stat.S_ISREG(path_stat.st_mode)
+        and descriptor_stat.st_dev == path_stat.st_dev
+        and descriptor_stat.st_ino == path_stat.st_ino
+        and descriptor_stat.st_dev == member.device
+        and descriptor_stat.st_ino == member.inode
+        and stat.S_IMODE(descriptor_stat.st_mode) == member.mode
+        and stat.S_IMODE(path_stat.st_mode) == member.mode
+    )
+
+
+def _open_recorded_member(
+    transaction: BackupTransaction,
+    member: _BackupTransactionMember,
+    flags: int,
+) -> int:
+    descriptor = os.open(
+        member.name,
+        flags
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=transaction.directory_descriptor,
+    )
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.stat(
+            member.name,
+            dir_fd=transaction.directory_descriptor,
+            follow_symlinks=False,
+        )
+        if not _member_stat_matches(
+            descriptor_stat,
+            path_stat,
+            member,
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def validate_backup_transaction(
     transaction: BackupTransaction,
 ) -> set[str]:
     _read_manifest(transaction)
     members = set(os.listdir(transaction.directory_descriptor))
-    if (
-        TRANSACTION_MANIFEST_NAME not in members
-        or not members <= TRANSACTION_MEMBER_NAMES
+    if members != TRANSACTION_MEMBER_NAMES:
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    descriptors: list[int] = []
+    try:
+        for member in transaction.manifest.members:
+            descriptors.append(
+                _open_recorded_member(
+                    transaction,
+                    member,
+                    os.O_RDONLY,
+                )
+            )
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    return members
+
+
+def _capture_member(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+) -> _BackupTransactionMember:
+    descriptor_stat = os.fstat(descriptor)
+    path_stat = os.stat(
+        name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    mode = stat.S_IMODE(descriptor_stat.st_mode)
+    if not (
+        stat.S_ISREG(descriptor_stat.st_mode)
+        and stat.S_ISREG(path_stat.st_mode)
+        and descriptor_stat.st_dev == path_stat.st_dev
+        and descriptor_stat.st_ino == path_stat.st_ino
+        and mode == 0o600
+        and stat.S_IMODE(path_stat.st_mode) == mode
     ):
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
         )
-    return members
+    return _BackupTransactionMember(
+        name=name,
+        device=descriptor_stat.st_dev,
+        inode=descriptor_stat.st_ino,
+        file_type="regular",
+        mode=mode,
+    )
+
+
+def _unlink_captured_member(
+    directory_descriptor: int,
+    member: _BackupTransactionMember,
+) -> None:
+    try:
+        path_stat = os.stat(
+            member.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISREG(path_stat.st_mode)
+        and path_stat.st_dev == member.device
+        and path_stat.st_ino == member.inode
+        and stat.S_IMODE(path_stat.st_mode) == member.mode
+    ):
+        os.unlink(member.name, dir_fd=directory_descriptor)
 
 
 def create_backup_transaction(destination: Path) -> BackupTransaction:
@@ -463,6 +661,8 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
     manifest_descriptor: int | None = None
     manifest_locked = False
     directory_name: str | None = None
+    manifest_member: _BackupTransactionMember | None = None
+    operation_members: list[_BackupTransactionMember] = []
     try:
         _destination_identity(destination, destination_descriptor)
         transaction_id = os.urandom(16).hex()
@@ -493,12 +693,6 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
             raise EncryptedBackupError(
                 "encrypted_backup_transaction_invalid"
             )
-        manifest = _BackupTransactionManifest(
-            transaction_id=transaction_id,
-            directory_name=directory_name,
-            directory_device=directory_stat.st_dev,
-            directory_inode=directory_stat.st_ino,
-        )
         manifest_descriptor = os.open(
             TRANSACTION_MANIFEST_NAME,
             os.O_RDWR
@@ -513,6 +707,49 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
         os.fchmod(manifest_descriptor, 0o600)
         acquire_bounded_lock(manifest_descriptor, fcntl.LOCK_EX)
         manifest_locked = True
+        manifest_member = _capture_member(
+            directory_descriptor,
+            TRANSACTION_MANIFEST_NAME,
+            manifest_descriptor,
+        )
+        for name in OPERATION_MEMBER_NAMES:
+            descriptor = os.open(
+                name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                retry_fsync(descriptor)
+                operation_members.append(
+                    _capture_member(
+                        directory_descriptor,
+                        name,
+                        descriptor,
+                    )
+                )
+            finally:
+                os.close(descriptor)
+        retry_fsync(directory_descriptor)
+        manifest = _BackupTransactionManifest(
+            transaction_id=transaction_id,
+            directory_name=directory_name,
+            directory_device=directory_stat.st_dev,
+            directory_inode=directory_stat.st_ino,
+            manifest_device=manifest_member.device,
+            manifest_inode=manifest_member.inode,
+            members=tuple(
+                sorted(
+                    operation_members,
+                    key=lambda member: member.name,
+                )
+            ),
+        )
         transaction = BackupTransaction(
             destination=destination,
             destination_descriptor=destination_descriptor,
@@ -524,10 +761,32 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
         pwrite_all(manifest_descriptor, _encode_manifest(manifest))
         retry_fsync(manifest_descriptor)
         _read_manifest(transaction)
+        validate_backup_transaction(transaction)
         retry_fsync(directory_descriptor)
         retry_fsync(destination_descriptor)
         return transaction
     except BaseException:
+        if directory_descriptor is not None:
+            for member in reversed(operation_members):
+                try:
+                    _unlink_captured_member(
+                        directory_descriptor,
+                        member,
+                    )
+                except OSError:
+                    pass
+            if manifest_member is not None:
+                try:
+                    _unlink_captured_member(
+                        directory_descriptor,
+                        manifest_member,
+                    )
+                except OSError:
+                    pass
+            try:
+                retry_fsync(directory_descriptor)
+            except OSError:
+                pass
         if manifest_descriptor is not None and manifest_locked:
             try:
                 retry_flock(manifest_descriptor, fcntl.LOCK_UN)
@@ -539,13 +798,6 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
             except OSError:
                 pass
         if directory_descriptor is not None:
-            try:
-                os.unlink(
-                    TRANSACTION_MANIFEST_NAME,
-                    dir_fd=directory_descriptor,
-                )
-            except OSError:
-                pass
             try:
                 os.close(directory_descriptor)
             except OSError:
@@ -563,31 +815,14 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
         raise
 
 
-def create_transaction_member(
+def transaction_member_path(
     transaction: BackupTransaction,
     name: str,
 ) -> Path:
-    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
+    if name not in OPERATION_MEMBER_NAMES:
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
         )
-    validate_backup_transaction(transaction)
-    descriptor = os.open(
-        name,
-        os.O_RDWR
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-        0o600,
-        dir_fd=transaction.directory_descriptor,
-    )
-    try:
-        os.fchmod(descriptor, 0o600)
-        retry_fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    retry_fsync(transaction.directory_descriptor)
     validate_backup_transaction(transaction)
     return transaction.directory / name
 
@@ -597,39 +832,16 @@ def open_transaction_member(
     name: str,
     flags: int,
 ) -> int:
-    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
+    if name not in OPERATION_MEMBER_NAMES:
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
         )
     validate_backup_transaction(transaction)
-    descriptor = os.open(
-        name,
-        flags
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-        dir_fd=transaction.directory_descriptor,
+    return _open_recorded_member(
+        transaction,
+        _recorded_member(transaction.manifest, name),
+        flags,
     )
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        path_stat = os.stat(
-            name,
-            dir_fd=transaction.directory_descriptor,
-            follow_symlinks=False,
-        )
-        if not (
-            stat.S_ISREG(descriptor_stat.st_mode)
-            and stat.S_ISREG(path_stat.st_mode)
-            and descriptor_stat.st_dev == path_stat.st_dev
-            and descriptor_stat.st_ino == path_stat.st_ino
-            and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
-        ):
-            raise EncryptedBackupError(
-                "encrypted_backup_transaction_invalid"
-            )
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
 
 
 def hash_transaction_member(
@@ -709,21 +921,49 @@ def fsync_and_hash_transaction_artifact(
 
 
 def _remove_backup_transaction(transaction: BackupTransaction) -> None:
-    members = validate_backup_transaction(transaction)
-    for name in sorted(members - {TRANSACTION_MANIFEST_NAME}):
-        member_stat = os.stat(
-            name,
-            dir_fd=transaction.directory_descriptor,
-            follow_symlinks=False,
-        )
-        if not (
-            stat.S_ISREG(member_stat.st_mode)
-            and stat.S_IMODE(member_stat.st_mode) == 0o600
+    validate_backup_transaction(transaction)
+    opened: list[tuple[_BackupTransactionMember, int]] = []
+    try:
+        for member in transaction.manifest.members:
+            opened.append(
+                (
+                    member,
+                    _open_recorded_member(
+                        transaction,
+                        member,
+                        os.O_RDONLY,
+                    ),
+                )
+            )
+        if set(os.listdir(transaction.directory_descriptor)) != (
+            TRANSACTION_MEMBER_NAMES
         ):
             raise EncryptedBackupError(
                 "encrypted_backup_transaction_invalid"
             )
-        os.unlink(name, dir_fd=transaction.directory_descriptor)
+        for member, descriptor in opened:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = os.stat(
+                member.name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not _member_stat_matches(
+                descriptor_stat,
+                path_stat,
+                member,
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+        for member, _descriptor in opened:
+            os.unlink(
+                member.name,
+                dir_fd=transaction.directory_descriptor,
+            )
+    finally:
+        for _member, descriptor in opened:
+            os.close(descriptor)
     retry_fsync(transaction.directory_descriptor)
     _read_manifest(transaction)
     _directory_identity(transaction)
