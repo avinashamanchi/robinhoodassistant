@@ -1419,7 +1419,22 @@ git commit -m "feat(analyst): isolate untrusted model context"
   Terminal retries replay their original HTTP status. All paths forbid approval,
   submission, cancellation, auto-enable, and execution.
 - `/chat` and both queue routes are marked broker-read. Queue routes require
-  CSRF and idempotency and use explicit `candidate_queue` mutation policy.
+  CSRF and idempotency. Candidate queue routes retain their principal-scoped
+  route lease but use the durable `CandidateQueueReceipt` as their sole
+  idempotency/recovery authority; they never claim the generic mutation
+  interlock.
+- `provider_budget.max_chat_tool_turns` is both the provider-turn ceiling and
+  an equal hard aggregate tool-call ceiling across the entire chat. Each
+  broker-backed tool dispatch first consumes one durable `broker_read` unit
+  under the exact authenticated-session limit principal. Budget exhaustion,
+  rate denial, and limit-store failure stop remaining dispatches and prevent
+  another provider turn.
+- `target_persisted -> completed` recovery requires the exact initial target.
+  Once completed, a same-request replay validates immutable target provenance
+  but permits legal order/rule lifecycle progression. Rule recovery compares
+  the complete canonical `RuleCommand` persistence shape and exactly one rule.
+- Candidate expiry is exclusive: an observation at or after `expires_at` is
+  expired.
 - MCP remains explicit and non-executing with its existing authenticated tool
   contract.
 
@@ -1433,6 +1448,20 @@ git commit -m "feat(analyst): isolate untrusted model context"
 - [x] **Step 8: Pass focused candidate/agent/API/MCP/migration/submission tests**
 - [x] **Step 9: Run exactly one full suite for the implementation round**
 - [x] **Step 10: Commit implementation, then package evidence in docs-only commit**
+
+**Fix round 1**
+
+- [x] **FR1.1:** Bound aggregate chat fan-out and durably meter each
+  broker-backed dispatch.
+- [x] **FR1.2:** Replace candidate-route generic interlocks with explicit
+  receipt-managed idempotency while retaining route leases.
+- [x] **FR1.3:** Separate strict target-persisted validation from immutable
+  completed replay.
+- [x] **FR1.4:** Validate the complete immutable persisted rule command and
+  exactly one initial rule.
+- [x] **FR1.5:** Expire candidates when `observed >= expires_at`.
+- [x] **FR1.6:** Pass focused, repeated-concurrency, one full-suite, and
+  release-static gates without runtime or external calls.
 
 ---
 

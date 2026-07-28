@@ -2,7 +2,8 @@
 
 ## Outcome
 
-Task 9 is implemented in commit `9a9327f`.
+Task 9 was implemented in `9a9327f`. Review fix round 1 is implemented in
+`9197ba8`.
 
 General chat now has one immutable read-only tool registry plus two
 non-persisting draft tools. It cannot propose, create, cancel, approve, submit,
@@ -24,8 +25,9 @@ proposal. No queue path can approve, submit, cancel, execute, or auto-execute.
 ## State-integrity design
 
 Migration `20260728_0016` adds metadata-only
-`candidate_queue_receipts` and extends the protected mutation-operation
-constraint with `candidate_queue`.
+`candidate_queue_receipts`. Candidate queue routes retain the generic
+principal-scoped route lease but do not claim a generic mutation interlock;
+the receipt lifecycle is their sole durable recovery authority.
 
 Receipt identity binds opaque current-session hash, kind, hashed idempotency
 key, candidate hash, nonce hash, actor hash, and operator-reason hash. It stores
@@ -148,6 +150,117 @@ The full suite was not rerun.
 - Diff:
   `.superpowers/sdd/2026-07-27-secrets-model-trust/review-4f2a866..9a9327f.diff`
 - Diff size: 5,285 lines / 188,100 bytes
+
+## Review fix round 1
+
+All four Important findings and the Minor expiry-boundary finding were
+addressed in implementation commit `9197ba8`:
+
+- A single chat can dispatch at most
+  `security.provider_budget.max_chat_tool_turns` tool blocks in total across
+  all model turns. Each actual broker-backed tool consumes one durable
+  `broker_read` unit under the same canonical authenticated-session principal
+  used by route policy. Exhaustion, denial, and store failure return stable
+  bounded results for the current response, stop remaining dispatches, and
+  prevent another provider turn.
+- Candidate queue policies are explicitly receipt-managed. They still require
+  CSRF, idempotency, mutation audit, rate policy, broker-read classification,
+  and a principal-scoped route lease, but they do not inspect, claim, settle,
+  or widen the generic mutation interlock. The unused `candidate_queue`
+  interlock operation and migration constraint widening were removed.
+- `target_persisted -> completed` validates the exact initial target state.
+  Completed same-request replay validates immutable provenance but no longer
+  rejects legal order/rule lifecycle progression.
+- Rule recovery reconstructs the canonical `RuleCommand` and compares the
+  deterministic group key, exactly one target rule, payload version, ticker,
+  kind, canonical condition/action JSON, size and limit fields, activation,
+  preapproval, terminal behavior, fraction, HWM, deadline, and plan ownership.
+  Immutable drift fails both recovery and completed replay.
+- Candidate expiry now treats `observed >= expires_at` as expired.
+
+### Fix-round RED evidence
+
+The first focused command contained one mistyped migration-test selector and
+collected no tests. The selector was corrected before implementation. The
+corrected RED run produced:
+
+```text
+46 failed, 8 passed in 2.49s
+```
+
+Those failures reproduced the missing Agent limiter interface, unbounded
+fan-out, lifecycle-sensitive completed replay, incomplete rule provenance
+checks, generic candidate interlock, retained migration widening, and exact
+expiry boundary.
+
+### Fix-round focused and concurrency evidence
+
+```text
+uv run pytest tests/test_agent.py
+28 passed in 1.88s
+
+focused receipt/replay/interlock selection
+23 passed in 1.00s
+
+focused route-policy and migration selection
+3 passed in 0.38s
+
+uv run pytest tests/test_agent.py tests/test_candidate_boundary.py \
+  tests/test_route_policy.py tests/test_api.py tests/test_mcp_tools.py \
+  tests/test_order_submission.py tests/test_submission_barrier.py
+374 passed, 1 warning in 56.33s
+
+uv run pytest tests/test_config.py tests/test_bootstrap.py \
+  tests/test_migrations.py
+282 passed, 1 warning in 22.83s
+
+10 repeated runs of concurrent chat rate limiting, eight four-thread \
+same-key receipt races, and candidate route-lease contention
+100 passed
+
+uv run pytest \
+  tests/test_candidate_boundary.py::test_completed_rule_receipt_replays_after_trigger_lifecycle_progression
+2 passed in 0.30s
+
+uv run python -m compileall -q src/trading_assistant \
+  migrations/versions tests/test_agent.py tests/test_api.py \
+  tests/test_candidate_boundary.py tests/test_migrations.py \
+  tests/test_route_policy.py
+PASS
+
+git diff --check
+PASS
+```
+
+One initial broad focused run exposed an expected API context assertion that
+needed the new canonical `limit_principal`; the corrected broad run above
+passed. The first adversarial repeat exposed a test-only scheduling assumption
+that one concurrent chat must finish before the other. The assertion was
+changed to accept both valid interleavings while preserving the exact durable
+capacity and zero-extra-call checks; the fresh 100-case repeat then passed.
+
+### Fix-round full and release gates
+
+Exactly one no-argument full suite was run for this fix round:
+
+```text
+uv run pytest
+3095 passed, 1 skipped, 1 warning in 238.86s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+The warning remains the existing `websockets.legacy` deprecation warning. The
+full suite was not rerun.
+
+### Fix-round review package
+
+- Base: `352e9e6`
+- Implementation: `9197ba8`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-352e9e6..9197ba8.diff`
+- Diff size: 1,636 lines / 56,923 bytes
 
 ## Safety statement
 

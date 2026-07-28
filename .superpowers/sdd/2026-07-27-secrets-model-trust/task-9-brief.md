@@ -55,12 +55,20 @@ order, reset a breaker, or enable live/autonomous trading.
 - Prose alone never creates a candidate.
 - `/chat` is marked broker-read and remains rate-limited before model/broker
   work.
+- `provider_budget.max_chat_tool_turns` is also the hard total tool-call budget
+  across all model turns. Every broker-backed dispatch consumes one durable
+  `broker_read` unit under the exact authenticated-session limit principal
+  before broker work. Budget exhaustion, rate denial, or store failure stops
+  remaining dispatches and prevents another provider call.
 
 ## Explicit queue boundary
 
 - `POST /candidates/order/queue` and `POST /candidates/rule/queue` require
   session authentication, CSRF, a canonical idempotency key, mutation audit,
   broker-read policy, and principal-scoped concurrency policy.
+- Candidate queue routes retain their route lease but do not claim the generic
+  mutation interlock. `CandidateQueueReceipt` is their sole durable
+  idempotency and crash-recovery authority.
 - A new attempt validates signature, kind, actor, current-session binding,
   envelope time, execution-grade quote freshness, allowlist, and static cap
   before reserving a receipt or consuming the nonce.
@@ -94,9 +102,17 @@ order, reset a breaker, or enable live/autonomous trading.
   values. Recovery never searches for a target from a visible raw nonce hash.
   It trusts only receipt state and validates exact order fields or exactly one
   matching rule target.
+- `target_persisted -> completed` validates the exact initial lifecycle and all
+  immutable target fields. A completed same-request replay still validates
+  immutable provenance but permits legal order/rule lifecycle progression.
+  Rule recovery reconstructs the canonical `RuleCommand` and compares ticker,
+  group, kind, canonical condition/action JSON, sizing/limit fields,
+  activation, preapproval, terminal behavior, fraction/HWM/deadline, plan
+  ownership, payload version, and exactly one rule.
 - Completed and target-persisted receipts may replay after envelope expiry.
   Reserved receipts must revalidate issue/expiry/quote age before resuming; a
   stale retry becomes a terminal exact-status receipt and creates no target.
+- Expiry is exclusive: `observed >= expires_at` is expired.
 - Terminal retries replay the original HTTP status.
 
 ## Required evidence
