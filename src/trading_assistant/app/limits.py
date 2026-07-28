@@ -83,6 +83,17 @@ class LimitDecision:
 
 
 @dataclass(frozen=True)
+class LimitInspection:
+    """Read-only evidence for the buckets backing one request policy."""
+
+    policy_name: str
+    remaining: int
+    limit: int
+    exhausted: bool
+    reset_at: datetime
+
+
+@dataclass(frozen=True)
 class LeaseDecision:
     """Lease result with an owner-and-generation fencing token.
 
@@ -252,6 +263,81 @@ class DurableRateLimiter:
             allowed=True,
             remaining=remaining,
             retry_after_seconds=0,
+            reset_at=reset_at,
+        )
+
+    def inspect_pair(
+        self,
+        spec: LimitSpec,
+        *,
+        principal: str,
+        now: datetime | None = None,
+    ) -> LimitInspection:
+        """Inspect the current fixed windows without creating or resetting any."""
+
+        current = _as_utc(now)
+        buckets = self._buckets(spec, principal, current)
+        by_key = {bucket.key: bucket for bucket in buckets}
+        with _store_session(self._session_factory) as session:
+            rows = session.execute(
+                select(
+                    RateWindow.bucket_key,
+                    RateWindow.policy_name,
+                    RateWindow.window_started_at,
+                    RateWindow.expires_at,
+                    RateWindow.hits,
+                    RateWindow.version,
+                ).where(RateWindow.bucket_key.in_(by_key))
+            ).all()
+
+        observed: list[tuple[int, int, datetime]] = []
+        for row in rows:
+            bucket = by_key[row.bucket_key]
+            if (
+                row.policy_name != spec.name
+                or not isinstance(row.window_started_at, datetime)
+                or row.window_started_at.tzinfo is None
+                or not isinstance(row.expires_at, datetime)
+                or row.expires_at.tzinfo is None
+                or type(row.hits) is not int
+                or row.hits < 0
+                or type(row.version) is not int
+                or row.version < 0
+            ):
+                raise LimitStoreUnavailable(
+                    "corrupt durable limit state"
+                )
+            expires_at = _as_utc(row.expires_at)
+            if expires_at <= current:
+                continue
+            observed.append(
+                (
+                    max(0, bucket.ceiling - row.hits),
+                    bucket.ceiling,
+                    expires_at,
+                )
+            )
+
+        observed_keys = {
+            row.bucket_key
+            for row in rows
+            if _as_utc(row.expires_at) > current
+        }
+        observed.extend(
+            (bucket.ceiling, bucket.ceiling, bucket.expires_at)
+            for bucket in buckets
+            if bucket.key not in observed_keys
+        )
+        remaining = min(item[0] for item in observed)
+        limiting = [item for item in observed if item[0] == remaining]
+        reset_at = max(
+            item[2] for item in limiting
+        )
+        return LimitInspection(
+            policy_name=spec.name,
+            remaining=remaining,
+            limit=min(item[1] for item in limiting),
+            exhausted=remaining == 0,
             reset_at=reset_at,
         )
 

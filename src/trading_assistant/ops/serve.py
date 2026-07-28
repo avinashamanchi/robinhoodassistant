@@ -8,6 +8,7 @@ checks have passed.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -15,6 +16,7 @@ import uvicorn
 from sqlalchemy import text
 
 from ..app.main import create_app
+from ..bootstrap import build_container
 from ..config import load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine
@@ -23,8 +25,13 @@ from ..preflight import (
     StructuralCheck,
     structural_runtime_check,
 )
+from ..operations.security_posture import startup_posture_evidence
 from ..security.crypto import build_sensitive_data_cipher
-from ..security.secrets import RuntimeSecrets, load_role_secrets
+from ..security.secrets import (
+    MacOSKeychainSecretProvider,
+    RuntimeSecrets,
+    load_role_secrets,
+)
 from ..security.transport import TransportPolicy
 from .control import start_app_control
 from .tls import TLSMaterialError, validate_tls_material
@@ -143,11 +150,56 @@ def main(argv: list[str] | None = None) -> int:
     if argv:
         raise SystemExit("ops.serve accepts no arguments")
     config = load_config()
-    run_startup_guard(config=config)
+    try:
+        secret_provider = MacOSKeychainSecretProvider()
+        secrets = load_role_secrets(
+            "app",
+            config=config,
+            provider=secret_provider,
+        )
+    except Exception:
+        raise StartupGuardBlocked(
+            (
+                StructuralCheck(
+                    "keychain",
+                    "blocked",
+                    "keychain_unavailable",
+                ),
+            )
+        ) from None
+    checks = run_startup_guard(
+        config=config,
+        secrets=secrets,
+    )
+    secret_loaded_at = secret_provider.last_successful_role_load_at
+    if secret_loaded_at is None:
+        raise StartupGuardBlocked(
+            (
+                StructuralCheck(
+                    "keychain",
+                    "blocked",
+                    "keychain_unavailable",
+                ),
+            )
+        )
+    evidence = startup_posture_evidence(
+        checks=checks,
+        observed_at=datetime.now(timezone.utc),
+        secret_loaded_at=secret_loaded_at,
+    )
     control = start_app_control(Path.cwd())
     app = None
     try:
-        app = create_app()
+        container = build_container(
+            config,
+            secrets,
+            runtime_role="app",
+            startup_evidence=evidence,
+        )
+        app = create_app(
+            container=container,
+            startup_evidence=evidence,
+        )
         server = uvicorn.Server(
             uvicorn.Config(
                 app,

@@ -2,6 +2,11 @@
 
 from .audit import AuditRecorder, MutationContext, mark_http_mutation
 from .health import LivenessReport, OperationalHealthReport
+from .security_posture import (
+    PostureCheck,
+    SecurityPostureReport,
+    StartupPostureEvidence,
+)
 from .service import OperationsService
 
 __all__ = [
@@ -10,5 +15,8 @@ __all__ = [
     "MutationContext",
     "OperationalHealthReport",
     "OperationsService",
+    "PostureCheck",
+    "SecurityPostureReport",
+    "StartupPostureEvidence",
     "mark_http_mutation",
 ]

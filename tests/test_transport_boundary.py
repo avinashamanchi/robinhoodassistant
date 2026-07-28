@@ -65,6 +65,47 @@ class _CountingSessionFactory:
         return self._factory()
 
 
+def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
+    """Keep launcher tests on one injected secrets/evidence/container chain."""
+
+    secrets = object()
+    provider = SimpleNamespace(
+        last_successful_role_load_at=datetime.now(timezone.utc)
+    )
+    container = SimpleNamespace(secrets=secrets)
+    monkeypatch.setattr(
+        serve,
+        "MacOSKeychainSecretProvider",
+        lambda: provider,
+    )
+    monkeypatch.setattr(
+        serve,
+        "load_role_secrets",
+        lambda *_args, **_kwargs: secrets,
+    )
+
+    def build_container(
+        config,
+        loaded,
+        *,
+        runtime_role,
+        startup_evidence,
+    ):
+        assert loaded is secrets
+        assert runtime_role == "app"
+        container.startup_evidence = startup_evidence
+        return container
+
+    monkeypatch.setattr(serve, "build_container", build_container)
+
+    def create_app(*, container: object, startup_evidence):
+        assert container is not None
+        assert container.startup_evidence is startup_evidence
+        return app
+
+    monkeypatch.setattr(serve, "create_app", create_app)
+
+
 def _durable_perimeter_state(
     service,
     *,
@@ -1016,7 +1057,7 @@ def test_strict_launcher_uses_only_loopback_tls_and_disables_proxy_headers(
     monkeypatch.setattr(serve, "load_config", lambda: SimpleNamespace(server=server))
     monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
     monkeypatch.setattr(serve, "start_app_control", lambda _project: FakeControl())
-    monkeypatch.setattr(serve, "create_app", lambda: app)
+    _patch_fake_launcher_composition(monkeypatch, serve, app)
     monkeypatch.setattr(
         serve.uvicorn,
         "Config",
@@ -1077,7 +1118,7 @@ def test_launcher_closes_running_tenure_if_server_construction_fails(
     )
     monkeypatch.setattr(serve, "run_startup_guard", lambda **_kwargs: ())
     monkeypatch.setattr(serve, "start_app_control", lambda _project: control)
-    monkeypatch.setattr(serve, "create_app", lambda: app)
+    _patch_fake_launcher_composition(monkeypatch, serve, app)
     monkeypatch.setattr(
         serve.uvicorn,
         "Config",
@@ -1152,7 +1193,7 @@ def test_launcher_fails_nonzero_when_lifespan_already_saw_uncertain_release(
         "start_app_control",
         lambda _project: SimpleNamespace(close=lambda: None),
     )
-    monkeypatch.setattr(serve, "create_app", lambda: app)
+    _patch_fake_launcher_composition(monkeypatch, serve, app)
     monkeypatch.setattr(
         serve.uvicorn,
         "Config",

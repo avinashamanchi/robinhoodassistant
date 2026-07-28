@@ -188,6 +188,12 @@ ROUTE_POLICIES = (
         receipt_managed_idempotency=True,
     ),
     RoutePolicy("GET", "/health", AuthLevel.SESSION, "session_read"),
+    RoutePolicy(
+        "GET",
+        "/security/posture",
+        AuthLevel.SESSION,
+        "session_read",
+    ),
     RoutePolicy("GET", "/pending", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
         "GET",

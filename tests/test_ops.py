@@ -51,6 +51,38 @@ class _StubAgent:
         return {"reply": "", "tool_calls": []}
 
 
+def test_operations_posture_facade_only_forwards_read_principal(
+    make_service,
+):
+    from datetime import datetime, timezone
+
+    from trading_assistant.operations import OperationsService
+    from trading_assistant.operations.security_posture import (
+        SecurityPostureReport,
+    )
+
+    seen: list[str] = []
+    expected = SecurityPostureReport(
+        observed_at=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        checks=(),
+    )
+
+    class Reader:
+        def report(self, *, limit_principal):
+            seen.append(limit_principal)
+            return expected
+
+    operations = OperationsService(
+        make_service(),
+        security_posture_reader=Reader(),
+    )
+
+    assert operations.security_posture(
+        limit_principal="session:21:operator"
+    ) is expected
+    assert seen == ["session:21:operator"]
+
+
 BACKUP_KEY = b"b" * 32
 BACKUP_KEY_ID = "operational-backup-2026"
 BACKUP_MARKER = b"operational-backup-marker-never-plaintext"

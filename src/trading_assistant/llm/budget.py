@@ -144,6 +144,27 @@ class BudgetStatus:
     price_effective_date: date | None = None
 
 
+@dataclass(frozen=True)
+class BudgetInspection:
+    """Read-only provider-budget evidence for operational reporting."""
+
+    provider: str
+    budget_day: date
+    calls_used: int
+    input_tokens_used: int
+    output_tokens_used: int
+    calls_limit: int
+    input_tokens_limit: int
+    output_tokens_limit: int
+    calls_remaining: int
+    input_tokens_remaining: int
+    output_tokens_remaining: int
+    reconciliation_required: bool
+    expired_started_count: int
+    expired_unknown_count: int
+    reset_at: datetime
+
+
 class ProviderInputEstimator(Protocol):
     def estimate_upper_bound(
         self,
@@ -753,6 +774,86 @@ class ProviderBudgetService:
             estimated_usd=estimated_usd,
             price_model=price_model,
             price_effective_date=price_effective_date,
+        )
+
+    def inspect(
+        self,
+        provider: str,
+        *,
+        now: datetime | None = None,
+    ) -> BudgetInspection:
+        """Inspect durable budget evidence without sweeping or latching state."""
+
+        _require_text("provider", provider)
+        current = _as_utc(now or self._clock())
+        budget_day = current.date()
+        with _budget_store_session(self._session_factory) as session:
+            self._validate_provider_aggregates(session, provider)
+            row = session.get(ProviderBudgetDay, (provider, budget_day))
+            reconciliation_required = bool(
+                session.scalar(
+                    select(ProviderBudgetDay.provider)
+                    .where(
+                        ProviderBudgetDay.provider == provider,
+                        ProviderBudgetDay.reconciliation_required.is_(True),
+                    )
+                    .limit(1)
+                )
+            )
+            ambiguous = session.scalars(
+                select(ProviderReservation).where(
+                    ProviderReservation.provider == provider,
+                    ProviderReservation.state.in_(
+                        ("started", "unknown")
+                    ),
+                    ProviderReservation.expires_at <= current,
+                )
+            ).all()
+            for reservation in ambiguous:
+                self._validate_reservation(reservation)
+
+        calls_used = row.calls_used if row is not None else 0
+        input_used = row.input_tokens_used if row is not None else 0
+        output_used = row.output_tokens_used if row is not None else 0
+        expired_started_count = sum(
+            reservation.state == "started"
+            for reservation in ambiguous
+        )
+        expired_unknown_count = sum(
+            reservation.state == "unknown"
+            for reservation in ambiguous
+        )
+        reset_at = datetime.combine(
+            budget_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        return BudgetInspection(
+            provider=provider,
+            budget_day=budget_day,
+            calls_used=calls_used,
+            input_tokens_used=input_used,
+            output_tokens_used=output_used,
+            calls_limit=self.limits.calls,
+            input_tokens_limit=self.limits.input_tokens,
+            output_tokens_limit=self.limits.output_tokens,
+            calls_remaining=max(0, self.limits.calls - calls_used),
+            input_tokens_remaining=max(
+                0,
+                self.limits.input_tokens - input_used,
+            ),
+            output_tokens_remaining=max(
+                0,
+                self.limits.output_tokens - output_used,
+            ),
+            reconciliation_required=(
+                reconciliation_required
+                or bool(expired_started_count)
+                or bool(expired_unknown_count)
+            ),
+            expired_started_count=expired_started_count,
+            expired_unknown_count=expired_unknown_count,
+            reset_at=reset_at,
         )
 
     def _effective_price(

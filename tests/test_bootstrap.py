@@ -494,6 +494,54 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
     assert app.state.provider_budget is container.provider_budget
 
 
+def test_create_app_preserves_exact_container_startup_evidence_identity(
+    make_service,
+):
+    from trading_assistant.operations.security_posture import (
+        StartupPostureEvidence,
+    )
+
+    service = make_service()
+    secrets = Secrets(
+        app_api_token="startup-evidence-identity-secret",
+    )
+    evidence = StartupPostureEvidence(
+        observed_at=datetime.now(timezone.utc),
+        structural_checks=(),
+        secret_provider="macos_keychain",
+        secret_load_status="pass",
+        secret_loaded_at=datetime.now(timezone.utc),
+    )
+    container = _injected_container(service, secrets)
+    container.startup_evidence = evidence
+    container.operations = OperationsService(
+        service,
+        container.audit,
+        rate_limiter=container.rate_limiter,
+        provider_budget=container.provider_budget,
+        startup_evidence=evidence,
+    )
+
+    app = create_app(
+        container=container,
+        agent=_StubAgent(),
+        planning=None,
+        startup_evidence=evidence,
+    )
+
+    assert app.state.startup_evidence is evidence
+    with pytest.raises(
+        RuntimeError,
+        match="container and startup evidence do not match",
+    ):
+        create_app(
+            container=container,
+            agent=_StubAgent(),
+            planning=None,
+            startup_evidence=evidence.model_copy(),
+        )
+
+
 def test_automatic_planning_and_screen_use_exact_injected_secrets(
     make_service,
     monkeypatch,

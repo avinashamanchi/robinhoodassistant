@@ -39,6 +39,7 @@ from .orders.reconciliation import ReconciliationService
 from .orders.snapshot import PortfolioSnapshotService
 from .orders.submission import OrderSubmissionService
 from .operations import AuditRecorder, OperationsService
+from .operations.security_posture import StartupPostureEvidence
 from .ops.tenure import (
     LocalProcessInspector,
     ProcessIdentity,
@@ -107,6 +108,7 @@ class ApplicationContainer:
     candidate_signer: CandidateSigner | None = None
     candidate_drafts: CandidateDraftService | None = None
     candidate_queue: CandidateQueueService | None = None
+    startup_evidence: StartupPostureEvidence | None = None
 
 
 def prepare_database_runtime(
@@ -271,6 +273,7 @@ def build_container(
     process_inspector=None,
     tenure_clock=None,
     tenure_owner_factory=None,
+    startup_evidence: StartupPostureEvidence | None = None,
 ) -> ApplicationContainer:
     config = config or load_config()
     if secrets is None:
@@ -285,6 +288,7 @@ def build_container(
         process_inspector=process_inspector,
         tenure_clock=tenure_clock,
         tenure_owner_factory=tenure_owner_factory,
+        startup_evidence=startup_evidence,
     )
 
 
@@ -294,6 +298,7 @@ def build_test_container(
     *,
     broker: BrokerClient,
     clock,
+    startup_evidence: StartupPostureEvidence | None = None,
 ) -> ApplicationContainer:
     """Compose with explicit fakes while retaining production-safe config."""
     return _build_container(
@@ -302,6 +307,7 @@ def build_test_container(
         broker=broker,
         clock=clock,
         enforce_runtime_tenure=False,
+        startup_evidence=startup_evidence,
     )
 
 
@@ -317,6 +323,7 @@ def _build_container(
     tenure_clock=None,
     tenure_owner_factory=None,
     enforce_runtime_tenure: bool = True,
+    startup_evidence: StartupPostureEvidence | None = None,
 ) -> ApplicationContainer:
     _guard_runtime(config, secrets)
     effective_role = runtime_role or "app"
@@ -357,6 +364,7 @@ def _build_container(
             clock=clock,
             sensitive_cipher=sensitive_cipher,
             runtime_tenure_guard=runtime_tenure_guard,
+            startup_evidence=startup_evidence,
         )
     except BaseException:
         if runtime_tenure_guard is not None:
@@ -375,6 +383,7 @@ def _finish_container(
     clock,
     sensitive_cipher: SensitiveDataCipher | None,
     runtime_tenure_guard: RuntimeTenureGuard | None,
+    startup_evidence: StartupPostureEvidence | None,
 ) -> ApplicationContainer:
     session_factory = runtime.session_factory
     if runtime_tenure_guard is not None:
@@ -496,6 +505,9 @@ def _finish_container(
         leases=leases,
         policy_store_maintenance=policy_store_maintenance,
         provider_budget=provider_budget,
+        startup_evidence=startup_evidence,
+        engine=runtime.engine,
+        sensitive_cipher=sensitive_cipher,
     )
     return ApplicationContainer(
         config=config,
@@ -523,4 +535,5 @@ def _finish_container(
         candidate_signer=candidate_signer,
         candidate_drafts=candidate_drafts,
         candidate_queue=candidate_queue,
+        startup_evidence=startup_evidence,
     )

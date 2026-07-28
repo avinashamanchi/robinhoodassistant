@@ -175,6 +175,11 @@ def test_every_api_route_has_exact_policy(make_service):
         registry.get("GET", "/health/live").auth
         is AuthLevel.PUBLIC
     )
+    posture = registry.get("GET", "/security/posture")
+    assert posture.auth is AuthLevel.SESSION
+    assert posture.limit_name == "session_read"
+    assert posture.broker_read is False
+    assert posture.provider_category is None
     for path in (
         "/candidates/order/queue",
         "/candidates/rule/queue",
@@ -411,6 +416,42 @@ def test_authenticated_rate_principal_is_the_persisted_session(
 
     assert denied.status_code == 429
     assert denied.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_security_posture_requires_session_and_uses_session_read_limit(
+    make_service,
+):
+    service = _with_limit(
+        make_service(),
+        "session_read",
+        requests=1,
+        global_requests=10,
+    )
+    app = create_app(
+        service=service,
+        agent=_StubAgent(),
+        api_token="posture-route-policy-secret",
+        planning=None,
+    )
+    unauthenticated = TestClient(app)
+    client = TestClient(app)
+
+    assert (
+        unauthenticated.get("/security/posture").status_code
+        == 401
+    )
+    assert client.post(
+        "/auth/login",
+        json={"secret": "posture-route-policy-secret"},
+    ).status_code == 200
+    allowed = client.get("/security/posture")
+    denied = client.get("/security/posture")
+
+    assert allowed.status_code == 200
+    assert allowed.json()["can_trade"] is False
+    assert denied.status_code == 429
+    assert denied.json()["error"]["code"] == "rate_limit_exceeded"
+    assert denied.headers["X-RateLimit-Limit"] == "1"
 
 
 @pytest.mark.parametrize(

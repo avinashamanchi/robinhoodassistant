@@ -85,6 +85,7 @@ _ACCOUNT_CACHE_TTL_SECONDS = 2.0
 
 if TYPE_CHECKING:
     from ..bootstrap import ApplicationContainer
+    from ..operations.security_posture import StartupPostureEvidence
 
 
 class _AssetOnlyStaticFiles(StaticFiles):
@@ -365,6 +366,7 @@ def _create_app(
     transport_policy: TransportPolicy | None = None,
     candidate_signer: CandidateSigner | None = None,
     candidate_queue: CandidateQueueService | None = None,
+    startup_evidence: "StartupPostureEvidence | None" = None,
 ) -> FastAPI:
     if container is None and ((service is None) != (agent is None)):
         raise RuntimeError(
@@ -379,6 +381,19 @@ def _create_app(
         service = container.service
         agent = _build_agent(container)
     if container is not None:
+        container_startup_evidence = getattr(
+            container,
+            "startup_evidence",
+            None,
+        )
+        if (
+            startup_evidence is not None
+            and startup_evidence is not container_startup_evidence
+        ):
+            raise RuntimeError(
+                "container and startup evidence do not match"
+            )
+        startup_evidence = container_startup_evidence
         if (
             runtime_secrets is not None
             and runtime_secrets is not container.secrets
@@ -526,6 +541,7 @@ def _create_app(
     app.state.candidate_queue = candidate_queue
     app.state.account_cache = account_cache
     app.state.transport_policy = transport_policy
+    app.state.startup_evidence = startup_evidence
     app.state.controlled_shutdown = None
     runtime_tenure_guard = (
         getattr(container, "runtime_tenure_guard", None)
@@ -583,6 +599,32 @@ def _create_app(
         app.state.operations = OperationsService(
             service,
             app.state.audit,
+            rate_limiter=rate_limiter,
+            provider_budget=(
+                getattr(container, "provider_budget", None)
+                if container is not None
+                else None
+            ),
+            policy_store_maintenance=(
+                getattr(
+                    container,
+                    "policy_store_maintenance",
+                    None,
+                )
+                if container is not None
+                else None
+            ),
+            startup_evidence=startup_evidence,
+            engine=(
+                getattr(container, "engine", None)
+                if container is not None
+                else None
+            ),
+            sensitive_cipher=(
+                getattr(container, "sensitive_cipher", None)
+                if container is not None
+                else None
+            ),
         )
     # TrustedHost is defense in depth after the boundary's RFC-aware IPv6
     # parsing; it receives the canonical exact configured origin host.
@@ -743,6 +785,17 @@ def _create_app(
         principal: SessionPrincipal = Depends(current_principal),
     ):
         return app.state.operations.health().as_dict()
+
+    @app.get("/security/posture")
+    def security_posture(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return app.state.operations.security_posture(
+            limit_principal=session_limit_principal(
+                principal.session_id,
+                principal.actor,
+            )
+        )
 
     @app.get("/pending")
     def pending(

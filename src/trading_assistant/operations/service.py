@@ -10,6 +10,11 @@ from .health import (
     build_liveness,
     build_operational_health,
 )
+from .security_posture import (
+    SecurityPostureReport,
+    SecurityPostureService,
+    StartupPostureEvidence,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -24,6 +29,10 @@ class OperationsService:
         leases=None,
         provider_budget=None,
         policy_store_maintenance=None,
+        startup_evidence: StartupPostureEvidence | None = None,
+        engine=None,
+        sensitive_cipher=None,
+        security_posture_reader: SecurityPostureService | None = None,
     ) -> None:
         self.service = service
         self.audit = audit or AuditRecorder(service.session_factory)
@@ -31,6 +40,22 @@ class OperationsService:
         self.leases = leases
         self.provider_budget = provider_budget
         self.policy_store_maintenance = policy_store_maintenance
+        reconciliation = service.startup_reconciliation
+        self._security_posture_reader = (
+            security_posture_reader
+            if security_posture_reader is not None
+            else SecurityPostureService(
+                config=service.config,
+                session_factory=service.session_factory,
+                reconciliation_key=reconciliation.broker_key,
+                reconciliation_enabled=reconciliation.enabled,
+                startup_evidence=startup_evidence,
+                rate_limiter=rate_limiter,
+                provider_budget=provider_budget,
+                engine=engine,
+                sensitive_cipher=sensitive_cipher,
+            )
+        )
 
     def _record_best_effort(
         self,
@@ -112,3 +137,12 @@ class OperationsService:
 
     def liveness(self):
         return build_liveness(self.service.session_factory)
+
+    def security_posture(
+        self,
+        *,
+        limit_principal: str,
+    ) -> SecurityPostureReport:
+        return self._security_posture_reader.report(
+            limit_principal=limit_principal
+        )
