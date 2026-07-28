@@ -1,4 +1,4 @@
-# Task 6 report — COMPLETE (exceptional post-round-5 hardening)
+# Task 6 report — COMPLETE (exceptional crash-transaction hardening)
 
 ## Status and safety boundary
 
@@ -1115,6 +1115,180 @@
 - Orphan recovery is deliberately conservative and TTL-delayed. Busy,
   malformed, ambiguous, or operator-owned names are preserved for manual
   inspection rather than deleted.
+- In-place production migration of a non-empty schema predating durable
+  `runtime_tenures` remains intentionally refused.
+- The sole warning is an upstream deprecation unrelated to backup durability,
+  migration authority, approval, execution safety, or broker truth.
+
+## Exceptional plaintext-orphan and final-commit hardening
+
+### Status, safety boundary, and commit
+
+- Review baseline:
+  `dfbe577c2186fed942bf9834c64486f0e933ede1`.
+- Implementation commit:
+  `f37638af92b58ed0e999c7c63fa6f8effe2b6826`
+  (`fix(security): harden Task 6 crash transactions`).
+- Work remained in the required shared worktree on
+  `codex/safety-foundation`; no separate worktree was created and nothing was
+  pushed.
+- PAPER-only operation, manual approval, kill switches, execution-time risk
+  checks, and broker-truth authority are unchanged.
+- All database activity used pytest-created temporary SQLite databases. The
+  ignored runtime `trading_assistant.db`, Keychain, credentials, existing
+  processes, network, external services, broker/provider/notification APIs,
+  the app, daemon, MCP server, breakers, and order APIs were not accessed.
+
+### Finding closure
+
+- Every operation-owned snapshot, verification database, encrypted
+  ciphertext, and known SQLite sidecar now lives under one exact hidden
+  `.backup-txn-<128-bit-id>` directory. No new `.sensitive-snapshot-*` or
+  `.sensitive-verify-*` root temporary file is created.
+- A fixed-size canonical checksummed manifest binds the exact transaction ID,
+  directory name, device, and inode. The mode-`0700` directory, mode-`0600`
+  manifest, manifest contents, and both containing-directory entries are
+  fsynced before the first plaintext member can exist.
+- Transaction members use a fixed allowlist and dirfd-relative
+  `O_NOFOLLOW`/`O_NONBLOCK` opens. Creation, reopening, hashing, verification,
+  and deletion revalidate regular type, mode, exact directory/manifest
+  identity, and the allowed member set.
+- The operation holds an exclusive manifest lock throughout normal work.
+  Recovery considers only exact transaction-directory names older than the
+  conservative TTL, takes the same lock with a bounded monotonic deadline,
+  and revalidates manifest, inode, member names, types, modes, and ages before
+  removing only exact members. It is idempotent and preserves recent, busy,
+  malformed, corrupt, symlinked, copied-manifest, extra-member, and unrelated
+  operator-owned paths.
+- Real child-process `_exit` probes cover every exposed plaintext/ciphertext
+  lifecycle hook from durable manifest through snapshot, encryption,
+  verification, hash, and SQLite `quick_check`. After TTL, two recovery passes
+  leave no operation-owned plaintext or ciphertext.
+- Publication remains officially PENDING while target and anchor links are
+  created and the destination directory is fsynced. The complete encrypted
+  artifact is authenticated, hashed, inode-checked, header-checked, privately
+  decrypted, hash-compared, and SQLite-checked before publication can commit.
+- The transaction directory is completely removed and both relevant
+  directories are fsynced before the last maintenance check, optional hook,
+  and receipt construction.
+- The same-descriptor durable COMMITTED transition is now the irrevocable final
+  operation. All artifact verification and receipt construction occur before
+  it. Once COMMITTED is proved through the still-exclusively-locked state
+  descriptor, only unlock/close remain; their reported failures are suppressed
+  because kernel descriptor closure releases ownership and cannot reverse the
+  durable state. No hook, maintenance check, verification, restoration, or
+  cleanup can run after that proof.
+- Ambiguous state-write/fsync failures are reconciled on the same locked
+  descriptor. The exact chained probe—durable COMMITTED write plus hostile
+  post-commit verification, PENDING/RETIRED restoration, and cleanup
+  failures—returns the prebuilt receipt, performs none of those post-commit
+  operations, and lists exactly one committed backup.
+- Operational recovery and retention still run before source-engine creation
+  and maintenance acquisition, preserving the fresh full lease immediately
+  before the no-renewal SQLite snapshot.
+
+### Complexity and public-API audit
+
+- `backup.py` is now `1,891` lines, down from `2,133` at the review baseline.
+  The `914`-line `backup_transaction.py` contains the single private
+  transaction filesystem protocol instead of leaving an approximately
+  2,800-line mixed-responsibility module.
+- Shadowing copies of lock, record, descriptor-I/O, hash, transaction-member,
+  cleanup, and transaction-recovery helpers were removed from `backup.py`.
+  AST/reference checks found no unused import, duplicate private definition, or
+  single-reference dead private helper in either module.
+- A smaller collapse was rejected because transaction ownership/recovery and
+  committed-state reading/transition/retention have different locks,
+  identities, failure semantics, and durable commit points. Combining them
+  would reintroduce the ambiguity this review removed.
+- Existing public backup function/class names and all public function
+  signatures are unchanged. `EncryptedBackupError` remains available from
+  `trading_assistant.ops.backup`; only its implementation storage moved to the
+  private transaction module.
+- Superseded root-temp and impossible anchor-only recovery helpers/tests were
+  removed. Their safety properties are covered by real child crash images from
+  states that the current protocol can actually emit.
+
+### Changed files
+
+- Protocol implementation:
+  `src/trading_assistant/ops/backup.py` and
+  `src/trading_assistant/ops/backup_transaction.py`.
+- Regression coverage:
+  `tests/test_sensitive_migration.py`,
+  `tests/test_task6_round4.py`,
+  `tests/test_task6_round5.py`,
+  `tests/test_task6_exceptional_hardening.py`, and new
+  `tests/test_task6_transaction_directory_hardening.py`.
+
+### TDD and focused evidence
+
+- Initial exact transaction/final-commit RED:
+  `15 failed, 1 passed in 0.61s`.
+- First implementation convergence:
+  `16 passed in 1.99s`.
+- Expanded crash, malformed-namespace, successful-cleanup,
+  pre-commit-crash, partial-cleanup-retry, and chained-final-commit coverage:
+  `19 passed`.
+- Complete backup, sensitive-migration, round-4, round-5, exceptional, and
+  transaction-directory focused group:
+  `157 passed`.
+- Migration, runtime-tenure, startup-schema, release-static, and
+  submission-barrier adjacency group:
+  `307 passed`.
+- Three bounded repetitions of all 19 transaction/crash cases:
+  `57/57 passed`.
+- Three bounded repetitions of nine durable-commit, held-lock, fresh-lease,
+  and concurrent-collision cases:
+  `27/27 passed`.
+
+### Final release gates
+
+- `.venv/bin/python -m compileall -q src tests migrations`: PASS.
+- `.venv/bin/python scripts/check_release_safety.py`:
+  `release static checks: PASS`.
+- `.venv/bin/alembic heads`: exactly `20260727_0015 (head)`.
+- `git diff --check`: PASS.
+- Explicit modified/untracked text scan:
+  `whitespace-eof: ok (7 files)`.
+- Public API/signature comparison: unchanged at the import boundary.
+- Duplicate/dead-code/import audit: clean.
+
+### Full-suite chronology
+
+- The complete original-through-round-5 and first exceptional-hardening
+  chronology is preserved above, including every failed and authorized
+  confirmation run.
+- This exceptional crash-transaction pass ran exactly one new full suite,
+  only after focused, repeated-adversarial, compile, release-static, Alembic,
+  API, diff, and whitespace gates were green.
+- Database, Alpaca, Robinhood, LLM/provider, market-data, notification,
+  candidate-signing, field-encryption, backup-encryption, live-confirmation,
+  runtime-instance, Composio, Octen, and OpenAI credential variables were
+  explicitly removed from the command environment.
+- Exact result:
+  `2752 passed, 1 skipped, 1 warning in 396.18s (0:06:36)`.
+- Skip: the opt-in real Alpaca paper integration, disabled because credentials
+  were unset. Warning: the existing third-party `websockets.legacy`
+  deprecation.
+- No second full suite ran. No source or test changed after this result; only
+  this report, the progress ledger, and generated review evidence changed.
+
+### Remaining caveats
+
+- Manifest and commit-state checksums and artifact SHA-256 are not keyed MACs.
+  Authenticity against an attacker able to rewrite every byte under the same
+  OS account still relies on the mode-`0700` directory, mode-`0600` files, and
+  operating-system account boundary.
+- A crash after transaction-directory creation but before the manifest becomes
+  durable can leave an empty exact-name directory. Recovery intentionally
+  preserves a manifest-less directory because it cannot prove protocol
+  ownership; no plaintext member is permitted before manifest durability.
+- Root-level temporary files from pre-hardening versions are not adopted or
+  broadly deleted. New code does not create them; any legacy cleanup requires
+  a separately reviewed ownership procedure.
+- Orphan recovery is deliberately conservative and TTL-delayed. Busy,
+  malformed, ambiguous, or operator-owned paths remain for manual inspection.
 - In-place production migration of a non-empty schema predating durable
   `runtime_tenures` remains intentionally refused.
 - The sole warning is an upstream deprecation unrelated to backup durability,
