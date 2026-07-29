@@ -1787,7 +1787,7 @@ Task 11 remains untouched.
 - Adds preflight checks `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
   `OUTBOUND_ORIGINS`, `INTEGRATIONS_DISABLED`.
 
-- [ ] **Step 1: Add negative static fixtures**
+- [x] **Step 1: Add negative static fixtures**
 
 Each fixture must fail with a stable code:
 
@@ -1801,7 +1801,7 @@ Each fixture must fail with a stable code:
 - `INSECURE_COOKIE`;
 - tracked `.env`, SQLite DB, TLS private key, or decrypted backup.
 
-- [ ] **Step 2: Run and verify missing checks**
+- [x] **Step 2: Run and verify missing checks**
 
 ```bash
 uv run pytest tests/test_release_static.py tests/test_launch.py -v
@@ -1809,7 +1809,7 @@ uv run pytest tests/test_release_static.py tests/test_launch.py -v
 
 Expected: FAIL because the new invariants are not gated.
 
-- [ ] **Step 3: Implement AST and Git-tree checks**
+- [x] **Step 3: Implement AST and Git-tree checks**
 
 Parse FastAPI decorators and reject any path beginning `/webhook` or `/hooks`.
 Parse `READ_ONLY_TOOL_SPECS` and forbid mutation names. Parse assignments to
@@ -1820,7 +1820,7 @@ working tree for private artifacts.
 Do not scan or print secret values. Pattern findings report path, line, and
 stable rule only.
 
-- [ ] **Step 4: Extend preflight**
+- [x] **Step 4: Extend preflight**
 
 Normal readiness requires:
 
@@ -1836,7 +1836,7 @@ Normal readiness requires:
 Preflight remains read-only and never resets a breaker, starts a daemon, or
 submits/cancels an order.
 
-- [ ] **Step 5: Document operator commands and hard limits**
+- [x] **Step 5: Document operator commands and hard limits**
 
 README/RUNBOOK must document:
 
@@ -1850,7 +1850,7 @@ README/RUNBOOK must document:
 - backup recovery;
 - no profit guarantee and no live-mode support.
 
-- [ ] **Step 6: Run the complete trust-boundary matrix**
+- [x] **Step 6: Run the complete trust-boundary matrix**
 
 ```bash
 uv run pytest tests/test_secret_provider.py tests/test_transport_boundary.py tests/test_outbound_policy.py tests/test_sensitive_crypto.py tests/test_sensitive_migration.py tests/test_untrusted_content.py tests/test_candidate_boundary.py tests/test_security_posture.py tests/test_release_static.py tests/test_launch.py -v
@@ -1859,7 +1859,7 @@ uv run python scripts/check_release_safety.py
 
 Expected: all tests PASS and `release static checks: PASS`.
 
-- [ ] **Step 7: Run the full suite**
+- [x] **Step 7: Run the full suite**
 
 ```bash
 uv run pytest
@@ -1867,7 +1867,13 @@ uv run pytest
 
 Expected: PASS with only the repository's documented skip.
 
-- [ ] **Step 8: Commit**
+Actual sole run: `3437 passed, 1 failed, 1 skipped, 1 warning`. The failure
+was the lazy default-Keychain-provider compatibility path; it was corrected,
+then the exact failed test passed `2/2` and the complete affected preflight,
+secret, posture, and Task 9 compatibility set passed `199/199`. The full suite
+was not rerun under the explicit one-run constraint.
+
+- [x] **Step 8: Commit**
 
 ```bash
 git add scripts/check_release_safety.py tests/test_release_static.py src/trading_assistant/preflight.py tests/test_launch.py README.md docs/RUNBOOK.md
