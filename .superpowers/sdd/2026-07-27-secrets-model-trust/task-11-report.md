@@ -1667,3 +1667,131 @@ temporary SQLite, normal mock subclasses, and inert unconnected
 Alpaca-shaped objects only. It did not start a service, access credentials or
 the ignored runtime database, call a network/broker/provider/notifier, push,
 trade, reconcile, notify, or reset a breaker.
+
+# Final Plan 2 Static Owned-State Closure
+
+## Supersession and verified defects
+
+The prior fake-broker provenance correction correctly rejected delegates in
+its explicitly modeled containers and callable captures, but its general
+owned-state conclusion was incomplete:
+
+1. an ordinary Python `Holder` with `holder.delegate = AlpacaBroker(...)`
+   returned no children and passed at issuance and consumption; and
+2. `dataclasses.is_dataclass(value)` used dynamic metaclass lookup, while the
+   preceding ABC `isinstance` could also request the instance's dynamic
+   `__class__`.
+
+Both reviewer findings reproduced without a network client or call. The
+metaclass probe's traceback reached `dataclasses.is_dataclass` and requested
+`__dataclass_fields__`. A separate retained-class probe also proved that
+treating class objects as leaves would leave a class-level delegate gap.
+
+## Static bounded owned-state invariant
+
+The scanner no longer uses `is_dataclass`, dynamic `isinstance` broker
+detection, `vars(instance)`, or dynamic class/MRO access. It now:
+
+- obtains type MROs and namespaces through the raw `type` implementation;
+- verifies the raw `__dict__` descriptor is a native get-set/member
+  descriptor before using `object.__getattribute__(value, "__dict__")`;
+- requires the returned state to be an exact dictionary and traverses its
+  keys and values;
+- walks raw non-dunder values from the owning type/MRO namespaces, including
+  retained class objects, so class-owned delegates are visible;
+- rejects declared slotted state without reading member descriptors;
+- supports exact dictionary/list/tuple/set/frozen-set/deque shapes and exact
+  `Counter`;
+- rejects other subclasses of those built-in containers before custom
+  iteration can run; and
+- keeps the existing bound-method, partial, Python closure/default,
+  cycle/depth/node, and non-root `BrokerClient` checks.
+
+The static metaclass/property probe passes through issuance and consumption
+with zero instance or metaclass lookups. Its property is never invoked.
+`SpyBroker` carrying a cycle, `threading.Event`, lock, and `Counter` remains a
+valid test capability. The same scanner still runs during marked-container
+issuance and test-app consumption.
+
+## TDD evidence
+
+Primary RED against unchanged production:
+
+```text
+6 failed, 1 passed, 1 warning in 5.65s
+```
+
+The five authority-shape failures were ordinary holder issuance, ordinary
+holder post-issuance insertion, class-owned delegate, declared slotted holder,
+and a custom list subclass. The static probe initially failed because dynamic
+ABC lookup requested `__class__`; after allowing that lookup solely to expose
+the next defect, the isolated unchanged-production run failed exactly at:
+
+```text
+dataclasses.is_dataclass(value)
+AssertionError: dynamic dataclass lookup
+1 failed in 0.62s
+```
+
+The retained-holder-class extension separately recorded:
+
+```text
+1 failed, 1 warning in 0.84s
+```
+
+Focused green:
+
+```text
+Exact final selection:
+8 passed, 1 warning in 1.21s
+
+Complete construction-boundary file:
+53 passed, 1 warning in 2.30s
+
+Affected 20-file matrix:
+1248 passed, 1 warning in 211.81s
+```
+
+Release verification:
+
+```text
+Static fixtures:
+304 passed in 92.77s
+
+Repository gate:
+release static checks: PASS
+
+compileall: PASS
+git diff --check: PASS
+
+Exactly one no-argument full suite:
+3731 passed, 1 skipped, 1 warning in 611.19s
+```
+
+Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning. The sole full suite started only
+after focused, affected, static, compile, and diff gates were green.
+
+## Review package and residual limit
+
+- Base: `504002fb3ac9a7ff592864088b5ac8765f1aee2f`
+- Implementation:
+  `82181ae1944b95f496638b665fe0fac491c7ed97`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-504002f..82181ae.diff`
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-plan2-static-owned-state.md`
+
+The residual boundary is unchanged but now narrowly stated: this is not a
+Python sandbox, so arbitrary local method code can read a function global or
+construct a provider without retaining it in owned object/callable state.
+Ordinary owned Python holders, class-owned values, declared slots, and custom
+built-in-container subclasses are no longer included in that residual.
+
+Production startup receipts, paper-only operation, manual approval, breaker
+and broker-truth gates, exact role-visible secrets, read-only chat, disabled
+Composio, and the no-webhook boundary are unchanged. Verification used
+temporary SQLite, normal mock subclasses, and inert unconnected
+Alpaca-shaped objects only. It did not start a service, access credentials or
+the ignored runtime database, call a network/broker/provider/notifier, push,
+trade, reconcile, notify, or reset a breaker.

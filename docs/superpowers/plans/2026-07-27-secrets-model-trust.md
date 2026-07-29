@@ -2252,6 +2252,44 @@ production broker authority.
   `f7cb485..2eb2f65`, coherent evidence, explicit residual limits, and prior
   supersession in a separate evidence-only commit.
 
+### Final Plan 2 static owned-state correction
+
+This correction supersedes the prior package's incomplete claim that modeled
+traversal covered ordinary holders and used no dynamic type lookup.
+
+- [x] Verify both findings against base
+  `504002fb3ac9a7ff592864088b5ac8765f1aee2f`.
+- [x] Record primary RED:
+  `6 failed, 1 passed, 1 warning in 5.65s`; isolated dynamic-dataclass RED:
+  `1 failed in 0.62s`; retained-holder-class RED:
+  `1 failed, 1 warning in 0.84s`.
+- [x] Traverse ordinary holder raw dictionaries and raw class/MRO namespaces
+  during issuance and consumption. Include retained class objects and
+  class-owned non-dunder values.
+- [x] Remove `is_dataclass`, dynamic ABC instance checking, and dynamic
+  instance/class lookup from the scanner. Prove zero probe
+  `__getattribute__`, `__dataclass_fields__`, and property access.
+- [x] Reject declared slotted state and custom subclasses of supported
+  built-in containers without descriptor access or custom iteration. Preserve
+  exact `Counter`, Event, lock, cycle, and `SpyBroker` test state.
+- [x] Preserve direct broker identity, callable captures, non-root
+  `BrokerClient` rejection, and depth/node budgets at issuance and
+  consumption.
+- [x] Final focused proof:
+  exact selection `8 passed, 1 warning in 1.21s`; complete file
+  `53 passed, 1 warning in 2.30s`.
+- [x] Affected 20-file matrix:
+  `1248 passed, 1 warning in 211.81s`.
+- [x] Static fixtures:
+  `304 passed in 92.77s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3731 passed, 1 skipped, 1 warning in 611.19s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `82181ae1944b95f496638b665fe0fac491c7ed97`; package bounded diff
+  `504002f..82181ae`, coherent evidence, narrowed residual, and prior
+  supersession in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

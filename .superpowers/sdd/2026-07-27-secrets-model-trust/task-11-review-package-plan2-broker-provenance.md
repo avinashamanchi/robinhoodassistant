@@ -1,5 +1,10 @@
 # Final Plan 2 Fake-Broker Provenance Review Package
 
+> Superseded for ordinary owned Python state and static lookup semantics by
+> `task-11-review-package-plan2-static-owned-state.md`. This package covered
+> explicit built-in/model shapes, but an ordinary holder terminated traversal,
+> and its dataclass branch performed dynamic metaclass lookup.
+
 ## Review boundary
 
 - Base: `f7cb48594c7fdc1c03ecb10bc8d38e58f7c94f47`

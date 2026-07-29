@@ -703,3 +703,53 @@ bounded owned-state and callable-capture model. No production receipt/runtime
 boundary was widened, and no service, credential, ignored runtime database,
 external call, trade, reconciliation write, notification, breaker reset,
 Plan 3 work, or push occurred.
+
+## Final Plan 2 static owned-state correction
+
+This correction supersedes the prior package's incomplete claim that its
+modeled traversal covered ordinary owned Python state and performed only
+static lookup. An ordinary `Holder` instance terminated traversal, and
+`dataclasses.is_dataclass(value)` queried `__dataclass_fields__` through the
+holder's metaclass.
+
+- [x] Record exact primary RED:
+  `6 failed, 1 passed, 1 warning in 5.65s`.
+- [x] Record the isolated dynamic-dataclass RED:
+  `1 failed in 0.62s`; the traceback reached
+  `dataclasses.is_dataclass` and the metaclass probe's
+  `__dataclass_fields__` trap.
+- [x] Record retained-class RED:
+  `1 failed, 1 warning in 0.84s`.
+- [x] Prove ordinary-holder delegates reject during issuance and after
+  issuance when consumed by `create_test_app`.
+- [x] Traverse raw exact instance dictionaries and raw type/MRO namespaces
+  without invoking instance `__getattribute__`, metaclass overrides,
+  properties, slot member descriptors, or custom container iteration.
+- [x] Reject declared slotted holder state and custom subclasses of supported
+  built-in containers without reading or iterating them. Preserve exact
+  `Counter`, `Event`, lock, cyclic `SpyBroker`, and ordinary scenario state.
+- [x] Traverse class-owned non-dunder values and retained holder class objects
+  so class-level delegates do not become a silent stop.
+- [x] Preserve depth 24/node 512 budgets, callable-capture checks, exact direct
+  broker identity, and issuance/consumption validation.
+- [x] Exact final focused proof:
+  `8 passed, 1 warning in 1.21s`; complete focused file:
+  `53 passed, 1 warning in 2.30s`.
+- [x] Affected 20-file matrix:
+  `1248 passed, 1 warning in 211.81s`.
+- [x] Static fixtures:
+  `304 passed in 92.77s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3731 passed, 1 skipped, 1 warning in 611.19s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `82181ae1944b95f496638b665fe0fac491c7ed97`; package bounded diff
+  `review-504002f..82181ae.diff`, corrected evidence, and prior-package
+  supersession separately.
+
+The sole residual remains the explicit non-sandbox boundary: arbitrary local
+method code may read a function global or construct a provider without
+retaining that authority in owned state. No production receipt/runtime
+boundary was widened, and no service, credential, ignored runtime database,
+external call, trade, reconciliation write, notification, breaker reset,
+Plan 3 work, or push occurred.
