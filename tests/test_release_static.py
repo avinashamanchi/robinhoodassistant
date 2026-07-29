@@ -4083,7 +4083,18 @@ def test_historical_ref_messages_are_scanned_without_printing_values(
         expected_path = "commit-message"
     else:
         subprocess.run(
-            ["git", "tag", "-a", "release-test", "-m", f"tag contains {token}"],
+            [
+                "git",
+                "-c",
+                "user.name=Release Test",
+                "-c",
+                "user.email=release-test@example.invalid",
+                "tag",
+                "-a",
+                "release-test",
+                "-m",
+                f"tag contains {token}",
+            ],
             cwd=root,
             check=True,
         )
@@ -4237,7 +4248,11 @@ def test_static_gate_git_runner_uses_private_bounded_regular_spools(tmp_path):
     completed = module._run_bounded_process(
         argv=(sys.executable, "-c", inspect_descriptors),
         cwd=tmp_path,
-        env={"PATH": os.defpath},
+        env={
+            "PATH": os.defpath,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+        },
         input_bytes=None,
         timeout=5.0,
         max_stdout_bytes=4096,
@@ -4267,7 +4282,11 @@ def test_static_gate_git_runner_uses_private_bounded_regular_spools(tmp_path):
     oversized = module._run_bounded_process(
         argv=(sys.executable, "-c", output_limit_probe),
         cwd=tmp_path,
-        env={"PATH": os.defpath},
+        env={
+            "PATH": os.defpath,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+        },
         input_bytes=None,
         timeout=5.0,
         max_stdout_bytes=128,
