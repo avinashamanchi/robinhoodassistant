@@ -2215,6 +2215,43 @@ top-level fake broker validation proved the complete app service graph.
   `0062579..8e75752`, coherent evidence, and prior-package supersession in a
   separate evidence-only commit.
 
+### Final Plan 2 fake-broker provenance correction
+
+This correction supersedes only the deep broker-identity package's
+overstatement that a shared `MockBroker` subclass necessarily contained no
+production broker authority.
+
+- [x] Verify the P1 against base
+  `f7cb48594c7fdc1c03ecb10bc8d38e58f7c94f47`.
+- [x] Record exact RED:
+  `7 failed, 1 passed, 1 warning in 1.35s`.
+- [x] Preserve ordinary `MockBroker` subclasses while rejecting a direct or
+  modeled nested non-root `BrokerClient`, bound-method/partial/Python-closure
+  captures, post-issuance delegate insertion, and graph budget exhaustion.
+- [x] Define one cycle-safe bounded owned-state/callable scan with depth 24
+  and node 512 limits. Use static broker-method lookup and invoke no
+  properties or arbitrary framework objects.
+- [x] Keep the exact direct broker identity invariant across service,
+  snapshot, submission, reconciliation, and container aliases at issuance and
+  consumption.
+- [x] Record the honest boundary: runtime introspection is not a Python
+  sandbox and does not inspect globals or provider construction performed by
+  arbitrary method code.
+- [x] Final focused proof:
+  exact selection `8 passed, 1 warning in 1.40s`; complete file
+  `46 passed, 1 warning in 2.00s`.
+- [x] Affected 20-file matrix:
+  `1241 passed, 1 warning in 210.30s`.
+- [x] Static fixtures:
+  `304 passed in 92.35s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3724 passed, 1 skipped, 1 warning in 606.77s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `2eb2f65b0a0326c40663dd594b069e3464bf3ab2`; package bounded diff
+  `f7cb485..2eb2f65`, coherent evidence, explicit residual limits, and prior
+  supersession in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

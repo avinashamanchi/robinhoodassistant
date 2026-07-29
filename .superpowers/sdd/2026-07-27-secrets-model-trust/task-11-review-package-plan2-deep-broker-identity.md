@@ -1,5 +1,11 @@
 # Final Plan 2 Deep Broker-Identity Review Package
 
+> Superseded for fake-broker provenance by
+> `task-11-review-package-plan2-broker-provenance.md`. This package proved
+> exact identity across direct broker holders, but it did not prove that a
+> permitted `MockBroker` subclass retained no production broker delegate in
+> its owned state or broker-method captures.
+
 ## Review boundary
 
 - Base: `0062579231b7d718afd123eaf6e65766a973cb24`

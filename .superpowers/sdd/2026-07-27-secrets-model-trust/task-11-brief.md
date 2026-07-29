@@ -657,3 +657,49 @@ and reconciliation subservices, which the prior validator did not inspect.
 No production receipt boundary or runtime capability was widened. No service,
 credential, ignored runtime database, external call, trade, reconciliation
 write, notification, breaker reset, Plan 3 work, or push occurred.
+
+## Final Plan 2 fake-broker provenance correction
+
+This correction supersedes only the deep broker-identity package's
+overstatement that exact shared `MockBroker` identity was sufficient to prove
+a fake-only test app. A `MockBroker` subclass could retain an inert
+`AlpacaBroker` delegate and forward `submit_order` while satisfying every
+direct identity check.
+
+- [x] Record exact RED against unchanged production:
+  `7 failed, 1 passed, 1 warning in 1.35s`.
+- [x] Prove issuance rejects a direct delegate, a delegate in supported nested
+  owned state, and bound-method/partial/Python-closure captures.
+- [x] Prove consumption rejects a production delegate inserted after issuance.
+- [x] Preserve a normal cyclic `SpyBroker` subclass carrying a test
+  `threading.Event`.
+- [x] Add one deterministic, cycle-safe scan with depth 24 and node 512
+  limits. It starts from root-owned values and statically resolved broker
+  methods, recurses only through explicitly modeled local shapes, and rejects
+  every encountered non-root `BrokerClient`, unsupported broker-method
+  callable, or exhausted budget.
+- [x] Keep the prior exact broker identity invariant across service,
+  snapshot, submission, reconciliation, and container aliases at issuance and
+  consumption.
+- [x] Exact new green:
+  `8 passed, 1 warning in 1.40s`; complete focused file:
+  `46 passed, 1 warning in 2.00s`.
+- [x] Affected 20-file matrix:
+  `1241 passed, 1 warning in 210.30s`.
+- [x] Static fixtures:
+  `304 passed in 92.35s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3724 passed, 1 skipped, 1 warning in 606.77s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `2eb2f65b0a0326c40663dd594b069e3464bf3ab2`; package bounded diff
+  `review-f7cb485..2eb2f65.diff`, corrected evidence, explicit residual
+  limits, and prior-package supersession separately.
+
+This validator is deliberately not a Python sandbox. It does not inspect
+function globals or claim to rule out provider construction performed by
+arbitrary method code. It proves retained authority only in its documented
+bounded owned-state and callable-capture model. No production receipt/runtime
+boundary was widened, and no service, credential, ignored runtime database,
+external call, trade, reconciliation write, notification, breaker reset,
+Plan 3 work, or push occurred.

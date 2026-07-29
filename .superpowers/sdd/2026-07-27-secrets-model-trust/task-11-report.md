@@ -1555,3 +1555,115 @@ Verification used temporary SQLite, `MockBroker` test doubles, and inert
 unconnected Alpaca-shaped objects only. It did not start services, access
 credentials or the ignored runtime database, make broker/provider/network
 calls, push, submit/cancel orders, reconcile, notify, or reset a breaker.
+
+# Final Plan 2 Fake-Broker Provenance Closure
+
+## Supersession and verified defect
+
+The deep broker-identity correction remains valid for direct service and
+container references, but its fake-only conclusion was incomplete.
+`isinstance(expected_broker, MockBroker)` also accepts subclasses. The
+reviewer's hermetic reproducer was valid: a subclass retained an inert
+`AlpacaBroker` in `self.delegate`, overrode `submit_order`, and passed both
+marked-container issuance and consumption.
+
+The supported scenario-broker inventory also confirmed that switching to
+exact `MockBroker` type would unnecessarily reject ordinary `SpyBroker` and
+outage/race subclasses. The correction therefore preserves subclass
+ergonomics and checks retained authority instead.
+
+## Bounded provenance invariant
+
+The existing exact-identity invariant still requires the same broker object
+across `TradingService`, snapshot, submission, reconciliation, and container
+aliases. Before that identity is accepted, one canonical bounded scanner now:
+
+- starts from the mock's instance-owned values;
+- statically resolves the broker method registry from instance/class
+  dictionaries without binding descriptors or invoking properties;
+- walks exact dictionaries, lists, tuples, sets, frozen sets, deques,
+  `SimpleNamespace`, ordinary dataclass-owned fields, `functools.partial`
+  state, bound-method owner/function state, and Python function
+  closure/default/keyword-default state;
+- rejects any encountered `BrokerClient` other than the root mock;
+- rejects unsupported broker-method callable shapes; and
+- is cycle-safe and rejects depth greater than 24, more than 512 visited
+  nodes, or an over-budget immediate child collection.
+
+The same helper runs during marked-container issuance and again at
+`create_test_app` consumption, so post-issuance delegate insertion fails
+closed. Opaque framework objects are not recursively inspected; this preserves
+ordinary synchronization-event test state and avoids invoking application or
+descriptor code during validation.
+
+## TDD and verification evidence
+
+Exact RED before implementation:
+
+```text
+7 failed, 1 passed, 1 warning in 1.35s
+```
+
+The seven failures covered direct and nested production delegates, bound
+method, partial, and Python-closure captures, post-issuance delegate insertion,
+and depth exhaustion. The existing cyclic `SpyBroker` control passed under
+unchanged production.
+
+Focused green:
+
+```text
+Exact new selection:
+8 passed, 1 warning in 1.40s
+
+Complete construction-boundary file:
+46 passed, 1 warning in 2.00s
+
+Affected 20-file matrix:
+1241 passed, 1 warning in 210.30s
+```
+
+Release verification:
+
+```text
+Static fixtures:
+304 passed in 92.35s
+
+Repository gate:
+release static checks: PASS
+
+compileall: PASS
+git diff --check: PASS
+
+Exactly one no-argument full suite:
+3724 passed, 1 skipped, 1 warning in 606.77s
+```
+
+Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning. The sole full suite started only
+after focused, affected, static, compile, and diff gates were green.
+
+## Review package and honest residual limit
+
+- Base: `f7cb48594c7fdc1c03ecb10bc8d38e58f7c94f47`
+- Implementation:
+  `2eb2f65b0a0326c40663dd594b069e3464bf3ab2`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-f7cb485..2eb2f65.diff`
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-plan2-broker-provenance.md`
+
+This is not, and does not claim to be, a Python sandbox. Arbitrary local
+method code can construct a provider or read a module global without retaining
+that authority in modeled object or callable state. Function globals are
+therefore explicitly outside this runtime-introspection proof. Such source
+code remains governed by the repository static gate and code review. The
+factory now rejects accidental retained broker authority in the documented
+bounded graph without overclaiming containment of arbitrary Python.
+
+Production startup receipts, paper-only operation, manual approval, breaker
+and broker-truth gates, exact role-visible secrets, read-only chat, disabled
+Composio, and the no-webhook boundary are unchanged. Verification used
+temporary SQLite, normal mock subclasses, and inert unconnected
+Alpaca-shaped objects only. It did not start a service, access credentials or
+the ignored runtime database, call a network/broker/provider/notifier, push,
+trade, reconcile, notify, or reset a breaker.
