@@ -727,6 +727,23 @@ def _test_broker_owned_children(value: object) -> tuple[object, ...]:
             except ValueError:
                 continue
         return tuple(captured)
+    if value_type is property:
+        return tuple(
+            child
+            for child in (
+                object.__getattribute__(value, "fget"),
+                object.__getattribute__(value, "fset"),
+                object.__getattribute__(value, "fdel"),
+            )
+            if child is not None
+        )
+    if value_type in {staticmethod, classmethod}:
+        return (object.__getattribute__(value, "__func__"),)
+    if any(
+        descriptor_type in value_mro
+        for descriptor_type in (property, staticmethod, classmethod)
+    ):
+        raise RuntimeError("production_test_capability_forbidden")
     state = _static_instance_state(value, value_mro)
     class_values = _static_class_owned_values(
         value_mro,
@@ -825,9 +842,18 @@ def _is_static_class_graph_value(value: object) -> bool:
         FunctionType,
         MethodType,
         partial,
+        property,
+        staticmethod,
+        classmethod,
     ):
         return True
-    return BrokerClient in _static_type_mro(value_type)
+    value_mro = _static_type_mro(value_type)
+    return (
+        BrokerClient in value_mro
+        or property in value_mro
+        or staticmethod in value_mro
+        or classmethod in value_mro
+    )
 
 
 def _is_test_application_container(container: object) -> bool:

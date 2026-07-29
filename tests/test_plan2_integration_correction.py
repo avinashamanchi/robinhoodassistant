@@ -527,6 +527,50 @@ def test_test_container_rejects_delegate_owned_by_retained_holder_class(
         )
 
 
+@pytest.mark.parametrize(
+    "descriptor_kind",
+    ("property", "staticmethod", "classmethod"),
+)
+def test_test_container_rejects_delegate_captured_by_class_descriptor(
+    descriptor_kind,
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    production_broker = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    if descriptor_kind == "property":
+        descriptor = property(lambda _self: production_broker)
+    elif descriptor_kind == "staticmethod":
+        descriptor = staticmethod(lambda: production_broker)
+    else:
+        descriptor = classmethod(lambda _cls: production_broker)
+
+    class Holder:
+        delegate = descriptor
+
+    service = make_service()
+    service.broker.owned_state = Holder()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token=(
+                    f"plan2-{descriptor_kind}-delegate-token"
+                )
+            ),
+        )
+
+
 def test_test_container_rejects_slotted_holder_without_invoking_descriptor(
     make_service,
 ):
