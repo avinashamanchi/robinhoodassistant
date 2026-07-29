@@ -110,7 +110,13 @@ def _injected_container(service, secrets):
     return SimpleNamespace(
         config=service.config,
         secrets=secrets,
+        broker=service.broker,
         service=service,
+        snapshot_service=service.snapshot_service,
+        order_application=service.order_application,
+        order_submission=service.order_submission,
+        reconciliation=service.reconciliation,
+        breakers=service.breakers,
         session_factory=service.session_factory,
         rate_limiter=DurableRateLimiter(service.session_factory),
         leases=ConcurrencyLeaseService(service.session_factory),

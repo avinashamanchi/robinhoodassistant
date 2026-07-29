@@ -243,6 +243,97 @@ def test_test_container_builder_rejects_wrapped_production_broker(
         )
 
 
+def test_test_container_builder_rejects_shallow_mock_broker_replacement(
+    app_config,
+    session_factory,
+):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.risk.clock import FakeClock
+    from trading_assistant.service import TradingService
+    from tests.app_factory import build_test_app_container
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    production_broker = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+    service = TradingService(
+        production_broker,
+        session_factory,
+        app_config,
+        FakeClock(is_open=True),
+    )
+    service.broker = MockBroker()
+
+    assert service.snapshot_service.broker is production_broker
+    assert service.order_submission.broker is production_broker
+    assert service.reconciliation.broker is production_broker
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        container = build_test_app_container(
+            service,
+            Agent(),
+            secrets=Secrets(
+                app_api_token="plan2-shallow-broker-swap-token"
+            ),
+        )
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "broker_owner",
+    (
+        "snapshot_service",
+        "order_submission",
+        "reconciliation",
+    ),
+)
+def test_create_test_app_rejects_post_issuance_nested_broker_tampering(
+    broker_owner,
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    service = make_service()
+    container = build_test_app_container(
+        service,
+        Agent(),
+        secrets=Secrets(
+            app_api_token="plan2-nested-broker-tamper-token"
+        ),
+    )
+    getattr(service, broker_owner).broker = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
 def test_non_app_test_composition_is_not_an_app_test_authority(
     app_config,
     monkeypatch,

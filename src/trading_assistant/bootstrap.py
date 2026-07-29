@@ -443,7 +443,7 @@ def build_test_container(
 ) -> ApplicationContainer | _TestApplicationContainer:
     """Compose with explicit fakes while retaining production-safe config."""
     if agent is not None:
-        _require_test_only_capabilities(broker, clock)
+        _require_test_clock_capability(clock)
     if service is None:
         if source_container is not None:
             raise RuntimeError("test_container_source_invalid")
@@ -465,10 +465,11 @@ def build_test_container(
             raise RuntimeError("production_test_capability_forbidden")
         if agent is not None:
             for configured_clock in clocks.values():
-                _require_test_only_capabilities(
-                    broker,
-                    configured_clock,
-                )
+                _require_test_clock_capability(configured_clock)
+            _require_test_broker_identity(
+                service=service,
+                expected_broker=broker,
+            )
         if (
             source_container is None
             or getattr(source_container, "config", None) is not config
@@ -486,22 +487,78 @@ def build_test_container(
         source = source_container
     if agent is None:
         return source
+    service = source.service
+    clocks = getattr(service, "_clocks", None)
+    if type(clocks) is not dict:
+        raise RuntimeError("production_test_capability_forbidden")
+    for configured_clock in clocks.values():
+        _require_test_clock_capability(configured_clock)
+    _require_test_broker_identity(
+        service=service,
+        expected_broker=broker,
+        source=source,
+    )
     return _TestApplicationContainer(
         _source=source,
         _test_agent=agent,
     )
 
 
-def _require_test_only_capabilities(
-    broker: object,
-    clock: object,
-) -> None:
-    from .broker.mock import MockBroker
+def _require_test_clock_capability(clock: object) -> None:
     from .risk.clock import CryptoClock, FakeClock
 
-    if not isinstance(broker, MockBroker):
-        raise RuntimeError("production_test_capability_forbidden")
     if not isinstance(clock, (CryptoClock, FakeClock)):
+        raise RuntimeError("production_test_capability_forbidden")
+
+
+def _require_test_broker_identity(
+    *,
+    service: object,
+    expected_broker: object,
+    source: object | None = None,
+) -> None:
+    """Require one exact MockBroker throughout the app service graph."""
+    from .broker.mock import MockBroker
+
+    if type(service) is not TradingService:
+        raise RuntimeError("production_test_capability_forbidden")
+    snapshot_service = service.snapshot_service
+    order_submission = service.order_submission
+    reconciliation = service.reconciliation
+    if (
+        not isinstance(expected_broker, MockBroker)
+        or type(snapshot_service) is not PortfolioSnapshotService
+        or type(order_submission) is not OrderSubmissionService
+        or type(reconciliation) is not ReconciliationService
+        or service.broker is not expected_broker
+        or snapshot_service.broker is not expected_broker
+        or order_submission.broker is not expected_broker
+        or reconciliation.broker is not expected_broker
+        or order_submission.snapshot_service is not snapshot_service
+        or reconciliation.broker_key
+        != expected_broker.reconciliation_key
+        or service.startup_reconciliation.broker_key
+        != expected_broker.reconciliation_key
+        or snapshot_service.startup_reconciliation_key
+        not in (None, expected_broker.reconciliation_key)
+    ):
+        raise RuntimeError("production_test_capability_forbidden")
+    if source is not None and (
+        getattr(source, "service", None) is not service
+        or getattr(source, "broker", None) is not expected_broker
+        or getattr(source, "snapshot_service", None)
+        is not snapshot_service
+        or getattr(source, "order_submission", None)
+        is not order_submission
+        or getattr(source, "reconciliation", None)
+        is not reconciliation
+        or getattr(
+            getattr(source, "operations", None),
+            "service",
+            None,
+        )
+        is not service
+    ):
         raise RuntimeError("production_test_capability_forbidden")
 
 
@@ -521,22 +578,19 @@ def _is_test_application_container(container: object) -> bool:
             is not None
             or getattr(source, "startup_evidence", None)
             is not None
-            or getattr(source.operations, "service", None)
-            is not service
         ):
             return False
-        _require_test_only_capabilities(
-            service.broker,
-            service.clock,
+        _require_test_clock_capability(service.clock)
+        _require_test_broker_identity(
+            service=service,
+            expected_broker=service.broker,
+            source=source,
         )
         clocks = getattr(service, "_clocks", None)
         if type(clocks) is not dict:
             return False
         for configured_clock in clocks.values():
-            _require_test_only_capabilities(
-                service.broker,
-                configured_clock,
-            )
+            _require_test_clock_capability(configured_clock)
     except Exception:
         return False
     return True
