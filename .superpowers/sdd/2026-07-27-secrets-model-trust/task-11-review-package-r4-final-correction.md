@@ -1,5 +1,12 @@
 # Task 11 Final Bounded Role-Visibility Correction Review Package
 
+> Superseded in part by the Whole-Plan-2 integration correction. Production
+> call tracing proved MCP, paper-drill, and safety-drill do not consume the
+> quarantine summarizer; their selected-provider news visibility was removed
+> as excess authority. The database-only watchdog, safety-drill Alpaca paper,
+> preflight live-confirmation, and separate required/visible-map findings
+> remain valid. See `task-11-review-package-plan2-integration.md`.
+
 ## Review boundary
 
 - Base: `35eee00d349be9e55624522692f0f263f3c827b5`

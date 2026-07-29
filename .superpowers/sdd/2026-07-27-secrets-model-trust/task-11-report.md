@@ -1192,3 +1192,124 @@ The correction used fake Keychain account access and local fixtures only. It
 did not start services or access external systems. Paper-only, explicit
 signed-queue, separate-human-approval, kill-switch, broker-truth, no-webhook,
 Composio-disabled, and no-profit-guarantee boundaries are unchanged.
+
+# Whole-Plan-2 Integration Closure
+
+## Supersession and verified findings
+
+This closure supersedes the prior claim that MCP, paper-drill, and safety-drill
+consume optional news-provider credentials. Production call tracing confirmed
+that their containers did not use the quarantine summarizer. Retaining those
+credentials and constructing an app-role summarizer from a maintenance root
+was excess authority, not a required capability.
+
+All three requested integration findings were confirmed:
+
+1. The public automatic app factory loaded ambient config and Keychain secrets
+   and built a container without the startup/TLS receipt required by
+   `ops.serve`.
+2. Paper-drill borrowed the app role, safety-drill test containers defaulted
+   to app, and the three non-news roots could construct or receive unused LLM
+   capability.
+3. `live_trading_enabled` still returned true for one legacy config/secret
+   combination, and planning could persist non-paper-only authority.
+
+## Implemented boundaries
+
+The public `create_app` accepts only an exact config, exact role-scoped secrets,
+and a one-shot startup receipt. `build_default_container` consumes that receipt
+through the same private guarded-container path used by `ops.serve`. Missing,
+mismatched, wrong-role, fabricated, or reused receipts fail before broker or
+trading-service authority can be composed. Explicit injected stacks are
+available only through the named `create_test_app` test boundary. No committed
+module-level ASGI object or alternate Uvicorn factory invocation bypasses the
+launcher.
+
+Runtime role identity is now preserved:
+
+- app and daemon are the only optional-news roots and pass their exact role to
+  the selected LLM adapter;
+- MCP remains `mcp` and has no news LLM secret or summarizer;
+- paper-drill remains `paper-drill`, uses that role for origins and adapters,
+  and holds mutually exclusive maintenance tenure rather than borrowing app
+  tenure; and
+- safety-drill passes `safety-drill` through its explicit fake-container path
+  and its credentialed paper adapter boundaries. Production
+  `build_container(..., runtime_role="safety-drill")` is rejected.
+
+The role-visible secret authority no longer includes LLM credentials for MCP,
+paper-drill, or safety-drill. Required-field validation, optional Alpaca paper
+credentials for safety-drill, live-confirmation diagnostics, watchdog's exact
+database-only projection, and key-material validation remain unchanged.
+
+The affirmative live contract is removed. `TradingMode.LIVE` and
+`live_trading_confirm` remain parseable only so configuration and preflight can
+diagnose and reject them. `live_trading_enabled` cannot return true, production
+bootstrap rejects every live configuration, broker/clock factories remain
+paper-targeted, and planning always persists `paper_only=True`. Crypto remains
+a supported paper-runtime asset class only.
+
+## TDD and verification evidence
+
+The exact pre-implementation selection, while production was untouched,
+reported:
+
+```text
+26 failed, 5 passed
+```
+
+The failures covered ambient automatic app construction, missing receipt
+plumbing and reuse protection, public unguarded injection, all nine
+non-news-root adapter combinations, paper-drill app-role borrowing, all nine
+non-news-root selected-secret combinations, safety-drill role loss, the exact
+legacy live confirmation combination, and live planning promotion.
+
+Post-implementation verification:
+
+```text
+Focused integration/config/role/asset proof:
+78 passed, 1 warning
+
+Final receipt/tenure composition file:
+22 passed
+
+Explicit 33-file affected matrix:
+2022 passed, 1 warning
+
+Repository static gate:
+release static checks: PASS
+
+Compileall, git diff --check, and shell syntax:
+PASS
+
+Exactly one no-argument full suite:
+3700 passed, 1 skipped, 1 warning in 607.63s
+```
+
+Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning. No no-argument full suite ran before
+the focused, affected, static, compile, diff, and shell prerequisites were
+green, and no second full suite ran.
+
+## Review package and residual limits
+
+- Base: `b1e20161ae3e589338c96c1038ab147a298aa6b4`
+- Implementation: `5d34837ef461b12ad4c5e7f8ea49f5e700cee2c1`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-b1e2016..5d34837.diff`
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-plan2-integration.md`
+
+The public production factory cannot load ambient authority and direct Uvicorn
+factory startup remains unsupported. Test-only injection is explicit and
+requires supplied fakes. Non-news roles cannot receive or construct LLM
+capability. Live inputs cannot enable live authority. General chat remains
+read-only; immutable drafts still require an explicit signed queue action and
+separate human approval. Composio remains disabled pending provider-side
+revocation/rotation, there is no webhook, and no profitability claim is made.
+
+Verification used temporary SQLite databases, fake Keychain/providers, fake
+brokers, and hermetic local fixtures only. It did not start app/daemon/MCP,
+access the ignored runtime database or real credentials/Keychain, make a
+network/broker/provider/notifier/integration call, trade, reconcile, notify,
+reset a breaker, or push.

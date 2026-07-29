@@ -2101,6 +2101,46 @@ evidence only.
   brief/report/progress, round-4 supersession, and final review package in a
   separate evidence-only commit.
 
+### Whole-Plan-2 integration correction
+
+This correction supersedes the prior conclusion that MCP, paper-drill, and
+safety-drill consume selected-provider news credentials. Production call
+tracing showed that their containers never consume the quarantine summarizer;
+the capability is removed rather than authorized under another role.
+
+- [x] Verify all three findings against base
+  `b1e20161ae3e589338c96c1038ab147a298aa6b4`.
+- [x] Record exact RED before implementation:
+  `26 failed, 5 passed`.
+- [x] Require public automatic app/container construction to consume the same
+  exact config-, secret-, role-, and launch-bound one-shot receipt used by
+  `ops.serve`. Reject missing and reused receipts before authority
+  construction; keep explicit fake injection only in `create_test_app`.
+- [x] Preserve exact runtime identity at every root and adapter. App/daemon are
+  the only optional-news roots. MCP has no LLM capability. Paper-drill uses
+  its own role plus mutually exclusive maintenance tenure. Safety-drill uses
+  its own role only through explicit fake composition.
+- [x] Remove affirmative live-mode authority. Keep legacy parsing only for
+  explicit rejection/diagnostics, make `live_trading_enabled` always false,
+  keep production bootstrap hard-fail, and persist every approved plan as
+  paper-only. Crypto remains a paper-runtime asset class, not a live class.
+- [x] Correct config, assets, operator docs, historical specs, and the
+  executable launch plan so none documents a supported direct Uvicorn factory
+  or affirmative live contract.
+- [x] Final focused proof:
+  `78 passed, 1 warning`, plus `22 passed` for the final receipt/tenure cases.
+- [x] Explicit 33-file affected matrix:
+  `2022 passed, 1 warning`.
+- [x] Repository static gate:
+  `release static checks: PASS`; compileall, `git diff --check`, and shell
+  syntax exited zero.
+- [x] Run exactly one no-argument full suite:
+  `3700 passed, 1 skipped, 1 warning in 607.63s`; pytest exited normally.
+- [x] Commit implementation/tests/executable docs as
+  `5d34837ef461b12ad4c5e7f8ea49f5e700cee2c1`; package bounded diff
+  `b1e2016..5d34837`, coherent brief/report/progress/plan evidence, prior
+  supersession notice, and review package in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

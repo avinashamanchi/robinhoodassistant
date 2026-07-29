@@ -522,3 +522,51 @@ No required-field validation was weakened. No Plan 3 work, app/daemon/MCP
 start, ignored runtime database, real Keychain/credential, network,
 broker/provider/notifier/integration call, trading action, reconciliation
 write, notification, breaker reset, or push occurred.
+
+## Whole-Plan-2 integration correction
+
+This correction supersedes the final bounded correction's conclusion that MCP,
+paper-drill, and safety-drill needed selected-provider news credentials.
+Tracing the production call graph showed that none of those roots consumes the
+quarantine summarizer. Their optional LLM visibility was excess authority and
+is removed. App and daemon remain the only news-capable runtime roots, with the
+same Keychain role, outbound-manifest role, and adapter `runtime_role`.
+
+- [x] Add exact RED coverage before production changes. The initial selection
+  produced `26 failed, 5 passed`.
+- [x] Require the public automatic `create_app` and
+  `build_default_container` paths to consume one exact app-role startup receipt
+  bound to the same config and secrets. Receipt reuse fails. Explicit injected
+  stacks moved to the clearly named `create_test_app` boundary.
+- [x] Preserve role identity end to end. Paper-drill uses its own role while
+  holding mutually exclusive maintenance tenure; safety-drill passes its own
+  role only through the explicit test-container path; MCP remains MCP. None
+  borrows app.
+- [x] Remove unused news-provider secrets and construction from MCP,
+  paper-drill, and safety-drill. Prove app/daemon selected-provider role
+  propagation for Anthropic, Gemini, and Groq.
+- [x] Remove the affirmative live-mode contract. Legacy live fields remain
+  parseable only for rejection and diagnostics; `live_trading_enabled` is
+  always false, production bootstrap rejects live mode, and every approved
+  plan remains paper-only. Crypto remains supported in the paper runtime, not
+  as a live asset class.
+- [x] Correct executable plan/spec/config/operator language and the direct
+  Uvicorn factory example. The supported production launcher remains
+  `trading_assistant.ops.serve`.
+- [x] Final focused proof: `78 passed, 1 warning`, followed by `22 passed` for
+  the final receipt/tenure role cases.
+- [x] Explicit 33-file affected matrix: `2022 passed, 1 warning`.
+- [x] Repository static gate: `release static checks: PASS`; compileall,
+  `git diff --check`, and shell syntax exited zero.
+- [x] Exactly one no-argument full suite:
+  `3700 passed, 1 skipped, 1 warning in 607.63s`; pytest exited normally.
+- [x] Commit implementation/tests/executable docs as
+  `5d34837ef461b12ad4c5e7f8ea49f5e700cee2c1` and package bounded diff
+  `review-b1e2016..5d34837.diff` separately with closure evidence.
+
+No required secret-field validation was weakened. The release remains
+paper-only, manually approved, breaker- and broker-truth-gated, webhook-free,
+and Composio-disabled pending provider-side rotation. Verification used only
+temporary databases, fake providers, and local fixtures; it did not start a
+service, access real credentials or the ignored runtime database, make an
+external call, push, trade, reconcile, notify, or reset a breaker.
