@@ -250,9 +250,9 @@ After preliminary idempotency lookup and request preparation, `AlpacaBroker`
 dynamically rechecks the exact SDK target while holding a broker-owned `RLock`
 across the actual SDK submit or cancel call, including compensation. The outer
 drill checks remain defense in depth. Live, uninitialized, subclassed,
-sandbox-false, or URL-overridden clients are refused. The guard is armed only
-by this explicit credentialed drill, so it does not globally disable
-intentionally configured live mode. Offline doubles can exercise mock behavior
+sandbox-false, or URL-overridden clients are refused. This release has no
+intentionally configurable live mode: legacy live fields are parsed only so
+startup can reject them explicitly. Offline doubles can exercise mock behavior
 only and can never produce `alpaca_paper:passed`.
 
 The gate snapshots pre-existing open-order IDs and exact position quantities,

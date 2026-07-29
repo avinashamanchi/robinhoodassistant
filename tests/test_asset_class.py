@@ -1,4 +1,4 @@
-"""Phase 7 §1: equity/crypto are independent in the live path.
+"""Phase 7 §1: equity/crypto are independent in the paper runtime.
 
 Existing equity behavior is covered unchanged by the Phase 1 suite; these tests
 prove the two asset classes' kill switches, clocks, and P&L boundaries do not

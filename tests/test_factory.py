@@ -1,4 +1,4 @@
-"""Broker/clock factory selection + live double-lock enforcement."""
+"""Broker/clock factory selection plus paper-only enforcement."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from trading_assistant.broker.factory import build_broker, build_clock
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.config import (
     BrokerKind,
-    LIVE_CONFIRM_STRING,
     Secrets,
     TradingMode,
     live_trading_enabled,
@@ -26,17 +25,21 @@ def test_mock_config_builds_fake_clock(app_config):
     assert isinstance(clock, MarketClock)
 
 
-def test_live_lock_requires_both_flags(app_config):
+def test_legacy_live_fields_never_enable_live_trading(app_config):
     live = app_config.model_copy(
         update={
             "trading": app_config.trading.model_copy(update={"mode": TradingMode.LIVE})
         }
     )
-    # Config says live but no env confirmation -> not live (forces paper).
     assert live_trading_enabled(live, Secrets(live_trading_confirm="")) is False
     assert (
-        live_trading_enabled(live, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING))
-        is True
+        live_trading_enabled(
+            live,
+            Secrets(
+                live_trading_confirm="I_UNDERSTAND_LIVE_TRADING"
+            ),
+        )
+        is False
     )
 
 
@@ -77,7 +80,9 @@ def test_factory_itself_remains_paper_only_even_with_legacy_live_double_lock(
             )
         }
     )
-    secrets = Secrets(live_trading_confirm=LIVE_CONFIRM_STRING)
+    secrets = Secrets(
+        live_trading_confirm="I_UNDERSTAND_LIVE_TRADING"
+    )
 
     build_broker(legacy_live, secrets)
     build_clock(legacy_live, secrets)

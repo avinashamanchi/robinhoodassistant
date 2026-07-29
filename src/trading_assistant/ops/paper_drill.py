@@ -30,7 +30,7 @@ def build_paper_service(
     container = build_container(
         config,
         secrets,
-        runtime_role="app",
+        runtime_role="paper-drill",
     )
     primary_failure = False
     try:

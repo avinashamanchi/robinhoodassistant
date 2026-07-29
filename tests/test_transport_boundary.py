@@ -22,7 +22,7 @@ from cryptography.x509.verification import (
 )
 from fastapi.testclient import TestClient
 
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.db.models import (
     AuditEvent,
     AuthSession,

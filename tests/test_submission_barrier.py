@@ -706,7 +706,9 @@ def _position_reconciliation_process(
         if entrypoint == "http":
             from fastapi.testclient import TestClient
 
-            from trading_assistant.app.main import create_app
+            from trading_assistant.app.main import (
+                create_test_app as create_app,
+            )
 
             client = TestClient(
                 create_app(

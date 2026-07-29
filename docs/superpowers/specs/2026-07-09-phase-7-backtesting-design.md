@@ -13,14 +13,15 @@
    exists:** `backtest/llm_runner.py`, wiring `MarketFeatures` into an analyst prompt, and
    graded-call linkage to `AnalysisReport`s. `MarketFeatures` and `playbook.md` are still
    built now (strategies consume `MarketFeatures`; the playbook ships as a doc).
-2. **Crypto is a real asset class in the live path** (not backtest-only). This modifies
-   Phase 1–3 code (§1). **Hard condition:** the entire existing Phase 1 risk + kill-switch
+2. **Crypto is a real asset class in the paper runtime** (not backtest-only),
+   but it is not a live-trading asset class. This modifies Phase 1–3 code (§1).
+   **Hard condition:** the entire existing Phase 1 risk + kill-switch
    suite must pass unchanged, plus new tests proving equity/crypto trip independently and
    the crypto clock is always-open while the equity clock is unaffected.
 
 ---
 
-## 1. Asset-class abstraction (modifies live-path code)
+## 1. Asset-class abstraction (modifies paper-runtime code)
 
 `assets.py`: `class AssetClass(str, Enum): EQUITY="equity"; CRYPTO="crypto"` and
 `AssetClass.for_symbol(sym)` — a symbol containing "/" (e.g. `BTC/USD`) is CRYPTO, else

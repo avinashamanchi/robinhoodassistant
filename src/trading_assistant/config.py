@@ -9,8 +9,8 @@ Two sources, deliberately separated:
 * runtime secrets — supplied separately through a typed secret provider.
 
 Legacy live-mode fields remain parseable for configuration compatibility, but
-the safety-foundation production bootstrap and broker factory reject/ignore
-them: this release is hard-locked to Alpaca paper trading.
+the safety-foundation production bootstrap rejects them and the broker factory
+is always paper-targeted: this release is hard-locked to Alpaca paper trading.
 """
 
 from __future__ import annotations
@@ -32,9 +32,6 @@ from pydantic import (
 )
 
 from .security.secrets import RuntimeSecrets
-
-LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
-
 
 class _Strict(BaseModel):
     """Base for all YAML config models: unknown keys are a hard error (A8)."""
@@ -361,8 +358,6 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
 
 
 def live_trading_enabled(config: AppConfig, secrets: RuntimeSecrets) -> bool:
-    """Guardrail #1: both locks must be set, else we are NOT live."""
-    return (
-        config.trading.mode is TradingMode.LIVE
-        and secrets.live_trading_confirm.get_secret_value() == LIVE_CONFIRM_STRING
-    )
+    """Compatibility diagnostic: this release never enables live trading."""
+    del config, secrets
+    return False

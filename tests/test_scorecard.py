@@ -1,4 +1,4 @@
-"""Grading analyst calls, the scorecard, the 50-call promotion gate, persistence."""
+"""Grading analyst calls, the advisory 50-call threshold, and persistence."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def test_scorecard_accuracy():
     assert sc.n_acted == 3
 
 
-# ── promotion gate ──────────────────────────────────────────────
+# ── advisory track-record threshold ─────────────────────────────
 def test_promotion_needs_50_calls():
     few = build_scorecard([(_report("buy"), grade(_report("buy"), 4.0))] * 10)
     ok, reason = can_promote(few)
@@ -59,7 +59,7 @@ def test_promotion_needs_50_calls():
 def test_promotion_eligible_at_threshold():
     fifty = build_scorecard([(_report("buy"), grade(_report("buy"), 4.0))] * 50)
     ok, reason = can_promote(fifty)
-    assert ok is True and "eligible for MANUAL promotion" in reason
+    assert ok is True and "eligible for MANUAL analyst review" in reason
 
 
 # ── persistence ─────────────────────────────────────────────────

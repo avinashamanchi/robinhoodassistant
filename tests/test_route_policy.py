@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 import trading_assistant.app.limits as limits_module
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 import trading_assistant.app.policy as policy_module
 from trading_assistant.app.policy import (
     AuthLevel,

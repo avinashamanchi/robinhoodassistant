@@ -142,9 +142,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
             "alpaca_api_key",
             "alpaca_secret_key",
             "database_url",
-            "anthropic_api_key",
-            "gemini_api_key",
-            "groq_api_key",
             "candidate_signing_key",
             "backup_encryption_key",
             "field_encryption_keys",
@@ -160,9 +157,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
             "alpaca_api_key",
             "alpaca_secret_key",
             "database_url",
-            "anthropic_api_key",
-            "gemini_api_key",
-            "groq_api_key",
             "candidate_signing_key",
             "backup_encryption_key",
             "field_encryption_keys",
@@ -186,9 +180,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
             "database_url",
             "alpaca_api_key",
             "alpaca_secret_key",
-            "anthropic_api_key",
-            "gemini_api_key",
-            "groq_api_key",
             "candidate_signing_key",
             "backup_encryption_key",
             "field_encryption_keys",
@@ -208,9 +199,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
 )
 _LLM_REQUIRED_ROLES = frozenset(
     {"app", "daemon", "preflight", "validate-analyst"}
-)
-_NEWS_LLM_ROLES = frozenset(
-    {"mcp", "paper-drill", "safety-drill"}
 )
 _LLM_SECRET_FIELDS = frozenset(
     {"anthropic_api_key", "gemini_api_key", "groq_api_key"}
@@ -704,13 +692,7 @@ def _role_visible_fields(
     config: AppConfig,
 ) -> tuple[str, ...]:
     allowed_fields = _ROLE_VISIBLE_FIELDS[role]
-    llm_visible = (
-        role in _LLM_REQUIRED_ROLES
-        or (
-            role in _NEWS_LLM_ROLES
-            and config.analyst.news_enabled
-        )
-    )
+    llm_visible = role in _LLM_REQUIRED_ROLES
     selected_llm = (
         _selected_llm_secret_field(config)
         if llm_visible

@@ -306,7 +306,7 @@ def authenticate_client(operator_token):
 def authenticated_client(make_service, operator_token, authenticate_client):
     from fastapi.testclient import TestClient
 
-    from trading_assistant.app.main import create_app
+    from trading_assistant.app.main import create_test_app as create_app
 
     class _StubAgent:
         def chat(self, message, **context):

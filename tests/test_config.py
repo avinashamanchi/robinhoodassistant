@@ -1,4 +1,4 @@
-"""A8: config fails fast on unknown/misspelled keys; live double-lock (guardrail #1)."""
+"""A8: config rejects unknown keys and never enables live trading."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import yaml
 from pydantic import AnyUrl, ValidationError
 
 from trading_assistant.config import (
-    LIVE_CONFIRM_STRING,
     ProviderOriginsConfig,
     Secrets,
     ServerConfig,
@@ -390,15 +389,32 @@ def test_unknown_daemon_heartbeat_setting_remains_forbidden(tmp_path):
         load_config(_write(tmp_path, invalid))
 
 
-def test_live_double_lock(tmp_path):
-    cfg = load_config(_write(tmp_path, VALID.replace("mode: paper", "mode: live")))
-    # Missing confirmation string -> still not live.
-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm="")) is False
-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm="wrong")) is False
-    # Both locks set -> live.
-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING))
+@pytest.mark.parametrize("mode", ["paper", "live"])
+@pytest.mark.parametrize(
+    "confirmation",
+    [
+        "",
+        "wrong",
+        "I_UNDERSTAND_LIVE_TRADING",
+        "any-other-populated-value",
+    ],
+)
+def test_live_trading_is_never_enabled_by_parsed_legacy_fields(
+    tmp_path,
+    mode,
+    confirmation,
+):
+    cfg = load_config(
+        _write(
+            tmp_path,
+            VALID.replace("mode: paper", f"mode: {mode}"),
+        )
+    )
 
-
-def test_paper_never_live_even_with_confirm(tmp_path):
-    cfg = load_config(_write(tmp_path, VALID))  # mode: paper
-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING)) is False
+    assert (
+        live_trading_enabled(
+            cfg,
+            Secrets(live_trading_confirm=confirmation),
+        )
+        is False
+    )

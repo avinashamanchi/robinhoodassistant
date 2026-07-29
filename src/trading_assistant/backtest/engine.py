@@ -3,7 +3,7 @@
 At simulated time t the strategy sees only a DataView bounded at t. An order
 decided at t is submitted after the decision and fills at t+1's open (via
 SimBroker) — so no decision can use information it could not have had. Orders run
-through the SAME RiskEngine as the live path; only the numeric limits differ
+through the SAME RiskEngine as the paper runtime; only the numeric limits differ
 (a permissive backtest profile so capital can actually be deployed).
 """
 

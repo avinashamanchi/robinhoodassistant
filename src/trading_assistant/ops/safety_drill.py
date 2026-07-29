@@ -1751,6 +1751,7 @@ def run_safety_drill(
         drill_secrets,
         broker=crash_broker,
         clock=clock or FakeClock(is_open=True),
+        runtime_role="safety-drill",
     )
     tag = f"safety-drill-{uuid4().hex}"
     details: list[str] = [
@@ -1834,6 +1835,7 @@ def run_safety_drill(
                 drill_secrets,
                 broker=crash_broker,
                 clock=clock or FakeClock(is_open=True),
+                runtime_role="safety-drill",
             )
             with restarted.session_factory() as session:
                 after_restart = session.get(Order, proposal["order_id"])
@@ -2057,6 +2059,7 @@ def run_safety_drill(
             drill_secrets,
             broker=crash_broker,
             clock=clock or FakeClock(is_open=True),
+            runtime_role="safety-drill",
         )
         survived_restart = (
             restarted.breakers.is_tripped(data_scope)

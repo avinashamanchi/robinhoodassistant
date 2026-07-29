@@ -94,12 +94,14 @@ def test_drill_copy_secrets_preserve_secretstr_masking(
     _upgrade_database(primary)
     original_token = "safety-drill-secretstr-marker"
     captured = []
+    captured_roles = []
 
     class CapturedDrillSecrets(RuntimeError):
         pass
 
-    def capture_container(_config, secrets, **_kwargs):
+    def capture_container(_config, secrets, **kwargs):
         captured.append(secrets)
+        captured_roles.append(kwargs.get("runtime_role"))
         raise CapturedDrillSecrets
 
     monkeypatch.setattr(
@@ -127,6 +129,7 @@ def test_drill_copy_secrets_preserve_secretstr_masking(
     assert dumped["app_api_token"] == "**********"
     assert original_token not in repr(drill_secrets)
     assert str(destination) not in repr(drill_secrets)
+    assert captured_roles == ["safety-drill"]
 
 
 def _runtime_secrets_from_test_environment(

@@ -544,8 +544,11 @@ class TransportPolicy:
         )
 ```
 
-Only tests may call `.test()`. The normal `create_app()` factory constructs
-`.production()`. `TransportBoundaryMiddleware` runs before route code, counts
+Only the explicitly named `create_test_app()` injection boundary may use
+`.test()`. The public `create_app()` factory requires the exact config,
+role-scoped secrets, and one-shot receipt issued by `run_startup_guard()`; an
+ambient ASGI factory invocation fails before container or broker construction.
+`TransportBoundaryMiddleware` runs before route code, counts
 headers from the ASGI scope, wraps `receive` to enforce the route's byte limit
 even without `Content-Length`, validates same-origin, and uses
 an RFC-aware bracketed-IPv6 parser plus `TrustedHostMiddleware` for exact
@@ -594,21 +597,24 @@ Tests inject pass/fail inspectors. The production default in Task 3 returns
 Task 5 replaces that default with the database-backed inspector in the same
 composition root before the program can be released.
 
-After that guard passes, `ops.serve` calls:
+After that guard passes, `ops.serve` consumes the one-shot receipt to build the
+container, creates the guarded app from that exact container, and passes the
+app object to Uvicorn:
 
 ```python
-uvicorn.run(
-    "trading_assistant.app.main:create_app",
-    factory=True,
-    host=config.server.bind_host,
-    port=config.server.port,
-    ssl_certfile=str(config.server.tls_cert_path),
-    ssl_keyfile=str(config.server.tls_key_path),
-    proxy_headers=False,
-    forwarded_allow_ips="",
-    access_log=False,
+receipt = run_startup_guard(...)
+container = _build_guarded_container(
+    config,
+    secrets,
+    runtime_role="app",
+    startup_guard_receipt=receipt,
 )
+app = _create_guarded_app(container=container)
+uvicorn.Server(uvicorn.Config(app, ...))
 ```
+
+Direct `uvicorn trading_assistant.app.main:create_app --factory` is not a
+supported launcher and fails with `production_startup_guard_required`.
 
 `scripts/start.sh` starts only this HTTPS app and does not kill unrelated
 processes, reset breakers, start the daemon, or display a secret-retrieval

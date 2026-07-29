@@ -29,8 +29,8 @@ Built in phases (see `docs/superpowers/specs/`):
   plans/screener UI, optional Alpaca news.
 - **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
   cited + regime-conditioned, earnings-aware), scorecard grading vs realized
-  forward returns, and a 50-graded-calls promotion gate (advice only — never
-  auto-enables; this release rejects live mode at startup).
+  forward returns, and a 50-graded-calls analyst-review threshold (research
+  advice only; this release rejects live mode at startup).
 - **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
   backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
   synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop

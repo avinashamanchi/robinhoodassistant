@@ -1,8 +1,8 @@
 """Grade analyst calls against realized forward returns, and summarize a track record.
 
 A call is graded once its horizon has elapsed and the realized forward return is
-known. This is the honest measure of whether the analyst adds anything — and it
-feeds the promotion gate.
+known. This is the honest measure of whether the analyst adds anything; it does
+not grant execution capability.
 """
 
 from __future__ import annotations

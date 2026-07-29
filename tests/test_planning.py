@@ -3285,7 +3285,11 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
         assert len(worker_outcomes) == 1
 
 
-def test_promotion_gate_blocks_live_without_track_record(make_service, app_config, session_factory):
+def test_legacy_live_fields_still_create_only_paper_plan_rules(
+    make_service,
+    app_config,
+    session_factory,
+):
     from trading_assistant.broker.mock import MockBroker
     from trading_assistant.service import TradingService
 
@@ -3298,10 +3302,17 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
     pln = PlanningService(svc_live, _StubAnalyst(_plan()), _provider, sec)
 
     pid = _analyze(pln, "promotion gate")["plan_id"]
-    res = _approve(pln,
+    res = _approve(
+        pln,
         pid,
         actor="operator:test",
         reason="reviewed plan",
         request_id="planning-promotion-gate",
-    )  # 0 graded calls -> gate blocks live approval
-    assert "promotion gate" in res["error"]
+    )
+
+    assert res["status"] == "approved"
+    assert res["paper_only"] is True
+    with session_factory() as session:
+        stored = session.get(TradePlanRow, pid)
+    assert stored is not None
+    assert stored.paper_only is True

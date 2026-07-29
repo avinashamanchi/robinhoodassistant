@@ -16,7 +16,7 @@ from trading_assistant.analyst.models import (
     EntryPlan, ExitPlan, ExitTarget, Invalidation, PlanAction, Scenario, TradePlan, Tranche,
 )
 from trading_assistant.analyst.planning import PlanningService
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars

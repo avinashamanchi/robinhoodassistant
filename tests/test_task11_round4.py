@@ -358,9 +358,14 @@ def test_preflight_live_confirmation_cannot_be_projected_to_all_disabled(
     "role",
     ["mcp", "paper-drill", "safety-drill"],
 )
-def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
+@pytest.mark.parametrize(
+    "provider",
+    ["anthropic", "gemini", "groq"],
+)
+def test_unused_news_roles_receive_no_llm_secret(
     app_config,
     role,
+    provider,
 ):
     config = app_config.model_copy(
         update={
@@ -368,7 +373,7 @@ def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
                 update={"news_enabled": True}
             ),
             "llm": app_config.llm.model_copy(
-                update={"provider": "gemini"}
+                update={"provider": provider}
             ),
         }
     )
@@ -380,10 +385,51 @@ def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
         provider=MacOSKeychainSecretProvider(backend=backend),
     )
 
-    assert backend.accounts.count("gemini_api_key") == 1
-    assert secret_is_set(loaded.gemini_api_key)
-    assert "anthropic_api_key" not in backend.accounts
-    assert "groq_api_key" not in backend.accounts
+    for field in (
+        "anthropic_api_key",
+        "gemini_api_key",
+        "groq_api_key",
+    ):
+        assert field not in backend.accounts
+        assert not secret_is_set(getattr(loaded, field))
+
+
+@pytest.mark.parametrize("role", ["app", "daemon"])
+@pytest.mark.parametrize(
+    "provider",
+    ["anthropic", "gemini", "groq"],
+)
+def test_supported_news_roles_receive_only_selected_llm_secret(
+    app_config,
+    role,
+    provider,
+):
+    config = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"news_enabled": True}
+            ),
+            "llm": app_config.llm.model_copy(
+                update={"provider": provider}
+            ),
+        }
+    )
+    backend = RecordingKeyring(_role_secret_values(config))
+
+    loaded = load_role_secrets(
+        role,
+        config=config,
+        provider=MacOSKeychainSecretProvider(backend=backend),
+    )
+
+    for field in (
+        "anthropic_api_key",
+        "gemini_api_key",
+        "groq_api_key",
+    ):
+        expected = field == f"{provider}_api_key"
+        assert (field in backend.accounts) is expected
+        assert secret_is_set(getattr(loaded, field)) is expected
 
 
 class SnapshotBroker:

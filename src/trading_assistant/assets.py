@@ -1,9 +1,9 @@
 """Asset-class abstraction (Phase 7).
 
-Crypto is a first-class live asset class: it has an independent kill switch, an
-always-open clock, and a UTC-midnight daily P&L boundary. This enum threads
-through the risk layer. Everything defaults to EQUITY so all pre-Phase-7
-behavior is unchanged.
+Crypto is a first-class paper-runtime asset class: it has an independent kill
+switch, an always-open clock, and a UTC-midnight daily P&L boundary. It is not a
+live-trading asset class in this release. This enum threads through the risk
+layer. Everything defaults to EQUITY so all pre-Phase-7 behavior is unchanged.
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
 """FastAPI host: chat, pending-approval queue, approve/reject, positions, log.
 
-``create_app`` accepts an injected service + agent (tests use mocks). With none
-provided it builds the real stack from config/secrets. The approval endpoint is
-the only path that can execute — and it runs the risk engine one final time
-inside TradingService.approve_order.
+The public production factory accepts only a startup-guard-bound composition.
+Tests use the explicitly named ``create_test_app`` injection boundary. The
+approval endpoint is the only path that can execute, and it runs the risk
+engine one final time inside ``TradingService.approve_order``.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..broker.models import OrderStatus
-from ..config import load_config
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
@@ -47,7 +46,6 @@ from ..operations import (
 from ..service import TradingService
 from ..security.secrets import (
     RuntimeSecrets,
-    load_role_secrets,
     secret_is_set,
     secrets_match,
 )
@@ -303,18 +301,27 @@ class KillSwitchResetIn(BaseModel):
         return value.strip()
 
 
-def build_default_container():
+def build_default_container(
+    *,
+    config=None,
+    secrets: RuntimeSecrets | None = None,
+    startup_guard_receipt=None,
+):
+    """Build production authority only from one exact startup receipt."""
     from .. import bootstrap
-    from ..logging import runtime_startup
 
-    config = load_config()
-    secrets = load_role_secrets("app", config=config)
-    with runtime_startup("app", secrets):
-        return bootstrap.build_container(
-            config,
-            secrets,
-            runtime_role="app",
-        )
+    if (
+        config is None
+        or secrets is None
+        or startup_guard_receipt is None
+    ):
+        raise RuntimeError("production_startup_guard_required")
+    return bootstrap._build_guarded_container(
+        config,
+        secrets,
+        runtime_role="app",
+        startup_guard_receipt=startup_guard_receipt,
+    )
 
 
 def _build_agent(container) -> Agent:
@@ -1214,12 +1221,6 @@ def _create_app(
             reason=context.reason,
             request_id=context.request_id,
         )
-        if "error" in result and "promotion gate" in result["error"]:
-            raise ApiError(
-                "policy_denied",
-                403,
-                "Plan approval was denied by safety policy",
-            )
         if result.get("error") == "not found":
             raise ApiError("plan_not_found", 404, "Plan not found")
         if result.get("error") == "plan_review_stale":
@@ -1470,8 +1471,8 @@ def _create_guarded_app(
 
 
 @wraps(_create_app)
-def create_app(*args, **kwargs) -> FastAPI:
-    """Build the automatic production app inside its role log boundary."""
+def create_test_app(*args, **kwargs) -> FastAPI:
+    """Build an explicitly injected local test app with no ambient authority."""
     if "_guarded_app_composition" in kwargs:
         raise TypeError(
             "guarded app composition requires private launcher entrypoint"
@@ -1486,16 +1487,30 @@ def create_app(*args, **kwargs) -> FastAPI:
         and bound.arguments["service"] is None
         and bound.arguments["agent"] is None
     )
-    if not automatic:
-        return _create_app(*args, **kwargs)
+    if automatic:
+        raise RuntimeError("explicit_test_stack_required")
+    return _create_app(*args, **kwargs)
 
-    container = build_default_container()
-    bound.arguments["container"] = container
-    from ..logging import runtime_startup
+
+def create_app(*args, **kwargs) -> FastAPI:
+    """Build an automatic production app from one startup receipt only."""
+    allowed = {
+        "config",
+        "secrets",
+        "startup_guard_receipt",
+    }
+    if args or set(kwargs).difference(allowed):
+        raise RuntimeError("explicit_stack_requires_test_factory")
+    container = build_default_container(
+        config=kwargs.get("config"),
+        secrets=kwargs.get("secrets"),
+        startup_guard_receipt=kwargs.get(
+            "startup_guard_receipt"
+        ),
+    )
 
     try:
-        with runtime_startup("app", container.secrets):
-            return _create_app(*bound.args, **bound.kwargs)
+        return _create_guarded_app(container=container)
     except BaseException:
         guard = getattr(container, "runtime_tenure_guard", None)
         if guard is not None and not guard.close():

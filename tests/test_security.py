@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Quote
 

@@ -5,8 +5,8 @@ conditional rules (entry tranches + targets + stop + trailing + time) tagged
 with the plan id. A firing creates a proposal and still requires a separate,
 identified human approval.
 
-Promotion gate: while the analyst has <50 graded calls for an asset class, plans
-for that class may be approved in PAPER mode only.
+Every approved plan remains paper-only. Track-record scoring remains available
+for analyst evaluation but cannot promote execution to live trading.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from typing import Any, Callable, Optional
 from sqlalchemy import select, update
 
 from ..assets import AssetClass
-from ..config import live_trading_enabled
 from ..db.models import AuditEvent, TradePlanRow, utcnow
 from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
@@ -30,10 +29,7 @@ from ..security.sensitive_fields import sensitive_store
 from ..signals.models import MarketFeatures
 from .citations import validate_source_citations
 from .models import PlanAction, TradePlan
-from .promotion import can_promote
-from .scorecard import build_scorecard
 from .sizing import SizedTradePlan, size_trade
-from .store import build_scorecard_from_db
 from .untrusted import UntrustedSummary
 
 
@@ -301,19 +297,10 @@ class PlanningService:
             if plan.action not in (PlanAction.BUY, PlanAction.SELL) or Decimal(sized["total_shares"]) <= 0:
                 return {"plan_id": plan_id, "error": "plan has no sized entry to approve"}
 
-            # Promotion gate: <50 graded calls for this class -> paper mode only.
-            promotable, _ = can_promote(build_scorecard_from_db(s))
-            live = live_trading_enabled(self.service.config, self.secrets) if self.secrets else False
-            if live and not promotable:
-                return {
-                    "plan_id": plan_id,
-                    "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
-                }
-
         # Decomposition is pure application work. It happens before the write
         # transaction so a process stop cannot leave a durable claim behind.
         rules = self._decompose(plan, sized, plan_id)
-        paper_only = not (live and promotable)
+        paper_only = True
         bracket = None
         with self.service.submission_barrier.hold_writer():
             with self.service.session_factory() as s:

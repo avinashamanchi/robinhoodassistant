@@ -1,8 +1,8 @@
 # Agentic Trading Assistant — Design Spec
 
 **Date:** 2026-07-09
-**Status:** Approved (with amendments 1–8)
-**Broker:** Alpaca (paper first; live behind double-lock)
+**Status:** Historical design; live-mode portions superseded by Plan 2
+**Broker:** Alpaca paper only in the current release
 
 ---
 
@@ -11,11 +11,12 @@
 An LLM-driven trading assistant. Claude (Anthropic API, `claude-sonnet-4-6`, native tool
 use) interprets natural-language commands and decides which tools to call. An MCP server
 exposes broker tools. A FastAPI host runs the agentic loop and enforces a **human
-confirmation gate** before any live order. A monitoring daemon watches prices and evaluates
+confirmation gate** before any broker order. A monitoring daemon watches prices and evaluates
 standing conditional orders.
 
-Everything runs against Alpaca **paper trading** first. Live trading is OFF by default and
-requires a double-lock (config flag AND an env confirmation string).
+Everything in the current release runs against Alpaca **paper trading**. Legacy
+live fields remain parseable only for explicit rejection and diagnostics; no
+configuration or environment combination enables live trading.
 
 ### The one invariant
 
@@ -140,7 +141,7 @@ project has — a test asserts a typo'd risk key fails to load.
 
 ```yaml
 trading:
-  mode: paper              # paper | live
+  mode: paper              # live is legacy syntax and is rejected at startup
   broker: alpaca           # alpaca | mock
 
 risk:
@@ -166,13 +167,14 @@ daemon:
   use_websocket: true
 ```
 
-`.env` (secrets, gitignored; documented in `.env.example`): `ANTHROPIC_API_KEY`,
-`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER_BASE_URL`, `LIVE_TRADING_CONFIRM`
-(must equal `I_UNDERSTAND_LIVE_TRADING` for live), `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, `APP_HOST`, `APP_PORT`.
+Historical `.env` deployments included `LIVE_TRADING_CONFIRM`. In the current
+release it is retained only as a migration/diagnostic field; setting it never
+enables live trading. Normal production secrets come from the role-scoped
+macOS Keychain provider.
 
-**Guardrail #1:** live mode requires `config.yaml` `mode: live` **AND**
-`LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`. Missing either → paper.
+**Guardrail #1 (superseded):** the former double-lock contract is removed.
+`trading.mode: live` is rejected by production bootstrap, regardless of any
+legacy confirmation value.
 
 ---
 
@@ -202,7 +204,7 @@ daemon:
 
 ## 9. Non-negotiable guardrails
 
-1. Live trading requires BOTH config flag AND env confirmation string.
+1. Live trading is unavailable; legacy live inputs are rejected.
 2. LLM proposes; only human approval (or pre-approved rule) executes.
 3. Risk engine is final authority on every order; no bypass path.
 4. Default state of everything dangerous is OFF.

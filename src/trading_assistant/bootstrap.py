@@ -213,6 +213,62 @@ def acquire_runtime_guard(
     return guard
 
 
+def acquire_maintenance_guard(
+    runtime: DatabaseRuntime,
+    *,
+    process_identity: ProcessIdentity | None = None,
+    process_inspector=None,
+    tenure_clock=None,
+    tenure_owner_factory=None,
+) -> RuntimeTenureGuard:
+    """Acquire the mutually exclusive maintenance tenure for a paper drill."""
+    inspector = process_inspector or LocalProcessInspector()
+    identity = process_identity
+    if identity is None:
+        try:
+            identity = inspector.current()
+        except Exception:
+            raise TenureUncertain() from None
+    service_kwargs = {"process_inspector": inspector}
+    if tenure_clock is not None:
+        service_kwargs["clock"] = tenure_clock
+    if tenure_owner_factory is not None:
+        service_kwargs["owner_factory"] = tenure_owner_factory
+    handle = RuntimeTenureService(
+        runtime.session_factory,
+        **service_kwargs,
+    ).acquire_maintenance(
+        identity,
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    try:
+        guard.start()
+        install_runtime_mutation_barrier(runtime.engine, guard)
+    except BaseException:
+        close_result = getattr(
+            guard,
+            "close_result",
+            TenureCloseResult.NOT_ATTEMPTED,
+        )
+        if close_result is TenureCloseResult.CONFIRMED:
+            raise
+        if close_result is TenureCloseResult.UNCERTAIN:
+            raise TenureUncertain() from None
+        try:
+            released = guard.close()
+        except BaseException:
+            raise TenureUncertain() from None
+        if not released:
+            raise TenureUncertain() from None
+        raise
+    return guard
+
+
 def _guard_runtime(config: AppConfig, secrets: RuntimeSecrets) -> None:
     if not secret_is_set(secrets.app_api_token):
         raise RuntimeError("APP_API_TOKEN is required")
@@ -271,7 +327,10 @@ def build_quarantine_summarizer(
     runtime_role: str = "app",
 ) -> QuarantineSummarizer | None:
     """Compose the no-tools reader separately from the privileged analyst."""
-    if not config.analyst.news_enabled:
+    if (
+        runtime_role not in {"app", "daemon"}
+        or not config.analyst.news_enabled
+    ):
         return None
     from .llm.factory import build_llm_backend
 
@@ -349,6 +408,7 @@ def build_test_container(
     *,
     broker: BrokerClient,
     clock,
+    runtime_role: str = "app",
 ) -> ApplicationContainer:
     """Compose with explicit fakes while retaining production-safe config."""
     return _build_container(
@@ -356,6 +416,7 @@ def build_test_container(
         secrets,
         broker=broker,
         clock=clock,
+        runtime_role=runtime_role,
         enforce_runtime_tenure=False,
     )
 
@@ -400,7 +461,15 @@ def _build_container(
     _consumed_startup_guard: _ConsumedStartupGuard | None = None,
 ) -> ApplicationContainer:
     effective_role = runtime_role or "app"
-    if effective_role not in {"app", "daemon", "mcp"}:
+    if effective_role not in {
+        "app",
+        "daemon",
+        "mcp",
+        "paper-drill",
+        "safety-drill",
+    }:
+        raise ValueError("runtime_role_invalid")
+    if enforce_runtime_tenure and effective_role == "safety-drill":
         raise ValueError("runtime_role_invalid")
     require_configured_role_origins(config, effective_role)
     startup_evidence = None
@@ -429,14 +498,23 @@ def _build_container(
     bind_sensitive_cipher(session_factory, sensitive_cipher)
     runtime_tenure_guard: RuntimeTenureGuard | None = None
     if enforce_runtime_tenure:
-        runtime_tenure_guard = acquire_runtime_guard(
-            runtime,
-            effective_role,
-            process_identity=process_identity,
-            process_inspector=process_inspector,
-            tenure_clock=tenure_clock,
-            tenure_owner_factory=tenure_owner_factory,
-        )
+        if effective_role == "paper-drill":
+            runtime_tenure_guard = acquire_maintenance_guard(
+                runtime,
+                process_identity=process_identity,
+                process_inspector=process_inspector,
+                tenure_clock=tenure_clock,
+                tenure_owner_factory=tenure_owner_factory,
+            )
+        else:
+            runtime_tenure_guard = acquire_runtime_guard(
+                runtime,
+                effective_role,
+                process_identity=process_identity,
+                process_inspector=process_inspector,
+                tenure_clock=tenure_clock,
+                tenure_owner_factory=tenure_owner_factory,
+            )
     try:
         return _finish_container(
             config,

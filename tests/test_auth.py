@@ -14,7 +14,7 @@ from trading_assistant.app.auth import (
     SessionAuth,
     SessionExpired,
 )
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.assets import AssetClass
 from trading_assistant.db.models import AuthSession
 from trading_assistant.risk.breakers import BreakerScope

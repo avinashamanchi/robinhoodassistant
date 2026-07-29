@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.config import BrokerKind, Secrets
 from trading_assistant.db.migrate import upgrade
@@ -131,42 +131,26 @@ def test_explicit_runtime_secrets_cannot_bypass_shared_planning_budget(
     assert constructed == []
 
 
-def test_automatic_app_root_logs_post_container_startup_failure(
-    tmp_path,
-    make_service,
+def test_automatic_app_root_refuses_before_container_construction(
     monkeypatch,
 ):
     import trading_assistant.app.main as app_main
+    from trading_assistant import bootstrap
 
-    marker = "post-container-agent-secret"
-    service = make_service()
-    secrets = Secrets(app_api_token=marker)
-    container = SimpleNamespace(
-        service=service,
-        secrets=secrets,
-    )
+    built = []
     monkeypatch.setattr(
-        app_main,
-        "build_default_container",
-        lambda: container,
+        bootstrap,
+        "_build_guarded_container",
+        lambda *_args, **_kwargs: built.append(True),
     )
-    monkeypatch.setattr(
-        app_main,
-        "_build_agent",
-        lambda _container: (_ for _ in ()).throw(
-            RuntimeError(marker)
-        ),
-    )
-    monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(RuntimeError, match=marker):
-        create_app()
+    with pytest.raises(
+        RuntimeError,
+        match="^production_startup_guard_required$",
+    ):
+        app_main.create_app()
 
-    content = (
-        tmp_path / "logs" / "app.runtime.log"
-    ).read_text(encoding="utf-8")
-    assert "startup_failed role=app" in content
-    assert marker not in content
+    assert built == []
 
 
 def test_mcp_startup_failure_prevents_transport_run(monkeypatch):
@@ -333,7 +317,7 @@ def test_every_production_role_has_private_bounded_startup_log(
 @pytest.mark.parametrize(
     ("builder_name", "runtime_role"),
     [
-        ("paper_drill", "app"),
+        ("paper_drill", "paper-drill"),
     ],
 )
 def test_service_utility_roots_pass_exact_role_and_secrets(

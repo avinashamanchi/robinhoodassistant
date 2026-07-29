@@ -21,7 +21,7 @@ from trading_assistant.app.limits import (
     LimitSpec,
     LimitStoreUnavailable,
 )
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.broker.alpaca import AlpacaBroker
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
@@ -1050,6 +1050,7 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
     import trading_assistant.daemon.main as daemon_main
     import trading_assistant.mcp_server.server as mcp_server
     from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
 
     service = make_service()
     config = app_config.model_copy(
@@ -1086,8 +1087,7 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
         return secrets
 
     monkeypatch.setattr(bootstrap, "build_container", capture_container)
-    monkeypatch.setattr(app_main, "load_config", lambda: config)
-    monkeypatch.setattr(app_main, "load_role_secrets", one_secrets)
+    monkeypatch.setattr(bootstrap, "_build_container", capture_container)
     monkeypatch.setattr(daemon_main, "load_config", lambda: config)
     monkeypatch.setattr(daemon_main, "load_role_secrets", one_secrets)
     monkeypatch.setattr(
@@ -1098,10 +1098,18 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
     monkeypatch.setattr(mcp_server, "load_role_secrets", one_secrets)
 
-    assert app_main.build_default_container() is container
+    receipt = _issue_guard_receipt(posture, config, secrets)
+    assert (
+        app_main.build_default_container(
+            config=config,
+            secrets=secrets,
+            startup_guard_receipt=receipt,
+        )
+        is container
+    )
     assert daemon_main.build_monitor().service is service
     assert mcp_server.build_default_container() is container
-    assert secret_reads == 3
+    assert secret_reads == 2
     assert observed == [
         (config, secrets, "app"),
         (config, secrets, "daemon"),

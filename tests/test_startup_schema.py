@@ -94,6 +94,8 @@ def test_api_startup_and_in_place_upgrade_fail_closed_on_pre_tenure_schema(
     monkeypatch,
 ):
     from trading_assistant.app import main as app_main
+    from trading_assistant.config import BrokerKind, load_config
+    from trading_assistant.operations import security_posture as posture
 
     engine, url = _revision_0004(tmp_path, "api-0004.db")
     with engine.begin() as connection:
@@ -106,10 +108,50 @@ def test_api_startup_and_in_place_upgrade_fail_closed_on_pre_tenure_schema(
             )
         )
     before = set(inspect(engine).get_table_names())
-    _patch_common_startup(monkeypatch, app_main, url)
+    config = load_config(
+        Path(__file__).resolve().parent.parent / "config.yaml"
+    )
+    config = config.model_copy(
+        update={
+            "trading": config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    secrets = RuntimeSecrets(
+        database_url=url,
+        app_api_token="startup-schema-test-secret",
+    )
+    observed_at = datetime.now(timezone.utc)
+    receipt = posture._issue_startup_guard_receipt(
+        config=config,
+        secrets=secrets,
+        checks=(
+            SimpleNamespace(
+                name="runtime_configuration",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(
+                name="loopback_https",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(name="tls", passed=True, code="ok"),
+            SimpleNamespace(name="database", passed=True, code="ok"),
+            SimpleNamespace(name="encryption", passed=True, code="ok"),
+        ),
+        observed_at=observed_at,
+        secret_loaded_at=observed_at - timedelta(seconds=1),
+        runtime_role="app",
+    )
 
     with pytest.raises(SchemaOutOfDate, match="current='20260724_0004'"):
-        app_main.build_default_stack()
+        app_main.build_default_container(
+            config=config,
+            secrets=secrets,
+            startup_guard_receipt=receipt,
+        )
 
     assert set(inspect(engine).get_table_names()) == before
     assert "circuit_breaker_state" not in before

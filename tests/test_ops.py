@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.models import PanicReceipt, utcnow

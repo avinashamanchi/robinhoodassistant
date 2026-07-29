@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, inspect as sa_inspect
 
-from trading_assistant.app.main import create_app
+from trading_assistant.app.main import create_test_app as create_app
 from trading_assistant.app.limits import DurableRateLimiter
 from trading_assistant.config import BrokerKind, TradingMode
 from trading_assistant.broker.alpaca import AlpacaClock
