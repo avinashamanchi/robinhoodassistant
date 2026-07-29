@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, timedelta
-from functools import wraps
-import inspect
 import json
 from pathlib import Path
 import threading
@@ -316,7 +314,7 @@ def build_default_container(
         or startup_guard_receipt is None
     ):
         raise RuntimeError("production_startup_guard_required")
-    return bootstrap._build_guarded_container(
+    return bootstrap.build_container(
         config,
         secrets,
         runtime_role="app",
@@ -355,8 +353,17 @@ def _build_agent(container) -> Agent:
     return agent
 
 
-def build_default_stack() -> tuple[TradingService, Agent]:
-    container = build_default_container()
+def build_default_stack(
+    *,
+    config,
+    secrets: RuntimeSecrets,
+    startup_guard_receipt,
+) -> tuple[TradingService, Agent]:
+    container = build_default_container(
+        config=config,
+        secrets=secrets,
+        startup_guard_receipt=startup_guard_receipt,
+    )
     return container.service, _build_agent(container)
 
 
@@ -1470,26 +1477,24 @@ def _create_guarded_app(
     )
 
 
-@wraps(_create_app)
 def create_test_app(*args, **kwargs) -> FastAPI:
-    """Build an explicitly injected local test app with no ambient authority."""
-    if "_guarded_app_composition" in kwargs:
+    """Build only from the opaque fake-only container issued to tests."""
+    if args or "_guarded_app_composition" in kwargs:
         raise TypeError(
-            "guarded app composition requires private launcher entrypoint"
+            "test app requires an explicit test-only container"
         )
-    bound = inspect.signature(_create_app).bind_partial(
-        *args,
-        **kwargs,
-    )
-    bound.apply_defaults()
-    automatic = (
-        bound.arguments["container"] is None
-        and bound.arguments["service"] is None
-        and bound.arguments["agent"] is None
-    )
-    if automatic:
-        raise RuntimeError("explicit_test_stack_required")
-    return _create_app(*args, **kwargs)
+    if "service" in kwargs or "runtime_secrets" in kwargs:
+        raise RuntimeError("test_container_required")
+    from .. import bootstrap
+
+    container = kwargs.get("container")
+    if not bootstrap._is_test_application_container(container):
+        raise RuntimeError("test_container_required")
+    agent = getattr(container, "_test_agent", None)
+    if agent is None:
+        raise RuntimeError("test_agent_required")
+    kwargs["agent"] = agent
+    return _create_app(**kwargs)
 
 
 def create_app(*args, **kwargs) -> FastAPI:
@@ -1501,23 +1506,32 @@ def create_app(*args, **kwargs) -> FastAPI:
     }
     if args or set(kwargs).difference(allowed):
         raise RuntimeError("explicit_stack_requires_test_factory")
-    container = build_default_container(
-        config=kwargs.get("config"),
-        secrets=kwargs.get("secrets"),
-        startup_guard_receipt=kwargs.get(
-            "startup_guard_receipt"
-        ),
-    )
+    secrets = kwargs.get("secrets")
+    if secrets is None:
+        raise RuntimeError("production_startup_guard_required")
+    from ..logging import runtime_startup
 
-    try:
-        return _create_guarded_app(container=container)
-    except BaseException:
-        guard = getattr(container, "runtime_tenure_guard", None)
-        if guard is not None and not guard.close():
-            raise RuntimeError(
-                "runtime_tenure_cleanup_uncertain"
-            ) from None
-        raise
+    with runtime_startup("app", secrets):
+        container = build_default_container(
+            config=kwargs.get("config"),
+            secrets=secrets,
+            startup_guard_receipt=kwargs.get(
+                "startup_guard_receipt"
+            ),
+        )
+        try:
+            return _create_guarded_app(container=container)
+        except BaseException:
+            guard = getattr(
+                container,
+                "runtime_tenure_guard",
+                None,
+            )
+            if guard is not None and not guard.close():
+                raise RuntimeError(
+                    "runtime_tenure_cleanup_uncertain"
+                ) from None
+            raise
 
 
 # ── backtest DB helpers ────────────────────────────────────────

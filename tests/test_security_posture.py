@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import importlib
@@ -652,6 +653,11 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
     monkeypatch.setattr(serve, "run_startup_guard", guard_once)
     monkeypatch.setattr(serve, "_build_guarded_container", build_once)
     monkeypatch.setattr(serve, "_create_guarded_app", create_once)
+    monkeypatch.setattr(
+        serve,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     monkeypatch.setattr(
         serve,
         "start_app_control",

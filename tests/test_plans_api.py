@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from types import SimpleNamespace
-
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event
@@ -16,11 +14,11 @@ from trading_assistant.analyst.models import (
     EntryPlan, ExitPlan, ExitTarget, Invalidation, PlanAction, Scenario, TradePlan, Tranche,
 )
 from trading_assistant.analyst.planning import PlanningService
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import build_test_app_container, create_app
 from trading_assistant.assets import AssetClass
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.synthetic import make_bars
-from trading_assistant.broker.alpaca import AlpacaClock
+from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.config import Secrets
 from trading_assistant.db.models import (
     AuditEvent,
@@ -31,7 +29,7 @@ from trading_assistant.db.models import (
     TradePlanRow,
 )
 from trading_assistant.dependencies import RequiredDependencyUnavailable
-from trading_assistant.risk.clock import FakeClock
+from trading_assistant.risk.clock import FakeClock, MarketClockObservation
 from trading_assistant.security.sensitive_fields import sensitive_store
 from trading_assistant.signals.models import MarketFeatures, Regime
 from tests.conftest import decrypt_test_sensitive
@@ -75,51 +73,61 @@ def _install_equity_clock(service, clock) -> None:
 
 
 def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
-    client = SimpleNamespace(
-        provider_marker=marker,
-        get_clock=lambda: SimpleNamespace(is_open=True),
-        get_calendar=lambda _request: [
-            SimpleNamespace(
-                date=CLOCK_NOW.date(),
-                open=raw_session_open,
-                close=datetime(2026, 7, 24, 16),
+    class MalformedCalendarFake(FakeClock):
+        provider_marker = marker
+
+        def observe(self, at):
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca market calendar"
             )
-        ],
-    )
-    return AlpacaClock(client)
+
+    return MalformedCalendarFake(is_open=True)
 
 
 def _race_alpaca_clock(later_current_state: bool):
     calls = {"clock": 0, "calendar": 0}
 
-    def get_clock():
-        calls["clock"] += 1
-        return SimpleNamespace(is_open=later_current_state)
+    class RaceCalendarFake(FakeClock):
+        def is_open(self, at=None):
+            if at is None:
+                calls["clock"] += 1
+                return later_current_state
+            return self.observe(at).is_open
 
-    def get_calendar(_request):
-        calls["calendar"] += 1
-        return [
-            SimpleNamespace(
-                date=datetime(2026, 7, 23).date(),
-                open=datetime(2026, 7, 23, 9, 30),
-                close=datetime(2026, 7, 23, 16),
-            ),
-            SimpleNamespace(
-                date=datetime(2026, 7, 24).date(),
-                open=datetime(2026, 7, 24, 9, 30),
-                close=datetime(2026, 7, 24, 16),
-            ),
-        ]
-
-    return (
-        AlpacaClock(
-            SimpleNamespace(
-                get_clock=get_clock,
-                get_calendar=get_calendar,
+        def observe(self, at):
+            calls["calendar"] += 1
+            session_open = datetime(
+                2026,
+                7,
+                24,
+                13,
+                30,
+                tzinfo=timezone.utc,
             )
-        ),
-        calls,
-    )
+            session_close = datetime(
+                2026,
+                7,
+                24,
+                20,
+                0,
+                tzinfo=timezone.utc,
+            )
+            previous_open = datetime(
+                2026,
+                7,
+                23,
+                13,
+                30,
+                tzinfo=timezone.utc,
+            )
+            return MarketClockObservation(
+                is_open=session_open <= at < session_close,
+                most_recent_open=(
+                    session_open if at >= session_open else previous_open
+                ),
+            )
+
+    return RaceCalendarFake(is_open=later_current_state), calls
 
 
 def _plan():
@@ -158,10 +166,6 @@ def test_planning_startup_internal_failure_is_not_hidden(
     monkeypatch,
 ):
     from trading_assistant.llm import factory as llm_factory
-    from trading_assistant.llm.budget import (
-        BudgetLimits,
-        ProviderBudgetService,
-    )
 
     marker = "internal-planning-startup-secret"
 
@@ -176,30 +180,14 @@ def test_planning_startup_internal_failure_is_not_hidden(
     )
     service = make_service()
     secrets = Secrets(app_api_token=TOKEN)
-    configured = service.config.security.provider_budget
-    container = SimpleNamespace(
-        config=service.config,
+    container = build_test_app_container(
+        service,
+        _StubAgent(),
         secrets=secrets,
-        service=service,
-        provider_budget=ProviderBudgetService(
-            service.session_factory,
-            BudgetLimits(
-                calls=configured.daily_calls,
-                input_tokens=configured.daily_input_tokens,
-                output_tokens=configured.daily_output_tokens,
-                reservation_ttl_seconds=(
-                    configured.reservation_ttl_seconds
-                ),
-            ),
-            prices=configured.prices,
-        ),
     )
 
     with pytest.raises(RuntimeError, match=marker):
-        create_app(
-            container=container,
-            agent=_StubAgent(),
-        )
+        create_app(container=container)
 
 
 @pytest.fixture

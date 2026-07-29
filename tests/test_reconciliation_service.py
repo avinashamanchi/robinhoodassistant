@@ -316,7 +316,7 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
 ):
     from fastapi.testclient import TestClient
 
-    from trading_assistant.app.main import create_test_app as create_app
+    from tests.app_factory import create_app
 
     service = make_service()
     active = service.create_conditional_rule(
@@ -418,7 +418,7 @@ def test_panic_local_enumeration_marks_partial_query_failure_unknown(
 ):
     from fastapi.testclient import TestClient
 
-    from trading_assistant.app.main import create_test_app as create_app
+    from tests.app_factory import create_app
 
     service = make_service()
 

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import create_app
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.config import BrokerKind, Secrets
 from trading_assistant.db.migrate import upgrade
@@ -88,10 +88,17 @@ def test_create_app_complete_explicit_injection_never_reads_ambient_secrets(
         bind_host="127.0.0.1",
     )
 
-    assert app.state.container is None
+    from trading_assistant import bootstrap
+
+    assert bootstrap._is_test_application_container(
+        app.state.container
+    )
     assert app.state.trading_service is service
     assert app.state.agent is agent
-    assert app.state.runtime_secrets is None
+    assert (
+        app.state.runtime_secrets.app_api_token.get_secret_value()
+        == "complete-explicit-token"
+    )
 
 
 def test_create_app_outside_container_requires_shared_container_for_auto_planning(
@@ -977,6 +984,7 @@ def test_public_production_container_rejects_non_alpaca_broker(
         build_container(
             app_config,
             _migrated_secrets(tmp_path),
+            runtime_role="daemon",
         )
 
 

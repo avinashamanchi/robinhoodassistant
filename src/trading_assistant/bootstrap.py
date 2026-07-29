@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from uuid import uuid4
 
@@ -22,7 +22,6 @@ from .config import (
     AppConfig,
     BrokerKind,
     TradingMode,
-    load_config,
 )
 from .db.schema import require_current_schema
 from .db.session import create_db_engine, make_session_factory
@@ -120,6 +119,24 @@ class ApplicationContainer:
     candidate_drafts: CandidateDraftService | None = None
     candidate_queue: CandidateQueueService | None = None
     startup_evidence: StartupPostureEvidence | None = None
+
+
+_TEST_CONTAINER_SEAL = object()
+
+
+@dataclass(frozen=True)
+class _TestApplicationContainer:
+    """Opaque test-only wrapper issued only after fake-capability checks."""
+
+    _source: object = field(repr=False)
+    _test_agent: object = field(repr=False)
+    _test_composition: object = field(
+        default=_TEST_CONTAINER_SEAL,
+        repr=False,
+    )
+
+    def __getattr__(self, name: str):
+        return getattr(self._source, name)
 
 
 @dataclass(frozen=True)
@@ -346,20 +363,31 @@ def build_quarantine_summarizer(
 
 
 def build_container(
-    config: AppConfig | None = None,
-    secrets: RuntimeSecrets | None = None,
+    config: AppConfig,
+    secrets: RuntimeSecrets,
     *,
-    runtime_role: str | None = None,
+    runtime_role: str,
+    startup_guard_receipt: StartupGuardReceipt | None = None,
     process_identity: ProcessIdentity | None = None,
     process_inspector=None,
     tenure_clock=None,
     tenure_owner_factory=None,
 ) -> ApplicationContainer:
-    config = config or load_config()
-    if secrets is None:
-        raise RuntimeError(
-            "build_container requires explicit RuntimeSecrets"
+    if runtime_role == "app":
+        if startup_guard_receipt is None:
+            raise RuntimeError("app_startup_guard_required")
+        return _build_guarded_container(
+            config,
+            secrets,
+            runtime_role=runtime_role,
+            startup_guard_receipt=startup_guard_receipt,
+            process_identity=process_identity,
+            process_inspector=process_inspector,
+            tenure_clock=tenure_clock,
+            tenure_owner_factory=tenure_owner_factory,
         )
+    if startup_guard_receipt is not None:
+        raise RuntimeError("startup_guard_receipt_role_invalid")
     return _build_container(
         config,
         secrets,
@@ -408,17 +436,110 @@ def build_test_container(
     *,
     broker: BrokerClient,
     clock,
+    service: TradingService | None = None,
+    agent: object | None = None,
+    source_container: object | None = None,
     runtime_role: str = "app",
-) -> ApplicationContainer:
+) -> ApplicationContainer | _TestApplicationContainer:
     """Compose with explicit fakes while retaining production-safe config."""
-    return _build_container(
-        config,
-        secrets,
-        broker=broker,
-        clock=clock,
-        runtime_role=runtime_role,
-        enforce_runtime_tenure=False,
+    if agent is not None:
+        _require_test_only_capabilities(broker, clock)
+    if service is None:
+        if source_container is not None:
+            raise RuntimeError("test_container_source_invalid")
+        source = _build_container(
+            config,
+            secrets,
+            broker=broker,
+            clock=clock,
+            runtime_role=runtime_role,
+            enforce_runtime_tenure=False,
+        )
+    else:
+        if service.config is not config:
+            raise RuntimeError("test_service_config_mismatch")
+        if service.broker is not broker or service.clock is not clock:
+            raise RuntimeError("test_service_capability_mismatch")
+        clocks = getattr(service, "_clocks", None)
+        if type(clocks) is not dict:
+            raise RuntimeError("production_test_capability_forbidden")
+        if agent is not None:
+            for configured_clock in clocks.values():
+                _require_test_only_capabilities(
+                    broker,
+                    configured_clock,
+                )
+        if (
+            source_container is None
+            or getattr(source_container, "config", None) is not config
+            or getattr(source_container, "secrets", None) is not secrets
+            or getattr(source_container, "service", None) is not service
+        ):
+            raise RuntimeError("test_container_source_invalid")
+        if (
+            getattr(source_container, "runtime_tenure_guard", None)
+            is not None
+            or getattr(source_container, "startup_evidence", None)
+            is not None
+        ):
+            raise RuntimeError("production_test_capability_forbidden")
+        source = source_container
+    if agent is None:
+        return source
+    return _TestApplicationContainer(
+        _source=source,
+        _test_agent=agent,
     )
+
+
+def _require_test_only_capabilities(
+    broker: object,
+    clock: object,
+) -> None:
+    from .broker.mock import MockBroker
+    from .risk.clock import CryptoClock, FakeClock
+
+    if not isinstance(broker, MockBroker):
+        raise RuntimeError("production_test_capability_forbidden")
+    if not isinstance(clock, (CryptoClock, FakeClock)):
+        raise RuntimeError("production_test_capability_forbidden")
+
+
+def _is_test_application_container(container: object) -> bool:
+    try:
+        if (
+            type(container) is not _TestApplicationContainer
+            or container._test_composition is not _TEST_CONTAINER_SEAL
+            or container._test_agent is None
+        ):
+            return False
+        source = container._source
+        service = source.service
+        if (
+            source.config is not service.config
+            or getattr(source, "runtime_tenure_guard", None)
+            is not None
+            or getattr(source, "startup_evidence", None)
+            is not None
+            or getattr(source.operations, "service", None)
+            is not service
+        ):
+            return False
+        _require_test_only_capabilities(
+            service.broker,
+            service.clock,
+        )
+        clocks = getattr(service, "_clocks", None)
+        if type(clocks) is not dict:
+            return False
+        for configured_clock in clocks.values():
+            _require_test_only_capabilities(
+                service.broker,
+                configured_clock,
+            )
+    except Exception:
+        return False
+    return True
 
 
 def build_preflight_service(

@@ -21,7 +21,7 @@ from trading_assistant.app.limits import (
     LimitSpec,
     LimitStoreUnavailable,
 )
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import create_app
 from trading_assistant.broker.alpaca import AlpacaBroker
 from trading_assistant.broker.base import BrokerSubmissionRejected
 from trading_assistant.broker.mock import MockBroker
@@ -232,11 +232,15 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
         "build_clock",
         lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
+    config = _alpaca_config(app_config)
+    secrets = _migrated_secrets(tmp_path)
 
     with _closed_runtime_container(
         bootstrap.build_container(
-            _alpaca_config(app_config),
-            _migrated_secrets(tmp_path),
+            config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
         )
     ) as container:
         with container.session_factory() as session:
@@ -307,10 +311,14 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
         "build_broker",
         lambda *_args, **_kwargs: MockBroker(),
     )
+    config = _alpaca_config(app_config)
+    secrets = _migrated_secrets(tmp_path)
     with pytest.raises(RuntimeError, match="exact AlpacaBroker"):
         bootstrap.build_container(
-            _alpaca_config(app_config),
-            _migrated_secrets(tmp_path),
+            config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
         )
 
     broker, trading = _paper_alpaca_broker()
@@ -325,9 +333,13 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
         BrokerSubmissionRejected,
         match="not official Alpaca paper",
     ):
+        config = _alpaca_config(app_config)
+        secrets = _migrated_secrets(tmp_path)
         bootstrap.build_container(
-            _alpaca_config(app_config),
-            _migrated_secrets(tmp_path),
+            config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
         )
 
 
@@ -405,12 +417,15 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
         "build_clock",
         lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
+    config = _alpaca_config(app_config)
+    secrets = _migrated_secrets(tmp_path)
 
     with _closed_runtime_container(
         bootstrap.build_container(
-            _alpaca_config(app_config),
-            _migrated_secrets(tmp_path),
+            config,
+            secrets,
             runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
         )
     ) as container:
         with container.session_factory() as session:
@@ -470,7 +485,7 @@ def test_daemon_container_remains_fail_closed_on_startup_reconciliation_failure(
     assert trading.cancel_calls == 0
 
 
-def test_create_app_builds_missing_agent_from_exact_injected_container(
+def test_create_test_app_uses_exact_injected_fake_stack(
     make_service,
     monkeypatch,
 ):
@@ -483,28 +498,22 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
     )
     container = _injected_container(service, secrets)
     agent = _StubAgent()
-    seen = []
 
     monkeypatch.setattr(
         app_main,
         "_build_agent",
-        lambda supplied: seen.append(supplied) or agent,
-    )
-    monkeypatch.setattr(
-        app_main,
-        "build_default_stack",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("injected container must not build a second stack")
+        lambda _supplied: (_ for _ in ()).throw(
+            AssertionError("test app must use its injected fake agent")
         ),
     )
 
     app = create_app(
         container=container,
+        agent=agent,
         planning=None,
     )
 
-    assert seen == [container]
-    assert app.state.container is container
+    assert app.state.container.service is container.service
     assert app.state.trading_service is container.service
     assert app.state.agent is agent
     assert app.state.runtime_secrets is container.secrets
@@ -660,6 +669,17 @@ def _issue_guard_receipt(posture, config, secrets, *, runtime_role="app"):
         secret_loaded_at=datetime.now(timezone.utc)
         - timedelta(seconds=1),
         runtime_role=runtime_role,
+    )
+
+
+def _app_receipt(config, secrets):
+    from trading_assistant.operations import security_posture as posture
+
+    return _issue_guard_receipt(
+        posture,
+        config,
+        secrets,
+        runtime_role="app",
     )
 
 
@@ -911,7 +931,7 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
     )
     with pytest.raises(
         RuntimeError,
-        match="guarded container requires guarded app composition",
+        match="^production_test_capability_forbidden$",
     ):
         create_app(
             container=container,
@@ -2297,7 +2317,11 @@ def test_bootstrap_rejects_every_dangerous_runtime_switch(
     unsafe = safe.model_copy(update=config_update(safe))
 
     with pytest.raises(RuntimeError, match=message):
-        build_container(unsafe, _migrated_secrets(tmp_path))
+        build_container(
+            unsafe,
+            _migrated_secrets(tmp_path),
+            runtime_role="daemon",
+        )
 
 
 def test_bootstrap_rejects_outdated_schema_before_provider_construction(
@@ -2325,6 +2349,7 @@ def test_bootstrap_rejects_outdated_schema_before_provider_construction(
                 database_url=database_url,
                 app_api_token="operator-secret-for-bootstrap-tests",
             ),
+            runtime_role="daemon",
         )
 
     assert broker_built is False
@@ -2383,12 +2408,14 @@ def test_active_maintenance_blocks_bootstrap_before_broker_construction(
         raise AssertionError("broker construction must follow runtime tenure")
 
     monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
+    config = _alpaca_config(app_config)
 
     with pytest.raises(TenureUnavailable) as exc:
         bootstrap.build_container(
-            _alpaca_config(app_config),
+            config,
             secrets,
             runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
             process_identity=ProcessIdentity(5102, "app-start"),
             process_inspector=inspector,
         )
@@ -2428,12 +2455,14 @@ def test_plaintext_sensitive_field_blocks_before_broker_construction(
         raise AssertionError("broker must follow full crypto scan")
 
     monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
+    config = _alpaca_config(app_config)
 
     with pytest.raises(bootstrap.StartupEncryptionBlocked) as exc:
         bootstrap.build_container(
-            _alpaca_config(app_config),
+            config,
             secrets,
             runtime_role="app",
+            startup_guard_receipt=_app_receipt(config, secrets),
             process_identity=ProcessIdentity(5110, "app-start"),
             process_inspector=_UnknownProcessInspector(),
         )
@@ -2581,6 +2610,9 @@ def test_runtime_guard_setup_failure_closes_acquired_tenure(
 def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
     make_service,
 ):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.operations import security_posture as posture
+
     service = make_service()
     secrets = Secrets(
         database_url=str(service.session_factory.kw["bind"].url),
@@ -2604,8 +2636,30 @@ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
     )
     guard.start()
     container.runtime_tenure_guard = guard
+    receipt = _app_receipt(service.config, secrets)
+    consumed = posture._consume_startup_guard_receipt(
+        receipt,
+        config=service.config,
+        secrets=secrets,
+        runtime_role="app",
+    )
+    container.startup_evidence = posture._validate_consumed_startup_guard(
+        consumed,
+        config=service.config,
+        secrets=secrets,
+        runtime_role="app",
+    )
+    container.operations = OperationsService(
+        service,
+        container.audit,
+        rate_limiter=container.rate_limiter,
+        provider_budget=container.provider_budget,
+        _consumed_startup_guard=consumed,
+        _startup_secrets=secrets,
+        _startup_runtime_role="app",
+    )
     with _closed_runtime_container(container):
-        app = create_app(
+        app = app_main._create_guarded_app(
             container=container,
             agent=_StubAgent(),
             planning=None,

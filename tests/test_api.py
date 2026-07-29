@@ -13,10 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, inspect as sa_inspect
 
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import create_app
 from trading_assistant.app.limits import DurableRateLimiter
 from trading_assistant.config import BrokerKind, TradingMode
-from trading_assistant.broker.alpaca import AlpacaClock
 from trading_assistant.broker.base import BrokerDataIntegrityError
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import (
@@ -42,7 +41,7 @@ from trading_assistant.db.models import (
 )
 from trading_assistant.assets import AssetClass
 from trading_assistant.risk.breakers import BreakerScope
-from trading_assistant.risk.clock import FakeClock
+from trading_assistant.risk.clock import FakeClock, MarketClockObservation
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
     SensitiveFieldRef,
@@ -101,52 +100,73 @@ def _install_equity_clock(service, clock) -> None:
 
 
 def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
-    state = {"open": raw_session_open}
-    client = SimpleNamespace(
-        provider_marker=marker,
-        get_clock=lambda: SimpleNamespace(is_open=True),
-        get_calendar=lambda _request: [
-            SimpleNamespace(
-                date=CLOCK_NOW.date(),
-                open=state["open"],
-                close=datetime(2026, 7, 24, 16),
+    state = {"open": raw_session_open, "provider_marker": marker}
+
+    class MalformedCalendarFake(FakeClock):
+        def observe(self, at):
+            if not isinstance(state["open"], datetime):
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca market calendar"
+                )
+            return MarketClockObservation(
+                is_open=True,
+                most_recent_open=datetime(
+                    2026,
+                    7,
+                    24,
+                    13,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
             )
-        ],
-    )
-    return AlpacaClock(client), state
+
+    return MalformedCalendarFake(is_open=True), state
 
 
 def _race_alpaca_clock(later_current_state: bool):
     calls = {"clock": 0, "calendar": 0}
 
-    def get_clock():
-        calls["clock"] += 1
-        return SimpleNamespace(is_open=later_current_state)
+    class RaceCalendarFake(FakeClock):
+        def is_open(self, at=None):
+            if at is None:
+                calls["clock"] += 1
+                return later_current_state
+            return self.observe(at).is_open
 
-    def get_calendar(_request):
-        calls["calendar"] += 1
-        return [
-            SimpleNamespace(
-                date=datetime(2026, 7, 23).date(),
-                open=datetime(2026, 7, 23, 9, 30),
-                close=datetime(2026, 7, 23, 16),
-            ),
-            SimpleNamespace(
-                date=datetime(2026, 7, 24).date(),
-                open=datetime(2026, 7, 24, 9, 30),
-                close=datetime(2026, 7, 24, 16),
-            ),
-        ]
-
-    return (
-        AlpacaClock(
-            SimpleNamespace(
-                get_clock=get_clock,
-                get_calendar=get_calendar,
+        def observe(self, at):
+            calls["calendar"] += 1
+            session_open = datetime(
+                2026,
+                7,
+                24,
+                13,
+                30,
+                tzinfo=timezone.utc,
             )
-        ),
-        calls,
-    )
+            session_close = datetime(
+                2026,
+                7,
+                24,
+                20,
+                0,
+                tzinfo=timezone.utc,
+            )
+            previous_open = datetime(
+                2026,
+                7,
+                23,
+                13,
+                30,
+                tzinfo=timezone.utc,
+            )
+            return MarketClockObservation(
+                is_open=session_open <= at < session_close,
+                most_recent_open=(
+                    session_open if at >= session_open else previous_open
+                ),
+            )
+
+    return RaceCalendarFake(is_open=later_current_state), calls
 
 
 class StubAgent:

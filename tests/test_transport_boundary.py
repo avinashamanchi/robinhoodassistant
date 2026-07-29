@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import ipaddress
 import os
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from cryptography.x509.verification import (
 )
 from fastapi.testclient import TestClient
 
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import create_app
 from trading_assistant.db.models import (
     AuditEvent,
     AuthSession,
@@ -91,6 +92,11 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
         serve,
         "load_role_secrets",
         lambda *_args, **_kwargs: secrets,
+    )
+    monkeypatch.setattr(
+        serve,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
     )
 
     def run_guard(*, config, secrets: object, secret_loaded_at, **_kwargs):

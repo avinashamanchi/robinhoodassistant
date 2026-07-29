@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +38,457 @@ def _issue_app_receipt(config, secrets):
         secret_loaded_at=observed_at - timedelta(seconds=1),
         runtime_role="app",
     )
+
+
+def test_public_build_container_has_no_ambient_app_default():
+    from trading_assistant import bootstrap
+
+    with pytest.raises(TypeError):
+        bootstrap.build_container()
+
+
+def test_public_build_container_requires_receipt_for_explicit_app(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unguarded app authority was constructed"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^app_startup_guard_required$",
+    ):
+        bootstrap.build_container(
+            app_config,
+            Secrets(app_api_token="plan2-app-boundary-token"),
+            runtime_role="app",
+        )
+
+
+def test_create_test_app_rejects_ordinary_build_container_result(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.app import main as app_main
+
+    ordinary = SimpleNamespace()
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: ordinary,
+    )
+    container = bootstrap.build_container(
+        app_config,
+        Secrets(app_api_token="plan2-ordinary-container-token"),
+        runtime_role="daemon",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
+def test_create_test_app_accepts_only_marked_fake_container(
+    app_config,
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from tests.app_factory import build_test_app_container
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    service = make_service()
+    agent = Agent()
+    secrets = Secrets(
+        app_api_token="plan2-marked-test-container-token"
+    )
+    container = build_test_app_container(
+        service,
+        agent,
+        secrets=secrets,
+    )
+
+    app = app_main.create_test_app(
+        container=container,
+        planning=None,
+    )
+
+    assert app.state.container is container
+    assert app.state.trading_service is service
+    assert app.state.agent is agent
+
+
+def test_test_container_builder_rejects_production_broker_capability(
+    app_config,
+    session_factory,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from trading_assistant.risk.clock import FakeClock
+    from trading_assistant.service import TradingService
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    broker = AlpacaBroker(SimpleNamespace(), SimpleNamespace())
+    clock = FakeClock(is_open=True)
+    service = TradingService(
+        broker,
+        session_factory,
+        app_config,
+        clock,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        bootstrap.build_test_container(
+            app_config,
+            Secrets(
+                app_api_token="plan2-production-capability-token"
+            ),
+            broker=broker,
+            clock=clock,
+            service=service,
+            agent=Agent(),
+        )
+
+
+def test_test_container_builder_rejects_nested_production_clock_capability(
+    app_config,
+    make_service,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.broker.alpaca import AlpacaClock
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    service = make_service()
+    service._clocks[AssetClass.CRYPTO] = AlpacaClock(
+        SimpleNamespace()
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        bootstrap.build_test_container(
+            app_config,
+            Secrets(
+                app_api_token="plan2-nested-capability-token"
+            ),
+            broker=service.broker,
+            clock=service.clock,
+            service=service,
+            agent=Agent(),
+        )
+
+
+def test_test_container_builder_rejects_wrapped_production_broker(
+    app_config,
+    session_factory,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from trading_assistant.ops.safety_drill import (
+        _CrashAfterAcceptanceOnceBroker,
+    )
+    from trading_assistant.risk.clock import FakeClock
+    from trading_assistant.service import TradingService
+    from tests.app_factory import build_test_app_container
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    broker = _CrashAfterAcceptanceOnceBroker(
+        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
+    )
+    service = TradingService(
+        broker,
+        session_factory,
+        app_config,
+        FakeClock(is_open=True),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            Agent(),
+            secrets=Secrets(
+                app_api_token="plan2-wrapped-capability-token"
+            ),
+        )
+
+
+def test_non_app_test_composition_is_not_an_app_test_authority(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.risk.clock import FakeClock
+
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            runtime_tenure_guard=None,
+        ),
+    )
+
+    container = bootstrap.build_test_container(
+        app_config,
+        Secrets(app_api_token="plan2-non-app-test-token"),
+        broker=MockBroker(),
+        clock=FakeClock(is_open=True),
+    )
+
+    assert bootstrap._is_test_application_container(container) is False
+
+
+def test_marked_test_container_revalidates_fake_capabilities_at_use(
+    app_config,
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Agent:
+        def chat(self, message, **context):
+            return {"reply": message, "context": context}
+
+    service = make_service()
+    container = build_test_app_container(
+        service,
+        Agent(),
+        secrets=Secrets(
+            app_api_token="plan2-revalidate-test-token"
+        ),
+    )
+    service.broker = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
+def test_app_prebuild_failure_logs_stable_marker_and_preserves_exception(
+    app_config,
+    caplog,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant import logging as runtime_logging
+    from trading_assistant.app import main as app_main
+
+    secret = "plan2-prebuild-sensitive-token"
+    secrets = Secrets(app_api_token=secret)
+    receipt = _issue_app_receipt(app_config, secrets)
+    failure = RuntimeError(f"prebuild failed with {secret}")
+
+    monkeypatch.setattr(
+        runtime_logging,
+        "configure_runtime_logging",
+        lambda role, loaded: None,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="trading_assistant.startup",
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            app_main.create_app(
+                config=app_config,
+                secrets=secrets,
+                startup_guard_receipt=receipt,
+            )
+
+    assert raised.value is failure
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "trading_assistant.startup"
+    ]
+    assert messages == ["startup_failed role=app"]
+    assert secret not in caplog.text
+
+
+def test_app_postbuild_failure_logs_and_closes_once_without_replacement(
+    app_config,
+    caplog,
+    monkeypatch,
+):
+    from trading_assistant import logging as runtime_logging
+    from trading_assistant.app import main as app_main
+
+    class Guard:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            return True
+
+    secret = "plan2-postbuild-sensitive-token"
+    secrets = Secrets(app_api_token=secret)
+    receipt = _issue_app_receipt(app_config, secrets)
+    guard = Guard()
+    container = SimpleNamespace(runtime_tenure_guard=guard)
+    failure = RuntimeError(f"app failed with {secret}")
+
+    monkeypatch.setattr(
+        runtime_logging,
+        "configure_runtime_logging",
+        lambda role, loaded: None,
+    )
+    monkeypatch.setattr(
+        app_main,
+        "build_default_container",
+        lambda **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        app_main,
+        "_create_guarded_app",
+        lambda **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="trading_assistant.startup",
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            app_main.create_app(
+                config=app_config,
+                secrets=secrets,
+                startup_guard_receipt=receipt,
+            )
+
+    assert raised.value is failure
+    assert guard.close_calls == 1
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "trading_assistant.startup"
+    ]
+    assert messages == ["startup_failed role=app"]
+    assert secret not in caplog.text
+
+
+def test_canonical_launcher_prebuild_failure_logs_and_preserves_cleanup(
+    app_config,
+    caplog,
+    monkeypatch,
+):
+    from trading_assistant import logging as runtime_logging
+    from trading_assistant.ops import serve
+
+    class Control:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    secret = "plan2-launcher-prebuild-sensitive-token"
+    secrets = Secrets(app_api_token=secret)
+    provider = SimpleNamespace(
+        last_successful_role_load_at=datetime.now(timezone.utc)
+    )
+    control = Control()
+    failure = RuntimeError(f"launcher failed with {secret}")
+
+    monkeypatch.setattr(serve, "load_config", lambda: app_config)
+    monkeypatch.setattr(
+        serve,
+        "MacOSKeychainSecretProvider",
+        lambda: provider,
+    )
+    monkeypatch.setattr(
+        serve,
+        "load_role_secrets",
+        lambda *_args, **_kwargs: secrets,
+    )
+    monkeypatch.setattr(
+        serve,
+        "run_startup_guard",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        serve,
+        "start_app_control",
+        lambda _path: control,
+    )
+    monkeypatch.setattr(
+        serve,
+        "_build_guarded_container",
+        lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(failure)
+        ),
+    )
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "Server",
+        lambda *_args, **_kwargs: pytest.fail(
+            "uvicorn must follow guarded composition"
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_logging,
+        "configure_runtime_logging",
+        lambda role, loaded: None,
+    )
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="trading_assistant.startup",
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            serve.main()
+
+    assert raised.value is failure
+    assert control.close_calls == 1
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "trading_assistant.startup"
+    ]
+    assert messages == ["startup_failed role=app"]
+    assert secret not in caplog.text
 
 
 def test_public_automatic_app_factory_refuses_before_ambient_or_authority_build(
@@ -128,6 +581,7 @@ def test_public_production_factory_consumes_receipt_before_app_creation(
     monkeypatch,
 ):
     from trading_assistant import bootstrap
+    from trading_assistant import logging as runtime_logging
     from trading_assistant.app import main as app_main
 
     secrets = Secrets(app_api_token="plan2-public-factory-token")
@@ -144,6 +598,11 @@ def test_public_production_factory_consumes_receipt_before_app_creation(
         app_main,
         "_create_guarded_app",
         lambda *, container: created.append(container) or "app",
+    )
+    monkeypatch.setattr(
+        runtime_logging,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
     )
 
     assert (
@@ -171,6 +630,7 @@ def test_explicit_unguarded_stack_requires_named_test_factory(
     make_service,
 ):
     from trading_assistant.app import main as app_main
+    from tests.app_factory import create_app as create_fake_app
 
     class Agent:
         def chat(self, message, **context):
@@ -188,7 +648,17 @@ def test_explicit_unguarded_stack_requires_named_test_factory(
             planning=None,
         )
 
-    test_app = app_main.create_test_app(
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            service=service,
+            agent=Agent(),
+            api_token="plan2-explicit-test-token",
+            planning=None,
+        )
+    test_app = create_fake_app(
         service=service,
         agent=Agent(),
         api_token="plan2-explicit-test-token",

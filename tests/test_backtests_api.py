@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 import trading_assistant.backtest.runner as runner
 from trading_assistant.app.limits import ConcurrencyLeaseService
-from trading_assistant.app.main import create_test_app as create_app
+from tests.app_factory import create_app
 from trading_assistant.db.models import (
     AuditEvent,
     BacktestRun,

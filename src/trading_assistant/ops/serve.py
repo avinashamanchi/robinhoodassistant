@@ -20,6 +20,7 @@ from ..bootstrap import _build_guarded_container
 from ..config import load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine
+from ..logging import runtime_startup
 from ..preflight import (
     SensitiveEncryptionStateInspector,
     StructuralCheck,
@@ -194,71 +195,76 @@ def main(argv: list[str] | None = None) -> int:
         secrets=secrets,
         secret_loaded_at=secret_loaded_at,
     )
-    control = start_app_control(Path.cwd())
-    app = None
-    try:
-        container = _build_guarded_container(
-            config,
-            secrets,
-            runtime_role="app",
-            startup_guard_receipt=startup_guard_receipt,
-        )
-        app = _create_guarded_app(
-            container=container,
-        )
-        server = uvicorn.Server(
-            uvicorn.Config(
-                app,
-                host=config.server.bind_host,
-                port=config.server.port,
-                ssl_certfile=str(config.server.tls_cert_path),
-                ssl_keyfile=str(config.server.tls_key_path),
-                proxy_headers=False,
-                forwarded_allow_ips="",
-                access_log=False,
-            )
-        )
-        install_shutdown = getattr(
-            app.state,
-            "install_controlled_shutdown",
-            None,
-        )
-        if not callable(install_shutdown):
-            raise RuntimeError("runtime_tenure_shutdown_owner_missing")
-        install_shutdown(lambda: setattr(server, "should_exit", True))
-        server.run()
-    finally:
+    with runtime_startup("app", secrets):
+        control = start_app_control(Path.cwd())
+        app = None
         try:
-            if app is not None:
-                guard = getattr(
-                    app.state,
-                    "runtime_tenure_guard",
-                    None,
+            container = _build_guarded_container(
+                config,
+                secrets,
+                runtime_role="app",
+                startup_guard_receipt=startup_guard_receipt,
+            )
+            app = _create_guarded_app(
+                container=container,
+            )
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=config.server.bind_host,
+                    port=config.server.port,
+                    ssl_certfile=str(config.server.tls_cert_path),
+                    ssl_keyfile=str(config.server.tls_key_path),
+                    proxy_headers=False,
+                    forwarded_allow_ips="",
+                    access_log=False,
                 )
-                if guard is not None:
-                    if (
-                        not getattr(guard, "closed", False)
-                        and not guard.close()
-                    ):
-                        raise RuntimeError(
-                            "runtime_tenure_cleanup_uncertain"
-                        )
-                    close_result = getattr(
-                        guard,
-                        "close_result",
+            )
+            install_shutdown = getattr(
+                app.state,
+                "install_controlled_shutdown",
+                None,
+            )
+            if not callable(install_shutdown):
+                raise RuntimeError(
+                    "runtime_tenure_shutdown_owner_missing"
+                )
+            install_shutdown(
+                lambda: setattr(server, "should_exit", True)
+            )
+            server.run()
+        finally:
+            try:
+                if app is not None:
+                    guard = getattr(
+                        app.state,
+                        "runtime_tenure_guard",
                         None,
                     )
-                    close_value = getattr(
-                        close_result,
-                        "value",
-                        close_result,
-                    )
-                    if close_value == "uncertain":
-                        raise RuntimeError(
-                            "runtime_tenure_cleanup_uncertain"
+                    if guard is not None:
+                        if (
+                            not getattr(guard, "closed", False)
+                            and not guard.close()
+                        ):
+                            raise RuntimeError(
+                                "runtime_tenure_cleanup_uncertain"
+                            )
+                        close_result = getattr(
+                            guard,
+                            "close_result",
+                            None,
                         )
-        finally:
-            control.close()
+                        close_value = getattr(
+                            close_result,
+                            "value",
+                            close_result,
+                        )
+                        if close_value == "uncertain":
+                            raise RuntimeError(
+                                "runtime_tenure_cleanup_uncertain"
+                            )
+            finally:
+                control.close()
     return 0
 
 

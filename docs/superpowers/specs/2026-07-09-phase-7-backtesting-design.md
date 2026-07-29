@@ -14,7 +14,9 @@
    graded-call linkage to `AnalysisReport`s. `MarketFeatures` and `playbook.md` are still
    built now (strategies consume `MarketFeatures`; the playbook ships as a doc).
 2. **Crypto is a real asset class in the paper runtime** (not backtest-only),
-   but it is not a live-trading asset class. This modifies Phase 1–3 code (§1).
+   but it is not a live-trading asset class. This modifies the shared runtime
+   architecture only for backtesting and paper operation (§1); this release
+   rejects live mode.
    **Hard condition:** the entire existing Phase 1 risk + kill-switch
    suite must pass unchanged, plus new tests proving equity/crypto trip independently and
    the crypto clock is always-open while the equity clock is unaffected.
@@ -145,8 +147,10 @@ asset class with the most turnover.
 ## 8. Guardrails (permanent)
 
 1. **Holdout is sacred** — `HoldoutGuard` blocks sweeps on it and logs access.
-2. Backtest results **never auto-enable** anything; promotion stays a manual config change and
-   the Phase 6 "50 graded calls" gate still applies on top (when Phase 6 exists).
+2. Backtest results **never auto-enable** anything. Promotion is an evaluation
+   label only: it cannot enable live mode and is not a live configuration path.
+   The Phase 6 "50 graded calls" gate remains a paper-evaluation requirement
+   (when Phase 6 exists).
 3. Every simulated result in the UI carries: **"Simulated — past performance does not predict
    future results."**
 4. **No lookahead** — the `DataView` test (single name + SPY context) runs in CI forever.
@@ -159,7 +163,8 @@ stamped Simulated.
 
 ## 10. Build order & review checkpoints
 
-`assets` + config + **§1 asset-class live-path change (existing suite must stay green)** →
+`assets` + config + **§1 shared runtime/paper change (live mode remains rejected;
+existing suite must stay green)** →
 `signals` → `strategies` → `data` (synthetic for tests) → **`sim_broker` + `engine` +
 no-lookahead `DataView` test** ⏸️ **STOP for review** → `evaluate` + **first walk-forward
 baseline report** ⏸️ **STOP for review (before any LLM run)** → `situations` → `stress/` → UI.

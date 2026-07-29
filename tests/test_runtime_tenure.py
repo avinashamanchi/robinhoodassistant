@@ -531,7 +531,7 @@ def test_app_rejects_mutations_immediately_after_tenure_loss(
 ):
     from fastapi.testclient import TestClient
 
-    from trading_assistant.app.main import create_test_app as create_app
+    from tests.app_factory import create_app
 
     class StubAgent:
         def chat(self, _message, **_context):
