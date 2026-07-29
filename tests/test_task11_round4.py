@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from trading_assistant import preflight
 from trading_assistant.broker.models import (
     OrderResult,
     OrderStatus,
@@ -31,6 +32,113 @@ from trading_assistant.security.secrets import (
     secret_is_set,
 )
 from trading_assistant.security.sensitive_fields import persist_sensitive
+
+
+_ALL_SIMPLE_SECRET_FIELDS = (
+    "anthropic_api_key",
+    "gemini_api_key",
+    "groq_api_key",
+    "openrouter_api_key",
+    "app_api_token",
+    "alpaca_api_key",
+    "alpaca_secret_key",
+    "database_url",
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "candidate_signing_key",
+    "backup_encryption_key",
+    "live_trading_confirm",
+)
+_DEFAULT_ROLE_VISIBLE_SIMPLE_FIELDS = {
+    "app": frozenset(
+        {
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "gemini_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "live_trading_confirm",
+        }
+    ),
+    "backup": frozenset(
+        {
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+        }
+    ),
+    "daemon": frozenset(
+        {
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "gemini_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "live_trading_confirm",
+        }
+    ),
+    "mcp": frozenset(
+        {
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+        }
+    ),
+    "migration": frozenset(
+        {
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+        }
+    ),
+    "paper-drill": frozenset(
+        {
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+        }
+    ),
+    "preflight": frozenset(
+        {
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "gemini_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "live_trading_confirm",
+        }
+    ),
+    "safety-drill": frozenset(
+        {
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "live_trading_confirm",
+        }
+    ),
+    "validate-analyst": frozenset(
+        {
+            "database_url",
+            "gemini_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+        }
+    ),
+}
 
 
 def _key(label: str) -> str:
@@ -73,7 +181,7 @@ def _role_secret_values(app_config) -> dict[str, str]:
         "telegram_chat_id": "",
         "candidate_signing_key": _key("round4-candidate"),
         "backup_encryption_key": _key("round4-backup"),
-        "live_trading_confirm": "",
+        "live_trading_confirm": "round4-live-confirm-present",
     }
     for key_id in (
         app_config.encryption.active_key_id,
@@ -132,42 +240,150 @@ def test_watchdog_keychain_load_requests_and_receives_only_database_url(
         "validate-analyst",
     ],
 )
-def test_other_keychain_roles_keep_exact_required_secret_projection(
+def test_other_keychain_roles_request_and_receive_exact_visible_secrets(
     app_config,
     role,
 ):
-    from trading_assistant.security.secrets import _required_fields
-
-    backend = RecordingKeyring(_role_secret_values(app_config))
+    config = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"news_enabled": False}
+            ),
+            "features": app_config.features.model_copy(
+                update={
+                    "shadow_mode": True,
+                    "telegram_notifications": False,
+                }
+            ),
+            "llm": app_config.llm.model_copy(
+                update={"provider": "gemini"}
+            ),
+        }
+    )
+    backend = RecordingKeyring(_role_secret_values(config))
 
     loaded = load_role_secrets(
         role,
+        config=config,
+        provider=MacOSKeychainSecretProvider(backend=backend),
+    )
+
+    expected_simple = _DEFAULT_ROLE_VISIBLE_SIMPLE_FIELDS[role]
+    expected_accounts = {
+        *expected_simple,
+        *(
+                f"field-encryption/{key_id}"
+                for key_id in (
+                    config.encryption.active_key_id,
+                    *config.encryption.retained_key_ids,
+                )
+            ),
+        }
+    assert set(backend.accounts) == expected_accounts
+    assert len(backend.accounts) == len(expected_accounts)
+    assert {
+        field
+        for field in _ALL_SIMPLE_SECRET_FIELDS
+        if secret_is_set(getattr(loaded, field))
+    } == expected_simple
+    assert set(loaded.field_encryption_keys) == {
+        config.encryption.active_key_id,
+        *config.encryption.retained_key_ids,
+    }
+
+
+def test_safety_drill_retains_optional_alpaca_paper_branch_credentials(
+    app_config,
+):
+    values = _role_secret_values(app_config)
+    values["live_trading_confirm"] = ""
+    backend = RecordingKeyring(values)
+
+    loaded = load_role_secrets(
+        "safety-drill",
         config=app_config,
         provider=MacOSKeychainSecretProvider(backend=backend),
     )
 
-    expected_simple = {
-        *_required_fields(role, app_config),
-        "candidate_signing_key",
-        "backup_encryption_key",
-    }
-    expected_accounts = {
-        *expected_simple,
-        *(
-            f"field-encryption/{key_id}"
-            for key_id in (
-                app_config.encryption.active_key_id,
-                *app_config.encryption.retained_key_ids,
-            )
-        ),
-    }
-    assert set(backend.accounts) == expected_accounts
-    assert len(backend.accounts) == len(expected_accounts)
-    assert all(secret_is_set(getattr(loaded, field)) for field in expected_simple)
-    assert set(loaded.field_encryption_keys) == {
-        app_config.encryption.active_key_id,
-        *app_config.encryption.retained_key_ids,
-    }
+    assert backend.accounts.count("alpaca_api_key") == 1
+    assert backend.accounts.count("alpaca_secret_key") == 1
+    assert loaded.alpaca_api_key.get_secret_value() == "round4-paper-key"
+    assert (
+        loaded.alpaca_secret_key.get_secret_value()
+        == "round4-paper-secret"
+    )
+
+
+def test_safety_drill_paper_credentials_remain_optional_at_startup(
+    app_config,
+):
+    values = _role_secret_values(app_config)
+    values["alpaca_api_key"] = ""
+    values["alpaca_secret_key"] = ""
+    values["live_trading_confirm"] = ""
+    backend = RecordingKeyring(values)
+
+    loaded = load_role_secrets(
+        "safety-drill",
+        config=app_config,
+        provider=MacOSKeychainSecretProvider(backend=backend),
+    )
+
+    assert not secret_is_set(loaded.alpaca_api_key)
+    assert not secret_is_set(loaded.alpaca_secret_key)
+    assert secret_is_set(loaded.database_url)
+
+
+def test_preflight_live_confirmation_cannot_be_projected_to_all_disabled(
+    app_config,
+):
+    backend = RecordingKeyring(_role_secret_values(app_config))
+
+    loaded = load_role_secrets(
+        "preflight",
+        config=app_config,
+        provider=MacOSKeychainSecretProvider(backend=backend),
+    )
+    result = preflight._dangerous_switches_off(app_config, loaded)
+
+    assert backend.accounts.count("live_trading_confirm") == 1
+    assert result == preflight.Result(
+        "dangerous switches OFF",
+        preflight.FAIL,
+        "enabled=live_confirmation",
+    )
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["mcp", "paper-drill", "safety-drill"],
+)
+def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
+    app_config,
+    role,
+):
+    config = app_config.model_copy(
+        update={
+            "analyst": app_config.analyst.model_copy(
+                update={"news_enabled": True}
+            ),
+            "llm": app_config.llm.model_copy(
+                update={"provider": "gemini"}
+            ),
+        }
+    )
+    backend = RecordingKeyring(_role_secret_values(config))
+
+    loaded = load_role_secrets(
+        role,
+        config=config,
+        provider=MacOSKeychainSecretProvider(backend=backend),
+    )
+
+    assert backend.accounts.count("gemini_api_key") == 1
+    assert secret_is_set(loaded.gemini_api_key)
+    assert "anthropic_api_key" not in backend.accounts
+    assert "groq_api_key" not in backend.accounts
 
 
 class SnapshotBroker:

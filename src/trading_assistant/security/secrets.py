@@ -60,45 +60,163 @@ _PRODUCTION_ROLES = frozenset(
 _DEVELOPMENT_ENVIRONMENT_ROLES = frozenset(
     {"migration", "safety-drill"}
 )
-_ROLE_REQUIRED_FIELDS = {
-    "app": (
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-    ),
-    "backup": ("database_url",),
-    "daemon": (
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-    ),
-    "mcp": (
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-    ),
-    "migration": ("database_url",),
-    "paper-drill": (
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-    ),
-    "preflight": (
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-    ),
-    "safety-drill": ("database_url",),
-    "validate-analyst": ("database_url",),
-    "watchdog": ("database_url",),
-}
-_LLM_ROLES = frozenset(
+_ROLE_REQUIRED_FIELDS = MappingProxyType(
+    {
+        "app": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+        ),
+        "backup": ("database_url",),
+        "daemon": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+        ),
+        "mcp": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+        ),
+        "migration": ("database_url",),
+        "paper-drill": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+        ),
+        "preflight": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+        ),
+        "safety-drill": ("database_url",),
+        "validate-analyst": ("database_url",),
+        "watchdog": ("database_url",),
+    }
+)
+_ROLE_VISIBLE_FIELDS = MappingProxyType(
+    {
+        "app": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "telegram_bot_token",
+            "telegram_chat_id",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+            "live_trading_confirm",
+        ),
+        "backup": (
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+        ),
+        "daemon": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "telegram_bot_token",
+            "telegram_chat_id",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+            "live_trading_confirm",
+        ),
+        "mcp": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+        ),
+        "migration": (
+            "database_url",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+        ),
+        "paper-drill": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+        ),
+        "preflight": (
+            "app_api_token",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "telegram_bot_token",
+            "telegram_chat_id",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+            "live_trading_confirm",
+        ),
+        "safety-drill": (
+            "database_url",
+            "alpaca_api_key",
+            "alpaca_secret_key",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+            "live_trading_confirm",
+        ),
+        "validate-analyst": (
+            "database_url",
+            "anthropic_api_key",
+            "gemini_api_key",
+            "groq_api_key",
+            "candidate_signing_key",
+            "backup_encryption_key",
+            "field_encryption_keys",
+        ),
+        "watchdog": ("database_url",),
+    }
+)
+_LLM_REQUIRED_ROLES = frozenset(
     {"app", "daemon", "preflight", "validate-analyst"}
+)
+_NEWS_LLM_ROLES = frozenset(
+    {"mcp", "paper-drill", "safety-drill"}
+)
+_LLM_SECRET_FIELDS = frozenset(
+    {"anthropic_api_key", "gemini_api_key", "groq_api_key"}
+)
+_TELEGRAM_SECRET_FIELDS = frozenset(
+    {"telegram_bot_token", "telegram_chat_id"}
 )
 _KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,63}")
 _KNOWN_EXAMPLE_KEY_MATERIAL = (
@@ -565,7 +683,7 @@ def _selected_llm_secret_field(config: AppConfig) -> str:
 
 def _required_fields(role: str, config: AppConfig) -> tuple[str, ...]:
     fields = list(_ROLE_REQUIRED_FIELDS[role])
-    if role in _LLM_ROLES:
+    if role in _LLM_REQUIRED_ROLES:
         fields.append(_selected_llm_secret_field(config))
     if config.features.telegram_notifications and role in {
         "app",
@@ -578,22 +696,62 @@ def _required_fields(role: str, config: AppConfig) -> tuple[str, ...]:
 
 def _role_requires_key_material(role: str) -> bool:
     """Watchdog is the sole role with no cryptographic write capability."""
-    return role != "watchdog"
+    return "field_encryption_keys" in _ROLE_VISIBLE_FIELDS[role]
+
+
+def _role_visible_fields(
+    role: str,
+    config: AppConfig,
+) -> tuple[str, ...]:
+    allowed_fields = _ROLE_VISIBLE_FIELDS[role]
+    llm_visible = (
+        role in _LLM_REQUIRED_ROLES
+        or (
+            role in _NEWS_LLM_ROLES
+            and config.analyst.news_enabled
+        )
+    )
+    selected_llm = (
+        _selected_llm_secret_field(config)
+        if llm_visible
+        else None
+    )
+    fields = tuple(
+        field_name
+        for field_name in allowed_fields
+        if (
+            (
+                field_name not in _LLM_SECRET_FIELDS
+                and field_name not in _TELEGRAM_SECRET_FIELDS
+            )
+            or (
+                field_name == selected_llm
+                and llm_visible
+            )
+            or (
+                field_name in _TELEGRAM_SECRET_FIELDS
+                and config.features.telegram_notifications
+            )
+        )
+    )
+    if not set(_required_fields(role, config)).issubset(fields):
+        raise SecretValidationError(
+            "role_visible_fields",
+            "authority_mismatch",
+            "role-visible secret authority excludes a required field",
+        )
+    return fields
 
 
 def _role_simple_secret_fields(
     role: str,
     config: AppConfig,
 ) -> tuple[str, ...]:
-    fields = list(_required_fields(role, config))
-    if _role_requires_key_material(role):
-        fields.extend(
-            (
-                "candidate_signing_key",
-                "backup_encryption_key",
-            )
-        )
-    return tuple(dict.fromkeys(fields))
+    return tuple(
+        field_name
+        for field_name in _role_visible_fields(role, config)
+        if field_name != "field_encryption_keys"
+    )
 
 
 def _project_role_secrets(
