@@ -12,6 +12,13 @@ a deterministic risk engine is the final authority on every order.
 
 Built in phases (see `docs/superpowers/specs/`):
 
+Current release evidence is separated into
+[`software verification`](docs/release/2026-07-27-verification.md) and
+[`operational status`](docs/release/2026-07-27-operational-status.md).
+Deterministic verification passes, while normal Alpaca paper operation remains
+**BLOCKED / NOT STARTED** until the operator-authorized credentialed preflight
+succeeds.
+
 - **Phase 1 ✅** — scaffold, config, DB models + order state machine, `BrokerClient`
   ABC + `MockBroker`, risk engine (pure) with FIFO P&L + persistent kill switch +
   injectable market clock. Full pytest coverage of every limit.

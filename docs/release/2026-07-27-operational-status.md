@@ -1,6 +1,6 @@
 # Operational release blocked
 
-Observed at: `2026-07-29T15:30:15Z`
+Observed at: `2026-07-29T19:13:46Z`
 
 This document records operational truth separately from deterministic software
 verification. No normal runtime credential store, database, process, broker
@@ -12,7 +12,7 @@ preflight.
 
 | Check | Status | Detail code |
 | --- | --- | --- |
-| Software release candidate | pending | `final_verifier_not_run` |
+| Software release candidate | verified | `release_verifier_pass_faa2af9` |
 | Required runtime secrets in Keychain | not started | `operator_authorization_boundary` |
 | Normal runtime TLS identity and trust | not started | `operator_authorization_boundary` |
 | Normal database schema head | unknown | `normal_database_not_inspected` |
@@ -29,6 +29,11 @@ preflight.
 | Broker writes during release verification | zero | `broker_write_count_zero` |
 
 Operational gate: **BLOCKED / NOT STARTED**.
+
+The deterministic software evidence is recorded in
+[`2026-07-27-verification.md`](2026-07-27-verification.md). That pass does not
+change any operational row below it: the credentialed paper-account preflight
+and normal-runtime inspection were not authorized or performed.
 
 The repository remains hard-locked to Alpaca paper mode, but source
 configuration is not broker-account evidence. Nothing in this document grants
