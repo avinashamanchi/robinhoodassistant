@@ -683,3 +683,190 @@ supported form requires explicit modeling plus negative and positive fixtures.
   and fakes only. No app/daemon/MCP server, real Keychain, credentials, runtime
   database, broker/provider/notifier/integration, or network transport was
   started or called; nothing was pushed.
+
+# Task 11 Fix Round 3 Addendum
+
+## Supersession and boundary
+
+The round-2 statement that no requested reproducer remained is historical and
+superseded. Round 3 was verified from base
+`8de8bd96783750500baccbd51f27b7561b505194`. All production, test, setup,
+operator, and executable-plan changes are isolated in implementation commit
+`b51e8ee0d5ece8bcde3701e4dd4b9adf58089c5c`; this addendum and its companion
+brief, plan completion record, progress entries, bounded diff, and review
+package are evidence only.
+
+No Plan 3 work, push, service process, real Keychain or credential, runtime
+database, broker/provider/notifier/integration transport, or external network
+call was used. TLS tests used generated files in temporary roots; database
+tests used temporary SQLite only.
+
+## Finding disposition
+
+1. **Final authorities — confirmed.** Dynamic `globals`/`locals`/`vars`,
+   `exec`/`eval`, subscript/container aliases, nested alias mutation, and
+   noncanonical rebinding now invalidate the applicable final authority.
+2. **Chat root effects — confirmed.** Assignment/deletion in
+   `ToolRouter.dispatch` was a gap. Root and recursively reachable helper
+   effects now fail closed; an additional direct mutable-call probe was
+   already rejected, while an unknown direct effect exposed and closed the
+   remaining unproven-call gap.
+3. **Outbound wrapper dominance — confirmed.** A policy assertion after I/O
+   passed before the fix. The only supported dynamic requests wrapper now has
+   exactly the guard followed by the direct return transport with inline query
+   validation; URL rebinding or additional control flow is unproven.
+4. **Chained mappings — confirmed.** Every chained assignment target now joins
+   the same mapping component, so query and provider-option mutation through
+   any alias reaches the effective call.
+5. **Environment unpacking — confirmed.** Mapping unpack, copies, views,
+   subscripts, aliases, and provider escapes are rejected outside the exact
+   authorized development chain.
+6. **Sensitive writes — confirmed.** Keyword `statement`/`values`, execute and
+   ORM query aliases, and unannotated local-helper model parameters are traced
+   or rejected.
+7. **Security call identity — confirmed.** Module, attribute, and collection
+   indirection around CORS middleware, HTTP clients, cookies, and SSL factories
+   fails closed.
+8. **Tracked SQL/dumps — confirmed.** Conventional root and nested SQL/dump
+   backup names are rejected without reading contents; benign plaintext-format
+   documentation remains allowed.
+9. **Network-option decoy — confirmed false-positive gap.** A local
+   `get(..., verify=False)` is clean unless the call identity is proven
+   network-shaped.
+10. **TLS constraints — confirmed with nuance.** The prior manual checks
+    accepted a CA lacking `keyCertSign` and a client-only leaf. Cryptography's
+    verifier rejects those chains. It accepts an absent EKU as unconstrained,
+    while the release requirement is an explicit leaf `serverAuth`; the local
+    validator therefore requires that extension in addition to standards
+    verification.
+11. **Direct stdlib networking/query keys — confirmed.** Chained
+    `build_opener().open`, `socket.socket().connect`, HTTP client aliases,
+    unverified contexts, and computed credential-like query names are gated.
+12. **Preflight capability — confirmed.** The old dedicated role still
+    returned a full mutable `TradingService`. It now returns only
+    `PreflightReconciliationProbe.inspect_reconciliation`, backed by broker
+    reads and local `SELECT`s. No clock, cipher hooks, LLM, notifier, mutable
+    trading method, or writer tenure is constructed.
+13. **Watchdog capability — mixed.** Alpaca and Telegram origins were excess
+    and are removed. The claimed provider-secret excess was not present:
+    `_required_fields("watchdog", config)` was already exactly
+    `("database_url",)` and remains protected by a dedicated counterexample.
+14. **TLS setup runner — confirmed.** The executable setup now uses
+    `uv run python`; tests inspect the script but never execute setup.
+
+## Exact RED evidence
+
+The initial round-3 static bundle produced:
+
+```text
+18 failed
+```
+
+The sensitive-write reproducer produced:
+
+```text
+3 failed
+```
+
+The initial runtime/TLS/preflight bundle produced:
+
+```text
+6 failed, 1 passed
+```
+
+The one pass was the already-working runtime computed-query rejection. The
+watchdog required-secret counterexample was later split from the valid egress
+probe and passed `2/2`.
+
+Final conservative diff audit added three narrowly scoped RED checks:
+
+```text
+direct mutable dispatch effect plus URL rebinding: .F
+unknown direct dispatch effect: 1 failed
+missing explicit leaf serverAuth EKU: 1 failed
+```
+
+The direct mutable effect was the retained pass: the existing reachable-call
+scan already rejected it. URL rebinding, unknown root effects, and absent EKU
+were genuine remaining gaps and were implemented before the final focused
+matrix or full suite.
+
+No RED output included source snippets from the release gate, credentials,
+URLs with query strings, exception text from production paths, or real
+resource data.
+
+## Final verification
+
+```text
+Focused release/static/TLS/round-3 set:
+432 passed in 101.29s
+
+Final affected trust matrix (30 files):
+1754 passed, 1 warning in 269.73s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+
+uv run python -m compileall -q src scripts tests
+PASS
+
+git diff --check
+PASS
+
+bash -n scripts/setup-local-tls.sh
+PASS
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning.
+
+Exactly one no-argument full suite was run:
+
+```text
+uv run pytest
+3619 passed, 1 failed, 1 skipped, 1 warning in 527.43s
+```
+
+The sole failure was
+`tests/test_migrations.py::test_sensitive_trust_downgrade_lock_closes_checked_after_race[dependent-insert]`.
+Round 3 does not modify that test or any migration. The test patches the first
+`alembic_op.drop_index` while downgrading from repository head; later migration
+revisions now contain an earlier index drop than the sensitive-state revision,
+so scheduling can let the dependent insert make the later pristine-state gate
+correctly fail closed. The exact failed node immediately passed:
+
+```text
+1 passed in 3.51s
+```
+
+No second full suite was run and no out-of-scope migration behavior was
+changed. The release evidence therefore retains, rather than hides, the sole
+full-suite caveat.
+
+## Review package
+
+- Base: `8de8bd96783750500baccbd51f27b7561b505194`
+- Implementation: `b51e8ee0d5ece8bcde3701e4dd4b9adf58089c5c`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-8de8bd9..b51e8ee.diff`
+- Diff size: 2,479 lines / 92,782 bytes
+- Package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-r3.md`
+
+## Residual hard limits
+
+- Static release analysis intentionally rejects unsupported or dynamic
+  security-boundary Python. Supporting a new construct requires an explicit
+  model plus negative and positive fixtures.
+- The sole full-suite artifact is not fully green because of the recorded
+  out-of-scope migration timing failure; the final Task 11 focused/matrix and
+  all static/compile/diff/shell gates are green.
+- Composio remains disabled pending provider-side revocation/rotation. It has
+  no origin, route, caller, toolkit, MCP surface, or chat tool. No webhook or
+  live-mode path exists.
+- General chat remains read-only. Immutable drafts require an explicit signed
+  queue action and separate human approval. Paper-only mode, manual approval,
+  kill switches, and broker-truth checks remain unchanged; no profit guarantee
+  is made.
+- No app, daemon, MCP, real Keychain/credential/runtime database, external
+  transport, trading action, notification, breaker reset, or push occurred.

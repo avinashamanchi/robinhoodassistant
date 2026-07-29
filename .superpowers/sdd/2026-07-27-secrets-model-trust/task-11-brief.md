@@ -347,3 +347,58 @@ Residual hard limits remain: unsupported or dynamic trust-boundary constructs
 fail closed; Composio remains disabled pending external provider-side
 revocation/rotation; there is no webhook or live-mode path; trading remains
 paper-only and separately human-approved; no profit guarantee is made.
+
+## Fix round 3 completion
+
+The round-2 conclusion is historical and superseded. Fresh review found
+additional final-authority, root-dispatch-effect, wrapper-ordering,
+mapping-provenance, environment, sensitive-write, transport-identity,
+artifact, TLS, direct-networking, and preflight-capability gaps.
+
+- [x] Verify all 14 findings against
+  `8de8bd96783750500baccbd51f27b7561b505194` before changing code.
+- [x] Record minimal pre-fix RED: initial static bundle `18 failed`;
+  sensitive-write bundle `3 failed`; runtime/TLS/preflight bundle
+  `6 failed, 1 passed`; URL-rebinding `.F`; unknown dispatch effect
+  `1 failed`; and missing explicit server-auth EKU `1 failed`.
+- [x] Retain the mixed watchdog disposition as a hermetic counterexample:
+  provider egress was a real excess capability and was removed, while the
+  role's required secret set was already exactly `("database_url",)`.
+- [x] Reject dynamic/nested authority access, root and recursively reachable
+  chat effects, unproven wrapper control flow, chained mappings, full
+  environment unpacking, sensitive helper/execute/query aliases,
+  security-call indirection, direct stdlib transports, computed query
+  credentials, conventional SQL dumps, and non-network option false
+  positives.
+- [x] Replace preflight's mutable `TradingService` with a dedicated one-method
+  read-only probe using only broker open-order/position reads and local SQL
+  `SELECT`s; it constructs no clock, field cipher, LLM, notifier, proposal,
+  approval, cancellation, submission, repair, or writer-tenure capability.
+- [x] Require CA `keyCertSign`, standards chain verification, and an explicit
+  leaf `serverAuth` EKU. The standards verifier rejects client-only EKU but
+  treats an absent EKU as unconstrained, so the local validator separately
+  requires the explicit extension.
+- [x] Remove all watchdog provider origins and use the repository-declared
+  `uv run python` TLS setup command.
+- [x] Final complete focused set: `432 passed in 101.29s`.
+- [x] Final 30-file affected trust matrix:
+  `1754 passed, 1 warning in 269.73s`.
+- [x] Repository static gate: `release static checks: PASS`; compileall,
+  `git diff --check`, and setup-script syntax exited zero.
+- [x] Run exactly one no-argument full suite:
+  `3619 passed, 1 failed, 1 skipped, 1 warning in 527.43s`. The sole failure
+  was the pre-existing, untouched SQLite sensitive-downgrade timing test's
+  `dependent-insert` case; its exact focused rerun passed `1/1 in 3.51s`.
+  No migration code was changed and no second full suite was run.
+- [x] Commit implementation/tests/operator/executable docs as
+  `b51e8ee0d5ece8bcde3701e4dd4b9adf58089c5c`, then package the bounded
+  implementation diff and this evidence in a truly evidence-only follow-up.
+
+Residual release evidence is explicit: the sole full-suite artifact contains
+one nondeterministic out-of-scope migration-race failure even though the exact
+node passed immediately afterward and the final Task 11 focused, matrix,
+static, compile, shell, and diff gates are green. Unsupported dynamic
+trust-boundary constructs remain intentionally rejected. Composio remains
+disabled pending provider-side rotation; no webhook, live mode, autonomous
+execution, profit guarantee, service start, real resource access, or push was
+introduced.

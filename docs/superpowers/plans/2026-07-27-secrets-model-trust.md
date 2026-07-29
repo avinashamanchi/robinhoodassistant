@@ -1959,6 +1959,41 @@ evidence only.
 - [x] Package bounded diff `7cc5c91..d7c9576`, coherent brief/report/progress,
   supersession notice, and round-2 review in a separate evidence-only commit.
 
+### Task 11 fix round 3: conservative trust-boundary closure
+
+The round-2 no-remaining-reproducer conclusion is superseded. All round-3
+production, test, setup, operator, and executable-plan changes are in
+implementation commit `b51e8ee0d5ece8bcde3701e4dd4b9adf58089c5c`;
+the follow-up commit contains evidence only.
+
+- [x] Verify all 14 findings against base
+  `8de8bd96783750500baccbd51f27b7561b505194`.
+- [x] Record exact RED before implementation: static `18 failed`;
+  sensitive-write `3 failed`; runtime/TLS/preflight `6 failed, 1 passed`;
+  final conservative probes `.F`, `1 failed`, and `1 failed`.
+- [x] Fail closed on dynamic/nested authorities, root/recursive chat effects,
+  unproven wrapper order, chained mappings, environment unpacking, sensitive
+  helper/execute/query aliases, transport identity indirection, direct stdlib
+  networking, computed credential queries, and conventional tracked SQL/dumps.
+- [x] Require CA `keyCertSign`, standards chain verification, and explicit
+  leaf `serverAuth`; use repository-declared `uv run python` for TLS setup.
+- [x] Replace mutable preflight service composition with a one-method
+  read-only broker/local snapshot protocol and remove watchdog provider
+  origins. Retain the exact watchdog database-only secret-role counterexample.
+- [x] Final focused set:
+  `432 passed in 101.29s`.
+- [x] Final 30-file affected trust matrix:
+  `1754 passed, 1 warning in 269.73s`.
+- [x] Repository static gate: `release static checks: PASS`; compileall,
+  `git diff --check`, and setup-shell syntax passed.
+- [x] Run exactly one no-argument full suite:
+  `3619 passed, 1 failed, 1 skipped, 1 warning in 527.43s`. The sole failure
+  was the untouched nondeterministic sensitive-downgrade
+  `dependent-insert` timing case; its exact focused rerun passed
+  `1/1 in 3.51s`. No second full suite or migration change was made.
+- [x] Package bounded diff `8de8bd9..b51e8ee`, coherent brief/report/progress,
+  supersession notice, and round-3 review in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint
