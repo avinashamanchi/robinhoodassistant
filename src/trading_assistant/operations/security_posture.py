@@ -6,6 +6,7 @@ imports or consumes these models.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Literal
@@ -30,11 +31,17 @@ from ..config import AppConfig, TradingMode
 from ..db.models import (
     CircuitBreakerState,
     FILL_RECONCILIATION_QUARANTINED,
+    FILL_RECONCILIATION_REQUIRED,
     FILL_RECONCILIATION_SUPERSEDED,
+    FILL_RECONCILIATION_TRUSTED,
     Fill,
     Heartbeat,
     MutationInterlock,
     Order,
+    PLAN_CANCEL_INDETERMINATE,
+    PLAN_CANCEL_NONE,
+    PLAN_CANCEL_REQUESTED,
+    PLAN_CANCEL_SETTLED,
     Rule,
     RuleGroup,
     RuntimeTenure,
@@ -46,8 +53,9 @@ from ..llm.budget import (
     ProviderBudgetService,
     ProviderBudgetUnavailable,
 )
-from ..preflight import SensitiveEncryptionStateInspector
-from ..risk.breakers import BreakerScope
+from ..orders.startup import validate_startup_reconciliation_snapshot
+from ..risk.breakers import BreakerKind, BreakerScope
+from ..rules.models import RuleState
 
 
 UTC = timezone.utc
@@ -183,6 +191,7 @@ class PostureDetailCode(str, Enum):
     QUARANTINE_ITEMS_PRESENT = "quarantine_items_present"
     BREAKER_CLEAR = "breaker_clear"
     BREAKER_TRIPPED = "breaker_tripped"
+    BREAKER_SCOPE_INVALID = "breaker_scope_invalid"
     DAEMON_HEARTBEAT_MISSING = "daemon_heartbeat_missing"
     DAEMON_HEARTBEAT_FRESH = "daemon_heartbeat_fresh"
     DAEMON_HEARTBEAT_STALE = "daemon_heartbeat_stale"
@@ -193,6 +202,9 @@ class PostureDetailCode(str, Enum):
     RECONCILIATION_FAILED = "reconciliation_failed"
     RECONCILIATION_CURRENT = "reconciliation_current"
     RECONCILIATION_STALE = "reconciliation_stale"
+    RECONCILIATION_EVIDENCE_INVALID = (
+        "reconciliation_evidence_invalid"
+    )
     QUOTE_EVIDENCE_UNAVAILABLE = "quote_evidence_unavailable"
     RUNTIME_TENURE_MISSING = "runtime_tenure_missing"
     RUNTIME_TENURE_HELD = "runtime_tenure_held"
@@ -201,13 +213,18 @@ class PostureDetailCode(str, Enum):
     RUNTIME_TENURE_STALE = "runtime_tenure_stale"
     UNSAFE_STATE_CLEAR = "unsafe_state_clear"
     UNSAFE_STATE_PRESENT = "unsafe_state_present"
+    STATE_DOMAIN_INVALID = "state_domain_invalid"
     UNCERTAIN_INTERLOCKS_CLEAR = "uncertain_interlocks_clear"
     UNCERTAIN_INTERLOCKS_PRESENT = "uncertain_interlocks_present"
     DATABASE_EVIDENCE_UNAVAILABLE = "database_evidence_unavailable"
 
 
 class StartupStructuralCheck(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+    )
 
     name: StartupCheckName
     status: Literal["pass", "blocked", "unknown"]
@@ -217,7 +234,11 @@ class StartupStructuralCheck(BaseModel):
 class StartupPostureEvidence(BaseModel):
     """Immutable output from the one production startup-evidence chain."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+    )
 
     observed_at: AwareDatetime
     structural_checks: tuple[StartupStructuralCheck, ...]
@@ -237,10 +258,102 @@ class StartupPostureEvidence(BaseModel):
         return self
 
 
+_STARTUP_GUARD_RECEIPT_SEAL = object()
+
+
+class StartupGuardReceipt:
+    """Opaque capability binding startup evidence to exact composition inputs."""
+
+    __slots__ = ("_seal", "_config", "_secrets", "_evidence")
+
+    def __new__(cls, *_args, **_kwargs):
+        raise TypeError("StartupGuardReceipt is issued by the startup guard")
+
+    def __setattr__(self, _name, _value) -> None:
+        raise TypeError("StartupGuardReceipt is immutable")
+
+    def __repr__(self) -> str:
+        return "<StartupGuardReceipt sealed>"
+
+
+def _issue_startup_guard_receipt(
+    *,
+    config,
+    secrets,
+    checks,
+    observed_at: datetime,
+    secret_loaded_at: datetime,
+) -> StartupGuardReceipt:
+    """Issue the internal receipt after one successful structural guard."""
+
+    evidence = startup_posture_evidence(
+        checks=checks,
+        observed_at=observed_at,
+        secret_loaded_at=secret_loaded_at,
+    )
+    canonical = {
+        StartupCheckName.RUNTIME_CONFIGURATION,
+        StartupCheckName.LOOPBACK_HTTPS,
+        StartupCheckName.TLS,
+        StartupCheckName.DATABASE,
+        StartupCheckName.ENCRYPTION,
+    }
+    observed_names = {
+        check.name for check in evidence.structural_checks
+    }
+    if (
+        len(observed_names) != len(evidence.structural_checks)
+        or observed_names != canonical
+        or any(
+            check.status != "pass"
+            or check.detail_code is not StartupDetailCode.OK
+            for check in evidence.structural_checks
+        )
+        or evidence.secret_load_status != "pass"
+        or evidence.secret_loaded_at is None
+        or evidence.secret_loaded_at > evidence.observed_at
+    ):
+        raise RuntimeError("startup_guard_receipt_invalid")
+    receipt = object.__new__(StartupGuardReceipt)
+    object.__setattr__(receipt, "_seal", _STARTUP_GUARD_RECEIPT_SEAL)
+    object.__setattr__(receipt, "_config", config)
+    object.__setattr__(receipt, "_secrets", secrets)
+    object.__setattr__(receipt, "_evidence", evidence)
+    return receipt
+
+
+def _validate_startup_guard_receipt(
+    receipt: StartupGuardReceipt,
+    *,
+    config,
+    secrets,
+) -> StartupPostureEvidence:
+    """Fail closed unless a sealed receipt matches exact composition objects."""
+
+    try:
+        valid_seal = (
+            type(receipt) is StartupGuardReceipt
+            and receipt._seal is _STARTUP_GUARD_RECEIPT_SEAL
+            and type(receipt._evidence) is StartupPostureEvidence
+        )
+    except Exception:
+        valid_seal = False
+    if not valid_seal:
+        raise RuntimeError("startup_guard_receipt_invalid")
+    if receipt._config is not config or receipt._secrets is not secrets:
+        raise RuntimeError("startup_guard_receipt_mismatch")
+    return receipt._evidence
+
+
 class PostureCheck(BaseModel):
     """One value-free, typed observation."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        allow_inf_nan=False,
+    )
 
     name: PostureName
     status: PostureStatus
@@ -278,6 +391,47 @@ class PostureCheck(BaseModel):
     rows_total: int | None = Field(default=None, ge=0)
     rows_completed: int | None = Field(default=None, ge=0)
 
+    @field_validator(
+        "count",
+        "generation",
+        "completed_generation",
+        "budget_used",
+        "budget_remaining",
+        "budget_limit",
+        "input_tokens_used",
+        "input_tokens_remaining",
+        "input_tokens_limit",
+        "output_tokens_used",
+        "output_tokens_remaining",
+        "output_tokens_limit",
+        "schema_version",
+        "rows_total",
+        "rows_completed",
+        mode="before",
+    )
+    @classmethod
+    def integer_evidence_is_exact(
+        cls,
+        value: object,
+    ) -> object:
+        if value is not None and type(value) is not int:
+            raise ValueError("integer posture evidence must be exact")
+        return value
+
+    @field_validator(
+        "age_seconds",
+        "max_age_seconds",
+        mode="before",
+    )
+    @classmethod
+    def float_evidence_is_exact(
+        cls,
+        value: object,
+    ) -> object:
+        if value is not None and type(value) is not float:
+            raise ValueError("float posture evidence must be exact")
+        return value
+
     @field_validator("scope")
     @classmethod
     def scope_is_typed(cls, value: str | None, info):
@@ -285,7 +439,15 @@ class PostureCheck(BaseModel):
             return value
         name = info.data.get("name")
         if name is PostureName.CIRCUIT_BREAKER:
-            BreakerScope.parse(value)
+            if value not in {
+                "account",
+                "equity",
+                "crypto",
+                "liquidity",
+            }:
+                raise ValueError(
+                    "posture scope is not a breaker category"
+                )
             return value
         allowed: dict[PostureName, set[str]] = {
             PostureName.REQUEST_BUDGET: {
@@ -329,11 +491,22 @@ class PostureCheck(BaseModel):
 class SecurityPostureReport(BaseModel):
     """Read-only evidence that can never represent trading authority."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+    )
 
     observed_at: AwareDatetime
     checks: tuple[PostureCheck, ...]
     can_trade: Literal[False] = False
+
+    @field_validator("can_trade", mode="before")
+    @classmethod
+    def can_trade_is_exact_false(cls, value: object) -> bool:
+        if type(value) is not bool or value is not False:
+            raise ValueError("can_trade must be exactly False")
+        return False
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -350,13 +523,20 @@ def startup_posture_evidence(
 ) -> StartupPostureEvidence:
     """Convert startup guard output without carrying paths or secret metadata."""
 
+    if (
+        not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or not isinstance(secret_loaded_at, datetime)
+        or secret_loaded_at.tzinfo is None
+    ):
+        raise RuntimeError("startup_guard_receipt_invalid")
     return StartupPostureEvidence(
         observed_at=_as_utc(observed_at),
         structural_checks=tuple(
             StartupStructuralCheck(
-                name=check.name,
+                name=StartupCheckName(check.name),
                 status="pass" if check.passed else "blocked",
-                detail_code=check.code,
+                detail_code=StartupDetailCode(check.code),
             )
             for check in checks
         ),
@@ -374,6 +554,44 @@ _LIVE_OR_UNKNOWN_ORDER_STATUSES = (
     OrderStatus.SUBMITTED.value,
     OrderStatus.PARTIALLY_FILLED.value,
 )
+_KNOWN_ORDER_STATUSES = frozenset(
+    status.value for status in OrderStatus
+)
+_KNOWN_ORDER_ACCEPTANCE_STATES = frozenset(
+    {
+        "not_started",
+        "pending",
+        "accepted",
+        FILL_RECONCILIATION_REQUIRED,
+        *_KNOWN_ORDER_STATUSES,
+    }
+)
+_KNOWN_PLAN_CANCEL_STATES = frozenset(
+    {
+        PLAN_CANCEL_NONE,
+        PLAN_CANCEL_REQUESTED,
+        PLAN_CANCEL_INDETERMINATE,
+        PLAN_CANCEL_SETTLED,
+    }
+)
+_KNOWN_FILL_RECONCILIATION_STATES = frozenset(
+    {
+        FILL_RECONCILIATION_REQUIRED,
+        FILL_RECONCILIATION_TRUSTED,
+        FILL_RECONCILIATION_QUARANTINED,
+        FILL_RECONCILIATION_SUPERSEDED,
+    }
+)
+_KNOWN_RULE_STATES = frozenset(state.value for state in RuleState)
+_KNOWN_RULE_GROUP_STATES = frozenset(
+    {
+        RuleState.PENDING.value,
+        RuleState.ACTIVE.value,
+        RuleState.TRIGGERED.value,
+        RuleState.CANCELED.value,
+        RuleState.FAILED.value,
+    }
+)
 _SAFETY_LATCH_ERROR_CODES = (
     "broker_submission_unknown",
     "cumulative_fill_contradiction",
@@ -389,6 +607,195 @@ _SAFETY_LATCH_ERROR_CODES = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class SensitiveEncryptionPostureSnapshot:
+    """Safe-column-only encryption migration evidence."""
+
+    status: PostureStatus
+    detail_code: PostureDetailCode | StartupDetailCode
+    migration_state: Literal[
+        "required",
+        "migrating",
+        "complete",
+        "rotating",
+        "failed",
+    ] | None = None
+    schema_version: int | None = None
+    rows_total: int | None = None
+    rows_completed: int | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SensitiveEncryptionPostureInspector:
+    """Inspect migration metadata without selecting ciphertext or key IDs."""
+
+    _BLOCKED_CODES = {
+        "required": StartupDetailCode.SENSITIVE_MIGRATION_REQUIRED,
+        "migrating": StartupDetailCode.SENSITIVE_MIGRATION_MIGRATING,
+        "rotating": StartupDetailCode.SENSITIVE_MIGRATION_ROTATING,
+        "failed": StartupDetailCode.SENSITIVE_MIGRATION_FAILED,
+    }
+
+    def __init__(
+        self,
+        session_factory,
+        *,
+        schema_version: int,
+        startup_evidence: StartupPostureEvidence | None,
+    ) -> None:
+        self._session_factory = session_factory
+        self._schema_version = schema_version
+        self._startup_evidence = startup_evidence
+
+    @staticmethod
+    def _invalid(
+        **safe_state,
+    ) -> SensitiveEncryptionPostureSnapshot:
+        return SensitiveEncryptionPostureSnapshot(
+            status=PostureStatus.UNKNOWN,
+            detail_code=(
+                StartupDetailCode.SENSITIVE_MIGRATION_STATE_INVALID
+            ),
+            **safe_state,
+        )
+
+    def inspect(
+        self,
+        *,
+        observed_at: datetime,
+    ) -> SensitiveEncryptionPostureSnapshot:
+        with self._session_factory() as session:
+            row = session.execute(
+                select(
+                    SensitiveMigrationState.singleton_id,
+                    SensitiveMigrationState.schema_version,
+                    SensitiveMigrationState.state,
+                    SensitiveMigrationState.rows_total,
+                    SensitiveMigrationState.rows_completed,
+                    SensitiveMigrationState.started_at,
+                    SensitiveMigrationState.completed_at,
+                    SensitiveMigrationState.updated_at,
+                )
+            ).one_or_none()
+        if row is None or type(row.singleton_id) is not int:
+            return self._invalid()
+        if (
+            row.singleton_id != 1
+            or type(row.schema_version) is not int
+            or row.schema_version <= 0
+            or type(row.rows_total) is not int
+            or row.rows_total < 0
+            or type(row.rows_completed) is not int
+            or not 0 <= row.rows_completed <= row.rows_total
+            or row.state
+            not in {
+                "required",
+                "migrating",
+                "complete",
+                "rotating",
+                "failed",
+            }
+            or not isinstance(row.updated_at, datetime)
+        ):
+            return self._invalid()
+        started_at = (
+            _as_utc(row.started_at)
+            if isinstance(row.started_at, datetime)
+            else None
+        )
+        completed_at = (
+            _as_utc(row.completed_at)
+            if isinstance(row.completed_at, datetime)
+            else None
+        )
+        updated_at = _as_utc(row.updated_at)
+        safe_state = {
+            "migration_state": row.state,
+            "schema_version": row.schema_version,
+            "rows_total": row.rows_total,
+            "rows_completed": row.rows_completed,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "updated_at": updated_at,
+        }
+        if updated_at > observed_at:
+            return self._invalid(**safe_state)
+        if row.schema_version != self._schema_version:
+            return SensitiveEncryptionPostureSnapshot(
+                status=PostureStatus.BLOCKED,
+                detail_code=StartupDetailCode.SENSITIVE_SCHEMA_MISMATCH,
+                **safe_state,
+            )
+        if row.state == "required":
+            if (
+                started_at is not None
+                or completed_at is not None
+                or row.rows_completed != 0
+            ):
+                return self._invalid(**safe_state)
+            return SensitiveEncryptionPostureSnapshot(
+                status=PostureStatus.BLOCKED,
+                detail_code=self._BLOCKED_CODES[row.state],
+                **safe_state,
+            )
+        if row.state in {"migrating", "rotating", "failed"}:
+            if (
+                started_at is None
+                or completed_at is not None
+                or not started_at <= updated_at
+            ):
+                return self._invalid(**safe_state)
+            return SensitiveEncryptionPostureSnapshot(
+                status=PostureStatus.BLOCKED,
+                detail_code=self._BLOCKED_CODES[row.state],
+                **safe_state,
+            )
+        if (
+            started_at is None
+            or completed_at is None
+            or row.rows_completed != row.rows_total
+            or not started_at <= completed_at <= updated_at
+        ):
+            return self._invalid(**safe_state)
+        startup = self._startup_evidence
+        if startup is None:
+            return SensitiveEncryptionPostureSnapshot(
+                status=PostureStatus.UNKNOWN,
+                detail_code=(
+                    PostureDetailCode.STARTUP_EVIDENCE_UNAVAILABLE
+                ),
+                **safe_state,
+            )
+        startup_check = next(
+            (
+                check
+                for check in startup.structural_checks
+                if check.name is StartupCheckName.ENCRYPTION
+            ),
+            None,
+        )
+        if (
+            startup_check is None
+            or startup_check.status != "pass"
+            or startup_check.detail_code is not StartupDetailCode.OK
+            or updated_at > startup.observed_at
+        ):
+            return SensitiveEncryptionPostureSnapshot(
+                status=PostureStatus.UNKNOWN,
+                detail_code=(
+                    PostureDetailCode.ENCRYPTION_EVIDENCE_UNAVAILABLE
+                ),
+                **safe_state,
+            )
+        return SensitiveEncryptionPostureSnapshot(
+            status=PostureStatus.PASS,
+            detail_code=StartupDetailCode.OK,
+            **safe_state,
+        )
+
+
 class SecurityPostureService:
     """Build a local snapshot without calling or mutating any dependency."""
 
@@ -399,22 +806,31 @@ class SecurityPostureService:
         session_factory,
         reconciliation_key: str,
         reconciliation_enabled: bool,
-        startup_evidence: StartupPostureEvidence | None = None,
         rate_limiter: DurableRateLimiter | None = None,
         provider_budget: ProviderBudgetService | None = None,
-        engine=None,
-        sensitive_cipher=None,
         clock: Callable[[], datetime] | None = None,
+        _startup_guard_receipt: StartupGuardReceipt | None = None,
+        _startup_secrets=None,
     ) -> None:
         self._config = config
         self._session_factory = session_factory
         self._reconciliation_key = reconciliation_key
         self._reconciliation_enabled = reconciliation_enabled
-        self._startup_evidence = startup_evidence
+        if _startup_guard_receipt is None:
+            if _startup_secrets is not None:
+                raise RuntimeError("startup_guard_receipt_invalid")
+            self._startup_evidence = None
+        else:
+            if _startup_secrets is None:
+                raise RuntimeError("startup_guard_receipt_invalid")
+            self._startup_evidence = _validate_startup_guard_receipt(
+                _startup_guard_receipt,
+                config=config,
+                secrets=_startup_secrets,
+            )
+        self._startup_guard_receipt = _startup_guard_receipt
         self._rate_limiter = rate_limiter
         self._provider_budget = provider_budget
-        self._engine = engine
-        self._sensitive_cipher = sensitive_cipher
         self._clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
@@ -577,73 +993,12 @@ class SecurityPostureService:
                 PostureName.SENSITIVE_ENCRYPTION,
                 observed_at,
             )
-        if self._engine is None:
-            return self._check(
-                PostureName.SENSITIVE_ENCRYPTION,
-                PostureStatus.UNKNOWN,
-                observed_at,
-                PostureDetailCode.ENCRYPTION_EVIDENCE_UNAVAILABLE,
-            )
         try:
-            result = SensitiveEncryptionStateInspector(
-                self._engine,
+            result = SensitiveEncryptionPostureInspector(
+                self._session_factory,
                 schema_version=self._config.encryption.schema_version,
-                active_key_id=self._config.encryption.active_key_id,
-                cipher=self._sensitive_cipher,
-            ).inspect()
-        except Exception:
-            return self._unknown(
-                PostureName.SENSITIVE_ENCRYPTION,
-                observed_at,
-            )
-        safe_state: dict[str, object] = {}
-        try:
-            with self._session_factory() as session:
-                row = session.execute(
-                    select(
-                        SensitiveMigrationState.schema_version,
-                        SensitiveMigrationState.state,
-                        SensitiveMigrationState.rows_total,
-                        SensitiveMigrationState.rows_completed,
-                        SensitiveMigrationState.started_at,
-                        SensitiveMigrationState.completed_at,
-                        SensitiveMigrationState.updated_at,
-                    )
-                ).one_or_none()
-            if (
-                row is not None
-                and type(row.schema_version) is int
-                and row.schema_version > 0
-                and row.state
-                in {
-                    "required",
-                    "migrating",
-                    "complete",
-                    "rotating",
-                    "failed",
-                }
-                and type(row.rows_total) is int
-                and row.rows_total >= 0
-                and type(row.rows_completed) is int
-                and 0 <= row.rows_completed <= row.rows_total
-            ):
-                safe_state = {
-                    "migration_state": row.state,
-                    "schema_version": row.schema_version,
-                    "rows_total": row.rows_total,
-                    "rows_completed": row.rows_completed,
-                    "started_at": (
-                        _as_utc(row.started_at)
-                        if row.started_at is not None
-                        else None
-                    ),
-                    "completed_at": (
-                        _as_utc(row.completed_at)
-                        if row.completed_at is not None
-                        else None
-                    ),
-                    "updated_at": _as_utc(row.updated_at),
-                }
+                startup_evidence=self._startup_evidence,
+            ).inspect(observed_at=observed_at)
         except Exception:
             return self._unknown(
                 PostureName.SENSITIVE_ENCRYPTION,
@@ -651,14 +1006,16 @@ class SecurityPostureService:
             )
         return self._check(
             PostureName.SENSITIVE_ENCRYPTION,
-            (
-                PostureStatus.PASS
-                if result.passed
-                else PostureStatus.BLOCKED
-            ),
+            result.status,
             observed_at,
-            result.code,
-            **safe_state,
+            result.detail_code,
+            migration_state=result.migration_state,
+            schema_version=result.schema_version,
+            rows_total=result.rows_total,
+            rows_completed=result.rows_completed,
+            started_at=result.started_at,
+            completed_at=result.completed_at,
+            updated_at=result.updated_at,
         )
 
     def _request_budget_checks(
@@ -885,47 +1242,77 @@ class SecurityPostureService:
                 CircuitBreakerState.updated_at,
             ).order_by(CircuitBreakerState.scope_key)
         ).all()
-        checks: list[PostureCheck] = []
-        for row in rows:
-            scope = BreakerScope.parse(row.scope_key)
-            if (
-                scope.kind.value != row.kind
-                or scope.target != row.target
-                or type(row.tripped) is not bool
-                or type(row.generation) is not int
-                or row.generation < 0
-            ):
-                raise ValueError("invalid breaker evidence")
-            checks.append(
+        categories = ("account", "equity", "crypto", "liquidity")
+        aggregated = {
+            category: {"tripped": 0, "generation": 0}
+            for category in categories
+        }
+        try:
+            for row in rows:
+                scope = BreakerScope.parse(row.scope_key)
+                updated_at = _as_utc(row.updated_at)
+                if (
+                    scope.kind.value != row.kind
+                    or scope.target != row.target
+                    or type(row.tripped) is not bool
+                    or type(row.generation) is not int
+                    or row.generation <= 0
+                    or updated_at > observed_at
+                ):
+                    raise ValueError("invalid breaker evidence")
+                if scope.kind in {
+                    BreakerKind.OPERATOR_GLOBAL,
+                    BreakerKind.BROKER_DRIFT,
+                }:
+                    category = "account"
+                elif scope.kind in {
+                    BreakerKind.DATA,
+                    BreakerKind.LOSS,
+                    BreakerKind.DRAWDOWN,
+                }:
+                    category = scope.target
+                elif scope.kind is BreakerKind.LIQUIDITY:
+                    category = "liquidity"
+                else:
+                    raise ValueError("invalid breaker evidence")
+                state = aggregated[category]
+                state["generation"] = max(
+                    state["generation"],
+                    row.generation,
+                )
+                if row.tripped:
+                    state["tripped"] += 1
+        except Exception:
+            return [
                 self._check(
                     PostureName.CIRCUIT_BREAKER,
-                    (
-                        PostureStatus.TRIPPED
-                        if row.tripped
-                        else PostureStatus.CLEAR
-                    ),
+                    PostureStatus.UNKNOWN,
                     observed_at,
-                    (
-                        PostureDetailCode.BREAKER_TRIPPED
-                        if row.tripped
-                        else PostureDetailCode.BREAKER_CLEAR
-                    ),
-                    scope=row.scope_key,
-                    generation=row.generation,
-                    updated_at=_as_utc(row.updated_at),
+                    PostureDetailCode.BREAKER_SCOPE_INVALID,
+                    scope=category,
                 )
+                for category in categories
+            ]
+        return [
+            self._check(
+                PostureName.CIRCUIT_BREAKER,
+                (
+                    PostureStatus.TRIPPED
+                    if aggregated[category]["tripped"]
+                    else PostureStatus.CLEAR
+                ),
+                observed_at,
+                (
+                    PostureDetailCode.BREAKER_TRIPPED
+                    if aggregated[category]["tripped"]
+                    else PostureDetailCode.BREAKER_CLEAR
+                ),
+                scope=category,
+                count=aggregated[category]["tripped"],
+                generation=aggregated[category]["generation"],
             )
-        if not checks:
-            checks.append(
-                self._check(
-                    PostureName.CIRCUIT_BREAKER,
-                    PostureStatus.CLEAR,
-                    observed_at,
-                    PostureDetailCode.BREAKER_CLEAR,
-                    count=0,
-                )
-            )
-        return checks
+            for category in categories
+        ]
 
     def _heartbeat_check(
         self,
@@ -999,22 +1386,28 @@ class SecurityPostureService:
                 generation=0,
                 completed_generation=0,
             )
-        if (
-            type(row.generation) is not int
-            or row.generation < 0
-            or type(row.completed_generation) is not int
-            or row.completed_generation < 0
-            or row.completed_generation > row.generation
-            or row.status not in {"required", "current", "failed"}
-        ):
-            raise ValueError("invalid reconciliation evidence")
-        started_at = _as_utc(row.started_at)
-        completed_at = (
-            _as_utc(row.completed_at)
-            if row.completed_at is not None
-            else None
+        validation = validate_startup_reconciliation_snapshot(
+            generation=row.generation,
+            completed_generation=row.completed_generation,
+            status=row.status,
+            started_at=row.started_at,
+            completed_at=row.completed_at,
+            updated_at=row.updated_at,
+            observed_at=observed_at,
         )
-        updated_at = _as_utc(row.updated_at)
+        if not validation.valid:
+            return self._unknown(
+                PostureName.STARTUP_RECONCILIATION,
+                observed_at,
+                detail=(
+                    PostureDetailCode.RECONCILIATION_EVIDENCE_INVALID
+                ),
+            )
+        started_at = validation.started_at
+        completed_at = validation.completed_at
+        updated_at = validation.updated_at
+        assert started_at is not None
+        assert updated_at is not None
         common = {
             "generation": row.generation,
             "completed_generation": row.completed_generation,
@@ -1038,12 +1431,14 @@ class SecurityPostureService:
                 PostureDetailCode.RECONCILIATION_FAILED,
                 **common,
             )
-        if (
-            completed_at is None
-            or row.completed_generation != row.generation
-            or completed_at > observed_at
-        ):
-            raise ValueError("invalid reconciliation evidence")
+        if not validation.current or completed_at is None:
+            return self._unknown(
+                PostureName.STARTUP_RECONCILIATION,
+                observed_at,
+                detail=(
+                    PostureDetailCode.RECONCILIATION_EVIDENCE_INVALID
+                ),
+            )
         age = (observed_at - completed_at).total_seconds()
         max_age = self._config.trading.reconciliation_max_age_seconds
         stale = age > max_age
@@ -1139,70 +1534,164 @@ class SecurityPostureService:
         session,
         observed_at: datetime,
     ) -> list[PostureCheck]:
-        order_count = session.scalar(
-            select(func.count(Order.id)).where(
-                or_(
-                    Order.status.in_(_LIVE_OR_UNKNOWN_ORDER_STATUSES),
-                    Order.acceptance_state
-                    == "fill_reconcile_required",
-                    Order.last_error_code.in_(
-                        _SAFETY_LATCH_ERROR_CODES
-                    ),
-                )
+        def known_values(column, known: frozenset[str]) -> bool:
+            values = session.scalars(
+                select(column).distinct()
+            ).all()
+            return all(
+                type(value) is str and value in known
+                for value in values
+            )
+
+        order_domain_known = (
+            known_values(Order.status, _KNOWN_ORDER_STATUSES)
+            and known_values(
+                Order.acceptance_state,
+                _KNOWN_ORDER_ACCEPTANCE_STATES,
+            )
+            and known_values(
+                Order.plan_cancel_state,
+                _KNOWN_PLAN_CANCEL_STATES,
             )
         )
-        fill_count = session.scalar(
-            select(func.count(Fill.id)).where(
-                or_(
-                    Fill.order_id.is_(None),
-                    Fill.reconciliation_state
-                    == FILL_RECONCILIATION_QUARANTINED,
-                    (
-                        Fill.reconciliation_state
-                        != FILL_RECONCILIATION_SUPERSEDED
+        fill_domain_known = known_values(
+            Fill.reconciliation_state,
+            _KNOWN_FILL_RECONCILIATION_STATES,
+        )
+        rule_domain_known = known_values(
+            Rule.state,
+            _KNOWN_RULE_STATES,
+        )
+        group_domain_known = known_values(
+            RuleGroup.state,
+            _KNOWN_RULE_GROUP_STATES,
+        )
+        order_count = (
+            session.scalar(
+                select(func.count(Order.id)).where(
+                    or_(
+                        Order.status.in_(
+                            _LIVE_OR_UNKNOWN_ORDER_STATUSES
+                        ),
+                        Order.acceptance_state
+                        == FILL_RECONCILIATION_REQUIRED,
+                        Order.plan_cancel_state.in_(
+                            (
+                                PLAN_CANCEL_REQUESTED,
+                                PLAN_CANCEL_INDETERMINATE,
+                            )
+                        ),
+                        Order.last_error_code.in_(
+                            _SAFETY_LATCH_ERROR_CODES
+                        ),
                     )
-                    & or_(
-                        Fill.broker_fill_id.is_(None),
-                        func.trim(Fill.broker_fill_id) == "",
-                    ),
                 )
             )
+            if order_domain_known
+            else None
         )
-        rule_count = session.scalar(
-            select(func.count(Rule.id)).where(
-                Rule.state.in_(("pending", "active", "processing"))
-            )
-        )
-        group_count = session.scalar(
-            select(func.count(RuleGroup.id)).where(
-                or_(
-                    RuleGroup.state.in_(("pending", "active")),
-                    RuleGroup.reconciliation_required.is_(True),
+        fill_count = (
+            session.scalar(
+                select(func.count(Fill.id)).where(
+                    or_(
+                        Fill.order_id.is_(None),
+                        Fill.reconciliation_state.in_(
+                            (
+                                FILL_RECONCILIATION_REQUIRED,
+                                FILL_RECONCILIATION_QUARANTINED,
+                            )
+                        ),
+                        (
+                            Fill.reconciliation_state
+                            != FILL_RECONCILIATION_SUPERSEDED
+                        )
+                        & or_(
+                            Fill.broker_fill_id.is_(None),
+                            func.trim(Fill.broker_fill_id) == "",
+                        ),
+                    )
                 )
             )
+            if fill_domain_known
+            else None
+        )
+        rule_count = (
+            session.scalar(
+                select(func.count(Rule.id)).where(
+                    Rule.state.in_(("pending", "active", "processing"))
+                )
+            )
+            if rule_domain_known
+            else None
+        )
+        group_count = (
+            session.scalar(
+                select(func.count(RuleGroup.id)).where(
+                    or_(
+                        RuleGroup.state.in_(("pending", "active")),
+                        RuleGroup.reconciliation_required.is_(True),
+                    )
+                )
+            )
+            if group_domain_known
+            else None
         )
         return [
-            self._count_check(
-                PostureName.UNSAFE_ORDERS,
-                observed_at,
-                int(order_count or 0),
+            (
+                self._count_check(
+                    PostureName.UNSAFE_ORDERS,
+                    observed_at,
+                    int(order_count or 0),
+                )
+                if order_domain_known
+                else self._unknown(
+                    PostureName.UNSAFE_ORDERS,
+                    observed_at,
+                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
+                )
             ),
-            self._count_check(
-                PostureName.UNSAFE_FILLS,
-                observed_at,
-                int(fill_count or 0),
+            (
+                self._count_check(
+                    PostureName.UNSAFE_FILLS,
+                    observed_at,
+                    int(fill_count or 0),
+                )
+                if fill_domain_known
+                else self._unknown(
+                    PostureName.UNSAFE_FILLS,
+                    observed_at,
+                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
+                )
             ),
-            self._count_check(
-                PostureName.UNSAFE_RULES,
-                observed_at,
-                int(rule_count or 0),
-                scope="rules",
+            (
+                self._count_check(
+                    PostureName.UNSAFE_RULES,
+                    observed_at,
+                    int(rule_count or 0),
+                    scope="rules",
+                )
+                if rule_domain_known
+                else self._unknown(
+                    PostureName.UNSAFE_RULES,
+                    observed_at,
+                    scope="rules",
+                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
+                )
             ),
-            self._count_check(
-                PostureName.UNSAFE_RULES,
-                observed_at,
-                int(group_count or 0),
-                scope="rule_groups",
+            (
+                self._count_check(
+                    PostureName.UNSAFE_RULES,
+                    observed_at,
+                    int(group_count or 0),
+                    scope="rule_groups",
+                )
+                if group_domain_known
+                else self._unknown(
+                    PostureName.UNSAFE_RULES,
+                    observed_at,
+                    scope="rule_groups",
+                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
+                )
             ),
         ]
 
@@ -1293,11 +1782,20 @@ class SecurityPostureService:
             for state in ("received", "summarized", "rejected", "failed")
         ]
         checks.extend(
+            self._unknown(
+                PostureName.CIRCUIT_BREAKER,
+                observed_at,
+                scope=scope,
+            )
+            for scope in (
+                "account",
+                "equity",
+                "crypto",
+                "liquidity",
+            )
+        )
+        checks.extend(
             [
-                self._unknown(
-                    PostureName.CIRCUIT_BREAKER,
-                    observed_at,
-                ),
                 self._unknown(
                     PostureName.DAEMON_HEARTBEAT,
                     observed_at,

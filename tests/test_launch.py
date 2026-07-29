@@ -98,6 +98,7 @@ def test_startup_guard_uses_database_encryption_inspector_and_blocks_required(
                     )
                 },
             ),
+            secret_loaded_at=datetime.now(timezone.utc),
         )
 
     codes = {check.code for check in captured.value.checks}
@@ -146,23 +147,36 @@ def test_startup_guard_allows_only_internally_consistent_complete_encryption(
         lambda _config: StructuralCheck("tls", "passed", "ok"),
     )
 
-    checks = serve.run_startup_guard(
+    secrets = Secrets(
+        database_url=url,
+        app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+        field_encryption_keys={
+            config.encryption.active_key_id: (
+                base64.b64encode(b"l" * 32).decode()
+            )
+        },
+    )
+    receipt = serve.run_startup_guard(
         config=config,
-        secrets=Secrets(
-            database_url=url,
-            app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
-            field_encryption_keys={
-                config.encryption.active_key_id: (
-                    base64.b64encode(b"l" * 32).decode()
-                )
-            },
-        ),
+        secrets=secrets,
+        secret_loaded_at=now,
+    )
+    from trading_assistant.operations import security_posture as posture
+
+    evidence = posture._validate_startup_guard_receipt(
+        receipt,
+        config=config,
+        secrets=secrets,
     )
 
-    assert all(check.passed for check in checks)
+    assert all(
+        check.status == "pass"
+        for check in evidence.structural_checks
+    )
     assert any(
-        check.name == "encryption" and check.code == "ok"
-        for check in checks
+        check.name is posture.StartupCheckName.ENCRYPTION
+        and check.detail_code is posture.StartupDetailCode.OK
+        for check in evidence.structural_checks
     )
 
 

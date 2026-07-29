@@ -76,6 +76,7 @@ class RoutePolicy:
     target_param: str | None = None
     mutation_operation: str | None = None
     receipt_managed_idempotency: bool = False
+    lease_free_bounded_read: bool = False
 
     def __post_init__(self) -> None:
         if self.receipt_managed_idempotency and (
@@ -84,6 +85,22 @@ class RoutePolicy:
         ):
             raise ValueError(
                 "receipt-managed idempotency cannot use a generic interlock"
+            )
+        if type(self.lease_free_bounded_read) is not bool:
+            raise ValueError("lease-free bounded read flag is invalid")
+        if self.lease_free_bounded_read and (
+            self.method.upper() != "GET"
+            or self.requires_idempotency
+            or self.audit_mutation
+            or self.broker_read
+            or self.provider_category is not None
+            or self.mutation_operation is not None
+            or self.receipt_managed_idempotency
+            or self.concurrency_behavior != "reject"
+            or self.target_param is not None
+        ):
+            raise ValueError(
+                "lease-free bounded read cannot carry mutation authority"
             )
 
 
@@ -193,6 +210,7 @@ ROUTE_POLICIES = (
         "/security/posture",
         AuthLevel.SESSION,
         "session_read",
+        lease_free_bounded_read=True,
     ),
     RoutePolicy("GET", "/pending", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
@@ -1670,6 +1688,8 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
             )
             if bounds_response is not None:
                 return bounds_response
+        if policy.lease_free_bounded_read:
+            return await call_next(request)
         lease_keys = _lease_keys(
             app,
             resolved,

@@ -15,8 +15,8 @@ from typing import Protocol
 import uvicorn
 from sqlalchemy import text
 
-from ..app.main import create_app
-from ..bootstrap import build_container
+from ..app.main import _create_guarded_app
+from ..bootstrap import _build_guarded_container
 from ..config import load_config
 from ..db.schema import require_current_schema
 from ..db.session import create_db_engine
@@ -25,7 +25,10 @@ from ..preflight import (
     StructuralCheck,
     structural_runtime_check,
 )
-from ..operations.security_posture import startup_posture_evidence
+from ..operations.security_posture import (
+    StartupGuardReceipt,
+    _issue_startup_guard_receipt,
+)
 from ..security.crypto import build_sensitive_data_cipher
 from ..security.secrets import (
     MacOSKeychainSecretProvider,
@@ -93,7 +96,8 @@ def run_startup_guard(
     config=None,
     secrets: RuntimeSecrets | None = None,
     encryption_inspector: EncryptionStateInspector | None = None,
-) -> tuple[StructuralCheck, ...]:
+    secret_loaded_at: datetime,
+) -> StartupGuardReceipt:
     """Run local structural checks and raise before app construction on failure."""
     config = config or load_config()
     if secrets is None:
@@ -143,7 +147,13 @@ def run_startup_guard(
     )
     if any(not check.passed for check in checks):
         raise StartupGuardBlocked(checks)
-    return checks
+    return _issue_startup_guard_receipt(
+        config=config,
+        secrets=secrets,
+        checks=checks,
+        observed_at=datetime.now(timezone.utc),
+        secret_loaded_at=secret_loaded_at,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,10 +177,6 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         ) from None
-    checks = run_startup_guard(
-        config=config,
-        secrets=secrets,
-    )
     secret_loaded_at = secret_provider.last_successful_role_load_at
     if secret_loaded_at is None:
         raise StartupGuardBlocked(
@@ -182,23 +188,23 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         )
-    evidence = startup_posture_evidence(
-        checks=checks,
-        observed_at=datetime.now(timezone.utc),
+    startup_guard_receipt = run_startup_guard(
+        config=config,
+        secrets=secrets,
         secret_loaded_at=secret_loaded_at,
     )
     control = start_app_control(Path.cwd())
     app = None
     try:
-        container = build_container(
+        container = _build_guarded_container(
             config,
             secrets,
             runtime_role="app",
-            startup_evidence=evidence,
+            startup_guard_receipt=startup_guard_receipt,
         )
-        app = create_app(
+        app = _create_guarded_app(
             container=container,
-            startup_evidence=evidence,
+            startup_guard_receipt=startup_guard_receipt,
         )
         server = uvicorn.Server(
             uvicorn.Config(

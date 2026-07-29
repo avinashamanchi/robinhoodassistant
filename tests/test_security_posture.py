@@ -20,12 +20,18 @@ from trading_assistant.db.models import (
     AuditEvent,
     Base,
     CircuitBreakerState,
+    ConcurrencyLease,
+    FILL_RECONCILIATION_REQUIRED,
+    FILL_RECONCILIATION_SUPERSEDED,
+    FILL_RECONCILIATION_TRUSTED,
     Fill,
     Heartbeat,
     MutationInterlock,
     Order,
+    PLAN_CANCEL_NONE,
     ProviderBudgetDay,
     ProviderReservation,
+    RateWindow,
     Rule,
     RuleGroup,
     RuntimeTenure,
@@ -35,6 +41,9 @@ from trading_assistant.db.models import (
 )
 from trading_assistant.app.limits import DurableRateLimiter
 from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
+from trading_assistant.notifications.base import NullNotifier
+from trading_assistant.orders.startup import StartupReconciliationGate
+from trading_assistant.rules.models import RuleState
 from trading_assistant.security.crypto import (
     SensitiveDataCipher,
     SensitiveFieldRef,
@@ -57,19 +66,25 @@ def _reader(
     *,
     app_config,
     session_factory,
-    engine=None,
-    startup_evidence=None,
+    startup_guard_receipt=None,
+    startup_secrets=None,
     reconciliation_enabled=True,
-    sensitive_cipher=None,
 ):
     posture = _posture_module()
     configured = app_config.security.provider_budget
+    startup_kwargs = (
+        {
+            "_startup_guard_receipt": startup_guard_receipt,
+            "_startup_secrets": startup_secrets,
+        }
+        if startup_guard_receipt is not None
+        else {}
+    )
     return posture.SecurityPostureService(
         config=app_config,
         session_factory=session_factory,
         reconciliation_key="mock",
         reconciliation_enabled=reconciliation_enabled,
-        startup_evidence=startup_evidence,
         rate_limiter=DurableRateLimiter(session_factory),
         provider_budget=ProviderBudgetService(
             session_factory,
@@ -83,10 +98,41 @@ def _reader(
             ),
             clock=lambda: NOW,
         ),
-        engine=engine,
-        sensitive_cipher=sensitive_cipher,
         clock=lambda: NOW,
+        **startup_kwargs,
     )
+
+
+def _issued_startup_receipt(
+    app_config,
+    *,
+    secrets=None,
+    checks=None,
+):
+    posture = _posture_module()
+    secrets = secrets or RuntimeSecrets(
+        app_api_token="posture-receipt-test-secret-0123456789",
+        database_url="sqlite:///posture-receipt-never-opened.db",
+    )
+    checks = checks or (
+        SimpleNamespace(
+            name="runtime_configuration",
+            passed=True,
+            code="ok",
+        ),
+        SimpleNamespace(name="loopback_https", passed=True, code="ok"),
+        SimpleNamespace(name="tls", passed=True, code="ok"),
+        SimpleNamespace(name="database", passed=True, code="ok"),
+        SimpleNamespace(name="encryption", passed=True, code="ok"),
+    )
+    receipt = posture._issue_startup_guard_receipt(
+        config=app_config,
+        secrets=secrets,
+        checks=checks,
+        observed_at=NOW,
+        secret_loaded_at=NOW - timedelta(seconds=2),
+    )
+    return receipt, secrets
 
 
 def _checks_by_name(report, name):
@@ -144,10 +190,10 @@ def test_security_posture_reports_evidence_not_permission(
 def test_posture_models_are_frozen_extra_forbid_and_cannot_authorize():
     posture = _posture_module()
     check = posture.PostureCheck(
-        name="quote_freshness",
-        status="unknown",
+        name=posture.PostureName.QUOTE_FRESHNESS,
+        status=posture.PostureStatus.UNKNOWN,
         observed_at=NOW,
-        detail_code="quote_evidence_unavailable",
+        detail_code=posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE,
     )
     report = posture.SecurityPostureReport(
         observed_at=NOW,
@@ -173,20 +219,92 @@ def test_posture_models_are_frozen_extra_forbid_and_cannot_authorize():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("count", True),
+        ("generation", "1"),
+        ("budget_used", 1.0),
+        ("age_seconds", True),
+        ("max_age_seconds", "1.0"),
+    ],
+)
+def test_posture_models_reject_coercive_or_boolean_numeric_scalars(
+    field,
+    value,
+):
+    posture = _posture_module()
+
+    with pytest.raises(ValidationError):
+        posture.PostureCheck(
+            name=posture.PostureName.QUOTE_FRESHNESS,
+            status=posture.PostureStatus.UNKNOWN,
+            observed_at=NOW,
+            detail_code=(
+                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
+            ),
+            **{field: value},
+        )
+
+
+def test_posture_models_are_strict_and_can_trade_is_exact_false_bool():
+    posture = _posture_module()
+    check = posture.PostureCheck(
+        name=posture.PostureName.QUOTE_FRESHNESS,
+        status=posture.PostureStatus.UNKNOWN,
+        observed_at=NOW,
+        detail_code=posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE,
+    )
+    report = posture.SecurityPostureReport(
+        observed_at=NOW,
+        checks=(check,),
+    )
+
+    assert report.can_trade is False
+    assert type(report.can_trade) is bool
+    for value in (0, 0.0, "false", None):
+        with pytest.raises(ValidationError):
+            posture.SecurityPostureReport(
+                observed_at=NOW,
+                checks=(check,),
+                can_trade=value,
+            )
+    with pytest.raises(ValidationError):
+        posture.PostureCheck(
+            name="quote_freshness",
+            status=posture.PostureStatus.UNKNOWN,
+            observed_at=NOW,
+            detail_code=(
+                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
+            ),
+        )
+    with pytest.raises(ValidationError):
+        posture.PostureCheck(
+            name=posture.PostureName.QUOTE_FRESHNESS,
+            status=posture.PostureStatus.UNKNOWN,
+            observed_at=NOW.isoformat(),
+            detail_code=(
+                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
+            ),
+        )
+
+
 def test_startup_posture_evidence_is_typed_redacted_and_immutable():
     posture = _posture_module()
     evidence = posture.StartupPostureEvidence(
         observed_at=NOW,
         structural_checks=(
             posture.StartupStructuralCheck(
-                name="loopback_https",
+                name=posture.StartupCheckName.LOOPBACK_HTTPS,
                 status="pass",
-                detail_code="ok",
+                detail_code=posture.StartupDetailCode.OK,
             ),
             posture.StartupStructuralCheck(
-                name="tls",
+                name=posture.StartupCheckName.TLS,
                 status="blocked",
-                detail_code="tls_certificate_san_invalid",
+                detail_code=(
+                    posture.StartupDetailCode.TLS_CERTIFICATE_SAN_INVALID
+                ),
             ),
         ),
         secret_provider="macos_keychain",
@@ -210,6 +328,68 @@ def test_startup_posture_evidence_is_typed_redacted_and_immutable():
             secret_load_status="pass",
             secret_loaded_at=NOW,
             secret_presence=True,
+        )
+    with pytest.raises(ValidationError):
+        posture.StartupStructuralCheck(
+            name="tls",
+            status="pass",
+            detail_code=posture.StartupDetailCode.OK,
+        )
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        (
+            SimpleNamespace(
+                name="loopback_https",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(name="tls", passed=True, code="ok"),
+            SimpleNamespace(name="encryption", passed=True, code="ok"),
+        ),
+        (
+            SimpleNamespace(
+                name="runtime_configuration",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(
+                name="loopback_https",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(
+                name="tls",
+                passed=True,
+                code="tls_material_parse_failed",
+            ),
+            SimpleNamespace(name="database", passed=True, code="ok"),
+            SimpleNamespace(name="encryption", passed=True, code="ok"),
+        ),
+    ],
+)
+def test_startup_receipt_issuer_rejects_partial_or_inconsistent_guard_checks(
+    app_config,
+    checks,
+):
+    posture = _posture_module()
+    secrets = RuntimeSecrets(
+        app_api_token="receipt-validation-test-secret-0123456789",
+        database_url="sqlite:///receipt-validation-never-opened.db",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_invalid",
+    ):
+        posture._issue_startup_guard_receipt(
+            config=app_config,
+            secrets=secrets,
+            checks=checks,
+            observed_at=NOW,
+            secret_loaded_at=NOW - timedelta(seconds=1),
         )
 
 
@@ -352,8 +532,11 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
         "app": 0,
     }
     checks = (
+        StructuralCheck("runtime_configuration", "passed", "ok"),
         StructuralCheck("loopback_https", "passed", "ok"),
         StructuralCheck("tls", "passed", "ok"),
+        StructuralCheck("database", "passed", "ok"),
+        StructuralCheck("encryption", "passed", "ok"),
     )
 
     def load_once(role, *, config, provider: object):
@@ -363,35 +546,49 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
         assert provider is provider_instance
         return loaded
 
-    def guard_once(*, config, secrets, **_kwargs):
+    def guard_once(*, config, secrets, secret_loaded_at, **_kwargs):
         calls["guard"] += 1
         assert config is app_config
         assert secrets is loaded
-        return checks
+        assert secret_loaded_at is provider.last_successful_role_load_at
+        posture = _posture_module()
+        return posture._issue_startup_guard_receipt(
+            config=config,
+            secrets=secrets,
+            checks=checks,
+            observed_at=NOW,
+            secret_loaded_at=secret_loaded_at,
+        )
 
     def build_once(
         config,
         secrets,
         *,
         runtime_role,
-        startup_evidence,
+        startup_guard_receipt,
     ):
         calls["build"] += 1
         assert config is app_config
         assert secrets is loaded
         assert runtime_role == "app"
-        assert startup_evidence.secret_loaded_at == (
-            provider.last_successful_role_load_at
+        evidence = _posture_module()._validate_startup_guard_receipt(
+            startup_guard_receipt,
+            config=config,
+            secrets=secrets,
         )
+        assert evidence.secret_loaded_at is provider.last_successful_role_load_at
         return SimpleNamespace(
             secrets=secrets,
-            startup_evidence=startup_evidence,
+            startup_guard_receipt=startup_guard_receipt,
         )
 
-    def create_once(*, container, startup_evidence):
+    def create_once(*, container, startup_guard_receipt):
         calls["app"] += 1
         assert container.secrets is loaded
-        assert container.startup_evidence is startup_evidence
+        assert (
+            container.startup_guard_receipt
+            is startup_guard_receipt
+        )
         return SimpleNamespace(
             state=SimpleNamespace(
                 install_controlled_shutdown=lambda _callback: None,
@@ -425,8 +622,8 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
     )
     monkeypatch.setattr(serve, "load_role_secrets", load_once)
     monkeypatch.setattr(serve, "run_startup_guard", guard_once)
-    monkeypatch.setattr(serve, "build_container", build_once)
-    monkeypatch.setattr(serve, "create_app", create_once)
+    monkeypatch.setattr(serve, "_build_guarded_container", build_once)
+    monkeypatch.setattr(serve, "_create_guarded_app", create_once)
     monkeypatch.setattr(
         serve,
         "start_app_control",
@@ -462,12 +659,12 @@ def test_launcher_keychain_failure_is_stable_and_stops_composition(
     )
     monkeypatch.setattr(
         serve,
-        "build_container",
+        "_build_guarded_container",
         lambda *_args, **_kwargs: composed.append("container"),
     )
     monkeypatch.setattr(
         serve,
-        "create_app",
+        "_create_guarded_app",
         lambda *_args, **_kwargs: composed.append("app"),
     )
 
@@ -490,14 +687,16 @@ def test_startup_failures_remain_independent_typed_evidence(
         observed_at=NOW - timedelta(seconds=3),
         structural_checks=(
             posture.StartupStructuralCheck(
-                name="loopback_https",
+                name=posture.StartupCheckName.LOOPBACK_HTTPS,
                 status="pass",
-                detail_code="ok",
+                detail_code=posture.StartupDetailCode.OK,
             ),
             posture.StartupStructuralCheck(
-                name="tls",
+                name=posture.StartupCheckName.TLS,
                 status="blocked",
-                detail_code="tls_certificate_san_invalid",
+                detail_code=(
+                    posture.StartupDetailCode.TLS_CERTIFICATE_SAN_INVALID
+                ),
             ),
         ),
         secret_provider="macos_keychain",
@@ -507,7 +706,6 @@ def test_startup_failures_remain_independent_typed_evidence(
     report = _reader(
         app_config=app_config,
         session_factory=session_factory,
-        startup_evidence=evidence,
     ).report(limit_principal="session:1:operator")
     by_name = {
         check.name.value: check
@@ -515,14 +713,23 @@ def test_startup_failures_remain_independent_typed_evidence(
         if check.name.value in {"loopback_https", "tls", "secret_provider"}
     }
 
-    assert by_name["loopback_https"].status.value == "pass"
-    assert by_name["tls"].status.value == "blocked"
+    assert by_name["loopback_https"].status.value == "unknown"
+    assert by_name["tls"].status.value == "unknown"
     assert (
         by_name["tls"].detail_code.value
-        == "tls_certificate_san_invalid"
+        == "startup_evidence_unavailable"
     )
-    assert by_name["secret_provider"].status.value == "blocked"
+    assert by_name["secret_provider"].status.value == "unknown"
     assert report.can_trade is False
+    with pytest.raises(TypeError):
+        posture.SecurityPostureService(
+            config=app_config,
+            session_factory=session_factory,
+            reconciliation_key="mock",
+            reconciliation_enabled=True,
+            startup_evidence=evidence,
+            clock=lambda: NOW,
+        )
 
 
 def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
@@ -651,7 +858,11 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
         session_factory=session_factory,
     ).report(limit_principal="session:1:operator")
 
-    breaker = _checks_by_name(report, "circuit_breaker")[0]
+    breaker = next(
+        check
+        for check in _checks_by_name(report, "circuit_breaker")
+        if check.scope == "liquidity"
+    )
     heartbeat = _checks_by_name(report, "daemon_heartbeat")[0]
     reconciliation = _checks_by_name(
         report,
@@ -669,10 +880,11 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
     )
 
     assert (breaker.scope, breaker.status.value, breaker.generation) == (
-        "liquidity:AAPL",
+        "liquidity",
         "tripped",
         4,
     )
+    assert breaker.count == 1
     assert heartbeat.status.value == "stale"
     assert reconciliation.status.value == "stale"
     assert reconciliation.generation == 7
@@ -699,6 +911,439 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
         "tool_call",
     ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "check_name", "scope"),
+    [
+        ("orders", "status", "unsafe_orders", None),
+        ("orders", "acceptance_state", "unsafe_orders", None),
+        ("orders", "plan_cancel_state", "unsafe_orders", None),
+        ("fills", "reconciliation_state", "unsafe_fills", None),
+        ("rules", "state", "unsafe_rules", "rules"),
+        ("rule_groups", "state", "unsafe_rules", "rule_groups"),
+    ],
+)
+def test_unknown_persisted_state_domains_are_unknown_never_clear(
+    app_config,
+    session_factory,
+    engine,
+    table,
+    column,
+    check_name,
+    scope,
+):
+    marker = "APP_API_TOKEN_CORRUPT_STATE"
+    with session_factory() as session:
+        order = Order(
+            idempotency_key=f"unknown-domain-{table}-{column}",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("10"),
+            status=OrderStatus.FILLED.value,
+            acceptance_state="accepted",
+            plan_cancel_state=PLAN_CANCEL_NONE,
+        )
+        group = RuleGroup(
+            group_key=f"unknown-domain-{table}-{column}",
+            state=RuleState.TRIGGERED.value,
+            reconciliation_required=False,
+        )
+        persist_sensitive(
+            session,
+            order,
+            {"approval_reason": "unknown domain fixture"},
+        )
+        session.add(group)
+        session.flush()
+        fill = Fill(
+            order_id=order.id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            broker_fill_id=f"fill-{table}-{column}",
+            reconciliation_state=FILL_RECONCILIATION_TRUSTED,
+            filled_at=NOW - timedelta(minutes=1),
+        )
+        rule = Rule(
+            group_id=group.id,
+            ticker="AAPL",
+            condition_json="{}",
+            action_json="{}",
+            state=RuleState.TRIGGERED.value,
+        )
+        session.add_all((fill, rule))
+        session.commit()
+        row_id = {
+            "orders": order.id,
+            "fills": fill.id,
+            "rules": rule.id,
+            "rule_groups": group.id,
+        }[table]
+
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"UPDATE {table} SET {column} = ? WHERE id = ?",
+            (marker, row_id),
+        )
+
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    check = next(
+        item
+        for item in _checks_by_name(report, check_name)
+        if item.scope == scope
+    )
+
+    assert check.status.value == "unknown"
+    assert check.detail_code.value == "state_domain_invalid"
+    assert check.count is None
+    assert marker not in report.model_dump_json()
+
+
+def test_rule_group_rejects_rule_only_processing_state(
+    app_config,
+    session_factory,
+):
+    with session_factory() as session:
+        session.add(
+            RuleGroup(
+                group_key="invalid-processing-group-state",
+                state=RuleState.PROCESSING.value,
+                reconciliation_required=False,
+            )
+        )
+        session.commit()
+
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    check = next(
+        item
+        for item in _checks_by_name(report, "unsafe_rules")
+        if item.scope == "rule_groups"
+    )
+
+    assert check.status.value == "unknown"
+    assert check.detail_code.value == "state_domain_invalid"
+    assert check.count is None
+
+
+def test_breakers_are_aggregated_into_fixed_categories_without_targets(
+    app_config,
+    session_factory,
+):
+    rows = (
+        ("operator_global", "operator_global", "", False, 2),
+        ("data:equity", "data", "equity", False, 3),
+        ("loss:crypto", "loss", "crypto", True, 4),
+        (
+            "liquidity:APP_API_TOKEN",
+            "liquidity",
+            "APP_API_TOKEN",
+            True,
+            5,
+        ),
+    )
+    with session_factory() as session:
+        for scope_key, kind, target, tripped, generation in rows:
+            persist_sensitive(
+                session,
+                CircuitBreakerState(
+                    scope_key=scope_key,
+                    kind=kind,
+                    target=target,
+                    tripped=tripped,
+                    actor=NARRATIVE_MARKER,
+                    generation=generation,
+                    updated_at=NOW - timedelta(minutes=1),
+                ),
+                {"reason": NARRATIVE_MARKER},
+            )
+        session.commit()
+
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    breakers = {
+        check.scope: check
+        for check in _checks_by_name(report, "circuit_breaker")
+    }
+
+    assert set(breakers) == {
+        "account",
+        "equity",
+        "crypto",
+        "liquidity",
+    }
+    assert (breakers["account"].status.value, breakers["account"].count) == (
+        "clear",
+        0,
+    )
+    assert (breakers["equity"].status.value, breakers["equity"].count) == (
+        "clear",
+        0,
+    )
+    assert (
+        breakers["crypto"].status.value,
+        breakers["crypto"].count,
+        breakers["crypto"].generation,
+    ) == ("tripped", 1, 4)
+    assert (
+        breakers["liquidity"].status.value,
+        breakers["liquidity"].count,
+        breakers["liquidity"].generation,
+    ) == ("tripped", 1, 5)
+    encoded = report.model_dump_json()
+    assert "liquidity:APP_API_TOKEN" not in encoded
+    assert "APP_API_TOKEN" not in encoded
+
+
+def test_malformed_breaker_scope_makes_breaker_evidence_unknown_without_echo(
+    app_config,
+    session_factory,
+):
+    marker = "APP_API_TOKEN"
+    with session_factory() as session:
+        persist_sensitive(
+            session,
+            CircuitBreakerState(
+                scope_key=f"liquidity:bad:{marker}",
+                kind="liquidity",
+                target=f"bad:{marker}",
+                tripped=True,
+                actor=NARRATIVE_MARKER,
+                generation=1,
+                updated_at=NOW - timedelta(minutes=1),
+            ),
+            {"reason": NARRATIVE_MARKER},
+        )
+        session.commit()
+
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    breakers = _checks_by_name(report, "circuit_breaker")
+
+    assert breakers
+    assert all(check.status.value == "unknown" for check in breakers)
+    assert all(
+        check.detail_code.value == "breaker_scope_invalid"
+        for check in breakers
+    )
+    assert marker not in report.model_dump_json()
+
+
+def test_malformed_breaker_generation_is_unknown_never_clear(
+    app_config,
+    session_factory,
+):
+    with session_factory() as session:
+        persist_sensitive(
+            session,
+            CircuitBreakerState(
+                scope_key="operator_global",
+                kind="operator_global",
+                target="",
+                tripped=False,
+                actor=NARRATIVE_MARKER,
+                generation=0,
+                updated_at=NOW - timedelta(minutes=1),
+            ),
+            {"reason": NARRATIVE_MARKER},
+        )
+        session.commit()
+
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    breakers = _checks_by_name(report, "circuit_breaker")
+
+    assert breakers
+    assert all(check.status.value == "unknown" for check in breakers)
+    assert all(
+        check.detail_code.value == "breaker_scope_invalid"
+        for check in breakers
+    )
+    assert NARRATIVE_MARKER not in report.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    (
+        "generation",
+        "completed_generation",
+        "status",
+        "started_at",
+        "completed_at",
+        "updated_at",
+        "gate_current",
+        "posture_status",
+        "detail_code",
+    ),
+    [
+        (
+            3,
+            3,
+            "current",
+            NOW - timedelta(minutes=2),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=30),
+            True,
+            "pass",
+            "reconciliation_current",
+        ),
+        (
+            3,
+            2,
+            "required",
+            NOW - timedelta(minutes=2),
+            None,
+            NOW - timedelta(minutes=1),
+            False,
+            "blocked",
+            "reconciliation_required",
+        ),
+        (
+            0,
+            0,
+            "current",
+            NOW - timedelta(minutes=2),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=30),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+        (
+            3,
+            2,
+            "current",
+            NOW - timedelta(minutes=2),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=30),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+        (
+            3,
+            3,
+            "current",
+            NOW + timedelta(seconds=1),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=30),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+        (
+            3,
+            3,
+            "current",
+            NOW - timedelta(minutes=2),
+            NOW + timedelta(seconds=1),
+            NOW + timedelta(seconds=2),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+        (
+            3,
+            3,
+            "current",
+            NOW - timedelta(seconds=30),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=10),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+        (
+            3,
+            3,
+            "required",
+            NOW - timedelta(minutes=2),
+            NOW - timedelta(minutes=1),
+            NOW - timedelta(seconds=30),
+            False,
+            "unknown",
+            "reconciliation_evidence_invalid",
+        ),
+    ],
+    ids=[
+        "fresh-current",
+        "required",
+        "zero-generation",
+        "incomplete-current",
+        "future-start",
+        "future-completion",
+        "timestamps-out-of-order",
+        "required-with-completion",
+    ],
+)
+def test_reconciliation_posture_matches_authoritative_safe_column_gate(
+    app_config,
+    session_factory,
+    generation,
+    completed_generation,
+    status,
+    started_at,
+    completed_at,
+    updated_at,
+    gate_current,
+    posture_status,
+    detail_code,
+):
+    with session_factory() as session:
+        persist_sensitive(
+            session,
+            StartupReconciliationState(
+                broker="mock",
+                generation=generation,
+                completed_generation=completed_generation,
+                status=status,
+                actor=NARRATIVE_MARKER,
+                request_id=NARRATIVE_MARKER,
+                started_at=started_at,
+                completed_at=completed_at,
+                updated_at=updated_at,
+            ),
+            {
+                "reason": NARRATIVE_MARKER,
+                "evidence_json": json.dumps(
+                    {"external": NARRATIVE_MARKER}
+                ),
+            },
+        )
+        session.commit()
+
+    gate = StartupReconciliationGate(
+        session_factory,
+        "mock",
+        enabled=True,
+        clock=lambda: NOW,
+    )
+    report = _reader(
+        app_config=app_config,
+        session_factory=session_factory,
+    ).report(limit_principal="session:1:operator")
+    check = _checks_by_name(
+        report,
+        "startup_reconciliation",
+    )[0]
+
+    assert gate.is_current() is gate_current
+    assert check.status.value == posture_status
+    assert check.detail_code.value == detail_code
+    assert NARRATIVE_MARKER not in report.model_dump_json()
 
 
 def test_posture_is_repeatable_concurrent_and_preserves_every_table(
@@ -732,24 +1377,7 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
     app_config,
 ):
     posture = _posture_module()
-    evidence = posture.StartupPostureEvidence(
-        observed_at=NOW,
-        structural_checks=(
-            posture.StartupStructuralCheck(
-                name="loopback_https",
-                status="pass",
-                detail_code="ok",
-            ),
-            posture.StartupStructuralCheck(
-                name="tls",
-                status="pass",
-                detail_code="ok",
-            ),
-        ),
-        secret_provider="macos_keychain",
-        secret_load_status="pass",
-        secret_loaded_at=NOW,
-    )
+    receipt, secrets = _issued_startup_receipt(app_config)
 
     class BrokenFactory:
         def __call__(self):
@@ -760,7 +1388,8 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
         session_factory=BrokenFactory(),
         reconciliation_key="mock",
         reconciliation_enabled=True,
-        startup_evidence=evidence,
+        _startup_guard_receipt=receipt,
+        _startup_secrets=secrets,
         clock=lambda: NOW,
     )
 
@@ -782,6 +1411,13 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
     assert checks["tls"].status.value == "pass"
     assert checks["unsafe_orders"].status.value == "unknown"
     assert checks["daemon_heartbeat"].status.value == "unknown"
+    breaker_checks = _checks_by_name(report, "circuit_breaker")
+    assert {
+        check.scope for check in breaker_checks
+    } == {"account", "equity", "crypto", "liquidity"}
+    assert all(
+        check.status.value == "unknown" for check in breaker_checks
+    )
     assert NARRATIVE_MARKER not in report.model_dump_json()
 
 
@@ -885,31 +1521,27 @@ def test_request_and_provider_exhaustion_are_read_only_blocked_evidence(
     assert _snapshot_all_tables(session_factory) == before
 
 
-def test_mixed_sensitive_encryption_is_blocked_without_key_ids_or_values(
+def test_posture_never_calls_decrypting_encryption_inspection_or_cipher(
     app_config,
     session_factory,
     engine,
+    monkeypatch,
 ):
+    from trading_assistant import preflight
+    from trading_assistant.ops import encrypt_sensitive
+
     active_key_id = app_config.encryption.active_key_id
-    old_key_id = "local-retained-2026-06"
-    cipher = SensitiveDataCipher(
-        {
-            active_key_id: b"a" * 32,
-            old_key_id: b"o" * 32,
-        },
+    writer_cipher = SensitiveDataCipher(
+        {active_key_id: b"a" * 32},
         active_key_id=active_key_id,
-    )
-    old_cipher = SensitiveDataCipher(
-        {old_key_id: b"o" * 32},
-        active_key_id=old_key_id,
     )
     started_at = NOW - timedelta(minutes=3)
     completed_at = NOW - timedelta(minutes=2)
-    encrypted_reason = old_cipher.encrypt(
+    encrypted_reason = writer_cipher.encrypt(
         NARRATIVE_MARKER,
         SensitiveFieldRef("audit_events", "1", "reason", 1),
     )
-    encrypted_detail = old_cipher.encrypt(
+    encrypted_detail = writer_cipher.encrypt(
         json.dumps({"external": NARRATIVE_MARKER}),
         SensitiveFieldRef(
             "audit_events",
@@ -959,39 +1591,70 @@ def test_mixed_sensitive_encryption_is_blocked_without_key_ids_or_values(
         )
         connection.commit()
 
-    report = _reader(
+    calls = {"inspector": 0, "scan": 0, "decrypt": 0}
+    real_inspect = preflight.SensitiveEncryptionStateInspector.inspect
+    real_scan = encrypt_sensitive.inspect_sensitive_envelopes
+
+    def counted_inspect(inspector):
+        calls["inspector"] += 1
+        return real_inspect(inspector)
+
+    def counted_scan(*args, **kwargs):
+        calls["scan"] += 1
+        return real_scan(*args, **kwargs)
+
+    class RaisingCipher(SensitiveDataCipher):
+        def decrypt(self, *args, **kwargs):
+            calls["decrypt"] += 1
+            raise AssertionError("posture attempted ciphertext decryption")
+
+    raising_cipher = RaisingCipher(
+        {active_key_id: b"a" * 32},
+        active_key_id=active_key_id,
+    )
+    monkeypatch.setattr(
+        preflight.SensitiveEncryptionStateInspector,
+        "inspect",
+        counted_inspect,
+    )
+    monkeypatch.setattr(
+        encrypt_sensitive,
+        "inspect_sensitive_envelopes",
+        counted_scan,
+    )
+    reader = _reader(
         app_config=app_config,
         session_factory=session_factory,
-        engine=engine,
-        sensitive_cipher=cipher,
-    ).report(limit_principal="session:1:operator")
+    )
+    reader._engine = engine
+    reader._sensitive_cipher = raising_cipher
+
+    report = reader.report(limit_principal="session:1:operator")
     encryption = _checks_by_name(
         report,
         "sensitive_encryption",
     )[0]
 
-    assert encryption.status.value == "blocked"
-    assert encryption.detail_code.value == "sensitive_mixed_key"
+    assert calls == {"inspector": 0, "scan": 0, "decrypt": 0}
+    assert encryption.status.value == "unknown"
+    assert (
+        encryption.detail_code.value
+        == "startup_evidence_unavailable"
+    )
     assert encryption.migration_state == "complete"
     assert encryption.schema_version == 1
     assert encryption.rows_total == 1
     assert encryption.rows_completed == 1
     encoded = report.model_dump_json()
     assert active_key_id not in encoded
-    assert old_key_id not in encoded
     assert NARRATIVE_MARKER not in encoded
 
 
-def test_complete_sensitive_encryption_reports_only_safe_migration_fields(
+def test_complete_encryption_uses_canonical_startup_receipt_and_safe_columns(
     app_config,
     session_factory,
-    engine,
 ):
     active_key_id = app_config.encryption.active_key_id
-    cipher = SensitiveDataCipher(
-        {active_key_id: b"a" * 32},
-        active_key_id=active_key_id,
-    )
     with session_factory() as session:
         session.add(
             SensitiveMigrationState(
@@ -1009,11 +1672,12 @@ def test_complete_sensitive_encryption_reports_only_safe_migration_fields(
         )
         session.commit()
 
+    receipt, secrets = _issued_startup_receipt(app_config)
     report = _reader(
         app_config=app_config,
         session_factory=session_factory,
-        engine=engine,
-        sensitive_cipher=cipher,
+        startup_guard_receipt=receipt,
+        startup_secrets=secrets,
     ).report(limit_principal="session:1:operator")
     encryption = _checks_by_name(
         report,
@@ -1031,8 +1695,12 @@ def test_route_access_never_loads_keychain_or_calls_broker(
     authenticated_client,
     monkeypatch,
 ):
+    from trading_assistant import preflight
+    from trading_assistant.ops import encrypt_sensitive
+
     client, _csrf = authenticated_client
     service = client.trading_service
+    session_factory = service.session_factory
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("posture attempted forbidden I/O")
@@ -1056,6 +1724,29 @@ def test_route_access_never_loads_keychain_or_calls_broker(
         "__init__",
         forbidden,
     )
+    monkeypatch.setattr(
+        ProviderBudgetService,
+        "status",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        ProviderBudgetService,
+        "reserve",
+        forbidden,
+    )
+    monkeypatch.setattr(NullNotifier, "send", forbidden)
+    monkeypatch.setattr(
+        preflight.SensitiveEncryptionStateInspector,
+        "inspect",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        encrypt_sensitive,
+        "inspect_sensitive_envelopes",
+        forbidden,
+    )
+    monkeypatch.setattr(SensitiveDataCipher, "decrypt", forbidden)
+    before = _snapshot_all_tables(session_factory)
 
     first = client.get("/security/posture")
     second = client.get("/security/posture")
@@ -1076,6 +1767,15 @@ def test_route_access_never_loads_keychain_or_calls_broker(
         response.json()["can_trade"] is False
         for response in concurrent
     )
+    after = _snapshot_all_tables(session_factory)
+    assert (
+        after[ConcurrencyLease.__tablename__]
+        == before[ConcurrencyLease.__tablename__]
+    )
+    for table_name in before:
+        if table_name == RateWindow.__tablename__:
+            continue
+        assert after[table_name] == before[table_name], table_name
 
 
 def test_no_production_consumer_treats_posture_as_authority():

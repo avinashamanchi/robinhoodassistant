@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
+from typing import Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,6 +23,101 @@ class StartupReconciliationFailed(RuntimeError):
 
 
 _FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{2,63}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class StartupReconciliationValidation:
+    """Pure validation result over non-narrative reconciliation columns."""
+
+    valid: bool
+    current: bool
+    started_at: datetime | None
+    completed_at: datetime | None
+    updated_at: datetime | None
+
+
+def _persisted_utc(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def validate_startup_reconciliation_snapshot(
+    *,
+    generation: object,
+    completed_generation: object,
+    status: object,
+    started_at: object,
+    completed_at: object,
+    updated_at: object,
+    observed_at: object,
+    expected_generation: int | None = None,
+) -> StartupReconciliationValidation:
+    """Validate exactly the safe columns used by reconciliation authority."""
+
+    observed = _persisted_utc(observed_at)
+    started = _persisted_utc(started_at)
+    completed = (
+        _persisted_utc(completed_at)
+        if completed_at is not None
+        else None
+    )
+    updated = _persisted_utc(updated_at)
+    invalid = StartupReconciliationValidation(
+        valid=False,
+        current=False,
+        started_at=started,
+        completed_at=completed,
+        updated_at=updated,
+    )
+    if (
+        observed is None
+        or not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or type(generation) is not int
+        or generation <= 0
+        or type(completed_generation) is not int
+        or completed_generation < 0
+        or completed_generation > generation
+        or status not in {"required", "current", "failed"}
+        or started is None
+        or updated is None
+        or not started <= updated <= observed
+        or (
+            expected_generation is not None
+            and (
+                type(expected_generation) is not int
+                or expected_generation <= 0
+                or generation != expected_generation
+            )
+        )
+    ):
+        return invalid
+    if status == "current":
+        if (
+            completed_generation != generation
+            or completed is None
+            or not started <= completed <= updated
+        ):
+            return invalid
+        return StartupReconciliationValidation(
+            valid=True,
+            current=True,
+            started_at=started,
+            completed_at=completed,
+            updated_at=updated,
+        )
+    if completed_generation >= generation or completed is not None:
+        return invalid
+    return StartupReconciliationValidation(
+        valid=True,
+        current=False,
+        started_at=started,
+        completed_at=None,
+        updated_at=updated,
+    )
 
 
 def _context(
@@ -48,10 +145,12 @@ class StartupReconciliationGate:
         broker_key: str,
         *,
         enabled: bool,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.broker_key = broker_key
         self.enabled = enabled
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.submission_barrier = SubmissionBarrier(session_factory)
 
     def require(
@@ -65,7 +164,7 @@ class StartupReconciliationGate:
         actor, reason, request_id = _context(actor, reason, request_id)
         if not self.enabled:
             raise RuntimeError("startup reconciliation gate is disabled")
-        now = datetime.now(timezone.utc)
+        now = self._clock()
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
                 state = session.get(
@@ -130,7 +229,7 @@ class StartupReconciliationGate:
             raise ValueError("startup reconciliation generation must be positive")
         if not self.enabled:
             return True
-        now = datetime.now(timezone.utc)
+        now = self._clock()
         encoded_evidence = json.dumps(evidence, sort_keys=True)
         with self.submission_barrier.hold_writer():
             with self.session_factory() as session:
@@ -197,7 +296,7 @@ class StartupReconciliationGate:
             raise ValueError("startup reconciliation failure code is invalid")
         if not self.enabled:
             return False
-        now = datetime.now(timezone.utc)
+        now = self._clock()
         detail = {**evidence, "failure_code": failure_code}
         encoded_evidence = json.dumps(detail, sort_keys=True)
         with self.submission_barrier.hold_writer():
@@ -292,18 +391,31 @@ class StartupReconciliationGate:
     def is_current(self, generation: int | None = None) -> bool:
         if not self.enabled:
             return True
-        with self.session_factory() as session:
-            state = session.get(
-                StartupReconciliationState,
-                self.broker_key,
+        try:
+            with self.session_factory() as session:
+                row = session.query(
+                    StartupReconciliationState.generation,
+                    StartupReconciliationState.completed_generation,
+                    StartupReconciliationState.status,
+                    StartupReconciliationState.started_at,
+                    StartupReconciliationState.completed_at,
+                    StartupReconciliationState.updated_at,
+                ).filter(
+                    StartupReconciliationState.broker
+                    == self.broker_key
+                ).one_or_none()
+            if row is None:
+                return False
+            validation = validate_startup_reconciliation_snapshot(
+                generation=row.generation,
+                completed_generation=row.completed_generation,
+                status=row.status,
+                started_at=row.started_at,
+                completed_at=row.completed_at,
+                updated_at=row.updated_at,
+                observed_at=self._clock(),
+                expected_generation=generation,
             )
-            return (
-                state is not None
-                and state.generation > 0
-                and state.status == "current"
-                and state.completed_generation == state.generation
-                and (
-                    generation is None
-                    or state.generation == generation
-                )
-            )
+            return validation.valid and validation.current
+        except Exception:
+            return False

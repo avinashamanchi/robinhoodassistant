@@ -178,6 +178,8 @@ def test_every_api_route_has_exact_policy(make_service):
     posture = registry.get("GET", "/security/posture")
     assert posture.auth is AuthLevel.SESSION
     assert posture.limit_name == "session_read"
+    assert posture.lease_free_bounded_read is True
+    assert registry.get("GET", "/pending").lease_free_bounded_read is False
     assert posture.broker_read is False
     assert posture.provider_category is None
     for path in (
@@ -251,6 +253,37 @@ def test_duplicate_and_unclassified_routes_fail_inventory_validation():
         match=r"duplicates=.*GET.*only.*unclassified=.*GET.*missing",
     ):
         validate_route_inventory(app)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"method": "POST"},
+        {"requires_idempotency": True},
+        {"audit_mutation": True},
+        {"broker_read": True},
+        {"provider_category": "chat"},
+        {"mutation_operation": "order_cancel"},
+        {"concurrency_behavior": "coalesce_panic"},
+    ],
+)
+def test_lease_free_capability_is_restricted_to_bounded_local_reads(
+    overrides,
+):
+    values = {
+        "method": "GET",
+        "path": "/bounded",
+        "auth": AuthLevel.SESSION,
+        "limit_name": "session_read",
+        "lease_free_bounded_read": True,
+        **overrides,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="lease-free bounded read",
+    ):
+        RoutePolicy(**values)
 
 
 def test_route_inventory_rejects_mounts_websockets_and_imperative_routes():
@@ -444,14 +477,37 @@ def test_security_posture_requires_session_and_uses_session_read_limit(
         "/auth/login",
         json={"secret": "posture-route-policy-secret"},
     ).status_code == 200
+    with service.session_factory() as session:
+        before_leases = tuple(
+            session.execute(
+                select(
+                    ConcurrencyLease.resource_key,
+                    ConcurrencyLease.owner,
+                    ConcurrencyLease.expires_at,
+                    ConcurrencyLease.generation,
+                ).order_by(ConcurrencyLease.resource_key)
+            ).all()
+        )
     allowed = client.get("/security/posture")
     denied = client.get("/security/posture")
+    with service.session_factory() as session:
+        after_leases = tuple(
+            session.execute(
+                select(
+                    ConcurrencyLease.resource_key,
+                    ConcurrencyLease.owner,
+                    ConcurrencyLease.expires_at,
+                    ConcurrencyLease.generation,
+                ).order_by(ConcurrencyLease.resource_key)
+            ).all()
+        )
 
     assert allowed.status_code == 200
     assert allowed.json()["can_trade"] is False
     assert denied.status_code == 429
     assert denied.json()["error"]["code"] == "rate_limit_exceeded"
     assert denied.headers["X-RateLimit-Limit"] == "1"
+    assert after_leases == before_leases
 
 
 @pytest.mark.parametrize(

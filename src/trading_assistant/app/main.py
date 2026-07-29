@@ -85,7 +85,7 @@ _ACCOUNT_CACHE_TTL_SECONDS = 2.0
 
 if TYPE_CHECKING:
     from ..bootstrap import ApplicationContainer
-    from ..operations.security_posture import StartupPostureEvidence
+    from ..operations.security_posture import StartupGuardReceipt
 
 
 class _AssetOnlyStaticFiles(StaticFiles):
@@ -366,8 +366,10 @@ def _create_app(
     transport_policy: TransportPolicy | None = None,
     candidate_signer: CandidateSigner | None = None,
     candidate_queue: CandidateQueueService | None = None,
-    startup_evidence: "StartupPostureEvidence | None" = None,
+    _startup_guard_receipt: "StartupGuardReceipt | None" = None,
 ) -> FastAPI:
+    if container is None and _startup_guard_receipt is not None:
+        raise RuntimeError("startup_guard_receipt_invalid")
     if container is None and ((service is None) != (agent is None)):
         raise RuntimeError(
             "service and agent must be injected together"
@@ -380,20 +382,38 @@ def _create_app(
         container = build_default_container()
         service = container.service
         agent = _build_agent(container)
+    startup_evidence = None
     if container is not None:
-        container_startup_evidence = getattr(
+        container_receipt = getattr(
             container,
-            "startup_evidence",
+            "startup_guard_receipt",
             None,
         )
-        if (
-            startup_evidence is not None
-            and startup_evidence is not container_startup_evidence
-        ):
+        if _startup_guard_receipt is None and container_receipt is not None:
             raise RuntimeError(
-                "container and startup evidence do not match"
+                "guarded container requires guarded app composition"
             )
-        startup_evidence = container_startup_evidence
+        if _startup_guard_receipt is not None:
+            if _startup_guard_receipt is not container_receipt:
+                raise RuntimeError("startup_guard_receipt_mismatch")
+            from ..operations.security_posture import (
+                _validate_startup_guard_receipt,
+            )
+
+            startup_evidence = _validate_startup_guard_receipt(
+                _startup_guard_receipt,
+                config=container.config,
+                secrets=container.secrets,
+            )
+            if (
+                getattr(
+                    container.operations,
+                    "_startup_guard_receipt",
+                    None,
+                )
+                is not _startup_guard_receipt
+            ):
+                raise RuntimeError("startup_guard_receipt_mismatch")
         if (
             runtime_secrets is not None
             and runtime_secrets is not container.secrets
@@ -614,15 +634,10 @@ def _create_app(
                 if container is not None
                 else None
             ),
-            startup_evidence=startup_evidence,
-            engine=(
-                getattr(container, "engine", None)
-                if container is not None
-                else None
-            ),
-            sensitive_cipher=(
-                getattr(container, "sensitive_cipher", None)
-                if container is not None
+            _startup_guard_receipt=_startup_guard_receipt,
+            _startup_secrets=(
+                runtime_secrets
+                if _startup_guard_receipt is not None
                 else None
             ),
         )
@@ -1431,9 +1446,28 @@ def _create_app(
     return app
 
 
+def _create_guarded_app(
+    *,
+    container: "ApplicationContainer",
+    startup_guard_receipt: "StartupGuardReceipt",
+    **kwargs,
+) -> FastAPI:
+    """Private launcher entrypoint for one validated startup receipt."""
+
+    return _create_app(
+        container=container,
+        _startup_guard_receipt=startup_guard_receipt,
+        **kwargs,
+    )
+
+
 @wraps(_create_app)
 def create_app(*args, **kwargs) -> FastAPI:
     """Build the automatic production app inside its role log boundary."""
+    if "_startup_guard_receipt" in kwargs:
+        raise TypeError(
+            "startup guard receipt requires private guarded composition"
+        )
     bound = inspect.signature(_create_app).bind_partial(
         *args,
         **kwargs,

@@ -66,7 +66,9 @@ class _CountingSessionFactory:
 
 
 def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
-    """Keep launcher tests on one injected secrets/evidence/container chain."""
+    """Keep launcher tests on one injected secrets/receipt/container chain."""
+
+    from trading_assistant.operations import security_posture as posture
 
     secrets = object()
     provider = SimpleNamespace(
@@ -84,26 +86,66 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
         lambda *_args, **_kwargs: secrets,
     )
 
+    def run_guard(*, config, secrets: object, secret_loaded_at, **_kwargs):
+        return posture._issue_startup_guard_receipt(
+            config=config,
+            secrets=secrets,
+            checks=(
+                SimpleNamespace(
+                    name="runtime_configuration",
+                    passed=True,
+                    code="ok",
+                ),
+                SimpleNamespace(
+                    name="loopback_https",
+                    passed=True,
+                    code="ok",
+                ),
+                SimpleNamespace(name="tls", passed=True, code="ok"),
+                SimpleNamespace(
+                    name="database",
+                    passed=True,
+                    code="ok",
+                ),
+                SimpleNamespace(
+                    name="encryption",
+                    passed=True,
+                    code="ok",
+                ),
+            ),
+            observed_at=secret_loaded_at,
+            secret_loaded_at=secret_loaded_at,
+        )
+
+    monkeypatch.setattr(serve, "run_startup_guard", run_guard)
+
     def build_container(
         config,
         loaded,
         *,
         runtime_role,
-        startup_evidence,
+        startup_guard_receipt,
     ):
         assert loaded is secrets
         assert runtime_role == "app"
-        container.startup_evidence = startup_evidence
+        container.startup_guard_receipt = startup_guard_receipt
         return container
 
-    monkeypatch.setattr(serve, "build_container", build_container)
+    monkeypatch.setattr(
+        serve,
+        "_build_guarded_container",
+        build_container,
+    )
 
-    def create_app(*, container: object, startup_evidence):
+    def create_app(*, container: object, startup_guard_receipt):
         assert container is not None
-        assert container.startup_evidence is startup_evidence
+        assert (
+            container.startup_guard_receipt
+            is startup_guard_receipt
+        )
         return app
 
-    monkeypatch.setattr(serve, "create_app", create_app)
+    monkeypatch.setattr(serve, "_create_guarded_app", create_app)
 
 
 def _durable_perimeter_state(
@@ -988,7 +1030,11 @@ def test_startup_guard_never_constructs_app_when_encryption_state_is_invalid(
         serve.StartupGuardBlocked,
         match="sensitive_migration_state_invalid",
     ):
-        serve.run_startup_guard(config=config, secrets=secrets)
+        serve.run_startup_guard(
+            config=config,
+            secrets=secrets,
+            secret_loaded_at=datetime.now(timezone.utc),
+        )
 
 
 def test_strict_launcher_stops_before_uvicorn_on_structural_failure(monkeypatch):

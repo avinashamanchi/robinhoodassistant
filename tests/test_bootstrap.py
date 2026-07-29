@@ -494,11 +494,14 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
     assert app.state.provider_budget is container.provider_budget
 
 
-def test_create_app_preserves_exact_container_startup_evidence_identity(
+def test_public_create_app_rejects_raw_startup_evidence_and_injection_is_unknown(
     make_service,
 ):
     from trading_assistant.operations.security_posture import (
+        StartupCheckName,
+        StartupDetailCode,
         StartupPostureEvidence,
+        StartupStructuralCheck,
     )
 
     service = make_service()
@@ -507,39 +510,188 @@ def test_create_app_preserves_exact_container_startup_evidence_identity(
     )
     evidence = StartupPostureEvidence(
         observed_at=datetime.now(timezone.utc),
-        structural_checks=(),
+        structural_checks=(
+            StartupStructuralCheck(
+                name=StartupCheckName.LOOPBACK_HTTPS,
+                status="pass",
+                detail_code=StartupDetailCode.OK,
+            ),
+        ),
         secret_provider="macos_keychain",
         secret_load_status="pass",
         secret_loaded_at=datetime.now(timezone.utc),
     )
     container = _injected_container(service, secrets)
-    container.startup_evidence = evidence
+
+    with pytest.raises(TypeError):
+        create_app(
+            container=container,
+            agent=_StubAgent(),
+            planning=None,
+            startup_evidence=evidence,
+        )
+    app = create_app(
+        container=container,
+        agent=_StubAgent(),
+        planning=None,
+    )
+    report = app.state.operations.security_posture(
+        limit_principal="session:1:operator",
+    )
+
+    assert app.state.startup_evidence is None
+    secret_check = next(
+        check
+        for check in report.checks
+        if check.name.value == "secret_provider"
+    )
+    assert secret_check.status.value == "unknown"
+
+
+def test_fabricated_startup_guard_receipt_is_rejected_before_composition(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations.security_posture import (
+        StartupGuardReceipt,
+    )
+
+    service = make_service()
+    secrets = Secrets(
+        app_api_token="startup-receipt-fabrication-secret",
+    )
+    composed = []
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: composed.append("built"),
+    )
+    fabricated = object.__new__(StartupGuardReceipt)
+
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_invalid",
+    ):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=fabricated,
+        )
+
+    assert composed == []
+
+
+def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.app import main as app_main
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(
+        app_api_token="startup-receipt-canonical-secret",
+    )
+    checks = (
+        SimpleNamespace(
+            name="runtime_configuration",
+            passed=True,
+            code="ok",
+        ),
+        SimpleNamespace(name="loopback_https", passed=True, code="ok"),
+        SimpleNamespace(name="tls", passed=True, code="ok"),
+        SimpleNamespace(name="database", passed=True, code="ok"),
+        SimpleNamespace(name="encryption", passed=True, code="ok"),
+    )
+    secret_loaded_at = datetime.now(timezone.utc)
+    receipt = posture._issue_startup_guard_receipt(
+        config=service.config,
+        secrets=secrets,
+        checks=checks,
+        observed_at=secret_loaded_at + timedelta(seconds=1),
+        secret_loaded_at=secret_loaded_at,
+    )
+    evidence = posture._validate_startup_guard_receipt(
+        receipt,
+        config=service.config,
+        secrets=secrets,
+    )
+    captured = []
+
+    def fake_build(config, loaded, **kwargs):
+        captured.append((config, loaded, kwargs))
+        return "guarded-container"
+
+    monkeypatch.setattr(bootstrap, "_build_container", fake_build)
+    with pytest.raises(TypeError):
+        bootstrap.build_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_evidence=evidence,
+        )
+    assert (
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+        == "guarded-container"
+    )
+    assert captured[0][0] is service.config
+    assert captured[0][1] is secrets
+    assert captured[0][2]["startup_guard_receipt"] is receipt
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_mismatch",
+    ):
+        bootstrap._build_guarded_container(
+            service.config.model_copy(),
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+
+    container = _injected_container(service, secrets)
+    container.startup_guard_receipt = receipt
     container.operations = OperationsService(
         service,
         container.audit,
         rate_limiter=container.rate_limiter,
         provider_budget=container.provider_budget,
-        startup_evidence=evidence,
+        _startup_guard_receipt=receipt,
+        _startup_secrets=secrets,
     )
-
-    app = create_app(
-        container=container,
-        agent=_StubAgent(),
-        planning=None,
-        startup_evidence=evidence,
-    )
-
-    assert app.state.startup_evidence is evidence
     with pytest.raises(
         RuntimeError,
-        match="container and startup evidence do not match",
+        match="guarded container requires guarded app composition",
     ):
         create_app(
             container=container,
             agent=_StubAgent(),
             planning=None,
-            startup_evidence=evidence.model_copy(),
         )
+    app = app_main._create_guarded_app(
+        container=container,
+        startup_guard_receipt=receipt,
+        agent=_StubAgent(),
+        planning=None,
+    )
+    report = app.state.operations.security_posture(
+        limit_principal="session:1:operator",
+    )
+    secret_check = next(
+        check
+        for check in report.checks
+        if check.name.value == "secret_provider"
+    )
+
+    assert app.state.startup_evidence is evidence
+    assert secret_check.status.value == "pass"
 
 
 def test_automatic_planning_and_screen_use_exact_injected_secrets(
