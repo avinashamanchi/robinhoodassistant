@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field, fields, is_dataclass
+from collections import Counter, deque
+from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
-from types import FunctionType, MethodType, SimpleNamespace
+from types import (
+    FunctionType,
+    GetSetDescriptorType,
+    MappingProxyType,
+    MemberDescriptorType,
+    MethodType,
+)
 from uuid import uuid4
 
 from sqlalchemy.engine import Engine
@@ -150,6 +156,18 @@ _TEST_BROKER_REQUIRED_METHODS = frozenset(
         "get_order_status",
         "cancel_order",
     }
+)
+_TEST_BROKER_EXACT_MAPPING_TYPES = frozenset({dict, Counter})
+_TEST_BROKER_EXACT_SEQUENCE_TYPES = frozenset(
+    {list, tuple, set, frozenset, deque}
+)
+_TEST_BROKER_CONTAINER_BASE_TYPES = (
+    dict,
+    list,
+    tuple,
+    set,
+    frozenset,
+    deque,
 )
 _STATIC_ATTRIBUTE_MISSING = object()
 
@@ -601,15 +619,13 @@ def _require_bounded_test_broker_graph(
     mock_broker_type: type,
 ) -> str:
     """Reject retained broker authority in a bounded static fake-owned graph."""
-    if not isinstance(root, mock_broker_type):
+    if mock_broker_type not in _static_type_mro(type(root)):
         raise RuntimeError("production_test_capability_forbidden")
-    try:
-        root_state = vars(root)
-    except TypeError:
-        raise RuntimeError(
-            "production_test_capability_forbidden"
-        ) from None
-    if type(root_state) is not dict:
+    root_state = _static_instance_state(
+        root,
+        _static_type_mro(type(root)),
+    )
+    if root_state is None:
         raise RuntimeError("production_test_capability_forbidden")
 
     broker_key = _static_broker_attribute(
@@ -620,10 +636,7 @@ def _require_bounded_test_broker_graph(
     if type(broker_key) is not str or not broker_key:
         raise RuntimeError("production_test_capability_forbidden")
 
-    stack = [
-        (value, 1)
-        for value in root_state.values()
-    ]
+    stack = [(root, 0)]
     for method_name in _TEST_BROKER_METHODS:
         method = _static_broker_attribute(
             root,
@@ -640,7 +653,7 @@ def _require_bounded_test_broker_graph(
             raise RuntimeError("production_test_capability_forbidden")
         stack.append((method, 1))
 
-    seen = {id(root)}
+    seen = set()
     visited = 0
     while stack:
         value, depth = stack.pop()
@@ -653,7 +666,10 @@ def _require_bounded_test_broker_graph(
         visited += 1
         if visited > _TEST_BROKER_GRAPH_MAX_NODES:
             raise RuntimeError("production_test_capability_forbidden")
-        if isinstance(value, BrokerClient):
+        if (
+            value is not root
+            and BrokerClient in _static_type_mro(type(value))
+        ):
             raise RuntimeError("production_test_capability_forbidden")
         children = _test_broker_owned_children(value)
         if len(children) > _TEST_BROKER_GRAPH_MAX_NODES:
@@ -669,8 +685,8 @@ def _static_broker_attribute(
 ):
     if name in root_state:
         return root_state[name]
-    for owner in type(root).__mro__:
-        namespace = vars(owner)
+    for owner in _static_type_mro(type(root)):
+        namespace = _static_type_namespace(owner)
         if name in namespace:
             return namespace[name]
     return _STATIC_ATTRIBUTE_MISSING
@@ -678,12 +694,21 @@ def _static_broker_attribute(
 
 def _test_broker_owned_children(value: object) -> tuple[object, ...]:
     value_type = type(value)
-    if value_type is dict:
-        return tuple(value.keys()) + tuple(value.values())
-    if value_type in {list, tuple, set, frozenset, deque}:
+    value_mro = _static_type_mro(value_type)
+    if type in value_mro:
+        return _static_class_owned_values(
+            _static_type_mro(value),
+            include_all=True,
+        )
+    if value_type in _TEST_BROKER_EXACT_MAPPING_TYPES:
+        return tuple(dict.keys(value)) + tuple(dict.values(value))
+    if value_type in _TEST_BROKER_EXACT_SEQUENCE_TYPES:
         return tuple(value)
-    if value_type is SimpleNamespace:
-        return tuple(vars(value).values())
+    if any(
+        container_type in value_mro
+        for container_type in _TEST_BROKER_CONTAINER_BASE_TYPES
+    ):
+        raise RuntimeError("production_test_capability_forbidden")
     if value_type is partial:
         keywords = value.keywords or {}
         return (value.func, *value.args, *keywords.keys(), *keywords.values())
@@ -702,19 +727,107 @@ def _test_broker_owned_children(value: object) -> tuple[object, ...]:
             except ValueError:
                 continue
         return tuple(captured)
-    if is_dataclass(value) and not isinstance(value, type):
-        try:
-            state = vars(value)
-        except TypeError:
-            raise RuntimeError(
-                "production_test_capability_forbidden"
-            ) from None
-        return tuple(
-            state[data_field.name]
-            for data_field in fields(value)
-            if data_field.name in state
-        )
-    return ()
+    state = _static_instance_state(value, value_mro)
+    class_values = _static_class_owned_values(
+        value_mro,
+        include_all=state is not None,
+    )
+    if state is None:
+        return class_values
+    return (
+        *tuple(dict.keys(state)),
+        *tuple(dict.values(state)),
+        *class_values,
+    )
+
+
+def _static_type_mro(value_type: type) -> tuple[type, ...]:
+    try:
+        mro = type.__getattribute__(value_type, "__mro__")
+    except BaseException:
+        raise RuntimeError(
+            "production_test_capability_forbidden"
+        ) from None
+    if type(mro) is not tuple:
+        raise RuntimeError("production_test_capability_forbidden")
+    return mro
+
+
+def _static_type_namespace(owner: type) -> MappingProxyType:
+    try:
+        namespace = type.__getattribute__(owner, "__dict__")
+    except BaseException:
+        raise RuntimeError(
+            "production_test_capability_forbidden"
+        ) from None
+    if type(namespace) is not MappingProxyType:
+        raise RuntimeError("production_test_capability_forbidden")
+    return namespace
+
+
+def _static_instance_state(
+    value: object,
+    value_mro: tuple[type, ...],
+) -> dict | None:
+    descriptor = _STATIC_ATTRIBUTE_MISSING
+    for owner in value_mro:
+        namespace = _static_type_namespace(owner)
+        if "__dict__" in namespace:
+            descriptor = namespace["__dict__"]
+            break
+    if descriptor is _STATIC_ATTRIBUTE_MISSING:
+        return None
+    if type(descriptor) not in {
+        GetSetDescriptorType,
+        MemberDescriptorType,
+    }:
+        raise RuntimeError("production_test_capability_forbidden")
+    try:
+        state = object.__getattribute__(value, "__dict__")
+    except BaseException:
+        raise RuntimeError(
+            "production_test_capability_forbidden"
+        ) from None
+    if type(state) is not dict:
+        raise RuntimeError("production_test_capability_forbidden")
+    return state
+
+
+def _static_class_owned_values(
+    value_mro: tuple[type, ...],
+    *,
+    include_all: bool,
+) -> tuple[object, ...]:
+    values = []
+    for owner in value_mro:
+        namespace = _static_type_namespace(owner)
+        declared_slots = "__slots__" in namespace
+        for name in sorted(namespace):
+            if name.startswith("__"):
+                continue
+            raw_value = namespace[name]
+            if type(raw_value) is MemberDescriptorType:
+                if declared_slots:
+                    raise RuntimeError(
+                        "production_test_capability_forbidden"
+                    )
+                continue
+            if include_all or _is_static_class_graph_value(raw_value):
+                values.append(raw_value)
+    return tuple(values)
+
+
+def _is_static_class_graph_value(value: object) -> bool:
+    value_type = type(value)
+    if value_type in (
+        *_TEST_BROKER_EXACT_MAPPING_TYPES,
+        *_TEST_BROKER_EXACT_SEQUENCE_TYPES,
+        FunctionType,
+        MethodType,
+        partial,
+    ):
+        return True
+    return BrokerClient in _static_type_mro(value_type)
 
 
 def _is_test_application_container(container: object) -> bool:

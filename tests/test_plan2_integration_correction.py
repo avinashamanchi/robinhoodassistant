@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -407,6 +408,240 @@ def test_test_container_rejects_nested_owned_production_delegate(
         )
 
 
+def test_test_container_rejects_delegate_in_plain_holder(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Holder:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+    service = make_service()
+    service.broker.owned_state = Holder(
+        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-plain-holder-token"
+            ),
+        )
+
+
+def test_create_test_app_rejects_plain_holder_delegate_inserted_after_issuance(
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Holder:
+        pass
+
+    service = make_service()
+    holder = Holder()
+    service.broker.owned_state = holder
+    container = build_test_app_container(
+        service,
+        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+        secrets=Secrets(
+            app_api_token="plan2-holder-consumption-token"
+        ),
+    )
+    holder.delegate = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
+def test_test_container_rejects_class_owned_production_delegate(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Holder:
+        delegate = AlpacaBroker(
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+
+    service = make_service()
+    service.broker.owned_state = Holder()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-class-holder-token"
+            ),
+        )
+
+
+def test_test_container_rejects_delegate_owned_by_retained_holder_class(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Holder:
+        delegate = AlpacaBroker(
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+
+    service = make_service()
+    service.broker.owned_state = Holder
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-retained-holder-class-token"
+            ),
+        )
+
+
+def test_test_container_rejects_slotted_holder_without_invoking_descriptor(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    class Holder:
+        __slots__ = ("delegate",)
+
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+    service = make_service()
+    service.broker.owned_state = Holder(
+        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-slotted-holder-token"
+            ),
+        )
+
+
+def test_test_container_rejects_builtin_container_subclass_without_iteration(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    iteration_attempted = []
+
+    class HolderList(list):
+        def __iter__(self):
+            iteration_attempted.append(True)
+            raise AssertionError("custom iteration invoked")
+
+    owned_state = HolderList()
+    list.append(
+        owned_state,
+        AlpacaBroker(SimpleNamespace(), SimpleNamespace()),
+    )
+    service = make_service()
+    service.broker.owned_state = owned_state
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-container-subclass-token"
+            ),
+        )
+    assert iteration_attempted == []
+
+
+def test_test_container_validation_uses_only_static_holder_state(
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from tests.app_factory import build_test_app_container
+
+    instance_lookups = []
+    metaclass_lookups = []
+
+    class ProbeMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__dataclass_fields__":
+                metaclass_lookups.append(name)
+                raise AssertionError("dynamic dataclass lookup")
+            return type.__getattribute__(cls, name)
+
+    class Probe(metaclass=ProbeMeta):
+        def __init__(self):
+            object.__setattr__(self, "marker", "safe")
+
+        def __getattribute__(self, name):
+            instance_lookups.append(name)
+            if name == "__class__":
+                return object.__getattribute__(self, name)
+            raise AssertionError("dynamic instance lookup")
+
+        @property
+        def delegate(self):
+            raise AssertionError("property invoked")
+
+    service = make_service()
+    service.broker.probe = Probe()
+    container = build_test_app_container(
+        service,
+        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+        secrets=Secrets(
+            app_api_token="plan2-static-holder-token"
+        ),
+    )
+
+    app = app_main.create_test_app(
+        container=container,
+        planning=None,
+    )
+
+    assert app.state.trading_service is service
+    assert instance_lookups == []
+    assert metaclass_lookups == []
+
+
 @pytest.mark.parametrize(
     "forwarder_kind",
     ("bound_method", "partial", "closure"),
@@ -508,7 +743,7 @@ def test_test_container_rejects_unbounded_owned_state(
 def test_test_container_accepts_spy_broker_and_cycle_safe_state(
     make_service,
 ):
-    from threading import Event
+    from threading import Event, Lock
 
     from trading_assistant.app import main as app_main
     from tests.app_factory import build_test_app_container
@@ -518,6 +753,8 @@ def test_test_container_accepts_spy_broker_and_cycle_safe_state(
     cycle.append(cycle)
     service.broker.cycle = cycle
     service.broker.test_event = Event()
+    service.broker.test_lock = Lock()
+    service.broker.call_counts = Counter({"submit": 1})
     container = build_test_app_container(
         service,
         SimpleNamespace(chat=lambda *_args, **_kwargs: None),
