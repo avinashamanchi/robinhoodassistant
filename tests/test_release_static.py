@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -3928,3 +3929,94 @@ def test_deleted_historical_credential_reports_only_rule_commit_and_path(
     assert token not in completed.stderr
     assert "credential:" not in completed.stderr
     assert "add retired credential" not in completed.stderr
+
+
+def _ci_workflow() -> tuple[str, dict[str, object]]:
+    source = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    parsed = yaml.load(source, Loader=yaml.BaseLoader)
+    assert isinstance(parsed, dict)
+    return source, parsed
+
+
+def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
+    _source, workflow = _ci_workflow()
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+
+    uses_steps: list[dict[str, object]] = []
+    for job in jobs.values():
+        assert isinstance(job, dict)
+        steps = job.get("steps", [])
+        assert isinstance(steps, list)
+        uses_steps.extend(
+            step
+            for step in steps
+            if isinstance(step, dict) and "uses" in step
+        )
+
+    assert uses_steps
+    for step in uses_steps:
+        uses = step["uses"]
+        assert isinstance(uses, str)
+        assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", uses), uses
+
+    checkout_steps = [
+        step
+        for step in uses_steps
+        if str(step["uses"]).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == len(jobs)
+    for step in checkout_steps:
+        with_values = step.get("with")
+        assert isinstance(with_values, dict)
+        assert with_values.get("fetch-depth") == "0"
+
+
+def test_ci_matches_offline_release_gate_without_runtime_authority():
+    source, workflow = _ci_workflow()
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    verification = jobs["verification"]
+    assert isinstance(verification, dict)
+    steps = verification["steps"]
+    assert isinstance(steps, list)
+    runs = "\n".join(
+        str(step.get("run", ""))
+        for step in steps
+        if isinstance(step, dict)
+    )
+
+    required = (
+        "uv sync --all-extras --dev",
+        "uv lock --check",
+        "trading_assistant.db.migrate --development-environment-secrets upgrade",
+        "trading_assistant.db.migrate --development-environment-secrets status",
+        "scripts/verify_loopback_release.py",
+        "trading_assistant.ops.safety_drill",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "PRAGMA journal_mode=DELETE",
+        "--development-environment-secrets",
+        "--mock",
+    )
+    for fragment in required:
+        assert fragment in runs
+
+    forbidden = (
+        "--armed",
+        "--alpaca-paper",
+        "trading_assistant.daemon",
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
+        "COMPOSIO_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "security find-generic-password",
+        "launchctl",
+    )
+    for fragment in forbidden:
+        assert fragment not in source
+
+    assert "gitleaks/gitleaks-action@" in source
+    assert "uv run pytest" not in runs.replace(
+        "uv run python scripts/verify_loopback_release.py",
+        "",
+    )

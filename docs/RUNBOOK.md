@@ -513,6 +513,34 @@ overfitting degrees of freedom. A rising hit rate in an uptrend may only be
 buy-and-hold exposure in disguise. Even if every evidence gate is met, this
 release remains paper-only and provides no live-mode authorization path.
 
+## CI release-verification boundary
+
+CI proves the committed software candidate; it does not prove that an operator's
+Alpaca account, local Keychain, TLS certificate, runtime database, daemon, or
+market-data feed is ready. The verification job checks out complete Git history
+with commit-pinned actions, validates the lock, installs all development extras,
+and creates a new SQLite database under the ephemeral runner directory. It
+generates independent test key material and exposes it only to the explicit
+`--development-environment-secrets` migration and mock-drill commands. Those
+commands cannot authorize an app, daemon, MCP process, provider, or broker.
+
+The job then:
+
+1. upgrades the isolated database to the sole migration head and verifies it;
+2. runs `scripts/verify_loopback_release.py`, which rejects a dirty tree,
+   migration-head drift, network-classified commands, empty or skipped suites,
+   timeouts, and any failed focused/full/coverage/static gate;
+3. runs the mock safety drill against a separate copy of the generated database;
+4. scans the complete Git history with a commit-pinned gitleaks action.
+
+The verifier writes private, redacted evidence to
+`.local/verification/release-results.json`. A passing result is evidence only for
+the exact commit recorded in that file. It is never permission to clear a
+breaker, start the daemon, approve an order, use Alpaca credentials, or describe
+the system as profitable or autonomous. Those operational checks remain a
+separate, explicit operator workflow, and an unperformed check must be reported
+as `BLOCKED` or `NOT STARTED`, never inferred from CI.
+
 ## Known dependency warning
 
 Starlette's test client uses its supported `httpx2` dependency, eliminating the
