@@ -256,7 +256,7 @@ git commit -m "feat(ui): establish dark operator design system"
 - Preserves every existing operational control ID.
 - Adds posture, provider-budget, freshness, and signed-candidate regions.
 
-- [ ] **Step 1: Add failing landmark and safety-copy tests**
+- [x] **Step 1: Add failing landmark and safety-copy tests**
 
 Assert the operations page contains:
 
@@ -266,12 +266,12 @@ Assert the operations page contains:
   `#provider-budget-output`, and `#provider-budget-reset`;
 - `#critical-banner`;
 - `#pending-list`;
-- `#positions`, `#holdings`, `#receipt-panel`, `#execution-log`;
-- `#assistant-form`, `#assistant-messages`, and `#assistant-candidates`;
+- `#positions`, `#holdings`, `#receipt-panel`, and `#risk-log`;
+- `#chat-form`, `#chat-log`, and `#assistant-candidates`;
 - breaker reset and panic buttons/dialogs;
 - copy saying candidates do not queue themselves and approval rechecks risk.
 
-- [ ] **Step 2: Run and verify missing regions**
+- [x] **Step 2: Run and verify missing regions**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py -k operations -v
@@ -279,7 +279,7 @@ uv run pytest tests/test_frontend_ui.py -k operations -v
 
 Expected: FAIL until the new composition is present.
 
-- [ ] **Step 3: Recompose the desktop layout**
+- [x] **Step 3: Recompose the desktop layout**
 
 Use this hierarchy:
 
@@ -310,14 +310,14 @@ At compact width, proof rail moves under pending decisions. At mobile width,
 all sections stack; critical state and approval controls remain before market
 research.
 
-- [ ] **Step 4: Preserve exact dangerous-action friction**
+- [x] **Step 4: Preserve exact dangerous-action friction**
 
 Approval cards show:
 
 - proposed symbol, side, quantity/notional, type, price;
 - proposal age/expiry;
-- source and reasoning availability;
-- last quote timestamp;
+- only fields present in the current pending-order contract, without invented
+  source, reasoning, or quote metadata;
 - “fresh risk check occurs after approval”;
 - review/approve and reject as distinct actions.
 
@@ -325,7 +325,7 @@ Breaker reset remains scoped to one currently tripped breaker and shows observed
 generation. Panic remains a separate dialog with account scope and result
 receipt. Neither action may appear as a purple primary shortcut.
 
-- [ ] **Step 5: Run page/security tests**
+- [x] **Step 5: Run page/security tests**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "operations or dialog or dom" -v
@@ -333,7 +333,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "operations or
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/trading_assistant/app/static/index.html src/trading_assistant/app/static/css/console.css tests/test_frontend_ui.py tests/test_security.py
@@ -359,7 +359,7 @@ git commit -m "feat(ui): recompose operations around proof"
 - Produces `renderCandidates()` and `queueCandidate()`.
 - Polls local state only on explicit refresh and a bounded 30-second cadence.
 
-- [ ] **Step 1: Write JavaScript behavior tests using the existing Node harness**
+- [x] **Step 1: Write JavaScript behavior tests using the existing Node harness**
 
 Test:
 
@@ -375,7 +375,7 @@ Test:
 - a `429` surfaces `Retry-After`/reset time and temporarily disables only the
   action governed by that policy.
 
-- [ ] **Step 2: Run and verify missing modules**
+- [x] **Step 2: Run and verify missing modules**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "posture or candidate or stale" -v
@@ -383,7 +383,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "posture or ca
 
 Expected: FAIL because posture/candidate modules do not exist.
 
-- [ ] **Step 3: Normalize posture without inventing state**
+- [x] **Step 3: Normalize posture without inventing state**
 
 `normalizePosture(payload, now)`:
 
@@ -400,7 +400,7 @@ stable request ID when present.
 headers. Shared status rendering shows the exact retry time and leaves unrelated
 read-only controls available. It never starts a retry loop automatically.
 
-- [ ] **Step 4: Render budget authority**
+- [x] **Step 4: Render budget authority**
 
 Display calls/input/output remaining and UTC reset time. Use progress bars with
 accessible text. At zero remaining or unknown budget state:
@@ -410,7 +410,7 @@ accessible text. At zero remaining or unknown budget state:
 - explain `Provider call blocked before network I/O`;
 - never suggest editing database counters.
 
-- [ ] **Step 5: Render and queue signed candidates**
+- [x] **Step 5: Render and queue signed candidates**
 
 Use DOM APIs:
 
@@ -435,15 +435,17 @@ The `/chat` response contract consumed here is:
 ```
 
 No candidate is automatically queued after chat.
+An order receipt is successful only with `status: "proposed"` and a rule
+receipt only with `status: "queued"`; rejected or unknown statuses fail closed.
 
-- [ ] **Step 6: Bound refresh activity**
+- [x] **Step 6: Bound refresh activity**
 
 Use one `AbortController` per resource, abort superseded requests, 10-second
 fetch timeout, and one 30-second refresh interval only while
 `document.visibilityState === "visible"`. Manual refresh cancels and replaces
 the current cycle. `pagehide` clears timers and aborts.
 
-- [ ] **Step 7: Run behavior/security tests**
+- [x] **Step 7: Run behavior/security tests**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "posture or candidate or stale or abort" -v
@@ -451,7 +453,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "posture or ca
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/trading_assistant/app/static/js/posture.js src/trading_assistant/app/static/js/candidates.js src/trading_assistant/app/static/js/auth.js src/trading_assistant/app/static/js/index.js tests/test_frontend_ui.py tests/test_security.py
