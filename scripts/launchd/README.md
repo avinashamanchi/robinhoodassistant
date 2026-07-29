@@ -5,15 +5,35 @@ watchdog, and creates a daily encrypted database backup. The daemon is deliberat
 installed by this app installer; launch it only through its explicit operator
 workflow after its own preflight.
 
+This release is paper-only and offers no profit or return guarantee. It has no
+live-mode support and no webhook receiver. Composio remains disabled pending
+provider-side revocation and rotation of the previously exposed credential.
+Chat can read or construct an immutable draft only; explicit signed queueing
+and a separate authenticated human approval are required before deterministic
+risk checks can reach paper submission.
+
 ## Install / update
 
 ```bash
+uv run python -m trading_assistant.ops.secrets audit
+./scripts/setup-local-tls.sh
+uv run python -m trading_assistant.ops.encrypt_sensitive verify
+uv run python scripts/check_release_safety.py
+uv run python -m trading_assistant.preflight
 ./scripts/launchd/install.sh
 ```
 
 Idempotent — re-run it after pulling code changes to reload with the new binary.
 It regenerates both plists from the repo's current path, so it works on any
-machine where the repo is checked out and `.venv` exists (`uv sync`).
+machine where the repo is checked out and `.venv` exists (`uv sync`). Do not
+install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
+`OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. Keychain migration,
+field migration/rotation, and encrypted restore procedures are in
+`docs/RUNBOOK.md`; no secret value belongs on a command line.
+For rotation, keep every writer stopped, configure and prompt for the reviewed
+retained key ID, run the field rotation, complete the coordinated
+active/retained config transition, then audit Keychain and verify all envelopes
+before reinstalling or restarting jobs.
 
 ## Remove
 
@@ -30,8 +50,9 @@ machine where the repo is checked out and `.venv` exists (`uv sync`).
 | `com.trading.watchdog` | watchdog every 60 seconds |
 | `com.trading.backup` | Verified AES-256-GCM backup daily at 02:00 |
 
-All jobs use `WorkingDirectory` = repo root so `.env`, `config.yaml`, and the
-SQLite DB resolve correctly. Inherited stdout and stderr go to `/dev/null`;
+All jobs use `WorkingDirectory` = repo root so `config.yaml` and the SQLite DB
+resolve correctly. Runtime secrets come only from macOS Keychain; `.env` is not
+a production source. Inherited stdout and stderr go to `/dev/null`;
 each process writes redacted, owner-only, bounded rotating output to its own
 `logs/<role>.runtime.log`.
 
@@ -43,6 +64,13 @@ backup key, verifies a streamed decryption and SQLite `quick_check`, then
 removes every plaintext snapshot and verification temporary file. The job
 fails closed while any app, daemon, MCP, or validation writer tenure is active;
 it never leaves an operational plaintext database copy.
+
+The installer does not start the daemon. After preflight passes, launch it as a
+separate operator-controlled process:
+
+```bash
+uv run python -m trading_assistant.daemon.main
+```
 
 ## Manage
 

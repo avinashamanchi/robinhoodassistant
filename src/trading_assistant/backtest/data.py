@@ -17,6 +17,11 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+from ..security.outbound import OutboundPolicy, install_pinned_session
+
+
+_ALPACA_DATA_POLICY = OutboundPolicy("https://data.alpaca.markets")
+
 
 class LookaheadError(Exception):
     """Raised when code requests data at a timestamp after the view's current t."""
@@ -122,8 +127,15 @@ def download_alpaca_bars(
     if path.exists():
         return load_parquet(path)
 
+    production_client = client_factory is None
     factory = client_factory or StockHistoricalDataClient
     client = factory(api_key, secret_key)
+    if production_client:
+        install_pinned_session(
+            client,
+            _ALPACA_DATA_POLICY,
+            read_timeout=30.0,
+        )
     start = datetime.now(timezone.utc).replace(microsecond=0)
     start = start.replace(year=start.year - years)
     tf = TimeFrame.Day if timeframe == "1Day" else TimeFrame.Hour

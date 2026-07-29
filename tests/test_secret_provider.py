@@ -42,7 +42,6 @@ _SIMPLE_ACCOUNTS = (
     "gemini_api_key",
     "groq_api_key",
     "openrouter_api_key",
-    "marketstack_api_key",
     "app_api_token",
     "alpaca_api_key",
     "alpaca_secret_key",
@@ -88,7 +87,6 @@ def _account_values(
         "gemini_api_key": "gemini-test-key",
         "groq_api_key": "groq-test-key",
         "openrouter_api_key": "",
-        "marketstack_api_key": "marketstack-test-key",
         "app_api_token": "A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
         "alpaca_api_key": "paper-key",
         "alpaca_secret_key": "paper-secret",
@@ -316,7 +314,6 @@ def _replacement_environment(
         "GEMINI_API_KEY": "replacement-gemini",
         "GROQ_API_KEY": "replacement-groq",
         "OPENROUTER_API_KEY": "replacement-openrouter",
-        "MARKETSTACK_API_KEY": "replacement-marketstack",
         "APP_API_TOKEN": "Q8!vN3#mR7$pL2&tX9-zC5_kW4sD6gH1",
         "ALPACA_API_KEY": "replacement-paper-key",
         "ALPACA_SECRET_KEY": "replacement-paper-secret",
@@ -984,7 +981,7 @@ def test_set_encryption_key_rejects_malformed_material_without_writing(
     assert backend.set_calls == []
 
 
-@pytest.mark.parametrize("failure_index", range(1, 15))
+@pytest.mark.parametrize("failure_index", range(1, 14))
 def test_migrate_env_rolls_back_failure_at_every_write_and_retries_safely(
     app_config,
     capsys,
@@ -1034,35 +1031,35 @@ def test_set_rolls_back_new_account_after_verification_failure_and_retries(
     capsys,
 ):
     original = _account_values(app_config.encryption)
-    original.pop("marketstack_api_key")
+    original.pop("openrouter_api_key")
     backend = _FailOnceDuringVerificationKeyring(
         original,
-        account="marketstack_api_key",
+        account="openrouter_api_key",
     )
-    replacement = "replacement-marketstack-key"
+    replacement = "replacement-openrouter-key"
 
     with pytest.raises(SecretUnavailable):
         secret_ops.main(
-            ["set", "marketstack_api_key"],
+            ["set", "openrouter_api_key"],
             backend=backend,
             config=app_config,
             prompt=lambda _prompt: replacement,
         )
 
-    assert "marketstack_api_key" not in backend.values
+    assert "openrouter_api_key" not in backend.values
     assert (
         _SERVICE,
-        "marketstack_api_key",
+        "openrouter_api_key",
     ) in backend.delete_calls
     assert "stored verified" not in capsys.readouterr().out
 
     assert secret_ops.main(
-        ["set", "marketstack_api_key"],
+        ["set", "openrouter_api_key"],
         backend=backend,
         config=app_config,
         prompt=lambda _prompt: replacement,
     ) == 0
-    assert backend.values["marketstack_api_key"] == replacement
+    assert backend.values["openrouter_api_key"] == replacement
 
 
 def test_set_rolls_back_postwrite_global_validation_failure_and_retries(
@@ -1072,15 +1069,15 @@ def test_set_rolls_back_postwrite_global_validation_failure_and_retries(
     original = _account_values(app_config.encryption)
     backend = _CorruptOtherAccountAfterVerificationKeyring(
         original,
-        trigger_account="marketstack_api_key",
+        trigger_account="openrouter_api_key",
         corrupt_account="candidate_signing_key",
         corrupt_value=original["backup_encryption_key"],
     )
-    replacement = "replacement-marketstack-key"
+    replacement = "replacement-openrouter-key"
 
     with pytest.raises(SecretValidationError, match="distinct"):
         secret_ops.main(
-            ["set", "marketstack_api_key"],
+            ["set", "openrouter_api_key"],
             backend=backend,
             config=app_config,
             prompt=lambda _prompt: replacement,
@@ -1090,12 +1087,12 @@ def test_set_rolls_back_postwrite_global_validation_failure_and_retries(
     assert "stored verified" not in capsys.readouterr().out
 
     assert secret_ops.main(
-        ["set", "marketstack_api_key"],
+        ["set", "openrouter_api_key"],
         backend=backend,
         config=app_config,
         prompt=lambda _prompt: replacement,
     ) == 0
-    assert backend.values["marketstack_api_key"] == replacement
+    assert backend.values["openrouter_api_key"] == replacement
 
 
 def test_set_rolls_back_postwrite_value_mismatch_even_when_still_valid(
@@ -1131,10 +1128,10 @@ def test_set_rejects_update_when_complete_role_state_is_invalid(
 
     with pytest.raises(SecretValidationError):
         secret_ops.main(
-            ["set", "marketstack_api_key"],
+            ["set", "openrouter_api_key"],
             backend=backend,
             config=app_config,
-            prompt=lambda _prompt: "replacement-marketstack",
+            prompt=lambda _prompt: "replacement-openrouter",
         )
 
     assert backend.set_calls == []

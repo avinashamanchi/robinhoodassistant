@@ -152,7 +152,6 @@ def test_default_urls_are_validated_and_serialize_without_warnings():
         "gemini": "https://generativelanguage.googleapis.com",
         "groq": "https://api.groq.com",
         "telegram": "https://api.telegram.org",
-        "marketstack": "https://api.marketstack.com",
         "coingecko": "https://api.coingecko.com",
     }
 
@@ -180,8 +179,12 @@ def test_committed_provider_origins_match_approved_urls(app_config):
     assert str(origins.gemini) == "https://generativelanguage.googleapis.com"
     assert str(origins.groq) == "https://api.groq.com"
     assert str(origins.telegram) == "https://api.telegram.org"
-    assert str(origins.marketstack) == "https://api.marketstack.com"
     assert str(origins.coingecko) == "https://api.coingecko.com"
+
+
+def test_marketstack_is_not_a_configured_origin_or_runtime_secret():
+    assert "marketstack" not in ProviderOriginsConfig.model_fields
+    assert "marketstack_api_key" not in RuntimeSecrets.model_fields
 
 
 def test_runtime_secrets_never_include_bind_or_provider_urls():

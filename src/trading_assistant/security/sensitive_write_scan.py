@@ -12,11 +12,13 @@ from collections.abc import Iterable
 from pathlib import Path
 import re
 
-from ..db.models import Base
-from .sensitive_fields import SENSITIVE_FIELDS
+def _default_registry() -> tuple[
+    dict[str, tuple[str, frozenset[str]]],
+    dict[str, frozenset[str]],
+]:
+    from ..db.models import Base
+    from .sensitive_fields import SENSITIVE_FIELDS
 
-
-def _registered_models() -> dict[str, tuple[str, frozenset[str]]]:
     registered: dict[str, tuple[str, frozenset[str]]] = {}
     for mapper in Base.registry.mappers:
         table = mapper.local_table.name
@@ -25,18 +27,15 @@ def _registered_models() -> dict[str, tuple[str, frozenset[str]]]:
                 table,
                 frozenset(SENSITIVE_FIELDS[table]),
             )
-    return registered
+    return (
+        registered,
+        {
+            table: frozenset(fields)
+            for table, fields in SENSITIVE_FIELDS.items()
+        },
+    )
 
 
-MODEL_FIELDS = _registered_models()
-TABLE_FIELDS = {
-    table: frozenset(fields)
-    for table, fields in SENSITIVE_FIELDS.items()
-}
-UNIQUE_FIELDS = (
-    set().union(*(fields for _, fields in MODEL_FIELDS.values()))
-    - {"reason"}
-)
 _DML = re.compile(r"\b(?:delete|insert|update|replace)\b", re.I)
 
 
@@ -65,10 +64,29 @@ def _annotation_name(node: ast.AST | None) -> str | None:
 
 
 class _SensitiveWriteVisitor(ast.NodeVisitor):
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        model_fields: dict[str, tuple[str, frozenset[str]]],
+        table_fields: dict[str, frozenset[str]],
+    ) -> None:
         self.path = path
+        self.model_fields = model_fields
+        self.table_fields = table_fields
+        self.unique_fields = (
+            set().union(
+                *(
+                    fields
+                    for _, fields in self.model_fields.values()
+                )
+            )
+            - {"reason"}
+            if self.model_fields
+            else set()
+        )
         self.offenders: list[str] = []
-        self.class_aliases = {name: name for name in MODEL_FIELDS}
+        self.class_aliases = {name: name for name in self.model_fields}
         self.sql_builders = {
             "select": "select",
             "insert": "insert",
@@ -237,7 +255,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         args: Iterable[ast.AST] = (),
         keywords: Iterable[ast.keyword] = (),
     ) -> None:
-        sensitive = MODEL_FIELDS[model][1]
+        sensitive = self.model_fields[model][1]
         fields: set[str] = set()
         dynamic = False
         for argument in args:
@@ -290,7 +308,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         if _DML.search(sql) is None:
             return
         lowered = sql.lower()
-        for table, fields in TABLE_FIELDS.items():
+        for table, fields in self.table_fields.items():
             if re.search(rf"\b{re.escape(table.lower())}\b", lowered) is None:
                 continue
             if re.search(r"\bdelete\b", lowered):
@@ -304,7 +322,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         for imported in node.names:
-            if imported.name in MODEL_FIELDS:
+            if imported.name in self.model_fields:
                 self.class_aliases[
                     imported.asname or imported.name
                 ] = imported.name
@@ -351,9 +369,12 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         for target in node.targets:
             if isinstance(target, ast.Attribute):
                 model = self._object_model(target.value)
-                if model is not None and target.attr in MODEL_FIELDS[model][1]:
+                if (
+                    model is not None
+                    and target.attr in self.model_fields[model][1]
+                ):
                     self._report(target, model, target.attr)
-                elif target.attr in UNIQUE_FIELDS:
+                elif target.attr in self.unique_fields:
                     self._report(target, "*", target.attr)
             self._record_target(target, node.value)
         self.generic_visit(node)
@@ -363,10 +384,10 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             model = self._object_model(node.target.value)
             if (
                 model is not None
-                and node.target.attr in MODEL_FIELDS[model][1]
+                and node.target.attr in self.model_fields[model][1]
             ):
                 self._report(node.target, model, node.target.attr)
-            elif node.target.attr in UNIQUE_FIELDS:
+            elif node.target.attr in self.unique_fields:
                 self._report(node.target, "*", node.target.attr)
         if node.value is not None:
             self._record_target(node.target, node.value, node.annotation)
@@ -381,10 +402,10 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             model = self._object_model(node.target.value)
             if (
                 model is not None
-                and node.target.attr in MODEL_FIELDS[model][1]
+                and node.target.attr in self.model_fields[model][1]
             ):
                 self._report(node.target, model, node.target.attr)
-            elif node.target.attr in UNIQUE_FIELDS:
+            elif node.target.attr in self.unique_fields:
                 self._report(node.target, "*", node.target.attr)
         self.generic_visit(node)
 
@@ -442,6 +463,48 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                     keywords=node.keywords,
                 )
 
+        approved_helpers = {
+            "select",
+            "insert",
+            "update",
+            "delete",
+            "get",
+            "merge",
+            "bulk_insert_mappings",
+            "bulk_update_mappings",
+            "join",
+            "outerjoin",
+            "select_from",
+            "where",
+            "order_by",
+            "group_by",
+            "having",
+            "limit",
+            "offset",
+            "options",
+            "filter",
+            "filter_by",
+            "distinct",
+            "returning",
+            "execution_options",
+            "on_conflict_do_update",
+            "values",
+        }
+        if call_name not in approved_helpers:
+            for index, argument in enumerate(node.args):
+                helper_model = self._model(argument)
+                if helper_model is None:
+                    continue
+                trailing = node.args[index + 1 :]
+                if trailing or node.keywords:
+                    self._check_mapping(
+                        node,
+                        helper_model,
+                        args=trailing,
+                        keywords=node.keywords,
+                    )
+                break
+
         if call_name == "setattr" and len(node.args) >= 2:
             object_model = self._object_model(node.args[0])
             field = (
@@ -452,12 +515,12 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             )
             if (
                 object_model is not None
-                and field in MODEL_FIELDS[object_model][1]
+                and field in self.model_fields[object_model][1]
             ):
                 self._report(node, object_model, field)
             elif object_model is not None and field is None:
                 self._report(node, object_model, "**field")
-            elif field in UNIQUE_FIELDS:
+            elif field in self.unique_fields:
                 self._report(node, "*", field)
 
         if (
@@ -496,15 +559,32 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def scan_sensitive_writes(paths: Iterable[Path]) -> list[str]:
+def scan_sensitive_writes(
+    paths: Iterable[Path],
+    *,
+    model_fields: dict[str, tuple[str, frozenset[str]]] | None = None,
+    table_fields: dict[str, frozenset[str]] | None = None,
+) -> list[str]:
     """Return stable, value-free diagnostics for disallowed write sites."""
+    if model_fields is None or table_fields is None:
+        default_models, default_tables = _default_registry()
+        model_fields = (
+            default_models if model_fields is None else model_fields
+        )
+        table_fields = (
+            default_tables if table_fields is None else table_fields
+        )
     offenders: list[str] = []
     for path in sorted(Path(item) for item in paths):
         tree = ast.parse(
             path.read_text(encoding="utf-8"),
             filename=str(path),
         )
-        visitor = _SensitiveWriteVisitor(path)
+        visitor = _SensitiveWriteVisitor(
+            path,
+            model_fields=model_fields,
+            table_fields=table_fields,
+        )
         visitor.visit(tree)
         offenders.extend(visitor.offenders)
     return sorted(offenders)

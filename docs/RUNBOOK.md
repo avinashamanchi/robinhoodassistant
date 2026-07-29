@@ -11,15 +11,29 @@ or guarantee returns.
 ```bash
 uv venv --python 3.11
 uv sync --all-extras --dev
-cp .env.example .env
-openssl rand -hex 32
+./scripts/setup-local-tls.sh
+uv run python -m trading_assistant.ops.secrets migrate-env \
+  --env-file /absolute/path/to/private-migration.env
+uv run python -m trading_assistant.ops.secrets audit
 ```
 
-Put the generated value in `APP_API_TOKEN`. Preflight rejects common
-placeholders, low-diversity values, and obvious repeated patterns, but this is
-only a basic format check—not proof of entropy. Generate the value rather than
-inventing it. Configure the selected LLM provider key and Alpaca paper
-credentials in `.env`; never commit or paste credentials into logs or reports.
+The one-time migration source must be a non-symlinked regular file with mode
+`0600`. Migration prompts for omitted values, verifies every macOS Keychain
+write, and leaves the source untouched for an operator-controlled archive or
+disposal decision. `audit` reports only presence and validation metadata.
+Never put a secret value in a command line, committed file, log, report, or
+chat. `.env.example` is an inventory for migration and tests; it is not a
+production runtime source. The operator login secret quality check rejects
+common placeholders, low-diversity values, and obvious repeated patterns, but
+is not proof of entropy.
+
+`setup-local-tls.sh` creates the only accepted local certificate layout:
+mode-`0700` `.local/tls`, mode-`0644` certificate, mode-`0600` private key,
+current validity, matching key, and exact SANs for `localhost`, `127.0.0.1`,
+and `::1`. The app binds only loopback and serves only
+`https://localhost:8020`; proxy/forwarded trust, wildcard hosts, cross-origin
+redirects, insecure cookies, and plaintext HTTP are release-gate failures.
+
 Keep these committed settings unchanged:
 
 ```yaml
@@ -36,10 +50,34 @@ llm:
 
 The runtime has no unofficial Robinhood login dependency or production path.
 
+## Trust-boundary hard limits
+
+There is no webhook receiver. Composio is disabled in config, runtime, MCP,
+tool registries, and the outbound manifest pending provider-side revocation and
+rotation of the previously exposed credential. Do not install, connect, or test
+that integration during this release.
+
+General chat can call only the reviewed read tools and immutable draft
+constructors. The state transition is deliberately split:
+
+1. chat returns a non-executing immutable draft;
+2. an authenticated operator explicitly places it in the signed, expiring
+   queue;
+3. a separate human approval request revalidates signature, freshness,
+   idempotency, and deterministic risk;
+4. only the normal submission service can attempt an Alpaca paper order.
+
+Chat cannot execute, approve, submit, cancel, reset a breaker, send a
+notification, or bypass the queue. This release has no live-mode support.
+Paper trading, tests, drills, backtests, and a passing preflight do not prove
+profitability and do not guarantee returns.
+
 ## Verified backup and migration
 
-Create a transactionally consistent, verified encrypted backup while all
-runtime writer roles are stopped:
+Stop the app, daemon, MCP, validation writer, watchdog, and every other database
+writer. Create a transactionally consistent encrypted backup, upgrade the
+schema, migrate registered sensitive fields, and verify every envelope before
+restarting:
 
 ```bash
 uv run python -m trading_assistant.ops.backup \
@@ -47,10 +85,14 @@ uv run python -m trading_assistant.ops.backup \
 uv run python -m trading_assistant.db.migrate status
 uv run python -m trading_assistant.db.migrate upgrade
 uv run python -m trading_assistant.db.migrate status
+uv run python -m trading_assistant.ops.encrypt_sensitive migrate
+uv run python -m trading_assistant.ops.encrypt_sensitive verify
 ```
 
 Proceed only when backup emits a redacted `status=verified` receipt and
-migration status reports current. The backup command acquires exclusive
+schema status reports current, sensitive migration reports `complete`, the
+configured active key ID is available in Keychain, and verification succeeds.
+The backup command acquires exclusive
 maintenance tenure, snapshots online into a private temporary, streams
 AES-256-GCM with the dedicated backup key, decrypts into a separate private
 verification temporary, checks its hash and SQLite `quick_check`, and removes
@@ -58,6 +100,30 @@ all plaintext temporaries. It publishes only mode-`0600`
 `.local/encrypted-backups/<timestamp>-whole-database-v1.sqlite3.aesgcm`
 artifacts in a mode-`0700` directory, without overwrite. It works independently
 of whether sensitive-field migration state is required, migrating, or complete.
+
+Key rotation is a stopped-writer maintenance operation, not an online config
+toggle. First prepare and review the coordinated config change that adds the
+new key ID to `retained_key_ids`; then prompt for that configured key without
+putting material on the command line:
+
+```bash
+uv run python -m trading_assistant.ops.secrets set-encryption-key \
+  reviewed-new-key-id
+uv run python -m trading_assistant.ops.encrypt_sensitive rotate \
+  --new-key-id reviewed-new-key-id
+```
+
+After the verified rotation receipt, complete the reviewed config transition so
+the new ID is active and every still-required old ID is retained. Run the
+Keychain audit and field verification again before preflight. Never remove an
+old key account until envelope verification and the retention decision are
+independently reviewed:
+
+```bash
+uv run python -m trading_assistant.ops.secrets audit
+uv run python -m trading_assistant.ops.encrypt_sensitive verify
+```
+
 Only a completely empty database may bootstrap directly to the current schema.
 An existing database at migration `0014` or later is upgraded while an
 exclusive, continuously renewed maintenance tenure is held. Older unversioned
@@ -236,9 +302,9 @@ credentials are a skip, never a pass.
 
 Runtime roles load their required secrets from the verified macOS Keychain
 backend; development environment loading is only available through explicit
-CLI opt-in. Use `python -m trading_assistant.ops.secrets audit` to report
+CLI opt-in. Use `uv run python -m trading_assistant.ops.secrets audit` to report
 presence and validation metadata without printing values, and use
-`migrate-env` only with an exact-mode-`0600` regular `.env` file. Migration
+`migrate-env` only with an exact-mode-`0600` private migration file. Migration
 verifies each Keychain write and deliberately leaves the source file in place
 for an operator-controlled cleanup decision.
 
@@ -251,21 +317,30 @@ values for redaction. Treat process memory and crash dumps as sensitive.
 
 ```bash
 uv run python -m trading_assistant.preflight
-uv run python -m trading_assistant.ops.serve
+./scripts/start.sh
+```
+
+The app command starts only the loopback HTTPS operator process. Start the
+monitoring daemon separately, only after the same preflight reports `READY`:
+
+```bash
 uv run python -m trading_assistant.daemon.main
 ```
 
-Preflight separately reports paper-only configuration, dangerous switches off,
-current schema, WAL, breaker state, operator-secret quality, Alpaca read
-dependencies, broker/local reconciliation, and the explicitly selected LLM
-provider. It is broker-write-free: it never submits or cancels a broker order,
-calls an LLM, or sends an external notification. It may update local
-reconciliation, audit, and breaker state while using broker reads as intentional
-startup repair. Both `FAIL` and `NEEDS-ME` print `NOT READY` and return nonzero;
-missing Alpaca or selected-LLM credentials can never produce `READY`.
+Preflight always evaluates the local structural checks `KEYCHAIN`, `LOCAL_TLS`,
+`FIELD_ENCRYPTION`, `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` first. It
+constructs no broker, provider, or notifier if any structural check fails.
+Only after all five pass does it run the unchanged paper-mode, schema, WAL,
+breaker, Alpaca-read, quote, daemon, and broker/local reconciliation checks.
+It is broker-write-free: it never submits or cancels a broker order, calls an
+LLM, or sends an external notification. Reconciliation may update local audit
+and repair state while using broker reads. Both `FAIL` and `NEEDS-ME` print
+`NOT READY` and return nonzero; missing required credentials can never produce
+`READY`.
 
-Open `http://127.0.0.1:8000`, log in with `APP_API_TOKEN`, and verify liveness and
-daemon freshness. Every non-liveness API route requires an opaque server-side
+Open `https://localhost:8020`, log in without displaying or storing the
+operator secret, and verify liveness and daemon freshness. Every non-liveness
+API route requires an opaque server-side
 operator session. Sessions expire after the configured eight hours. Mutations
 also require the in-memory CSRF token. Panic, breaker reset, approval, and other
 high-consequence actions require recent reauthentication (five minutes by
@@ -382,8 +457,9 @@ The installer runs the loopback API, one-minute liveness watchdog, and 02:00
 verified encrypted backup; the daemon remains an explicit operator workflow.
 The watchdog may restart a stale process; it never clears a
 breaker or changes trading mode. On failure, inspect the role-specific bounded
-runtime log, verify `.env`/database permissions, run migration status and
-preflight manually, then reload only the affected plist. Use
+runtime log, audit Keychain, validate TLS and database permissions, run
+migration/field verification and preflight manually, then reload only the
+affected plist. Use
 `./scripts/launchd/uninstall.sh` to remove all four agents.
 
 The scheduled artifact name ends in

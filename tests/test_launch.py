@@ -744,6 +744,241 @@ def test_preflight_app_secret_quality_is_independent_of_provider_credentials():
     assert "basic format/placeholder checks" in result.detail
 
 
+def _structural_preflight_secrets(app_config, *, include_llm: bool = True):
+    selected_llm = {
+        "anthropic": {"anthropic_api_key": "configured-anthropic"},
+        "gemini": {"gemini_api_key": "configured-gemini"},
+        "groq": {"groq_api_key": "configured-groq"},
+    }[app_config.llm.provider]
+    return Secrets(
+        app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+        alpaca_api_key="configured-alpaca",
+        alpaca_secret_key="configured-alpaca-secret",
+        database_url="sqlite:///fixture-preflight.db",
+        candidate_signing_key="configured-candidate",
+        backup_encryption_key="configured-backup",
+        field_encryption_keys={
+            app_config.encryption.active_key_id: "configured-field-key",
+        },
+        **(selected_llm if include_llm else {}),
+    )
+
+
+def test_structural_preflight_has_exact_checks_and_uses_injected_keychain(
+    app_config,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    calls = []
+
+    class ExplodingKeyring:
+        def get_password(self, *_args, **_kwargs):
+            raise AssertionError("structural preflight reread Keychain")
+
+    provider = MacOSKeychainSecretProvider(backend=ExplodingKeyring())
+    checks = preflight._structural_preflight_checks(
+        app_config,
+        _structural_preflight_secrets(app_config),
+        provider=provider,
+        tls_validator=lambda _server: calls.append("tls") or object(),
+        encryption_checker=lambda _config, _secrets: (
+            calls.append("encryption")
+            or preflight.StructuralCheck(
+                "encryption",
+                "passed",
+                "ok",
+            )
+        ),
+    )
+
+    assert [check.name for check in checks] == [
+        "KEYCHAIN",
+        "LOCAL_TLS",
+        "FIELD_ENCRYPTION",
+        "OUTBOUND_ORIGINS",
+        "INTEGRATIONS_DISABLED",
+    ]
+    assert [check.status for check in checks] == [preflight.PASS] * 5
+    assert [check.detail for check in checks] == ["ok"] * 5
+    assert calls == ["tls", "encryption"]
+
+
+def test_structural_preflight_keychain_failure_is_stable_and_value_free(
+    app_config,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    provider = MacOSKeychainSecretProvider(backend=object())
+    checks = preflight._structural_preflight_checks(
+        app_config,
+        _structural_preflight_secrets(
+            app_config,
+            include_llm=False,
+        ),
+        provider=provider,
+        tls_validator=lambda _server: object(),
+        encryption_checker=lambda _config, _secrets: (
+            preflight.StructuralCheck("encryption", "passed", "ok")
+        ),
+    )
+
+    keychain = checks[0]
+    assert keychain.name == "KEYCHAIN"
+    assert keychain.status == preflight.FAIL
+    assert keychain.detail == "required_fields_missing"
+    assert "gemini_api_key" not in keychain.detail
+    assert "anthropic_api_key" not in keychain.detail
+    assert "groq_api_key" not in keychain.detail
+
+
+def test_structural_preflight_rejects_origin_drift_without_exposing_url(
+    app_config,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    marker = "https://fixture-origin.invalid"
+    unsafe = app_config.model_copy(
+        update={
+            "provider_origins": app_config.provider_origins.model_copy(
+                update={"alpaca_data": marker}
+            )
+        }
+    )
+    checks = preflight._structural_preflight_checks(
+        unsafe,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+        tls_validator=lambda _server: object(),
+        encryption_checker=lambda _config, _secrets: (
+            preflight.StructuralCheck("encryption", "passed", "ok")
+        ),
+    )
+
+    outbound = checks[3]
+    assert outbound.name == "OUTBOUND_ORIGINS"
+    assert outbound.status == preflight.FAIL
+    assert outbound.detail == "origin_manifest_mismatch"
+    assert marker not in outbound.detail
+
+
+def test_structural_preflight_rejects_noncanonical_loopback_bind(
+    app_config,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    unsafe = app_config.model_copy(
+        update={
+            "server": app_config.server.model_copy(
+                update={"bind_host": "0.0.0.0"}
+            )
+        }
+    )
+    checks = preflight._structural_preflight_checks(
+        unsafe,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+        tls_validator=lambda _server: object(),
+        encryption_checker=lambda _config, _secrets: (
+            preflight.StructuralCheck("encryption", "passed", "ok")
+        ),
+    )
+
+    local_tls = checks[1]
+    assert local_tls.name == "LOCAL_TLS"
+    assert local_tls.status == preflight.FAIL
+    assert local_tls.detail == "local_tls_invalid"
+
+
+def test_structural_failure_runs_every_local_check_then_stops_before_outbound(
+    app_config,
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    seen = []
+
+    def structural(*_args, **_kwargs):
+        checks = []
+        for name in (
+            "KEYCHAIN",
+            "LOCAL_TLS",
+            "FIELD_ENCRYPTION",
+            "OUTBOUND_ORIGINS",
+            "INTEGRATIONS_DISABLED",
+        ):
+            seen.append(name)
+            checks.append(
+                preflight.Result(
+                    name,
+                    preflight.FAIL
+                    if name == "FIELD_ENCRYPTION"
+                    else preflight.PASS,
+                    "migration_incomplete"
+                    if name == "FIELD_ENCRYPTION"
+                    else "ok",
+                )
+            )
+        return checks
+
+    def outbound_explosion(*_args, **_kwargs):
+        raise AssertionError(
+            "outbound/dependent construction occurred before structural pass"
+        )
+
+    monkeypatch.setattr(
+        preflight,
+        "_structural_preflight_checks",
+        structural,
+    )
+    monkeypatch.setattr(preflight, "_alpaca", outbound_explosion)
+    monkeypatch.setattr(preflight, "_db", outbound_explosion)
+    monkeypatch.setattr(preflight, "_build_service", outbound_explosion)
+    monkeypatch.setattr(
+        preflight,
+        "_llm_provider_configured",
+        outbound_explosion,
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_notification_configuration",
+        outbound_explosion,
+    )
+
+    result = preflight._run(
+        app_config,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert seen == [
+        "KEYCHAIN",
+        "LOCAL_TLS",
+        "FIELD_ENCRYPTION",
+        "OUTBOUND_ORIGINS",
+        "INTEGRATIONS_DISABLED",
+    ]
+    assert "=> NOT READY" in output
+    assert "Alpaca paper auth" not in output
+
+
 def _install_preflight_alpaca_stubs(
     monkeypatch,
     *,
@@ -944,9 +1179,25 @@ def test_preflight_needs_me_is_not_ready_and_nonzero(
             preflight.SKIP,
         ),
     )
+    monkeypatch.setattr(
+        preflight,
+        "_structural_preflight_checks",
+        lambda *_args, **_kwargs: [
+            preflight.Result(name, preflight.PASS, "ok")
+            for name in (
+                "KEYCHAIN",
+                "LOCAL_TLS",
+                "FIELD_ENCRYPTION",
+                "OUTBOUND_ORIGINS",
+                "INTEGRATIONS_DISABLED",
+            )
+        ],
+    )
 
     result = preflight._run(
-        Secrets(app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5")
+        app_config,
+        Secrets(app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5"),
+        provider=SimpleNamespace(provider_name="macos-keychain"),
     )
 
     output = capsys.readouterr().out

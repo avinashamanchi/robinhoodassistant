@@ -5,15 +5,56 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass, field
+import importlib.util
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class ReleaseViolation:
+    """One value-free, deterministic release-gate finding."""
+
+    code: str
+    path: str
+    line: int
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", self.code) is None:
+            raise ValueError("release violation code is invalid")
+        if (
+            not isinstance(self.path, str)
+            or not self.path
+            or self.path.startswith(("/", "\\"))
+            or "://" in self.path
+            or any(char in self.path for char in ("\n", "\r", "?", "#", ":"))
+            or "\\" in self.path
+        ):
+            raise ValueError("release violation path is invalid")
+        parts = PurePosixPath(self.path).parts
+        if self.path != "." and (
+            not parts or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("release violation path is invalid")
+        if (
+            isinstance(self.line, bool)
+            or not isinstance(self.line, int)
+            or self.line <= 0
+        ):
+            raise ValueError("release violation line is invalid")
+
+
+def _finding(code: str, relative: str, line: int) -> ReleaseViolation:
+    return ReleaseViolation(code, relative, line)
 
 
 def _fail(message: str) -> None:
@@ -678,6 +719,985 @@ def _check_route_policy_inventory(root: Path) -> None:
         _fail(f"route missing from ROUTE_POLICIES: {method} {path}")
 
 
+@dataclass(frozen=True, slots=True)
+class _RouteConstructor:
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticAssetConstructor:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticAssetValue:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _RouteModule:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RouteImport:
+    module: str
+    symbol: str
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RouteFactory:
+    module: str
+    function: ast.FunctionDef | ast.AsyncFunctionDef
+
+
+@dataclass(frozen=True, slots=True)
+class _RouteMethod:
+    receiver: "_RouteObject"
+    name: str
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DynamicRouteMethod:
+    receiver: "_RouteObject"
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownRouteValue:
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _OpaqueRouteValue:
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticRoute:
+    method: str
+    path: str
+    line: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticRouteInclude:
+    child: "_RouteObject | None"
+    prefix: str | None
+    line: int
+    mount: bool = False
+    static_assets: bool = False
+
+
+@dataclass(slots=True)
+class _RouteObject:
+    key: str
+    kind: str
+    prefix: str | None
+    line: int
+    routes: list[_StaticRoute] = field(default_factory=list)
+    includes: list[_StaticRouteInclude] = field(default_factory=list)
+
+
+def _route_module_name(path: Path, source_root: Path) -> str:
+    parts = list(path.relative_to(source_root).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _route_import_module(
+    current_module: str,
+    node: ast.ImportFrom,
+) -> str | None:
+    if node.level == 0:
+        return node.module
+    package = current_module.split(".")[:-1]
+    parents = node.level - 1
+    if parents > len(package):
+        return None
+    if parents:
+        package = package[:-parents]
+    if node.module:
+        package.extend(node.module.split("."))
+    return ".".join(package)
+
+
+def _route_join(prefix: str, path: str) -> str:
+    if prefix == "" and path == "":
+        return ""
+    if not prefix:
+        joined = path or "/"
+    elif path == "":
+        joined = prefix
+    else:
+        joined = f"{prefix.rstrip('/')}/{path.lstrip('/')}"
+    if not joined.startswith("/"):
+        joined = f"/{joined}"
+    return joined
+
+
+def _route_literal_methods(node: ast.AST | None) -> tuple[str, ...] | None:
+    if node is None:
+        return ("GET",)
+    if not isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return None
+    methods: list[str] = []
+    for element in node.elts:
+        if not isinstance(element, ast.Constant) or not isinstance(
+            element.value, str
+        ):
+            return None
+        methods.append(element.value.upper())
+    return tuple(methods) if methods else None
+
+
+def _effective_route_shape(path: str) -> str:
+    normalized = re.sub(r"/+", "/", path)
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+    return re.sub(
+        r"\{[^{}:]+(?::([^{}]+))?\}",
+        lambda match: f"{{{match.group(1) or 'str'}}}",
+        normalized,
+    )
+
+
+class _EffectiveRouteGraph:
+    """Conservatively resolve the FastAPI graph rooted at app.main."""
+
+    _SAFE_APP_METHODS = frozenset(
+        {
+            "add_event_handler",
+            "add_exception_handler",
+            "add_middleware",
+            "exception_handler",
+            "middleware",
+        }
+    )
+    _DYNAMIC_IMPORT_NAMES = frozenset({"__import__", "import_module"})
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.source_root = root / "src"
+        app_root = self.source_root / "trading_assistant" / "app"
+        self.modules: dict[str, tuple[Path, ast.Module]] = {}
+        self.module_envs: dict[str, dict[str, Any]] = {}
+        self._evaluating_modules: set[str] = set()
+        self._function_results: dict[
+            tuple[Any, ...], _RouteObject | _UnknownRouteValue
+        ] = {}
+        self._active_functions: set[tuple[str, int]] = set()
+        self._object_sequence = 0
+        self.findings: list[ReleaseViolation] = []
+        if app_root.exists():
+            for path in sorted(app_root.rglob("*.py")):
+                relative = path.relative_to(root).as_posix()
+                try:
+                    tree = ast.parse(
+                        path.read_text(encoding="utf-8"),
+                        filename=relative,
+                    )
+                except (OSError, SyntaxError):
+                    self.findings.append(
+                        _finding("ROUTE_REGISTRATION_UNPROVEN", relative, 1)
+                    )
+                    continue
+                self.modules[_route_module_name(path, self.source_root)] = (
+                    path,
+                    tree,
+                )
+
+    def _relative(self, module: str) -> str:
+        item = self.modules.get(module)
+        if item is None:
+            return "src/trading_assistant/app/main.py"
+        return item[0].relative_to(self.root).as_posix()
+
+    def _unproven(self, module: str, line: int) -> _UnknownRouteValue:
+        self.findings.append(
+            _finding(
+                "ROUTE_REGISTRATION_UNPROVEN",
+                self._relative(module),
+                max(1, line),
+            )
+        )
+        return _UnknownRouteValue(max(1, line))
+
+    def _new_object(
+        self,
+        module: str,
+        kind: str,
+        prefix: str | None,
+        line: int,
+    ) -> _RouteObject:
+        self._object_sequence += 1
+        return _RouteObject(
+            key=f"{module}:{line}:{self._object_sequence}",
+            kind=kind,
+            prefix=prefix,
+            line=line,
+        )
+
+    def _resolve(self, value: Any, seen: set[tuple[str, str]] | None = None) -> Any:
+        if not isinstance(value, _RouteImport):
+            return value
+        if value.module == "fastapi" and value.symbol in {
+            "FastAPI",
+            "APIRouter",
+        }:
+            return _RouteConstructor(value.symbol)
+        if (
+            value.module in {"fastapi.staticfiles", "starlette.staticfiles"}
+            and value.symbol == "StaticFiles"
+        ):
+            return _StaticAssetConstructor()
+        if value.module not in self.modules:
+            return _OpaqueRouteValue(value.line)
+        marker = (value.module, value.symbol)
+        active = set() if seen is None else set(seen)
+        if marker in active:
+            return self._unproven(value.module, value.line)
+        active.add(marker)
+        env = self._evaluate_module(value.module)
+        resolved = env.get(value.symbol)
+        if resolved is None:
+            return _OpaqueRouteValue(value.line)
+        return self._resolve(resolved, active)
+
+    def _bind_import(
+        self,
+        env: dict[str, Any],
+        module: str,
+        statement: ast.Import | ast.ImportFrom,
+    ) -> None:
+        if isinstance(statement, ast.Import):
+            for imported in statement.names:
+                local = imported.asname or imported.name.split(".", 1)[0]
+                env[local] = _RouteModule(imported.name)
+            return
+        target = _route_import_module(module, statement)
+        for imported in statement.names:
+            local = imported.asname or imported.name
+            if imported.name == "*":
+                self._unproven(module, statement.lineno)
+                continue
+            if target == "fastapi" and imported.name in {
+                "FastAPI",
+                "APIRouter",
+            }:
+                env[local] = _RouteConstructor(imported.name)
+            elif target is not None:
+                env[local] = _RouteImport(
+                    target,
+                    imported.name,
+                    statement.lineno,
+                )
+            else:
+                env[local] = _UnknownRouteValue(statement.lineno)
+
+    def _bind_target(
+        self,
+        target: ast.AST,
+        value: Any,
+        env: dict[str, Any],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            env[target.id] = value
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                if isinstance(element, ast.Name):
+                    env[element.id] = _UnknownRouteValue(
+                        getattr(target, "lineno", 1)
+                    )
+
+    def _evaluate_module(self, module: str) -> dict[str, Any]:
+        if module in self.module_envs:
+            return self.module_envs[module]
+        item = self.modules.get(module)
+        if item is None:
+            return {}
+        if module in self._evaluating_modules:
+            return {}
+        self._evaluating_modules.add(module)
+        env: dict[str, Any] = {}
+        self.module_envs[module] = env
+        self._process_statements(item[1].body, module, env, [])
+        self._evaluating_modules.remove(module)
+        return env
+
+    def _factory_call(
+        self,
+        factory: _RouteFactory,
+        call: ast.Call,
+        caller_env: dict[str, Any],
+    ) -> _RouteObject | _UnknownRouteValue:
+        parameters = [
+            *factory.function.args.posonlyargs,
+            *factory.function.args.args,
+            *factory.function.args.kwonlyargs,
+        ]
+        supplied: dict[str, Any] = {}
+        positional = [
+            self._eval_expr(argument, factory.module, caller_env)
+            for argument in call.args
+            if not isinstance(argument, ast.Starred)
+        ]
+        for parameter, value in zip(parameters, positional):
+            supplied[parameter.arg] = value
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                supplied[keyword.arg] = self._eval_expr(
+                    keyword.value,
+                    factory.module,
+                    caller_env,
+                )
+        def value_token(value: Any) -> tuple[Any, ...]:
+            resolved = self._resolve(value)
+            if isinstance(resolved, _RouteObject):
+                return ("route", resolved.key)
+            if isinstance(resolved, _UnknownRouteValue):
+                return ("unknown", resolved.line)
+            if isinstance(resolved, _OpaqueRouteValue):
+                return ("opaque", resolved.line)
+            if isinstance(resolved, _RouteModule):
+                return ("module", resolved.name)
+            if isinstance(resolved, _RouteConstructor):
+                return ("constructor", resolved.kind)
+            if isinstance(resolved, (str, int, bool, type(None))):
+                return ("literal", type(resolved).__name__, resolved)
+            return ("other", type(resolved).__name__)
+
+        signature = tuple(
+            (parameter.arg, value_token(supplied.get(
+                parameter.arg,
+                _UnknownRouteValue(factory.function.lineno),
+            )))
+            for parameter in parameters
+        )
+        mutates_receiver = any(
+            isinstance(self._resolve(value), _RouteObject)
+            for value in supplied.values()
+        )
+        cache_key = (
+            factory.module,
+            factory.function.lineno,
+            signature,
+            call.lineno if mutates_receiver else 0,
+        )
+        cached = self._function_results.get(cache_key)
+        if cached is not None:
+            return cached
+        active_key = (factory.module, factory.function.lineno)
+        if active_key in self._active_functions:
+            return self._unproven(factory.module, factory.function.lineno)
+        self._active_functions.add(active_key)
+        env = dict(self._evaluate_module(factory.module))
+        for parameter in parameters:
+            env[parameter.arg] = supplied.get(
+                parameter.arg,
+                _UnknownRouteValue(factory.function.lineno),
+            )
+        returns: list[Any] = []
+        self._process_statements(
+            factory.function.body,
+            factory.module,
+            env,
+            returns,
+        )
+        objects = [
+            self._resolve(value)
+            for value in returns
+            if isinstance(self._resolve(value), _RouteObject)
+        ]
+        result: _RouteObject | _UnknownRouteValue
+        if not objects:
+            result = _UnknownRouteValue(factory.function.lineno)
+        elif any(value is not objects[0] for value in objects[1:]):
+            result = self._unproven(factory.module, factory.function.lineno)
+        else:
+            result = objects[0]
+        self._function_results[cache_key] = result
+        self._active_functions.remove(active_key)
+        return result
+
+    def _registration_path(
+        self,
+        receiver: _RouteObject,
+        call: ast.Call,
+        module: str,
+        env: dict[str, Any],
+    ) -> str | None:
+        path_node = call.args[0] if call.args else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"path", "prefix"}
+            ),
+            None,
+        )
+        route_value = self._eval_expr(path_node, module, env)
+        route_path = route_value if isinstance(route_value, str) else None
+        if route_path is None:
+            self._unproven(module, call.lineno)
+            return None
+        return route_path
+
+    def _register_method(
+        self,
+        method: _RouteMethod,
+        call: ast.Call,
+        module: str,
+        env: dict[str, Any],
+    ) -> Any:
+        receiver = method.receiver
+        name = method.name
+        if name in _ROUTE_DECORATOR_METHODS:
+            route_path = self._registration_path(
+                receiver,
+                call,
+                module,
+                env,
+            )
+            if route_path is not None:
+                receiver.routes.append(
+                    _StaticRoute(
+                        _ROUTE_DECORATOR_METHODS[name],
+                        route_path,
+                        call.lineno,
+                    )
+                )
+            return _UnknownRouteValue(call.lineno)
+        if name in _GENERIC_ROUTE_DECORATORS:
+            route_path = self._registration_path(
+                receiver,
+                call,
+                module,
+                env,
+            )
+            methods_node = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "methods"
+                ),
+                None,
+            )
+            methods = _route_literal_methods(methods_node)
+            if route_path is None or methods is None:
+                self._unproven(module, call.lineno)
+            else:
+                receiver.routes.extend(
+                    _StaticRoute(route_method, route_path, call.lineno)
+                    for route_method in methods
+                )
+            return _UnknownRouteValue(call.lineno)
+        if name in _WEBSOCKET_ROUTE_DECORATORS:
+            self._unproven(module, call.lineno)
+            return _UnknownRouteValue(call.lineno)
+        if name in _IMPERATIVE_HTTP_REGISTRATIONS:
+            route_path = self._registration_path(
+                receiver,
+                call,
+                module,
+                env,
+            )
+            methods_node = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "methods"
+                ),
+                None,
+            )
+            methods = _route_literal_methods(methods_node)
+            if route_path is None or methods is None:
+                self._unproven(module, call.lineno)
+            else:
+                receiver.routes.extend(
+                    _StaticRoute(route_method, route_path, call.lineno)
+                    for route_method in methods
+                )
+            return _UnknownRouteValue(call.lineno)
+        if name in _IMPERATIVE_WEBSOCKET_REGISTRATIONS:
+            self._unproven(module, call.lineno)
+            return _UnknownRouteValue(call.lineno)
+        if name == "include_router":
+            child_node = call.args[0] if call.args else next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "router"
+                ),
+                None,
+            )
+            child = self._resolve(
+                self._eval_expr(child_node, module, env)
+                if child_node is not None
+                else _UnknownRouteValue(call.lineno)
+            )
+            prefix_node = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "prefix"
+                ),
+                None,
+            )
+            prefix_value = (
+                ""
+                if prefix_node is None
+                else self._eval_expr(prefix_node, module, env)
+            )
+            prefix = (
+                prefix_value
+                if isinstance(prefix_value, str)
+                else None
+            )
+            if not isinstance(child, _RouteObject) or prefix is None:
+                self._unproven(module, call.lineno)
+                child = child if isinstance(child, _RouteObject) else None
+            receiver.includes.append(
+                _StaticRouteInclude(child, prefix, call.lineno)
+            )
+            return _UnknownRouteValue(call.lineno)
+        if name == "mount":
+            mount_path = self._registration_path(
+                receiver,
+                call,
+                module,
+                env,
+            )
+            child_node = (
+                call.args[1]
+                if len(call.args) >= 2
+                else next(
+                    (
+                        keyword.value
+                        for keyword in call.keywords
+                        if keyword.arg == "app"
+                    ),
+                    None,
+                )
+            )
+            mounted = self._resolve(
+                self._eval_expr(child_node, module, env)
+                if child_node is not None
+                else _UnknownRouteValue(call.lineno)
+            )
+            child = mounted if isinstance(mounted, _RouteObject) else None
+            static_assets = isinstance(mounted, _StaticAssetValue)
+            receiver.includes.append(
+                _StaticRouteInclude(
+                    child,
+                    mount_path,
+                    call.lineno,
+                    mount=True,
+                    static_assets=static_assets,
+                )
+            )
+            return _UnknownRouteValue(call.lineno)
+        if name in self._SAFE_APP_METHODS:
+            return _UnknownRouteValue(call.lineno)
+        return _UnknownRouteValue(call.lineno)
+
+    def _eval_expr(
+        self,
+        node: ast.AST | None,
+        module: str,
+        env: dict[str, Any],
+    ) -> Any:
+        if node is None:
+            return _UnknownRouteValue(1)
+        if isinstance(node, ast.Constant) and isinstance(
+            node.value,
+            (str, int, bool, type(None)),
+        ):
+            return node.value
+        if isinstance(node, ast.Name):
+            return self._resolve(
+                env.get(node.id, _UnknownRouteValue(node.lineno))
+            )
+        if isinstance(node, ast.Attribute):
+            base = self._resolve(self._eval_expr(node.value, module, env))
+            if isinstance(base, _RouteObject):
+                if node.attr == "router":
+                    return base
+                return _RouteMethod(base, node.attr, node.lineno)
+            if (
+                isinstance(base, _RouteMethod)
+                and base.name == "routes"
+                and node.attr in {"append", "extend", "insert"}
+            ):
+                return _DynamicRouteMethod(base.receiver, node.lineno)
+            if isinstance(base, _RouteModule):
+                return self._resolve(
+                    _RouteImport(base.name, node.attr, node.lineno)
+                )
+            return _UnknownRouteValue(node.lineno)
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+            ):
+                receiver = self._resolve(
+                    self._eval_expr(node.args[0], module, env)
+                )
+                attribute = _literal_string(node.args[1])
+                if isinstance(receiver, _RouteObject):
+                    if attribute is None:
+                        self._unproven(module, node.lineno)
+                        return _DynamicRouteMethod(receiver, node.lineno)
+                    return _RouteMethod(receiver, attribute, node.lineno)
+                if isinstance(receiver, _RouteModule):
+                    if attribute is None:
+                        return self._unproven(module, node.lineno)
+                    return self._resolve(
+                        _RouteImport(
+                            receiver.name,
+                            attribute,
+                            node.lineno,
+                        )
+                    )
+                return _UnknownRouteValue(node.lineno)
+            dynamic_import = (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "__import__"
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "import_module"
+            )
+            if dynamic_import:
+                imported = _literal_string(node.args[0] if node.args else None)
+                if imported is None or imported not in self.modules:
+                    return self._unproven(module, node.lineno)
+                return _RouteModule(imported)
+            function = self._resolve(self._eval_expr(node.func, module, env))
+            if isinstance(function, _RouteConstructor):
+                prefix_node = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "prefix"
+                    ),
+                    None,
+                )
+                prefix_value = (
+                    ""
+                    if prefix_node is None
+                    else self._eval_expr(prefix_node, module, env)
+                )
+                prefix = (
+                    prefix_value
+                    if isinstance(prefix_value, str)
+                    else None
+                )
+                if prefix is None:
+                    self._unproven(module, node.lineno)
+                return self._new_object(
+                    module,
+                    function.kind,
+                    prefix,
+                    node.lineno,
+                )
+            if isinstance(function, _StaticAssetConstructor):
+                return _StaticAssetValue()
+            if isinstance(function, _RouteFactory):
+                return self._factory_call(function, node, env)
+            if isinstance(function, _RouteMethod):
+                return self._register_method(function, node, module, env)
+            if isinstance(function, _DynamicRouteMethod):
+                return self._unproven(module, node.lineno)
+            argument_values = [
+                self._resolve(self._eval_expr(argument, module, env))
+                for argument in node.args
+            ]
+            keyword_values = [
+                self._resolve(self._eval_expr(keyword.value, module, env))
+                for keyword in node.keywords
+            ]
+            if any(
+                isinstance(value, _RouteObject)
+                for value in (*argument_values, *keyword_values)
+            ):
+                self._unproven(module, node.lineno)
+            return _UnknownRouteValue(node.lineno)
+        if isinstance(node, ast.IfExp):
+            left = self._eval_expr(node.body, module, env)
+            right = self._eval_expr(node.orelse, module, env)
+            return left if left is right else _UnknownRouteValue(node.lineno)
+        return _UnknownRouteValue(getattr(node, "lineno", 1))
+
+    def _process_statements(
+        self,
+        statements: list[ast.stmt],
+        module: str,
+        env: dict[str, Any],
+        returns: list[Any],
+    ) -> None:
+        for statement in statements:
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                self._bind_import(env, module, statement)
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value = self._eval_expr(statement.value, module, env)
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Attribute):
+                        resolved_target = self._resolve(
+                            self._eval_expr(target, module, env)
+                        )
+                        if (
+                            isinstance(resolved_target, _RouteMethod)
+                            and resolved_target.name == "routes"
+                        ):
+                            self._unproven(module, statement.lineno)
+                    if isinstance(target, ast.Name):
+                        previous = self._resolve(env.get(target.id))
+                        if (
+                            isinstance(previous, _RouteMethod)
+                            and isinstance(value, _RouteMethod)
+                            and (
+                                previous.receiver is not value.receiver
+                                or previous.name != value.name
+                            )
+                        ):
+                            self._unproven(module, statement.lineno)
+                    self._bind_target(target, value, env)
+            elif isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                for decorator in statement.decorator_list:
+                    target = (
+                        self._resolve(
+                            self._eval_expr(
+                                decorator.func,
+                                module,
+                                env,
+                            )
+                        )
+                        if isinstance(decorator, ast.Call)
+                        else None
+                    )
+                    self._eval_expr(decorator, module, env)
+                    if (
+                        not isinstance(
+                            target,
+                            (_RouteMethod, _DynamicRouteMethod),
+                        )
+                        and isinstance(decorator, ast.Call)
+                        and decorator.args
+                        and isinstance(decorator.args[0], ast.Constant)
+                        and isinstance(decorator.args[0].value, str)
+                        and decorator.args[0].value.startswith("/")
+                    ):
+                        self._unproven(module, decorator.lineno)
+                env[statement.name] = _RouteFactory(module, statement)
+            elif isinstance(statement, ast.ClassDef):
+                bases = [
+                    self._resolve(
+                        self._eval_expr(base, module, env)
+                    )
+                    for base in statement.bases
+                ]
+                if any(
+                    isinstance(base, _StaticAssetConstructor)
+                    for base in bases
+                ):
+                    env[statement.name] = _StaticAssetConstructor()
+            elif isinstance(statement, ast.Expr):
+                self._eval_expr(statement.value, module, env)
+            elif isinstance(statement, ast.Return):
+                returns.append(
+                    self._eval_expr(statement.value, module, env)
+                )
+            elif isinstance(statement, ast.If):
+                self._process_statements(
+                    statement.body, module, env, returns
+                )
+                self._process_statements(
+                    statement.orelse, module, env, returns
+                )
+            elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+                self._process_statements(
+                    statement.body, module, env, returns
+                )
+                self._process_statements(
+                    statement.orelse, module, env, returns
+                )
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                self._process_statements(
+                    statement.body, module, env, returns
+                )
+            elif isinstance(statement, ast.Try):
+                self._process_statements(
+                    statement.body, module, env, returns
+                )
+                for handler in statement.handlers:
+                    self._process_statements(
+                        handler.body, module, env, returns
+                    )
+                self._process_statements(
+                    statement.orelse, module, env, returns
+                )
+                self._process_statements(
+                    statement.finalbody, module, env, returns
+                )
+
+    def _canonical_root(self) -> _RouteObject | None:
+        module = "trading_assistant.app.main"
+        env = self._evaluate_module(module)
+        configured = self._resolve(env.get("app"))
+        if isinstance(configured, _RouteObject):
+            return configured
+        for name in ("create_app", "_create_app"):
+            candidate = self._resolve(env.get(name))
+            if isinstance(candidate, _RouteFactory):
+                result = self._factory_call(
+                    candidate,
+                    ast.Call(
+                        func=ast.Name(id=name, ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                        lineno=candidate.function.lineno,
+                        col_offset=0,
+                    ),
+                    env,
+                )
+                if isinstance(result, _RouteObject):
+                    return result
+        self._unproven(module, 1)
+        return None
+
+    def _effective_routes(
+        self,
+        root_object: _RouteObject,
+    ) -> list[tuple[str, str, str, int]]:
+        effective: list[tuple[str, str, str, int]] = []
+
+        def visit(
+            current: _RouteObject,
+            inherited: str,
+            active: frozenset[str],
+        ) -> None:
+            if current.key in active:
+                self._unproven(
+                    current.key.split(":", 1)[0],
+                    current.line,
+                )
+                return
+            if current.prefix is None:
+                self._unproven(
+                    current.key.split(":", 1)[0],
+                    current.line,
+                )
+                return
+            composed = _route_join(inherited, current.prefix)
+            next_active = active | {current.key}
+            module = current.key.rsplit(":", 2)[0]
+            relative = self._relative(module)
+            for route in current.routes:
+                effective.append(
+                    (
+                        route.method,
+                        _route_join(composed, route.path),
+                        relative,
+                        route.line,
+                    )
+                )
+            for include in current.includes:
+                if include.prefix is None:
+                    self._unproven(module, include.line)
+                    continue
+                include_path = _route_join(composed, include.prefix)
+                if include.mount:
+                    effective.append(
+                        ("MOUNT", include_path, relative, include.line)
+                    )
+                    if include.child is not None:
+                        visit(include.child, include_path, next_active)
+                    elif not (
+                        include.static_assets
+                        and include_path == "/static"
+                    ):
+                        self._unproven(module, include.line)
+                elif include.child is None:
+                    self._unproven(module, include.line)
+                else:
+                    visit(include.child, include_path, next_active)
+
+        visit(root_object, "", frozenset())
+        return effective
+
+    def scan(self) -> list[ReleaseViolation]:
+        root_object = self._canonical_root()
+        if root_object is None:
+            return self.findings
+        effective = self._effective_routes(root_object)
+        seen: dict[tuple[str, str], tuple[str, int]] = {}
+        for method, path, relative, line in effective:
+            if re.search(r"(?:^/|/)(?:webhook|hooks)[^/]*", path):
+                self.findings.append(
+                    _finding("WEBHOOK_ROUTE_PRESENT", relative, line)
+                )
+            if method == "MOUNT":
+                if path != "/static":
+                    self.findings.append(
+                        _finding(
+                            "ROUTE_REGISTRATION_UNPROVEN",
+                            relative,
+                            line,
+                        )
+                    )
+                continue
+            key = (method, _effective_route_shape(path))
+            if key in seen:
+                self.findings.append(
+                    _finding("DUPLICATE_EFFECTIVE_ROUTE", relative, line)
+                )
+            else:
+                seen[key] = (relative, line)
+
+        policy_relative = "src/trading_assistant/app/policy.py"
+        policy_path = self.root / policy_relative
+        try:
+            policies = _literal_route_policies(self.root)
+        except (OSError, SyntaxError, RuntimeError):
+            self.findings.append(
+                _finding("ROUTE_REGISTRATION_UNPROVEN", policy_relative, 1)
+            )
+        else:
+            for method, path, relative, line in effective:
+                if method != "MOUNT" and (method, path) not in policies:
+                    self.findings.append(
+                        _finding(
+                            "ROUTE_REGISTRATION_UNPROVEN",
+                            relative,
+                            line,
+                        )
+                    )
+            if not policy_path.exists():
+                self.findings.append(
+                    _finding(
+                        "ROUTE_REGISTRATION_UNPROVEN",
+                        policy_relative,
+                        1,
+                    )
+                )
+        return self.findings
+
+
+def _scan_effective_route_graph(root: Path) -> list[ReleaseViolation]:
+    return _EffectiveRouteGraph(root).scan()
+
+
 def _is_llm_backend_module(module: str | None) -> bool:
     return module in _LLM_BACKEND_MODULE_PATHS
 
@@ -950,48 +1970,6 @@ def _check_no_deleted_rate_limiter_import(root: Path) -> None:
         )
 
 
-def _check_no_tracked_secret_files(root: Path) -> None:
-    tracked = subprocess.check_output(
-        ["git", "ls-files", "-z"],
-        cwd=root,
-    ).decode().split("\0")
-    secret_names = {".env", ".env.local", "id_rsa", "id_ed25519"}
-    offenders = [
-        name
-        for name in tracked
-        if name and (Path(name).name in secret_names or Path(name).suffix in {".pem", ".p12"})
-    ]
-    if offenders:
-        _fail("tracked secret-bearing file: " + ", ".join(offenders))
-
-
-def _check_sensitive_field_writes(root: Path) -> None:
-    source_root = root / "src" / "trading_assistant"
-    if not source_root.exists():
-        return
-    project_src = DEFAULT_ROOT / "src"
-    if str(project_src) not in sys.path:
-        sys.path.insert(0, str(project_src))
-    from trading_assistant.security.sensitive_write_scan import (
-        scan_sensitive_writes,
-    )
-
-    allowed = {
-        source_root / "security" / "sensitive_fields.py",
-        source_root / "ops" / "encrypt_sensitive.py",
-    }
-    offenders = scan_sensitive_writes(
-        path
-        for path in source_root.rglob("*.py")
-        if path not in allowed
-    )
-    if offenders:
-        _fail(
-            "sensitive field write bypass: "
-            + ", ".join(offenders)
-        )
-
-
 def _check_encrypted_operational_backup_surface(root: Path) -> None:
     relative = "src/trading_assistant/ops/backup.py"
     path = root / relative
@@ -1073,31 +2051,2772 @@ def _check_encrypted_operational_backup_surface(root: Path) -> None:
             _fail(f"plaintext operational backup entrypoint: {surface}")
 
 
+_APPROVED_PROVIDER_ORIGINS = {
+    "alpaca_trading": "https://paper-api.alpaca.markets",
+    "alpaca_data": "https://data.alpaca.markets",
+    "alpaca_stream": "wss://stream.data.alpaca.markets",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com",
+    "groq": "https://api.groq.com",
+    "telegram": "https://api.telegram.org",
+    "coingecko": "https://api.coingecko.com",
+}
+_APPROVED_OUTBOUND_RULES = {
+    "alpaca_trading": (
+        "alpaca.trading",
+        frozenset(
+            {
+                "app",
+                "daemon",
+                "mcp",
+                "paper-drill",
+                "preflight",
+                "safety-drill",
+                "watchdog",
+            }
+        ),
+        None,
+    ),
+    "alpaca_data": (
+        "alpaca.historical",
+        frozenset(
+            {
+                "app",
+                "daemon",
+                "paper-drill",
+                "preflight",
+                "safety-drill",
+                "validate-analyst",
+            }
+        ),
+        None,
+    ),
+    "alpaca_stream": (
+        "alpaca.stream",
+        frozenset({"daemon"}),
+        "daemon.use_websocket",
+    ),
+    "anthropic": (
+        "llm.anthropic",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=anthropic",
+    ),
+    "gemini": (
+        "llm.gemini",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=gemini",
+    ),
+    "groq": (
+        "llm.groq",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=groq",
+    ),
+    "telegram": (
+        "notifier.telegram",
+        frozenset({"app", "daemon", "preflight", "watchdog"}),
+        "features.telegram_notifications",
+    ),
+    "coingecko": (
+        "marketdata.coingecko",
+        frozenset({"app", "daemon"}),
+        "crypto_risk",
+    ),
+}
+_APPROVED_OUTBOUND_ORIGINS = frozenset(
+    _APPROVED_PROVIDER_ORIGINS.values()
+)
+_APPROVED_ORIGINS_BY_ADAPTER_PATH = {
+    "src/trading_assistant/broker/alpaca.py": frozenset(
+        {
+            _APPROVED_PROVIDER_ORIGINS["alpaca_trading"],
+            _APPROVED_PROVIDER_ORIGINS["alpaca_data"],
+            _APPROVED_PROVIDER_ORIGINS["alpaca_stream"],
+        }
+    ),
+    "src/trading_assistant/analyst/news.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["alpaca_data"]}
+    ),
+    "src/trading_assistant/backtest/data.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["alpaca_data"]}
+    ),
+    "src/trading_assistant/llm/anthropic_backend.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["anthropic"]}
+    ),
+    "src/trading_assistant/llm/gemini_backend.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["gemini"]}
+    ),
+    "src/trading_assistant/llm/groq_backend.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["groq"]}
+    ),
+    "src/trading_assistant/notifications/telegram.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["telegram"]}
+    ),
+    "src/trading_assistant/backtest/coingecko.py": frozenset(
+        {_APPROVED_PROVIDER_ORIGINS["coingecko"]}
+    ),
+}
+_QUERY_SECRET_KEYS = frozenset(
+    {
+        "access_key",
+        "api_key",
+        "apikey",
+        "credential",
+        "secret",
+        "token",
+    }
+)
+_OUTBOUND_CLIENT_CONSTRUCTORS = frozenset(
+    {
+        "Client",
+        "AsyncClient",
+        "ClientSession",
+        "OpenAI",
+        "AsyncOpenAI",
+        "PoolManager",
+        "ProxyManager",
+        "Session",
+    }
+)
+_OUTBOUND_REQUEST_METHODS = frozenset(
+    {
+        "delete",
+        "get",
+        "head",
+        "options",
+        "patch",
+        "post",
+        "put",
+        "request",
+        "stream",
+        "urlopen",
+        "ws_connect",
+    }
+)
+_PROVIDER_CLIENT_IMPORTS = frozenset(
+    {
+        "Anthropic",
+        "CryptoHistoricalDataClient",
+        "Groq",
+        "NewsClient",
+        "StockHistoricalDataClient",
+        "TradingClient",
+    }
+)
+_APPROVED_PROVIDER_CLIENT_PATHS = {
+    "Anthropic": frozenset(
+        {"src/trading_assistant/llm/anthropic_backend.py"}
+    ),
+    "Groq": frozenset(
+        {"src/trading_assistant/llm/groq_backend.py"}
+    ),
+    "NewsClient": frozenset(
+        {"src/trading_assistant/analyst/news.py"}
+    ),
+    "StockHistoricalDataClient": frozenset(
+        {
+            "src/trading_assistant/backtest/data.py",
+            "src/trading_assistant/broker/alpaca.py",
+        }
+    ),
+    "CryptoHistoricalDataClient": frozenset(
+        {"src/trading_assistant/broker/alpaca.py"}
+    ),
+    "TradingClient": frozenset(
+        {"src/trading_assistant/broker/alpaca.py"}
+    ),
+}
+
+
+def _yaml_key_line(path: Path, key: str) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 1
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*:")
+    for number, line in enumerate(lines, 1):
+        if pattern.match(line):
+            return number
+    return 1
+
+
+def _python_sources(root: Path) -> list[Path]:
+    source_root = root / "src" / "trading_assistant"
+    if not source_root.exists():
+        return []
+    return sorted(source_root.rglob("*.py"))
+
+
+def _literal_string(
+    node: ast.AST | None,
+    constants: dict[str, str] | None = None,
+) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and constants is not None:
+        return constants.get(node.id)
+    return None
+
+
+def _module_string_constants(tree: ast.AST) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    for node in getattr(tree, "body", ()):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = _literal_string(node.value, constants)
+        if value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants[target.id] = value
+    return constants
+
+
+def _literal_frozenset(node: ast.AST | None) -> frozenset[str] | None:
+    collection = node
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "frozenset"
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        collection = node.args[0]
+    if not isinstance(collection, (ast.Set, ast.Tuple, ast.List)):
+        return None
+    values: set[str] = set()
+    for element in collection.elts:
+        value = _literal_string(element)
+        if value is None:
+            return None
+        values.add(value)
+    return frozenset(values)
+
+
+def _scan_outbound_manifest(root: Path) -> list[ReleaseViolation]:
+    relative = "src/trading_assistant/security/outbound.py"
+    path = root / relative
+    if not path.exists():
+        return [_finding("OUTBOUND_ORIGIN_UNAPPROVED", relative, 1)]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return [_finding("OUTBOUND_ORIGIN_UNAPPROVED", relative, 1)]
+    assignment = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "OUTBOUND_ORIGIN_MANIFEST"
+                for target in (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+            )
+        ),
+        None,
+    )
+    if assignment is None or not isinstance(
+        assignment.value,
+        (ast.Tuple, ast.List),
+    ):
+        return [
+            _finding(
+                "OUTBOUND_ORIGIN_UNAPPROVED",
+                relative,
+                getattr(assignment, "lineno", 1),
+            )
+        ]
+    parsed: dict[
+        str,
+        tuple[str, str, frozenset[str], str | None],
+    ] = {}
+    for element in assignment.value.elts:
+        if not (
+            isinstance(element, ast.Call)
+            and isinstance(element.func, ast.Name)
+            and element.func.id == "OutboundOriginRule"
+            and 4 <= len(element.args) <= 5
+            and not element.keywords
+        ):
+            return [
+                _finding(
+                    "OUTBOUND_ORIGIN_UNAPPROVED",
+                    relative,
+                    getattr(element, "lineno", assignment.lineno),
+                )
+            ]
+        key = _literal_string(element.args[0])
+        adapter = _literal_string(element.args[1])
+        origin = _literal_string(element.args[2])
+        roles = _literal_frozenset(element.args[3])
+        feature = (
+            _literal_string(element.args[4])
+            if len(element.args) == 5
+            else None
+        )
+        if (
+            key is None
+            or adapter is None
+            or origin is None
+            or roles is None
+            or not roles
+            or key in parsed
+            or (
+                len(element.args) == 5
+                and feature is None
+            )
+        ):
+            return [
+                _finding(
+                    "OUTBOUND_ORIGIN_UNAPPROVED",
+                    relative,
+                    element.lineno,
+                )
+            ]
+        parsed[key] = (origin, adapter, roles, feature)
+    expected = {
+        key: (
+            _APPROVED_PROVIDER_ORIGINS[key],
+            adapter,
+            roles,
+            feature,
+        )
+        for key, (adapter, roles, feature) in _APPROVED_OUTBOUND_RULES.items()
+    }
+    if parsed != expected:
+        return [
+            _finding(
+                "OUTBOUND_ORIGIN_UNAPPROVED",
+                relative,
+                assignment.lineno,
+            )
+        ]
+    return []
+
+
+def _literal_false_annotation(node: ast.AST | None) -> bool:
+    if not isinstance(node, ast.Subscript):
+        return False
+    annotation_name = (
+        node.value.id
+        if isinstance(node.value, ast.Name)
+        else node.value.attr
+        if isinstance(node.value, ast.Attribute)
+        else None
+    )
+    return (
+        annotation_name == "Literal"
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value is False
+    )
+
+
+def _literal_string_collection(
+    node: ast.AST | None,
+) -> tuple[frozenset[str], bool]:
+    if not isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return frozenset(), False
+    values: set[str] = set()
+    for element in node.elts:
+        value = _literal_string(element)
+        if value is None:
+            return frozenset(), False
+        values.add(value)
+    return frozenset(values), True
+
+
+def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+    findings = _scan_outbound_manifest(root)
+    config_path = root / "config.yaml"
+    if config_path.exists():
+        try:
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return [_finding("CONFIG_UNPROVEN", "config.yaml", 1)]
+        server = raw.get("server")
+        if not isinstance(server, dict):
+            findings.extend(
+                (
+                    _finding("TLS_DISABLED", "config.yaml", 1),
+                    _finding("INSECURE_COOKIE", "config.yaml", 1),
+                    _finding("WILDCARD_HOST_ORIGIN", "config.yaml", 1),
+                )
+            )
+        else:
+            if server.get("secure_cookies") is not True:
+                findings.append(
+                    _finding(
+                        "INSECURE_COOKIE",
+                        "config.yaml",
+                        _yaml_key_line(config_path, "secure_cookies"),
+                    )
+                )
+            allowed_hosts = server.get("allowed_hosts")
+            origin = server.get("origin")
+            if (
+                not isinstance(allowed_hosts, list)
+                or set(allowed_hosts)
+                != {"localhost", "127.0.0.1", "::1"}
+            ) or (
+                isinstance(origin, str)
+                and "*" in origin
+            ):
+                findings.append(
+                    _finding(
+                        "WILDCARD_HOST_ORIGIN",
+                        "config.yaml",
+                        _yaml_key_line(
+                            config_path,
+                            "allowed_hosts",
+                        ),
+                    )
+                )
+            if (
+                server.get("bind_host") != "127.0.0.1"
+                or server.get("port") != 8020
+                or origin != "https://localhost:8020"
+                or server.get("tls_cert_path")
+                != ".local/tls/localhost.pem"
+                or server.get("tls_key_path")
+                != ".local/tls/localhost-key.pem"
+            ):
+                findings.append(
+                    _finding(
+                        "TLS_DISABLED",
+                        "config.yaml",
+                        _yaml_key_line(config_path, "origin"),
+                    )
+                )
+            if any(
+                server.get(key) not in (None, False, "", ())
+                for key in (
+                    "proxy_headers",
+                    "trust_proxy_headers",
+                    "forwarded_allow_ips",
+                )
+            ):
+                findings.append(
+                    _finding(
+                        "PROXY_HEADERS_TRUSTED",
+                        "config.yaml",
+                        min(
+                            (
+                                _yaml_key_line(config_path, key)
+                                for key in (
+                                    "proxy_headers",
+                                    "trust_proxy_headers",
+                                    "forwarded_allow_ips",
+                                )
+                                if key in server
+                            ),
+                            default=1,
+                        ),
+                    )
+                )
+        integrations = raw.get("integrations")
+        if not isinstance(integrations, dict):
+            findings.extend(
+                (
+                    _finding("COMPOSIO_ENABLED", "config.yaml", 1),
+                    _finding("WEBHOOK_ROUTE_PRESENT", "config.yaml", 1),
+                )
+            )
+        else:
+            if integrations.get("composio_enabled") is not False:
+                findings.append(
+                    _finding(
+                        "COMPOSIO_ENABLED",
+                        "config.yaml",
+                        _yaml_key_line(config_path, "composio_enabled"),
+                    )
+                )
+            if integrations.get("webhooks_enabled") is not False:
+                findings.append(
+                    _finding(
+                        "WEBHOOK_ROUTE_PRESENT",
+                        "config.yaml",
+                        _yaml_key_line(config_path, "webhooks_enabled"),
+                    )
+                )
+        origins = raw.get("provider_origins")
+        if not isinstance(origins, dict):
+            findings.append(
+                _finding(
+                    "OUTBOUND_ORIGIN_UNAPPROVED",
+                    "config.yaml",
+                    1,
+                )
+            )
+        else:
+            for key, value in origins.items():
+                if _APPROVED_PROVIDER_ORIGINS.get(key) != value:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            "config.yaml",
+                            _yaml_key_line(config_path, str(key)),
+                        )
+                    )
+            for key in _APPROVED_PROVIDER_ORIGINS:
+                if key not in origins:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            "config.yaml",
+                            _yaml_key_line(config_path, "provider_origins"),
+                        )
+                    )
+
+    config_source = root / "src" / "trading_assistant" / "config.py"
+    if not config_source.exists():
+        relative = "src/trading_assistant/config.py"
+        findings.extend(
+            (
+                _finding("COMPOSIO_ENABLED", relative, 1),
+                _finding("WEBHOOK_ROUTE_PRESENT", relative, 1),
+            )
+        )
+    else:
+        relative = config_source.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(
+                config_source.read_text(encoding="utf-8"),
+                filename=relative,
+            )
+        except (OSError, SyntaxError):
+            findings.append(_finding("CONFIG_UNPROVEN", relative, 1))
+        else:
+            integration_class = next(
+                (
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.ClassDef)
+                    and node.name == "IntegrationsConfig"
+                ),
+                None,
+            )
+            if integration_class is None:
+                findings.extend(
+                    (
+                        _finding("COMPOSIO_ENABLED", relative, 1),
+                        _finding("WEBHOOK_ROUTE_PRESENT", relative, 1),
+                    )
+                )
+            else:
+                values = {
+                    node.target.id: node
+                    for node in integration_class.body
+                    if isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                }
+                for name, code in (
+                    ("composio_enabled", "COMPOSIO_ENABLED"),
+                    ("webhooks_enabled", "WEBHOOK_ROUTE_PRESENT"),
+                ):
+                    declaration = values.get(name)
+                    if (
+                        declaration is None
+                        or not isinstance(declaration.value, ast.Constant)
+                        or declaration.value.value is not False
+                        or not _literal_false_annotation(
+                            declaration.annotation
+                        )
+                    ):
+                        findings.append(
+                            _finding(
+                                code,
+                                relative,
+                                getattr(declaration, "lineno", integration_class.lineno),
+                            )
+                        )
+
+    env_example = root / ".env.example"
+    if env_example.exists():
+        try:
+            lines = env_example.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            findings.append(_finding("CONFIG_UNPROVEN", ".env.example", 1))
+        else:
+            for line_number, line in enumerate(lines, 1):
+                name = line.split("=", 1)[0].strip().upper()
+                if name.startswith("COMPOSIO_"):
+                    findings.append(
+                        _finding(
+                            "COMPOSIO_ENABLED",
+                            ".env.example",
+                            line_number,
+                        )
+                    )
+
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        relative_parts = PurePosixPath(relative).parts
+        composio_sensitive_path = (
+            "mcp_server" in relative_parts
+            or "integration" in path.stem.lower()
+            or "toolkit" in path.stem.lower()
+        )
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(
+                node.value,
+                str,
+            ):
+                parsed = urlsplit(node.value)
+                if (
+                    parsed.scheme.lower() in {"http", "https", "ws", "wss"}
+                    and parsed.hostname is not None
+                    and "composio" in parsed.hostname.lower()
+                ):
+                    findings.append(
+                        _finding(
+                            "COMPOSIO_ENABLED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+            composio_import = (
+                isinstance(node, ast.Import)
+                and any(
+                    imported.name == "composio"
+                    or imported.name.startswith("composio.")
+                    for imported in node.names
+                )
+            ) or (
+                isinstance(node, ast.ImportFrom)
+                and isinstance(node.module, str)
+                and (
+                    node.module == "composio"
+                    or node.module.startswith("composio.")
+                )
+            )
+            if composio_import:
+                findings.append(
+                    _finding("COMPOSIO_ENABLED", relative, node.lineno)
+                )
+            if isinstance(node, ast.Call):
+                call_name = (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else ""
+                )
+                if "composio" in call_name.lower():
+                    findings.append(
+                        _finding(
+                            "COMPOSIO_ENABLED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if (
+                    call_name == "getattr"
+                    and len(node.args) >= 2
+                    and (
+                        (
+                            _literal_string(node.args[1]) is not None
+                            and "composio"
+                            in _literal_string(node.args[1]).lower()
+                        )
+                        or _literal_string(node.args[1]) is None
+                        and (
+                            "composio" in relative.lower()
+                            or composio_sensitive_path
+                        )
+                    )
+                ):
+                    findings.append(
+                        _finding(
+                            "COMPOSIO_ENABLED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if call_name in {
+                    "CORSMiddleware",
+                    "TrustedHostMiddleware",
+                }:
+                    keyword_name = (
+                        "allow_origins"
+                        if call_name == "CORSMiddleware"
+                        else "allowed_hosts"
+                    )
+                    configured = next(
+                        (
+                            keyword.value
+                            for keyword in node.keywords
+                            if keyword.arg == keyword_name
+                        ),
+                        None,
+                    )
+                    values, proven = _literal_string_collection(
+                        configured
+                    )
+                    canonical_trusted_host = (
+                        call_name == "TrustedHostMiddleware"
+                        and relative
+                        == "src/trading_assistant/app/main.py"
+                        and isinstance(configured, ast.List)
+                        and len(configured.elts) == 1
+                        and _attribute_path(configured.elts[0])
+                        == ("transport_policy", "canonical_host")
+                    )
+                    if (
+                        "*" in values
+                        or not proven
+                        and not canonical_trusted_host
+                    ):
+                        findings.append(
+                            _finding(
+                                "WILDCARD_HOST_ORIGIN",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                if call_name in {"import_module", "__import__"} and node.args:
+                    module_name = _literal_string(node.args[0])
+                    if (
+                        module_name is not None
+                        and (
+                            module_name == "composio"
+                            or module_name.startswith("composio.")
+                        )
+                        or module_name is None
+                        and composio_sensitive_path
+                    ):
+                        findings.append(
+                            _finding(
+                                "COMPOSIO_ENABLED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+
+    dangerous_doc = re.compile(
+        r"\b(?:pip(?:3)?\s+install|uv\s+add|poetry\s+add)\s+composio\b"
+        r"|\bcomposio\s+(?:login|connect|install|enable)\b"
+        r"|https?://[^\s)]*composio",
+        re.IGNORECASE,
+    )
+    for relative in (
+        "README.md",
+        "docs/RUNBOOK.md",
+        "docs/ops/README.md",
+        "scripts/launchd/README.md",
+    ):
+        path = root / relative
+        if not path.exists():
+            findings.extend(
+                (
+                    _finding("COMPOSIO_ENABLED", relative, 1),
+                    _finding("WEBHOOK_ROUTE_PRESENT", relative, 1),
+                )
+            )
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            findings.extend(
+                (
+                    _finding("COMPOSIO_ENABLED", relative, 1),
+                    _finding("WEBHOOK_ROUTE_PRESENT", relative, 1),
+                )
+            )
+            continue
+        normalized = " ".join(lines).lower()
+        if "composio" not in normalized or "disabled" not in normalized:
+            findings.append(
+                _finding("COMPOSIO_ENABLED", relative, 1)
+            )
+        if "no webhook receiver" not in normalized:
+            findings.append(
+                _finding("WEBHOOK_ROUTE_PRESENT", relative, 1)
+            )
+        for line_number, line in enumerate(lines, 1):
+            if dangerous_doc.search(line):
+                findings.append(
+                    _finding("COMPOSIO_ENABLED", relative, line_number)
+                )
+    return findings
+
+
+def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+    if not isinstance(node, ast.Dict):
+        return set(), True
+    keys: set[str] = set()
+    dynamic = False
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value.lower())
+        else:
+            dynamic = True
+    return keys, dynamic
+
+
+def _static_string_fragments(node: ast.AST | None) -> tuple[str, ...]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return (node.value,)
+    if isinstance(node, ast.JoinedStr):
+        return tuple(
+            fragment
+            for value in node.values
+            for fragment in _static_string_fragments(value)
+        )
+    if isinstance(node, ast.FormattedValue):
+        return ()
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op,
+        (ast.Add, ast.Mod),
+    ):
+        return (
+            *_static_string_fragments(node.left),
+            *_static_string_fragments(node.right),
+        )
+    return ()
+
+
+def _mapping_alias_keys(
+    tree: ast.AST,
+) -> dict[str, tuple[set[str], bool]]:
+    mappings: dict[str, tuple[set[str], bool]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            names = {
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            }
+            if not names:
+                continue
+            if isinstance(node.value, ast.Dict):
+                resolved = _mapping_literal_keys(node.value)
+            elif isinstance(node.value, ast.Name):
+                resolved = mappings.get(node.value.id)
+                if resolved is None:
+                    continue
+            else:
+                continue
+            for name in names:
+                previous = mappings.get(name)
+                merged = (
+                    (set(resolved[0]), resolved[1])
+                    if previous is None
+                    else (
+                        set(previous[0]).union(resolved[0]),
+                        previous[1] or resolved[1],
+                    )
+                )
+                if previous != merged:
+                    mappings[name] = merged
+                    changed = True
+    return mappings
+
+
+def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+    findings: list[ReleaseViolation] = []
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        boundary_wrapper = (
+            relative == "src/trading_assistant/security/outbound.py"
+        )
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        except (OSError, SyntaxError):
+            findings.append(
+                _finding("OUTBOUND_CLIENT_UNAPPROVED", relative, 1)
+            )
+            continue
+        constants = _module_string_constants(tree)
+        mapping_aliases = _mapping_alias_keys(tree)
+        verified_tls_contexts: set[str] = set()
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = assignment.value
+            if not isinstance(value, ast.Call):
+                continue
+            constructor = _attribute_path(value.func)
+            if constructor not in {
+                ("ssl", "create_default_context"),
+                ("_verified_ssl_context",),
+            }:
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            verified_tls_contexts.update(
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            )
+        imported_client_names: set[str] = set()
+        imported_request_names: set[str] = set()
+        provider_client_names: dict[str, str] = {}
+        module_aliases: set[str] = set()
+        google_genai_aliases: set[str] = set()
+        network_modules = {
+            "requests",
+            "httpx",
+            "aiohttp",
+            "openai",
+            "urllib3",
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    root_module = imported.name.split(".", 1)[0]
+                    if root_module in network_modules:
+                        module_aliases.add(
+                            imported.asname or root_module
+                        )
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and isinstance(node.module, str)
+                and node.module.split(".", 1)[0] in network_modules
+            ):
+                for imported in node.names:
+                    if imported.name in _OUTBOUND_CLIENT_CONSTRUCTORS:
+                        imported_client_names.add(
+                            imported.asname or imported.name
+                        )
+                    if imported.name.lower() in _OUTBOUND_REQUEST_METHODS:
+                        imported_request_names.add(
+                            imported.asname or imported.name
+                        )
+            if isinstance(node, ast.ImportFrom):
+                for imported in node.names:
+                    local = imported.asname or imported.name
+                    if imported.name in _PROVIDER_CLIENT_IMPORTS:
+                        provider_client_names[local] = imported.name
+                    if (
+                        node.module == "google"
+                        and imported.name == "genai"
+                    ):
+                        google_genai_aliases.add(local)
+
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                names = {
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                }
+                if not names:
+                    continue
+                value = node.value
+                if isinstance(value, ast.Name):
+                    if value.id in imported_client_names:
+                        before = len(imported_client_names)
+                        imported_client_names.update(names)
+                        changed = changed or len(imported_client_names) != before
+                    if value.id in imported_request_names:
+                        before = len(imported_request_names)
+                        imported_request_names.update(names)
+                        changed = changed or len(imported_request_names) != before
+                    if value.id in provider_client_names:
+                        for name in names:
+                            if name not in provider_client_names:
+                                provider_client_names[name] = (
+                                    provider_client_names[value.id]
+                                )
+                                changed = True
+                if (
+                    isinstance(value, ast.Attribute)
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id in module_aliases
+                ):
+                    if value.attr in _OUTBOUND_CLIENT_CONSTRUCTORS:
+                        before = len(imported_client_names)
+                        imported_client_names.update(names)
+                        changed = changed or len(imported_client_names) != before
+                    if value.attr.lower() in _OUTBOUND_REQUEST_METHODS:
+                        before = len(imported_request_names)
+                        imported_request_names.update(names)
+                        changed = changed or len(imported_request_names) != before
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                for target in targets:
+                    target_name = (
+                        target.attr
+                        if isinstance(target, ast.Attribute)
+                        else _literal_string(target.slice)
+                        if isinstance(target, ast.Subscript)
+                        else None
+                    )
+                    if target_name is None:
+                        continue
+                    if target_name in {
+                        "follow_redirects",
+                        "allow_redirects",
+                    } and (
+                        not isinstance(node.value, ast.Constant)
+                        or node.value.value is not False
+                    ):
+                        findings.append(
+                            _finding(
+                                "CROSS_ORIGIN_REDIRECT_ENABLED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                    if target_name in {
+                        "trust_env",
+                        "proxy",
+                        "proxies",
+                        "forwarded_allow_ips",
+                    } and (
+                        not isinstance(node.value, ast.Constant)
+                        or node.value.value not in {None, False, ""}
+                    ) and not (
+                        target_name in {"proxy", "proxies"}
+                        and isinstance(node.value, ast.Dict)
+                        and not node.value.keys
+                    ):
+                        findings.append(
+                            _finding(
+                                "PROXY_HEADERS_TRUSTED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                    if target_name == "verify" and (
+                        not isinstance(node.value, ast.Constant)
+                        or node.value.value is not True
+                    ):
+                        findings.append(
+                            _finding("TLS_DISABLED", relative, node.lineno)
+                        )
+            if not isinstance(node, ast.Call):
+                continue
+            direct_client = (
+                isinstance(node.func, ast.Name)
+                and node.func.id in imported_client_names
+            )
+            direct_request = (
+                isinstance(node.func, ast.Name)
+                and node.func.id in imported_request_names
+            )
+            provider_client_name = (
+                provider_client_names.get(node.func.id)
+                if isinstance(node.func, ast.Name)
+                else "Client"
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in google_genai_aliases
+                    and node.func.attr == "Client"
+                )
+                else None
+            )
+            provider_client_unapproved = (
+                provider_client_name is not None
+                and relative
+                not in _APPROVED_PROVIDER_CLIENT_PATHS.get(
+                    provider_client_name,
+                    frozenset(
+                        {
+                            "src/trading_assistant/llm/gemini_backend.py"
+                        }
+                    )
+                    if provider_client_name == "Client"
+                    else frozenset(),
+                )
+            )
+            module_client = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in module_aliases
+                and (
+                    node.func.attr in _OUTBOUND_CLIENT_CONSTRUCTORS
+                    or node.func.attr.lower() in _OUTBOUND_REQUEST_METHODS
+                )
+            )
+            module_getattr = (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in module_aliases
+            )
+            dynamic_network_import = (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                )
+            ) and (
+                not node.args
+                or _literal_string(node.args[0]) is None
+                or _literal_string(node.args[0]).split(".", 1)[0]
+                in network_modules
+            )
+            if (
+                (
+                    direct_client
+                    or direct_request
+                    or module_client
+                )
+                and not boundary_wrapper
+                or module_getattr
+                or dynamic_network_import
+                or provider_client_unapproved
+            ):
+                findings.append(
+                    _finding(
+                        "OUTBOUND_CLIENT_UNAPPROVED",
+                        relative,
+                        node.lineno,
+                    )
+                )
+
+            url_nodes = list(node.args)
+            url_nodes.extend(
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg
+                in {"url", "base_url", "baseUrl", "url_override"}
+            )
+            allowed_for_adapter = _APPROVED_ORIGINS_BY_ADAPTER_PATH.get(
+                relative,
+                frozenset(),
+            )
+            call_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else node.func.id
+                if isinstance(node.func, ast.Name)
+                else ""
+            )
+            for argument in url_nodes:
+                value = _literal_string(argument, constants)
+                fragments = "".join(_static_string_fragments(argument))
+                if re.search(
+                    r"(?:\?|&)(?:access_key|api_key|apikey|credential|"
+                    r"secret|token)\s*=",
+                    fragments,
+                    flags=re.IGNORECASE,
+                ):
+                    findings.append(
+                        _finding("QUERY_SECRET", relative, node.lineno)
+                    )
+                if value is None or "?" not in value:
+                    query = ""
+                else:
+                    try:
+                        query = urlsplit(value).query
+                    except ValueError:
+                        query = ""
+                        findings.append(
+                            _finding(
+                                "OUTBOUND_ORIGIN_UNAPPROVED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                names = {
+                    item.partition("=")[0].lower()
+                    for item in query.split("&")
+                    if item
+                }
+                if names.intersection(_QUERY_SECRET_KEYS):
+                    findings.append(
+                        _finding("QUERY_SECRET", relative, node.lineno)
+                    )
+                if value is None:
+                    continue
+                try:
+                    parsed_url = urlsplit(value)
+                    parsed_port = parsed_url.port
+                except ValueError:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                    continue
+                if parsed_url.scheme.lower() == "http":
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if (
+                    parsed_url.scheme.lower() in {"https", "wss"}
+                    and call_name.lower() in _OUTBOUND_REQUEST_METHODS
+                ):
+                    hostname = parsed_url.hostname
+                    default_port = 443
+                    suffix = (
+                        ""
+                        if parsed_port in {None, default_port}
+                        else f":{parsed_port}"
+                    )
+                    origin = (
+                        f"{parsed_url.scheme.lower()}://{hostname}{suffix}"
+                        if hostname is not None
+                        else ""
+                    )
+                    if origin not in allowed_for_adapter:
+                        findings.append(
+                            _finding(
+                                "OUTBOUND_ORIGIN_UNAPPROVED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+
+            if call_name == "OutboundPolicy":
+                origin = _literal_string(
+                    node.args[0] if node.args else None,
+                    constants,
+                )
+                if (
+                    origin not in _APPROVED_OUTBOUND_ORIGINS
+                    or origin not in allowed_for_adapter
+                ):
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+
+            for keyword in node.keywords:
+                if (
+                    keyword.arg
+                    in {"base_url", "baseUrl", "url_override"}
+                    and call_name != "AlpacaExecutionTarget"
+                ):
+                    base_url = _literal_string(
+                        keyword.value,
+                        constants,
+                    )
+                    if base_url not in allowed_for_adapter:
+                        findings.append(
+                            _finding(
+                                "OUTBOUND_ORIGIN_UNAPPROVED",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                if (
+                    keyword.arg in {"follow_redirects", "allow_redirects"}
+                    and (
+                        not isinstance(keyword.value, ast.Constant)
+                        or keyword.value.value is not False
+                    )
+                ):
+                    findings.append(
+                        _finding(
+                            "CROSS_ORIGIN_REDIRECT_ENABLED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if keyword.arg == "verify" and (
+                    not isinstance(keyword.value, ast.Constant)
+                    or keyword.value.value is not True
+                ):
+                    findings.append(
+                        _finding("TLS_DISABLED", relative, node.lineno)
+                    )
+                if keyword.arg in {
+                    "trust_env",
+                    "proxy_headers",
+                } and (
+                    not isinstance(keyword.value, ast.Constant)
+                    or keyword.value.value is not False
+                ):
+                    findings.append(
+                        _finding(
+                            "PROXY_HEADERS_TRUSTED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if keyword.arg == "forwarded_allow_ips" and (
+                    not isinstance(keyword.value, ast.Constant)
+                    or keyword.value.value != ""
+                ):
+                    findings.append(
+                        _finding(
+                            "PROXY_HEADERS_TRUSTED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if keyword.arg in {"proxy", "proxies"} and (
+                    not isinstance(keyword.value, ast.Constant)
+                    or keyword.value.value not in {None, False}
+                ) and not (
+                    isinstance(keyword.value, ast.Dict)
+                    and not keyword.value.keys
+                ):
+                    findings.append(
+                        _finding(
+                            "PROXY_HEADERS_TRUSTED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if keyword.arg in {
+                    "ssl",
+                    "tls",
+                    "use_ssl",
+                } and (
+                    not isinstance(keyword.value, ast.Constant)
+                    or keyword.value.value is not True
+                ) and not (
+                    boundary_wrapper
+                    and keyword.arg == "ssl"
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id in verified_tls_contexts
+                ):
+                    findings.append(
+                        _finding("TLS_DISABLED", relative, node.lineno)
+                    )
+                if keyword.arg in {
+                    "ssl_certfile",
+                    "ssl_keyfile",
+                } and (
+                    isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value in {None, False, ""}
+                ):
+                    findings.append(
+                        _finding("TLS_DISABLED", relative, node.lineno)
+                    )
+                if keyword.arg == "params":
+                    keys, dynamic = (
+                        mapping_aliases.get(keyword.value.id)
+                        if isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in mapping_aliases
+                        else _mapping_literal_keys(keyword.value)
+                    )
+                    if keys.intersection(_QUERY_SECRET_KEYS):
+                        findings.append(
+                            _finding(
+                                "QUERY_SECRET",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                    elif (
+                        dynamic
+                        and relative
+                        not in {
+                            "src/trading_assistant/backtest/coingecko.py",
+                        }
+                    ):
+                        findings.append(
+                            _finding(
+                                "QUERY_SECRET",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+    return findings
+
+
+def _tracked_artifact_code(name: str) -> str | None:
+    path = PurePosixPath(name)
+    basename = path.name.lower()
+    lowered = name.lower()
+    if basename == ".env" or (
+        basename.startswith(".env.")
+        and basename
+        not in {".env.example", ".env.sample", ".env.template"}
+    ):
+        return "TRACKED_ENV_FILE"
+    if basename.endswith((".sqlite-wal", ".sqlite3-wal", ".db-wal")):
+        return "TRACKED_SQLITE_WAL"
+    if basename.endswith((".sqlite-shm", ".sqlite3-shm", ".db-shm")):
+        return "TRACKED_SQLITE_SHM"
+    if (
+        basename in {"id_rsa", "id_ed25519"}
+        or basename.endswith(".key")
+        or basename.endswith("-key.pem")
+        or "private-key" in basename
+    ):
+        return "TRACKED_TLS_PRIVATE_KEY"
+    if basename.endswith((".p12", ".pfx", ".pkcs12")):
+        return "TRACKED_TLS_PRIVATE_CERTIFICATE"
+    if (
+        "decrypted" in lowered
+        or "plaintext-backup" in lowered
+        or (
+            "backup" in lowered
+            and basename.endswith((".bak", ".sqlite", ".sqlite3", ".db"))
+        )
+    ) and not basename.endswith((".aesgcm", ".age", ".gpg")):
+        return "TRACKED_DECRYPTED_BACKUP"
+    if basename.endswith((".sqlite", ".sqlite3", ".db")):
+        return "TRACKED_SQLITE_DATABASE"
+    if basename.endswith(".log") or "/logs/" in f"/{lowered}":
+        return "TRACKED_RUNTIME_LOG"
+    if (
+        "/exports/" in f"/{lowered}"
+        or "raw-export" in basename
+        or "raw_account_export" in basename
+        or "raw-account-export" in basename
+    ):
+        return "TRACKED_RAW_EXPORT"
+    return None
+
+
+def _scan_tracked_artifacts(root: Path) -> list[ReleaseViolation]:
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z", "--"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    if completed.returncode != 0:
+        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    findings: list[ReleaseViolation] = []
+    for raw_name in completed.stdout.split(b"\0"):
+        if not raw_name:
+            continue
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            findings.append(_finding("GIT_TREE_UNPROVEN", ".", 1))
+            continue
+        code = _tracked_artifact_code(name)
+        if code is not None:
+            findings.append(_finding(code, name, 1))
+    return findings
+
+
+def _registered_environment_names(
+    root: Path,
+) -> tuple[frozenset[str], ReleaseViolation | None]:
+    relative = "src/trading_assistant/security/secrets.py"
+    path = root / relative
+    if not path.exists():
+        return (
+            frozenset(),
+            _finding("ENVIRONMENT_SECRETS_IN_PRODUCTION", relative, 1),
+        )
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return (
+            frozenset(),
+            _finding("ENVIRONMENT_SECRETS_IN_PRODUCTION", relative, 1),
+        )
+    registry = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_SIMPLE_SECRET_FIELDS"
+                for target in (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+            )
+        ),
+        None,
+    )
+    if registry is None or not isinstance(registry.value, (ast.Tuple, ast.List)):
+        return (
+            frozenset(),
+            _finding("ENVIRONMENT_SECRETS_IN_PRODUCTION", relative, 1),
+        )
+    names: set[str] = set()
+    for element in registry.value.elts:
+        if not isinstance(element, ast.Constant) or not isinstance(
+            element.value, str
+        ):
+            return (
+                frozenset(),
+                _finding(
+                    "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                    relative,
+                    getattr(element, "lineno", registry.lineno),
+                ),
+            )
+        names.add(element.value.upper())
+    names.add("FIELD_ENCRYPTION_KEYS_JSON")
+    return frozenset(names), None
+
+
+def _is_development_flag(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+        and node.attr == "development_environment_secrets"
+    )
+
+
+def _is_os_environ(
+    node: ast.AST,
+    os_module_names: set[str] | frozenset[str] = frozenset({"os"}),
+) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in os_module_names
+        and node.attr == "environ"
+    )
+
+
+def _call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def _allowed_environment_branch_lines(
+    tree: ast.AST,
+    relative: str,
+    provider_names: set[str],
+    load_names: set[str],
+    os_module_names: set[str],
+) -> set[int]:
+    expected_role = {
+        "src/trading_assistant/db/migrate.py": "migration",
+        "src/trading_assistant/ops/safety_drill.py": "safety-drill",
+    }.get(relative)
+    if expected_role is None:
+        return set()
+    allowed: set[int] = set()
+    for branch in ast.walk(tree):
+        if not isinstance(branch, ast.If) or not _is_development_flag(
+            branch.test
+        ):
+            continue
+        provider_calls: list[ast.Call] = []
+        load_calls: list[ast.Call] = []
+        provider_variables: set[str] = set()
+        for statement in branch.body:
+            for candidate in ast.walk(statement):
+                if not isinstance(candidate, ast.Call):
+                    continue
+                name = _call_name(candidate)
+                if name in provider_names:
+                    provider_calls.append(candidate)
+                if name in load_names:
+                    load_calls.append(candidate)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value = statement.value
+                if isinstance(value, ast.Call) and _call_name(value) in provider_names:
+                    targets = (
+                        statement.targets
+                        if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                    provider_variables.update(
+                        target.id
+                        for target in targets
+                        if isinstance(target, ast.Name)
+                    )
+        valid_providers = {
+            call.lineno
+            for call in provider_calls
+            if any(
+                keyword.arg == "environ"
+                and _is_os_environ(keyword.value, os_module_names)
+                for keyword in call.keywords
+            )
+            and any(
+                keyword.arg == "encryption"
+                and isinstance(keyword.value, ast.Attribute)
+                and isinstance(keyword.value.value, ast.Name)
+                and keyword.value.value.id == "config"
+                and keyword.value.attr == "encryption"
+                for keyword in call.keywords
+            )
+        }
+        if len(valid_providers) != len(provider_calls) or not provider_calls:
+            continue
+        valid_loads: list[ast.Call] = []
+        for call in load_calls:
+            role = _literal_string(call.args[0] if call.args else None)
+            allow = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "allow_environment"
+                ),
+                None,
+            )
+            provider_arg = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "provider"
+                ),
+                None,
+            )
+            provider_proven = (
+                isinstance(provider_arg, ast.Name)
+                and provider_arg.id in provider_variables
+            ) or (
+                isinstance(provider_arg, ast.Call)
+                and provider_arg.lineno in valid_providers
+            )
+            if (
+                role == expected_role
+                and isinstance(allow, ast.Constant)
+                and allow.value is True
+                and provider_proven
+            ):
+                valid_loads.append(call)
+        if (
+            not valid_loads
+            or len(valid_loads) != len(load_calls)
+        ):
+            continue
+        allowed.update(valid_providers)
+        allowed.update(call.lineno for call in valid_loads)
+        for provider_call in provider_calls:
+            for candidate in ast.walk(provider_call):
+                if hasattr(candidate, "lineno"):
+                    allowed.add(candidate.lineno)
+    return allowed
+
+
+def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
+    registered, registry_finding = _registered_environment_names(root)
+    findings = [registry_finding] if registry_finding is not None else []
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        if relative == "src/trading_assistant/security/secrets.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        except (OSError, SyntaxError):
+            continue
+        provider_names = {"EnvironmentSecretProvider"}
+        load_names = {"load_role_secrets"}
+        os_module_names = {"os"}
+        getenv_names: set[str] = set()
+        environ_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    if imported.name == "os":
+                        os_module_names.add(imported.asname or "os")
+            elif isinstance(node, ast.ImportFrom):
+                for imported in node.names:
+                    local = imported.asname or imported.name
+                    if imported.name == "EnvironmentSecretProvider":
+                        provider_names.add(local)
+                    elif imported.name == "load_role_secrets":
+                        load_names.add(local)
+                    elif node.module == "os" and imported.name == "getenv":
+                        getenv_names.add(local)
+                    elif node.module == "os" and imported.name == "environ":
+                        environ_names.add(local)
+
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                names = {
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                }
+                if not names:
+                    continue
+                value = node.value
+                if isinstance(value, ast.Name) and value.id in provider_names:
+                    before = len(provider_names)
+                    provider_names.update(names)
+                    changed = changed or len(provider_names) != before
+                if isinstance(value, ast.Name) and value.id in getenv_names:
+                    before = len(getenv_names)
+                    getenv_names.update(names)
+                    changed = changed or len(getenv_names) != before
+                if isinstance(value, ast.Name) and value.id in environ_names:
+                    before = len(environ_names)
+                    environ_names.update(names)
+                    changed = changed or len(environ_names) != before
+                if _is_os_environ(value, os_module_names):
+                    before = len(environ_names)
+                    environ_names.update(names)
+                    changed = changed or len(environ_names) != before
+                if (
+                    isinstance(value, ast.Attribute)
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id in os_module_names
+                    and value.attr == "getenv"
+                ):
+                    before = len(getenv_names)
+                    getenv_names.update(names)
+                    changed = changed or len(getenv_names) != before
+
+        allowed_lines = _allowed_environment_branch_lines(
+            tree,
+            relative,
+            provider_names,
+            load_names,
+            os_module_names,
+        )
+        for node in ast.walk(tree):
+            if not hasattr(node, "lineno") or node.lineno in allowed_lines:
+                continue
+            if isinstance(node, ast.Call):
+                name = _call_name(node)
+                if name in provider_names:
+                    findings.append(
+                        _finding(
+                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                    continue
+                dynamic_import = name in {"import_module", "__import__"} and (
+                    not node.args
+                    or _literal_string(node.args[0]) is None
+                )
+                if dynamic_import:
+                    findings.append(
+                        _finding(
+                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                    continue
+                is_getenv = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in getenv_names
+                ) or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in os_module_names
+                    and node.func.attr == "getenv"
+                ) or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and (
+                        _is_os_environ(node.func.value)
+                        or _is_os_environ(
+                            node.func.value,
+                            os_module_names,
+                        )
+                        or isinstance(node.func.value, ast.Name)
+                        and node.func.value.id in environ_names
+                    )
+                )
+                if is_getenv:
+                    key = _literal_string(node.args[0] if node.args else None)
+                    if key is None or key.upper() in registered:
+                        findings.append(
+                            _finding(
+                                "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                ):
+                    attribute = _literal_string(node.args[1])
+                    receiver = node.args[0]
+                    receiver_is_os = (
+                        isinstance(receiver, ast.Name)
+                        and receiver.id in os_module_names
+                    )
+                    if attribute == "EnvironmentSecretProvider" or (
+                        attribute in {"environ", "getenv"}
+                        and receiver_is_os
+                    ):
+                        findings.append(
+                            _finding(
+                                "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                    elif attribute is None and receiver_is_os:
+                        findings.append(
+                            _finding(
+                                "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+            elif isinstance(node, ast.Subscript):
+                value = node.value
+                is_environ = _is_os_environ(
+                    value,
+                    os_module_names,
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in environ_names
+                )
+                if is_environ:
+                    key = _literal_string(node.slice)
+                    if key is None or key.upper() in registered:
+                        findings.append(
+                            _finding(
+                                "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+    return findings
+
+
+def _root_sensitive_registry(
+    root: Path,
+) -> tuple[
+    dict[str, frozenset[str]],
+    ReleaseViolation | None,
+]:
+    relative = "src/trading_assistant/security/sensitive_fields.py"
+    path = root / relative
+    if not path.exists():
+        return {}, _finding("SENSITIVE_REGISTRY_INVALID", relative, 1)
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return {}, _finding("SENSITIVE_REGISTRY_INVALID", relative, 1)
+    registry = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "SENSITIVE_FIELDS"
+                for target in (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+            )
+        ),
+        None,
+    )
+    if registry is None or not isinstance(registry.value, ast.Dict):
+        return (
+            {},
+            _finding(
+                "SENSITIVE_REGISTRY_INVALID",
+                relative,
+                getattr(registry, "lineno", 1),
+            ),
+        )
+    parsed: dict[str, frozenset[str]] = {}
+    for key, value in zip(registry.value.keys, registry.value.values, strict=True):
+        if (
+            not isinstance(key, ast.Constant)
+            or not isinstance(key.value, str)
+            or not key.value
+            or not isinstance(value, (ast.Set, ast.Tuple, ast.List))
+        ):
+            return (
+                {},
+                _finding(
+                    "SENSITIVE_REGISTRY_INVALID",
+                    relative,
+                    getattr(key, "lineno", registry.lineno),
+                ),
+            )
+        fields: set[str] = set()
+        for element in value.elts:
+            if (
+                not isinstance(element, ast.Constant)
+                or not isinstance(element.value, str)
+                or not element.value
+            ):
+                return (
+                    {},
+                    _finding(
+                        "SENSITIVE_REGISTRY_INVALID",
+                        relative,
+                        getattr(element, "lineno", registry.lineno),
+                    ),
+                )
+            fields.add(element.value)
+        if not fields or key.value in parsed:
+            return (
+                {},
+                _finding(
+                    "SENSITIVE_REGISTRY_INVALID",
+                    relative,
+                    key.lineno,
+                ),
+            )
+        parsed[key.value] = frozenset(fields)
+    if not parsed:
+        return (
+            {},
+            _finding(
+                "SENSITIVE_REGISTRY_INVALID",
+                relative,
+                registry.lineno,
+            ),
+        )
+    return parsed, None
+
+
+def _root_model_fields(
+    root: Path,
+    table_fields: dict[str, frozenset[str]],
+) -> tuple[
+    dict[str, tuple[str, frozenset[str]]],
+    ReleaseViolation | None,
+]:
+    relative = "src/trading_assistant/db/models.py"
+    path = root / relative
+    if not path.exists():
+        if table_fields:
+            return {}, _finding("SENSITIVE_REGISTRY_INVALID", relative, 1)
+        return {}, None
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return {}, _finding("SENSITIVE_REGISTRY_INVALID", relative, 1)
+    models: dict[str, tuple[str, frozenset[str]]] = {}
+    seen_tables: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        table_name: str | None = None
+        for statement in node.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if not any(
+                isinstance(target, ast.Name)
+                and target.id == "__tablename__"
+                for target in targets
+            ):
+                continue
+            table_name = _literal_string(statement.value)
+        if table_name in table_fields:
+            models[node.name] = (table_name, table_fields[table_name])
+            seen_tables.add(table_name)
+    if set(table_fields) != seen_tables:
+        return {}, _finding("SENSITIVE_REGISTRY_INVALID", relative, 1)
+    return models, None
+
+
+def _scan_root_sensitive_writes(root: Path) -> list[ReleaseViolation]:
+    table_fields, registry_finding = _root_sensitive_registry(root)
+    if registry_finding is not None:
+        return [registry_finding]
+    if not table_fields:
+        return []
+    model_fields, model_finding = _root_model_fields(root, table_fields)
+    if model_finding is not None:
+        return [model_finding]
+    scanner_path = (
+        DEFAULT_ROOT
+        / "src"
+        / "trading_assistant"
+        / "security"
+        / "sensitive_write_scan.py"
+    )
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_release_sensitive_write_scan",
+            scanner_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError
+        scanner_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner_module)
+        scan_sensitive_writes = scanner_module.scan_sensitive_writes
+    except Exception:
+        return [
+            _finding(
+                "SENSITIVE_REGISTRY_INVALID",
+                "src/trading_assistant/security/sensitive_fields.py",
+                1,
+            )
+        ]
+    source_root = root / "src" / "trading_assistant"
+    allowed = {
+        source_root / "security" / "sensitive_fields.py",
+        source_root / "ops" / "encrypt_sensitive.py",
+    }
+    findings: list[ReleaseViolation] = []
+    for path in sorted(source_root.rglob("*.py")):
+        if path in allowed:
+            continue
+        try:
+            offenders = scan_sensitive_writes(
+                [path],
+                model_fields=model_fields,
+                table_fields=table_fields,
+            )
+        except (OSError, SyntaxError, TypeError, ValueError):
+            findings.append(
+                _finding(
+                    "SENSITIVE_REGISTRY_INVALID",
+                    path.relative_to(root).as_posix(),
+                    1,
+                )
+            )
+            continue
+        if not offenders:
+            continue
+        lines: set[int] = set()
+        for offender in offenders:
+            pieces = offender.rsplit(":", 2)
+            try:
+                line = int(pieces[-2])
+            except (IndexError, ValueError):
+                line = 1
+            lines.add(max(1, line))
+        relative = path.relative_to(root).as_posix()
+        findings.extend(
+            _finding("PLAINTEXT_SENSITIVE_WRITE", relative, line)
+            for line in sorted(lines)
+        )
+    return findings
+
+
+_CHAT_TOOL_ALLOWLIST = frozenset(
+    {
+        "get_market_data",
+        "get_account_summary",
+        "get_open_orders",
+        "get_order_status",
+        "list_rules",
+        "draft_order_candidate",
+        "draft_rule_candidate",
+    }
+)
+_CHAT_READ_METHODS = frozenset(
+    {
+        "get_market_data",
+        "get_account_summary",
+        "get_open_orders",
+        "get_order_status",
+        "list_rules",
+    }
+)
+_CHAT_DRAFT_METHODS = frozenset({"draft_order", "draft_rule"})
+_MUTATION_TOOL_TOKENS = frozenset(
+    {
+        "add",
+        "approve",
+        "cancel",
+        "commit",
+        "create",
+        "delete",
+        "execute",
+        "flush",
+        "notify",
+        "panic",
+        "persist",
+        "queue",
+        "reconcile",
+        "reject",
+        "release",
+        "reset",
+        "send",
+        "submit",
+        "sync",
+        "trip",
+        "update",
+        "write",
+    }
+)
+
+
+def _mutable_tool_name(name: str) -> bool:
+    parts = {
+        part
+        for part in re.split(r"[^a-z0-9]+", name.lower())
+        if part
+    }
+    return bool(parts.intersection(_MUTATION_TOOL_TOKENS))
+
+
+def _class_method(
+    tree: ast.Module,
+    class_name: str,
+    method_name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    cls = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == class_name
+        ),
+        None,
+    )
+    if cls is None:
+        return None
+    return next(
+        (
+            node
+            for node in cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        ),
+        None,
+    )
+
+
+def _attribute_path(node: ast.AST | None) -> tuple[str, ...]:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return tuple(reversed(parts))
+
+
+def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
+    relative = "src/trading_assistant/app/agent.py"
+    path = root / relative
+    if not path.exists():
+        return [_finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return [_finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)]
+    findings: list[ReleaseViolation] = []
+    registry = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "READ_ONLY_TOOL_SPECS"
+                for target in (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+            )
+        ),
+        None,
+    )
+    spec_names: list[str] = []
+    if registry is None or not isinstance(registry.value, ast.Tuple):
+        findings.append(
+            _finding(
+                "CHAT_TOOL_REGISTRY_UNPROVEN",
+                relative,
+                getattr(registry, "lineno", 1),
+            )
+        )
+    else:
+        for element in registry.value.elts:
+            if not isinstance(element, ast.Dict):
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        getattr(element, "lineno", registry.lineno),
+                    )
+                )
+                continue
+            name: str | None = None
+            for key, value in zip(element.keys, element.values, strict=True):
+                if _literal_string(key) == "name":
+                    name = _literal_string(value)
+            if name is None:
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        element.lineno,
+                    )
+                )
+            else:
+                spec_names.append(name)
+                if name not in _CHAT_TOOL_ALLOWLIST or _mutable_tool_name(name):
+                    findings.append(
+                        _finding("MUTABLE_CHAT_TOOL", relative, element.lineno)
+                    )
+        if (
+            frozenset(spec_names) != _CHAT_TOOL_ALLOWLIST
+            or len(spec_names) != len(_CHAT_TOOL_ALLOWLIST)
+        ):
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    registry.lineno,
+                )
+            )
+
+    dispatch = _class_method(tree, "ToolRouter", "dispatch")
+    draft = _class_method(tree, "ToolRouter", "_draft")
+    if dispatch is None or draft is None:
+        findings.append(
+            _finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)
+        )
+    else:
+        table_assignment = next(
+            (
+                node
+                for node in ast.walk(dispatch)
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "table"
+                    for target in (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                )
+            ),
+            None,
+        )
+        dispatch_names: list[str] = []
+        if table_assignment is None or not isinstance(
+            table_assignment.value, ast.Dict
+        ):
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    getattr(table_assignment, "lineno", dispatch.lineno),
+                )
+            )
+        else:
+            alias_methods: dict[str, str] = {}
+            for node in ast.walk(dispatch):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                if not isinstance(value, ast.Attribute):
+                    continue
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        alias_methods[target.id] = value.attr
+            for key, value in zip(
+                table_assignment.value.keys,
+                table_assignment.value.values,
+                strict=True,
+            ):
+                name = _literal_string(key)
+                if name is None:
+                    findings.append(
+                        _finding(
+                            "CHAT_TOOL_REGISTRY_UNPROVEN",
+                            relative,
+                            getattr(key, "lineno", table_assignment.lineno),
+                        )
+                    )
+                    continue
+                dispatch_names.append(name)
+                if name not in _CHAT_TOOL_ALLOWLIST:
+                    findings.append(
+                        _finding(
+                            "MUTABLE_CHAT_TOOL",
+                            relative,
+                            getattr(key, "lineno", table_assignment.lineno),
+                        )
+                    )
+                if not isinstance(value, ast.Lambda):
+                    findings.append(
+                        _finding(
+                            "CHAT_TOOL_REGISTRY_UNPROVEN",
+                            relative,
+                            getattr(value, "lineno", table_assignment.lineno),
+                        )
+                    )
+                    continue
+                for call in (
+                    node
+                    for node in ast.walk(value.body)
+                    if isinstance(node, ast.Call)
+                ):
+                    if (
+                        isinstance(call.func, ast.Name)
+                        and call.func.id == "getattr"
+                    ):
+                        findings.append(
+                            _finding(
+                                "CHAT_TOOL_REGISTRY_UNPROVEN",
+                                relative,
+                                call.lineno,
+                            )
+                        )
+                        continue
+                    called = (
+                        call.func.attr
+                        if isinstance(call.func, ast.Attribute)
+                        else alias_methods.get(call.func.id)
+                        if isinstance(call.func, ast.Name)
+                        else None
+                    )
+                    call_path = (
+                        _attribute_path(call.func)
+                        if isinstance(call.func, ast.Attribute)
+                        else ()
+                    )
+                    if called is None:
+                        findings.append(
+                            _finding(
+                                "CHAT_TOOL_REGISTRY_UNPROVEN",
+                                relative,
+                                call.lineno,
+                            )
+                        )
+                    elif (
+                        called not in _CHAT_READ_METHODS
+                        and called not in _CHAT_DRAFT_METHODS
+                        and called != "_draft"
+                    ):
+                        findings.append(
+                            _finding(
+                                "MUTABLE_CHAT_TOOL"
+                                if _mutable_tool_name(called)
+                                else "CHAT_TOOL_REGISTRY_UNPROVEN",
+                                relative,
+                                call.lineno,
+                            )
+                        )
+                    elif (
+                        name in _CHAT_READ_METHODS
+                        and call_path != ("s", name)
+                    ) or (
+                        name
+                        in {
+                            "draft_order_candidate",
+                            "draft_rule_candidate",
+                        }
+                        and call_path != ("self", "_draft")
+                    ):
+                        findings.append(
+                            _finding(
+                                "CHAT_TOOL_REGISTRY_UNPROVEN",
+                                relative,
+                                call.lineno,
+                            )
+                        )
+            if (
+                frozenset(dispatch_names) != _CHAT_TOOL_ALLOWLIST
+                or len(dispatch_names) != len(_CHAT_TOOL_ALLOWLIST)
+            ):
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        table_assignment.lineno,
+                    )
+                )
+
+        for function in (dispatch, draft):
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"getattr", "__import__"}
+                ):
+                    findings.append(
+                        _finding(
+                            "CHAT_TOOL_REGISTRY_UNPROVEN",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    findings.append(
+                        _finding(
+                            "CHAT_TOOL_REGISTRY_UNPROVEN",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+        approved_draft_constructors: set[str] = set()
+        for call in (
+            node
+            for node in ast.walk(draft)
+            if isinstance(node, ast.Call)
+        ):
+            called = (
+                call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else ""
+            )
+            call_path = (
+                _attribute_path(call.func)
+                if isinstance(call.func, ast.Attribute)
+                else ()
+            )
+            if call_path in {
+                ("self", "candidate_drafts", "draft_order"),
+                ("self", "candidate_drafts", "draft_rule"),
+            }:
+                approved_draft_constructors.add(call_path[-1])
+                continue
+            if call_path == ("envelope", "model_dump") or (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "CandidateError"
+            ):
+                continue
+            findings.append(
+                _finding(
+                    "MUTABLE_CHAT_TOOL"
+                    if called and _mutable_tool_name(called)
+                    else "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    call.lineno,
+                )
+            )
+        if approved_draft_constructors != _CHAT_DRAFT_METHODS:
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    draft.lineno,
+                )
+            )
+        for assignment in (
+            node
+            for node in ast.walk(draft)
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        ):
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            if any(
+                isinstance(target, (ast.Attribute, ast.Subscript))
+                for target in targets
+            ):
+                findings.append(
+                    _finding(
+                        "MUTABLE_CHAT_TOOL",
+                        relative,
+                        assignment.lineno,
+                    )
+                )
+
+    chat = _class_method(tree, "Agent", "chat")
+    if chat is None:
+        findings.append(
+            _finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)
+        )
+    else:
+        backend_calls = [
+            node
+            for node in ast.walk(chat)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "create"
+        ]
+        if not backend_calls:
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    chat.lineno,
+                )
+            )
+        for call in backend_calls:
+            tools = next(
+                (
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "tools"
+                ),
+                None,
+            )
+            if not (
+                isinstance(tools, ast.Name)
+                and tools.id == "READ_ONLY_TOOL_SPECS"
+            ):
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        call.lineno,
+                    )
+                )
+        if not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dispatch"
+            for node in ast.walk(chat)
+        ):
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    chat.lineno,
+                )
+            )
+
+    reachable = [
+        function
+        for function in (dispatch, draft, chat)
+        if function is not None
+    ]
+    for function in reachable:
+        aliases: dict[str, str] = {}
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            if not isinstance(node.value, ast.Attribute):
+                continue
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = node.value.attr
+        for call in (
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+        ):
+            called = (
+                call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else aliases.get(call.func.id)
+                if isinstance(call.func, ast.Name)
+                else None
+            )
+            if called is None or not _mutable_tool_name(called):
+                continue
+            path_parts = (
+                _attribute_path(call.func)
+                if isinstance(call.func, ast.Attribute)
+                else ()
+            )
+            approved_backend_create = (
+                called == "create"
+                and path_parts == ("self", "backend", "create")
+            )
+            approved_draft = (
+                function is draft
+                and called in _CHAT_DRAFT_METHODS
+            )
+            if not approved_backend_create and not approved_draft:
+                findings.append(
+                    _finding("MUTABLE_CHAT_TOOL", relative, call.lineno)
+                )
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "__import__"
+        ) or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+        ):
+            findings.append(
+                _finding(
+                    "CHAT_TOOL_REGISTRY_UNPROVEN",
+                    relative,
+                    node.lineno,
+                )
+            )
+    return findings
+
+
+_LEGACY_RELEASE_CHECKS = (
+    (
+        _check_config,
+        "CONFIG_DEFAULT_UNSAFE",
+        "config.yaml",
+    ),
+    (
+        _check_no_runtime_create_all,
+        "RUNTIME_SCHEMA_MUTATION",
+        "src/trading_assistant",
+    ),
+    (
+        _check_submission_paths,
+        "BROKER_SUBMISSION_PATH_UNAPPROVED",
+        "src/trading_assistant",
+    ),
+    (
+        _check_no_raw_broker_escape,
+        "RAW_BROKER_ESCAPE",
+        "src/trading_assistant",
+    ),
+    (
+        _check_browser_sources,
+        "UNSAFE_BROWSER_SOURCE",
+        "src/trading_assistant/app/static",
+    ),
+    (
+        _check_no_unofficial_robinhood_dependency,
+        "UNOFFICIAL_BROKER_DEPENDENCY",
+        "pyproject.toml",
+    ),
+    (
+        _check_llm_escape_paths,
+        "LLM_CONSTRUCTION_UNPROVEN",
+        "src/trading_assistant/llm",
+    ),
+    (
+        _check_llm_construction_paths,
+        "LLM_CONSTRUCTION_UNPROVEN",
+        "src/trading_assistant/llm",
+    ),
+    (
+        _check_no_deleted_rate_limiter_import,
+        "DELETED_RATE_LIMITER_REFERENCE",
+        "src/trading_assistant/app",
+    ),
+    (
+        _check_encrypted_operational_backup_surface,
+        "PLAINTEXT_BACKUP_SURFACE",
+        "src/trading_assistant/ops/backup.py",
+    ),
+)
+
+_STRUCTURED_RELEASE_SCANNERS = (
+    (
+        _scan_effective_route_graph,
+        "ROUTE_REGISTRATION_UNPROVEN",
+        "src/trading_assistant/app/main.py",
+    ),
+    (
+        _scan_chat_tool_boundary,
+        "CHAT_TOOL_REGISTRY_UNPROVEN",
+        "src/trading_assistant/app/agent.py",
+    ),
+    (
+        _scan_root_sensitive_writes,
+        "SENSITIVE_REGISTRY_INVALID",
+        "src/trading_assistant/security/sensitive_fields.py",
+    ),
+    (
+        _scan_environment_secret_sources,
+        "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+        "src/trading_assistant/security/secrets.py",
+    ),
+    (
+        _scan_outbound_clients,
+        "OUTBOUND_CLIENT_UNAPPROVED",
+        "src/trading_assistant/security/outbound.py",
+    ),
+    (
+        _scan_transport_and_integrations,
+        "CONFIG_UNPROVEN",
+        "config.yaml",
+    ),
+    (
+        _scan_tracked_artifacts,
+        "GIT_TREE_UNPROVEN",
+        ".",
+    ),
+)
+
+
+def _collect_release_violations(root: Path) -> list[ReleaseViolation]:
+    findings: list[ReleaseViolation] = []
+    for check, code, relative in _LEGACY_RELEASE_CHECKS:
+        try:
+            check(root)
+        except Exception:
+            findings.append(_finding(code, relative, 1))
+    for scan, code, relative in _STRUCTURED_RELEASE_SCANNERS:
+        try:
+            findings.extend(scan(root))
+        except Exception:
+            findings.append(_finding(code, relative, 1))
+    return sorted(set(findings))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     args = parser.parse_args(argv)
     root = args.root.resolve()
-    checks = (
-        _check_config,
-        _check_no_runtime_create_all,
-        _check_submission_paths,
-        _check_no_raw_broker_escape,
-        _check_browser_sources,
-        _check_no_unofficial_robinhood_dependency,
-        _check_route_policy_inventory,
-        _check_llm_escape_paths,
-        _check_llm_construction_paths,
-        _check_no_deleted_rate_limiter_import,
-        _check_sensitive_field_writes,
-        _check_encrypted_operational_backup_surface,
-        _check_no_tracked_secret_files,
-    )
-    try:
-        for check in checks:
-            check(root)
-    except (KeyError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"release static checks: FAIL ({exc})", file=sys.stderr)
+    findings = _collect_release_violations(root)
+    if findings:
+        for finding in findings:
+            print(
+                f"{finding.code} {finding.path}:{finding.line}",
+                file=sys.stderr,
+            )
+        count = len(findings)
+        noun = "violation" if count == 1 else "violations"
+        print(
+            f"release static checks: FAIL ({count} {noun})",
+            file=sys.stderr,
+        )
         return 1
     print("release static checks: PASS")
     return 0

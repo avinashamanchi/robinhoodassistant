@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -68,10 +70,8 @@ def _static_fixture(
     *,
     policy_source: str | None = None,
 ) -> Path:
-    root = tmp_path / "fixture"
-    static = root / "src" / "trading_assistant" / "app" / "static"
-    static.mkdir(parents=True)
-    app = static.parent
+    root = _trust_fixture(tmp_path)
+    app = root / "src" / "trading_assistant" / "app"
     (app / "policy.py").write_text(
         policy_source
         or (
@@ -82,28 +82,83 @@ def _static_fixture(
         encoding="utf-8",
     )
     (app / "main.py").write_text(
-        "@app.get('/covered')\n"
-        "def covered():\n"
-        "    return None\n",
+        "from fastapi import FastAPI\n\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    @app.get('/covered')\n"
+        "    def covered():\n"
+        "        return None\n"
+        "    return app\n",
         encoding="utf-8",
     )
-    (root / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "trading": {"mode": "paper", "broker": "alpaca"},
-                "features": {
-                    "auto_execute_preapproved_rules": False,
-                },
-                "execution": {"prefer_bracket_orders": False},
-                "llm": {"fallback_provider": None},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (root / "pyproject.toml").write_text("", encoding="utf-8")
-    (root / "uv.lock").write_text("", encoding="utf-8")
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     return root
+
+
+def _write_static_mutation(
+    root: Path,
+    relative_path: str,
+    source: str,
+) -> None:
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if relative_path == "src/trading_assistant/app/main.py":
+        indented = "".join(
+            f"    {line}" if line.strip() else line
+            for line in source.splitlines(keepends=True)
+        )
+        source = (
+            "from fastapi import FastAPI\n\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            f"{indented}"
+            "    return app\n"
+        )
+    elif relative_path.startswith(
+        "src/trading_assistant/app/routers/"
+    ):
+        source = (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            f"{source}"
+        )
+        (root / "src/trading_assistant/app/main.py").write_text(
+            "from fastapi import FastAPI\n"
+            "from .routers.unsafe import router\n\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    app.include_router(router)\n"
+            "    @app.get('/covered')\n"
+            "    def covered():\n"
+            "        return None\n"
+            "    return app\n",
+            encoding="utf-8",
+        )
+    target.write_text(source, encoding="utf-8")
+
+
+def _legacy_expected_code(expected: str) -> str:
+    mappings = (
+        ("runtime create_all", "RUNTIME_SCHEMA_MUTATION"),
+        ("broker submission", "BROKER_SUBMISSION_PATH_UNAPPROVED"),
+        ("sensitive field write bypass", "PLAINTEXT_SENSITIVE_WRITE"),
+        ("inline event handler", "UNSAFE_BROWSER_SOURCE"),
+        ("raw broker escape", "RAW_BROKER_ESCAPE"),
+        ("plaintext operational backup", "PLAINTEXT_BACKUP_SURFACE"),
+        ("route ", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("route mount", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("imperative HTTP", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("websocket route", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("unresolved route", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("conflicting route", "ROUTE_REGISTRATION_UNPROVEN"),
+        ("raw LLM", "LLM_CONSTRUCTION_UNPROVEN"),
+        ("direct LLM", "LLM_CONSTRUCTION_UNPROVEN"),
+        ("unproven wildcard", "LLM_CONSTRUCTION_UNPROVEN"),
+        ("deleted RateLimiter", "DELETED_RATE_LIMITER_REFERENCE"),
+    )
+    for marker, code in mappings:
+        if marker in expected:
+            return code
+    raise AssertionError(f"legacy expectation has no stable code: {expected}")
 
 
 @pytest.mark.parametrize(
@@ -149,9 +204,7 @@ def test_release_static_gate_rejects_negative_fixtures(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -166,7 +219,7 @@ def test_release_static_gate_rejects_negative_fixtures(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -241,9 +294,7 @@ def test_release_static_gate_rejects_task6_review_bypasses(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -258,7 +309,7 @@ def test_release_static_gate_rejects_task6_review_bypasses(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -320,9 +371,7 @@ def test_release_static_gate_rejects_final_review_escape_paths(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -337,7 +386,7 @@ def test_release_static_gate_rejects_final_review_escape_paths(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -396,9 +445,7 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -413,7 +460,7 @@ def test_release_static_gate_rejects_policy_omission_fixtures(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -518,9 +565,7 @@ def test_release_static_gate_rejects_fix_round_one_bypasses(
     policy_source,
 ):
     root = _static_fixture(tmp_path, policy_source=policy_source)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -535,7 +580,7 @@ def test_release_static_gate_rejects_fix_round_one_bypasses(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -579,9 +624,7 @@ def test_release_static_gate_rejects_fix_round_two_bypasses(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -596,7 +639,7 @@ def test_release_static_gate_rejects_fix_round_two_bypasses(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -638,7 +681,7 @@ def test_release_static_gate_rejects_parent_provider_module_imports(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -667,9 +710,7 @@ def test_release_static_gate_rejects_sibling_relative_provider_imports(
     expected,
 ):
     root = _static_fixture(tmp_path)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source, encoding="utf-8")
+    _write_static_mutation(root, relative_path, source)
 
     completed = subprocess.run(
         [
@@ -684,7 +725,7 @@ def test_release_static_gate_rejects_sibling_relative_provider_imports(
     )
 
     assert completed.returncode == 1
-    assert expected in completed.stderr
+    assert _legacy_expected_code(expected) in completed.stderr
 
 
 @pytest.mark.parametrize("route_path", ("/covered/", "//covered"))
@@ -698,11 +739,12 @@ def test_release_static_gate_accepts_exact_noncanonical_route_paths(
         ")\n"
     )
     root = _static_fixture(tmp_path, policy_source=policy_source)
-    (root / "src" / "trading_assistant" / "app" / "main.py").write_text(
+    _write_static_mutation(
+        root,
+        "src/trading_assistant/app/main.py",
         f"@app.get('{route_path}')\n"
         "def covered():\n"
         "    return None\n",
-        encoding="utf-8",
     )
 
     completed = subprocess.run(
@@ -722,13 +764,14 @@ def test_release_static_gate_accepts_exact_noncanonical_route_paths(
 
 def test_release_static_gate_rejects_conflicting_route_aliases(tmp_path):
     root = _static_fixture(tmp_path)
-    (root / "src" / "trading_assistant" / "app" / "main.py").write_text(
+    _write_static_mutation(
+        root,
+        "src/trading_assistant/app/main.py",
         "expose = app.post\n"
         "expose = app.get\n\n"
         "@expose('/covered')\n"
         "def covered():\n"
         "    return None\n",
-        encoding="utf-8",
     )
 
     try:
@@ -748,10 +791,7 @@ def test_release_static_gate_rejects_conflicting_route_aliases(tmp_path):
         pytest.fail(f"checker did not terminate: {exc}")
 
     assert completed.returncode == 1
-    assert (
-        "conflicting route decorator alias: "
-        "src/trading_assistant/app/main.py:2"
-    ) in completed.stderr
+    assert "ROUTE_REGISTRATION_UNPROVEN" in completed.stderr
 
 
 def test_release_static_gate_ignores_backend_and_rate_limiter_text(tmp_path):
@@ -776,3 +816,1399 @@ def test_release_static_gate_ignores_backend_and_rate_limiter_text(tmp_path):
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+# ── Task 11 trust-boundary release gate ────────────────────────────────
+
+_READ_TOOLS = (
+    "get_market_data",
+    "get_account_summary",
+    "get_open_orders",
+    "get_order_status",
+    "list_rules",
+)
+_DRAFT_TOOLS = (
+    "draft_order_candidate",
+    "draft_rule_candidate",
+)
+
+
+def _write_fixture_file(root: Path, relative: str, source: str) -> Path:
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+    return target
+
+
+def _agent_fixture_source() -> str:
+    specs = ",\n".join(
+        f"    {{'name': {name!r}, 'input_schema': {{'type': 'object'}}}}"
+        for name in (*_READ_TOOLS, *_DRAFT_TOOLS)
+    )
+    dispatch = ",\n".join(
+        (
+            f"            {name!r}: lambda: s.{name}()"
+            if name in _READ_TOOLS
+            else (
+                "            'draft_order_candidate': "
+                "lambda: self._draft('order', tool_input)"
+                if name == "draft_order_candidate"
+                else
+                "            'draft_rule_candidate': "
+                "lambda: self._draft('rule', tool_input)"
+            )
+        )
+        for name in (*_READ_TOOLS, *_DRAFT_TOOLS)
+    )
+    return (
+        "READ_ONLY_TOOL_SPECS = (\n"
+        f"{specs},\n"
+        ")\n\n"
+        "class ToolRouter:\n"
+        "    def dispatch(self, name, tool_input):\n"
+        "        s = self.service\n"
+        "        table = {\n"
+        f"{dispatch},\n"
+        "        }\n"
+        "        return table[name]()\n\n"
+        "    def _draft(self, kind, tool_input):\n"
+        "        if kind == 'order':\n"
+        "            return self.candidate_drafts.draft_order(tool_input)\n"
+        "        return self.candidate_drafts.draft_rule(tool_input)\n\n"
+        "class Agent:\n"
+        "    def chat(self):\n"
+        "        self.backend.create(tools=READ_ONLY_TOOL_SPECS)\n"
+        "        return self.router.dispatch('get_account_summary', {})\n"
+    )
+
+
+def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
+    """Build one self-contained clean root for Task 11 static analysis."""
+    root = tmp_path / "trust-root"
+    _write_fixture_file(
+        root,
+        "config.yaml",
+        yaml.safe_dump(
+            {
+                "server": {
+                    "bind_host": "127.0.0.1",
+                    "port": 8020,
+                    "origin": "https://localhost:8020",
+                    "allowed_hosts": ["localhost", "127.0.0.1", "::1"],
+                    "tls_cert_path": ".local/tls/localhost.pem",
+                    "tls_key_path": ".local/tls/localhost-key.pem",
+                    "secure_cookies": True,
+                },
+                "provider_origins": {
+                    "alpaca_trading": "https://paper-api.alpaca.markets",
+                    "alpaca_data": "https://data.alpaca.markets",
+                    "alpaca_stream": "wss://stream.data.alpaca.markets",
+                    "anthropic": "https://api.anthropic.com",
+                    "gemini": "https://generativelanguage.googleapis.com",
+                    "groq": "https://api.groq.com",
+                    "telegram": "https://api.telegram.org",
+                    "coingecko": "https://api.coingecko.com",
+                },
+                "integrations": {
+                    "webhooks_enabled": False,
+                    "composio_enabled": False,
+                },
+                "trading": {"mode": "paper", "broker": "alpaca"},
+                "features": {
+                    "auto_execute_preapproved_rules": False,
+                    "telegram_notifications": False,
+                },
+                "execution": {"prefer_bracket_orders": False},
+                "llm": {
+                    "provider": "anthropic",
+                    "fallback_provider": None,
+                },
+            },
+            sort_keys=False,
+        ),
+    )
+    _write_fixture_file(root, "pyproject.toml", "")
+    _write_fixture_file(root, "uv.lock", "")
+    _write_fixture_file(
+        root,
+        ".env.example",
+        "# Migration-only names; normal runtime uses macOS Keychain.\n"
+        "ANTHROPIC_API_KEY=\nALPACA_API_KEY=\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/main.py",
+        "from fastapi import FastAPI\n"
+        "from .routers.safe import router as safe_router\n\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    app.include_router(safe_router)\n"
+        "    return app\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/routers/safe.py",
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/v1')\n\n"
+        "@router.get('/covered')\n"
+        "def covered():\n"
+        "    return None\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/policy.py",
+        "ROUTE_POLICIES = (\n"
+        "    RoutePolicy('GET', '/v1/covered', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/agent.py",
+        _agent_fixture_source(),
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/config.py",
+        "from typing import Literal\n\n"
+        "class IntegrationsConfig:\n"
+        "    webhooks_enabled: Literal[False] = False\n"
+        "    composio_enabled: Literal[False] = False\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/secrets.py",
+        "_SIMPLE_SECRET_FIELDS = (\n"
+        "    'anthropic_api_key',\n"
+        "    'alpaca_api_key',\n"
+        "    'alpaca_secret_key',\n"
+        "    'database_url',\n"
+        ")\n\n"
+        "class EnvironmentSecretProvider:\n"
+        "    def __init__(self, *, environ, encryption):\n"
+        "        self.environ = environ\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/sensitive_fields.py",
+        "SENSITIVE_FIELDS = {\n"
+        "    'audit_events': {'reason', 'detail_json'},\n"
+        "}\n\n"
+        "def sensitive_store(session, factory):\n"
+        "    return object()\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/db/models.py",
+        "class AuditEvent:\n"
+        "    __tablename__ = 'audit_events'\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/outbound.py",
+        "OUTBOUND_ORIGIN_MANIFEST = (\n"
+        "    OutboundOriginRule('alpaca_trading', 'alpaca.trading', "
+        "'https://paper-api.alpaca.markets', frozenset({'app', 'daemon', "
+        "'mcp', 'paper-drill', 'preflight', 'safety-drill', 'watchdog'})),\n"
+        "    OutboundOriginRule('alpaca_data', 'alpaca.historical', "
+        "'https://data.alpaca.markets', frozenset({'app', 'daemon', "
+        "'paper-drill', 'preflight', 'safety-drill', "
+        "'validate-analyst'})),\n"
+        "    OutboundOriginRule('alpaca_stream', 'alpaca.stream', "
+        "'wss://stream.data.alpaca.markets', frozenset({'daemon'}), "
+        "'daemon.use_websocket'),\n"
+        "    OutboundOriginRule('anthropic', 'llm.anthropic', "
+        "'https://api.anthropic.com', frozenset({'app', 'daemon', "
+        "'preflight', 'validate-analyst'}), 'llm.provider=anthropic'),\n"
+        "    OutboundOriginRule('gemini', 'llm.gemini', "
+        "'https://generativelanguage.googleapis.com', "
+        "frozenset({'app', 'daemon', 'preflight', 'validate-analyst'}), "
+        "'llm.provider=gemini'),\n"
+        "    OutboundOriginRule('groq', 'llm.groq', "
+        "'https://api.groq.com', frozenset({'app', 'daemon', "
+        "'preflight', 'validate-analyst'}), 'llm.provider=groq'),\n"
+        "    OutboundOriginRule('telegram', 'notifier.telegram', "
+        "'https://api.telegram.org', frozenset({'app', 'daemon', "
+        "'preflight', 'watchdog'}), 'features.telegram_notifications'),\n"
+        "    OutboundOriginRule('coingecko', 'marketdata.coingecko', "
+        "'https://api.coingecko.com', frozenset({'app', 'daemon'}), "
+        "'crypto_risk'),\n"
+        ")\n",
+    )
+    static = root / "src/trading_assistant/app/static"
+    static.mkdir(parents=True, exist_ok=True)
+    for surface in (
+        "README.md",
+        "docs/RUNBOOK.md",
+        "docs/ops/README.md",
+        "scripts/launchd/README.md",
+    ):
+        _write_fixture_file(
+            root,
+            surface,
+            "Composio is disabled. There is no webhook receiver. "
+            "Backups use whole-database-v1.sqlite3.aesgcm.\n",
+        )
+    if git:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    return root
+
+
+def _run_trust_gate(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_release_violation_is_strict_immutable_and_value_free():
+    spec = importlib.util.spec_from_file_location(
+        "release_gate_contract",
+        Path("scripts/check_release_safety.py"),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    finding = module.ReleaseViolation(
+        "QUERY_SECRET",
+        "src/trading_assistant/provider.py",
+        17,
+    )
+    assert (
+        finding.code,
+        finding.path,
+        finding.line,
+    ) == (
+        "QUERY_SECRET",
+        "src/trading_assistant/provider.py",
+        17,
+    )
+    with pytest.raises(FrozenInstanceError):
+        finding.line = 18
+    with pytest.raises((TypeError, ValueError)):
+        module.ReleaseViolation(
+            "QUERY_SECRET",
+            "https://provider.invalid/path?credential=fixture",
+            1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "code"),
+    [
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    expose = getattr(app, 'post')\n"
+            "    @expose('/webhook-orders')\n"
+            "    def inbound():\n"
+            "        return None\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def register(app, path):\n"
+            "    app.add_api_route(path, endpoint, methods=['GET'])\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    register(app, '/covered')\n"
+            "    register(app, '/hooks-second-call')\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "from .routers.safe import router\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    app.include_router(router, prefix='/hooks')\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    app.add_api_route('/hooks-events', endpoint, methods=['POST'])\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    app.mount('/webhook-assets', child_app)\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app(path):\n"
+            "    app = FastAPI()\n"
+            "    app.add_api_route(path, endpoint, methods=['POST'])\n"
+            "    return app\n",
+            "ROUTE_REGISTRATION_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app(method_name):\n"
+            "    app = FastAPI()\n"
+            "    expose = getattr(app, method_name)\n"
+            "    @expose('/covered')\n"
+            "    def covered():\n"
+            "        return None\n"
+            "    return app\n",
+            "ROUTE_REGISTRATION_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "import importlib\n"
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    routes = importlib.import_module(route_module)\n"
+            "    app.include_router(routes.router)\n"
+            "    return app\n",
+            "ROUTE_REGISTRATION_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "from third_party_routes import register_routes\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    register_routes(app)\n"
+            "    return app\n",
+            "ROUTE_REGISTRATION_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    app = FastAPI()\n"
+            "    app.router.add_api_route(\n"
+            "        '/hooks-router', endpoint, methods=['POST']\n"
+            "    )\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import FastAPI\n"
+            "def create_app():\n"
+            "    child = FastAPI()\n"
+            "    @child.get('/hooks-mounted')\n"
+            "    def mounted():\n"
+            "        return None\n"
+            "    app = FastAPI()\n"
+            "    app.mount('/static', child)\n"
+            "    return app\n",
+            "WEBHOOK_ROUTE_PRESENT",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "from fastapi import APIRouter, FastAPI\n"
+            "def create_app():\n"
+            "    shadow = APIRouter()\n"
+            "    @shadow.get('/covered')\n"
+            "    def covered():\n"
+            "        return None\n"
+            "    app = FastAPI()\n"
+            "    app.routes.append(shadow.routes[0])\n"
+            "    return app\n",
+            "ROUTE_REGISTRATION_UNPROVEN",
+        ),
+    ],
+)
+def test_effective_route_graph_negative_fixtures(
+    tmp_path,
+    relative_path,
+    source,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_effective_route_graph_resolves_fastapi_module_alias(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/main.py",
+        "import fastapi as framework\n"
+        "def create_app():\n"
+        "    app = framework.FastAPI()\n"
+        "    @app.get('/covered')\n"
+        "    def covered():\n"
+        "        return None\n"
+        "    return app\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/policy.py",
+        "ROUTE_POLICIES = (\n"
+        "    RoutePolicy('GET', '/covered', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_effective_route_graph_resolves_imported_nested_factories(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/factory.py",
+        "from fastapi import FastAPI\n"
+        "from .routers.outer import router\n\n"
+        "def build_app():\n"
+        "    app = FastAPI()\n"
+        "    app.include_router(router, prefix='/api')\n"
+        "    return app\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/routers/outer.py",
+        "from fastapi import APIRouter\n"
+        "from .inner import router as inner\n"
+        "router = APIRouter(prefix='/outer')\n"
+        "router.include_router(inner, prefix='/nested')\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/routers/inner.py",
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/hooks')\n"
+        "@router.get('/events')\n"
+        "def events():\n"
+        "    return None\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/main.py",
+        "from .factory import build_app\n"
+        "app = build_app()\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "WEBHOOK_ROUTE_PRESENT" in completed.stderr
+
+
+def test_effective_route_graph_detects_duplicate_effective_routes(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/main.py",
+        "from fastapi import FastAPI\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    @app.get('/same')\n"
+        "    def first():\n"
+        "        return None\n"
+        "    @app.get('/same')\n"
+        "    def second():\n"
+        "        return None\n"
+        "    return app\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/policy.py",
+        "ROUTE_POLICIES = (\n"
+        "    RoutePolicy('GET', '/same', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "DUPLICATE_EFFECTIVE_ROUTE" in completed.stderr
+
+
+def test_effective_route_graph_detects_duplicate_parameter_shapes(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/main.py",
+        "from fastapi import FastAPI\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    @app.get('/same/{first}')\n"
+        "    def first():\n"
+        "        return None\n"
+        "    @app.get('/same/{second}')\n"
+        "    def second():\n"
+        "        return None\n"
+        "    return app\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/policy.py",
+        "ROUTE_POLICIES = (\n"
+        "    RoutePolicy('GET', '/same/{first}', AuthLevel.PUBLIC, 'read'),\n"
+        "    RoutePolicy('GET', '/same/{second}', AuthLevel.PUBLIC, 'read'),\n"
+        ")\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "DUPLICATE_EFFECTIVE_ROUTE" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        (
+            _agent_fixture_source().replace(
+                "'get_account_summary': lambda: s.get_account_summary()",
+                "'get_account_summary': lambda: s.cancel_order()",
+            ),
+            "MUTABLE_CHAT_TOOL",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "s = self.service",
+                "s = self.service\n        mutate = s.approve_plan",
+            ).replace(
+                "'get_account_summary': lambda: s.get_account_summary()",
+                "'get_account_summary': lambda: mutate()",
+            ),
+            "MUTABLE_CHAT_TOOL",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "table = {",
+                "table = dict({",
+            ).replace(
+                "        }\n        return table[name]()",
+                "        })\n        return table[name]()",
+            ),
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "'get_account_summary': lambda: s.get_account_summary()",
+                "'get_account_summary': lambda: getattr(s, method_name)()",
+            ),
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            _agent_fixture_source()
+            + "\ndef dynamic_escape(name):\n"
+            "    return __import__(name)\n",
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "        return table[name]()",
+                "        s.cancel_order()\n"
+                "        return table[name]()",
+            ),
+            "MUTABLE_CHAT_TOOL",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "        self.backend.create(tools=READ_ONLY_TOOL_SPECS)",
+                "        self.router.service.approve_plan()\n"
+                "        self.backend.create(tools=READ_ONLY_TOOL_SPECS)",
+            ),
+            "MUTABLE_CHAT_TOOL",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "s.get_account_summary()",
+                "other.get_account_summary()",
+            ),
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            _agent_fixture_source().replace(
+                "self.candidate_drafts.draft_order",
+                "self.service.draft_order",
+            ),
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+    ],
+)
+def test_chat_tool_boundary_negative_fixtures(tmp_path, source, code):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/agent.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from trading_assistant.db.models import AuditEvent\n"
+        "event = AuditEvent(reason='fixture-sensitive-value')\n",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "event: AuditEvent\n"
+        "event.reason = 'fixture-sensitive-value'\n",
+        "from sqlalchemy import update\n"
+        "from trading_assistant.db.models import AuditEvent\n"
+        "statement = update(AuditEvent).values(reason='fixture-sensitive-value')\n",
+        "from trading_assistant.db.models import AuditEvent as Event\n"
+        "rows = [{'reason': 'fixture-sensitive-value'}]\n"
+        "session.bulk_update_mappings(Event, rows)\n",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "model = AuditEvent\n"
+        "session.bulk_insert_mappings(model, [{'detail_json': '{}'}])\n",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "write_model(AuditEvent, {'reason': 'fixture-sensitive-value'})\n",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "def persist_sensitive(model, values):\n"
+        "    return None\n"
+        "persist_sensitive(AuditEvent, {'reason': 'fixture-sensitive-value'})\n",
+    ],
+)
+def test_sensitive_write_negative_fixtures_are_root_local(tmp_path, source):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/plaintext_write.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
+    assert "fixture-sensitive-value" not in completed.stderr
+
+
+def test_dynamic_sensitive_registry_fails_closed(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/sensitive_fields.py",
+        "SENSITIVE_FIELDS = build_sensitive_registry()\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "code"),
+    [
+        (
+            "src/trading_assistant/app/agent.py",
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/security/sensitive_fields.py",
+            "SENSITIVE_REGISTRY_INVALID",
+        ),
+        (
+            "src/trading_assistant/security/secrets.py",
+            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+        ),
+        (
+            "src/trading_assistant/config.py",
+            "COMPOSIO_ENABLED",
+        ),
+        (
+            "docs/RUNBOOK.md",
+            "COMPOSIO_ENABLED",
+        ),
+    ],
+)
+def test_missing_trust_boundary_authority_fails_closed(
+    tmp_path,
+    relative_path,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    (root / relative_path).unlink()
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_sensitive_registry_never_imports_the_active_checkout(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/sensitive_fields.py",
+        "SENSITIVE_FIELDS = {'fixture_rows': {'secret_note'}}\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/db/models.py",
+        "class AuditEvent:\n"
+        "    __tablename__ = 'audit_events'\n\n"
+        "class FixtureRow:\n"
+        "    __tablename__ = 'fixture_rows'\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/root_isolation.py",
+        "from trading_assistant.db.models import AuditEvent, FixtureRow\n"
+        "safe = AuditEvent(reason='not-registered-in-this-root')\n"
+        "unsafe = FixtureRow(secret_note='fixture-root-only')\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    lines = [
+        line
+        for line in completed.stderr.splitlines()
+        if line.startswith("PLAINTEXT_SENSITIVE_WRITE ")
+    ]
+    assert lines == [
+        "PLAINTEXT_SENSITIVE_WRITE "
+        "src/trading_assistant/root_isolation.py:3"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        (
+            "src/trading_assistant/bootstrap.py",
+            "from trading_assistant.security.secrets import "
+            "EnvironmentSecretProvider as Provider\n"
+            "provider = Provider(environ={}, encryption=config.encryption)\n",
+        ),
+        (
+            "src/trading_assistant/daemon/main.py",
+            "import os\n"
+            "key = os.environ['ALPACA_API_KEY']\n",
+        ),
+        (
+            "src/trading_assistant/daemon/main.py",
+            "import os as operating_system\n"
+            "environment = operating_system.environ\n"
+            "key = environment['ALPACA_API_KEY']\n",
+        ),
+        (
+            "src/trading_assistant/mcp_server/server.py",
+            "from os import getenv as read_environment\n"
+            "key = read_environment('ANTHROPIC_API_KEY')\n",
+        ),
+        (
+            "src/trading_assistant/app/main.py",
+            "import importlib\n"
+            "provider = getattr(importlib.import_module(module_name), "
+            "'EnvironmentSecretProvider')\n",
+        ),
+    ],
+)
+def test_production_environment_secret_sources_fail_closed(
+    tmp_path,
+    relative_path,
+    source,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "ENVIRONMENT_SECRETS_IN_PRODUCTION" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        (
+            "src/trading_assistant/db/migrate.py",
+            "import os\n"
+            "from trading_assistant.security.secrets import (\n"
+            "    EnvironmentSecretProvider, load_role_secrets,\n"
+            ")\n"
+            "def main(args, config):\n"
+            "    if args.development_environment_secrets:\n"
+            "        provider = EnvironmentSecretProvider(\n"
+            "            environ=os.environ, encryption=config.encryption,\n"
+            "        )\n"
+            "        return load_role_secrets(\n"
+            "            'migration', config=config, provider=provider,\n"
+            "            allow_environment=True,\n"
+            "        )\n"
+            "    return load_role_secrets('migration', config=config)\n",
+        ),
+        (
+            "src/trading_assistant/ops/safety_drill.py",
+            "import os\n"
+            "from trading_assistant.security.secrets import (\n"
+            "    EnvironmentSecretProvider, load_role_secrets,\n"
+            ")\n"
+            "def main(args, config):\n"
+            "    if args.development_environment_secrets:\n"
+            "        return load_role_secrets(\n"
+            "            'safety-drill', config=config,\n"
+            "            provider=EnvironmentSecretProvider(\n"
+            "                environ=os.environ, encryption=config.encryption,\n"
+            "            ), allow_environment=True,\n"
+            "        )\n"
+            "    return load_role_secrets('safety-drill', config=config)\n",
+        ),
+    ],
+)
+def test_exact_development_environment_secret_branches_are_allowed(
+    tmp_path,
+    relative_path,
+    source,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_development_environment_branch_rejects_extra_unapproved_role(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/db/migrate.py",
+        "import os\n"
+        "from trading_assistant.security.secrets import (\n"
+        "    EnvironmentSecretProvider, load_role_secrets,\n"
+        ")\n"
+        "def main(args, config):\n"
+        "    if args.development_environment_secrets:\n"
+        "        provider = EnvironmentSecretProvider(\n"
+        "            environ=os.environ, encryption=config.encryption,\n"
+        "        )\n"
+        "        load_role_secrets(\n"
+        "            'migration', config=config, provider=provider,\n"
+        "            allow_environment=True,\n"
+        "        )\n"
+        "        return load_role_secrets(\n"
+        "            'app', config=config, provider=provider,\n"
+        "            allow_environment=True,\n"
+        "        )\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "ENVIRONMENT_SECRETS_IN_PRODUCTION" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        (
+            "config.yaml",
+            yaml.safe_dump(
+                {
+                    "server": {
+                        "bind_host": "127.0.0.1",
+                        "port": 8020,
+                        "origin": "https://localhost:8020",
+                        "allowed_hosts": ["localhost"],
+                        "secure_cookies": True,
+                    },
+                    "integrations": {
+                        "webhooks_enabled": False,
+                        "composio_enabled": True,
+                    },
+                    "trading": {"mode": "paper", "broker": "alpaca"},
+                    "features": {
+                        "auto_execute_preapproved_rules": False,
+                    },
+                    "execution": {"prefer_bracket_orders": False},
+                    "llm": {"fallback_provider": None},
+                }
+            ),
+        ),
+        (
+            ".env.example",
+            "COMPOSIO_API_KEY=\n",
+        ),
+        (
+            "src/trading_assistant/integrations.py",
+            "from composio import App\n"
+            "toolkit = App()\n",
+        ),
+        (
+            "docs/RUNBOOK.md",
+            "Enable the integration with `composio login`.\n"
+            "Backups use whole-database-v1.sqlite3.aesgcm.\n",
+        ),
+    ],
+)
+def test_composio_must_remain_explicitly_disabled(
+    tmp_path,
+    relative_path,
+    source,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "COMPOSIO_ENABLED" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source", "code"),
+    [
+        (
+            "src/trading_assistant/unsafe_http.py",
+            "import httpx\nclient = httpx.Client()\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/unsafe_http.py",
+            "import requests as transport\n"
+            "response = transport.get('https://api.anthropic.com')\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/unsafe_origin.py",
+            "from trading_assistant.security.outbound import OutboundPolicy\n"
+            "policy = OutboundPolicy('https://unknown.invalid')\n",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/unsafe_origin.py",
+            "from trading_assistant.security.outbound import OutboundPolicy\n"
+            "policy = OutboundPolicy('https://api.anthropic.com')\n",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/unsafe_origin.py",
+            "from trading_assistant.security.outbound import OutboundPolicy\n"
+            "origin = configured_origin\n"
+            "policy = OutboundPolicy(origin)\n",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/query_auth.py",
+            "client.get('/data', params={'access_key': credential})\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/query_auth.py",
+            "client.get('https://api.anthropic.com/data?api_key=fixture')\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/redirects.py",
+            "client.get('/data', allow_redirects=True)\n",
+            "CROSS_ORIGIN_REDIRECT_ENABLED",
+        ),
+        (
+            "src/trading_assistant/redirects.py",
+            "client.get('/data', follow_redirects=configured)\n",
+            "CROSS_ORIGIN_REDIRECT_ENABLED",
+        ),
+        (
+            "src/trading_assistant/proxy.py",
+            "client = Client(trust_env=True)\n",
+            "PROXY_HEADERS_TRUSTED",
+        ),
+        (
+            "src/trading_assistant/query_auth.py",
+            "client.get('/data', params=query_values)\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/query_auth.py",
+            "client.get(url='https://api.anthropic.com/data?token=fixture')\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/unknown_client.py",
+            "import urllib3\nclient = urllib3.PoolManager()\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/dynamic_origin.py",
+            "client = ProviderClient(base_url=configured_origin)\n",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/http_origin.py",
+            "client.get('http://provider.invalid/data')\n",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/client_alias.py",
+            "import httpx\n"
+            "make_client = httpx.Client\n"
+            "client = make_client()\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/client_alias.py",
+            "import httpx._client as transport\n"
+            "client = transport.Client()\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/query_auth.py",
+            "client.get(f'https://api.anthropic.com/data?"
+            "access_key={credential}')\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/backtest/coingecko.py",
+            "query = {'access_key': credential}\n"
+            "client.get('/data', params=query)\n",
+            "QUERY_SECRET",
+        ),
+        (
+            "src/trading_assistant/sdk_escape.py",
+            "from alpaca.data.historical import "
+            "StockHistoricalDataClient\n"
+            "client = StockHistoricalDataClient('fixture', 'fixture')\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "src/trading_assistant/redirects.py",
+            "client.follow_redirects = True\n",
+            "CROSS_ORIGIN_REDIRECT_ENABLED",
+        ),
+        (
+            "src/trading_assistant/proxy.py",
+            "server = Config(forwarded_allow_ips='*')\n",
+            "PROXY_HEADERS_TRUSTED",
+        ),
+        (
+            "src/trading_assistant/tls.py",
+            "server = Config(ssl_certfile=None)\n",
+            "TLS_DISABLED",
+        ),
+    ],
+)
+def test_outbound_manifest_negative_fixtures(
+    tmp_path,
+    relative_path,
+    source,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_dynamic_outbound_manifest_fails_closed(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security/outbound.py",
+        "OUTBOUND_ORIGIN_MANIFEST = build_manifest()\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_ORIGIN_UNAPPROVED" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        (
+            "client = make_client(follow_redirects=True)\n",
+            "CROSS_ORIGIN_REDIRECT_ENABLED",
+        ),
+        (
+            "options['trust_env'] = configured_proxy_trust\n",
+            "PROXY_HEADERS_TRUSTED",
+        ),
+    ],
+)
+def test_outbound_wrapper_options_are_statically_gated(
+    tmp_path,
+    source,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    path = root / "src/trading_assistant/security/outbound.py"
+    path.write_text(
+        path.read_text(encoding="utf-8") + source,
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutator", "code"),
+    [
+        (
+            lambda raw: raw["server"].update({"secure_cookies": False}),
+            "INSECURE_COOKIE",
+        ),
+        (
+            lambda raw: raw["server"].update({"allowed_hosts": ["*"]}),
+            "WILDCARD_HOST_ORIGIN",
+        ),
+        (
+            lambda raw: raw["server"].update({"origin": "http://localhost:8020"}),
+            "TLS_DISABLED",
+        ),
+        (
+            lambda raw: raw["server"].update({"proxy_headers": True}),
+            "PROXY_HEADERS_TRUSTED",
+        ),
+        (
+            lambda raw: raw["server"].update({"tls_key_path": None}),
+            "TLS_DISABLED",
+        ),
+    ],
+)
+def test_transport_config_negative_fixtures(tmp_path, mutator, code):
+    root = _trust_fixture(tmp_path)
+    config_path = root / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    mutator(raw)
+    config_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("section", "code"),
+    [
+        ("server", "TLS_DISABLED"),
+        ("integrations", "COMPOSIO_ENABLED"),
+        ("provider_origins", "OUTBOUND_ORIGIN_UNAPPROVED"),
+    ],
+)
+def test_missing_structural_config_sections_fail_closed(
+    tmp_path,
+    section,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    config_path = root / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.pop(section)
+    config_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_integration_defaults_must_be_literal_false_types(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/config.py",
+        "class IntegrationsConfig:\n"
+        "    webhooks_enabled: bool = False\n"
+        "    composio_enabled: bool = False\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "COMPOSIO_ENABLED" in completed.stderr
+    assert "WEBHOOK_ROUTE_PRESENT" in completed.stderr
+
+
+def test_operator_docs_must_explicitly_reject_a_webhook_receiver(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "docs/RUNBOOK.md",
+        "Composio is disabled. The webhook receiver is enabled.\n"
+        "Backups use whole-database-v1.sqlite3.aesgcm.\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "WEBHOOK_ROUTE_PRESENT" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        (
+            "src/trading_assistant/app/security.py",
+            "from starlette.middleware.cors import CORSMiddleware\n"
+            "middleware = CORSMiddleware(app, allow_origins=['*'])\n",
+        ),
+        (
+            "src/trading_assistant/mcp_server/composio_escape.py",
+            "toolkit = getattr(integrations, 'ComposioToolSet')()\n",
+        ),
+        (
+            "src/trading_assistant/integrations.py",
+            "endpoint = 'https://provider.composio.invalid/tools'\n",
+        ),
+        (
+            "src/trading_assistant/mcp_server/server.py",
+            "toolkit = getattr(integrations, toolkit_name)()\n",
+        ),
+        (
+            "src/trading_assistant/integrations.py",
+            "import importlib\n"
+            "toolkit = importlib.import_module(provider_module)\n",
+        ),
+    ],
+)
+def test_ast_transport_and_composio_escapes_fail_closed(
+    tmp_path,
+    relative_path,
+    source,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    expected = (
+        "WILDCARD_HOST_ORIGIN"
+        if "CORSMiddleware" in source
+        else "COMPOSIO_ENABLED"
+    )
+    assert expected in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "code"),
+    [
+        (".env", "TRACKED_ENV_FILE"),
+        ("state/runtime.sqlite3", "TRACKED_SQLITE_DATABASE"),
+        ("state/runtime.sqlite3-wal", "TRACKED_SQLITE_WAL"),
+        ("state/runtime.sqlite3-shm", "TRACKED_SQLITE_SHM"),
+        (".local/tls/localhost-key.pem", "TRACKED_TLS_PRIVATE_KEY"),
+        (".local/tls/operator.p12", "TRACKED_TLS_PRIVATE_CERTIFICATE"),
+        ("backups/decrypted-backup.bak", "TRACKED_DECRYPTED_BACKUP"),
+        ("logs/runtime.log", "TRACKED_RUNTIME_LOG"),
+        ("exports/raw-account-export.csv", "TRACKED_RAW_EXPORT"),
+    ],
+)
+def test_tracked_private_artifacts_have_separate_stable_codes(
+    tmp_path,
+    relative_path,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, "fixture-only\n")
+    subprocess.run(["git", "add", "--", relative_path], cwd=root, check=True)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+    assert "fixture-only" not in completed.stderr
+
+
+def test_git_tree_failure_is_value_free_and_fail_closed(tmp_path):
+    root = _trust_fixture(tmp_path, git=False)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert completed.stderr.splitlines() == [
+        "GIT_TREE_UNPROVEN .:1",
+        "release static checks: FAIL (1 violation)",
+    ]
+
+
+def test_clean_root_and_false_positive_decoys_pass(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/decoys.py",
+        "# /webhook execute approve cancel Composio http://not-a-call.invalid\n"
+        "message = '/hooks access_key EnvironmentSecretProvider notify reset'\n",
+    )
+    _write_fixture_file(root, "untracked.sqlite3", "untracked fixture\n")
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "release static checks: PASS"
+    assert completed.stderr == ""
+
+
+def test_findings_are_sorted_deduplicated_and_never_include_matches(tmp_path):
+    root = _trust_fixture(tmp_path)
+    marker = "fixture-query-marker"
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/z_query.py",
+        "client.get('/x', params={'access_key': 'fixture-query-marker'})\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/a_client.py",
+        "import httpx\n"
+        "first = httpx.Client()\n"
+        "second = httpx.Client()\n",
+    )
+
+    first = _run_trust_gate(root)
+    second = _run_trust_gate(root)
+
+    assert first.returncode == second.returncode == 1
+    assert first.stderr == second.stderr
+    finding_lines = first.stderr.splitlines()[:-1]
+    assert finding_lines == sorted(set(finding_lines))
+    assert marker not in first.stderr
+    assert "https://" not in first.stderr
+    assert "?" not in first.stderr
+    assert first.stderr.splitlines()[-1] == (
+        f"release static checks: FAIL ({len(finding_lines)} violations)"
+    )

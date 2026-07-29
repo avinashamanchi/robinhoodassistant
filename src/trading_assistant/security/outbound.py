@@ -13,6 +13,7 @@ import math
 import numbers
 import ssl
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Iterable
 from urllib.parse import SplitResult, urlsplit
 
@@ -28,6 +29,134 @@ DEFAULT_MAX_RESPONSE_BYTES = 1_000_000
 _SUPPORTED_SCHEMES = frozenset({"https", "wss"})
 _DEFAULT_PORTS = {"https": 443, "wss": 443}
 _UNSET = object()
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundOriginRule:
+    """One exact adapter destination and the runtime roles that may use it."""
+
+    key: str
+    adapter: str
+    origin: str
+    roles: frozenset[str]
+    feature_gate: str | None = None
+
+
+OUTBOUND_ORIGIN_MANIFEST = (
+    OutboundOriginRule(
+        "alpaca_trading",
+        "alpaca.trading",
+        "https://paper-api.alpaca.markets",
+        frozenset(
+            {
+                "app",
+                "daemon",
+                "mcp",
+                "paper-drill",
+                "preflight",
+                "safety-drill",
+                "watchdog",
+            }
+        ),
+    ),
+    OutboundOriginRule(
+        "alpaca_data",
+        "alpaca.historical",
+        "https://data.alpaca.markets",
+        frozenset(
+            {
+                "app",
+                "daemon",
+                "paper-drill",
+                "preflight",
+                "safety-drill",
+                "validate-analyst",
+            }
+        ),
+    ),
+    OutboundOriginRule(
+        "alpaca_stream",
+        "alpaca.stream",
+        "wss://stream.data.alpaca.markets",
+        frozenset({"daemon"}),
+        "daemon.use_websocket",
+    ),
+    OutboundOriginRule(
+        "anthropic",
+        "llm.anthropic",
+        "https://api.anthropic.com",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=anthropic",
+    ),
+    OutboundOriginRule(
+        "gemini",
+        "llm.gemini",
+        "https://generativelanguage.googleapis.com",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=gemini",
+    ),
+    OutboundOriginRule(
+        "groq",
+        "llm.groq",
+        "https://api.groq.com",
+        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        "llm.provider=groq",
+    ),
+    OutboundOriginRule(
+        "telegram",
+        "notifier.telegram",
+        "https://api.telegram.org",
+        frozenset({"app", "daemon", "preflight", "watchdog"}),
+        "features.telegram_notifications",
+    ),
+    OutboundOriginRule(
+        "coingecko",
+        "marketdata.coingecko",
+        "https://api.coingecko.com",
+        frozenset({"app", "daemon"}),
+        "crypto_risk",
+    ),
+)
+OUTBOUND_ORIGINS_BY_KEY = MappingProxyType(
+    {rule.key: rule.origin for rule in OUTBOUND_ORIGIN_MANIFEST}
+)
+
+
+def configured_origins_match_manifest(configured: Any) -> bool:
+    """Return only whether config has the complete, exact committed manifest."""
+
+    try:
+        observed = {
+            key: str(getattr(configured, key))
+            for key in type(configured).model_fields
+        }
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return observed == dict(OUTBOUND_ORIGINS_BY_KEY)
+
+
+def origins_for_role(config: Any, role: str) -> frozenset[str]:
+    """Resolve destinations enabled for one role without constructing clients."""
+
+    selected: set[str] = set()
+    for rule in OUTBOUND_ORIGIN_MANIFEST:
+        if role not in rule.roles:
+            continue
+        gate = rule.feature_gate
+        if gate == "daemon.use_websocket" and not config.daemon.use_websocket:
+            continue
+        if gate and gate.startswith("llm.provider="):
+            if config.llm.provider != gate.partition("=")[2]:
+                continue
+        if (
+            gate == "features.telegram_notifications"
+            and not config.features.telegram_notifications
+        ):
+            continue
+        if gate == "crypto_risk" and config.crypto_risk is None:
+            continue
+        selected.add(rule.origin)
+    return frozenset(selected)
 
 
 class OutboundError(Exception):
@@ -227,6 +356,17 @@ class OutboundPolicy:
     @property
     def origins(self) -> frozenset[OutboundOrigin]:
         return self._origins
+
+    @property
+    def origin(self) -> str:
+        """Expose one canonical manifest origin for structural inspection only."""
+
+        if len(self._origins) != 1:
+            raise OutboundOriginDenied()
+        origin = next(iter(self._origins))
+        default_port = _DEFAULT_PORTS[origin.scheme]
+        suffix = "" if origin.port == default_port else f":{origin.port}"
+        return f"{origin.scheme}://{origin.hostname}{suffix}"
 
     def assert_url(self, url: str) -> None:
         """Reject a request URL before transport I/O unless its triple is pinned."""

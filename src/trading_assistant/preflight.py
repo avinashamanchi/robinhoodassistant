@@ -208,6 +208,148 @@ def _safe_exception_code(_exc: Exception) -> str:
     return "dependency_failed"
 
 
+def _default_encryption_check(
+    config,
+    secrets: RuntimeSecrets,
+) -> StructuralCheck:
+    """Inspect only configured key material and the local migration state."""
+
+    try:
+        from .db.session import create_db_engine
+        from .security.crypto import build_sensitive_data_cipher
+
+        cipher = build_sensitive_data_cipher(
+            config.encryption,
+            secrets,
+        )
+        return SensitiveEncryptionStateInspector(
+            create_db_engine(secrets.database_url),
+            schema_version=config.encryption.schema_version,
+            active_key_id=config.encryption.active_key_id,
+            cipher=cipher,
+        ).inspect()
+    except Exception:
+        return StructuralCheck(
+            "encryption",
+            "blocked",
+            "sensitive_migration_state_invalid",
+        )
+
+
+def _structural_preflight_checks(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    provider: SecretProvider | None,
+    tls_validator=None,
+    encryption_checker=None,
+) -> list[Result]:
+    """Run all five local release prerequisites without constructing clients."""
+
+    from .ops.tls import validate_tls_material
+    from .security.outbound import configured_origins_match_manifest
+    from .security.secrets import _required_fields
+    from .security.transport import TransportPolicy
+
+    tls_validator = tls_validator or validate_tls_material
+    encryption_checker = encryption_checker or _default_encryption_check
+
+    keychain_ok = (
+        provider is None
+        or (
+            isinstance(provider, MacOSKeychainSecretProvider)
+            and provider.provider_name == "macos-keychain"
+        )
+    )
+    try:
+        required = _required_fields("preflight", config)
+        fields_present = all(
+            secret_is_set(getattr(secrets, field_name))
+            for field_name in required
+        )
+        expected_key_ids = (
+            config.encryption.active_key_id,
+            *config.encryption.retained_key_ids,
+        )
+        field_keys_present = (
+            tuple(secrets.field_encryption_keys) == expected_key_ids
+            and all(
+                secret_is_set(secrets.field_encryption_keys[key_id])
+                for key_id in expected_key_ids
+            )
+        )
+    except Exception:
+        fields_present = False
+        field_keys_present = False
+    keychain_ok = keychain_ok and fields_present and field_keys_present
+    keychain = Result(
+        "KEYCHAIN",
+        PASS if keychain_ok else FAIL,
+        "ok" if keychain_ok else "required_fields_missing",
+    )
+
+    try:
+        if (
+            config.server.bind_host != "127.0.0.1"
+            or config.server.port != 8020
+            or str(config.server.origin).rstrip("/")
+            != "https://localhost:8020"
+            or set(config.server.allowed_hosts)
+            != {"localhost", "127.0.0.1", "::1"}
+            or config.server.secure_cookies is not True
+        ):
+            raise RuntimeError("local transport configuration invalid")
+        TransportPolicy.production(
+            config.server,
+            request_bounds=config.security.request_bounds,
+        )
+        tls_validator(config.server)
+    except Exception:
+        local_tls = Result("LOCAL_TLS", FAIL, "local_tls_invalid")
+    else:
+        local_tls = Result("LOCAL_TLS", PASS, "ok")
+
+    try:
+        encryption = encryption_checker(config, secrets)
+        encryption_ok = (
+            isinstance(encryption, StructuralCheck)
+            and encryption.passed
+        )
+    except Exception:
+        encryption_ok = False
+    field_encryption = Result(
+        "FIELD_ENCRYPTION",
+        PASS if encryption_ok else FAIL,
+        "ok" if encryption_ok else "migration_incomplete",
+    )
+
+    outbound_ok = configured_origins_match_manifest(
+        config.provider_origins
+    )
+    outbound = Result(
+        "OUTBOUND_ORIGINS",
+        PASS if outbound_ok else FAIL,
+        "ok" if outbound_ok else "origin_manifest_mismatch",
+    )
+
+    integrations_ok = (
+        config.integrations.webhooks_enabled is False
+        and config.integrations.composio_enabled is False
+    )
+    integrations = Result(
+        "INTEGRATIONS_DISABLED",
+        PASS if integrations_ok else FAIL,
+        "ok" if integrations_ok else "integration_enabled",
+    )
+    return [
+        keychain,
+        local_tls,
+        field_encryption,
+        outbound,
+        integrations,
+    ]
+
+
 def _config_parses() -> Result:
     try:
         load_config("config.yaml")
@@ -574,7 +716,35 @@ def _run_partial_keychain(
     if presence.get("live_trading_confirm") is True:
         dangerous.append("live_confirmation")
 
+    origins_ok = False
+    integrations_ok = False
+    try:
+        from .security.outbound import configured_origins_match_manifest
+
+        origins_ok = configured_origins_match_manifest(
+            config.provider_origins
+        )
+        integrations_ok = (
+            config.integrations.webhooks_enabled is False
+            and config.integrations.composio_enabled is False
+        )
+    except Exception:
+        pass
+
     results = [
+        Result("KEYCHAIN", FAIL, "required_fields_missing"),
+        Result("LOCAL_TLS", NEEDS, "keychain_unavailable"),
+        Result("FIELD_ENCRYPTION", NEEDS, "keychain_unavailable"),
+        Result(
+            "OUTBOUND_ORIGINS",
+            PASS if origins_ok else FAIL,
+            "ok" if origins_ok else "origin_manifest_mismatch",
+        ),
+        Result(
+            "INTEGRATIONS_DISABLED",
+            PASS if integrations_ok else FAIL,
+            "ok" if integrations_ok else "integration_enabled",
+        ),
         _config_parses(),
         _paper_only(config),
         Result("runtime secret role validation", NEEDS, role_detail),
@@ -634,36 +804,74 @@ def run(*, provider: SecretProvider | None = None) -> int:
 
     config = load_config("config.yaml")
     try:
-        if provider is None:
-            secrets = load_role_secrets("preflight", config=config)
-        else:
-            secrets = load_role_secrets(
+        secrets = (
+            load_role_secrets("preflight", config=config)
+            if provider is None
+            else load_role_secrets(
                 "preflight",
                 config=config,
                 provider=provider,
             )
-    except SecretBoundaryError:
-        selected = (
-            provider
-            if isinstance(provider, MacOSKeychainSecretProvider)
-            else MacOSKeychainSecretProvider()
         )
+    except SecretBoundaryError:
+        if provider is not None and not isinstance(
+            provider,
+            MacOSKeychainSecretProvider,
+        ):
+            return _print_results(
+                [
+                    Result(
+                        "KEYCHAIN",
+                        FAIL,
+                        "required_fields_missing",
+                    ),
+                    Result("LOCAL_TLS", NEEDS, "keychain_unavailable"),
+                    Result(
+                        "FIELD_ENCRYPTION",
+                        NEEDS,
+                        "keychain_unavailable",
+                    ),
+                    Result(
+                        "OUTBOUND_ORIGINS",
+                        FAIL,
+                        "origin_manifest_unproven",
+                    ),
+                    Result(
+                        "INTEGRATIONS_DISABLED",
+                        FAIL,
+                        "integration_state_unproven",
+                    ),
+                ]
+            )
+        selected = provider or MacOSKeychainSecretProvider()
         return _run_partial_keychain(
             config,
             selected.read_presence(encryption=config.encryption),
         )
     with runtime_startup("preflight", secrets):
-        return _run(config, secrets)
+        if provider is None:
+            return _run(config, secrets)
+        return _run(config, secrets, provider=provider)
 
 
 def _run(
     config,
     secrets: RuntimeSecrets | None = None,
+    *,
+    provider: SecretProvider | None = None,
 ) -> int:
     if secrets is None:
         secrets = config
         config = load_config("config.yaml")
+    structural = _structural_preflight_checks(
+        config,
+        secrets,
+        provider=provider,
+    )
+    if any(result.status in {FAIL, NEEDS} for result in structural):
+        return _print_results(structural)
     results = [
+        *structural,
         _config_parses(),
         _paper_only(config),
         _dangerous_switches_off(config, secrets),

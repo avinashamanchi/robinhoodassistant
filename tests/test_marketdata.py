@@ -1,17 +1,19 @@
-"""MarketStack (equities) + CoinGecko (crypto) data-source parsing & caching."""
+"""Alpaca equities and CoinGecko crypto data-source boundaries."""
 
 from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+from trading_assistant.backtest import data as backtest_data
 from trading_assistant.backtest.coingecko import CoinGeckoClient, coin_id
 from trading_assistant.backtest.data import download_alpaca_bars
-from trading_assistant.backtest.marketstack import MarketStackClient
+from trading_assistant.security.secrets import RuntimeSecrets
 
 
 class _Resp:
@@ -46,40 +48,9 @@ class _HTTP:
         return nullcontext(_Resp(self._router(url, params), url))
 
 
-# ── MarketStack ─────────────────────────────────────────────────
-_EOD = {
-    "data": [
-        {"date": "2023-01-04T00:00:00+0000", "open": 101, "high": 102, "low": 100,
-         "close": 101.5, "volume": 1200, "adj_close": 101.5},
-        {"date": "2023-01-03T00:00:00+0000", "open": 100, "high": 101, "low": 99,
-         "close": 100.5, "volume": 1000, "adj_close": 100.5},
-    ]
-}
-
-
-def test_marketstack_eod_parses_and_sorts(tmp_path):
-    http = _HTTP(lambda url, params: _EOD)
-    client = MarketStackClient("key", http=http, cache_dir=tmp_path)
-    df = client.eod("AAPL")
-    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
-    assert len(df) == 2
-    assert df.index.is_monotonic_increasing          # ascending by date
-    assert df["close"].iloc[-1] == 101.5
-
-
-def test_marketstack_uses_cache(tmp_path):
-    http = _HTTP(lambda url, params: _EOD)
-    client = MarketStackClient("key", http=http, cache_dir=tmp_path)
-    client.eod("AAPL")
-    client.eod("AAPL")                               # second call served from parquet
-    assert http.calls == 1
-
-
-def test_marketstack_splits_dividends(tmp_path):
-    http = _HTTP(lambda url, params: {"data": [{"date": "2023-06-01", "split_factor": "4/1"}]})
-    client = MarketStackClient("key", http=http, cache_dir=tmp_path)
-    assert client.splits("AAPL")[0]["split_factor"] == "4/1"
-    assert client.dividends("AAPL")[0]["date"] == "2023-06-01"
+def test_marketstack_runtime_and_secret_paths_are_removed():
+    assert not Path("src/trading_assistant/backtest/marketstack.py").exists()
+    assert "marketstack_api_key" not in RuntimeSecrets.model_fields
 
 
 # ── CoinGecko ───────────────────────────────────────────────────
@@ -128,25 +99,18 @@ def test_coingecko_cache_miss_gates_each_http_attempt(tmp_path):
     assert http.calls == 2
 
 
-@pytest.mark.parametrize(
-    "client_factory",
-    [
-        lambda http, tmp_path: MarketStackClient(
-            "test-key", http=http, cache_dir=tmp_path, max_response_bytes=4
-        ),
-        lambda http, tmp_path: CoinGeckoClient(
-            http=http, cache_dir=tmp_path, max_response_bytes=4
-        ),
-    ],
-)
 def test_direct_marketdata_response_read_is_bounded_without_content_leak(
-    client_factory, tmp_path
+    tmp_path,
 ):
     """Removing bounded reads would let a provider body exhaust memory or enter errors."""
     from trading_assistant.security.outbound import OutboundResponseTooLarge
 
     secret = "provider-secret-body"
-    client = client_factory(_HTTP(lambda _url, _params: {"data": secret}), tmp_path)
+    client = CoinGeckoClient(
+        http=_HTTP(lambda _url, _params: {"data": secret}),
+        cache_dir=tmp_path,
+        max_response_bytes=4,
+    )
 
     with pytest.raises(OutboundResponseTooLarge) as raised:
         client._get("/eod", {})
@@ -171,48 +135,25 @@ class _RedirectHTTP:
         )
 
 
-@pytest.mark.parametrize(
-    "client",
-    [
-        lambda http, tmp_path: MarketStackClient("test-key", http=http, cache_dir=tmp_path),
-        lambda http, tmp_path: CoinGeckoClient(http=http, cache_dir=tmp_path),
-    ],
-)
-def test_direct_marketdata_redirect_is_rejected_without_second_request(client, tmp_path):
+def test_direct_marketdata_redirect_is_rejected_without_second_request(tmp_path):
     """A response redirect must not be followed or expose its Location in errors."""
     from trading_assistant.security.outbound import OutboundRedirectDenied
 
     http = _RedirectHTTP()
     with pytest.raises(OutboundRedirectDenied) as raised:
-        client(http, tmp_path)._get("/eod", {})
+        CoinGeckoClient(http=http, cache_dir=tmp_path)._get("/coins", {})
 
     assert http.calls == 1
     assert str(raised.value) == "outbound redirect rejected"
     assert "provider-secret" not in str(raised.value)
 
 
-def test_marketstack_transport_error_redacts_access_key(tmp_path):
-    """A direct-client exception must not expose MarketStack's query-string key."""
-    from trading_assistant.security.outbound import OutboundRequestFailed
+def test_alpaca_cache_miss_pins_origin_and_gates_only_network_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    from alpaca.data import historical as alpaca_historical
 
-    secret = "test-only-marketstack-key"
-
-    class FailingHTTP:
-        def stream(self, _method, _url, *, params):
-            raise RuntimeError(f"provider failure with {params['access_key']}")
-
-    with pytest.raises(OutboundRequestFailed) as raised:
-        MarketStackClient(
-            secret,
-            http=FailingHTTP(),
-            cache_dir=tmp_path,
-        )._get("/eod", {})
-
-    assert str(raised.value) == "outbound request failed"
-    assert secret not in str(raised.value)
-
-
-def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
     frame = pd.DataFrame(
         {
             "open": [100.0],
@@ -230,6 +171,7 @@ def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
     class FakeAlpacaHistory:
         def __init__(self):
             self.calls = 0
+            self._base_url = "https://data.alpaca.markets"
 
         def get_stock_bars(self, _request):
             self.calls += 1
@@ -237,6 +179,20 @@ def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
 
     client = FakeAlpacaHistory()
     attempts = 0
+    installed = []
+
+    monkeypatch.setattr(
+        backtest_data,
+        "install_pinned_session",
+        lambda candidate, policy, *, read_timeout: installed.append(
+            (candidate, policy.origin, read_timeout)
+        ),
+    )
+    monkeypatch.setattr(
+        alpaca_historical,
+        "StockHistoricalDataClient",
+        lambda *_args: client,
+    )
 
     def gate(operation):
         nonlocal attempts
@@ -248,7 +204,6 @@ def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
         "fake-key",
         "fake-secret",
         cache_dir=tmp_path,
-        client_factory=lambda *_args: client,
         attempt_gate=gate,
     )
     download_alpaca_bars(
@@ -256,7 +211,6 @@ def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
         "fake-key",
         "fake-secret",
         cache_dir=tmp_path,
-        client_factory=lambda *_args: client,
         attempt_gate=lambda _operation: pytest.fail(
             "cache hit must not consume provider allowance"
         ),
@@ -264,3 +218,47 @@ def test_alpaca_cache_miss_gates_only_the_network_attempt(tmp_path):
 
     assert attempts == 1
     assert client.calls == 1
+    assert installed == [
+        (client, "https://data.alpaca.markets", 30.0),
+    ]
+
+
+def test_injected_alpaca_history_fake_is_not_mutated_as_a_real_sdk_client(
+    tmp_path,
+    monkeypatch,
+):
+    frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1_000.0],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-07-24T00:00:00Z"],
+            name="ts",
+        ),
+    )
+
+    class FakeAlpacaHistory:
+        def get_stock_bars(self, _request):
+            return type("Bars", (), {"df": frame.copy()})()
+
+    monkeypatch.setattr(
+        backtest_data,
+        "install_pinned_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "injected test fake must not receive production transport state"
+        ),
+    )
+
+    result = download_alpaca_bars(
+        "AAPL",
+        "fake-key",
+        "fake-secret",
+        cache_dir=tmp_path,
+        client_factory=lambda *_args: FakeAlpacaHistory(),
+    )
+
+    assert result["close"].iloc[-1] == 100.5

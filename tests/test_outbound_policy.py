@@ -47,6 +47,72 @@ class _ResponseAdapter(BaseAdapter):
         pass
 
 
+def test_outbound_manifest_is_exact_and_role_feature_scoped(
+    outbound,
+    app_config,
+):
+    keys = tuple(rule.key for rule in outbound.OUTBOUND_ORIGIN_MANIFEST)
+
+    assert keys == (
+        "alpaca_trading",
+        "alpaca_data",
+        "alpaca_stream",
+        "anthropic",
+        "gemini",
+        "groq",
+        "telegram",
+        "coingecko",
+    )
+    assert "composio" not in keys
+    assert outbound.configured_origins_match_manifest(
+        app_config.provider_origins
+    )
+    selected_origin = {
+        "anthropic": "https://api.anthropic.com",
+        "gemini": "https://generativelanguage.googleapis.com",
+        "groq": "https://api.groq.com",
+    }[app_config.llm.provider]
+    assert outbound.origins_for_role(app_config, "preflight") == frozenset(
+        {
+            "https://paper-api.alpaca.markets",
+            "https://data.alpaca.markets",
+            selected_origin,
+        }
+    )
+
+    anthropic = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"provider": "anthropic"}
+            )
+        }
+    )
+    assert "https://api.anthropic.com" in outbound.origins_for_role(
+        anthropic,
+        "preflight",
+    )
+    assert (
+        "https://generativelanguage.googleapis.com"
+        not in outbound.origins_for_role(anthropic, "preflight")
+    )
+
+    notifications = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"telegram_notifications": True}
+            )
+        }
+    )
+    assert "https://api.telegram.org" in outbound.origins_for_role(
+        notifications,
+        "preflight",
+    )
+    assert "https://api.telegram.org" not in outbound.origins_for_role(
+        notifications,
+        "validate-analyst",
+    )
+
+
 def test_origin_normalizes_idna_case_and_default_port(outbound):
     """Changing host casing, Unicode spelling, or :443 must not create a new origin."""
     origin = outbound.OutboundOrigin.parse("HTTPS://B\u00dcCHER.example:443/")

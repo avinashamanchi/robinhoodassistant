@@ -43,12 +43,11 @@ Deterministic indicators are computed in code (`signals/`); the LLM only ever
 harness (`backtest/`) benchmark everything against buy-and-hold.
 
 ```bash
-# Run a synthetic walk-forward (no credentials needed) and open the report UI:
-uv run python -m trading_assistant.ops.serve
-# visit http://127.0.0.1:8000/backtests/ui  → "Run new backtest"
+# Run the synthetic backtest tests without credentials or network access:
+uv run pytest tests/test_backtest_engine.py tests/test_backtest_evaluate.py
 
-# Real data (equities + crypto), cached to parquet, adjusted for corp actions:
-#   backtest.data.download_alpaca_bars(symbol, ALPACA_API_KEY, ALPACA_SECRET_KEY)
+# The authenticated report UI is available only through the separately started
+# loopback HTTPS app at https://localhost:8020/backtests/ui.
 ```
 
 **LLM-in-the-loop.** `backtest/llm_runner.py` runs the Phase-6 analyst inside the
@@ -85,23 +84,45 @@ fill idempotency.
 ```bash
 uv venv --python 3.11
 uv sync --all-extras --dev
-cp .env.example .env
-openssl rand -hex 32      # use as APP_API_TOKEN
+./scripts/setup-local-tls.sh
+uv run python -m trading_assistant.ops.secrets migrate-env \
+  --env-file /absolute/path/to/private-migration.env
+uv run python -m trading_assistant.ops.secrets audit
 uv run python -m trading_assistant.db.migrate upgrade
+uv run python -m trading_assistant.ops.encrypt_sensitive migrate
+uv run python -m trading_assistant.ops.encrypt_sensitive verify
+uv run python scripts/check_release_safety.py
 uv run pytest
 ```
+
+The migration source must be a private regular file with mode `0600`. The
+Keychain command verifies every write but does not remove the source; archive or
+dispose of it through the operator’s approved credential procedure. Normal app,
+daemon, MCP, watchdog, and preflight roles never read secrets from the
+environment.
+
+Sensitive-field rotation is a stopped-writer maintenance change: add a reviewed
+new key ID to the configured retained set, prompt for it with
+`trading_assistant.ops.secrets set-encryption-key`, run
+`trading_assistant.ops.encrypt_sensitive rotate`, transition the active/retained
+IDs as reviewed, then audit and verify again. Never remove an old key before
+envelope verification and retention review.
 
 ## Running
 
 ```bash
-# API + UI (chat, approvals, positions, backtests):
-uv run python -m trading_assistant.ops.serve
+# Local structural checks plus broker-read readiness. Do not continue on FAIL or
+# NEEDS-ME:
+uv run python -m trading_assistant.preflight
 
-# Monitoring daemon (evaluates conditional rules against live quotes):
+# Loopback HTTPS app only:
+./scripts/start.sh
+
+# In a separate operator-controlled terminal, and only after preflight passes:
 uv run python -m trading_assistant.daemon.main
 
-# Verify Alpaca's full paper order path with one tiny submit/cancel:
-uv run python -m trading_assistant.ops.paper_drill
+# Credentialed paper-account drills are not startup steps. Use only the
+# separately reviewed procedure in docs/RUNBOOK.md.
 
 # Exercise migration, response-loss recovery, OCO, breakers, and reconciliation
 # offline against an explicit online SQLite copy (the source is opened mode=ro):
@@ -154,13 +175,14 @@ The agent/analyst run on a pluggable backend (`llm/`): set `llm.provider` to
 `anthropic`, `gemini`, or `groq`. Runtime cross-provider fallback is prohibited:
 a provider change requires an explicit configuration edit and process restart, so
 the same financial context is never silently sent to a second vendor.
-Install with `uv sync --all-extras --dev`. Keys:
-`GEMINI_API_KEY` / `GROQ_API_KEY` / `ANTHROPIC_API_KEY` in `.env`.
+Install with `uv sync --all-extras --dev`. Provider credentials are stored
+under configured accounts in macOS Keychain and audited with
+`trading_assistant.ops.secrets audit`; production roles do not load them from
+`.env`.
 
-Historical bars come from Alpaca, **MarketStack** (equities EOD/splits/dividends —
-`MARKETSTACK_API_KEY`, cached to parquet since the free tier is ~100 req/month), or
-**CoinGecko** (crypto OHLCV, **no key required** — the recommended crypto source).
-The same supported-extra install includes the market-data clients.
+Historical equity bars come from the exact pinned Alpaca data origin and are
+cached to parquet. Crypto OHLCV uses the exact pinned CoinGecko origin and has
+no credential query parameter. Query-string credentials are prohibited.
 
 The abstract read-only external-account protocol and deterministic mock remain for
 portfolio tests. No unofficial Robinhood login library or production factory path
@@ -175,11 +197,21 @@ is shipped.
 4. Everything dangerous defaults OFF.
 5. Every production runtime role writes redacted, owner-only, bounded rotating
    logs under `logs/`.
+6. Chat has an exact read-only tool allowlist plus immutable draft constructors.
+   A draft must be explicitly placed in the signed queue, and a separate
+   authenticated human approval is required before the execution-time risk
+   check can reach order submission.
+7. There is no webhook receiver. Composio remains disabled pending
+   provider-side revocation and rotation of the previously exposed credential;
+   no Composio origin, toolkit, MCP tool, or runtime caller is allowed.
 
 A narrowly proven reduce-only order may pass only active loss, drawdown, and
 operator-global scopes so an open position can be made smaller. The observed
 breach is still persisted atomically. Data, liquidity, broker-drift, stale-fill,
 and allocation failures always remain blocking.
 
-Configuration lives in `config.yaml` (risk limits, non-secret) and `.env`
-(secrets, gitignored — see `.env.example`).
+Configuration lives in `config.yaml` and contains no secrets. Production
+secrets live in macOS Keychain. `.env.example` is a migration inventory only,
+not a production secret source. Local TLS, field-encryption
+migration/verification/rotation, encrypted backup recovery, and the exact
+preflight gates are documented in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).

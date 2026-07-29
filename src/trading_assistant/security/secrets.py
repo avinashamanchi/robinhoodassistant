@@ -33,7 +33,6 @@ _SIMPLE_SECRET_FIELDS = (
     "gemini_api_key",
     "groq_api_key",
     "openrouter_api_key",
-    "marketstack_api_key",
     "app_api_token",
     "alpaca_api_key",
     "alpaca_secret_key",
@@ -141,7 +140,6 @@ class RuntimeSecrets(BaseModel):
     gemini_api_key: SecretStr = SecretStr("")
     groq_api_key: SecretStr = SecretStr("")
     openrouter_api_key: SecretStr = SecretStr("")
-    marketstack_api_key: SecretStr = SecretStr("")
     app_api_token: SecretStr = SecretStr("")
     alpaca_api_key: SecretStr = SecretStr("")
     alpaca_secret_key: SecretStr = SecretStr("")

@@ -66,7 +66,6 @@ class ProviderOriginsConfig(_Strict):
     gemini: AnyUrl = "https://generativelanguage.googleapis.com"
     groq: AnyUrl = "https://api.groq.com"
     telegram: AnyUrl = "https://api.telegram.org"
-    marketstack: AnyUrl = "https://api.marketstack.com"
     coingecko: AnyUrl = "https://api.coingecko.com"
 
 

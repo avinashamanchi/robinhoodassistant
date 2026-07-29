@@ -56,7 +56,6 @@ _SECRET_ATTRS = (
     "gemini_api_key",
     "groq_api_key",
     "openrouter_api_key",
-    "marketstack_api_key",
     "app_api_token",
     "alpaca_api_key",
     "alpaca_secret_key",
