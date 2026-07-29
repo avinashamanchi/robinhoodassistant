@@ -424,8 +424,10 @@ diagnosed pytest process-fixture hang found during the first round-4 full run.
   independent production defect.
 - [x] Load Keychain fields by exact runtime role before retrieval. A watchdog
   fake proves it requests and receives only `database_url`; app, daemon, MCP,
-  preflight, migration, drill, and other roles retain their exact required
-  projections.
+  preflight, migration, drill, and other roles retain their exact
+  startup-required projections. The final bounded correction below
+  supersedes the earlier inference that startup-required fields alone also
+  proved every optional branch-visible field.
 - [x] Exclude legitimate superseded fill tombstones from reconciliation
   arithmetic while retaining fail-closed quarantine handling. Reject empty or
   duplicate remote broker IDs and non-finite, negative, status-inconsistent,
@@ -477,3 +479,46 @@ Unsupported dynamic trust-boundary constructs remain intentionally rejected.
 Composio remains disabled pending provider-side rotation; no webhook, live
 mode, autonomous execution, profit guarantee, service start, real resource
 access, or push was introduced.
+
+## Final bounded role-visibility correction
+
+This correction supersedes only the round-4 overclaim that the
+startup-required-field map was a complete role-capability projection. The
+provider-before-retrieval architecture and database-only watchdog result
+remain valid.
+
+- [x] Retain the pre-existing fake-Keychain watchdog counterexample: before
+  this correction it already passed and proved the provider requested and
+  returned only `database_url`. No false RED is claimed.
+- [x] Record the real RED command before implementation:
+  `9 failed, 6 passed`. It proved missing optional Alpaca paper credentials
+  for `safety-drill`, missing `live_trading_confirm` for `app`, `daemon`,
+  `preflight`, and `safety-drill`, and missing selected news-provider
+  credentials for `mcp`, `paper-drill`, and `safety-drill`.
+- [x] Separate immutable canonical role-visible authority from immutable
+  startup-required authority. Resolve only the configured LLM provider and
+  enabled Telegram/news branches; retain existing key-material validation;
+  use no broad all-fields fallback.
+- [x] Prove `safety-drill` receives optional Alpaca paper credentials while
+  those fields remain optional at ordinary startup. Prove preflight receives
+  `live_trading_confirm` and therefore reports `enabled=live_confirmation`
+  instead of a false all-disabled result.
+- [x] Prove exact fake-Keychain account access and returned values for every
+  production role under the default feature set, plus selected-provider-only
+  news visibility for `mcp`, `paper-drill`, and `safety-drill`.
+- [x] Final focused secret/preflight/safety-drill/watchdog set:
+  `353 passed, 1 warning`.
+- [x] Final 33-file affected trust matrix:
+  `2182 passed, 1 warning in 385.43s`.
+- [x] Repository gate reported `release static checks: PASS`; compileall and
+  `git diff --check` exited zero.
+- [x] Exactly one no-argument full suite for this correction:
+  `3660 passed, 1 skipped, 1 warning in 609.41s`; pytest exited normally.
+- [x] Commit production/tests as
+  `b6cee46bbddc3cae147c1cdaa9b3f970a96d6dbb`; package bounded diff
+  `review-35eee00..b6cee46.diff` and corrected evidence separately.
+
+No required-field validation was weakened. No Plan 3 work, app/daemon/MCP
+start, ignored runtime database, real Keychain/credential, network,
+broker/provider/notifier/integration call, trading action, reconciliation
+write, notification, breaker reset, or push occurred.

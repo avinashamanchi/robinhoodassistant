@@ -1,5 +1,11 @@
 # Task 11 Fix Round 4 Review Package
 
+> Supersession notice: the final bounded role-visibility correction in
+> `task-11-review-package-r4-final-correction.md` supersedes only this
+> package's overbroad claim that exact startup-required projections covered
+> every branch-visible optional field. The database-only watchdog proof and
+> all unrelated round-4 findings remain valid.
+
 ## Review boundary
 
 - Base: `c12ce6f1c5df914f5f40e48d100bdfa0bf3fdb4c`
@@ -26,7 +32,9 @@ full-suite migration caveat without rewriting their historical results.
    not prevent generic loading from requesting every provider account.
    Provider-level `load_for_role` now projects before retrieval. The watchdog
    fake proves its account access and returned mapping are exactly
-   `database_url`; all other roles retain exact requirements.
+   `database_url`; all other roles retained their exact startup-required
+   fields. That required-field statement did not prove complete optional
+   branch visibility and is corrected by the superseding package.
 2. **Superseded fill tombstones — confirmed.** Preflight excludes them from
    trusted arithmetic. Quarantined and otherwise untrusted states still fail
    closed.

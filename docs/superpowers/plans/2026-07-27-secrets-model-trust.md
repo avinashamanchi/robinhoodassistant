@@ -2056,6 +2056,45 @@ the follow-up commit contains evidence only.
   round-3 supersession, and round-4 review package in a separate evidence-only
   commit.
 
+### Task 11 final bounded correction: exact role-visible secret authority
+
+The round-4 provider-before-retrieval design and database-only watchdog proof
+remain valid. This section supersedes only the overbroad inference that exact
+startup-required fields also covered every optional branch-consumed field.
+All production/test changes are in implementation commit
+`b6cee46bbddc3cae147c1cdaa9b3f970a96d6dbb`; the follow-up commit contains
+evidence only.
+
+- [x] Verify the watchdog subclaim before changing production. Its existing
+  fake-Keychain test already passed and proved exact `database_url` account
+  access and returned visibility; retain it as the counterexample rather than
+  manufacturing RED.
+- [x] Record exact RED for the verified omissions:
+  `9 failed, 6 passed`. Missing capabilities were safety-drill optional
+  Alpaca paper credentials, live confirmation for app/daemon/preflight/
+  safety-drill, and selected-provider news credentials for MCP/paper-drill/
+  safety-drill.
+- [x] Define separate immutable canonical startup-required and role-visible
+  maps. Keep required validation unchanged; fail closed if required authority
+  is not visible; use no broad all-fields fallback.
+- [x] Audit every production role. Resolve only the configured LLM provider,
+  feature-enabled Telegram pair, and enabled-news provider. Preserve exact
+  key-material visibility for the roles whose startup validation consumes it.
+- [x] Prove safety-drill receives Alpaca credentials for its optional paper
+  branch without making them startup-required. Prove preflight sees populated
+  `live_trading_confirm` and cannot falsely report all switches disabled.
+- [x] Final focused set:
+  `353 passed, 1 warning`.
+- [x] Final 33-file affected matrix:
+  `2182 passed, 1 warning in 385.43s`.
+- [x] Repository static gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3660 passed, 1 skipped, 1 warning in 609.41s`; pytest exited normally.
+- [x] Package bounded implementation diff `35eee00..b6cee46`, corrected
+  brief/report/progress, round-4 supersession, and final review package in a
+  separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

@@ -901,7 +901,9 @@ and progress ledger form the separate evidence-only commit.
    `MacOSKeychainSecretProvider.load()` still requested all accounts. Round 4
    adds provider-level `load_for_role`; the watchdog fake records account
    access and proves that only `database_url` is requested or returned. Every
-   other runtime role has an exact projection test.
+   other runtime role had an exact startup-required projection test; the final
+   bounded correction below records why that was insufficient for optional
+   branch-visible fields.
 2. **Superseded fill tombstones — confirmed.** They are valid reconciliation
    exclusions and no longer count as drift. Quarantined or otherwise
    untrusted states still fail closed.
@@ -1094,3 +1096,99 @@ Pytest exited normally. The warning is the existing third-party
   database, real Keychain/credential, network, broker/provider/notifier call,
   trading action, reconciliation write, notification, breaker reset, or push
   occurred.
+
+# Task 11 Final Bounded Role-Visibility Correction
+
+## Supersession and verified scope
+
+Round 4 correctly moved projection ahead of Keychain retrieval and correctly
+reduced the watchdog to `database_url`. It overclaimed that the
+startup-required-field map also represented every field a role could consume
+in an optional branch. This correction supersedes only that claim.
+
+The existing standalone watchdog fake-Keychain test was run before any
+implementation change and passed. It already asserted exact account access,
+exact returned database visibility, no encryption-key mapping, and empty
+Alpaca, LLM, signing, backup, Telegram, app-token, and live-confirmation
+fields. The reviewer subclaim that this proof was missing was therefore
+invalid; the hermetic counterexample remains in the suite.
+
+The audit confirmed three projection defects:
+
+1. `safety-drill --alpaca-paper` consumes optional Alpaca paper credentials,
+   but round 4 projected them away.
+2. Preflight consumes `live_trading_confirm` when evaluating dangerous
+   switches, but round 4 projected it away and could falsely report all
+   switches disabled. App, daemon, and safety-drill also have branch-visible
+   live-confirmation authority.
+3. MCP, paper-drill, and safety-drill may consume the selected LLM credential
+   when their news branch is enabled, but round 4 projected every LLM field
+   away for those roles.
+
+Backup, migration, validate-analyst, and watchdog had no additional optional
+simple-secret branch omissions. Existing candidate-signing, backup-encryption,
+and configured field-encryption key visibility remains because startup
+key-material validation consumes it for every role except watchdog.
+
+## Authority model and TDD evidence
+
+The implementation now has two distinct immutable authorities:
+
+- startup-required fields preserve the existing nonempty validation contract;
+- role-visible fields enumerate the maximum exact field capability for each
+  role before configuration narrows it.
+
+The resolver exposes only the selected LLM provider, exposes news LLM
+credentials only when news is enabled for an audited news role, exposes
+Telegram credentials only when the feature is enabled for an authorized
+role, and exposes no field outside that role's canonical tuple. It verifies
+that every startup-required field is visible and otherwise fails closed with
+`authority_mismatch`. There is no broad all-fields fallback.
+
+The exact pre-implementation command selected the standalone watchdog proof,
+the all-role account-access matrix, the safety-drill Alpaca branch, the
+preflight consumer, and the three news roles:
+
+```text
+9 failed, 6 passed
+```
+
+The six passes included the already-safe standalone watchdog proof. The nine
+failing cases were four role-matrix cases (`app`, `daemon`, `preflight`, and
+`safety-drill`), the direct safety-drill consumer, the direct preflight
+consumer, and three selected news-provider cases. After implementation the
+same selection passed `15/15`. A final characterization also proves missing
+Alpaca credentials do not become startup-required for safety-drill.
+
+## Final verification
+
+```text
+Focused secret/preflight/safety-drill/watchdog:
+353 passed, 1 warning
+
+33-file affected trust matrix:
+2182 passed, 1 warning in 385.43s
+
+Repository static gate:
+release static checks: PASS
+
+Compileall:
+PASS
+
+git diff --check:
+PASS
+
+Exactly one no-argument full suite:
+3660 passed, 1 skipped, 1 warning in 609.41s
+```
+
+Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning. Implementation commit
+`b6cee46bbddc3cae147c1cdaa9b3f970a96d6dbb` changes only
+`src/trading_assistant/security/secrets.py` and
+`tests/test_task11_round4.py`.
+
+The correction used fake Keychain account access and local fixtures only. It
+did not start services or access external systems. Paper-only, explicit
+signed-queue, separate-human-approval, kill-switch, broker-truth, no-webhook,
+Composio-disabled, and no-profit-guarantee boundaries are unchanged.
