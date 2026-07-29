@@ -48,6 +48,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  overflow-x: clip;
   background: var(--canvas);
   color: var(--text);
   font: 400 14px/1.55 var(--font-sans);
@@ -266,7 +267,7 @@ pre {
 .primary-nav a,
 .side-nav a {
   display: inline-flex;
-  min-height: 40px;
+  min-height: 44px;
   align-items: center;
   padding: 0 14px;
   border-radius: 9px;
@@ -799,6 +800,14 @@ dialog {
 dialog::backdrop {
   background: rgb(3 2 8 / 78%);
   backdrop-filter: blur(4px);
+}
+
+dialog[aria-busy="true"] {
+  cursor: progress;
+}
+
+dialog[aria-busy="true"]::backdrop {
+  cursor: wait;
 }
 
 .dialog-header,
@@ -2125,7 +2134,8 @@ pre {
   }
 
   .environment-strip {
-    position: static;
+    position: sticky;
+    top: 0;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2284,5 +2294,59 @@ pre {
 
   :focus-visible {
     outline: 3px solid Highlight;
+  }
+}
+
+@media print {
+  body {
+    min-width: 0;
+    background: white;
+    color: black;
+  }
+
+  body::before {
+    display: block;
+    padding: 8pt 0;
+    border-bottom: 2pt solid black;
+    color: black;
+    content: "ALPACA PAPER ONLY — NOT LIVE TRADING";
+    font: 700 10pt/1.3 sans-serif;
+  }
+
+  .backtests-main::before {
+    display: block;
+    margin-bottom: 10pt;
+    padding: 8pt;
+    border: 1pt solid black;
+    color: black;
+    content: "SIMULATED — PAST PERFORMANCE DOES NOT PREDICT FUTURE RESULTS";
+    font: 700 9pt/1.3 sans-serif;
+  }
+
+  .skip-link,
+  .primary-nav,
+  .session-controls,
+  .dialog-actions,
+  .status-region,
+  button,
+  input,
+  select,
+  textarea {
+    display: none !important;
+  }
+
+  .simulated-banner,
+  .simulated-inline,
+  .chart-warning {
+    display: block !important;
+    border-color: black;
+    color: black;
+  }
+
+  .panel,
+  .receipt,
+  .evidence-chart {
+    break-inside: avoid;
+    box-shadow: none;
   }
 }

@@ -2,16 +2,17 @@
 
 import {
   api,
+  closeModal,
   jsonPost,
   loadSession,
   logout,
+  openModal,
 } from "/static/js/auth.js";
 import {
   normalizePosture,
 } from "/static/js/posture.js";
 
 const byId = (id) => document.getElementById(id);
-const dialogReturnFocus = new Map();
 let plansRequestSequence = 0;
 let plansAbortController = null;
 let savedPlansState = [];
@@ -23,6 +24,8 @@ let planApprovalState = null;
 let planApprovalRequestSequence = 0;
 let planCancelState = null;
 let planCancelRequestSequence = 0;
+let planApprovalMutationInFlight = false;
+let planCancelMutationInFlight = false;
 let screenRequestSequence = 0;
 let screenAbortController = null;
 let postureRequestSequence = 0;
@@ -89,54 +92,25 @@ function notify(message, kind = "") {
   window.setTimeout(() => notice.remove(), kind === "notice-error" ? 9000 : 5000);
 }
 
-function showDialog(dialog, trigger) {
-  dialogReturnFocus.set(dialog, trigger || document.activeElement);
-  if (!dialog.open) {
-    dialog.showModal();
-  }
-}
-
 function closeDialog(dialog) {
-  const target = dialogReturnFocus.get(dialog);
-  dialogReturnFocus.delete(dialog);
-  if (dialog.id === "plan-approval-dialog") {
-    poisonPlanApprovalState();
-  }
-  if (dialog.id === "plan-cancel-dialog") {
-    poisonPlanCancelState();
-  }
-  if (dialog.open) {
-    dialog.close();
-  }
-  if (target && typeof target.focus === "function") {
-    target.focus();
-  }
+  closeModal(dialog);
 }
 
-function bindDialogReturnFocus(dialog) {
-  dialog.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeDialog(dialog);
-    }
-  });
-  dialog.addEventListener("close", () => {
-    const target = dialogReturnFocus.get(dialog);
-    dialogReturnFocus.delete(dialog);
-    if (dialog.id === "plan-approval-dialog") {
-      poisonPlanApprovalState();
-    }
-    if (dialog.id === "plan-cancel-dialog") {
-      poisonPlanCancelState();
-    }
-    if (target && typeof target.focus === "function") {
-      target.focus();
+function setPlanModalBusy(dialogId, busy, controlIds) {
+  const dialog = byId(dialogId);
+  if (dialog && typeof dialog.setAttribute === "function") {
+    dialog.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+  controlIds.forEach((id) => {
+    const control = byId(id);
+    if (control) {
+      control.disabled = busy;
     }
   });
 }
 
 function metricTable(headers, rows) {
-  const wrapper = node("div", null, "table-wrap");
+  const wrapper = node("div", null, "table-wrap table-scroll-cue");
   const table = node("table");
   const head = node("thead");
   const headRow = node("tr");
@@ -474,7 +448,10 @@ function validPlanSummary(plan) {
     && typeof plan.status === "string"
     && Boolean(plan.status.trim())
     && typeof plan.paper_only === "boolean"
-    && Number.isFinite(Number(plan.confidence))
+    && typeof plan.confidence === "number"
+    && Number.isFinite(plan.confidence)
+    && plan.confidence >= 0
+    && plan.confidence <= 1
     && typeof plan.as_of === "string"
     && Number.isFinite(Date.parse(plan.as_of))
   );
@@ -831,8 +808,15 @@ function openPlanApproval(plan, detailRequestToken, invoker) {
   );
   byId("plan-approval-reason").value = "";
   byId("plan-approval-submit").disabled = true;
-  showDialog(byId("plan-approval-dialog"), invoker);
-  byId("plan-approval-reason").focus();
+  openModal(
+    byId("plan-approval-dialog"),
+    byId("plan-approval-reason"),
+    {
+      opener: invoker,
+      canDismiss: () => !planApprovalMutationInFlight,
+      onClose: poisonPlanApprovalState,
+    },
+  );
 }
 
 function openPlanCancel(plan, detailRequestToken, invoker) {
@@ -859,8 +843,15 @@ function openPlanCancel(plan, detailRequestToken, invoker) {
     plan.plan && plan.plan.action,
   );
   byId("plan-cancel-reason").value = "";
-  showDialog(byId("plan-cancel-dialog"), invoker);
-  byId("plan-cancel-reason").focus();
+  openModal(
+    byId("plan-cancel-dialog"),
+    byId("plan-cancel-reason"),
+    {
+      opener: invoker,
+      canDismiss: () => !planCancelMutationInFlight,
+      onClose: poisonPlanCancelState,
+    },
+  );
 }
 
 function appendPlanActions(target, plan, detailRequestToken) {
@@ -1280,6 +1271,11 @@ async function submitPlanApproval(event) {
     ...state,
     submitting: true,
   });
+  planApprovalMutationInFlight = true;
+  setPlanModalBusy("plan-approval-dialog", true, [
+    "plan-approval-cancel",
+    "plan-approval-submit",
+  ]);
   poisonPlanApprovalState();
   try {
     const result = await api(
@@ -1306,6 +1302,12 @@ async function submitPlanApproval(event) {
     await showPlan(planId);
   } catch (error) {
     notify(errorText(error), "notice-error");
+  } finally {
+    planApprovalMutationInFlight = false;
+    setPlanModalBusy("plan-approval-dialog", false, [
+      "plan-approval-cancel",
+    ]);
+    byId("plan-approval-submit").disabled = true;
   }
 }
 
@@ -1317,6 +1319,7 @@ async function submitPlanCancel(event) {
     !reason
     || !state
     || state.submitting === true
+    || planCancelMutationInFlight
     || state.requestToken !== planCancelRequestSequence
     || !byId("plan-cancel-dialog").open
     || !currentDetailMatches(
@@ -1336,6 +1339,11 @@ async function submitPlanCancel(event) {
     ...state,
     submitting: true,
   });
+  planCancelMutationInFlight = true;
+  setPlanModalBusy("plan-cancel-dialog", true, [
+    "plan-cancel-close",
+    "plan-cancel-submit",
+  ]);
   try {
     const result = await api(
       `/plans/${planId}/cancel`,
@@ -1358,6 +1366,12 @@ async function submitPlanCancel(event) {
   } catch (error) {
     poisonPlanCancelState();
     notify(errorText(error), "notice-error");
+  } finally {
+    planCancelMutationInFlight = false;
+    setPlanModalBusy("plan-cancel-dialog", false, [
+      "plan-cancel-close",
+      "plan-cancel-submit",
+    ]);
   }
 }
 
@@ -1368,10 +1382,6 @@ async function initialize() {
   } catch (_error) {
     return;
   }
-  [
-    byId("plan-approval-dialog"),
-    byId("plan-cancel-dialog"),
-  ].forEach(bindDialogReturnFocus);
   byId("sign-out").addEventListener("click", async () => {
     try {
       await logout();
@@ -1395,12 +1405,20 @@ async function initialize() {
   );
   byId("plan-approval-cancel").addEventListener(
     "click",
-    () => closeDialog(byId("plan-approval-dialog")),
+    () => {
+      if (!planApprovalMutationInFlight) {
+        closeDialog(byId("plan-approval-dialog"));
+      }
+    },
   );
   byId("plan-cancel-form").addEventListener("submit", submitPlanCancel);
   byId("plan-cancel-close").addEventListener(
     "click",
-    () => closeDialog(byId("plan-cancel-dialog")),
+    () => {
+      if (!planCancelMutationInFlight) {
+        closeDialog(byId("plan-cancel-dialog"));
+      }
+    },
   );
   clearPlanBudget();
   await Promise.allSettled([

@@ -56,7 +56,7 @@
     </div>
   </div>
 
-  <main class="operations-main" id="main-content">
+  <main class="operations-main" id="main-content" aria-labelledby="console-title">
     <section class="page-intro operations-heading" aria-labelledby="console-title">
       <div>
         <p class="section-label">Paper decision ledger</p>
@@ -367,12 +367,16 @@
     </div>
   </main>
 
-  <dialog id="approval-dialog" aria-labelledby="approval-title">
+  <dialog
+    id="approval-dialog"
+    aria-labelledby="approval-title"
+    aria-describedby="approval-description"
+  >
     <form id="approval-form">
       <div class="dialog-header">
         <p class="section-label">Server confirmation</p>
         <h2 id="approval-title">Review exact order proof</h2>
-        <p>Approval remains disabled unless every proof field is present.</p>
+        <p id="approval-description">Approval remains disabled unless every proof field is present.</p>
       </div>
       <div class="dialog-body">
         <p class="proof-status" id="approval-proof-status" role="status">Loading server proof…</p>
@@ -393,7 +397,12 @@
         </dl>
         <div class="field">
           <label for="approval-reason">Approval reason</label>
-          <textarea id="approval-reason" name="reason" required></textarea>
+          <textarea
+            id="approval-reason"
+            name="reason"
+            aria-describedby="approval-description approval-proof-status"
+            required
+          ></textarea>
         </div>
         <p class="field-hint">The server rechecks risk, market state, broker state, and breakers at execution time.</p>
       </div>
@@ -409,51 +418,74 @@
     </form>
   </dialog>
 
-  <dialog id="rejection-dialog" aria-labelledby="rejection-title">
+  <dialog
+    id="rejection-dialog"
+    aria-labelledby="rejection-title"
+    aria-describedby="rejection-description"
+  >
     <form id="rejection-form">
       <div class="dialog-header">
         <p class="section-label">Human decision</p>
         <h2 id="rejection-title">Reject proposed order</h2>
+        <p id="rejection-description">This records a human rejection for the exact proposed paper order.</p>
       </div>
       <div class="dialog-body">
         <div class="field">
           <label for="rejection-reason">Rejection reason</label>
-          <textarea id="rejection-reason" name="reason" required></textarea>
+          <textarea
+            id="rejection-reason"
+            name="reason"
+            aria-describedby="rejection-description"
+            required
+          ></textarea>
         </div>
       </div>
       <div class="dialog-actions">
         <button id="rejection-cancel" type="button">Cancel</button>
-        <button class="button-danger" type="submit">Reject order</button>
+        <button class="button-danger" id="rejection-submit" type="submit">Reject order</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="panic-dialog" aria-labelledby="panic-title">
+  <dialog
+    id="panic-dialog"
+    aria-labelledby="panic-title"
+    aria-describedby="panic-description"
+  >
     <form id="panic-form">
       <div class="dialog-header">
         <p class="section-label">Destructive safety procedure</p>
         <h2 id="panic-title">Request panic cancellation</h2>
-        <p>This asks the server to cancel orders, disable rules, and latch breakers. Only an explicit safe receipt is success.</p>
+        <p id="panic-description">This asks the server to cancel orders, disable rules, and latch breakers. Only an explicit safe receipt is success.</p>
       </div>
       <div class="dialog-body">
         <div class="field">
           <label for="panic-reason">Panic reason</label>
-          <textarea id="panic-reason" name="reason" required></textarea>
+          <textarea
+            id="panic-reason"
+            name="reason"
+            aria-describedby="panic-description"
+            required
+          ></textarea>
         </div>
       </div>
       <div class="dialog-actions">
         <button id="panic-cancel" type="button">Cancel</button>
-        <button class="button-danger-solid" type="submit">Request panic action</button>
+        <button class="button-danger-solid" id="panic-submit" type="submit">Request panic action</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="reauth-dialog" aria-labelledby="reauth-title">
+  <dialog
+    id="reauth-dialog"
+    aria-labelledby="reauth-title"
+    aria-describedby="reauth-description"
+  >
     <form id="reauth-form">
       <div class="dialog-header">
         <p class="section-label">Recent sign-in required</p>
         <h2 id="reauth-title">Verify operator secret</h2>
-        <p>The entered secret is cleared before the verification request.</p>
+        <p id="reauth-description">The entered secret is cleared before the verification request.</p>
       </div>
       <div class="dialog-body">
         <div class="field">
@@ -462,6 +494,7 @@
             id="reauth-secret"
             type="password"
             autocomplete="current-password"
+            aria-describedby="reauth-description reauth-status"
             required
           >
         </div>

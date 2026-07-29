@@ -42,7 +42,11 @@
     Simulated — past performance does not predict future results.
   </div>
 
-  <main class="backtests-main" id="main-content">
+  <main
+    class="backtests-main"
+    id="main-content"
+    aria-labelledby="backtests-page-title"
+  >
     <section class="page-intro backtests-intro" aria-labelledby="backtests-page-title">
       <div>
         <p class="section-label">Evaluation ledger</p>
@@ -171,17 +175,27 @@
     </div>
   </main>
 
-  <dialog id="reauth-dialog" aria-labelledby="reauth-title">
+  <dialog
+    id="reauth-dialog"
+    aria-labelledby="reauth-title"
+    aria-describedby="reauth-description"
+  >
     <form id="reauth-form">
       <div class="dialog-header">
         <p class="section-label">Recent sign-in required</p>
         <h2 id="reauth-title">Verify operator secret</h2>
-        <p>The entered secret is cleared before the verification request.</p>
+        <p id="reauth-description">The entered secret is cleared before the verification request.</p>
       </div>
       <div class="dialog-body">
         <div class="field">
           <label for="reauth-secret">Operator secret</label>
-          <input id="reauth-secret" type="password" autocomplete="current-password" required>
+          <input
+            id="reauth-secret"
+            type="password"
+            autocomplete="current-password"
+            aria-describedby="reauth-description reauth-status"
+            required
+          >
         </div>
         <p class="field-error" id="reauth-status" role="status"></p>
       </div>

@@ -296,6 +296,21 @@ def _run_page_module(
             csrf_token: "csrf-test",
           });
           export const logout = () => Promise.resolve();
+          export const openModal = (dialog, initialFocus, options = {}) => {
+            dialog.__modalOptions = options;
+            dialog.showModal();
+            if (initialFocus && typeof initialFocus.focus === "function") {
+              initialFocus.focus();
+            }
+          };
+          export const closeModal = (dialog) => {
+            const options = dialog.__modalOptions || {};
+            dialog.__modalOptions = null;
+            if (typeof options.onClose === "function") {
+              options.onClose();
+            }
+            dialog.close();
+          };
         `;
         const authUrl = `data:text/javascript;base64,${
           Buffer.from(authSource).toString("base64")
@@ -1759,6 +1774,125 @@ def test_auth_module_reuses_internal_retry_options_and_rotates_action_key():
     )
 
 
+def test_shared_modal_traps_focus_and_refuses_unsafe_user_dismissal():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        r"""
+        class EventTarget {
+          constructor() {
+            this.listeners = new Map();
+          }
+          addEventListener(name, callback) {
+            const callbacks = this.listeners.get(name) || [];
+            callbacks.push(callback);
+            this.listeners.set(name, callbacks);
+          }
+          removeEventListener(name, callback) {
+            const callbacks = this.listeners.get(name) || [];
+            this.listeners.set(
+              name,
+              callbacks.filter((candidate) => candidate !== callback),
+            );
+          }
+          emit(name, overrides = {}) {
+            let prevented = false;
+            let stopped = false;
+            const event = {
+              key: undefined,
+              shiftKey: false,
+              target: this,
+              preventDefault() { prevented = true; },
+              stopPropagation() { stopped = true; },
+              ...overrides,
+            };
+            for (const callback of this.listeners.get(name) || []) {
+              callback(event);
+            }
+            return {prevented, stopped};
+          }
+        }
+        const focusable = (name) => ({
+          name,
+          disabled: false,
+          hidden: false,
+          focusCount: 0,
+          getAttribute: () => null,
+          focus() {
+            this.focusCount += 1;
+            globalThis.document.activeElement = this;
+          },
+        });
+        const opener = focusable("opener");
+        const first = focusable("first");
+        const last = focusable("last");
+        const dialog = new EventTarget();
+        dialog.open = false;
+        dialog.querySelectorAll = () => [first, last];
+        dialog.showModal = () => { dialog.open = true; };
+        dialog.close = () => {
+          if (!dialog.open) return;
+          dialog.open = false;
+          dialog.emit("close");
+        };
+        globalThis.document = {activeElement: opener};
+
+        let safe = false;
+        const dismissals = [];
+        module.openModal(dialog, first, {
+          canDismiss: () => safe,
+          onDismiss: (reason) => dismissals.push(reason),
+        });
+        if (!dialog.open || document.activeElement !== first) {
+          throw new Error("modal did not open on its meaningful control");
+        }
+
+        document.activeElement = last;
+        const forward = dialog.emit("keydown", {key: "Tab"});
+        if (!forward.prevented || document.activeElement !== first) {
+          throw new Error("forward Tab escaped the modal");
+        }
+        document.activeElement = first;
+        const backward = dialog.emit(
+          "keydown",
+          {key: "Tab", shiftKey: true},
+        );
+        if (!backward.prevented || document.activeElement !== last) {
+          throw new Error("backward Tab escaped the modal");
+        }
+
+        const escape = dialog.emit("keydown", {key: "Escape"});
+        const cancel = dialog.emit("cancel");
+        const backdrop = dialog.emit("click", {target: dialog});
+        if (
+          !escape.prevented
+          || !cancel.prevented
+          || !backdrop.prevented
+          || !dialog.open
+          || dismissals.length
+        ) {
+          throw new Error("unsafe modal accepted user dismissal");
+        }
+
+        safe = true;
+        dialog.emit("keydown", {key: "Escape"});
+        if (
+          dialog.open
+          || dismissals.join(",") !== "escape"
+          || document.activeElement !== opener
+        ) {
+          throw new Error("safe dismissal did not close and restore focus");
+        }
+
+        safe = false;
+        module.openModal(dialog, first, {canDismiss: () => safe});
+        module.closeModal(dialog);
+        if (dialog.open || document.activeElement !== opener) {
+          throw new Error("verified programmatic close was blocked");
+        }
+        """,
+    )
+
+
 def test_login_clears_secret_before_fetch_even_when_network_fails():
     _run_module(
         _STATIC / "js" / "login.js",
@@ -1803,6 +1937,84 @@ def test_login_clears_secret_before_fetch_even_when_network_fails():
         }
         """,
     )
+
+
+def test_login_429_copy_uses_only_bounded_retry_after_seconds():
+    _run_module(
+        _STATIC / "js" / "login.js",
+        r"""
+        const listeners = {};
+        const form = {
+          addEventListener: (name, callback) => { listeners[name] = callback; },
+        };
+        const statusLine = {textContent: ""};
+        const secretInput = {
+          value: "first-secret",
+          focus() {},
+        };
+        globalThis.document = {
+          getElementById: (id) => ({
+            "login-form": form,
+            "login-status": statusLine,
+            "login-secret": secretInput,
+          })[id],
+        };
+        globalThis.window = {location: {assign() {}}};
+        const responses = [
+          {
+            status: 429,
+            ok: false,
+            headers: new Headers({"Retry-After": "17"}),
+          },
+          {
+            status: 429,
+            ok: false,
+            headers: new Headers({"Retry-After": "999999"}),
+          },
+        ];
+        globalThis.fetch = async () => responses.shift();
+        await import(`data:text/javascript;base64,${Buffer.from(
+          fs.readFileSync(process.argv[1], "utf8"),
+        ).toString("base64")}#login-rate`);
+
+        await listeners.submit({preventDefault() {}});
+        if (
+          statusLine.textContent
+          !== "Too many sign-in attempts. Try again in 17 seconds."
+        ) {
+          throw new Error(`unexpected bounded copy: ${statusLine.textContent}`);
+        }
+        secretInput.value = "second-secret";
+        await listeners.submit({preventDefault() {}});
+        if (
+          statusLine.textContent
+          !== "Too many sign-in attempts. Try again later."
+        ) {
+          throw new Error(`unbounded retry leaked: ${statusLine.textContent}`);
+        }
+        """,
+    )
+
+
+def test_login_and_reauthentication_clear_local_secret_material_in_finally():
+    login = (_STATIC / "js" / "login.js").read_text(encoding="utf-8")
+    auth = (_STATIC / "js" / "auth.js").read_text(encoding="utf-8")
+
+    login_submit = login[login.index('form.addEventListener("submit"'):]
+    assert "let secret =" in login_submit
+    assert "let requestBody =" in login_submit
+    assert "finally {" in login_submit
+    login_finally = login_submit[login_submit.index("finally {"):]
+    assert 'secret = "";' in login_finally
+    assert 'requestBody = "";' in login_finally
+
+    reauth = auth[auth.index("async function reauthenticate()"):]
+    assert "let secret =" in reauth
+    assert "let requestBody =" in reauth
+    assert "finally {" in reauth
+    reauth_finally = reauth[reauth.index("finally {"):]
+    assert 'secret = "";' in reauth_finally
+    assert 'requestBody = "";' in reauth_finally
 
 
 _APPROVAL_DOM_SETUP = r"""
@@ -2107,6 +2319,126 @@ def test_approval_dialog_blocks_double_submit_for_one_target():
         }
         if (elements["approval-reason"].value !== "") {
           throw new Error("approval state was not cleared after submit");
+        }
+        """,
+    )
+
+
+def test_order_approval_modal_blocks_user_dismissal_during_submission():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        (
+            "refreshPending",
+            "openApproval",
+            "submitApproval",
+            "updateApprovalButton",
+            "closeDialog",
+        ),
+        _APPROVAL_DOM_SETUP
+        + r"""
+        const approval = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/pending") {
+            return Promise.resolve({pending: [pendingOrder(1, "AAPL")]});
+          }
+          if (path === "/pending/1/confirmation") {
+            return Promise.resolve(confirmation(1, "AAPL"));
+          }
+          if (path === "/approve/1") return approval.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPending();
+        await module.openApproval(1, elements["approval-form"]);
+        const options = elements["approval-dialog"].__modalOptions;
+        if (!options || options.canDismiss() !== true) {
+          throw new Error("approval modal did not start dismissible");
+        }
+        elements["approval-reason"].value = "reviewed exact proof";
+        module.updateApprovalButton();
+        module.submitApproval({preventDefault() {}});
+        await flush();
+        if (options.canDismiss() !== false) {
+          throw new Error("approval modal remained user-dismissible in flight");
+        }
+        module.closeDialog(elements["approval-dialog"]);
+        if (elements["approval-dialog"].open) {
+          throw new Error("verified programmatic approval close was blocked");
+        }
+        """,
+    )
+
+
+def test_rejection_modal_blocks_user_dismissal_during_submission():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("openRejection", "submitRejection", "closeDialog"),
+        r"""
+        const elements = installDom([
+          "rejection-dialog",
+          "rejection-reason",
+          "status-region",
+          "receipt-panel",
+        ]);
+        const rejection = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/reject/7") return rejection.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        module.openRejection(7, elements["rejection-reason"]);
+        const options = elements["rejection-dialog"].__modalOptions;
+        if (!options || options.canDismiss() !== true) {
+          throw new Error("rejection modal did not start dismissible");
+        }
+        elements["rejection-reason"].value = "operator rejected";
+        module.submitRejection({preventDefault() {}});
+        await flush();
+        if (options.canDismiss() !== false) {
+          throw new Error("rejection modal remained user-dismissible in flight");
+        }
+        module.closeDialog(elements["rejection-dialog"]);
+        if (elements["rejection-dialog"].open) {
+          throw new Error("verified programmatic rejection close was blocked");
+        }
+        """,
+    )
+
+
+def test_panic_modal_blocks_user_dismissal_during_submission():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("openPanic", "submitPanic", "closeDialog"),
+        r"""
+        const elements = installDom([
+          "panic-dialog",
+          "panic-reason",
+          "status-region",
+          "receipt-panel",
+          "critical-banner",
+          "critical-banner-title",
+          "critical-banner-message",
+        ]);
+        const panic = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/panic") return panic.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        module.openPanic(elements["panic-reason"]);
+        const options = elements["panic-dialog"].__modalOptions;
+        if (!options || options.canDismiss() !== true) {
+          throw new Error("panic modal did not start dismissible");
+        }
+        elements["panic-reason"].value = "halt reviewed paper activity";
+        module.submitPanic({preventDefault() {}});
+        await flush();
+        if (options.canDismiss() !== false) {
+          throw new Error("panic modal remained user-dismissible in flight");
+        }
+        module.closeDialog(elements["panic-dialog"]);
+        if (elements["panic-dialog"].open) {
+          throw new Error("verified programmatic panic close was blocked");
         }
         """,
     )
@@ -4159,6 +4491,73 @@ def test_plan_approval_blocks_double_submit():
     )
 
 
+def test_plan_mutation_modals_block_user_dismissal_during_submission():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+            "submitPlanCancel",
+            "closeDialog",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const approval = deferred();
+        const cancellation = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/1/approve") return approval.promise;
+          if (path === "/plans/1/cancel") return cancellation.promise;
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(
+          elements["plan-detail"],
+          "Review plan approval",
+        ).click();
+        const approvalOptions = (
+          elements["plan-approval-dialog"].__modalOptions
+        );
+        if (!approvalOptions || approvalOptions.canDismiss() !== true) {
+          throw new Error("plan approval modal did not start dismissible");
+        }
+        elements["plan-approval-reason"].value = "reviewed paper plan";
+        module.submitPlanApproval({preventDefault() {}});
+        await flush();
+        if (approvalOptions.canDismiss() !== false) {
+          throw new Error(
+            "plan approval modal remained user-dismissible in flight",
+          );
+        }
+        module.closeDialog(elements["plan-approval-dialog"]);
+        if (elements["plan-approval-dialog"].open) {
+          throw new Error("programmatic plan approval close was blocked");
+        }
+
+        findButton(elements["plan-detail"], "Cancel plan").click();
+        const cancelOptions = elements["plan-cancel-dialog"].__modalOptions;
+        if (!cancelOptions || cancelOptions.canDismiss() !== true) {
+          throw new Error("plan cancellation modal did not start dismissible");
+        }
+        elements["plan-cancel-reason"].value = "retire stale plan";
+        module.submitPlanCancel({preventDefault() {}});
+        await flush();
+        if (cancelOptions.canDismiss() !== false) {
+          throw new Error(
+            "plan cancellation modal remained user-dismissible in flight",
+          );
+        }
+        module.closeDialog(elements["plan-cancel-dialog"]);
+        if (elements["plan-cancel-dialog"].open) {
+          throw new Error("programmatic plan cancellation close was blocked");
+        }
+        """,
+    )
+
+
 def test_plan_detail_response_id_mismatch_fails_closed():
     _run_page_module(
         _STATIC / "js" / "plans.js",
@@ -4310,6 +4709,81 @@ def test_plan_list_failure_or_malformed_envelope_clears_stale_authority():
           () => {},
         );
         assertCleared("malformed refresh");
+        """,
+    )
+
+
+def test_plan_list_rejects_coercive_confidence_and_clears_stale_authority():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("showPlan", "refreshPlans"),
+        _PLAN_DOM_SETUP
+        + r"""
+        elements["plans-list"] = document.createElement("div");
+        elements["plan-filter"] = document.createElement("input");
+        document.getElementById = (id) => elements[id] || null;
+        let currentConfidence = 0.5;
+        globalThis.__api = (path) => {
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans") {
+            return Promise.resolve({
+              plans: [{
+                plan_id: 1,
+                symbol: "AAPL",
+                action: "buy",
+                status: "proposed",
+                paper_only: true,
+                confidence: currentConfidence,
+                as_of: "2026-07-29T16:00:00+00:00",
+              }],
+            });
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+        const assertCleared = (stage) => {
+          const detail = elements["plan-detail"].textContent;
+          if (
+            detail.includes("AAPL test thesis")
+            || findButton(elements["plan-detail"], "Review plan approval")
+            || findButton(elements["plan-detail"], "Cancel plan")
+            || elements["plan-approval-dialog"].open
+            || !detail.includes("unavailable")
+          ) {
+            throw new Error(`${stage} retained stale plan authority`);
+          }
+        };
+
+        for (const invalid of [
+          null,
+          false,
+          "",
+          [],
+          -0.01,
+          1.01,
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+        ]) {
+          await module.showPlan(1);
+          findButton(
+            elements["plan-detail"],
+            "Review plan approval",
+          ).click();
+          currentConfidence = invalid;
+          let rejected = false;
+          try {
+            await module.refreshPlans();
+          } catch (_error) {
+            rejected = true;
+          }
+          if (!rejected) {
+            throw new Error(
+              `coercive confidence ${String(invalid)} was accepted`,
+            );
+          }
+          assertCleared(`confidence ${String(invalid)}`);
+        }
         """,
     )
 
@@ -4869,20 +5343,20 @@ def test_pages_include_accessible_session_actions_dialogs_and_live_regions():
     assert "Sign out" in index
 
 
-@pytest.mark.parametrize("script", ["index.js", "plans.js"])
-def test_review_dialogs_close_on_escape_and_restore_invoker_focus(script):
-    text = (_STATIC / "js" / script).read_text(encoding="utf-8")
+def test_review_dialogs_use_the_shared_modal_security_boundary():
+    auth = (_STATIC / "js" / "auth.js").read_text(encoding="utf-8")
 
-    assert 'event.key === "Escape"' in text
-    assert "closeDialog(dialog)" in text
-    assert "target.focus()" in text
-    close_start = text.index("function closeDialog(dialog)")
-    target_lookup = text.index(
-        "const target = dialogReturnFocus.get(dialog)",
-        close_start,
-    )
-    native_close = text.index("dialog.close()", close_start)
-    assert target_lookup < native_close
+    assert "export function openModal(" in auth
+    assert "export function closeModal(" in auth
+    assert "requestReauthenticationInput" in auth
+    assert "openModal(dialog, input" in auth
+    assert "closeModal(dialog)" in auth
+    for script in ("index.js", "plans.js"):
+        text = (_STATIC / "js" / script).read_text(encoding="utf-8")
+        assert "openModal," in text
+        assert "closeModal," in text
+        assert "dialogReturnFocus" not in text
+        assert "bindDialogReturnFocus" not in text
 
 
 def test_console_workspace_constrains_mobile_data_without_hiding_it():

@@ -32,18 +32,25 @@
     <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Sign in required</strong></div>
     <div class="environment-cell"><span>Observed</span><strong class="is-stale">Not authenticated</strong></div>
   </div>
-  <main class="login-shell" id="main-content">
+  <main
+    class="login-shell"
+    id="main-content"
+    aria-labelledby="login-context-title"
+  >
     <section class="login-context" aria-labelledby="login-context-title">
       <div>
-        <p class="brand-mark">Local paper-trading security boundary</p>
-        <h1 id="login-context-title">Know the state before you move capital.</h1>
-        <p>Broker truth, scoped safety state, and operator actions stay visibly separate.</p>
+        <p class="brand-mark">Loopback access boundary</p>
+        <h1 id="login-context-title">Local HTTPS operator console</h1>
+        <p>Alpaca paper only. Broker truth, scoped safety state, and operator actions stay visibly separate.</p>
       </div>
       <p class="login-proof">Local session · HttpOnly cookie · in-memory request protection</p>
     </section>
-    <form class="login-form" id="login-form">
-      <h2>Operator sign in</h2>
-      <p>Use the local operator secret. It is cleared from this form before the request begins.</p>
+    <form class="login-form" id="login-form" aria-labelledby="login-form-title">
+      <h2 id="login-form-title">Operator sign in</h2>
+      <p id="login-secret-help">
+        Use the local operator secret. It is cleared from this form before the
+        request begins and is never stored by this page.
+      </p>
       <div class="field">
         <label for="login-secret">Operator secret</label>
         <input
@@ -51,6 +58,7 @@
           name="secret"
           type="password"
           autocomplete="current-password"
+          aria-describedby="login-secret-help login-status"
           required
         >
       </div>

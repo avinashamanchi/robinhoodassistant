@@ -132,8 +132,13 @@ class PageContractParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.ids: set[str] = set()
+        self.attributes_by_id: dict[str, dict[str, str | None]] = {}
         self.labels: set[str] = set()
         self.controls: list[tuple[str, str]] = []
+        self.headings: list[int] = []
+        self.landmarks: list[tuple[str, dict[str, str | None]]] = []
+        self.dialogs: list[dict[str, str | None]] = []
+        self.live_regions: list[tuple[str, str]] = []
         self.main_count = 0
         self.h1_count = 0
         self.inline_scripts = 0
@@ -147,10 +152,21 @@ class PageContractParser(HTMLParser):
         element_id = attributes.get("id")
         if element_id:
             self.ids.add(element_id)
+            self.attributes_by_id[element_id] = attributes
         if tag == "main":
             self.main_count += 1
         if tag == "h1":
             self.h1_count += 1
+        if re.fullmatch(r"h[1-6]", tag):
+            self.headings.append(int(tag[1]))
+        if tag in {"main", "nav", "aside"}:
+            self.landmarks.append((tag, attributes))
+        if tag == "dialog":
+            self.dialogs.append(attributes)
+        if attributes.get("aria-live"):
+            self.live_regions.append(
+                (element_id or "", attributes["aria-live"] or "")
+            )
         if tag == "label" and attributes.get("for"):
             self.labels.add(attributes["for"])
         if tag in {"input", "select", "textarea"}:
@@ -249,6 +265,86 @@ def test_every_form_control_keeps_an_explicit_label(page):
     for tag, element_id in parsed.controls:
         assert element_id, f"{page}: {tag} is missing an id"
         assert element_id in parsed.labels, f"{page}: #{element_id} is unlabeled"
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_accessibility_regions_are_named_and_headings_do_not_skip_levels(page):
+    """Removing a landmark name, dialog description, or heading level breaks navigation."""
+    parsed = parse_page(page)
+
+    assert parsed.headings
+    assert parsed.headings[0] == 1
+    for previous, current in zip(parsed.headings, parsed.headings[1:]):
+        assert current <= previous + 1, (
+            f"{page}: heading level jumps from h{previous} to h{current}"
+        )
+    for tag, attributes in parsed.landmarks:
+        assert (
+            attributes.get("aria-label")
+            or attributes.get("aria-labelledby")
+        ), f"{page}: {tag} landmark has no accessible name"
+    for attributes in parsed.dialogs:
+        assert attributes.get("aria-labelledby"), (
+            f"{page}: dialog has no title association"
+        )
+        description_id = attributes.get("aria-describedby")
+        assert description_id, f"{page}: dialog has no description association"
+        assert description_id in parsed.ids, (
+            f"{page}: dialog description #{description_id} is missing"
+        )
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_accessibility_live_regions_are_bounded_status_surfaces(page):
+    """Arbitrary dynamic containers must not become noisy announcement regions."""
+    parsed = parse_page(page)
+    allowed = {"chat-log", "status-region", "login-status"}
+
+    for element_id, politeness in parsed.live_regions:
+        assert element_id in allowed, (
+            f"{page}: #{element_id or '<anonymous>'} is an unbounded live region"
+        )
+        assert politeness == "polite"
+
+
+def test_login_accessibility_names_https_paper_boundary_and_one_secret():
+    """The entry page must state its transport/account boundary without secret setup hints."""
+    html = static_text("login.html")
+    parsed = parse_page("login.html")
+    password_controls = [
+        element_id
+        for tag, element_id in parsed.controls
+        if (
+            tag == "input"
+            and parsed.attributes_by_id[element_id].get("type") == "password"
+        )
+    ]
+
+    assert "Local HTTPS operator console" in html
+    assert "Alpaca paper only" in html
+    assert password_controls == ["login-secret"]
+    described_by = (
+        parsed.attributes_by_id["login-secret"]
+        .get("aria-describedby", "")
+        .split()
+    )
+    assert {"login-secret-help", "login-status"} <= set(described_by)
+    assert "never stored by this page" in html
+    assert ".env" not in html
+    assert "token" not in html.lower()
+
+
+@pytest.mark.parametrize("page", AUTHENTICATED_PAGES)
+def test_reauthentication_secret_has_help_and_error_associations(page):
+    """Recent-auth errors must be announced in the context of the secret field."""
+    parsed = parse_page(page)
+    described_by = (
+        parsed.attributes_by_id["reauth-secret"]
+        .get("aria-describedby", "")
+        .split()
+    )
+
+    assert {"reauth-description", "reauth-status"} <= set(described_by)
 
 
 @pytest.mark.parametrize("page", AUTHENTICATED_PAGES)
@@ -403,6 +499,48 @@ def test_operations_layout_moves_the_proof_rail_without_shrinking_actions():
     assert ".proof-rail" in css
     assert "grid-template-areas:" in css
     assert "min-height: 44px;" in css
+
+
+def test_responsive_console_preserves_touch_targets_and_page_width():
+    """Mobile layout cannot shrink primary targets or hide page-level overflow bugs."""
+    css = static_text("css/console.css")
+    nav_start = css.index(".primary-nav a,")
+    nav_rule = css[nav_start:css.index("}", nav_start)]
+    mobile_start = css.index("@media (max-width: 759px)")
+    mobile_rule = css[mobile_start:css.index(
+        "/* 11. Reduced motion",
+        mobile_start,
+    )]
+
+    assert "min-height: 44px;" in nav_rule
+    assert "overflow-x: clip;" in css
+    assert ".environment-strip" in mobile_rule
+    assert "position: sticky;" in mobile_rule
+    assert "top: 0;" in mobile_rule
+
+
+def test_dynamic_tables_use_a_visible_horizontal_scroll_cue():
+    """Data tables must scroll inside a named wrapper instead of clipping at mobile width."""
+    for script in ("js/index.js", "js/plans.js", "js/backtests.js"):
+        source = static_text(script)
+        assert '"table-wrap table-scroll-cue"' in source
+
+    css = static_text("css/console.css")
+    assert ".table-scroll-cue::before" in css
+    assert "Scroll horizontally" in css
+
+
+def test_print_output_keeps_paper_and_simulation_labels_while_hiding_controls():
+    """Printed evidence must remain unmistakably paper-only and simulated where applicable."""
+    css = static_text("css/console.css")
+    print_start = css.index("@media print")
+    print_rule = css[print_start:]
+
+    assert "ALPACA PAPER ONLY" in print_rule
+    assert "SIMULATED" in print_rule
+    assert ".primary-nav" in print_rule
+    assert ".dialog-actions" in print_rule
+    assert "display: none !important;" in print_rule
 
 
 def test_plans_page_exposes_a_three_pane_paper_research_workspace():

@@ -3,6 +3,202 @@
 let csrfToken = null;
 let sessionPromise = null;
 let reauthenticationRequester = requestReauthenticationInput;
+const modalStates = new WeakMap();
+const MODAL_FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function focusableModalControls(dialog) {
+  if (!dialog || typeof dialog.querySelectorAll !== "function") {
+    return [];
+  }
+  return Array.from(dialog.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter(
+    (element) => (
+      element
+      && element.disabled !== true
+      && element.hidden !== true
+      && (
+        typeof element.getAttribute !== "function"
+        || element.getAttribute("aria-hidden") !== "true"
+      )
+    ),
+  );
+}
+
+function modalCanDismiss(state) {
+  try {
+    return state.canDismiss() === true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function finalizeModal(dialog, restoreFocus = true) {
+  const state = modalStates.get(dialog);
+  if (!state || state.finalized) {
+    return;
+  }
+  state.finalized = true;
+  modalStates.delete(dialog);
+  dialog.removeEventListener("keydown", state.keydownListener);
+  dialog.removeEventListener("cancel", state.cancelListener);
+  dialog.removeEventListener("click", state.clickListener);
+  dialog.removeEventListener("close", state.closeListener);
+  if (typeof state.closeCallback === "function") {
+    state.closeCallback();
+  }
+  if (
+    restoreFocus
+    && state.opener
+    && typeof state.opener.focus === "function"
+  ) {
+    state.opener.focus();
+  }
+}
+
+function requestModalDismiss(dialog, reason, event) {
+  if (event && typeof event.preventDefault === "function") {
+    event.preventDefault();
+  }
+  if (event && typeof event.stopPropagation === "function") {
+    event.stopPropagation();
+  }
+  const state = modalStates.get(dialog);
+  if (!state || !modalCanDismiss(state)) {
+    return false;
+  }
+  if (typeof state.dismissCallback === "function") {
+    try {
+      if (state.dismissCallback(reason) === false) {
+        return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+  }
+  closeModal(dialog);
+  return true;
+}
+
+function trapModalFocus(dialog, event) {
+  const controls = focusableModalControls(dialog);
+  if (!controls.length) {
+    event.preventDefault();
+    if (typeof dialog.focus === "function") {
+      dialog.focus();
+    }
+    return;
+  }
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !controls.includes(active))) {
+    event.preventDefault();
+    last.focus();
+    return;
+  }
+  if (!event.shiftKey && (active === last || !controls.includes(active))) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+export function openModal(dialog, initialFocus, options = {}) {
+  if (
+    !dialog
+    || typeof dialog.showModal !== "function"
+    || typeof dialog.addEventListener !== "function"
+  ) {
+    throw new TypeError("A dialog element is required");
+  }
+  const previous = modalStates.get(dialog);
+  const previousOpener = previous && previous.opener;
+  if (previous) {
+    previous.finalized = true;
+    dialog.removeEventListener("keydown", previous.keydownListener);
+    dialog.removeEventListener("cancel", previous.cancelListener);
+    dialog.removeEventListener("click", previous.clickListener);
+    dialog.removeEventListener("close", previous.closeListener);
+    modalStates.delete(dialog);
+  }
+  const {
+    opener: requestedOpener,
+    canDismiss: requestedCanDismiss,
+    onDismiss: requestedDismissCallback,
+    onClose: requestedCloseCallback,
+  } = options;
+  const opener = requestedOpener || previousOpener || document.activeElement;
+  const state = {
+    opener,
+    canDismiss: typeof requestedCanDismiss === "function"
+      ? requestedCanDismiss
+      : () => requestedCanDismiss !== false,
+    dismissCallback: typeof requestedDismissCallback === "function"
+      ? requestedDismissCallback
+      : null,
+    closeCallback: typeof requestedCloseCallback === "function"
+      ? requestedCloseCallback
+      : null,
+    finalized: false,
+    keydownListener: null,
+    cancelListener: null,
+    clickListener: null,
+    closeListener: null,
+  };
+  state.keydownListener = (event) => {
+    if (event.key === "Tab") {
+      trapModalFocus(dialog, event);
+      return;
+    }
+    if (event.key === "Escape") {
+      requestModalDismiss(dialog, "escape", event);
+    }
+  };
+  state.cancelListener = (event) => {
+    requestModalDismiss(dialog, "cancel", event);
+  };
+  state.clickListener = (event) => {
+    if (event.target === dialog) {
+      requestModalDismiss(dialog, "backdrop", event);
+    }
+  };
+  state.closeListener = () => {
+    finalizeModal(dialog);
+  };
+  modalStates.set(dialog, state);
+  dialog.addEventListener("keydown", state.keydownListener);
+  dialog.addEventListener("cancel", state.cancelListener);
+  dialog.addEventListener("click", state.clickListener);
+  dialog.addEventListener("close", state.closeListener);
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+  const target = (
+    initialFocus
+    && typeof initialFocus.focus === "function"
+  )
+    ? initialFocus
+    : focusableModalControls(dialog)[0];
+  if (target && typeof target.focus === "function") {
+    target.focus();
+  }
+  return dialog;
+}
+
+export function closeModal(dialog) {
+  if (!dialog) {
+    return;
+  }
+  if (dialog.open && typeof dialog.close === "function") {
+    dialog.close();
+  }
+  finalizeModal(dialog);
+}
 
 export class ApiRequestError extends Error {
   constructor(
@@ -150,8 +346,16 @@ export function configureReauthentication(requester) {
 }
 
 async function reauthenticate() {
-  const input = await reauthenticationRequester();
-  if (!input || typeof input.value !== "string") {
+  const submitted = await reauthenticationRequester();
+  const hasSubmittedSecret = (
+    typeof submitted === "string"
+    || (
+      submitted
+      && typeof submitted === "object"
+      && typeof submitted.value === "string"
+    )
+  );
+  if (!hasSubmittedSecret) {
     throw new ApiRequestError("Reauthentication was canceled", {
       code: "reauthentication_canceled",
       status: 0,
@@ -159,24 +363,34 @@ async function reauthenticate() {
       body: {},
     });
   }
-  const secret = input.value;
-  const body = JSON.stringify({secret});
-  input.value = "";
-  if (!secret) {
-    throw new ApiRequestError("Operator secret is required", {
-      code: "invalid_credentials",
-      status: 0,
-      requestId: null,
-      body: {},
-    });
+  let secret = typeof submitted === "string"
+    ? submitted
+    : submitted.value;
+  if (submitted && typeof submitted === "object" && "value" in submitted) {
+    submitted.value = "";
   }
-  const result = await fetchJson("/auth/reauth", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body,
-  });
-  if (!result.response.ok) {
-    throw errorFromResponse(result.response, result.body);
+  let requestBody = "";
+  try {
+    if (!secret) {
+      throw new ApiRequestError("Operator secret is required", {
+        code: "invalid_credentials",
+        status: 0,
+        requestId: null,
+        body: {},
+      });
+    }
+    requestBody = JSON.stringify({secret});
+    const result = await fetchJson("/auth/reauth", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: requestBody,
+    });
+    if (!result.response.ok) {
+      throw errorFromResponse(result.response, result.body);
+    }
+  } finally {
+    secret = "";
+    requestBody = "";
   }
 }
 
@@ -240,24 +454,21 @@ function requestReauthenticationInput() {
     ));
   }
 
-  const returnFocus = document.activeElement;
   status.textContent = "";
   input.value = "";
-  dialog.showModal();
-  input.focus();
 
   return new Promise((resolve, reject) => {
+    let settled = false;
     const cleanup = () => {
       form.removeEventListener("submit", onSubmit);
       cancel.removeEventListener("click", onCancel);
-      dialog.removeEventListener("cancel", onDialogCancel);
-      if (returnFocus && typeof returnFocus.focus === "function") {
-        returnFocus.focus();
-      }
     };
-    const closeAndReject = () => {
+    const rejectCancellation = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       input.value = "";
-      dialog.close();
       cleanup();
       reject(new ApiRequestError("Reauthentication was canceled", {
         code: "reauthentication_canceled",
@@ -273,20 +484,29 @@ function requestReauthenticationInput() {
         input.focus();
         return;
       }
-      dialog.close();
+      let secret = input.value;
+      input.value = "";
+      settled = true;
       cleanup();
-      resolve(input);
+      closeModal(dialog);
+      resolve(secret);
+      secret = "";
     };
     const onCancel = (event) => {
       event.preventDefault();
-      closeAndReject();
-    };
-    const onDialogCancel = (event) => {
-      event.preventDefault();
-      closeAndReject();
+      rejectCancellation();
+      closeModal(dialog);
     };
     form.addEventListener("submit", onSubmit);
     cancel.addEventListener("click", onCancel);
-    dialog.addEventListener("cancel", onDialogCancel);
+    openModal(dialog, input, {
+      canDismiss: () => !settled,
+      onDismiss: () => {
+        rejectCancellation();
+      },
+      onClose: () => {
+        rejectCancellation();
+      },
+    });
   });
 }

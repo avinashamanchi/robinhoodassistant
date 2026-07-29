@@ -2,9 +2,11 @@
 
 import {
   api,
+  closeModal,
   jsonPost,
   loadSession,
   logout,
+  openModal,
 } from "/static/js/auth.js";
 import {
   clearPosture,
@@ -25,7 +27,6 @@ const unsafeLocalIdFields = [
   "active_rule_ids",
   "unsafe_rule_group_ids",
 ];
-const dialogReturnFocus = new Map();
 const HEALTH_OBSERVATION_MAX_AGE_MS = 30000;
 const ACCOUNT_OBSERVATION_MAX_AGE_MS = 30000;
 const OPERATIONAL_REQUEST_TIMEOUT_MS = 10000;
@@ -39,6 +40,9 @@ let pendingRequestSequence = 0;
 let approvalDialogState = null;
 let approvalRequestSequence = 0;
 let rejectionOrderId = null;
+let approvalMutationInFlight = false;
+let rejectionMutationInFlight = false;
+let panicMutationInFlight = false;
 let unsafePanicLatched = false;
 let providerCallAllowed = false;
 let providerCallReason = "Provider call blocked before network I/O";
@@ -98,42 +102,19 @@ function notify(message, kind = "") {
   window.setTimeout(() => notice.remove(), kind === "notice-error" ? 9000 : 5000);
 }
 
-function showDialog(dialog, trigger) {
-  dialogReturnFocus.set(dialog, trigger || document.activeElement);
-  if (!dialog.open) {
-    dialog.showModal();
-  }
-}
-
 function closeDialog(dialog) {
-  const target = dialogReturnFocus.get(dialog);
-  dialogReturnFocus.delete(dialog);
-  if (dialog.id === "approval-dialog") {
-    poisonApprovalState();
-  }
-  if (dialog.open) {
-    dialog.close();
-  }
-  if (target && typeof target.focus === "function") {
-    target.focus();
-  }
+  closeModal(dialog);
 }
 
-function bindDialogReturnFocus(dialog) {
-  dialog.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeDialog(dialog);
-    }
-  });
-  dialog.addEventListener("close", () => {
-    const target = dialogReturnFocus.get(dialog);
-    dialogReturnFocus.delete(dialog);
-    if (dialog.id === "approval-dialog") {
-      poisonApprovalState();
-    }
-    if (target && typeof target.focus === "function") {
-      target.focus();
+function setModalMutationBusy(dialogId, busy, controlIds) {
+  const dialog = byId(dialogId);
+  if (dialog && typeof dialog.setAttribute === "function") {
+    dialog.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+  controlIds.forEach((id) => {
+    const control = byId(id);
+    if (control) {
+      control.disabled = busy;
     }
   });
 }
@@ -229,7 +210,7 @@ function clearAccountTruth(message) {
 }
 
 function makeTable(headers, rows) {
-  const wrapper = node("div", null, "table-wrap");
+  const wrapper = node("div", null, "table-wrap table-scroll-cue");
   const table = node("table");
   const head = node("thead");
   const headRow = node("tr");
@@ -663,7 +644,11 @@ async function openApproval(orderId, trigger) {
   byId("approval-proof-status").textContent = "Loading exact server proof…";
   byId("approval-proof-status").className = "proof-status";
   const dialog = byId("approval-dialog");
-  showDialog(dialog, trigger);
+  openModal(dialog, byId("approval-cancel"), {
+    opener: trigger,
+    canDismiss: () => !approvalMutationInFlight,
+    onClose: poisonApprovalState,
+  });
   try {
     const proof = await api(`/pending/${targetOrderId}/confirmation`);
     if (!approvalTokenIsCurrent(requestToken, targetOrderId)) {
@@ -711,6 +696,11 @@ async function submitApproval(event) {
     ...state,
     submitting: true,
   });
+  approvalMutationInFlight = true;
+  setModalMutationBusy("approval-dialog", true, [
+    "approval-cancel",
+    "approval-confirm-button",
+  ]);
   poisonApprovalState();
   try {
     const result = await api(`/approve/${orderId}`, jsonPost({reason}));
@@ -738,24 +728,46 @@ async function submitApproval(event) {
         "Approval state was cleared after the failed submission. Close and review again."
       );
     }
+  } finally {
+    approvalMutationInFlight = false;
+    setModalMutationBusy("approval-dialog", false, ["approval-cancel"]);
+    byId("approval-confirm-button").disabled = true;
   }
 }
 
 function openRejection(orderId, trigger) {
+  if (rejectionMutationInFlight) {
+    return;
+  }
   rejectionOrderId = orderId;
   byId("rejection-reason").value = "";
-  showDialog(byId("rejection-dialog"), trigger);
-  byId("rejection-reason").focus();
+  openModal(byId("rejection-dialog"), byId("rejection-reason"), {
+    opener: trigger,
+    canDismiss: () => !rejectionMutationInFlight,
+    onClose: () => {
+      rejectionOrderId = null;
+      byId("rejection-reason").value = "";
+    },
+  });
 }
 
 async function submitRejection(event) {
   event.preventDefault();
   const reason = byId("rejection-reason").value.trim();
-  if (!reason || rejectionOrderId === null) {
+  if (
+    !reason
+    || rejectionOrderId === null
+    || rejectionMutationInFlight
+  ) {
     notify("A non-empty rejection reason is required.", "notice-error");
     return;
   }
   const orderId = rejectionOrderId;
+  rejectionMutationInFlight = true;
+  setModalMutationBusy("rejection-dialog", true, [
+    "rejection-cancel",
+    "rejection-submit",
+  ]);
   try {
     const result = await api(`/reject/${orderId}`, jsonPost({reason}));
     appendReceipt(
@@ -767,6 +779,12 @@ async function submitRejection(event) {
     await refreshPending();
   } catch (error) {
     notify(errorText(error), "notice-error");
+  } finally {
+    rejectionMutationInFlight = false;
+    setModalMutationBusy("rejection-dialog", false, [
+      "rejection-cancel",
+      "rejection-submit",
+    ]);
   }
 }
 
@@ -820,14 +838,32 @@ function latchUnsafePanic(receipt) {
   banner.hidden = false;
 }
 
+function openPanic(trigger) {
+  if (panicMutationInFlight) {
+    return;
+  }
+  byId("panic-reason").value = "";
+  openModal(byId("panic-dialog"), byId("panic-reason"), {
+    opener: trigger,
+    canDismiss: () => !panicMutationInFlight,
+    onClose: () => {
+      byId("panic-reason").value = "";
+    },
+  });
+}
+
 async function submitPanic(event) {
   event.preventDefault();
   const reason = byId("panic-reason").value.trim();
-  if (!reason) {
+  if (!reason || panicMutationInFlight) {
     notify("A non-empty panic reason is required.", "notice-error");
     return;
   }
-  closeDialog(byId("panic-dialog"));
+  panicMutationInFlight = true;
+  setModalMutationBusy("panic-dialog", true, [
+    "panic-cancel",
+    "panic-submit",
+  ]);
   try {
     const receipt = await api("/panic", jsonPost({reason}));
     if (receipt && receipt.safe === true) {
@@ -842,11 +878,18 @@ async function submitPanic(event) {
       latchUnsafePanic(receipt);
       notify("Panic response did not explicitly confirm safety.", "notice-error");
     }
+    closeDialog(byId("panic-dialog"));
   } catch (error) {
     const receipt = error && error.body ? error.body.receipt : null;
     renderPanicReceipt(receipt, false);
     latchUnsafePanic(receipt);
     notify(`Panic is incomplete. ${errorText(error)}`, "notice-error");
+  } finally {
+    panicMutationInFlight = false;
+    setModalMutationBusy("panic-dialog", false, [
+      "panic-cancel",
+      "panic-submit",
+    ]);
   }
   await refreshAll();
 }
@@ -1808,11 +1851,6 @@ async function initialize() {
     return;
   }
 
-  [
-    byId("approval-dialog"),
-    byId("rejection-dialog"),
-    byId("panic-dialog"),
-  ].forEach(bindDialogReturnFocus);
   byId("sign-out").addEventListener("click", async () => {
     try {
       await logout();
@@ -1825,22 +1863,32 @@ async function initialize() {
   byId("approval-reason").addEventListener("input", updateApprovalButton);
   byId("approval-cancel").addEventListener(
     "click",
-    () => closeDialog(byId("approval-dialog")),
+    () => {
+      if (!approvalMutationInFlight) {
+        closeDialog(byId("approval-dialog"));
+      }
+    },
   );
   byId("rejection-form").addEventListener("submit", submitRejection);
   byId("rejection-cancel").addEventListener(
     "click",
-    () => closeDialog(byId("rejection-dialog")),
+    () => {
+      if (!rejectionMutationInFlight) {
+        closeDialog(byId("rejection-dialog"));
+      }
+    },
   );
   byId("panic-open").addEventListener("click", (event) => {
-    byId("panic-reason").value = "";
-    showDialog(byId("panic-dialog"), event.currentTarget);
-    byId("panic-reason").focus();
+    openPanic(event.currentTarget);
   });
   byId("panic-form").addEventListener("submit", submitPanic);
   byId("panic-cancel").addEventListener(
     "click",
-    () => closeDialog(byId("panic-dialog")),
+    () => {
+      if (!panicMutationInFlight) {
+        closeDialog(byId("panic-dialog"));
+      }
+    },
   );
   byId("breaker-reset-form").addEventListener("submit", submitBreakerReset);
   byId("breaker-scope").addEventListener("change", updateBreakerReset);
