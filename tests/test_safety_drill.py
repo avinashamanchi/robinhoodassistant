@@ -3323,15 +3323,10 @@ def test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed(
     assert "alpaca_paper:unconfirmed" in report.details
 
 
-def test_fake_credentialed_drill_runtime_does_not_import_or_spawn_verifier(
-    tmp_path,
+def test_real_credentialed_validator_does_not_import_or_spawn_verifier(
     app_config,
     monkeypatch,
 ):
-    primary = tmp_path / "primary.db"
-    _upgrade_database(primary)
-    _seed_preexisting_paper_order(primary)
-    _credentialed_environment(monkeypatch, primary)
     verifier_module = "scripts.verify_loopback_release"
     real_import = builtins.__import__
     real_import_module = importlib.import_module
@@ -3377,22 +3372,31 @@ def test_fake_credentialed_drill_runtime_does_not_import_or_spawn_verifier(
         reject_verifier_import_module,
     )
     monkeypatch.setattr(subprocess, "Popen", reject_verifier_process)
-    monkeypatch.setattr(
-        safety_drill_module,
-        "_validate_credentialed_paper",
-        lambda broker, secrets, config: None,
+    broker = AlpacaBroker(
+        TradingClient(
+            "generated-paper-key-for-separation-test",
+            "generated-paper-secret-for-separation-test",
+            paper=True,
+        ),
+        object(),
+    )
+    generated_secrets = RuntimeSecrets(
+        alpaca_api_key=SecretStr(
+            "generated-paper-key-for-separation-test"
+        ),
+        alpaca_secret_key=SecretStr(
+            "generated-paper-secret-for-separation-test"
+        ),
     )
 
-    report = run_safety_drill(
-        database_copy=tmp_path / "separate-authorization-copy.db",
+    _production_validate_credentialed_paper(
+        broker,
+        generated_secrets,
         config=_safe_config(app_config),
-        broker=PaperStateBroker(identity_failures=2),
-        credentialed_paper=True,
-        clock=FakeClock(is_open=True),
     )
 
-    assert report.details[0] == "mode:alpaca_paper"
-    assert "alpaca_paper:unconfirmed" in report.details
+    assert broker.execution_target is not None
+    assert broker.execution_target.is_official_paper is True
 
 
 @pytest.mark.parametrize(

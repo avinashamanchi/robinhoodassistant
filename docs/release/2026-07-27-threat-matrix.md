@@ -8,25 +8,36 @@ call.
 
 ## Two-dimensional release status
 
-Software verification and operational readiness are independent claims.
-`src/trading_assistant/ops/release_status.py::evaluate_release_status` accepts
-two immutable Ed25519-signed evidence receipts and classifies each
-dimension without consulting the other:
+Software verification and operational readiness are independently classified
+claims. `src/trading_assistant/ops/release_status.py::evaluate_release_status`
+accepts two immutable Ed25519-signed receipts and one immutable
+`ReleaseTrustPolicy`; it has no loose verifier, candidate-commit, or
+caller-supplied timestamp parameter:
 
-- The software receipt contains a canonical run UUID, exact candidate commit,
-  UTC start/finish/expiry times, and the exact eight-step release manifest with
-  passed and failed steps.
-- The operational receipt contains a canonical run UUID and commit, bounded
-  UTC observation/expiry/authentication/heartbeat times, the official Alpaca
-  paper endpoint and an account-identity fingerprint, matching
-  local/broker order and position digests, tripped breaker scopes, daemon
-  heartbeat bounds, and sensitive-encryption state.
-- `ReleaseEvidenceSigner` is the collector-only private-key capability.
-  `ReleaseEvidenceVerifier` contains only its public key and cannot issue
-  evidence. Evaluation accepts the verifier, not the signer. This classifier
-  neither loads key material nor collects operational evidence.
-- `evaluate_combined_release_gate` separately combines the two dimensions for
-  publication only. It always reports `execution_authorized=false`.
+- `SoftwareEvidenceSigner` and `OperationalEvidenceSigner` are different
+  capability types with different Ed25519 keys and domain separators. Their
+  role-specific public verifier types cannot issue evidence. The trust policy
+  rejects shared key material across the two roles.
+- The trust policy pins both public verifiers, the intended Alpaca paper
+  account fingerprint, the maximum daemon-heartbeat age, a trusted UTC clock,
+  and a trusted repository resolver that returns the exact current `HEAD`.
+- The software receipt contains schema version 1, a canonical run UUID, an
+  exact 40-character SHA-1 or 64-character SHA-256 commit, bounded UTC times,
+  and the exact eight-step release manifest with passed and failed steps.
+- The operational receipt contains schema version 1, a canonical run UUID and
+  commit, bounded UTC observation/expiry/authentication/heartbeat times, the
+  observed broker endpoint and account fingerprint, tripped breaker scopes,
+  and sensitive-encryption state. Readiness requires those observed identities
+  to match the policy's official Alpaca paper target and intended account.
+- Order and position reconciliation use separate typed domains. Each receipt
+  is constructed from nonempty local and broker identity manifests; its digest
+  binds the domain and positive generation, and readiness requires matching
+  nonzero counts, matching digests, and one shared generation.
+- `ReleaseStatus` is display-only data. `evaluate_combined_release_gate`
+  accepts the two raw receipts and the trust policy, then reauthenticates and
+  reclassifies them against the current trusted time and `HEAD` on every call.
+  It never accepts a prior status object as authority and always reports
+  `execution_authorized=false`.
 
 | Authenticated software evidence | Authenticated operational evidence | Software status | Operational status | Combined gate |
 | --- | --- | --- | --- | --- |
@@ -37,8 +48,9 @@ dimension without consulting the other:
 | Complete, current, exact commit | Daemon heartbeat stale | Verified | Blocked | Blocked |
 | Complete, current, exact commit | Encryption mixed | Verified | Blocked | Blocked |
 
-`paper_only=true` appears only when a current authenticated operational receipt
-proves the official Alpaca paper target. It is `null` when that target is
+`paper_only=true` appears only when a current, role-authenticated operational
+receipt matches the current repository `HEAD`, official Alpaca paper target,
+and trust-policy account fingerprint. It is `null` when any identity input is
 unproved. “Operational ready” is not execution authority and the combined
 publication gate is not an order gate. The status vocabulary does not claim
 profitable behavior, unattended authority, a running daemon, or a non-paper
@@ -46,12 +58,16 @@ trading mode.
 
 Exact release-state evidence:
 
-- `tests/test_release_status.py::test_ready_status_requires_authenticated_complete_evidence_and_paper_target`
-- `tests/test_release_status.py::test_evaluation_verifier_has_no_evidence_issuing_capability`
-- `tests/test_release_status.py::test_status_dimensions_are_independent_and_combined_gate_is_separate`
-- `tests/test_release_status.py::test_tampered_or_nonpaper_evidence_cannot_mint_readiness_claims`
-- `tests/test_release_status.py::test_operational_controls_block_only_operational_status`
-- `tests/test_release_status.py::test_authenticated_partial_software_manifest_is_still_blocked`
+- `tests/test_release_status.py::test_trusted_policy_rejects_self_issued_attacker_evidence`
+- `tests/test_release_status.py::test_role_specific_key_capabilities_are_distinct_and_not_interchangeable`
+- `tests/test_release_status.py::test_trust_policy_verifier_keys_are_deeply_immutable`
+- `tests/test_release_status.py::test_gate_reverifies_raw_receipts_on_every_call_and_status_is_not_authority`
+- `tests/test_release_status.py::test_signed_evidence_for_wrong_paper_account_cannot_be_ready`
+- `tests/test_release_status.py::test_trusted_policy_not_receipt_controls_heartbeat_freshness`
+- `tests/test_release_status.py::test_reconciliation_evidence_is_typed_nonempty_and_domain_bound`
+- `tests/test_release_status.py::test_authentic_evidence_for_non_head_commit_is_blocked`
+- `tests/test_release_status.py::test_unknown_signed_evidence_versions_fail_closed`
+- `tests/test_release_status.py::test_status_dimensions_remain_independent_and_combined_gate_is_separate`
 
 ## 1. Paid-call and resource exhaustion
 
@@ -254,7 +270,7 @@ Exact release-state evidence:
 - **Exact tests:** `tests/test_security.py::test_plan_list_failure_or_malformed_envelope_clears_stale_authority`,
   `tests/test_security.py::test_plan_mutation_receipts_must_match_exact_frozen_target`,
   `tests/test_frontend_ui.py::test_every_page_uses_the_original_local_identity_and_explicit_paper_mode`,
-  `tests/test_release_status.py::test_status_dimensions_are_independent_and_combined_gate_is_separate`.
+  `tests/test_release_status.py::test_status_dimensions_remain_independent_and_combined_gate_is_separate`.
 
 ## 12. Dependency, build, or publication compromise
 
@@ -298,10 +314,13 @@ step, a prerequisite for software verification, or permission for routine
 execution.
 
 Fresh-interpreter probes install an import rejection hook before importing
-either module and prove that their module import graphs are separate. A
-fake-broker credentialed-branch test rejects Python imports and subprocess
-launches of the verifier during that path, and direct-command inspection proves
-that the verifier manifest contains no credentialed drill command.
+either module and prove that neither module imports the other at import time.
+The credentialed-validator probe then installs Python-import and subprocess
+rejection hooks and executes the real production validator with generated,
+in-memory, official-paper SDK objects and generated secret wrappers. It does
+not replace the validator, access a database, contact Alpaca, or submit/cancel
+an order. Direct-command inspection separately proves that the verifier
+manifest contains no credentialed drill command.
 
 The verifier's full `pytest` command intentionally collects isolated mock
 safety-drill tests. Therefore this matrix does not claim that full test
@@ -312,6 +331,6 @@ release task runs no credentialed broker path.
 Exact separation evidence:
 
 - `tests/test_release_verifier.py::test_release_verifier_has_only_the_exact_offline_commands`
-- `tests/test_safety_drill.py::test_fake_credentialed_drill_runtime_does_not_import_or_spawn_verifier`
+- `tests/test_safety_drill.py::test_real_credentialed_validator_does_not_import_or_spawn_verifier`
 - `tests/test_safety_drill.py::test_release_verifier_and_drill_have_separate_import_graphs`
 - `tests/test_safety_drill.py::test_offline_verifier_has_no_direct_credentialed_drill_command`
