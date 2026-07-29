@@ -777,6 +777,8 @@ def test_tool_mutation_between_command_checks_fails_closed(
 def test_failed_step_stops_success_claim_and_remaining_commands(
     clean_repository: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ):
     commands = (
         Command(
@@ -794,7 +796,11 @@ def test_failed_step_stops_success_claim_and_remaining_commands(
     runner = ScriptedRunner(
         [
             _completed(),
-            _completed(returncode=1, stderr="test failed\n"),
+            _completed(
+                returncode=1,
+                stdout="first line\n::error::untrusted log command\n",
+                stderr="test failed\n",
+            ),
             _completed(),
         ]
     )
@@ -821,6 +827,18 @@ def test_failed_step_stops_success_claim_and_remaining_commands(
     )
     assert payload["passed"] is False
     assert payload["steps"][-1]["status"] == "failed"
+    monkeypatch.setattr(verifier_module, "verify_release", lambda: result)
+
+    assert verifier_module.main() == 1
+
+    captured = capsys.readouterr()
+    assert "compile stdout-json" not in captured.err
+    assert (
+        'focused-tests stdout-json: "first line\\n'
+        '::error::untrusted log command\\n"'
+    ) in captured.err
+    assert 'focused-tests stderr-json: "test failed\\n"' in captured.err
+    assert "\n::error::" not in captured.err
 
 
 def test_in_progress_evidence_replaces_stale_pass_before_first_command(
@@ -1003,6 +1021,7 @@ def test_subprocess_runner_uses_private_bounded_regular_spools(tmp_path: Path):
         "print('regular=' + str(stat.S_ISREG(os.fstat(1).st_mode)))\n"
         "print('mode=' + oct(stat.S_IMODE(os.fstat(1).st_mode)))\n"
         "print('x' * 100000)\n"
+        "print('TAIL')\n"
     )
 
     completed = runner.run(
@@ -1014,8 +1033,10 @@ def test_subprocess_runner_uses_private_bounded_regular_spools(tmp_path: Path):
 
     assert completed.returncode == 0
     assert completed.stdout.startswith("regular=True\nmode=0o600\n")
+    assert "x" * 1024 in completed.stdout
     assert len(completed.stdout) < 40_000
-    assert completed.stdout.endswith("[TRUNCATED]\n")
+    assert "\n[TRUNCATED]\n" in completed.stdout
+    assert completed.stdout.endswith("TAIL\n")
 
 
 def test_subprocess_runner_enforces_output_file_limit_while_child_runs(

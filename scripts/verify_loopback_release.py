@@ -451,18 +451,21 @@ class SubprocessRunner:
     @staticmethod
     def _capture(handle) -> str:
         handle.flush()
-        handle.seek(0)
-        payload = handle.read(_MAX_CAPTURE_BYTES + 1)
-        truncated = len(payload) > _MAX_CAPTURE_BYTES
-        text = payload[:_MAX_CAPTURE_BYTES].decode(
-            "utf-8",
-            errors="replace",
-        )
-        if truncated:
-            if text and not text.endswith("\n"):
-                text += "\n"
-            text += "[TRUNCATED]\n"
-        return text
+        size = handle.seek(0, os.SEEK_END)
+        if size <= _MAX_CAPTURE_BYTES:
+            handle.seek(0)
+            payload = handle.read()
+        else:
+            marker = b"\n[TRUNCATED]\n"
+            retained_bytes = _MAX_CAPTURE_BYTES - len(marker)
+            head_bytes = retained_bytes // 2
+            tail_bytes = retained_bytes - head_bytes
+            handle.seek(0)
+            head = handle.read(head_bytes)
+            handle.seek(-tail_bytes, os.SEEK_END)
+            tail = handle.read(tail_bytes)
+            payload = head + marker + tail
+        return payload.decode("utf-8", errors="replace")
 
     @staticmethod
     def _signal_process_group(
@@ -2502,6 +2505,21 @@ def main() -> int:
     if result.passed:
         print("release verification: PASS")
         return 0
+    for step in result.steps:
+        if step.status == "passed":
+            continue
+        if step.stdout:
+            print(
+                f"{step.name} stdout-json: "
+                f"{json.dumps(step.stdout, ensure_ascii=True)}",
+                file=sys.stderr,
+            )
+        if step.stderr:
+            print(
+                f"{step.name} stderr-json: "
+                f"{json.dumps(step.stderr, ensure_ascii=True)}",
+                file=sys.stderr,
+            )
     print(
         f"release verification: FAIL ({result.detail_code})",
         file=sys.stderr,
