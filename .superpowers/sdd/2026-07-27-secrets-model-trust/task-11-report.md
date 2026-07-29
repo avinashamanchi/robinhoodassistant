@@ -488,3 +488,198 @@ finding remains at this implementation gate.
   post-start observation.
 - This release remains paper-only, human-approved, webhook-free, and provides
   no profit guarantee or live-mode path.
+
+# Task 11 Fix Round 2 Addendum
+
+## Supersession and outcome
+
+The round-1 claims that its bounded review had no open code findings and that
+its evidence commit was evidence-only are superseded.
+
+Fresh review found real gaps after round 1. In addition, commit
+`7cc5c91d42b0349a7235ddf65cc21626250a0ccc` changed executable MarketStack
+plan instructions while labeling itself an evidence commit. That provenance
+claim was inaccurate. Fix-round-2 runtime, test, setup, operator-document, and
+executable-plan changes are all contained in implementation commit
+`d7c9576146ec205f454a8fd7b8db1425a2ce91d0`; the following commit is limited to
+SDD evidence and plan completion records.
+
+The implementation closes the requested final-authority, reachable-helper,
+mapping-provenance, client, transport, artifact, watchdog-TLS, query-credential,
+and preflight-composition findings. Unsupported or dynamic security-boundary
+constructs remain deliberately fail-closed.
+
+## Reviewer-claim verification
+
+Every reviewer claim was probed against the round-1 tree before implementation.
+Two exact subclaims were not gaps:
+
+- `Anthropic(**{"base_url": ..., "api_key": ...})` already failed closed as
+  `OUTBOUND_CLIENT_UNAPPROVED`. That hermetic fixture is retained.
+- route-registrar list/subscript indirection already failed closed as
+  `ROUTE_REGISTRATION_UNPROVEN`. That hermetic fixture is retained.
+
+The broader named-mapping/network-option and route-expression boundaries were
+still reviewed; real adjacent gaps were fixed. The mkcert claim was confirmed
+without a socket: an in-memory TLS handshake rejected the localhost leaf as a
+CA file with `SSLCertVerificationError`, while the generated root CA verified
+the same leaf.
+
+## Static closure
+
+The release scanner now:
+
+- follows nested aliases of canonical authorities and fails closed on dynamic
+  `globals()`/`vars()` rebinding;
+- rejects assignment, annotated assignment, augmented assignment, deletion,
+  and named-expression state effects in every reachable local chat helper;
+- permits dynamic wrapper URL flow only for the narrowly modeled
+  `NoRedirectSession.request` path where the same URL variable is checked by
+  `OutboundPolicy.assert_url`;
+- resolves shared mapping aliases, literal/named `**kwargs`, mutations,
+  `update`, `setdefault`, and subscript writes, then validates effective
+  network options and query keys;
+- propagates sensitive ORM object, mutation-call, and `session.execute`
+  aliases;
+- detects module-qualified environment-provider aliases and copied environment
+  mappings;
+- gates `http.client` connection/request surfaces and unverified SSL contexts;
+- recognizes actual middleware registration, aliased `set_cookie`, aliased SSL
+  factories, and unpacked Uvicorn proxy settings;
+- rejects tracked production SQL/backup payloads while accepting
+  `docs/plaintext-format.md`; and
+- limits `verify`/`params` interpretation to proven network call sites.
+
+All findings remain immutable and value-free. No source snippet, URL/query,
+matched value, exception text, or arbitrary AST representation is emitted.
+
+## Runtime, TLS, and preflight closure
+
+`OutboundPolicy.assert_url` rejects credential-like query names before either
+requests or HTTPX transport is reached and exposes only a generic denial.
+
+Watchdog liveness now trusts only the canonical public
+`.local/tls/rootCA.pem`, with proxy/environment trust and redirects disabled
+and exact loopback request/final URLs enforced. TLS preflight validates the
+canonical CA/leaf/key paths, modes, current self-signed CA, leaf issuer and
+signature, exact SANs, and leaf/private-key match. The setup script copies only
+the public mkcert root certificate; it never copies the CA private key.
+
+Operational preflight uses `build_preflight_service` with runtime role
+`preflight`. It builds no LLM provider, agent, app, or notifier. The five local
+structural rows retain their independent failure behavior. After all five pass,
+the existing operator-controlled paper broker/reconciliation checks may repair
+or cancel already-known paper-order state, but they do not submit a new order.
+
+## Exact RED evidence
+
+The first round-2 static node bundle produced:
+
+```text
+22 failed, 2 passed
+```
+
+The two passes were the retained inline-literal-provider and route-indirection
+counterexamples above. The remaining authority, chat-effect, wrapper URL,
+named mapping, proxy-option, sensitive alias, environment alias, stdlib
+client, shared query mapping, transport alias, tracked SQL, and false-positive
+fixtures were RED.
+
+The runtime/TLS/preflight bundle produced:
+
+```text
+18 failed, 12 passed
+```
+
+The in-memory leaf-versus-root TLS characterization was already green because
+it describes platform behavior rather than implementation behavior. A second
+wrapper fixture then exposed the instance-client path:
+
+```text
+uv run pytest \
+  tests/test_release_static.py::test_outbound_wrapper_rejects_unproven_dynamic_direct_request \
+  --tb=short -q
+.F
+```
+
+The dedicated composition API had its own RED:
+
+```text
+uv run pytest \
+ tests/test_task9_round2.py::test_dedicated_preflight_builder_constructs_no_llm_capability \
+  --tb=short -q
+1 failed
+AttributeError: bootstrap has no build_preflight_service
+```
+
+No exception value, credential, real Keychain value, runtime database content,
+or network result was used as evidence.
+
+## Focused and release-gate verification
+
+```text
+New static probes:
+25 passed in 7.40s
+
+Runtime-focused files:
+326 passed, 1 warning in 16.72s
+
+Affected trust matrix:
+1680 passed, 1 warning in 261.01s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+
+uv run python -m compileall -q src scripts tests
+PASS
+
+git diff --check
+PASS
+```
+
+The warning is the existing third-party `websockets.legacy` deprecation
+warning.
+
+Exactly one no-argument full suite was run:
+
+```text
+uv run pytest
+3582 passed, 1 skipped, 1 warning in 522.86s
+```
+
+During the later evidence-coherence pass, one documentation-only executable
+plan sentence was corrected to stop calling reconciliation broker-write-free.
+No production or test code changed after the full run. The repository static
+gate and `git diff --check` were rerun on that final implementation tree and
+passed; the full suite was not rerun under the one-run constraint.
+
+## Round-2 review package
+
+- Base: `7cc5c91d42b0349a7235ddf65cc21626250a0ccc`
+- Implementation: `d7c9576146ec205f454a8fd7b8db1425a2ce91d0`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-7cc5c91..d7c9576.diff`
+- Diff size: 2,184 lines / 86,981 bytes
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-r2.md`
+
+The requested probes are closed at the implementation gate. This is not a
+claim that static analysis can prove arbitrary Python semantics; unsupported
+or dynamic trust-boundary constructs are intentionally rejected and any new
+supported form requires explicit modeling plus negative and positive fixtures.
+
+## Residual hard limits
+
+- Provider-side revocation/rotation of the previously exposed integration
+  credential remains external. Composio has no enabled route, origin, caller,
+  toolkit, MCP surface, or chat tool.
+- There is no webhook receiver, live-mode path, autonomous approval, or profit
+  guarantee.
+- General chat remains read-only; immutable drafts reach the signed queue only
+  through an explicit action and require separate human approval.
+- Preflight has no daemon-health row. Daemon freshness is observed separately
+  after startup.
+- Verification used temporary Git roots, generated certificates, in-memory TLS,
+  and fakes only. No app/daemon/MCP server, real Keychain, credentials, runtime
+  database, broker/provider/notifier/integration, or network transport was
+  started or called; nothing was pushed.

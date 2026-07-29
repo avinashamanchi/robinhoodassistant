@@ -1,0 +1,2184 @@
+diff --git a/README.md b/README.md
+index 79e22f6..4b28298 100644
+--- a/README.md
++++ b/README.md
+@@ -114,2 +114,2 @@ envelope verification and retention review.
+-# Local structural checks plus broker-read readiness. Do not continue on FAIL or
+-# NEEDS-ME:
++# Local structural checks plus paper broker/reconciliation readiness. Do not
++# continue on FAIL or NEEDS-ME:
+diff --git a/config.yaml b/config.yaml
+index fad1e6d..ee9963a 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -9,0 +10 @@ server:
++  tls_ca_path: .local/tls/rootCA.pem
+diff --git a/docs/RUNBOOK.md b/docs/RUNBOOK.md
+index 210cd59..e9f459f 100644
+--- a/docs/RUNBOOK.md
++++ b/docs/RUNBOOK.md
+@@ -31,3 +31,5 @@ is not proof of entropy.
+-mode-`0700` `.local/tls`, mode-`0644` certificate, mode-`0600` private key,
+-current validity, matching key, and exact SANs for `localhost`, `127.0.0.1`,
+-and `::1`. The app binds only loopback and serves only
++mode-`0700` `.local/tls`, mode-`0644` `rootCA.pem` and `localhost.pem`, and
++mode-`0600` `localhost-key.pem`. The leaf must be current, signed by that CA,
++match the private key, and contain the exact SANs `localhost`, `127.0.0.1`,
++and `::1`. The watchdog trusts only `rootCA.pem`; the leaf is never treated as
++its CA bundle. The app binds only loopback and serves only
+@@ -335,6 +337,10 @@ any structural check fails. `LOCAL_TLS` requires the exact
+-`.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` paths as well as
+-the local certificate checks. `FIELD_ENCRYPTION` reads migration metadata and
+-key availability only; it does not decrypt rows. The startup guard performs the
+-one full envelope scan. Only after all five pass does preflight run the
+-unchanged paper-mode, schema, WAL, breaker, Alpaca-read, quote, and broker/local
+-reconciliation checks. There is no daemon-health preflight row; daemon
++`.local/tls/rootCA.pem`, `.local/tls/localhost.pem`, and
++`.local/tls/localhost-key.pem` paths. The CA and leaf must be current, the CA
++must sign the leaf, and the leaf must match the private key and exact loopback
++SANs. The watchdog trusts `rootCA.pem`, not the leaf as a CA file.
++`FIELD_ENCRYPTION` reads migration metadata and key availability only; it does
++not decrypt rows. The startup guard performs the one full envelope scan. Only
++after all five pass does preflight run the unchanged paper-mode, schema, WAL,
++breaker, Alpaca-read, quote, and broker/local reconciliation checks through a
++dedicated `preflight` composition. That composition constructs no LLM provider,
++agent, app, or notifier. There is no daemon-health preflight row; daemon
+@@ -342,5 +348,7 @@ freshness is observed separately after startup.
+-It is broker-write-free: it never submits or cancels a broker order, calls an
+-LLM, or sends an external notification. Reconciliation may update local audit
+-and repair state while using broker reads. Both `FAIL` and `NEEDS-ME` print
+-`NOT READY` and return nonzero; missing required credentials can never produce
+-`READY`.
++
++Preflight never submits a new order, calls an LLM, or sends an external
++notification. Its existing broker-truth reconciliation can perform the
++fail-closed repair or cancellation actions required to resolve already-known
++paper-order state, so run it only as the explicit operator-controlled readiness
++step. Both `FAIL` and `NEEDS-ME` print `NOT READY` and return nonzero; missing
++required credentials can never produce `READY`.
+diff --git a/docs/ops/README.md b/docs/ops/README.md
+index 42140bb..6882343 100644
+--- a/docs/ops/README.md
++++ b/docs/ops/README.md
+@@ -30,0 +31,4 @@ in these commands.
++The TLS setup installs the canonical `rootCA.pem`, `localhost.pem`, and
++`localhost-key.pem` layout; watchdog verification uses the CA file, never the
++leaf as a trust bundle. After the five structural rows pass, preflight uses a
++dedicated non-LLM reconciliation composition.
+diff --git a/docs/superpowers/plans/2026-07-27-release-verification-publication.md b/docs/superpowers/plans/2026-07-27-release-verification-publication.md
+index cca986a..88087f1 100644
+--- a/docs/superpowers/plans/2026-07-27-release-verification-publication.md
++++ b/docs/superpowers/plans/2026-07-27-release-verification-publication.md
+@@ -657 +657 @@ curl --fail --silent --show-error \
+-  --cacert .local/tls/localhost.pem \
++  --cacert .local/tls/rootCA.pem \
+diff --git a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+index ca400ea..4507b59 100644
+--- a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
++++ b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+@@ -154,0 +155 @@ class ServerConfig(_Strict):
++    tls_ca_path: Path = Path(".local/tls/rootCA.pem")
+@@ -565,2 +566,3 @@ Remove `CORSMiddleware`; no cross-origin route is supported.
+-4. writes `.local/tls/localhost.pem` and
+-   `.local/tls/localhost-key.pem` for `localhost`, `127.0.0.1`, and `::1`;
++4. copies the public mkcert root to `.local/tls/rootCA.pem`, then writes
++   `.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` for
++   `localhost`, `127.0.0.1`, and `::1`;
+@@ -1836,2 +1838,5 @@ Normal readiness requires:
+-Preflight remains read-only and never resets a breaker, starts a daemon, or
+-submits/cancels an order.
++Preflight never resets a breaker, starts a daemon, submits a new order, calls
++an LLM, or sends a notification. Its existing broker-truth reconciliation may
++perform the fail-closed repair or cancellation actions required for
++already-known paper-order state, so it remains an explicit operator-controlled
++readiness step.
+diff --git a/scripts/check_release_safety.py b/scripts/check_release_safety.py
+index 12a7869..f520578 100644
+--- a/scripts/check_release_safety.py
++++ b/scripts/check_release_safety.py
+@@ -271 +271 @@ def _canonical_assignment_finding(
+-            if not isinstance(node.value, ast.Name) or node.value.id not in aliases:
++            if _target_root_name(node.value) not in aliases:
+@@ -307,0 +308,6 @@ def _canonical_assignment_finding(
++        if (
++            isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Name)
++            and node.func.id in {"globals", "vars"}
++        ):
++            return [_finding(code, relative, node.lineno)]
+@@ -2739,0 +2746,2 @@ _OUTBOUND_CLIENT_CONSTRUCTORS = frozenset(
++        "HTTPConnection",
++        "HTTPSConnection",
+@@ -3043,0 +3052,2 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++                or server.get("tls_ca_path")
++                != ".local/tls/rootCA.pem"
+@@ -3228,0 +3239 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++        transport_mapping_entries = _mapping_alias_entries(tree)
+@@ -3230,0 +3242 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++        ssl_unverified_factories = {"_create_unverified_context"}
+@@ -3231,0 +3244,5 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++        cookie_callables: set[str] = set()
++        cors_middleware_names = {"CORSMiddleware"}
++        trusted_host_middleware_names = {"TrustedHostMiddleware"}
++        uvicorn_module_names: set[str] = set()
++        uvicorn_run_names: set[str] = set()
+@@ -3236,0 +3254,4 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++                    if imported.name == "uvicorn":
++                        uvicorn_module_names.add(
++                            imported.asname or "uvicorn"
++                        )
+@@ -3246 +3267,107 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+-            elif isinstance(candidate, (ast.Assign, ast.AnnAssign)):
++                    if imported.name == "_create_unverified_context":
++                        ssl_unverified_factories.add(
++                            imported.asname or imported.name
++                        )
++            elif isinstance(candidate, ast.ImportFrom):
++                for imported in candidate.names:
++                    local = imported.asname or imported.name
++                    if imported.name == "CORSMiddleware":
++                        cors_middleware_names.add(local)
++                    if imported.name == "TrustedHostMiddleware":
++                        trusted_host_middleware_names.add(local)
++                    if (
++                        candidate.module == "uvicorn"
++                        and imported.name == "run"
++                    ):
++                        uvicorn_run_names.add(local)
++
++        changed = True
++        while changed:
++            changed = False
++            for candidate in ast.walk(tree):
++                if not isinstance(
++                    candidate,
++                    (ast.Assign, ast.AnnAssign),
++                ):
++                    continue
++                targets = [
++                    target.id
++                    for target in _assignment_targets(candidate)
++                    if isinstance(target, ast.Name)
++                ]
++                if not targets:
++                    continue
++                value = candidate.value
++                value_path = _attribute_path(value)
++                if (
++                    len(value_path) == 2
++                    and value_path[0] in ssl_module_aliases
++                    and value_path[1] == "create_default_context"
++                ) or (
++                    isinstance(value, ast.Name)
++                    and value.id in ssl_context_factories
++                ):
++                    before = len(ssl_context_factories)
++                    ssl_context_factories.update(targets)
++                    changed = (
++                        changed
++                        or len(ssl_context_factories) != before
++                    )
++                if (
++                    len(value_path) == 2
++                    and value_path[0] in ssl_module_aliases
++                    and value_path[1] == "_create_unverified_context"
++                ) or (
++                    isinstance(value, ast.Name)
++                    and value.id in ssl_unverified_factories
++                ):
++                    before = len(ssl_unverified_factories)
++                    ssl_unverified_factories.update(targets)
++                    changed = (
++                        changed
++                        or len(ssl_unverified_factories) != before
++                    )
++                if (
++                    isinstance(value, ast.Attribute)
++                    and value.attr == "set_cookie"
++                ) or (
++                    isinstance(value, ast.Name)
++                    and value.id in cookie_callables
++                ):
++                    before = len(cookie_callables)
++                    cookie_callables.update(targets)
++                    changed = changed or len(cookie_callables) != before
++                if (
++                    isinstance(value, ast.Name)
++                    and value.id in cors_middleware_names
++                ):
++                    before = len(cors_middleware_names)
++                    cors_middleware_names.update(targets)
++                    changed = (
++                        changed or len(cors_middleware_names) != before
++                    )
++                if (
++                    isinstance(value, ast.Name)
++                    and value.id in trusted_host_middleware_names
++                ):
++                    before = len(trusted_host_middleware_names)
++                    trusted_host_middleware_names.update(targets)
++                    changed = (
++                        changed
++                        or len(trusted_host_middleware_names) != before
++                    )
++                if (
++                    isinstance(value, ast.Attribute)
++                    and len(value_path) == 2
++                    and value_path[0] in uvicorn_module_names
++                    and value_path[1] == "run"
++                ) or (
++                    isinstance(value, ast.Name)
++                    and value.id in uvicorn_run_names
++                ):
++                    before = len(uvicorn_run_names)
++                    uvicorn_run_names.update(targets)
++                    changed = changed or len(uvicorn_run_names) != before
++
++        for candidate in ast.walk(tree):
++            if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+@@ -3359 +3486 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+-                call_name = (
++                raw_call_name = (
+@@ -3365,0 +3493,65 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++                call_path = _attribute_path(node.func)
++                call_name = (
++                    "set_cookie"
++                    if isinstance(node.func, ast.Name)
++                    and node.func.id in cookie_callables
++                    else "CORSMiddleware"
++                    if isinstance(node.func, ast.Name)
++                    and node.func.id in cors_middleware_names
++                    else "TrustedHostMiddleware"
++                    if isinstance(node.func, ast.Name)
++                    and node.func.id in trusted_host_middleware_names
++                    else raw_call_name
++                )
++                if call_name == "add_middleware" and node.args:
++                    middleware = node.args[0]
++                    middleware_name = (
++                        middleware.id
++                        if isinstance(middleware, ast.Name)
++                        else middleware.attr
++                        if isinstance(middleware, ast.Attribute)
++                        else ""
++                    )
++                    if middleware_name in cors_middleware_names:
++                        call_name = "CORSMiddleware"
++                    elif middleware_name in trusted_host_middleware_names:
++                        call_name = "TrustedHostMiddleware"
++                effective_keywords = [
++                    keyword
++                    for keyword in node.keywords
++                    if keyword.arg is not None
++                ]
++                unpacked_dynamic = False
++                for keyword in node.keywords:
++                    if keyword.arg is not None:
++                        continue
++                    if isinstance(keyword.value, ast.Dict):
++                        entries, dynamic = _mapping_literal_entries(
++                            keyword.value
++                        )
++                    elif (
++                        isinstance(keyword.value, ast.Name)
++                        and keyword.value.id in transport_mapping_entries
++                    ):
++                        entries, dynamic = transport_mapping_entries[
++                            keyword.value.id
++                        ]
++                    else:
++                        entries, dynamic = {}, True
++                    effective_keywords.extend(
++                        ast.keyword(arg=name, value=value)
++                        for name, value in entries.items()
++                    )
++                    unpacked_dynamic = unpacked_dynamic or dynamic
++                unverified_context = (
++                    isinstance(node.func, ast.Name)
++                    and node.func.id in ssl_unverified_factories
++                ) or (
++                    len(call_path) == 2
++                    and call_path[0] in ssl_module_aliases
++                    and call_path[1] == "_create_unverified_context"
++                )
++                if unverified_context:
++                    findings.append(
++                        _finding("TLS_DISABLED", relative, node.lineno)
++                    )
+@@ -3409 +3601 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+-                            for keyword in node.keywords
++                            for keyword in effective_keywords
+@@ -3442 +3634 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+-                                for keyword in node.keywords
++                                for keyword in effective_keywords
+@@ -3459,0 +3652,11 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++                if call_name in {
++                    "CORSMiddleware",
++                    "TrustedHostMiddleware",
++                } and unpacked_dynamic:
++                    findings.append(
++                        _finding(
++                            "WILDCARD_HOST_ORIGIN",
++                            relative,
++                            node.lineno,
++                        )
++                    )
+@@ -3463 +3666 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+-                        for keyword in node.keywords
++                        for keyword in effective_keywords
+@@ -3484,0 +3688,40 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
++                    if unpacked_dynamic:
++                        findings.append(
++                            _finding(
++                                "INSECURE_COOKIE",
++                                relative,
++                                node.lineno,
++                            )
++                        )
++                uvicorn_run = (
++                    isinstance(node.func, ast.Name)
++                    and node.func.id in uvicorn_run_names
++                ) or (
++                    len(call_path) == 2
++                    and call_path[0] in uvicorn_module_names
++                    and call_path[1] == "run"
++                )
++                if uvicorn_run:
++                    uvicorn_options = {
++                        keyword.arg: keyword.value
++                        for keyword in effective_keywords
++                        if keyword.arg is not None
++                    }
++                    proxy_headers = uvicorn_options.get("proxy_headers")
++                    forwarded = uvicorn_options.get(
++                        "forwarded_allow_ips"
++                    )
++                    if (
++                        unpacked_dynamic
++                        or not isinstance(proxy_headers, ast.Constant)
++                        or proxy_headers.value is not False
++                        or not isinstance(forwarded, ast.Constant)
++                        or forwarded.value != ""
++                    ):
++                        findings.append(
++                            _finding(
++                                "PROXY_HEADERS_TRUSTED",
++                                relative,
++                                node.lineno,
++                            )
++                        )
+@@ -3580,0 +3824,7 @@ def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
++    entries, dynamic = _mapping_literal_entries(node)
++    return set(entries), dynamic
++
++
++def _mapping_literal_entries(
++    node: ast.AST | None,
++) -> tuple[dict[str, ast.AST], bool]:
+@@ -3582,2 +3832,2 @@ def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+-        return set(), True
+-    keys: set[str] = set()
++        return {}, True
++    entries: dict[str, ast.AST] = {}
+@@ -3585 +3835 @@ def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+-    for key in node.keys:
++    for key, value in zip(node.keys, node.values, strict=True):
+@@ -3587 +3837 @@ def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+-            keys.add(key.value.lower())
++            entries[key.value.lower()] = value
+@@ -3590 +3840 @@ def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+-    return keys, dynamic
++    return entries, dynamic
+@@ -3615 +3865 @@ def _static_string_fragments(node: ast.AST | None) -> tuple[str, ...]:
+-def _mapping_alias_keys(
++def _mapping_alias_entries(
+@@ -3617,28 +3867,38 @@ def _mapping_alias_keys(
+-) -> dict[str, tuple[set[str], bool]]:
+-    mappings: dict[str, tuple[set[str], bool]] = {}
+-    changed = True
+-    while changed:
+-        changed = False
+-        for node in ast.walk(tree):
+-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+-                continue
+-            targets = (
+-                node.targets
+-                if isinstance(node, ast.Assign)
+-                else [node.target]
+-            )
+-            names = {
+-                target.id
+-                for target in targets
+-                if isinstance(target, ast.Name)
+-            }
+-            if not names:
+-                continue
+-            if isinstance(node.value, ast.Dict):
+-                resolved = _mapping_literal_keys(node.value)
+-            elif isinstance(node.value, ast.Name):
+-                resolved = mappings.get(node.value.id)
+-                if resolved is None:
+-                    continue
+-            else:
+-                continue
++) -> dict[str, tuple[dict[str, ast.AST], bool]]:
++    """Resolve mapping aliases as shared objects and union every mutation."""
++
++    parent: dict[str, str] = {}
++
++    def add(name: str) -> None:
++        parent.setdefault(name, name)
++
++    def find(name: str) -> str:
++        add(name)
++        while parent[name] != name:
++            parent[name] = parent[parent[name]]
++            name = parent[name]
++        return name
++
++    def union(left: str, right: str) -> None:
++        left_root = find(left)
++        right_root = find(right)
++        if left_root != right_root:
++            parent[right_root] = left_root
++
++    assignments = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, (ast.Assign, ast.AnnAssign))
++    ]
++    for node in assignments:
++        targets = (
++            node.targets
++            if isinstance(node, ast.Assign)
++            else [node.target]
++        )
++        names = [
++            target.id
++            for target in targets
++            if isinstance(target, ast.Name)
++        ]
++        if isinstance(node.value, ast.Dict):
+@@ -3646,39 +3906,17 @@ def _mapping_alias_keys(
+-                previous = mappings.get(name)
+-                merged = (
+-                    (set(resolved[0]), resolved[1])
+-                    if previous is None
+-                    else (
+-                        set(previous[0]).union(resolved[0]),
+-                        previous[1] or resolved[1],
+-                    )
+-                )
+-                if previous != merged:
+-                    mappings[name] = merged
+-                    changed = True
+-        for node in ast.walk(tree):
+-            assignment_target = (
+-                node.target
+-                if isinstance(node, ast.AnnAssign)
+-                else node.targets[0]
+-                if isinstance(node, ast.Assign)
+-                and len(node.targets) == 1
+-                else None
+-            )
+-            if (
+-                isinstance(node, (ast.Assign, ast.AnnAssign))
+-                and isinstance(assignment_target, ast.Subscript)
+-                and isinstance(assignment_target.value, ast.Name)
+-                and assignment_target.value.id in mappings
+-            ):
+-                name = assignment_target.value.id
+-                previous = mappings[name]
+-                key = _literal_string(assignment_target.slice)
+-                merged = (
+-                    set(previous[0]),
+-                    previous[1] or key is None,
+-                )
+-                if key is not None:
+-                    merged[0].add(key.lower())
+-                if previous != merged:
+-                    mappings[name] = merged
+-                    changed = True
++                add(name)
++        elif isinstance(node.value, ast.Name):
++            for name in names:
++                union(name, node.value.id)
++
++    component_entries: dict[str, dict[str, ast.AST]] = {}
++    component_dynamic: dict[str, bool] = {}
++
++    def merge(
++        name: str,
++        entries: dict[str, ast.AST],
++        dynamic: bool,
++    ) -> None:
++        root_name = find(name)
++        current = component_entries.setdefault(root_name, {})
++        for key, value in entries.items():
++            previous = current.get(key)
+@@ -3686,5 +3924,3 @@ def _mapping_alias_keys(
+-                isinstance(node, ast.Call)
+-                and isinstance(node.func, ast.Attribute)
+-                and node.func.attr == "update"
+-                and isinstance(node.func.value, ast.Name)
+-                and node.func.value.id in mappings
++                previous is not None
++                and ast.dump(previous, include_attributes=False)
++                != ast.dump(value, include_attributes=False)
+@@ -3692,28 +3928,25 @@ def _mapping_alias_keys(
+-                name = node.func.value.id
+-                previous = mappings[name]
+-                if len(node.args) == 1 and not node.keywords:
+-                    update_keys, update_dynamic = (
+-                        mappings.get(node.args[0].id)
+-                        if isinstance(node.args[0], ast.Name)
+-                        and node.args[0].id in mappings
+-                        else _mapping_literal_keys(node.args[0])
+-                    )
+-                elif not node.args:
+-                    update_keys = {
+-                        keyword.arg.lower()
+-                        for keyword in node.keywords
+-                        if keyword.arg is not None
+-                    }
+-                    update_dynamic = any(
+-                        keyword.arg is None for keyword in node.keywords
+-                    )
+-                else:
+-                    update_keys, update_dynamic = set(), True
+-                merged = (
+-                    set(previous[0]).union(update_keys),
+-                    previous[1] or update_dynamic,
+-                )
+-                if previous != merged:
+-                    mappings[name] = merged
+-                    changed = True
+-    return mappings
++                component_dynamic[root_name] = True
++            current[key] = value
++        component_dynamic[root_name] = (
++            component_dynamic.get(root_name, False) or dynamic
++        )
++
++    for node in assignments:
++        targets = (
++            node.targets
++            if isinstance(node, ast.Assign)
++            else [node.target]
++        )
++        names = [
++            target.id
++            for target in targets
++            if isinstance(target, ast.Name)
++        ]
++        if isinstance(node.value, ast.Dict):
++            entries, dynamic = _mapping_literal_entries(node.value)
++            for name in names:
++                merge(name, entries, dynamic)
++        elif names and not isinstance(node.value, ast.Name):
++            for name in names:
++                if name in parent:
++                    merge(name, {}, True)
+@@ -3720,0 +3954,13 @@ def _mapping_alias_keys(
++        for target in targets:
++            if not (
++                isinstance(target, ast.Subscript)
++                and isinstance(target.value, ast.Name)
++                and target.value.id in parent
++            ):
++                continue
++            key = _literal_string(target.slice)
++            merge(
++                target.value.id,
++                {key.lower(): node.value} if key is not None else {},
++                key is None,
++            )
+@@ -3722,2 +3967,0 @@ def _mapping_alias_keys(
+-def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
+-    mutated: set[str] = set()
+@@ -3725,13 +3969,19 @@ def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
+-        target = (
+-            node.target
+-            if isinstance(node, (ast.AnnAssign, ast.AugAssign))
+-            else node.targets[0]
+-            if isinstance(node, ast.Assign) and len(node.targets) == 1
+-            else None
+-        )
+-        if isinstance(target, ast.Subscript) and isinstance(
+-            target.value,
+-            ast.Name,
+-        ):
+-            mutated.add(target.value.id)
+-        if (
++        if isinstance(node, ast.AugAssign):
++            if isinstance(node.target, ast.Name) and node.target.id in parent:
++                entries, dynamic = _mapping_literal_entries(node.value)
++                merge(node.target.id, entries, dynamic)
++            elif (
++                isinstance(node.target, ast.Subscript)
++                and isinstance(node.target.value, ast.Name)
++                and node.target.value.id in parent
++            ):
++                merge(node.target.value.id, {}, True)
++        if isinstance(node, ast.Delete):
++            for target in node.targets:
++                if (
++                    isinstance(target, ast.Subscript)
++                    and isinstance(target.value, ast.Name)
++                    and target.value.id in parent
++                ):
++                    merge(target.value.id, {}, True)
++        if not (
+@@ -3741 +3991 @@ def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
+-            and node.func.attr in _AUTHORITY_MUTATORS
++            and node.func.value.id in parent
+@@ -3743,2 +3993,53 @@ def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
+-            mutated.add(node.func.value.id)
+-    return frozenset(mutated)
++            continue
++        name = node.func.value.id
++        if node.func.attr == "setdefault":
++            key = _literal_string(node.args[0] if node.args else None)
++            value = node.args[1] if len(node.args) >= 2 else ast.Constant(None)
++            merge(
++                name,
++                {key.lower(): value} if key is not None else {},
++                key is None or len(node.args) not in {1, 2} or bool(node.keywords),
++            )
++        elif node.func.attr == "update":
++            entries: dict[str, ast.AST] = {}
++            dynamic = False
++            if len(node.args) == 1:
++                argument = node.args[0]
++                if isinstance(argument, ast.Dict):
++                    entries, dynamic = _mapping_literal_entries(argument)
++                elif isinstance(argument, ast.Name) and argument.id in parent:
++                    source_root = find(argument.id)
++                    entries = dict(
++                        component_entries.get(source_root, {})
++                    )
++                    dynamic = component_dynamic.get(source_root, False)
++                else:
++                    dynamic = True
++            elif node.args:
++                dynamic = True
++            for keyword in node.keywords:
++                if keyword.arg is None:
++                    dynamic = True
++                else:
++                    entries[keyword.arg.lower()] = keyword.value
++            merge(name, entries, dynamic)
++        elif node.func.attr in _AUTHORITY_MUTATORS:
++            merge(name, {}, True)
++
++    resolved: dict[str, tuple[dict[str, ast.AST], bool]] = {}
++    for name in parent:
++        root_name = find(name)
++        resolved[name] = (
++            dict(component_entries.get(root_name, {})),
++            component_dynamic.get(root_name, False),
++        )
++    return resolved
++
++
++def _mapping_alias_keys(
++    tree: ast.AST,
++) -> dict[str, tuple[set[str], bool]]:
++    return {
++        name: (set(entries), dynamic)
++        for name, (entries, dynamic) in _mapping_alias_entries(tree).items()
++    }
+@@ -3760,0 +4062,30 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++        parents = {
++            child: parent
++            for parent in ast.walk(tree)
++            for child in ast.iter_child_nodes(parent)
++        }
++
++        def enclosing_context(
++            candidate: ast.AST,
++        ) -> tuple[
++            ast.FunctionDef | ast.AsyncFunctionDef | None,
++            ast.ClassDef | None,
++        ]:
++            function = None
++            class_node = None
++            current = parents.get(candidate)
++            while current is not None:
++                if (
++                    function is None
++                    and isinstance(
++                        current,
++                        (ast.FunctionDef, ast.AsyncFunctionDef),
++                    )
++                ):
++                    function = current
++                if isinstance(current, ast.ClassDef):
++                    class_node = current
++                    break
++                current = parents.get(current)
++            return function, class_node
++
+@@ -3762,2 +4093,5 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-        mapping_aliases = _mapping_alias_keys(tree)
+-        mutated_mappings = _mutated_mapping_names(tree)
++        mapping_entries = _mapping_alias_entries(tree)
++        mapping_aliases = {
++            name: (set(entries), dynamic)
++            for name, (entries, dynamic) in mapping_entries.items()
++        }
+@@ -3794,0 +4129 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++            "http",
+@@ -4082 +4416,0 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                    or direct_request
+@@ -4088 +4421,0 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                    or module_request
+@@ -4090,0 +4424,2 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++                or direct_request
++                or module_request
+@@ -4114,7 +4448,0 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-            url_nodes = list(node.args)
+-            url_nodes.extend(
+-                keyword.value
+-                for keyword in node.keywords
+-                if keyword.arg
+-                in {"url", "base_url", "baseUrl", "url_override"}
+-            )
+@@ -4140,0 +4469,61 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++            if (
++                boundary_wrapper
++                and call_name.lower() in _OUTBOUND_REQUEST_METHODS
++                and not module_request
++                and not direct_request
++            ):
++                request_url_node = (
++                    node.args[1]
++                    if call_name.lower() == "request"
++                    and len(node.args) >= 2
++                    else node.args[0]
++                    if node.args
++                    else next(
++                        (
++                            keyword.value
++                            for keyword in node.keywords
++                            if keyword.arg == "url"
++                        ),
++                        None,
++                    )
++                )
++                request_url = _literal_string(
++                    request_url_node,
++                    constants,
++                )
++                function, class_node = enclosing_context(node)
++                approved_dynamic_request = (
++                    request_url is None
++                    and function is not None
++                    and class_node is not None
++                    and class_node.name == "NoRedirectSession"
++                    and function.name == "request"
++                    and call_name.lower() == "request"
++                    and isinstance(node.func, ast.Attribute)
++                    and isinstance(node.func.value, ast.Call)
++                    and isinstance(node.func.value.func, ast.Name)
++                    and node.func.value.func.id == "super"
++                    and any(
++                        isinstance(guard, ast.Call)
++                        and _attribute_path(guard.func)
++                        == ("self", "_policy", "assert_url")
++                        and guard.args
++                        and isinstance(request_url_node, ast.Name)
++                        and isinstance(guard.args[0], ast.Name)
++                        and guard.args[0].id == request_url_node.id
++                        for guard in ast.walk(function)
++                    )
++                )
++                if request_url is None and not approved_dynamic_request:
++                    findings.append(
++                        _finding(
++                            "OUTBOUND_CLIENT_UNAPPROVED",
++                            relative,
++                            node.lineno,
++                        )
++                    )
++            effective_keywords = [
++                keyword
++                for keyword in node.keywords
++                if keyword.arg is not None
++            ]
+@@ -4144,10 +4533,25 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                mapping_name = (
+-                    keyword.value.id
+-                    if isinstance(keyword.value, ast.Name)
+-                    else None
+-                )
+-                unresolved = (
+-                    mapping_name is None
+-                    or mapping_name not in mapping_aliases
+-                    or mapping_aliases[mapping_name][1]
+-                    or mapping_name in mutated_mappings
++                if isinstance(keyword.value, ast.Dict):
++                    entries, unresolved = _mapping_literal_entries(
++                        keyword.value
++                    )
++                    # Inline unpacking is unsupported even when its contents
++                    # are also inspected for a more specific finding.
++                    findings.append(
++                        _finding(
++                            "OUTBOUND_CLIENT_UNAPPROVED",
++                            relative,
++                            node.lineno,
++                        )
++                    )
++                elif (
++                    isinstance(keyword.value, ast.Name)
++                    and keyword.value.id in mapping_entries
++                ):
++                    entries, unresolved = mapping_entries[
++                        keyword.value.id
++                    ]
++                else:
++                    entries, unresolved = {}, True
++                effective_keywords.extend(
++                    ast.keyword(arg=name, value=value)
++                    for name, value in entries.items()
+@@ -4162,0 +4567,8 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++            url_nodes = list(node.args)
++            url_nodes.extend(
++                keyword.value
++                for keyword in effective_keywords
++                if keyword.arg is not None
++                and keyword.arg.lower()
++                in {"url", "base_url", "baseurl", "url_override"}
++            )
+@@ -4269 +4681,6 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-            for keyword in node.keywords:
++            for keyword in effective_keywords:
++                keyword_name = (
++                    keyword.arg.lower()
++                    if keyword.arg is not None
++                    else ""
++                )
+@@ -4271,2 +4688,2 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                    keyword.arg
+-                    in {"base_url", "baseUrl", "url_override"}
++                    keyword_name
++                    in {"base_url", "baseurl", "url_override"}
+@@ -4288 +4705,3 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                    keyword.arg in {"follow_redirects", "allow_redirects"}
++                    keyword_name
++                    in {"follow_redirects", "allow_redirects"}
++                    and (network_option_call or boundary_wrapper)
+@@ -4301 +4720,4 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg == "verify" and (
++                if (
++                    keyword_name == "verify"
++                    and (network_option_call or boundary_wrapper)
++                    and (
+@@ -4304 +4726,2 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                ) and not (
++                    )
++                    and not (
+@@ -4307,0 +4731 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++                    )
+@@ -4312 +4736 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg in {
++                if keyword_name in {
+@@ -4326 +4750,3 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg == "forwarded_allow_ips" and (
++                if (
++                    keyword_name == "forwarded_allow_ips"
++                    and (
+@@ -4328,0 +4755 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++                    )
+@@ -4337 +4764,3 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg in {"proxy", "proxies"} and (
++                if (
++                    keyword_name in {"proxy", "proxies"}
++                    and (
+@@ -4340 +4769,2 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                ) and not (
++                    )
++                    and not (
+@@ -4342,0 +4773 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
++                    )
+@@ -4351 +4782 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg in {
++                if keyword_name in {
+@@ -4360 +4791 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                    and keyword.arg == "ssl"
++                    and keyword_name == "ssl"
+@@ -4367 +4798 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg in {
++                if keyword_name in {
+@@ -4377 +4808,4 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+-                if keyword.arg == "params":
++                if (
++                    keyword_name == "params"
++                    and (network_option_call or boundary_wrapper)
++                ):
+@@ -4419,0 +4854 @@ def _tracked_artifact_code(name: str) -> str | None:
++    parent_names = {part.lower() for part in path.parts[:-1]}
+@@ -4452,0 +4888,22 @@ def _tracked_artifact_code(name: str) -> str | None:
++    encrypted_suffix = basename.endswith((".aesgcm", ".age", ".gpg"))
++    backup_directory = bool(
++        parent_names.intersection({"backup", "backups"})
++    )
++    backup_payload = basename.endswith(
++        (
++            ".bak",
++            ".csv",
++            ".db",
++            ".dump",
++            ".json",
++            ".sql",
++            ".sqlite",
++            ".sqlite3",
++            ".tar",
++            ".txt",
++            ".zip",
++        )
++    )
++    plaintext_marker = (
++        "decrypted" in lowered or "plaintext" in lowered
++    )
+@@ -4454,6 +4911,9 @@ def _tracked_artifact_code(name: str) -> str | None:
+-        "decrypted" in lowered
+-        or "plaintext" in lowered
+-        or "plaintext-backup" in lowered
+-        or (
+-            "backup" in lowered
+-            and basename.endswith((".bak", ".sqlite", ".sqlite3", ".db"))
++        (
++            backup_directory
++            and backup_payload
++            or plaintext_marker
++            and backup_payload
++            and not (
++                path.suffix.lower() == ".md"
++                and "docs" in parent_names
++            )
+@@ -4461 +4921,2 @@ def _tracked_artifact_code(name: str) -> str | None:
+-    ) and not basename.endswith((".aesgcm", ".age", ".gpg")):
++        and not encrypted_suffix
++    ):
+@@ -4700,0 +5162 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
++        environment_mapping_copy_names = {"dict"}
+@@ -4740,0 +5203,7 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
++                if (
++                    isinstance(value, ast.Attribute)
++                    and value.attr == "EnvironmentSecretProvider"
++                ):
++                    before = len(provider_names)
++                    provider_names.update(names)
++                    changed = changed or len(provider_names) != before
+@@ -4744,0 +5214,10 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
++                if (
++                    isinstance(value, ast.Name)
++                    and value.id in environment_mapping_copy_names
++                ):
++                    before = len(environment_mapping_copy_names)
++                    environment_mapping_copy_names.update(names)
++                    changed = (
++                        changed
++                        or len(environment_mapping_copy_names) != before
++                    )
+@@ -4893,0 +5373,18 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
++                copies_environment_mapping = (
++                    isinstance(node.func, ast.Name)
++                    and node.func.id in environment_mapping_copy_names
++                    and any(
++                        _is_os_environ(argument, os_module_names)
++                        or isinstance(argument, ast.Name)
++                        and argument.id in environ_names
++                        for argument in node.args
++                    )
++                )
++                if copies_environment_mapping:
++                    findings.append(
++                        _finding(
++                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
++                            relative,
++                            node.lineno,
++                        )
++                    )
+@@ -5657,0 +6155,35 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
++            for mutation in (
++                node
++                for node in ast.walk(helper)
++                if isinstance(
++                    node,
++                    (
++                        ast.Assign,
++                        ast.AnnAssign,
++                        ast.AugAssign,
++                        ast.Delete,
++                        ast.NamedExpr,
++                    ),
++                )
++            ):
++                targets = (
++                    mutation.targets
++                    if isinstance(mutation, (ast.Assign, ast.Delete))
++                    else [mutation.target]
++                )
++                state_mutation = any(
++                    isinstance(target, (ast.Attribute, ast.Subscript))
++                    for target in targets
++                ) or isinstance(
++                    mutation,
++                    (ast.AugAssign, ast.Delete),
++                )
++                findings.append(
++                    _finding(
++                        "MUTABLE_CHAT_TOOL"
++                        if state_mutation
++                        else "CHAT_TOOL_REGISTRY_UNPROVEN",
++                        relative,
++                        mutation.lineno,
++                    )
++                )
+diff --git a/scripts/launchd/README.md b/scripts/launchd/README.md
+index 3775623..0dfd401 100644
+--- a/scripts/launchd/README.md
++++ b/scripts/launchd/README.md
+@@ -34,2 +34,5 @@ Field preflight is metadata-only; the startup guard owns the full envelope
+-scan. Keychain migration, field migration/rotation, and encrypted restore
+-procedures are in
++scan. Local TLS requires `rootCA.pem`, `localhost.pem`, and
++`localhost-key.pem`; the watchdog trusts only the CA file. After structural
++success, preflight uses a dedicated composition that constructs no LLM
++provider, agent, app, or notifier. Keychain migration, field
++migration/rotation, and encrypted restore procedures are in
+diff --git a/scripts/setup-local-tls.sh b/scripts/setup-local-tls.sh
+index c8e6c31..5028bf4 100755
+--- a/scripts/setup-local-tls.sh
++++ b/scripts/setup-local-tls.sh
+@@ -15,0 +16,2 @@ mkcert -install
++mkcert_ca_root="$(mkcert -CAROOT)"
++install -m 0644 "$mkcert_ca_root/rootCA.pem" .local/tls/rootCA.pem
+@@ -19,0 +22 @@ chmod 0644 .local/tls/localhost.pem
++chmod 0644 .local/tls/rootCA.pem
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 38653eb..172ef33 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -120,0 +121,8 @@ class ApplicationContainer:
++@dataclass(frozen=True)
++class PreflightServiceContainer:
++    """Minimal preflight owner with no app, agent, notifier, or LLM surface."""
++
++    service: TradingService
++    runtime_tenure_guard: None = None
++
++
+@@ -350,0 +359,43 @@ def build_test_container(
++def build_preflight_service(
++    config: AppConfig,
++    secrets: RuntimeSecrets,
++) -> PreflightServiceContainer:
++    """Compose only paper broker reconciliation for the preflight role."""
++
++    require_configured_role_origins(config, "preflight")
++    _guard_runtime(config, secrets)
++    runtime = prepare_database_runtime(
++        secrets,
++        runtime_role="preflight",
++    )
++    try:
++        sensitive_cipher = build_sensitive_data_cipher(
++            config.encryption,
++            secrets,
++        )
++    except Exception:
++        raise StartupEncryptionBlocked(
++            "sensitive_key_unavailable"
++        ) from None
++    bind_sensitive_cipher(runtime.session_factory, sensitive_cipher)
++    broker = build_broker(
++        config,
++        secrets,
++        runtime_role="preflight",
++    )
++    _arm_production_paper_broker(broker)
++    clock = build_clock(
++        config,
++        secrets,
++        runtime_role="preflight",
++    )
++    service = TradingService(
++        broker,
++        runtime.session_factory,
++        config,
++        clock,
++        external_source=None,
++    )
++    return PreflightServiceContainer(service=service)
++
++
+diff --git a/src/trading_assistant/config.py b/src/trading_assistant/config.py
+index 18ff5d2..1343d46 100644
+--- a/src/trading_assistant/config.py
++++ b/src/trading_assistant/config.py
+@@ -55,0 +56 @@ class ServerConfig(_Strict):
++    tls_ca_path: Path = Path(".local/tls/rootCA.pem")
+diff --git a/src/trading_assistant/ops/tls.py b/src/trading_assistant/ops/tls.py
+index 8342ad4..d7baafa 100644
+--- a/src/trading_assistant/ops/tls.py
++++ b/src/trading_assistant/ops/tls.py
+@@ -12,0 +13,8 @@ from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric import (
++    dsa,
++    ec,
++    ed25519,
++    ed448,
++    padding,
++    rsa,
++)
+@@ -27,0 +36 @@ class TLSMaterialStatus:
++    ca_certificate_path: Path
+@@ -66,0 +76,40 @@ def _mode(path: Path) -> int:
++def _signature_is_valid(
++    certificate: x509.Certificate,
++    issuer: x509.Certificate,
++) -> bool:
++    public_key = issuer.public_key()
++    try:
++        if isinstance(public_key, rsa.RSAPublicKey):
++            public_key.verify(
++                certificate.signature,
++                certificate.tbs_certificate_bytes,
++                padding.PKCS1v15(),
++                certificate.signature_hash_algorithm,
++            )
++        elif isinstance(public_key, ec.EllipticCurvePublicKey):
++            public_key.verify(
++                certificate.signature,
++                certificate.tbs_certificate_bytes,
++                ec.ECDSA(certificate.signature_hash_algorithm),
++            )
++        elif isinstance(public_key, dsa.DSAPublicKey):
++            public_key.verify(
++                certificate.signature,
++                certificate.tbs_certificate_bytes,
++                certificate.signature_hash_algorithm,
++            )
++        elif isinstance(
++            public_key,
++            (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey),
++        ):
++            public_key.verify(
++                certificate.signature,
++                certificate.tbs_certificate_bytes,
++            )
++        else:
++            return False
++    except Exception:
++        return False
++    return True
++
++
+@@ -69,0 +119 @@ def validate_tls_material(server) -> TLSMaterialStatus:
++    ca_certificate_path = _contained(Path(server.tls_ca_path), root)
+@@ -73,0 +124,5 @@ def validate_tls_material(server) -> TLSMaterialStatus:
++    if (
++        not ca_certificate_path.is_file()
++        or _mode(ca_certificate_path) != 0o644
++    ):
++        raise TLSMaterialError("tls_ca_permissions_invalid")
+@@ -78,0 +134,22 @@ def validate_tls_material(server) -> TLSMaterialStatus:
++    try:
++        ca_certificate = x509.load_pem_x509_certificate(
++            ca_certificate_path.read_bytes()
++        )
++        ca_constraints = ca_certificate.extensions.get_extension_for_class(
++            x509.BasicConstraints
++        ).value
++    except Exception:
++        raise TLSMaterialError("tls_ca_invalid") from None
++    now = datetime.now(timezone.utc)
++    if (
++        not ca_constraints.ca
++        or ca_certificate.subject != ca_certificate.issuer
++        or not (
++            ca_certificate.not_valid_before_utc
++            <= now
++            <= ca_certificate.not_valid_after_utc
++        )
++        or not _signature_is_valid(ca_certificate, ca_certificate)
++    ):
++        raise TLSMaterialError("tls_ca_invalid")
++
+@@ -93 +169,0 @@ def validate_tls_material(server) -> TLSMaterialStatus:
+-    now = datetime.now(timezone.utc)
+@@ -95,0 +172,5 @@ def validate_tls_material(server) -> TLSMaterialStatus:
++    if (
++        certificate.issuer != ca_certificate.subject
++        or not _signature_is_valid(certificate, ca_certificate)
++    ):
++        raise TLSMaterialError("tls_ca_chain_invalid")
+@@ -113,0 +195 @@ def validate_tls_material(server) -> TLSMaterialStatus:
++        ca_certificate_path=ca_certificate_path,
+diff --git a/src/trading_assistant/ops/watchdog.py b/src/trading_assistant/ops/watchdog.py
+index 7517b85..cc6820b 100644
+--- a/src/trading_assistant/ops/watchdog.py
++++ b/src/trading_assistant/ops/watchdog.py
+@@ -206 +206 @@ def main(argv: list[str] | None = None) -> int:
+-            config.server.tls_cert_path
++            config.server.tls_ca_path
+diff --git a/src/trading_assistant/preflight.py b/src/trading_assistant/preflight.py
+index 41186aa..35c4a01 100644
+--- a/src/trading_assistant/preflight.py
++++ b/src/trading_assistant/preflight.py
+@@ -316,0 +317,2 @@ def _structural_preflight_checks(
++            or str(config.server.tls_ca_path)
++            != ".local/tls/rootCA.pem"
+@@ -604 +606 @@ def _build_service(config, secrets: RuntimeSecrets):
+-    from .bootstrap import build_container
++    from .bootstrap import build_preflight_service
+@@ -606 +608 @@ def _build_service(config, secrets: RuntimeSecrets):
+-    container = build_container(
++    container = build_preflight_service(
+@@ -609 +610,0 @@ def _build_service(config, secrets: RuntimeSecrets):
+-        runtime_role="app",
+diff --git a/src/trading_assistant/security/outbound.py b/src/trading_assistant/security/outbound.py
+index 2b17e7a..9dd2f89 100644
+--- a/src/trading_assistant/security/outbound.py
++++ b/src/trading_assistant/security/outbound.py
+@@ -18 +18 @@ from typing import Any, Iterable
+-from urllib.parse import SplitResult, urlsplit
++from urllib.parse import SplitResult, parse_qsl, urlsplit
+@@ -310 +310 @@ def build_local_liveness_transport(
+-    certificate_path: Any,
++    ca_certificate_path: Any,
+@@ -317 +317 @@ def build_local_liveness_transport(
+-    if str(certificate_path) != ".local/tls/localhost.pem":
++    if str(ca_certificate_path) != ".local/tls/rootCA.pem":
+@@ -323 +323 @@ def build_local_liveness_transport(
+-    context = ssl_context_factory(cafile=str(certificate_path))
++    context = ssl_context_factory(cafile=str(ca_certificate_path))
+@@ -501,0 +502,8 @@ class OutboundPolicy:
++            if any(
++                name.lower() in _QUERY_CREDENTIAL_NAMES
++                for name, _value in parse_qsl(
++                    parts.query,
++                    keep_blank_values=True,
++                )
++            ):
++                _deny()
+diff --git a/src/trading_assistant/security/sensitive_write_scan.py b/src/trading_assistant/security/sensitive_write_scan.py
+index cd1be37..384a7a3 100644
+--- a/src/trading_assistant/security/sensitive_write_scan.py
++++ b/src/trading_assistant/security/sensitive_write_scan.py
+@@ -405 +405 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+-        object_model = self._call_model(value)
++        object_model = self._object_model(value) or self._call_model(value)
+@@ -409,0 +410,5 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
++        elif (
++            isinstance(value, ast.Name)
++            and value.id in self.unknown_object_aliases
++        ):
++            self.unknown_object_aliases.add(target.id)
+@@ -429,0 +435,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
++        elif isinstance(value, ast.Name):
++            if value.id in self.execute_aliases:
++                self.execute_aliases.add(target.id)
++            if value.id in self.mutation_call_models:
++                self.mutation_call_models[target.id] = (
++                    self.mutation_call_models[value.id]
++                )
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index 40b48db..a4814e6 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -1009,0 +1010 @@ def test_structural_preflight_never_accepts_missing_keychain_provenance(
++        ("tls_ca_path", ".local/tls/renamed-root.pem"),
+@@ -1011,0 +1013 @@ def test_structural_preflight_never_accepts_missing_keychain_provenance(
++        ("tls_ca_path", "elsewhere/rootCA.pem"),
+diff --git a/tests/test_outbound_policy.py b/tests/test_outbound_policy.py
+index c291306..d6ee3f0 100644
+--- a/tests/test_outbound_policy.py
++++ b/tests/test_outbound_policy.py
+@@ -5,0 +6 @@ import asyncio
++from datetime import datetime, timedelta, timezone
+@@ -6,0 +8 @@ import io
++import ipaddress
+@@ -9,0 +12,3 @@ import ssl
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
+@@ -217,0 +223,136 @@ class _LocalClient:
++def _write_mkcert_style_chain(tmp_path: Path) -> tuple[Path, Path, Path]:
++    """Create a root-signed localhost leaf without using a socket or Keychain."""
++
++    now = datetime.now(timezone.utc)
++    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    root_name = x509.Name(
++        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "fixture local CA")]
++    )
++    root_certificate = (
++        x509.CertificateBuilder()
++        .subject_name(root_name)
++        .issuer_name(root_name)
++        .public_key(root_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - timedelta(minutes=1))
++        .not_valid_after(now + timedelta(days=2))
++        .add_extension(
++            x509.BasicConstraints(ca=True, path_length=0),
++            critical=True,
++        )
++        .sign(root_key, hashes.SHA256())
++    )
++    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    leaf_name = x509.Name(
++        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]
++    )
++    leaf_certificate = (
++        x509.CertificateBuilder()
++        .subject_name(leaf_name)
++        .issuer_name(root_name)
++        .public_key(leaf_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - timedelta(minutes=1))
++        .not_valid_after(now + timedelta(days=1))
++        .add_extension(
++            x509.BasicConstraints(ca=False, path_length=None),
++            critical=True,
++        )
++        .add_extension(
++            x509.SubjectAlternativeName(
++                [
++                    x509.DNSName("localhost"),
++                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
++                    x509.IPAddress(ipaddress.ip_address("::1")),
++                ]
++            ),
++            critical=False,
++        )
++        .sign(root_key, hashes.SHA256())
++    )
++    ca_path = tmp_path / "rootCA.pem"
++    leaf_path = tmp_path / "localhost.pem"
++    key_path = tmp_path / "localhost-key.pem"
++    ca_path.write_bytes(
++        root_certificate.public_bytes(serialization.Encoding.PEM)
++    )
++    leaf_path.write_bytes(
++        leaf_certificate.public_bytes(serialization.Encoding.PEM)
++    )
++    key_path.write_bytes(
++        leaf_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++    )
++    return ca_path, leaf_path, key_path
++
++
++def _memory_bio_tls_handshake(
++    client_context: ssl.SSLContext,
++    server_context: ssl.SSLContext,
++) -> None:
++    """Drive a complete TLS handshake entirely in memory."""
++
++    client_in = ssl.MemoryBIO()
++    client_out = ssl.MemoryBIO()
++    server_in = ssl.MemoryBIO()
++    server_out = ssl.MemoryBIO()
++    client = client_context.wrap_bio(
++        client_in,
++        client_out,
++        server_hostname="localhost",
++    )
++    server = server_context.wrap_bio(
++        server_in,
++        server_out,
++        server_side=True,
++    )
++    client_done = False
++    server_done = False
++    for _attempt in range(20):
++        if not client_done:
++            try:
++                client.do_handshake()
++            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
++                pass
++            else:
++                client_done = True
++        outbound = client_out.read()
++        if outbound:
++            server_in.write(outbound)
++        if not server_done:
++            try:
++                server.do_handshake()
++            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
++                pass
++            else:
++                server_done = True
++        outbound = server_out.read()
++        if outbound:
++            client_in.write(outbound)
++        if client_done and server_done:
++            return
++    raise AssertionError("fixture TLS handshake did not complete")
++
++
++def test_mkcert_leaf_is_not_a_ca_but_root_chain_verifies_in_memory(tmp_path):
++    """Characterize the reviewer claim without opening a network socket."""
++
++    ca_path, leaf_path, key_path = _write_mkcert_style_chain(tmp_path)
++    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    server_context.load_cert_chain(leaf_path, key_path)
++
++    with pytest.raises(ssl.SSLCertVerificationError):
++        _memory_bio_tls_handshake(
++            ssl.create_default_context(cafile=str(leaf_path)),
++            server_context,
++        )
++
++    _memory_bio_tls_handshake(
++        ssl.create_default_context(cafile=str(ca_path)),
++        server_context,
++    )
++
++
+@@ -232 +373 @@ def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
+-        Path(".local/tls/localhost.pem"),
++        Path(".local/tls/rootCA.pem"),
+@@ -246 +387 @@ def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
+-    assert observed["cafile"] == ".local/tls/localhost.pem"
++    assert observed["cafile"] == ".local/tls/rootCA.pem"
+@@ -261,10 +402,14 @@ def test_local_liveness_transport_rejects_noncanonical_certificate_path(
+-    with pytest.raises(outbound.OutboundOriginDenied):
+-        outbound.build_local_liveness_transport(
+-            Path(".local/tls/renamed.pem"),
+-            client_factory=lambda **_kwargs: pytest.fail(
+-                "client constructed before certificate path validation"
+-            ),
+-            ssl_context_factory=lambda **_kwargs: pytest.fail(
+-                "TLS context constructed before certificate path validation"
+-            ),
+-        )
++    for path in (
++        Path(".local/tls/renamed.pem"),
++        Path(".local/tls/localhost.pem"),
++    ):
++        with pytest.raises(outbound.OutboundOriginDenied):
++            outbound.build_local_liveness_transport(
++                path,
++                client_factory=lambda **_kwargs: pytest.fail(
++                    "client constructed before CA path validation"
++                ),
++                ssl_context_factory=lambda **_kwargs: pytest.fail(
++                    "TLS context constructed before CA path validation"
++                ),
++            )
+@@ -356,0 +502,70 @@ def test_policy_accepts_request_paths_and_queries_only_after_exact_origin_match(
++@pytest.mark.parametrize(
++    "query_name",
++    [
++        "access_key",
++        "api_key",
++        "apikey",
++        "credential",
++        "secret",
++        "token",
++        "API_KEY",
++    ],
++)
++def test_policy_rejects_credential_query_names_without_value_leak(
++    query_name,
++    alpaca_policy,
++    outbound,
++):
++    marker = "fixture-query-secret-marker"
++
++    with pytest.raises(outbound.OutboundOriginDenied) as raised:
++        alpaca_policy.assert_url(
++            "https://paper-api.alpaca.markets/v2/orders"
++            f"?{query_name}={marker}"
++        )
++
++    assert marker not in str(raised.value)
++    assert "?" not in str(raised.value)
++
++
++def test_prebuilt_requests_and_httpx_urls_reject_query_credentials_before_io(
++    alpaca_policy,
++    outbound,
++):
++    import httpx
++
++    marker = "fixture-prebuilt-query-marker"
++    url = (
++        "https://paper-api.alpaca.markets/v2/account"
++        f"?api_key={marker}"
++    )
++
++    requests_adapter = _ResponseAdapter()
++    session = outbound.NoRedirectSession(alpaca_policy)
++    session.mount("https://", requests_adapter)
++    prepared = requests.Request("GET", url).prepare()
++    with pytest.raises(outbound.OutboundOriginDenied) as requests_error:
++        session.send(prepared)
++    assert requests_adapter.calls == []
++    assert marker not in str(requests_error.value)
++
++    httpx_calls: list[object] = []
++
++    def transport(request):
++        httpx_calls.append(request)
++        raise AssertionError("HTTPX transport reached")
++
++    client = outbound.new_httpx_client(
++        alpaca_policy,
++        transport=httpx.MockTransport(transport),
++    )
++    request = client.build_request("GET", url)
++    try:
++        with pytest.raises(outbound.OutboundOriginDenied) as httpx_error:
++            client.send(request)
++    finally:
++        client.close()
++    assert httpx_calls == []
++    assert marker not in str(httpx_error.value)
++
++
+diff --git a/tests/test_release_static.py b/tests/test_release_static.py
+index 6de4d3c..b49cd2e 100644
+--- a/tests/test_release_static.py
++++ b/tests/test_release_static.py
+@@ -897,0 +898 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
++                    "tls_ca_path": ".local/tls/rootCA.pem",
+@@ -2003,0 +2005,6 @@ def test_outbound_wrapper_options_are_statically_gated(
++        (
++            lambda raw: raw["server"].update(
++                {"tls_ca_path": ".local/tls/renamed-root.pem"}
++            ),
++            "TLS_DISABLED",
++        ),
+@@ -2930,0 +2938,362 @@ def test_historical_marketstack_removal_note_is_allowed(tmp_path):
++
++
++@pytest.mark.parametrize(
++    "mutation",
++    [
++        "\nnested = SENSITIVE_FIELDS['audit_events']\n"
++        "nested.add('fixture_field')\n",
++        "\nouter = SENSITIVE_FIELDS\n"
++        "nested = outer['audit_events']\n"
++        "nested.clear()\n",
++        "\nglobals()['SENSITIVE_FIELDS'] = {}\n",
++    ],
++)
++def test_sensitive_authority_rejects_nested_alias_and_global_rebinding(
++    tmp_path,
++    mutation,
++):
++    root = _trust_fixture(tmp_path)
++    path = root / "src/trading_assistant/security/sensitive_fields.py"
++    path.write_text(
++        path.read_text(encoding="utf-8") + mutation,
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
++    assert "fixture_field" not in completed.stderr
++
++
++@pytest.mark.parametrize(
++    "method_body",
++    [
++        "        self.cached_result = s.get_account_summary()\n"
++        "        return self.cached_result",
++        "        self.counter += 1\n"
++        "        return s.get_account_summary()",
++        "        del self.cached_result\n"
++        "        return s.get_account_summary()",
++    ],
++)
++def test_chat_reachable_helpers_reject_state_mutation_syntax(
++    tmp_path,
++    method_body,
++):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/app/agent.py",
++        _agent_with_recursive_helper(method_body),
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "MUTABLE_CHAT_TOOL" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    "source",
++    [
++        "\nimport httpx\n"
++        "def unsafe_direct_request(url):\n"
++        "    return httpx.get(url, follow_redirects=False)\n",
++        "\nimport httpx\n"
++        "def unsafe_client_request(url):\n"
++        "    client = httpx.Client(\n"
++        "        follow_redirects=False, trust_env=False, proxy=None,\n"
++        "    )\n"
++        "    return client.get(url)\n",
++    ],
++)
++def test_outbound_wrapper_rejects_unproven_dynamic_direct_request(
++    tmp_path,
++    source,
++):
++    root = _trust_fixture(tmp_path)
++    path = root / "src/trading_assistant/security/outbound.py"
++    path.write_text(
++        path.read_text(encoding="utf-8") + source,
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
++
++
++def test_named_provider_kwargs_are_resolved_and_origin_checked(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/llm/anthropic_backend.py",
++        "import anthropic\n"
++        "options = {\n"
++        "    'base_url': 'https://unapproved.invalid',\n"
++        "    'api_key': credential,\n"
++        "}\n"
++        "client = anthropic.Anthropic(**options)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_ORIGIN_UNAPPROVED" in completed.stderr
++
++
++def test_literal_provider_kwargs_are_already_fail_closed(tmp_path):
++    """Reviewer subclaim counterexample: inline mappings were already rejected."""
++
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/llm/anthropic_backend.py",
++        "import anthropic\n"
++        "client = anthropic.Anthropic(**{\n"
++        "    'base_url': 'https://unapproved.invalid',\n"
++        "    'api_key': credential,\n"
++        "})\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
++
++
++def test_uvicorn_unpacked_proxy_options_are_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/ops/serve.py",
++        "import uvicorn\n"
++        "options = {\n"
++        "    'proxy_headers': True,\n"
++        "    'forwarded_allow_ips': '*',\n"
++        "}\n"
++        "uvicorn.run(app, **options)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "PROXY_HEADERS_TRUSTED" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    "source",
++    [
++        "from trading_assistant.db.models import AuditEvent\n"
++        "event = AuditEvent()\n"
++        "alias = event\n"
++        "alias.reason = 'fixture'\n",
++        "from sqlalchemy import text\n"
++        "execute = session.execute\n"
++        "run = execute\n"
++        "run(text('UPDATE audit_events SET reason=:reason'), "
++        "{'reason': 'fixture'})\n",
++    ],
++)
++def test_sensitive_write_alias_chains_fail_closed(tmp_path, source):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/sensitive_alias_chain.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
++    assert "fixture" not in completed.stderr
++
++
++@pytest.mark.parametrize(
++    "source",
++    [
++        "import trading_assistant.security.secrets as secrets\n"
++        "Provider = secrets.EnvironmentSecretProvider\n"
++        "provider = Provider(environ={}, encryption=None)\n",
++        "import os\ncopy = dict(os.environ)\n",
++    ],
++)
++def test_environment_provider_and_mapping_aliases_fail_closed(tmp_path, source):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/environment_alias.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "ENVIRONMENT_SECRETS_IN_PRODUCTION" in completed.stderr
++
++
++def test_route_registrar_container_indirection_fails_closed(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/app/main.py",
++        "from fastapi import FastAPI\n"
++        "def endpoint():\n"
++        "    return None\n"
++        "def create_app():\n"
++        "    app = FastAPI()\n"
++        "    @app.get('/covered')\n"
++        "    def covered():\n"
++        "        return None\n"
++        "    registrars = [app.add_api_route]\n"
++        "    registrar = registrars[0]\n"
++        "    registrar('/hooks-list', endpoint, methods=['GET'])\n"
++        "    return app\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "ROUTE_REGISTRATION_UNPROVEN" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("source", "codes"),
++    [
++        (
++            "import http.client\n"
++            "connection = http.client.HTTPSConnection('example.test')\n"
++            "connection.request('GET', '/')\n",
++            ("OUTBOUND_CLIENT_UNAPPROVED",),
++        ),
++        (
++            "import http.client as hc\n"
++            "import ssl\n"
++            "connection = hc.HTTPSConnection(\n"
++            "    'example.test', context=ssl._create_unverified_context(),\n"
++            ")\n",
++            ("OUTBOUND_CLIENT_UNAPPROVED", "TLS_DISABLED"),
++        ),
++    ],
++)
++def test_stdlib_http_client_and_unverified_contexts_are_rejected(
++    tmp_path,
++    source,
++    codes,
++):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/stdlib_network.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    for code in codes:
++        assert code in completed.stderr
++
++
++def test_shared_query_mapping_alias_mutation_is_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/query_alias.py",
++        "params = {'symbol': 'AAPL'}\n"
++        "alias = params\n"
++        "alias.setdefault('api_key', credential)\n"
++        "client.get('/data', params=params)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "QUERY_SECRET" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("source", "code"),
++    [
++        (
++            "from fastapi import FastAPI\n"
++            "from starlette.middleware.cors import CORSMiddleware\n"
++            "app = FastAPI()\n"
++            "app.add_middleware(CORSMiddleware, allow_origins=['*'])\n",
++            "WILDCARD_HOST_ORIGIN",
++        ),
++        (
++            "cookie = response.set_cookie\n"
++            "cookie('session', secure=False, httponly=True, "
++            "samesite='strict')\n",
++            "INSECURE_COOKIE",
++        ),
++        (
++            "import ssl\n"
++            "factory = ssl.create_default_context\n"
++            "context = factory()\n"
++            "context.check_hostname = False\n",
++            "TLS_DISABLED",
++        ),
++    ],
++)
++def test_transport_alias_and_middleware_calls_are_rejected(
++    tmp_path,
++    source,
++    code,
++):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/transport_alias.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert code in completed.stderr
++
++
++def test_tracked_production_sql_backup_is_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    relative = "backups/production.sql"
++    _write_fixture_file(root, relative, "fixture backup marker\n")
++    subprocess.run(["git", "add", "--", relative], cwd=root, check=True)
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "TRACKED_DECRYPTED_BACKUP" in completed.stderr
++    assert "fixture backup marker" not in completed.stderr
++
++
++def test_non_network_verify_keyword_call_is_a_decoy(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/non_network_compare.py",
++        "result = compare(expected, actual, verify=False)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 0, completed.stdout + completed.stderr
++
++
++def test_plaintext_format_document_is_not_a_decrypted_backup(tmp_path):
++    root = _trust_fixture(tmp_path)
++    relative = "docs/plaintext-format.md"
++    _write_fixture_file(
++        root,
++        relative,
++        "Documentation about the word plaintext.\n",
++    )
++    subprocess.run(["git", "add", "--", relative], cwd=root, check=True)
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 0, completed.stdout + completed.stderr
+diff --git a/tests/test_task9_round2.py b/tests/test_task9_round2.py
+index 0c443de..f131b25 100644
+--- a/tests/test_task9_round2.py
++++ b/tests/test_task9_round2.py
+@@ -336 +335,0 @@ def test_every_production_role_has_private_bounded_startup_log(
+-        ("preflight", "app"),
+@@ -364,4 +363 @@ def test_service_utility_roots_pass_exact_role_and_secrets(
+-    if builder_name == "preflight":
+-        owner = preflight._build_service(app_config, secrets)
+-    else:
+-        owner = paper_drill.build_paper_service(app_config, secrets)
++    owner = paper_drill.build_paper_service(app_config, secrets)
+@@ -373,0 +370,141 @@ def test_service_utility_roots_pass_exact_role_and_secrets(
++def test_preflight_uses_dedicated_non_llm_service_composition(
++    app_config,
++    make_service,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap, preflight
++
++    service = make_service()
++    secrets = Secrets(app_api_token="preflight-role-secret")
++    observed: list[tuple[object, object]] = []
++
++    def build_preflight(config, supplied_secrets):
++        observed.append((config, supplied_secrets))
++        return SimpleNamespace(
++            service=service,
++            runtime_tenure_guard=None,
++        )
++
++    monkeypatch.setattr(
++        bootstrap,
++        "build_preflight_service",
++        build_preflight,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_container",
++        lambda *_args, **_kwargs: pytest.fail(
++            "preflight must not use the app/LLM container"
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_quarantine_summarizer",
++        lambda *_args, **_kwargs: pytest.fail(
++            "preflight must never construct an LLM provider"
++        ),
++    )
++
++    with preflight._build_service(app_config, secrets) as result:
++        assert result is service
++
++    assert observed == [(app_config, secrets)]
++
++
++def test_dedicated_preflight_builder_constructs_no_llm_capability(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++
++    secrets = Secrets(app_api_token="preflight-builder-secret")
++    session_factory = object()
++    runtime = SimpleNamespace(
++        engine=object(),
++        session_factory=session_factory,
++    )
++    broker = object()
++    clock = object()
++    cipher = object()
++    service = object()
++    observed: list[tuple[str, object]] = []
++
++    monkeypatch.setattr(
++        bootstrap,
++        "require_configured_role_origins",
++        lambda config, role: observed.append(("origins", role)),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "_guard_runtime",
++        lambda config, supplied: observed.append(("guard", supplied)),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "prepare_database_runtime",
++        lambda supplied, *, runtime_role: (
++            observed.append(("database_role", runtime_role)) or runtime
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_sensitive_data_cipher",
++        lambda encryption, supplied: (
++            observed.append(("cipher", supplied)) or cipher
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "bind_sensitive_cipher",
++        lambda factory, supplied_cipher: observed.append(
++            ("bind_cipher", (factory, supplied_cipher))
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_broker",
++        lambda config, supplied, *, runtime_role: (
++            observed.append(("broker_role", runtime_role)) or broker
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "_arm_production_paper_broker",
++        lambda supplied_broker: observed.append(
++            ("arm_broker", supplied_broker)
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_clock",
++        lambda config, supplied, *, runtime_role: (
++            observed.append(("clock_role", runtime_role)) or clock
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "TradingService",
++        lambda supplied_broker, factory, config, supplied_clock, **kwargs: (
++            observed.append(("service", kwargs)) or service
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_quarantine_summarizer",
++        lambda *_args, **_kwargs: pytest.fail(
++            "dedicated preflight composition reached an LLM builder"
++        ),
++    )
++
++    container = bootstrap.build_preflight_service(app_config, secrets)
++
++    assert container.service is service
++    assert container.runtime_tenure_guard is None
++    assert ("origins", "preflight") in observed
++    assert ("database_role", "preflight") in observed
++    assert ("broker_role", "preflight") in observed
++    assert ("clock_role", "preflight") in observed
++    assert ("service", {"external_source": None}) in observed
++
++
+@@ -438 +575 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
+-                tls_cert_path=".local/tls/localhost.pem"
++                tls_ca_path=".local/tls/rootCA.pem"
+@@ -445 +582 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
+-        lambda certificate_path: (
++        lambda ca_certificate_path: (
+@@ -447 +584 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
+-            if str(certificate_path) == ".local/tls/localhost.pem"
++            if str(ca_certificate_path) == ".local/tls/rootCA.pem"
+@@ -449 +586 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
+-                AssertionError("noncanonical liveness certificate")
++                AssertionError("noncanonical liveness CA")
+diff --git a/tests/test_transport_boundary.py b/tests/test_transport_boundary.py
+index c14c026..1c03b86 100644
+--- a/tests/test_transport_boundary.py
++++ b/tests/test_transport_boundary.py
+@@ -770,0 +771,22 @@ def _write_tls_pair(
++    root_key = rsa.generate_private_key(
++        public_exponent=65537,
++        key_size=2048,
++    )
++    root_name = x509.Name(
++        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "fixture local CA")]
++    )
++    now = datetime.now(timezone.utc)
++    root_certificate = (
++        x509.CertificateBuilder()
++        .subject_name(root_name)
++        .issuer_name(root_name)
++        .public_key(root_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - timedelta(minutes=1))
++        .not_valid_after(now + timedelta(days=2))
++        .add_extension(
++            x509.BasicConstraints(ca=True, path_length=0),
++            critical=True,
++        )
++        .sign(root_key, hashes.SHA256())
++    )
+@@ -780 +801,0 @@ def _write_tls_pair(
+-    now = datetime.now(timezone.utc)
+@@ -784 +805 @@ def _write_tls_pair(
+-        .issuer_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]))
++        .issuer_name(root_name)
+@@ -799 +820,5 @@ def _write_tls_pair(
+-        .sign(certificate_key, hashes.SHA256())
++        .add_extension(
++            x509.BasicConstraints(ca=False, path_length=None),
++            critical=True,
++        )
++        .sign(root_key, hashes.SHA256())
+@@ -800,0 +826 @@ def _write_tls_pair(
++    ca_path = tls_directory / "rootCA.pem"
+@@ -802,0 +829,3 @@ def _write_tls_pair(
++    ca_path.write_bytes(
++        root_certificate.public_bytes(serialization.Encoding.PEM)
++    )
+@@ -811,0 +841 @@ def _write_tls_pair(
++    os.chmod(ca_path, 0o644)
+@@ -814,0 +845 @@ def _write_tls_pair(
++        tls_ca_path=Path(".local/tls/rootCA.pem"),
+@@ -832,0 +864 @@ def test_tls_inspection_requires_local_sans_permissions_and_matching_key(
++    assert status.ca_certificate_path.name == "rootCA.pem"
+@@ -840,0 +873 @@ def test_tls_inspection_requires_local_sans_permissions_and_matching_key(
++        ("rootCA.pem", 0o600, "tls_ca_permissions_invalid"),
+@@ -865,0 +899,24 @@ def test_tls_inspection_rejects_unsafe_certificate_and_key_modes(
++def test_tls_inspection_requires_a_valid_ca_that_signed_the_local_leaf(
++    tmp_path,
++    monkeypatch,
++):
++    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
++
++    server = _write_tls_pair(tmp_path)
++    monkeypatch.chdir(tmp_path)
++    ca_path = tmp_path / ".local/tls/rootCA.pem"
++    leaf_path = tmp_path / ".local/tls/localhost.pem"
++
++    ca_path.write_bytes(leaf_path.read_bytes())
++    with pytest.raises(TLSMaterialError) as exc_info:
++        validate_tls_material(server)
++    assert exc_info.value.code == "tls_ca_invalid"
++
++    other = tmp_path / "other"
++    _write_tls_pair(other)
++    ca_path.write_bytes((other / ".local/tls/rootCA.pem").read_bytes())
++    with pytest.raises(TLSMaterialError) as exc_info:
++        validate_tls_material(server)
++    assert exc_info.value.code == "tls_ca_chain_invalid"
++
++
+@@ -878,0 +936 @@ def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
++        tls_ca_path=server.tls_ca_path,
+@@ -889,0 +948 @@ def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
++        tls_ca_path=server.tls_ca_path,
+diff --git a/tests/test_watchdog.py b/tests/test_watchdog.py
+index 5c9ab3d..ddd7ea1 100644
+--- a/tests/test_watchdog.py
++++ b/tests/test_watchdog.py
+@@ -578 +578 @@ def test_fetch_health_uses_only_injected_local_liveness_transport():
+-def test_main_builds_one_local_liveness_transport_from_canonical_cert(
++def test_main_builds_one_local_liveness_transport_from_canonical_ca(
+@@ -589,0 +590 @@ def test_main_builds_one_local_liveness_transport_from_canonical_cert(
++                tls_ca_path=".local/tls/rootCA.pem",
+@@ -620 +621 @@ def test_main_builds_one_local_liveness_transport_from_canonical_cert(
+-        ("build", ".local/tls/localhost.pem"),
++        ("build", ".local/tls/rootCA.pem"),

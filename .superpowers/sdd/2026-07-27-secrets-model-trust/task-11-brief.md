@@ -60,11 +60,13 @@ Normal readiness requires:
 - encryption state complete and key ID available;
 - no webhook/Composio integration;
 - exact outbound HTTPS origins;
-- existing paper-mode, reconciliation, breaker, quote-integrity, and daemon
-  checks unchanged.
+- existing paper-mode, reconciliation, breaker, and quote-integrity checks
+  unchanged. Daemon freshness is a separate post-start observation.
 
-Preflight remains read-only and never resets a breaker, starts a daemon, or
-submits/cancels an order.
+Preflight never resets a breaker, starts a daemon, submits a new order, calls
+an LLM, or sends a notification. Existing broker-truth reconciliation may
+repair or cancel already-known paper-order state during the explicit
+operator-controlled readiness step.
 
 - [x] **Step 5: Document operator commands and hard limits**
 
@@ -304,3 +306,44 @@ green, while the final tree has exact focused, complete affected, matrix,
 compile, diff, and repository-static proof. Composio remains disabled pending
 external provider-side revocation/rotation; no webhook, live mode, autonomous
 execution, or profit guarantee was introduced.
+
+## Fix round 2 completion
+
+The round-1 statement that its bounded review had zero open code findings is
+historical and superseded. Fresh review found additional statically reachable
+authority, helper-effect, mapping-option, transport, artifact, TLS, and
+preflight-composition gaps. Two exact reviewer examples were already
+fail-closed and are retained as counterexamples: inline literal provider
+`**kwargs` and route-registrar list/subscript indirection.
+
+- [x] Add minimal round-2 fixtures first and record the pre-fix RED:
+  `22 failed, 2 passed` for the static bundle, `18 failed, 12 passed` for the
+  runtime/TLS/preflight bundle, `.F` for direct wrapper requests, and one
+  missing dedicated-builder failure.
+- [x] Reject nested/dynamic final-authority mutation, all reachable chat helper
+  state mutation, unproven wrapper URL flow, unresolved or unsafe network
+  mappings, sensitive/session aliases, environment-copy aliases, stdlib
+  clients, middleware/cookie/SSL aliases, and newly requested tracked backup
+  names without introducing non-network false positives.
+- [x] Prove hermetically that a localhost leaf is not a usable CA bundle and
+  use the canonical public `rootCA.pem` chain for watchdog and TLS validation.
+- [x] Reject credential-like query keys before requests/HTTPX transport and
+  construct preflight through a dedicated non-LLM role/container.
+- [x] Put all runtime, setup, operator, and executable-plan corrections in
+  implementation commit
+  `d7c9576146ec205f454a8fd7b8db1425a2ce91d0`.
+- [x] Focused new static probes: `25 passed in 7.40s`.
+- [x] Focused runtime set: `326 passed, 1 warning in 16.72s`.
+- [x] Full affected trust matrix:
+  `1680 passed, 1 warning in 261.01s`.
+- [x] Repository static gate: `release static checks: PASS`; compileall and
+  `git diff --check` exited zero.
+- [x] Exactly one no-argument full suite:
+  `3582 passed, 1 skipped, 1 warning in 522.86s`.
+- [x] Prepare the bounded implementation diff and round-2 review/evidence
+  package in a truly evidence-only follow-up commit.
+
+Residual hard limits remain: unsupported or dynamic trust-boundary constructs
+fail closed; Composio remains disabled pending external provider-side
+revocation/rotation; there is no webhook or live-mode path; trading remains
+paper-only and separately human-approved; no profit guarantee is made.

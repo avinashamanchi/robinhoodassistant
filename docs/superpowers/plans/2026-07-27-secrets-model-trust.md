@@ -1917,6 +1917,46 @@ git commit -m "chore(security): gate trust-boundary invariants"
   bounded review diff, brief/report, plan checkboxes, and progress ledger in a
   separate evidence commit.
 
+### Task 11 fix round 2: close static/runtime trust review gaps
+
+The round-1 “no open code finding” and evidence-only provenance conclusions
+are superseded. Its evidence commit also changed executable MarketStack plan
+instructions. Round-2 executable, runtime, test, setup, and operator-document
+changes are isolated in implementation commit
+`d7c9576146ec205f454a8fd7b8db1425a2ce91d0`; this section records completion
+evidence only.
+
+- [x] Verify all 18 reviewer findings against the round-1 tree before changing
+  code. Retain the already-fail-closed inline literal provider `**kwargs` and
+  route-registrar indirection fixtures as counterexamples.
+- [x] Record exact RED evidence: static bundle `22 failed, 2 passed`;
+  runtime/TLS/preflight bundle `18 failed, 12 passed`; wrapper probe `.F`;
+  dedicated preflight builder `1 failed`.
+- [x] Close nested authority mutation, reachable chat state effects, unproven
+  wrapper URL/mapping flow, sensitive/environment aliases, stdlib clients,
+  shared query maps, middleware/cookie/SSL aliases, tracked SQL, and the two
+  false-positive gaps.
+- [x] Confirm hermetically that the mkcert localhost leaf fails as a CA file
+  while the root CA verifies it; pin watchdog and preflight to canonical public
+  `.local/tls/rootCA.pem`.
+- [x] Reject credential-like query names before requests/HTTPX transport and
+  use a dedicated non-LLM `preflight` composition.
+- [x] Focused new static probes:
+  `25 passed in 7.40s`.
+- [x] Focused runtime files:
+  `326 passed, 1 warning in 16.72s`.
+- [x] Full affected trust matrix:
+  `1680 passed, 1 warning in 261.01s`.
+- [x] Repository static gate: `release static checks: PASS`; compileall and
+  `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3582 passed, 1 skipped, 1 warning in 522.86s`.
+- [x] Record the final documentation-only preflight wording correction
+  caveat: no production/test code changed after the full run; repository
+  static and diff gates were rerun and passed; no second full suite was run.
+- [x] Package bounded diff `7cc5c91..d7c9576`, coherent brief/report/progress,
+  supersession notice, and round-2 review in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

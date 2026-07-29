@@ -1,5 +1,11 @@
 # Task 11 Fix Round 1 Review Package
 
+> Superseded evidence: fix round 2 found additional gaps after this package
+> was written. Its “no open code finding” conclusion is not current; use
+> `task-11-review-package-r2.md`. The round-1 evidence commit also changed
+> executable MarketStack plan instructions, so its evidence-only provenance
+> claim was inaccurate and is corrected by the round-2 package.
+
 ## Review boundary
 
 - Base: `1f25c102c7886fb8425c88198dbaf1618ddb090a`
