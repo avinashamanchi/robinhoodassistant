@@ -2935,11 +2935,29 @@ def test_operational_refreshes_ignore_late_error_after_newer_success(
             "backtest-runs",
             (
                 '{backtests: [{run_id: 1, label: "OLD-RUN", '
-                'created_at: "2026-07-25T10:00:00Z"}]}'
+                'status: "succeeded", '
+                'created_at: "2026-07-25T10:00:00Z", '
+                'holdout_start: null}], simulation_policy: {'
+                'max_runtime_seconds: 1200, max_symbols: 20, '
+                'max_calendar_days: 3000, window_requests: 2, '
+                'global_window_requests: 4, window_seconds: 60, '
+                'daily_requests: 10, global_daily_requests: 20, '
+                'concurrency: 1, llm_enabled: false, '
+                'saved_run_page_limit: 25}, pagination: {'
+                'limit: 25, next_cursor: null}}'
             ),
             (
                 '{backtests: [{run_id: 2, label: "NEW-RUN", '
-                'created_at: "2026-07-25T10:01:00Z"}]}'
+                'status: "succeeded", '
+                'created_at: "2026-07-25T10:01:00Z", '
+                'holdout_start: null}], simulation_policy: {'
+                'max_runtime_seconds: 1200, max_symbols: 20, '
+                'max_calendar_days: 3000, window_requests: 2, '
+                'global_window_requests: 4, window_seconds: 60, '
+                'daily_requests: 10, global_daily_requests: 20, '
+                'concurrency: 1, llm_enabled: false, '
+                'saved_run_page_limit: 25}, pagination: {'
+                'limit: 25, next_cursor: null}}'
             ),
             "OLD-RUN",
             "NEW-RUN",
@@ -3040,7 +3058,16 @@ def test_saved_resource_refresh_ignores_superseded_success(
             "backtest-runs",
             (
                 '{backtests: [{run_id: 2, label: "CURRENT-RUN", '
-                'created_at: "2026-07-25T10:01:00Z"}]}'
+                'status: "succeeded", '
+                'created_at: "2026-07-25T10:01:00Z", '
+                'holdout_start: null}], simulation_policy: {'
+                'max_runtime_seconds: 1200, max_symbols: 20, '
+                'max_calendar_days: 3000, window_requests: 2, '
+                'global_window_requests: 4, window_seconds: 60, '
+                'daily_requests: 10, global_daily_requests: 20, '
+                'concurrency: 1, llm_enabled: false, '
+                'saved_run_page_limit: 25}, pagination: {'
+                'limit: 25, next_cursor: null}}'
             ),
             "CURRENT-RUN",
         ),
@@ -3146,6 +3173,275 @@ def test_pending_refresh_ignores_superseded_error_after_newer_truth():
     )
 
 
+_BACKTEST_POLICY_JS = r"""({
+  max_runtime_seconds: 1200,
+  max_symbols: 20,
+  max_calendar_days: 3000,
+  window_requests: 2,
+  global_window_requests: 4,
+  window_seconds: 60,
+  daily_requests: 10,
+  global_daily_requests: 20,
+  concurrency: 1,
+  llm_enabled: false,
+  saved_run_page_limit: 25,
+})"""
+
+
+def test_backtest_list_malformed_payload_is_truth_unavailable():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("refreshRuns",),
+        f"""
+        const elements = installDom([
+          "backtest-runs",
+          "backtest-report",
+          "report-title",
+        ]);
+        globalThis.__api = (path) => {{
+          if (path !== "/backtests") {{
+            throw new Error(`unexpected API path ${{path}}`);
+          }}
+          return Promise.resolve({{
+            backtests: "not-an-array",
+            simulation_policy: {_BACKTEST_POLICY_JS},
+            pagination: {{limit: 25, next_cursor: null}},
+          }});
+        }};
+
+        const outcome = await module.refreshRuns().then(
+          () => "resolved",
+          () => "rejected",
+        );
+        const rendered = elements["backtest-runs"].textContent;
+        if (
+          outcome !== "rejected"
+          || !rendered.includes("truth is unavailable")
+          || rendered.includes("No saved runs")
+        ) {{
+          throw new Error(`malformed list looked authoritative: ${{rendered}}`);
+        }}
+        """,
+    )
+
+
+def test_backtest_list_rejects_forged_oversized_page_contract():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("refreshRuns",),
+        f"""
+        const elements = installDom([
+          "backtest-runs",
+          "backtest-report",
+          "report-title",
+        ]);
+        globalThis.__api = (path) => {{
+          if (path !== "/backtests") {{
+            throw new Error(`unexpected API path ${{path}}`);
+          }}
+          return Promise.resolve({{
+            backtests: [],
+            simulation_policy: {{
+              ...{_BACKTEST_POLICY_JS},
+              saved_run_page_limit: 5000,
+            }},
+            pagination: {{limit: 5000, next_cursor: null}},
+          }});
+        }};
+
+        const outcome = await module.refreshRuns().then(
+          () => "resolved",
+          () => "rejected",
+        );
+        const rendered = elements["backtest-runs"].textContent;
+        if (
+          outcome !== "rejected"
+          || !rendered.includes("truth is unavailable")
+          || rendered.includes("No saved runs")
+        ) {{
+          throw new Error(`forged page limit looked authoritative: ${{rendered}}`);
+        }}
+        """,
+    )
+
+
+def test_backtest_list_cursor_continuation_appends_exact_next_page():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("refreshRuns", "loadMoreRuns"),
+        f"""
+        const elements = installDom(["backtest-runs"]);
+        const paths = [];
+        const run = (runId) => ({{
+          run_id: runId,
+          label: `RUN-${{runId}}`,
+          status: "succeeded",
+          created_at: "2026-07-29T10:00:00Z",
+          holdout_start: null,
+        }});
+        globalThis.__api = (path) => {{
+          paths.push(path);
+          if (path === "/backtests") {{
+            return Promise.resolve({{
+              backtests: Array.from(
+                {{length: 25}},
+                (_unused, index) => run(50 - index),
+              ),
+              simulation_policy: {_BACKTEST_POLICY_JS},
+              pagination: {{limit: 25, next_cursor: 26}},
+            }});
+          }}
+          if (path === "/backtests?cursor=26") {{
+            return Promise.resolve({{
+              backtests: [run(25)],
+              simulation_policy: {_BACKTEST_POLICY_JS},
+              pagination: {{limit: 25, next_cursor: null}},
+            }});
+          }}
+          throw new Error(`unexpected API path ${{path}}`);
+        }};
+
+        await module.refreshRuns();
+        const button = findButton(
+          elements["backtest-runs"],
+          "Load more saved runs",
+        );
+        if (!button) {{
+          throw new Error("cursor continuation control was not rendered");
+        }}
+        const callbacks = button.click();
+        await callbacks[0];
+
+        const rendered = elements["backtest-runs"].textContent;
+        if (
+          paths.join(",") !== "/backtests,/backtests?cursor=26"
+          || !rendered.includes("RUN-50")
+          || !rendered.includes("RUN-25")
+          || findButton(
+            elements["backtest-runs"],
+            "Load more saved runs",
+          )
+        ) {{
+          throw new Error(`cursor continuation failed: ${{rendered}}`);
+        }}
+        """,
+    )
+
+
+def test_backtest_busy_response_remains_visible_and_blocks_resubmit():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("submitBacktest",),
+        r"""
+        const elements = installDom([
+          "backtest-reason",
+          "backtest-submit",
+          "backtest-active-state",
+          "backtest-report",
+          "report-title",
+          "status-region",
+          "backtest-run-budget",
+        ]);
+        elements["backtest-reason"].value = "observe server lease";
+        globalThis.__api = (path) => {
+          if (path === "/backtests/run") {
+            const error = new Error("A backtest is already in progress");
+            error.code = "backtest_busy";
+            error.status = 409;
+            return Promise.reject(error);
+          }
+          if (path === "/security/posture") {
+            return Promise.resolve({});
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.submitBacktest({preventDefault() {}});
+
+        if (
+          elements["backtest-submit"].disabled !== true
+          || !elements["backtest-active-state"].textContent.includes("Busy")
+          || elements["backtest-active-state"].textContent.includes(
+            "No local run",
+          )
+        ) {
+          throw new Error(
+            `server busy authority was erased: ${
+              elements["backtest-active-state"].textContent
+            }`,
+          );
+        }
+        """,
+    )
+
+
+def test_successful_backtest_receipt_survives_saved_list_refresh_failure():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("submitBacktest",),
+        r"""
+        const elements = installDom([
+          "backtest-reason",
+          "backtest-submit",
+          "backtest-active-state",
+          "backtest-report",
+          "backtest-runs",
+          "report-title",
+          "status-region",
+          "backtest-run-budget",
+        ]);
+        elements["backtest-reason"].value = "preserve durable receipt";
+        const reportRequest = deferred();
+        globalThis.__api = (path) => {
+          if (path === "/backtests/run") {
+            return Promise.resolve({
+              run_id: 7,
+              report: {
+                label: "synthetic walk-forward",
+                disclaimer: (
+                  "Simulated — past performance does not predict future results."
+                ),
+                rows: [],
+              },
+            });
+          }
+          if (path === "/backtests") {
+            return Promise.reject(new Error("saved list unavailable"));
+          }
+          if (path === "/security/posture") {
+            return Promise.resolve({});
+          }
+          if (path === "/backtests/7/report") {
+            return reportRequest.promise;
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        const submission = module.submitBacktest({preventDefault() {}});
+        await flush();
+        await flush();
+        const loadingBody = elements["backtest-report"].textContent;
+        if (!loadingBody.includes("Run #7 completed")) {
+          throw new Error(
+            `receipt vanished during report refresh: ${loadingBody}`,
+          );
+        }
+        reportRequest.reject(new Error("report unavailable"));
+        await submission;
+
+        const title = elements["report-title"].textContent;
+        const body = elements["backtest-report"].textContent;
+        if (
+          !title.includes("#7")
+          || !body.includes("Run #7 completed")
+          || body.includes("Backtest run unavailable")
+        ) {
+          throw new Error(`successful receipt was lost: ${title} / ${body}`);
+        }
+        """,
+    )
+
+
 _BACKTEST_REPORT_DOM_SETUP = r"""
     const elements = installDom([
       "backtest-report",
@@ -3159,20 +3455,74 @@ _BACKTEST_REPORT_DOM_SETUP = r"""
       rows: [{
         symbol,
         strategy: `${label}-strategy`,
-        window: "walk-forward",
+        window: "holdout",
         metrics: {
           total_return_pct: 1,
+          cagr_pct: 1,
           sharpe: 1,
+          sortino: 1,
           max_drawdown_pct: -1,
+          win_rate_pct: 50,
+          profit_factor: 1,
+          avg_win: 1,
+          avg_loss: -1,
           num_trades: 1,
           exposure_pct: 50,
+          turnover: 1,
           pnl_by_regime: {},
         },
-        benchmark_buy_and_hold: {total_return_pct: 0},
+        benchmark_buy_and_hold: {
+          total_return_pct: 0,
+          cagr_pct: 0,
+          sharpe: 0,
+          sortino: 0,
+          max_drawdown_pct: -2,
+          win_rate_pct: 0,
+          profit_factor: null,
+          avg_win: 0,
+          avg_loss: 0,
+          num_trades: 0,
+          exposure_pct: 100,
+          turnover: 0,
+          pnl_by_regime: {},
+        },
         beat_buy_and_hold: true,
       }],
     });
 """
+
+
+def test_backtest_report_rejects_coercible_metric_values():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        globalThis.__api = (path) => {
+          if (path !== "/backtests/9/report") {
+            throw new Error(`unexpected API path ${path}`);
+          }
+          const malformed = report(
+            9,
+            "Malformed metrics",
+            "AAPL",
+            "Simulated — past performance does not predict future results.",
+          );
+          malformed.rows[0].metrics.total_return_pct = null;
+          return Promise.resolve(malformed);
+        };
+
+        await module.showReport(9);
+
+        const rendered = elements["backtest-report"].textContent;
+        if (
+          !rendered.includes("Metric evidence unavailable")
+          || rendered.includes("Metrics versus buy-and-hold")
+        ) {
+          throw new Error(`coercible metric rendered as evidence: ${rendered}`);
+        }
+        """,
+    )
 
 
 @pytest.mark.parametrize(
@@ -3487,7 +3837,23 @@ def test_starting_backtest_invalidates_prior_report_request():
           if (path === "/backtests/1/report") return priorReport.promise;
           if (path === "/backtests/run") return runRequest.promise;
           if (path === "/backtests") {
-            return Promise.resolve({backtests: []});
+            return Promise.resolve({
+              backtests: [],
+              simulation_policy: {
+                max_runtime_seconds: 1200,
+                max_symbols: 20,
+                max_calendar_days: 3000,
+                window_requests: 2,
+                global_window_requests: 4,
+                window_seconds: 60,
+                daily_requests: 10,
+                global_daily_requests: 20,
+                concurrency: 1,
+                llm_enabled: false,
+                saved_run_page_limit: 25,
+              },
+              pagination: {limit: 25, next_cursor: null},
+            });
           }
           if (path === "/backtests/2/report") {
             return Promise.resolve(
@@ -3545,7 +3911,23 @@ def test_newer_report_selection_wins_over_older_backtest_completion():
             );
           }
           if (path === "/backtests") {
-            return Promise.resolve({backtests: []});
+            return Promise.resolve({
+              backtests: [],
+              simulation_policy: {
+                max_runtime_seconds: 1200,
+                max_symbols: 20,
+                max_calendar_days: 3000,
+                window_requests: 2,
+                global_window_requests: 4,
+                window_seconds: 60,
+                daily_requests: 10,
+                global_daily_requests: 20,
+                concurrency: 1,
+                llm_enabled: false,
+                saved_run_page_limit: 25,
+              },
+              pagination: {limit: 25, next_cursor: null},
+            });
           }
           if (path === "/backtests/2/report") {
             return Promise.resolve(

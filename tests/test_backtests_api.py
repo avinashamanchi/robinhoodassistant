@@ -19,6 +19,7 @@ from tests.app_factory import create_app
 from trading_assistant.db.models import (
     AuditEvent,
     BacktestArtifact,
+    BacktestMetricRow,
     BacktestRun,
     ConcurrencyLease,
     MutationInterlock,
@@ -172,6 +173,7 @@ def test_list_exposes_only_bounded_simulation_policy(client):
         "llm_enabled": (
             svc.config.security.provider_budget.backtest_llm_enabled
         ),
+        "saved_run_page_limit": 25,
     }
     serialized = json.dumps(response["simulation_policy"])
     for forbidden in (
@@ -182,6 +184,154 @@ def test_list_exposes_only_bounded_simulation_policy(client):
         "credential",
     ):
         assert forbidden not in serialized.lower()
+
+
+def test_missing_or_unknown_run_status_never_defaults_to_success(client):
+    c, svc = client
+    with svc.session_factory() as session:
+        missing = BacktestRun(
+            label="missing status",
+            config_json="{}",
+        )
+        unknown = BacktestRun(
+            label="unknown status",
+            config_json=json.dumps({"status": "unexpected"}),
+        )
+        session.add_all([missing, unknown])
+        session.commit()
+        missing_id = missing.id
+        unknown_id = unknown.id
+
+    payload = c.get("/backtests").json()
+    listed = {
+        row["run_id"]: row["status"]
+        for row in payload["backtests"]
+    }
+
+    assert listed[missing_id] == "unknown"
+    assert listed[unknown_id] == "unknown"
+    assert c.get(f"/backtests/{missing_id}/report").json()["status"] == (
+        "unknown"
+    )
+    assert c.get(f"/backtests/{unknown_id}/report").json()["status"] == (
+        "unknown"
+    )
+
+
+def test_list_backtests_uses_strict_cursor_pages(client):
+    c, svc = client
+    with svc.session_factory() as session:
+        session.add_all(
+            [
+                BacktestRun(
+                    label=f"cursor run {index:02d}",
+                    config_json=json.dumps({"status": "succeeded"}),
+                )
+                for index in range(31)
+            ]
+        )
+        session.commit()
+
+    first = c.get("/backtests")
+
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["pagination"]["limit"] == 25
+    assert len(first_payload["backtests"]) == 25
+    first_ids = [
+        row["run_id"] for row in first_payload["backtests"]
+    ]
+    assert first_ids == sorted(first_ids, reverse=True)
+    assert first_payload["pagination"]["next_cursor"] == first_ids[-1]
+
+    second = c.get(
+        "/backtests",
+        params={"cursor": first_payload["pagination"]["next_cursor"]},
+    )
+
+    assert second.status_code == 200
+    second_payload = second.json()
+    second_ids = [
+        row["run_id"] for row in second_payload["backtests"]
+    ]
+    assert len(second_ids) == 6
+    assert second_ids == sorted(second_ids, reverse=True)
+    assert set(first_ids).isdisjoint(second_ids)
+    assert second_payload["pagination"] == {
+        "limit": 25,
+        "next_cursor": None,
+    }
+
+
+@pytest.mark.parametrize("cursor", ("0", "-1", "not-an-integer"))
+def test_list_backtests_rejects_invalid_cursor(client, cursor):
+    c, _svc = client
+
+    response = c.get("/backtests", params={"cursor": cursor})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "null_metric",
+        "string_metric",
+        "boolean_metric",
+        "beat_mismatch",
+        "column_mismatch",
+        "extra_field",
+        "missing_field",
+    ),
+)
+def test_report_rejects_malformed_metric_rows(client, mutation):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:invalid-metrics",
+        reason=f"corrupt metric row: {mutation}",
+        request_id=f"backtest-invalid-metrics-{mutation}",
+    )
+    with svc.session_factory() as session:
+        row = (
+            session.query(BacktestMetricRow)
+            .filter_by(run_id=run_id)
+            .order_by(BacktestMetricRow.id)
+            .first()
+        )
+        payload = json.loads(row.metrics_json)
+        if mutation == "null_metric":
+            payload["metrics"]["total_return_pct"] = None
+        elif mutation == "string_metric":
+            payload["metrics"]["sharpe"] = "1.25"
+        elif mutation == "boolean_metric":
+            payload["metrics"]["turnover"] = False
+        elif mutation == "beat_mismatch":
+            payload["beat_buy_and_hold"] = not payload[
+                "beat_buy_and_hold"
+            ]
+        elif mutation == "column_mismatch":
+            payload["symbol"] = "MSFT"
+        elif mutation == "extra_field":
+            payload["metrics"]["invented_edge"] = 999.0
+        else:
+            del payload["metrics"]["cagr_pct"]
+        row.metrics_json = json.dumps(payload, allow_nan=False)
+        session.commit()
+
+    report = c.get(f"/backtests/{run_id}/report").json()
+
+    assert report["status"] == "succeeded"
+    assert report["rows"] == []
+    assert report["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "metric_rows_invalid",
+    }
+    assert "manifest" not in report
+    assert "series" not in report
 
 
 def test_runner_persists_exact_applied_cost_and_holdout_config(client):
@@ -526,6 +676,82 @@ def test_run_endpoint_rejects_blank_reason(client):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_run_endpoint_normalizes_and_deduplicates_symbols(
+    client,
+    monkeypatch,
+):
+    c, _svc = client
+    observed: dict[str, object] = {}
+
+    def completed_run(*args, **kwargs):
+        observed["symbols"] = kwargs["symbols"]
+        return 701, _report()
+
+    monkeypatch.setattr(
+        runner,
+        "run_synthetic_backtest",
+        completed_run,
+    )
+
+    response = c.post(
+        "/backtests/run",
+        json={
+            "reason": "normalize direct API symbols",
+            "symbols": [" aapl ", "AAPL", "btc/usd", "BTC/USD"],
+        },
+        headers={"Idempotency-Key": "backtest-normalized-symbols"},
+    )
+
+    assert response.status_code == 200
+    assert observed["symbols"] == ["AAPL", "BTC/USD"]
+
+
+@pytest.mark.parametrize(
+    "symbols",
+    (
+        [""],
+        ["AAPL<script>"],
+        ["SYMBOL-NAME-THAT-IS-TOO-LONG"],
+    ),
+)
+def test_run_endpoint_rejects_invalid_symbols_before_runner(
+    client,
+    monkeypatch,
+    symbols,
+):
+    c, _svc = client
+    runner_calls = 0
+
+    def forbidden_run(*args, **kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        return 702, _report()
+
+    monkeypatch.setattr(
+        runner,
+        "run_synthetic_backtest",
+        forbidden_run,
+    )
+
+    response = c.post(
+        "/backtests/run",
+        json={
+            "reason": "reject malformed direct API symbol",
+            "symbols": symbols,
+        },
+        headers={
+            "Idempotency-Key": (
+                "backtest-invalid-symbol-"
+                + str(len(symbols[0]))
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert runner_calls == 0
 
 
 def test_failed_backtest_launch_is_sanitized_and_audited(

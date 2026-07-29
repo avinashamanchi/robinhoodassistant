@@ -12,11 +12,12 @@ from copy import deepcopy
 from datetime import date, timedelta
 import json
 from pathlib import Path
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import (
@@ -24,6 +25,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -80,6 +82,11 @@ _DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
 _AUTO_PLANNING = object()
 _ACCOUNT_CACHE_TTL_SECONDS = 2.0
 _GUARDED_APP_COMPOSITION_SEAL = object()
+_BACKTEST_LIST_PAGE_LIMIT = 25
+_BACKTEST_STATUSES = frozenset(
+    {"succeeded", "timed_out", "failed", "canceled"}
+)
+_BACKTEST_SYMBOL = re.compile(r"^[A-Z0-9./-]{1,20}$")
 
 if TYPE_CHECKING:
     from ..bootstrap import ApplicationContainer
@@ -198,7 +205,25 @@ class BacktestRunIn(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     start_date: date | None = None
     end_date: date | None = None
-    reason: str
+    reason: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def normalize_symbols(cls, value):
+        if not isinstance(value, list):
+            return value
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_symbol in value:
+            if not isinstance(raw_symbol, str):
+                raise ValueError("symbols must contain strings")
+            symbol = raw_symbol.strip().upper()
+            if _BACKTEST_SYMBOL.fullmatch(symbol) is None:
+                raise ValueError("symbol is invalid")
+            if symbol not in seen:
+                seen.add(symbol)
+                normalized.append(symbol)
+        return normalized
 
     @field_validator("reason")
     @classmethod
@@ -219,6 +244,68 @@ class BacktestRunIn(BaseModel):
             and self.end_date < self.start_date
         ):
             raise ValueError("end_date must not precede start_date")
+        return self
+
+
+class _BacktestMetricValues(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    total_return_pct: float = Field(allow_inf_nan=False)
+    cagr_pct: float = Field(allow_inf_nan=False)
+    sharpe: float = Field(allow_inf_nan=False)
+    sortino: float = Field(allow_inf_nan=False)
+    max_drawdown_pct: float = Field(le=0, allow_inf_nan=False)
+    win_rate_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    profit_factor: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    avg_win: float = Field(ge=0, allow_inf_nan=False)
+    avg_loss: float = Field(le=0, allow_inf_nan=False)
+    exposure_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    turnover: float = Field(ge=0, allow_inf_nan=False)
+    num_trades: int = Field(ge=0)
+    pnl_by_regime: dict[str, float]
+
+    @field_validator("pnl_by_regime")
+    @classmethod
+    def validate_regime_values(
+        cls,
+        value: dict[str, float],
+    ) -> dict[str, float]:
+        if any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(amount, bool)
+            or not isinstance(amount, float)
+            for name, amount in value.items()
+        ):
+            raise ValueError("regime attribution is invalid")
+        return value
+
+
+class _BacktestMetricRowPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    symbol: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^[A-Z0-9./-]+$",
+    )
+    strategy: str = Field(min_length=1, max_length=100)
+    window: Literal["development", "holdout", "full"]
+    metrics: _BacktestMetricValues
+    benchmark_buy_and_hold: _BacktestMetricValues
+    beat_buy_and_hold: bool
+
+    @model_validator(mode="after")
+    def beat_flag_matches_returns(self):
+        expected = (
+            self.metrics.total_return_pct
+            > self.benchmark_buy_and_hold.total_return_pct
+        )
+        if self.beat_buy_and_hold is not expected:
+            raise ValueError("benchmark comparison is inconsistent")
         return self
 
 
@@ -1387,10 +1474,19 @@ def _create_app(
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")
     def list_backtests(
+        cursor: int | None = Query(default=None, gt=0),
         principal: SessionPrincipal = Depends(current_principal),
     ):
+        runs, next_cursor = _list_backtests(
+            service.session_factory,
+            cursor=cursor,
+        )
         return {
-            "backtests": _list_backtests(service.session_factory),
+            "backtests": runs,
+            "pagination": {
+                "limit": _BACKTEST_LIST_PAGE_LIMIT,
+                "next_cursor": next_cursor,
+            },
             "simulation_policy": _backtest_simulation_policy(
                 service.config
             ),
@@ -1557,38 +1653,78 @@ def _backtest_simulation_policy(config) -> dict:
         "llm_enabled": (
             config.security.provider_budget.backtest_llm_enabled
         ),
+        "saved_run_page_limit": _BACKTEST_LIST_PAGE_LIMIT,
     }
 
 
-def _list_backtests(session_factory) -> list[dict]:
-    import json
+def _backtest_status(config_json: str) -> str:
+    try:
+        config = json.loads(config_json)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not isinstance(config, dict):
+        return "unknown"
+    status = config.get("status")
+    return (
+        status
+        if isinstance(status, str) and status in _BACKTEST_STATUSES
+        else "unknown"
+    )
 
-    from sqlalchemy import select
 
+def _list_backtests(
+    session_factory,
+    *,
+    cursor: int | None = None,
+) -> tuple[list[dict], int | None]:
     from ..db.models import BacktestRun
 
     with session_factory() as s:
-        runs = s.execute(select(BacktestRun).order_by(BacktestRun.id.desc())).scalars().all()
-        return [
+        statement = select(BacktestRun).order_by(
+            BacktestRun.id.desc()
+        )
+        if cursor is not None:
+            statement = statement.where(BacktestRun.id < cursor)
+        fetched = list(
+            s.execute(
+                statement.limit(_BACKTEST_LIST_PAGE_LIMIT + 1)
+            ).scalars()
+        )
+        has_more = len(fetched) > _BACKTEST_LIST_PAGE_LIMIT
+        runs = fetched[:_BACKTEST_LIST_PAGE_LIMIT]
+        payload = [
             {
                 "run_id": r.id,
                 "label": r.label,
-                "status": json.loads(r.config_json).get(
-                    "status",
-                    "succeeded",
-                ),
+                "status": _backtest_status(r.config_json),
                 "created_at": r.created_at.isoformat(),
                 "holdout_start": r.holdout_start.isoformat() if r.holdout_start else None,
             }
             for r in runs
         ]
+        next_cursor = runs[-1].id if has_more and runs else None
+        return payload, next_cursor
+
+
+def _validated_backtest_metric_rows(rows) -> list[dict]:
+    validated: list[dict] = []
+    for row in rows:
+        payload = json.loads(row.metrics_json)
+        model = _BacktestMetricRowPayload.model_validate(
+            payload,
+            strict=True,
+        )
+        if (
+            model.symbol != row.symbol
+            or model.strategy != row.strategy
+            or model.window != row.window
+        ):
+            raise ValueError("metric row identity is inconsistent")
+        validated.append(model.model_dump(mode="json"))
+    return validated
 
 
 def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
-    import json
-
-    from sqlalchemy import select
-
     from ..backtest.report import (
         SIMULATED_LABEL,
         validate_persisted_artifacts,
@@ -1604,21 +1740,28 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
         run = s.get(BacktestRun, run_id)
         if run is None:
             return None
-        config = json.loads(run.config_json)
         rows = s.execute(
             select(BacktestMetricRow)
             .where(BacktestMetricRow.run_id == run_id)
             .order_by(BacktestMetricRow.id)
         ).scalars().all()
-        metric_payloads = [json.loads(r.metrics_json) for r in rows]
         response = {
             "run_id": run.id,
             "label": run.label,
-            "status": config.get("status", "succeeded"),
+            "status": _backtest_status(run.config_json),
             "holdout_start": run.holdout_start.isoformat() if run.holdout_start else None,
             "disclaimer": SIMULATED_LABEL,
-            "rows": metric_payloads,
+            "rows": [],
         }
+        try:
+            metric_payloads = _validated_backtest_metric_rows(rows)
+        except (TypeError, ValueError, ValidationError):
+            response["artifact_status"] = {
+                "status": "unavailable",
+                "reason": "metric_rows_invalid",
+            }
+            return response
+        response["rows"] = metric_payloads
         artifacts = s.execute(
             select(BacktestArtifact)
             .where(BacktestArtifact.run_id == run_id)
