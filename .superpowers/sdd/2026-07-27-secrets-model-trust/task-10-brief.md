@@ -282,3 +282,37 @@ This remains ordinary Python private-API and call-graph enforcement, not
 cryptographic isolation. No Task 11, push, service/daemon/MCP start, real
 resource, ignored runtime database, Keychain/credential, network, broker,
 provider, notifier, decryption, reconciliation, or trading action occurred.
+
+## Fix round 3 checkpoint
+
+The late-startup route-inventory finding was addressed in implementation
+commit `951e276ec10c54896824ea2441086c57b0d544ba`:
+
+- route inventory validation is no longer an ordinary startup callback;
+- one outer lifespan wrapper enters the complete original app/router lifespan,
+  validates the final effective route inventory, then yields for serving;
+- direct route registration, router inclusion, and direct route-list mutation
+  from later startup callbacks cannot shadow `GET /security/posture`;
+- unique policy-classified late routes remain valid;
+- existing app/router lifespan state and startup/shutdown exceptions are
+  preserved, and failed validation still executes original cleanup; and
+- installation is idempotent for the exact wrapper and fails closed if that
+  wrapper has been displaced.
+
+Verification:
+
+- Exact RED: `8 failed` (two direct `DID NOT RAISE` reproductions and six
+  absent-wrapper contract failures)
+- Exact new-test GREEN: `8 passed`
+- Final focused route/policy/auth/API/lifespan gate:
+  `478 passed, 1 warning`
+- Sole full suite:
+  `3331 passed, 1 skipped, 1 warning in 252.09s`
+- Static gate:
+  `release static checks: PASS`
+- Review package:
+  `review-e14b1c0..951e276.diff` (395 lines / 11,150 bytes)
+
+Task 11 remains untouched. No push, service/daemon/MCP start, real resource,
+ignored runtime database, Keychain/credential, network, broker, provider,
+notifier, decryption, reconciliation, or trading action occurred.

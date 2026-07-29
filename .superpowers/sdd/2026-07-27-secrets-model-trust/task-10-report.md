@@ -718,3 +718,166 @@ implementation finding remains at this gate.
 
 These residuals are conservative evidence and composition limits, not trading
 permissions.
+
+---
+
+## Fix round 3 amendment
+
+### Outcome
+
+The late-startup duplicate-handler finding was fixed in
+`951e276ec10c54896824ea2441086c57b0d544ba`.
+
+Route inventory validation no longer participates in the ordered startup
+callback list. It now runs after the complete original FastAPI/router lifespan
+has entered and immediately before the application can serve a request.
+Task 10 posture behavior, authentication, rate limiting, read-only boundaries,
+and permanent `can_trade=False` remain unchanged.
+
+### Architecture decision
+
+`install_route_inventory_lifespan()` is called once at the end of canonical
+`create_app()` composition, after router inclusion, route declarations, and
+middleware registration. It captures the complete original
+`app.router.lifespan_context` and installs this outer context:
+
+1. enter the original app/router lifespan;
+2. allow every original startup callback and nested lifespan startup to
+   complete;
+3. call `validate_route_inventory()` against the final effective route graph;
+4. yield the original lifespan state unchanged only if validation succeeds;
+5. delegate shutdown and exception handling to the original context.
+
+Validation failure occurs inside the original context, so its `__aexit__`
+path still runs. Startup and shutdown exceptions are not caught, translated,
+or replaced. A second installation leaves the exact installed wrapper
+unchanged; if some caller has displaced it, installation rejects rather than
+nests another validator.
+
+The former `app.router.add_event_handler("startup", ...)` validator was
+removed. Consequently, a later startup callback that calls
+`add_api_route()`, includes an `APIRouter`, or appends directly to
+`app.routes` completes before the inventory is checked.
+
+### Exact RED evidence
+
+The complete round-3 probes were added before production changes:
+
+```text
+uv run pytest -q \
+  tests/test_route_policy.py::test_later_startup_callback_cannot_shadow_posture_handler \
+  tests/test_route_policy.py::test_later_startup_direct_route_list_mutation_cannot_bypass_inventory \
+  tests/test_route_policy.py::test_unique_route_added_by_later_startup_callback_is_served \
+  tests/test_route_policy.py::test_route_inventory_lifespan_is_installed_once_and_preserves_state \
+  tests/test_route_policy.py::test_inventory_failure_runs_original_lifespan_cleanup \
+  tests/test_route_policy.py::test_original_lifespan_exceptions_propagate_unchanged
+```
+
+Result: exit `1`, `8 failed`.
+
+The direct and router-inclusion posture-shadow cases both failed with
+`DID NOT RAISE RuntimeError`, reproducing the review finding. The other six
+parameterized cases failed because the required final-lifespan installer did
+not exist; they encoded direct routes-list mutation, unique late-route
+acceptance, one-time installation, nested lifespan state, cleanup, and exact
+exception propagation.
+
+After the implementation, the same selection passed:
+
+```text
+........ [100%]
+8 passed
+```
+
+### Focused GREEN evidence
+
+The final route/policy/auth/API/lifespan and security adjacency gate was:
+
+```text
+uv run pytest -q \
+  tests/test_route_policy.py \
+  tests/test_auth.py \
+  tests/test_api.py \
+  tests/test_security.py \
+  tests/test_security_headers.py \
+  tests/test_security_posture.py \
+  tests/test_transport_boundary.py
+```
+
+Result: exit `0`; all `478` collected tests passed with the one existing
+`websockets.legacy` warning.
+
+The focused tests prove:
+
+- later direct and included-router posture shadows fail TestClient startup
+  before any request or shadow-handler invocation;
+- direct `app.routes` mutation cannot bypass final inventory validation;
+- one unique, pre-classified late route starts and serves normally;
+- app and included-router lifespan state is preserved;
+- app and included-router startup/shutdown each run exactly once;
+- validation failure runs original cleanup; and
+- original startup and shutdown exception objects propagate unchanged.
+
+### Sole full suite and static gate
+
+After focused green and final diff review, exactly one no-argument full suite
+was run:
+
+```text
+uv run pytest
+3331 passed, 1 skipped, 1 warning in 252.09s
+```
+
+It was not rerun. The warning is the pre-existing third-party
+`websockets.legacy` deprecation.
+
+The required static gate then passed:
+
+```text
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+`git diff --check` also passed before the implementation commit.
+
+### Fix-round implementation files
+
+- `src/trading_assistant/app/main.py`
+- `src/trading_assistant/app/policy.py`
+- `tests/test_route_policy.py`
+
+### Fix-round review package
+
+- Base:
+  `e14b1c0d4145326d8762e8a1fa32dd8b781fb3c3`
+- Implementation:
+  `951e276ec10c54896824ea2441086c57b0d544ba`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-e14b1c0..951e276.diff`
+- Diff size:
+  395 lines / 11,150 bytes
+- Diff SHA-256:
+  `3c86ff94c0b20963e7e7d9495d7464b27f9b9b44170b6d4c42e86bdcff1ef391`
+
+The bounded package was reviewed against the one finding, final route
+composition order, FastAPI included-router lifespan merging, direct route
+registration/list mutation, state propagation, cleanup, exception identity,
+and Task 11 scope. No open implementation finding remains at this gate.
+
+### Residual concerns after fix round 3
+
+- The route graph is intentionally treated as immutable once serving begins.
+  Mutation after the lifespan wrapper yields is unsupported and is not
+  reclassified continuously; canonical production composition exposes no such
+  mutation path.
+- Quote posture intentionally remains
+  `unknown/quote_evidence_unavailable`.
+- Startup receipt sealing remains ordinary Python private-API/call-graph
+  enforcement, not cryptographic isolation.
+- The pre-existing `websockets.legacy` warning remains unrelated and
+  non-blocking.
+
+These residuals are conservative composition/evidence limits, not trading
+permissions. No Task 11, push, service/daemon/MCP start, real resource,
+ignored runtime database, Keychain/credential, network, broker, provider,
+notifier, decryption, reconciliation, or trading action occurred.

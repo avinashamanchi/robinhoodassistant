@@ -1750,6 +1750,22 @@ Final focused/adjacent gate: `712 passed, 1 warning`. Exactly one full suite:
 `3323 passed, 1 skipped, 1 warning`. Static release gate: PASS.
 Task 11 remains untouched.
 
+- [x] **Fix round 3: validate the final post-startup route inventory**
+
+The fix round removes route inventory validation from the ordered startup
+callback list. A one-time outer lifespan wrapper now enters the original
+app/router lifespan, waits for every startup callback, validates the final
+effective handler inventory immediately before serving, and preserves yielded
+state, cleanup, and original exceptions. Late direct registration, router
+inclusion, and direct routes-list shadows are rejected; unique classified
+routes remain valid.
+
+Implementation: `951e276ec10c54896824ea2441086c57b0d544ba`.
+Final focused route/policy/auth/API/lifespan gate:
+`478 passed, 1 warning`. Exactly one full suite:
+`3331 passed, 1 skipped, 1 warning in 252.09s`. Static release gate: PASS.
+Task 11 remains untouched.
+
 ---
 
 ### Task 11: Make trust-boundary regressions fail the release gate
