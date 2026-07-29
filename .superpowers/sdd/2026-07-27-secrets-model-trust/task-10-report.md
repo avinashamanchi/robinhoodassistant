@@ -486,3 +486,235 @@ remains at this gate.
   non-blocking.
 
 These residuals are conservative evidence limits, not permissions.
+
+---
+
+## Fix round 2 amendment
+
+### Outcome
+
+All four fresh findings were fixed in
+`87aa612a382d29e95e44bcf57728637d8cf84b5a`.
+
+The posture route remains authenticated `SESSION/session_read`, local-only,
+typed, redacted, and non-authoritative. The round changes trading authority
+only to make the existing reconciliation requirement fail closed in
+`PortfolioSnapshotService`; no posture result is consumed as authority.
+
+### Architecture decisions
+
+1. `PortfolioSnapshotService` now selects only reconciliation generation,
+   status, and lifecycle timestamps, then calls the same pure
+   `validate_startup_reconciliation_snapshot` function as
+   `StartupReconciliationGate.is_current()` and posture. The snapshot's one
+   `captured_at` value is passed as `observed_at`; future, corrupt,
+   incomplete, or out-of-order rows make `broker_reconciled=False`, which
+   keeps `RiskEngine` closed. No actor, reason, request ID, evidence JSON, or
+   cipher is read.
+2. `StartupGuardReceipt` is bound to exact config and secrets object
+   identities, one exact runtime role, and the private canonical launch-chain
+   sentinel. `_build_guarded_container` atomically consumes it under its own
+   lock before calling any container builder. Wrong-role attempts reject
+   without consuming; exact sequential/concurrent reuse rejects with the
+   stable consumed code; a failed build remains consumed. Only a private
+   consumed-chain context traverses construction, and neither that context nor
+   the receipt is stored. `ApplicationContainer` retains only frozen
+   `StartupPostureEvidence`.
+3. `RoutePolicy` permits `lease_free_bounded_read=True` only for the exact
+   tuple `GET /security/posture`, `AuthLevel.SESSION`, `session_read`, default
+   body limit, principal concurrency scope, reject behavior, and no authority
+   flags. Lowercase methods, aliases, trailing/double slashes, parameterized
+   paths, alternate auth/limits/scopes, and every mutation/idempotency flag
+   reject at construction. The default remains `False` for all other routes.
+4. `RoutePolicyRegistry` separately inventories actual effective
+   `APIRoute` handlers. It normalizes repeated/trailing slashes and parameter
+   names/converters, expands FastAPI's lazy included-router contexts, and
+   rejects duplicate effective method/path pairs during startup validation.
+   Distinct `GET`/`HEAD`/`OPTIONS` methods, one multi-method declaration with
+   unique methods, and static mounts remain valid.
+
+The receipt boundary is Python private-API, sentinel, identity, and call-graph
+enforcement. It is intentionally not described as cryptographic isolation.
+Task 11 static caller restrictions remain out of scope.
+
+### Exact RED evidence
+
+The combined review probes were written before production changes:
+
+```text
+uv run pytest -q \
+  tests/test_security_posture.py::test_reconciliation_posture_matches_authoritative_safe_column_gate \
+  tests/test_bootstrap.py::test_startup_guard_receipt_is_role_bound_and_wrong_role_does_not_consume \
+  tests/test_bootstrap.py::test_startup_guard_receipt_is_consumed_before_sequential_reuse \
+  tests/test_bootstrap.py::test_startup_guard_receipt_has_exactly_one_concurrent_consumer \
+  tests/test_bootstrap.py::test_failed_guarded_construction_still_consumes_receipt \
+  tests/test_bootstrap.py::test_application_container_retains_evidence_not_reusable_receipt \
+  tests/test_route_policy.py::test_lease_free_capability_is_confined_to_exact_posture_policy \
+  tests/test_route_policy.py::test_exact_security_posture_policy_can_be_lease_free \
+  tests/test_route_policy.py::test_duplicate_effective_api_handlers_fail_inventory_validation \
+  tests/test_route_policy.py::test_including_same_router_twice_is_a_duplicate_effective_handler \
+  tests/test_route_policy.py::test_duplicate_handler_normalization_preserves_unique_http_methods \
+  tests/test_route_policy.py::test_dynamic_shadow_posture_handler_fails_at_app_startup
+```
+
+Result: exit `1`, with `30 failed` and `9 passed` across the 39 selected
+cases. Eight reconciliation cases initially failed in test setup because the
+fixed-time mock expected a callable and received a `datetime`; that
+test-only fixture was corrected before production edits and is not counted as
+authority evidence.
+
+The corrected reconciliation differential then produced the intended RED:
+
+```text
+uv run pytest -q \
+  tests/test_security_posture.py::test_reconciliation_posture_matches_authoritative_safe_column_gate
+```
+
+Result: `3 failed, 5 passed`. Future-start, future-completion, and
+timestamp-order corruption passed the old snapshot's weaker
+generation/status check while both the gate and posture rejected them.
+
+The remaining combined RED failures reproduced absent receipt role/one-shot
+enforcement, reusable receipt retention, thirteen lease-free tuple escapes,
+and four duplicate-handler/inventory gaps.
+
+### Focused GREEN evidence
+
+The final focused plus snapshot/risk/auth/API/operations adjacency gate was:
+
+```text
+uv run pytest -o addopts='' -q \
+  tests/test_security_posture.py \
+  tests/test_bootstrap.py \
+  tests/test_route_policy.py \
+  tests/test_transport_boundary.py \
+  tests/test_launch.py \
+  tests/test_startup_reconciliation.py \
+  tests/test_reconciliation_service.py \
+  tests/test_execution_risk_snapshot.py \
+  tests/test_risk_engine.py \
+  tests/test_execution.py \
+  tests/test_auth.py \
+  tests/test_api.py \
+  tests/test_ops.py
+```
+
+Result: `712 passed, 1 warning in 38.65s`.
+
+An earlier run of this exact adjacency set found one compatibility regression:
+`1 failed, 711 passed, 1 warning`. An injected `OperationsService` posture
+reader correctly has no private startup-evidence attribute. The constructor
+was corrected to preserve that test-injection seam as explicit unknown
+startup evidence; the exact failing test then passed and the complete
+712-test gate above was rerun green.
+
+Additional checks before the sole full suite:
+
+```text
+uv run python -m compileall -q src/trading_assistant \
+  tests/test_bootstrap.py tests/test_route_policy.py \
+  tests/test_security_posture.py tests/test_transport_boundary.py
+PASS
+
+git diff --check
+PASS
+```
+
+### Sole full suite and static gate
+
+After final focused green and diff review, exactly one no-argument full suite
+was run:
+
+```text
+uv run pytest
+3323 passed, 1 skipped, 1 warning in 252.16s
+```
+
+It was not rerun. The one warning remains the documented third-party
+`websockets.legacy` deprecation.
+
+The required static gate then passed:
+
+```text
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+```
+
+### Authority, read-only, and no-I/O proof
+
+The fixed-clock differential seeds adversarial reconciliation rows with
+encrypted narrative markers, patches `SensitiveDataCipher.decrypt` to raise,
+and proves gate, posture, snapshot `broker_reconciled`, and final risk approval
+all agree. Decryption calls remain exactly zero.
+
+Round-1 repeated/concurrent route tests remain in the final focused/full
+gates. They patch broker reads/mutations, provider mutators, notifier,
+Keychain, startup encryption inspection, envelope scanning, and cipher
+decryption to raise. Before/after snapshots preserve every mapped table except
+ordinary `session_read` `RateWindow` accounting; `ConcurrencyLease` remains
+exactly unchanged.
+
+Receipt tests use temp SQLite/fakes and prove:
+
+- wrong-role rejection followed by exactly one correct-role success;
+- one sequential success and stable reuse rejection;
+- 32 simultaneous exact consumers produce one build and 31 stable consumed
+  rejections;
+- construction failure consumes before the failing builder and cannot retry;
+- launch-chain tampering and fabricated receipts reject before composition;
+- public/test composition remains startup-unknown; and
+- canonical private app composition receives the same immutable evidence but
+  stores no reusable receipt.
+
+No service, daemon, MCP server, real Keychain/credential, ignored
+`trading_assistant.db`, broker/provider/notifier/network endpoint, decryption,
+trade, reconciliation, reset, prune, sweep, reserve, notification, or push
+action was performed.
+
+### Fix-round implementation files
+
+- `src/trading_assistant/app/main.py`
+- `src/trading_assistant/app/policy.py`
+- `src/trading_assistant/bootstrap.py`
+- `src/trading_assistant/operations/security_posture.py`
+- `src/trading_assistant/operations/service.py`
+- `src/trading_assistant/ops/serve.py`
+- `src/trading_assistant/orders/snapshot.py`
+- `tests/test_bootstrap.py`
+- `tests/test_launch.py`
+- `tests/test_route_policy.py`
+- `tests/test_security_posture.py`
+- `tests/test_transport_boundary.py`
+
+### Fix-round review package
+
+- Base:
+  `d0d4fa6ba7b97766f808a95ae996cff228be1875`
+- Implementation:
+  `87aa612a382d29e95e44bcf57728637d8cf84b5a`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-d0d4fa6..87aa612.diff`
+- Diff size:
+  1,600 lines / 57,453 bytes
+
+The bounded package was reviewed against all four findings, production
+callers, execution-authority parity, selected reconciliation columns,
+receipt lifetime/identity/role/concurrency, route-policy aliases, effective
+handler collisions, narrative decryption, and Task 11 scope. No open
+implementation finding remains at this gate.
+
+### Residual concerns after fix round 2
+
+- Quote posture intentionally remains
+  `unknown/quote_evidence_unavailable`.
+- Receipt sealing is normal Python private-API/call-graph enforcement, not
+  cryptographic isolation. Task 11 may add static caller restrictions; none
+  were added here.
+- Duplicate-handler classification runs at FastAPI startup after canonical
+  route registration. Mutating the route graph after startup is unsupported
+  and outside this production composition path.
+- The pre-existing `websockets.legacy` warning remains unrelated and
+  non-blocking.
+
+These residuals are conservative evidence and composition limits, not trading
+permissions.

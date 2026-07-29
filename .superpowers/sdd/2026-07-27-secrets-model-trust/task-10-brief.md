@@ -37,16 +37,17 @@ paths, certificate names, URLs, exception text, or narrative.
 4. run the startup guard against that exact `RuntimeSecrets` object;
 5. seal the returned structural checks plus provider/load evidence in an
    opaque `StartupGuardReceipt` bound by object identity to the exact config
-   and secrets;
-6. build one container through the private guarded composition entrypoint;
-7. call the private guarded app entrypoint with that exact
-   container/receipt.
+   and secrets, the exact runtime role, and the private launch chain;
+6. atomically consume that receipt once under a lock before building one
+   container through the private guarded composition entrypoint;
+7. retain only immutable evidence in the container and call the private
+   guarded app entrypoint with that exact container.
 
 The posture route never retains or calls the provider. An injected unit app
 without startup evidence reports startup-derived checks as `unknown`; it does
 not infer a pass from config. Public `build_container` and `create_app`
-cannot accept startup evidence or a receipt, and a guarded container is
-rejected by public app composition.
+cannot accept startup evidence, a receipt, or the private composition seal,
+and a guarded container is rejected by public app composition.
 
 ## Posture response
 
@@ -241,3 +242,43 @@ Verification:
 No Task 11, service, daemon, MCP, real Keychain/credential, ignored runtime
 database, broker/provider/notifier/network, trade, reconciliation, reset, or
 push action was performed.
+
+## Fix round 2 checkpoint
+
+Fresh authority and startup-classification findings were addressed in
+implementation commit
+`87aa612a382d29e95e44bcf57728637d8cf84b5a`:
+
+- snapshot/risk execution authority now uses the exact shared
+  reconciliation safe-column validator and the snapshot's one fixed
+  observation time;
+- the startup receipt is exact-role/config/secrets/private-launch-chain bound,
+  atomically consumed once under a lock before container construction, and is
+  never retained by the container;
+- only the exact `GET /security/posture`, `SESSION`, `session_read`, default
+  body/principal/reject policy tuple may enable lease-free bounded reads; and
+- startup inventory validation rejects duplicate effective normalized
+  `APIRoute` method/path handlers, including dynamic posture shadows and
+  repeated router inclusion, while preserving distinct methods and static
+  mounts.
+
+Verification:
+
+- Corrected reconciliation authority RED:
+  `3 failed, 5 passed`
+- Initial combined review-probe RED:
+  `30 failed, 9 passed` (including eight test-fixture failures corrected
+  before implementation)
+- Final focused/adjacent gate:
+  `712 passed, 1 warning in 38.65s`
+- Sole full suite:
+  `3323 passed, 1 skipped, 1 warning in 252.16s`
+- Static gate:
+  `release static checks: PASS`
+- Review package:
+  `review-d0d4fa6..87aa612.diff` (1,600 lines / 57,453 bytes)
+
+This remains ordinary Python private-API and call-graph enforcement, not
+cryptographic isolation. No Task 11, push, service/daemon/MCP start, real
+resource, ignored runtime database, Keychain/credential, network, broker,
+provider, notifier, decryption, reconciliation, or trading action occurred.

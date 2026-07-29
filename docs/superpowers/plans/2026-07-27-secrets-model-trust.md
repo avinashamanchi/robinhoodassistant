@@ -1735,6 +1735,21 @@ Final focused gate: `314 passed`. Exactly one full suite:
 `3297 passed, 1 skipped, 1 warning`. Static release gate: PASS.
 Task 11 remains untouched.
 
+- [x] **Fix round 2: close authority, receipt, policy, and route-registry findings**
+
+The fix round routes `PortfolioSnapshotService` through the exact shared
+safe-column reconciliation validator and fixed observation time used by the
+gate/posture authority; makes startup receipts config/secrets/role/launch-chain
+bound and atomically one-shot before container construction; confines
+lease-free policy construction to the exact posture route tuple; and rejects
+duplicate effective normalized FastAPI handlers at startup, including lazy
+router inclusion.
+
+Implementation: `87aa612a382d29e95e44bcf57728637d8cf84b5a`.
+Final focused/adjacent gate: `712 passed, 1 warning`. Exactly one full suite:
+`3323 passed, 1 skipped, 1 warning`. Static release gate: PASS.
+Task 11 remains untouched.
+
 ---
 
 ### Task 11: Make trust-boundary regressions fail the release gate
