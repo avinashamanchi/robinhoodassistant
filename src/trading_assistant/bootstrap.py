@@ -40,8 +40,11 @@ from .orders.snapshot import PortfolioSnapshotService
 from .orders.submission import OrderSubmissionService
 from .operations import AuditRecorder, OperationsService
 from .operations.security_posture import (
+    _ConsumedStartupGuard,
     StartupGuardReceipt,
-    _validate_startup_guard_receipt,
+    StartupPostureEvidence,
+    _consume_startup_guard_receipt,
+    _validate_consumed_startup_guard,
 )
 from .ops.tenure import (
     LocalProcessInspector,
@@ -111,7 +114,7 @@ class ApplicationContainer:
     candidate_signer: CandidateSigner | None = None
     candidate_drafts: CandidateDraftService | None = None
     candidate_queue: CandidateQueueService | None = None
-    startup_guard_receipt: StartupGuardReceipt | None = None
+    startup_evidence: StartupPostureEvidence | None = None
 
 
 def prepare_database_runtime(
@@ -306,10 +309,11 @@ def _build_guarded_container(
 ) -> ApplicationContainer:
     """Private production path for the exact startup-guard composition."""
 
-    _validate_startup_guard_receipt(
+    consumed_startup_guard = _consume_startup_guard_receipt(
         startup_guard_receipt,
         config=config,
         secrets=secrets,
+        runtime_role=runtime_role,
     )
     return _build_container(
         config,
@@ -319,7 +323,7 @@ def _build_guarded_container(
         process_inspector=process_inspector,
         tenure_clock=tenure_clock,
         tenure_owner_factory=tenure_owner_factory,
-        startup_guard_receipt=startup_guard_receipt,
+        _consumed_startup_guard=consumed_startup_guard,
     )
 
 
@@ -352,18 +356,20 @@ def _build_container(
     tenure_clock=None,
     tenure_owner_factory=None,
     enforce_runtime_tenure: bool = True,
-    startup_guard_receipt: StartupGuardReceipt | None = None,
+    _consumed_startup_guard: _ConsumedStartupGuard | None = None,
 ) -> ApplicationContainer:
-    _guard_runtime(config, secrets)
-    if startup_guard_receipt is not None:
-        _validate_startup_guard_receipt(
-            startup_guard_receipt,
-            config=config,
-            secrets=secrets,
-        )
     effective_role = runtime_role or "app"
     if effective_role not in {"app", "daemon", "mcp"}:
         raise ValueError("runtime_role_invalid")
+    startup_evidence = None
+    if _consumed_startup_guard is not None:
+        startup_evidence = _validate_consumed_startup_guard(
+            _consumed_startup_guard,
+            config=config,
+            secrets=secrets,
+            runtime_role=effective_role,
+        )
+    _guard_runtime(config, secrets)
     runtime = prepare_database_runtime(
         secrets,
         runtime_role=effective_role if enforce_runtime_tenure else None,
@@ -399,7 +405,8 @@ def _build_container(
             clock=clock,
             sensitive_cipher=sensitive_cipher,
             runtime_tenure_guard=runtime_tenure_guard,
-            startup_guard_receipt=startup_guard_receipt,
+            consumed_startup_guard=_consumed_startup_guard,
+            startup_evidence=startup_evidence,
         )
     except BaseException:
         if runtime_tenure_guard is not None:
@@ -418,7 +425,8 @@ def _finish_container(
     clock,
     sensitive_cipher: SensitiveDataCipher | None,
     runtime_tenure_guard: RuntimeTenureGuard | None,
-    startup_guard_receipt: StartupGuardReceipt | None,
+    consumed_startup_guard: _ConsumedStartupGuard | None,
+    startup_evidence: StartupPostureEvidence | None,
 ) -> ApplicationContainer:
     session_factory = runtime.session_factory
     if runtime_tenure_guard is not None:
@@ -540,9 +548,12 @@ def _finish_container(
         leases=leases,
         policy_store_maintenance=policy_store_maintenance,
         provider_budget=provider_budget,
-        _startup_guard_receipt=startup_guard_receipt,
+        _consumed_startup_guard=consumed_startup_guard,
         _startup_secrets=(
-            secrets if startup_guard_receipt is not None else None
+            secrets if consumed_startup_guard is not None else None
+        ),
+        _startup_runtime_role=(
+            runtime_role if consumed_startup_guard is not None else None
         ),
     )
     return ApplicationContainer(
@@ -571,5 +582,5 @@ def _finish_container(
         candidate_signer=candidate_signer,
         candidate_drafts=candidate_drafts,
         candidate_queue=candidate_queue,
-        startup_guard_receipt=startup_guard_receipt,
+        startup_evidence=startup_evidence,
     )

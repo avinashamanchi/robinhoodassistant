@@ -82,10 +82,10 @@ _STATIC = Path(__file__).parent / "static"
 _DEPENDENCY_UNAVAILABLE_MESSAGE = "Required dependency is unavailable"
 _AUTO_PLANNING = object()
 _ACCOUNT_CACHE_TTL_SECONDS = 2.0
+_GUARDED_APP_COMPOSITION_SEAL = object()
 
 if TYPE_CHECKING:
     from ..bootstrap import ApplicationContainer
-    from ..operations.security_posture import StartupGuardReceipt
 
 
 class _AssetOnlyStaticFiles(StaticFiles):
@@ -366,10 +366,10 @@ def _create_app(
     transport_policy: TransportPolicy | None = None,
     candidate_signer: CandidateSigner | None = None,
     candidate_queue: CandidateQueueService | None = None,
-    _startup_guard_receipt: "StartupGuardReceipt | None" = None,
+    _guarded_app_composition: object | None = None,
 ) -> FastAPI:
-    if container is None and _startup_guard_receipt is not None:
-        raise RuntimeError("startup_guard_receipt_invalid")
+    if container is None and _guarded_app_composition is not None:
+        raise RuntimeError("guarded_app_composition_invalid")
     if container is None and ((service is None) != (agent is None)):
         raise RuntimeError(
             "service and agent must be injected together"
@@ -384,36 +384,49 @@ def _create_app(
         agent = _build_agent(container)
     startup_evidence = None
     if container is not None:
-        container_receipt = getattr(
+        container_evidence = getattr(
             container,
-            "startup_guard_receipt",
+            "startup_evidence",
             None,
         )
-        if _startup_guard_receipt is None and container_receipt is not None:
+        if (
+            _guarded_app_composition is None
+            and container_evidence is not None
+        ):
             raise RuntimeError(
                 "guarded container requires guarded app composition"
             )
-        if _startup_guard_receipt is not None:
-            if _startup_guard_receipt is not container_receipt:
-                raise RuntimeError("startup_guard_receipt_mismatch")
+        if _guarded_app_composition is not None:
+            if (
+                _guarded_app_composition
+                is not _GUARDED_APP_COMPOSITION_SEAL
+            ):
+                raise RuntimeError("guarded_app_composition_invalid")
             from ..operations.security_posture import (
-                _validate_startup_guard_receipt,
+                StartupPostureEvidence,
             )
 
-            startup_evidence = _validate_startup_guard_receipt(
-                _startup_guard_receipt,
-                config=container.config,
-                secrets=container.secrets,
-            )
             if (
-                getattr(
-                    container.operations,
-                    "_startup_guard_receipt",
+                type(container_evidence) is not StartupPostureEvidence
+                or getattr(
+                    container.operations, "_startup_evidence", None
+                )
+                is not container_evidence
+                or getattr(
+                    getattr(
+                        container.operations,
+                        "_security_posture_reader",
+                        None,
+                    ),
+                    "_startup_evidence",
                     None,
                 )
-                is not _startup_guard_receipt
+                is not container_evidence
             ):
-                raise RuntimeError("startup_guard_receipt_mismatch")
+                raise RuntimeError("guarded_app_composition_mismatch")
+            if auth_now is not None:
+                raise RuntimeError("guarded_app_override_invalid")
+            startup_evidence = container_evidence
         if (
             runtime_secrets is not None
             and runtime_secrets is not container.secrets
@@ -632,12 +645,6 @@ def _create_app(
                     None,
                 )
                 if container is not None
-                else None
-            ),
-            _startup_guard_receipt=_startup_guard_receipt,
-            _startup_secrets=(
-                runtime_secrets
-                if _startup_guard_receipt is not None
                 else None
             ),
         )
@@ -1449,14 +1456,13 @@ def _create_app(
 def _create_guarded_app(
     *,
     container: "ApplicationContainer",
-    startup_guard_receipt: "StartupGuardReceipt",
     **kwargs,
 ) -> FastAPI:
-    """Private launcher entrypoint for one validated startup receipt."""
+    """Private launcher entrypoint for one consumed startup chain."""
 
     return _create_app(
         container=container,
-        _startup_guard_receipt=startup_guard_receipt,
+        _guarded_app_composition=_GUARDED_APP_COMPOSITION_SEAL,
         **kwargs,
     )
 
@@ -1464,9 +1470,9 @@ def _create_guarded_app(
 @wraps(_create_app)
 def create_app(*args, **kwargs) -> FastAPI:
     """Build the automatic production app inside its role log boundary."""
-    if "_startup_guard_receipt" in kwargs:
+    if "_guarded_app_composition" in kwargs:
         raise TypeError(
-            "startup guard receipt requires private guarded composition"
+            "guarded app composition requires private launcher entrypoint"
         )
     bound = inspect.signature(_create_app).bind_partial(
         *args,

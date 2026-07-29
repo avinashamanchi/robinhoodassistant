@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from decimal import Decimal
 
@@ -583,6 +585,233 @@ def test_fabricated_startup_guard_receipt_is_rejected_before_composition(
     assert composed == []
 
 
+def test_startup_guard_receipt_rejects_a_broken_launch_chain(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(app_api_token="startup-receipt-chain-secret")
+    receipt = _issue_guard_receipt(posture, service.config, secrets)
+    object.__setattr__(receipt, "_launch_chain", object())
+    built: list[str] = []
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: built.append("built"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_invalid",
+    ):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+
+    assert built == []
+
+
+def _issue_guard_receipt(posture, config, secrets, *, runtime_role="app"):
+    return posture._issue_startup_guard_receipt(
+        config=config,
+        secrets=secrets,
+        checks=(
+            SimpleNamespace(
+                name="runtime_configuration",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(
+                name="loopback_https",
+                passed=True,
+                code="ok",
+            ),
+            SimpleNamespace(name="tls", passed=True, code="ok"),
+            SimpleNamespace(name="database", passed=True, code="ok"),
+            SimpleNamespace(name="encryption", passed=True, code="ok"),
+        ),
+        observed_at=datetime.now(timezone.utc),
+        secret_loaded_at=datetime.now(timezone.utc)
+        - timedelta(seconds=1),
+        runtime_role=runtime_role,
+    )
+
+
+def test_startup_guard_receipt_is_role_bound_and_wrong_role_does_not_consume(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(app_api_token="startup-receipt-role-secret")
+    receipt = _issue_guard_receipt(
+        posture,
+        service.config,
+        secrets,
+        runtime_role="app",
+    )
+    built: list[str] = []
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_container",
+        lambda *_args, **_kwargs: built.append("built") or "container",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_role_mismatch",
+    ):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="daemon",
+            startup_guard_receipt=receipt,
+        )
+    assert bootstrap._build_guarded_container(
+        service.config,
+        secrets,
+        runtime_role="app",
+        startup_guard_receipt=receipt,
+    ) == "container"
+    assert built == ["built"]
+
+
+def test_startup_guard_receipt_is_consumed_before_sequential_reuse(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(app_api_token="startup-receipt-sequential-secret")
+    receipt = _issue_guard_receipt(posture, service.config, secrets)
+    captured: list[dict[str, object]] = []
+
+    def fake_build(*_args, **kwargs):
+        captured.append(kwargs)
+        return "container"
+
+    monkeypatch.setattr(bootstrap, "_build_container", fake_build)
+
+    assert bootstrap._build_guarded_container(
+        service.config,
+        secrets,
+        runtime_role="app",
+        startup_guard_receipt=receipt,
+    ) == "container"
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_consumed",
+    ):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+
+    assert len(captured) == 1
+    assert "startup_guard_receipt" not in captured[0]
+    assert "_consumed_startup_guard" in captured[0]
+
+
+def test_startup_guard_receipt_has_exactly_one_concurrent_consumer(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(app_api_token="startup-receipt-concurrent-secret")
+    receipt = _issue_guard_receipt(posture, service.config, secrets)
+    barrier = threading.Barrier(32)
+    build_calls: list[int] = []
+
+    def fake_build(*_args, **_kwargs):
+        build_calls.append(1)
+        return "container"
+
+    monkeypatch.setattr(bootstrap, "_build_container", fake_build)
+
+    def consume(_index):
+        barrier.wait()
+        try:
+            return bootstrap._build_guarded_container(
+                service.config,
+                secrets,
+                runtime_role="app",
+                startup_guard_receipt=receipt,
+            )
+        except RuntimeError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        results = list(pool.map(consume, range(32)))
+
+    assert results.count("container") == 1
+    assert results.count("startup_guard_receipt_consumed") == 31
+    assert build_calls == [1]
+
+
+def test_failed_guarded_construction_still_consumes_receipt(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+    from trading_assistant.operations import security_posture as posture
+
+    service = make_service()
+    secrets = Secrets(app_api_token="startup-receipt-failed-build-secret")
+    receipt = _issue_guard_receipt(posture, service.config, secrets)
+    build_calls = 0
+
+    def fail_build(*_args, **_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        raise RuntimeError("construction_failed")
+
+    monkeypatch.setattr(bootstrap, "_build_container", fail_build)
+
+    with pytest.raises(RuntimeError, match="construction_failed"):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="startup_guard_receipt_consumed",
+    ):
+        bootstrap._build_guarded_container(
+            service.config,
+            secrets,
+            runtime_role="app",
+            startup_guard_receipt=receipt,
+        )
+
+    assert build_calls == 1
+
+
+def test_application_container_retains_evidence_not_reusable_receipt():
+    from trading_assistant.bootstrap import ApplicationContainer
+
+    fields = ApplicationContainer.__dataclass_fields__
+
+    assert "startup_evidence" in fields
+    assert "startup_guard_receipt" not in fields
+
+
 def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
     make_service,
     monkeypatch,
@@ -595,29 +824,12 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
     secrets = Secrets(
         app_api_token="startup-receipt-canonical-secret",
     )
-    checks = (
-        SimpleNamespace(
-            name="runtime_configuration",
-            passed=True,
-            code="ok",
-        ),
-        SimpleNamespace(name="loopback_https", passed=True, code="ok"),
-        SimpleNamespace(name="tls", passed=True, code="ok"),
-        SimpleNamespace(name="database", passed=True, code="ok"),
-        SimpleNamespace(name="encryption", passed=True, code="ok"),
-    )
-    secret_loaded_at = datetime.now(timezone.utc)
-    receipt = posture._issue_startup_guard_receipt(
-        config=service.config,
-        secrets=secrets,
-        checks=checks,
-        observed_at=secret_loaded_at + timedelta(seconds=1),
-        secret_loaded_at=secret_loaded_at,
-    )
+    receipt = _issue_guard_receipt(posture, service.config, secrets)
     evidence = posture._validate_startup_guard_receipt(
         receipt,
         config=service.config,
         secrets=secrets,
+        runtime_role="app",
     )
     captured = []
 
@@ -644,7 +856,17 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
     )
     assert captured[0][0] is service.config
     assert captured[0][1] is secrets
-    assert captured[0][2]["startup_guard_receipt"] is receipt
+    assert "startup_guard_receipt" not in captured[0][2]
+    context = captured[0][2]["_consumed_startup_guard"]
+    assert (
+        posture._validate_consumed_startup_guard(
+            context,
+            config=service.config,
+            secrets=secrets,
+            runtime_role="app",
+        )
+        is evidence
+    )
     with pytest.raises(
         RuntimeError,
         match="startup_guard_receipt_mismatch",
@@ -657,14 +879,15 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
         )
 
     container = _injected_container(service, secrets)
-    container.startup_guard_receipt = receipt
+    container.startup_evidence = evidence
     container.operations = OperationsService(
         service,
         container.audit,
         rate_limiter=container.rate_limiter,
         provider_budget=container.provider_budget,
-        _startup_guard_receipt=receipt,
+        _consumed_startup_guard=context,
         _startup_secrets=secrets,
+        _startup_runtime_role="app",
     )
     with pytest.raises(
         RuntimeError,
@@ -677,7 +900,6 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
         )
     app = app_main._create_guarded_app(
         container=container,
-        startup_guard_receipt=receipt,
         agent=_StubAgent(),
         planning=None,
     )

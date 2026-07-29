@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
@@ -259,20 +259,34 @@ def test_duplicate_and_unclassified_routes_fail_inventory_validation():
     "overrides",
     [
         {"method": "POST"},
+        {"method": "get"},
+        {"path": "/bounded"},
+        {"path": "/security/posture/"},
+        {"path": "//security/posture"},
+        {"path": "/security/{section}"},
+        {"auth": AuthLevel.PUBLIC},
+        {"auth": AuthLevel.CSRF},
+        {"auth": AuthLevel.RECENT},
+        {"limit_name": "login"},
+        {"body_limit_name": "chat"},
         {"requires_idempotency": True},
         {"audit_mutation": True},
         {"broker_read": True},
         {"provider_category": "chat"},
+        {"concurrency_scope": "global"},
+        {"concurrency_scope": "target"},
         {"mutation_operation": "order_cancel"},
         {"concurrency_behavior": "coalesce_panic"},
+        {"target_param": "order_id"},
+        {"receipt_managed_idempotency": True},
     ],
 )
-def test_lease_free_capability_is_restricted_to_bounded_local_reads(
+def test_lease_free_capability_is_confined_to_exact_posture_policy(
     overrides,
 ):
     values = {
         "method": "GET",
-        "path": "/bounded",
+        "path": "/security/posture",
         "auth": AuthLevel.SESSION,
         "limit_name": "session_read",
         "lease_free_bounded_read": True,
@@ -284,6 +298,158 @@ def test_lease_free_capability_is_restricted_to_bounded_local_reads(
         match="lease-free bounded read",
     ):
         RoutePolicy(**values)
+
+
+def test_exact_security_posture_policy_can_be_lease_free():
+    policy = RoutePolicy(
+        method="GET",
+        path="/security/posture",
+        auth=AuthLevel.SESSION,
+        limit_name="session_read",
+        lease_free_bounded_read=True,
+    )
+
+    assert policy.lease_free_bounded_read is True
+
+
+def test_duplicate_effective_api_handlers_fail_inventory_validation():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    @app.get("/security/posture")
+    def posture():
+        return {"source": "canonical"}
+
+    @app.get("/security/posture")
+    def shadow_posture():
+        return {"source": "shadow"}
+
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/security/posture",
+                AuthLevel.SESSION,
+                "session_read",
+                lease_free_bounded_read=True,
+            ),
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*security/posture",
+    ):
+        validate_route_inventory(app)
+
+
+def test_normalized_parameterized_handler_collision_is_rejected():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_api_route(
+        "/items/{item_id}",
+        lambda: {"source": "canonical"},
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "//items/{alias}/",
+        lambda: {"source": "shadow"},
+        methods=["GET"],
+    )
+    registry = RoutePolicyRegistry(())
+
+    assert registry.duplicate_handlers(app) == [
+        ("GET", "/items/{str}"),
+    ]
+
+
+def test_including_same_router_twice_is_a_duplicate_effective_handler():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    router = APIRouter()
+
+    @router.get("/router-status")
+    def router_status():
+        return {"ok": True}
+
+    app.include_router(router)
+    app.include_router(router)
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/router-status",
+                AuthLevel.PUBLIC,
+                "session_read",
+            ),
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*router-status",
+    ):
+        validate_route_inventory(app)
+
+
+def test_duplicate_handler_normalization_preserves_unique_http_methods():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_api_route(
+        "/resource/{item_id}",
+        lambda: {"method": "get"},
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "/resource/{name}/",
+        lambda: {"method": "head"},
+        methods=["HEAD"],
+    )
+    app.add_api_route(
+        "/resource/{value}",
+        lambda: {"method": "options"},
+        methods=["OPTIONS"],
+    )
+    app.add_api_route(
+        "/multi",
+        lambda: {"method": "multi"},
+        methods=["GET", "POST"],
+    )
+    registry = RoutePolicyRegistry(())
+
+    assert registry.duplicate_handlers(app) == []
+
+
+def test_dynamic_shadow_posture_handler_fails_at_app_startup(make_service):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="dynamic-shadow-posture-secret",
+        planning=None,
+    )
+
+    @app.get("/security/posture")
+    def shadow_posture():
+        return {"can_trade": True}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*security/posture",
+    ):
+        with TestClient(app):
+            pass
 
 
 def test_route_inventory_rejects_mounts_websockets_and_imperative_routes():

@@ -167,6 +167,7 @@ def test_startup_guard_allows_only_internally_consistent_complete_encryption(
         receipt,
         config=config,
         secrets=secrets,
+        runtime_role="app",
     )
 
     assert all(

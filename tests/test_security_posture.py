@@ -15,7 +15,12 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from trading_assistant.broker.models import OrderStatus
+from trading_assistant.broker.models import (
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from trading_assistant.db.models import (
     AuditEvent,
     Base,
@@ -66,7 +71,7 @@ def _reader(
     *,
     app_config,
     session_factory,
-    startup_guard_receipt=None,
+    consumed_startup_guard=None,
     startup_secrets=None,
     reconciliation_enabled=True,
 ):
@@ -74,10 +79,11 @@ def _reader(
     configured = app_config.security.provider_budget
     startup_kwargs = (
         {
-            "_startup_guard_receipt": startup_guard_receipt,
+            "_consumed_startup_guard": consumed_startup_guard,
             "_startup_secrets": startup_secrets,
+            "_startup_runtime_role": "app",
         }
-        if startup_guard_receipt is not None
+        if consumed_startup_guard is not None
         else {}
     )
     return posture.SecurityPostureService(
@@ -131,8 +137,23 @@ def _issued_startup_receipt(
         checks=checks,
         observed_at=NOW,
         secret_loaded_at=NOW - timedelta(seconds=2),
+        runtime_role="app",
     )
     return receipt, secrets
+
+
+def _consumed_startup_context(app_config):
+    posture = _posture_module()
+    receipt, secrets = _issued_startup_receipt(app_config)
+    return (
+        posture._consume_startup_guard_receipt(
+            receipt,
+            config=app_config,
+            secrets=secrets,
+            runtime_role="app",
+        ),
+        secrets,
+    )
 
 
 def _checks_by_name(report, name):
@@ -390,6 +411,7 @@ def test_startup_receipt_issuer_rejects_partial_or_inconsistent_guard_checks(
             checks=checks,
             observed_at=NOW,
             secret_loaded_at=NOW - timedelta(seconds=1),
+            runtime_role="app",
         )
 
 
@@ -558,6 +580,7 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
             checks=checks,
             observed_at=NOW,
             secret_loaded_at=secret_loaded_at,
+            runtime_role="app",
         )
 
     def build_once(
@@ -571,24 +594,29 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
         assert config is app_config
         assert secrets is loaded
         assert runtime_role == "app"
-        evidence = _posture_module()._validate_startup_guard_receipt(
+        posture = _posture_module()
+        context = posture._consume_startup_guard_receipt(
             startup_guard_receipt,
             config=config,
             secrets=secrets,
+            runtime_role=runtime_role,
+        )
+        evidence = posture._validate_consumed_startup_guard(
+            context,
+            config=config,
+            secrets=secrets,
+            runtime_role=runtime_role,
         )
         assert evidence.secret_loaded_at is provider.last_successful_role_load_at
         return SimpleNamespace(
             secrets=secrets,
-            startup_guard_receipt=startup_guard_receipt,
+            startup_evidence=evidence,
         )
 
-    def create_once(*, container, startup_guard_receipt):
+    def create_once(*, container):
         calls["app"] += 1
         assert container.secrets is loaded
-        assert (
-            container.startup_guard_receipt
-            is startup_guard_receipt
-        )
+        assert container.startup_evidence.secret_load_status == "pass"
         return SimpleNamespace(
             state=SimpleNamespace(
                 install_controlled_shutdown=lambda _callback: None,
@@ -1292,6 +1320,8 @@ def test_malformed_breaker_generation_is_unknown_never_clear(
 def test_reconciliation_posture_matches_authoritative_safe_column_gate(
     app_config,
     session_factory,
+    make_service,
+    monkeypatch,
     generation,
     completed_generation,
     status,
@@ -1331,6 +1361,18 @@ def test_reconciliation_posture_matches_authoritative_safe_column_gate(
         enabled=True,
         clock=lambda: NOW,
     )
+    decrypt_calls = 0
+
+    def forbidden_decrypt(*_args, **_kwargs):
+        nonlocal decrypt_calls
+        decrypt_calls += 1
+        raise AssertionError("reconciliation authority decrypted narrative")
+
+    monkeypatch.setattr(
+        SensitiveDataCipher,
+        "decrypt",
+        forbidden_decrypt,
+    )
     report = _reader(
         app_config=app_config,
         session_factory=session_factory,
@@ -1339,10 +1381,30 @@ def test_reconciliation_posture_matches_authoritative_safe_column_gate(
         report,
         "startup_reconciliation",
     )[0]
+    service = make_service(quote_now=lambda: NOW)
+    service.snapshot_service.now = lambda: NOW
+    service.snapshot_service.startup_reconciliation_key = "mock"
+    snapshot = service.snapshot_service.assemble_for_confirmation("AAPL")
+    risk = service.risk.check(
+        OrderRequest(
+            ticker="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            idempotency_key="reconciliation-authority-parity",
+            notional=Decimal("100"),
+        ),
+        snapshot,
+    )
 
     assert gate.is_current() is gate_current
     assert check.status.value == posture_status
     assert check.detail_code.value == detail_code
+    assert snapshot.broker_reconciled is gate_current
+    assert risk.approved is gate_current
+    assert (
+        "broker reconciliation is not current" in risk.reasons
+    ) is (not gate_current)
+    assert decrypt_calls == 0
     assert NARRATIVE_MARKER not in report.model_dump_json()
 
 
@@ -1377,7 +1439,7 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
     app_config,
 ):
     posture = _posture_module()
-    receipt, secrets = _issued_startup_receipt(app_config)
+    context, secrets = _consumed_startup_context(app_config)
 
     class BrokenFactory:
         def __call__(self):
@@ -1388,8 +1450,9 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
         session_factory=BrokenFactory(),
         reconciliation_key="mock",
         reconciliation_enabled=True,
-        _startup_guard_receipt=receipt,
+        _consumed_startup_guard=context,
         _startup_secrets=secrets,
+        _startup_runtime_role="app",
         clock=lambda: NOW,
     )
 
@@ -1672,11 +1735,11 @@ def test_complete_encryption_uses_canonical_startup_receipt_and_safe_columns(
         )
         session.commit()
 
-    receipt, secrets = _issued_startup_receipt(app_config)
+    context, secrets = _consumed_startup_context(app_config)
     report = _reader(
         app_config=app_config,
         session_factory=session_factory,
-        startup_guard_receipt=receipt,
+        consumed_startup_guard=context,
         startup_secrets=secrets,
     ).report(limit_principal="session:1:operator")
     encryption = _checks_by_name(

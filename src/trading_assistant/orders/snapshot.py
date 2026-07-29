@@ -40,6 +40,9 @@ from trading_assistant.dependencies import (
     RequiredDependencyUnavailable,
     RequiredQuoteUnavailable,
 )
+from trading_assistant.orders.startup import (
+    validate_startup_reconciliation_snapshot,
+)
 from trading_assistant.risk.breakers import BreakerScope, BreakerService
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
 from trading_assistant.risk.staleness import is_stale
@@ -647,17 +650,37 @@ class PortfolioSnapshotService:
             )
             startup_reconciled = True
             if self.startup_reconciliation_key is not None:
-                startup_state = session.get(
-                    StartupReconciliationState,
-                    self.startup_reconciliation_key,
-                )
-                startup_reconciled = (
-                    startup_state is not None
-                    and startup_state.generation > 0
-                    and startup_state.status == "current"
-                    and startup_state.completed_generation
-                    == startup_state.generation
-                )
+                startup_state = session.execute(
+                    select(
+                        StartupReconciliationState.generation,
+                        StartupReconciliationState.completed_generation,
+                        StartupReconciliationState.status,
+                        StartupReconciliationState.started_at,
+                        StartupReconciliationState.completed_at,
+                        StartupReconciliationState.updated_at,
+                    ).where(
+                        StartupReconciliationState.broker
+                        == self.startup_reconciliation_key
+                    )
+                ).one_or_none()
+                startup_reconciled = False
+                if startup_state is not None:
+                    validation = (
+                        validate_startup_reconciliation_snapshot(
+                            generation=startup_state.generation,
+                            completed_generation=(
+                                startup_state.completed_generation
+                            ),
+                            status=startup_state.status,
+                            started_at=startup_state.started_at,
+                            completed_at=startup_state.completed_at,
+                            updated_at=startup_state.updated_at,
+                            observed_at=captured_at,
+                        )
+                    )
+                    startup_reconciled = (
+                        validation.valid and validation.current
+                    )
             broker_reconciled = (
                 startup_reconciled
                 and position_exposure_complete

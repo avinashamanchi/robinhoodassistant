@@ -115,6 +115,7 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
             ),
             observed_at=secret_loaded_at,
             secret_loaded_at=secret_loaded_at,
+            runtime_role="app",
         )
 
     monkeypatch.setattr(serve, "run_startup_guard", run_guard)
@@ -128,7 +129,20 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
     ):
         assert loaded is secrets
         assert runtime_role == "app"
-        container.startup_guard_receipt = startup_guard_receipt
+        context = posture._consume_startup_guard_receipt(
+            startup_guard_receipt,
+            config=config,
+            secrets=loaded,
+            runtime_role=runtime_role,
+        )
+        container.startup_evidence = (
+            posture._validate_consumed_startup_guard(
+                context,
+                config=config,
+                secrets=loaded,
+                runtime_role=runtime_role,
+            )
+        )
         return container
 
     monkeypatch.setattr(
@@ -137,12 +151,9 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
         build_container,
     )
 
-    def create_app(*, container: object, startup_guard_receipt):
+    def create_app(*, container: object):
         assert container is not None
-        assert (
-            container.startup_guard_receipt
-            is startup_guard_receipt
-        )
+        assert container.startup_evidence.secret_load_status == "pass"
         return app
 
     monkeypatch.setattr(serve, "_create_guarded_app", create_app)

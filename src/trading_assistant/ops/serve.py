@@ -153,6 +153,7 @@ def run_startup_guard(
         checks=checks,
         observed_at=datetime.now(timezone.utc),
         secret_loaded_at=secret_loaded_at,
+        runtime_role="app",
     )
 
 
@@ -204,7 +205,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         app = _create_guarded_app(
             container=container,
-            startup_guard_receipt=startup_guard_receipt,
         )
         server = uvicorn.Server(
             uvicorn.Config(

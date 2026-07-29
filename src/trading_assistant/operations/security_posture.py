@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import threading
 from typing import Callable, Literal
 
 from pydantic import (
@@ -259,12 +260,24 @@ class StartupPostureEvidence(BaseModel):
 
 
 _STARTUP_GUARD_RECEIPT_SEAL = object()
+_STARTUP_GUARD_LAUNCH_CHAIN = object()
+_CONSUMED_STARTUP_GUARD_SEAL = object()
+_RUNTIME_ROLES = frozenset({"app", "daemon", "mcp"})
 
 
 class StartupGuardReceipt:
     """Opaque capability binding startup evidence to exact composition inputs."""
 
-    __slots__ = ("_seal", "_config", "_secrets", "_evidence")
+    __slots__ = (
+        "_seal",
+        "_launch_chain",
+        "_config",
+        "_secrets",
+        "_runtime_role",
+        "_evidence",
+        "_consume_lock",
+        "_consumed",
+    )
 
     def __new__(cls, *_args, **_kwargs):
         raise TypeError("StartupGuardReceipt is issued by the startup guard")
@@ -276,6 +289,28 @@ class StartupGuardReceipt:
         return "<StartupGuardReceipt sealed>"
 
 
+class _ConsumedStartupGuard:
+    """Internal launch-chain grant created by consuming one guard receipt."""
+
+    __slots__ = (
+        "_seal",
+        "_launch_chain",
+        "_config",
+        "_secrets",
+        "_runtime_role",
+        "_evidence",
+    )
+
+    def __new__(cls, *_args, **_kwargs):
+        raise TypeError("startup guard context is internally issued")
+
+    def __setattr__(self, _name, _value) -> None:
+        raise TypeError("startup guard context is immutable")
+
+    def __repr__(self) -> str:
+        return "<ConsumedStartupGuard sealed>"
+
+
 def _issue_startup_guard_receipt(
     *,
     config,
@@ -283,9 +318,12 @@ def _issue_startup_guard_receipt(
     checks,
     observed_at: datetime,
     secret_loaded_at: datetime,
+    runtime_role: str,
 ) -> StartupGuardReceipt:
     """Issue the internal receipt after one successful structural guard."""
 
+    if type(runtime_role) is not str or runtime_role not in _RUNTIME_ROLES:
+        raise RuntimeError("startup_guard_receipt_invalid")
     evidence = startup_posture_evidence(
         checks=checks,
         observed_at=observed_at,
@@ -316,9 +354,17 @@ def _issue_startup_guard_receipt(
         raise RuntimeError("startup_guard_receipt_invalid")
     receipt = object.__new__(StartupGuardReceipt)
     object.__setattr__(receipt, "_seal", _STARTUP_GUARD_RECEIPT_SEAL)
+    object.__setattr__(
+        receipt,
+        "_launch_chain",
+        _STARTUP_GUARD_LAUNCH_CHAIN,
+    )
     object.__setattr__(receipt, "_config", config)
     object.__setattr__(receipt, "_secrets", secrets)
+    object.__setattr__(receipt, "_runtime_role", runtime_role)
     object.__setattr__(receipt, "_evidence", evidence)
+    object.__setattr__(receipt, "_consume_lock", threading.Lock())
+    object.__setattr__(receipt, "_consumed", False)
     return receipt
 
 
@@ -327,6 +373,7 @@ def _validate_startup_guard_receipt(
     *,
     config,
     secrets,
+    runtime_role: str,
 ) -> StartupPostureEvidence:
     """Fail closed unless a sealed receipt matches exact composition objects."""
 
@@ -334,7 +381,13 @@ def _validate_startup_guard_receipt(
         valid_seal = (
             type(receipt) is StartupGuardReceipt
             and receipt._seal is _STARTUP_GUARD_RECEIPT_SEAL
+            and receipt._launch_chain is _STARTUP_GUARD_LAUNCH_CHAIN
             and type(receipt._evidence) is StartupPostureEvidence
+            and type(receipt._runtime_role) is str
+            and receipt._runtime_role in _RUNTIME_ROLES
+            and type(receipt._consumed) is bool
+            and hasattr(receipt._consume_lock, "acquire")
+            and hasattr(receipt._consume_lock, "release")
         )
     except Exception:
         valid_seal = False
@@ -342,7 +395,78 @@ def _validate_startup_guard_receipt(
         raise RuntimeError("startup_guard_receipt_invalid")
     if receipt._config is not config or receipt._secrets is not secrets:
         raise RuntimeError("startup_guard_receipt_mismatch")
+    if receipt._runtime_role != runtime_role:
+        raise RuntimeError("startup_guard_receipt_role_mismatch")
     return receipt._evidence
+
+
+def _consume_startup_guard_receipt(
+    receipt: StartupGuardReceipt,
+    *,
+    config,
+    secrets,
+    runtime_role: str,
+) -> _ConsumedStartupGuard:
+    """Atomically consume one exact receipt before container construction."""
+
+    try:
+        lock = receipt._consume_lock
+    except Exception:
+        raise RuntimeError("startup_guard_receipt_invalid") from None
+    with lock:
+        evidence = _validate_startup_guard_receipt(
+            receipt,
+            config=config,
+            secrets=secrets,
+            runtime_role=runtime_role,
+        )
+        if receipt._consumed:
+            raise RuntimeError("startup_guard_receipt_consumed")
+        object.__setattr__(receipt, "_consumed", True)
+        context = object.__new__(_ConsumedStartupGuard)
+        object.__setattr__(
+            context,
+            "_seal",
+            _CONSUMED_STARTUP_GUARD_SEAL,
+        )
+        object.__setattr__(
+            context,
+            "_launch_chain",
+            _STARTUP_GUARD_LAUNCH_CHAIN,
+        )
+        object.__setattr__(context, "_config", config)
+        object.__setattr__(context, "_secrets", secrets)
+        object.__setattr__(context, "_runtime_role", runtime_role)
+        object.__setattr__(context, "_evidence", evidence)
+        return context
+
+
+def _validate_consumed_startup_guard(
+    context: _ConsumedStartupGuard,
+    *,
+    config,
+    secrets,
+    runtime_role: str,
+) -> StartupPostureEvidence:
+    """Validate the private continuation of one consumed launch chain."""
+
+    try:
+        valid = (
+            type(context) is _ConsumedStartupGuard
+            and context._seal is _CONSUMED_STARTUP_GUARD_SEAL
+            and context._launch_chain is _STARTUP_GUARD_LAUNCH_CHAIN
+            and type(context._evidence) is StartupPostureEvidence
+            and context._runtime_role in _RUNTIME_ROLES
+        )
+    except Exception:
+        valid = False
+    if not valid:
+        raise RuntimeError("startup_guard_context_invalid")
+    if context._config is not config or context._secrets is not secrets:
+        raise RuntimeError("startup_guard_context_mismatch")
+    if context._runtime_role != runtime_role:
+        raise RuntimeError("startup_guard_context_role_mismatch")
+    return context._evidence
 
 
 class PostureCheck(BaseModel):
@@ -809,26 +933,33 @@ class SecurityPostureService:
         rate_limiter: DurableRateLimiter | None = None,
         provider_budget: ProviderBudgetService | None = None,
         clock: Callable[[], datetime] | None = None,
-        _startup_guard_receipt: StartupGuardReceipt | None = None,
+        _consumed_startup_guard: _ConsumedStartupGuard | None = None,
         _startup_secrets=None,
+        _startup_runtime_role: str | None = None,
     ) -> None:
         self._config = config
         self._session_factory = session_factory
         self._reconciliation_key = reconciliation_key
         self._reconciliation_enabled = reconciliation_enabled
-        if _startup_guard_receipt is None:
-            if _startup_secrets is not None:
-                raise RuntimeError("startup_guard_receipt_invalid")
+        if _consumed_startup_guard is None:
+            if (
+                _startup_secrets is not None
+                or _startup_runtime_role is not None
+            ):
+                raise RuntimeError("startup_guard_context_invalid")
             self._startup_evidence = None
         else:
-            if _startup_secrets is None:
-                raise RuntimeError("startup_guard_receipt_invalid")
-            self._startup_evidence = _validate_startup_guard_receipt(
-                _startup_guard_receipt,
+            if (
+                _startup_secrets is None
+                or _startup_runtime_role is None
+            ):
+                raise RuntimeError("startup_guard_context_invalid")
+            self._startup_evidence = _validate_consumed_startup_guard(
+                _consumed_startup_guard,
                 config=config,
                 secrets=_startup_secrets,
+                runtime_role=_startup_runtime_role,
             )
-        self._startup_guard_receipt = _startup_guard_receipt
         self._rate_limiter = rate_limiter
         self._provider_budget = provider_budget
         self._clock = clock or (lambda: datetime.now(UTC))

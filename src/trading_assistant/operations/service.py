@@ -11,9 +11,9 @@ from .health import (
     build_operational_health,
 )
 from .security_posture import (
+    _ConsumedStartupGuard,
     SecurityPostureReport,
     SecurityPostureService,
-    StartupGuardReceipt,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -30,21 +30,25 @@ class OperationsService:
         provider_budget=None,
         policy_store_maintenance=None,
         security_posture_reader: SecurityPostureService | None = None,
-        _startup_guard_receipt: StartupGuardReceipt | None = None,
+        _consumed_startup_guard: _ConsumedStartupGuard | None = None,
         _startup_secrets=None,
+        _startup_runtime_role: str | None = None,
     ) -> None:
         if (
             security_posture_reader is not None
-            and _startup_guard_receipt is not None
+            and (
+                _consumed_startup_guard is not None
+                or _startup_secrets is not None
+                or _startup_runtime_role is not None
+            )
         ):
-            raise RuntimeError("startup_guard_receipt_invalid")
+            raise RuntimeError("startup_guard_context_invalid")
         self.service = service
         self.audit = audit or AuditRecorder(service.session_factory)
         self.rate_limiter = rate_limiter
         self.leases = leases
         self.provider_budget = provider_budget
         self.policy_store_maintenance = policy_store_maintenance
-        self._startup_guard_receipt = _startup_guard_receipt
         reconciliation = service.startup_reconciliation
         self._security_posture_reader = (
             security_posture_reader
@@ -56,9 +60,15 @@ class OperationsService:
                 reconciliation_enabled=reconciliation.enabled,
                 rate_limiter=rate_limiter,
                 provider_budget=provider_budget,
-                _startup_guard_receipt=_startup_guard_receipt,
+                _consumed_startup_guard=_consumed_startup_guard,
                 _startup_secrets=_startup_secrets,
+                _startup_runtime_role=_startup_runtime_role,
             )
+        )
+        self._startup_evidence = (
+            None
+            if security_posture_reader is not None
+            else self._security_posture_reader._startup_evidence
         )
 
     def _record_best_effort(

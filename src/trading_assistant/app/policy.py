@@ -11,11 +11,13 @@ import json
 import logging
 import math
 from pathlib import PurePosixPath
+import re
 from typing import Literal
 from urllib.parse import unquote
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.routing import APIRoute
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -51,6 +53,23 @@ _LEASE_RENEW_INTERVAL_SECONDS = 10.0
 _PANIC_POLL_INITIAL_SECONDS = 0.025
 _PANIC_POLL_MAX_SECONDS = 0.25
 _LOG = logging.getLogger(__name__)
+_PATH_PARAMETER = re.compile(
+    r"\{[^{}:]+(?::(?P<converter>[^{}]+))?\}"
+)
+
+
+def _normalize_handler_path(path: str) -> str:
+    """Canonicalize equivalent FastAPI route shapes for collision checks."""
+
+    normalized = re.sub(r"/+", "/", path)
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+
+    def replace_parameter(match: re.Match[str]) -> str:
+        converter = match.group("converter") or "str"
+        return f"{{{converter}}}"
+
+    return _PATH_PARAMETER.sub(replace_parameter, normalized)
 
 
 class AuthLevel(str, Enum):
@@ -79,28 +98,33 @@ class RoutePolicy:
     lease_free_bounded_read: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.lease_free_bounded_read) is not bool:
+            raise ValueError("lease-free bounded read flag is invalid")
+        if self.lease_free_bounded_read and (
+            self.method != "GET"
+            or self.path != "/security/posture"
+            or self.auth is not AuthLevel.SESSION
+            or self.limit_name != "session_read"
+            or self.body_limit_name != "default"
+            or self.requires_idempotency
+            or self.audit_mutation
+            or self.broker_read
+            or self.provider_category is not None
+            or self.concurrency_scope != "principal"
+            or self.concurrency_behavior != "reject"
+            or self.target_param is not None
+            or self.mutation_operation is not None
+            or self.receipt_managed_idempotency
+        ):
+            raise ValueError(
+                "lease-free bounded read is reserved for security posture"
+            )
         if self.receipt_managed_idempotency and (
             not self.requires_idempotency
             or self.mutation_operation is not None
         ):
             raise ValueError(
                 "receipt-managed idempotency cannot use a generic interlock"
-            )
-        if type(self.lease_free_bounded_read) is not bool:
-            raise ValueError("lease-free bounded read flag is invalid")
-        if self.lease_free_bounded_read and (
-            self.method.upper() != "GET"
-            or self.requires_idempotency
-            or self.audit_mutation
-            or self.broker_read
-            or self.provider_category is not None
-            or self.mutation_operation is not None
-            or self.receipt_managed_idempotency
-            or self.concurrency_behavior != "reject"
-            or self.target_param is not None
-        ):
-            raise ValueError(
-                "lease-free bounded read cannot carry mutation authority"
             )
 
 
@@ -510,6 +534,37 @@ class RoutePolicyRegistry:
             seen.add(key)
         return sorted(duplicate_keys)
 
+    def duplicate_handlers(
+        self,
+        app: FastAPI,
+    ) -> list[tuple[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        duplicate_keys: set[tuple[str, str]] = set()
+        for route in app.routes:
+            handlers: list[tuple[str, set[str] | None]] = []
+            if isinstance(route, APIRoute):
+                handlers.append((route.path, route.methods))
+            else:
+                effective_contexts = getattr(
+                    route,
+                    "effective_route_contexts",
+                    None,
+                )
+                if effective_contexts is not None:
+                    handlers.extend(
+                        (context.path, context.methods)
+                        for context in effective_contexts()
+                        if isinstance(context.original_route, APIRoute)
+                    )
+            for raw_path, methods in handlers:
+                path = _normalize_handler_path(raw_path)
+                for method in methods or ():
+                    key = (method.upper(), path)
+                    if key in seen:
+                        duplicate_keys.add(key)
+                    seen.add(key)
+        return sorted(duplicate_keys)
+
     def unclassified(self, app: FastAPI) -> list[tuple[str, str]]:
         policy_keys = set(self._by_key)
         route_keys: set[tuple[str, str]] = set()
@@ -537,11 +592,14 @@ class RoutePolicyRegistry:
 def validate_route_inventory(app: FastAPI) -> None:
     registry: RoutePolicyRegistry = app.state.route_policy_registry
     duplicates = registry.duplicates()
+    handler_duplicates = registry.duplicate_handlers(app)
     unclassified = registry.unclassified(app)
-    if duplicates or unclassified:
+    if duplicates or handler_duplicates or unclassified:
         raise RuntimeError(
             "route policy inventory invalid: "
-            f"duplicates={duplicates!r} unclassified={unclassified!r}"
+            f"duplicates={duplicates!r} "
+            f"handlers={handler_duplicates!r} "
+            f"unclassified={unclassified!r}"
         )
 
 
