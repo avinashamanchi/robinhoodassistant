@@ -29,11 +29,33 @@ jobs:
           version: "0.11.28"
 
       - name: Set up Python 3.11
-        run: uv python install 3.11.15
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        run: uv python install --no-config 3.11.15
 
-      - name: Verify and install the locked dependency graph
+      - name: Install locked test dependencies without project code
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
         run: |
-          uv lock --check
+          uv lock --check --no-build --no-config
+          uv sync --frozen --all-extras --dev \
+            --no-install-project --no-build --no-config \
+            --managed-python --python 3.11.15
+
+      - name: Run the deterministic release verifier
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          uv_source="$(command -v uv)"
+          node_source="$(command -v node)"
+          verifier_python="$(uv python find --managed-python \
+            --no-project --no-config --resolve-links 3.11.15)"
+          sudo install -o root -g root -m 0555 \
+            "$uv_source" /usr/local/bin/uv
+          sudo install -o root -g root -m 0555 \
+            "$node_source" /usr/local/bin/node
+          export PATH="/usr/local/bin:/usr/bin:/bin"
+          "$verifier_python" -I -S scripts/verify_loopback_release.py
+
+      - name: Verify and install the full locked dependency graph
+        run: |
           uv sync --all-extras --dev
           uv pip check
 
@@ -70,6 +92,8 @@ jobs:
               ),
               "CI_RELEASE_STAGE": str(stage),
           }
+          for value in values.values():
+              print(f"::add-mask::{value}")
           with open(
               os.environ["GITHUB_ENV"],
               "a",
@@ -83,9 +107,6 @@ jobs:
         run: |
           uv run python -m trading_assistant.db.migrate --development-environment-secrets upgrade
           uv run python -m trading_assistant.db.migrate --development-environment-secrets status
-
-      - name: Run the deterministic release verifier
-        run: uv run python scripts/verify_loopback_release.py
 
       - name: Run the isolated mock safety drill
         run: |

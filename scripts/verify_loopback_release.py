@@ -1710,7 +1710,16 @@ class ReleaseVerifier:
         return (
             Command(
                 "compile",
-                ("uv", "run", "python", "-m", "compileall", "-q", "src"),
+                (
+                    "uv",
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "-m",
+                    "compileall",
+                    "-q",
+                    "src",
+                ),
                 timeout_seconds=120.0,
             ),
             Command(
@@ -1718,6 +1727,7 @@ class ReleaseVerifier:
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -1734,6 +1744,7 @@ class ReleaseVerifier:
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -1756,6 +1767,7 @@ class ReleaseVerifier:
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -1776,6 +1788,7 @@ class ReleaseVerifier:
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -1790,7 +1803,14 @@ class ReleaseVerifier:
             ),
             Command(
                 "full-tests",
-                ("uv", "run", "python", "-m", "pytest"),
+                (
+                    "uv",
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "-m",
+                    "pytest",
+                ),
                 timeout_seconds=1800.0,
                 expects_tests=True,
                 test_manifest=_FULL_TEST_MANIFEST,
@@ -1800,6 +1820,7 @@ class ReleaseVerifier:
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -1817,7 +1838,13 @@ class ReleaseVerifier:
             ),
             Command(
                 "static-gate",
-                ("uv", "run", "python", "scripts/check_release_safety.py"),
+                (
+                    "uv",
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "scripts/check_release_safety.py",
+                ),
                 timeout_seconds=300.0,
             ),
         )

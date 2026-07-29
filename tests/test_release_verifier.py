@@ -390,13 +390,23 @@ def test_release_verifier_has_only_the_exact_offline_commands():
     assert tuple((command.name, command.argv) for command in commands) == (
         (
             "compile",
-            ("uv", "run", "python", "-m", "compileall", "-q", "src"),
+            (
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "-m",
+                "compileall",
+                "-q",
+                "src",
+            ),
         ),
         (
             "migration-tests",
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -410,6 +420,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -429,6 +440,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -446,6 +458,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -455,12 +468,16 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "-v",
             ),
         ),
-        ("full-tests", ("uv", "run", "python", "-m", "pytest")),
+        (
+            "full-tests",
+            ("uv", "run", "--no-sync", "python", "-m", "pytest"),
+        ),
         (
             "branch-coverage",
                 (
                     "uv",
                     "run",
+                    "--no-sync",
                     "python",
                     "-m",
                     "pytest",
@@ -475,7 +492,13 @@ def test_release_verifier_has_only_the_exact_offline_commands():
         ),
         (
             "static-gate",
-            ("uv", "run", "python", "scripts/check_release_safety.py"),
+            (
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "scripts/check_release_safety.py",
+            ),
         ),
     )
     flat = "\n".join(" ".join(command.argv) for command in commands)

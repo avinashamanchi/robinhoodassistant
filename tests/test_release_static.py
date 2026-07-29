@@ -4346,6 +4346,126 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
     assert isinstance(verification, dict)
     steps = verification["steps"]
     assert isinstance(steps, list)
+    named_steps = {
+        str(step.get("name")): step
+        for step in steps
+        if isinstance(step, dict)
+    }
+    ordered_names = [
+        str(step.get("name"))
+        for step in steps
+        if isinstance(step, dict)
+    ]
+    assert len(ordered_names) == len(set(ordered_names))
+    assert workflow.get("env") is None
+    assert workflow.get("defaults") is None
+    assert verification.get("env") is None
+    assert verification.get("defaults") is None
+    assert verification.get("container") is None
+    assert verification.get("services") is None
+    assert verification.get("if") is None
+    assert verification.get("continue-on-error") is None
+    assert verification.get("needs") is None
+    assert verification.get("runs-on") == "ubuntu-24.04"
+    assert verification.get("timeout-minutes") == "60"
+    expected_order = (
+        "Install locked test dependencies without project code",
+        "Run the deterministic release verifier",
+        "Verify and install the full locked dependency graph",
+        "Audit installed dependencies",
+        "Prepare isolated development-only migration secrets",
+        "Apply and verify migrations on an isolated database",
+        "Run the isolated mock safety drill",
+    )
+    assert all(name in named_steps for name in expected_order)
+    assert [
+        ordered_names.index(name)
+        for name in expected_order
+    ] == sorted(ordered_names.index(name) for name in expected_order)
+
+    dependency_run = str(
+        named_steps[
+            "Install locked test dependencies without project code"
+        ].get("run", "")
+    )
+    normalized_dependency_run = " ".join(
+        dependency_run.replace("\\\n", " ").split()
+    )
+    assert normalized_dependency_run == (
+        "uv lock --check --no-build --no-config "
+        "uv sync --frozen --all-extras --dev "
+        "--no-install-project --no-build --no-config "
+        "--managed-python --python 3.11.15"
+    )
+
+    verifier_run = str(
+        named_steps["Run the deterministic release verifier"].get("run", "")
+    )
+    normalized_verifier_run = " ".join(
+        verifier_run.replace("\\\n", " ").split()
+    )
+    assert normalized_verifier_run == " ".join(
+        (
+            'uv_source="$(command -v uv)"',
+            'node_source="$(command -v node)"',
+            (
+                'verifier_python="$(uv python find --managed-python '
+                '--no-project --no-config --resolve-links 3.11.15)"'
+            ),
+            (
+                "sudo install -o root -g root -m 0555 "
+                '"$uv_source" /usr/local/bin/uv'
+            ),
+            (
+                "sudo install -o root -g root -m 0555 "
+                '"$node_source" /usr/local/bin/node'
+            ),
+            'export PATH="/usr/local/bin:/usr/bin:/bin"',
+            '"$verifier_python" -I -S scripts/verify_loopback_release.py',
+        )
+    )
+
+    verifier_index = ordered_names.index(
+        "Run the deterministic release verifier"
+    )
+    pre_verifier_run_steps = {
+        str(step.get("name")): " ".join(
+            str(step.get("run", "")).replace("\\\n", " ").split()
+        )
+        for step in steps[:verifier_index]
+        if isinstance(step, dict) and "run" in step
+    }
+    assert pre_verifier_run_steps == {
+        "Set up Python 3.11": "uv python install --no-config 3.11.15",
+        "Install locked test dependencies without project code": (
+            normalized_dependency_run
+        ),
+    }
+    protected_steps = (
+        "Set up Python 3.11",
+        "Install locked test dependencies without project code",
+        "Run the deterministic release verifier",
+    )
+    exact_shell = "/bin/bash --noprofile --norc -e -o pipefail {0}"
+    for name in protected_steps:
+        step = named_steps[name]
+        assert step.get("shell") == exact_shell
+        assert step.get("env") is None
+        assert step.get("if") is None
+        assert step.get("continue-on-error") is None
+        assert step.get("working-directory") is None
+
+    prepare_run = str(
+        named_steps[
+            "Prepare isolated development-only migration secrets"
+        ].get("run", "")
+    )
+    mask = 'print(f"::add-mask::{value}")'
+    assert prepare_run.index(mask) < prepare_run.index("with open(")
+    assert prepare_run.index("with open(") < prepare_run.index(
+        "environment.write"
+    )
+
     runs = "\n".join(
         str(step.get("run", ""))
         for step in steps
@@ -4354,8 +4474,8 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
 
     required = (
         "uv sync --all-extras --dev",
-        "uv lock --check",
-        "uv python install 3.11.15",
+        "uv lock --check --no-build --no-config",
+        "uv python install --no-config 3.11.15",
         "uv run --with pip-audit==2.10.1 pip-audit",
         "trading_assistant.db.migrate --development-environment-secrets upgrade",
         "trading_assistant.db.migrate --development-environment-secrets status",
@@ -4385,6 +4505,6 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
 
     assert "gitleaks/gitleaks-action@" in source
     assert "uv run pytest" not in runs.replace(
-        "uv run python scripts/verify_loopback_release.py",
+        '"$verifier_python" -I -S scripts/verify_loopback_release.py',
         "",
     )
