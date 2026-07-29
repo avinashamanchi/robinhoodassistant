@@ -22,6 +22,7 @@ from ..security.outbound import (
     OutboundRequestFailed,
     new_httpx_client,
     read_bounded_json,
+    require_origin,
 )
 from .data import cache_path, load_parquet
 
@@ -48,14 +49,21 @@ class CoinGeckoClient:
         cache_dir: str | Path = ".cache/bars",
         attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        runtime_role: str = "app",
     ) -> None:
         self._http = http
         self._cache_dir = cache_dir
         self._attempt_gate = attempt_gate
         self._max_response_bytes = max_response_bytes
+        self._runtime_role = runtime_role
 
     def _client(self):
         if self._http is None:
+            require_origin(
+                self._runtime_role,
+                "marketdata.coingecko",
+                "https://api.coingecko.com",
+            )
             self._http = new_httpx_client(_ORIGIN_POLICY, read_timeout=30.0)
         return self._http
 

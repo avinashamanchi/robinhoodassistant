@@ -1229,7 +1229,7 @@ def test_audit_blocks_current_role_validation_without_success_timestamp(
         assert candidate not in output
 
 
-def test_preflight_partial_keychain_prints_needs_without_external_checks(
+def test_preflight_partial_keychain_prints_five_structural_rows_only(
     app_config,
     capsys,
     monkeypatch,
@@ -1261,9 +1261,16 @@ def test_preflight_partial_keychain_prints_needs_without_external_checks(
     assert preflight.run(provider=provider) == 1
 
     output = capsys.readouterr().out
-    assert "runtime secret role validation" in output
-    assert "NEEDS-ME" in output
-    assert "Alpaca paper auth" in output
+    for name in (
+        "KEYCHAIN",
+        "LOCAL_TLS",
+        "FIELD_ENCRYPTION",
+        "OUTBOUND_ORIGINS",
+        "INTEGRATIONS_DISABLED",
+    ):
+        assert output.count(name) == 1
+    assert "runtime secret role validation" not in output
+    assert "Alpaca paper auth" not in output
     assert "NOT READY" in output
     assert marker not in output
     assert provider.last_successful_role_load_at is None

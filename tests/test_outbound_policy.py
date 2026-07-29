@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
 import ssl
 
 import pytest
@@ -67,16 +68,16 @@ def test_outbound_manifest_is_exact_and_role_feature_scoped(
     assert outbound.configured_origins_match_manifest(
         app_config.provider_origins
     )
-    selected_origin = {
-        "anthropic": "https://api.anthropic.com",
-        "gemini": "https://generativelanguage.googleapis.com",
-        "groq": "https://api.groq.com",
-    }[app_config.llm.provider]
     assert outbound.origins_for_role(app_config, "preflight") == frozenset(
         {
             "https://paper-api.alpaca.markets",
             "https://data.alpaca.markets",
-            selected_origin,
+        }
+    )
+    assert outbound.origins_for_role(app_config, "mcp") == frozenset(
+        {
+            "https://paper-api.alpaca.markets",
+            "https://data.alpaca.markets",
         }
     )
 
@@ -87,7 +88,7 @@ def test_outbound_manifest_is_exact_and_role_feature_scoped(
             )
         }
     )
-    assert "https://api.anthropic.com" in outbound.origins_for_role(
+    assert "https://api.anthropic.com" not in outbound.origins_for_role(
         anthropic,
         "preflight",
     )
@@ -111,6 +112,192 @@ def test_outbound_manifest_is_exact_and_role_feature_scoped(
         notifications,
         "validate-analyst",
     )
+
+
+def test_require_origin_enforces_every_adapter_role_without_io(outbound):
+    observed = {
+        (rule.adapter, role, rule.origin)
+        for rule in outbound.OUTBOUND_ORIGIN_MANIFEST
+        for role in rule.roles
+    }
+
+    for adapter, role, origin in observed:
+        assert outbound.require_origin(role, adapter, origin) == origin
+
+    assert (
+        "alpaca.historical",
+        "mcp",
+        "https://data.alpaca.markets",
+    ) in observed
+    assert all(
+        role != "preflight"
+        for adapter, role, _origin in observed
+        if adapter.startswith("llm.")
+    )
+    for role, adapter, origin in (
+        ("unknown", "alpaca.trading", "https://paper-api.alpaca.markets"),
+        ("app", "unknown.adapter", "https://paper-api.alpaca.markets"),
+        ("app", "alpaca.trading", "https://data.alpaca.markets"),
+        ("app", "alpaca.trading", "http://paper-api.alpaca.markets"),
+    ):
+        with pytest.raises(outbound.OutboundOriginDenied):
+            outbound.require_origin(role, adapter, origin)
+
+
+def test_composition_role_gate_checks_every_manifest_adapter_without_io(
+    outbound,
+    app_config,
+    monkeypatch,
+):
+    observed: set[tuple[str, str, str]] = set()
+
+    monkeypatch.setattr(
+        outbound,
+        "origins_for_role",
+        lambda _config, role: frozenset(
+            rule.origin
+            for rule in outbound.OUTBOUND_ORIGIN_MANIFEST
+            if role in rule.roles
+        ),
+    )
+    monkeypatch.setattr(
+        outbound,
+        "require_origin",
+        lambda role, adapter, origin: (
+            observed.add((role, adapter, origin)) or origin
+        ),
+    )
+
+    roles = {
+        role
+        for rule in outbound.OUTBOUND_ORIGIN_MANIFEST
+        for role in rule.roles
+    }
+    for role in roles:
+        outbound.require_configured_role_origins(app_config, role)
+
+    assert observed == {
+        (role, rule.adapter, rule.origin)
+        for rule in outbound.OUTBOUND_ORIGIN_MANIFEST
+        for role in rule.roles
+    }
+
+
+class _LocalResponse:
+    def __init__(
+        self,
+        *,
+        url: str,
+        status_code: int = 200,
+        body: bytes = b"{}",
+        history=(),
+    ) -> None:
+        self.url = url
+        self.status_code = status_code
+        self.history = history
+        self.headers = {"Content-Length": str(len(body))}
+        self._body = body
+
+    def iter_bytes(self):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+class _LocalClient:
+    def __init__(self, response: _LocalResponse) -> None:
+        self.response = response
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.response
+
+
+def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
+    outbound,
+):
+    expected_url = "https://localhost:8020/health/live"
+    response = _LocalResponse(url=expected_url, body=b'{"alive":true}')
+    client = _LocalClient(response)
+    observed: dict[str, object] = {}
+    verified_context = object()
+
+    def client_factory(**kwargs):
+        observed.update(kwargs)
+        return client
+
+    transport = outbound.build_local_liveness_transport(
+        Path(".local/tls/localhost.pem"),
+        client_factory=client_factory,
+        ssl_context_factory=lambda *, cafile: (
+            observed.update(cafile=cafile) or verified_context
+        ),
+    )
+
+    assert transport.fetch(expected_url, timeout_seconds=3.0) == (
+        b'{"alive":true}'
+    )
+    assert observed["follow_redirects"] is False
+    assert observed["trust_env"] is False
+    assert observed["proxy"] is None
+    assert observed["verify"] is verified_context
+    assert observed["cafile"] == ".local/tls/localhost.pem"
+    assert client.calls == [
+        (
+            expected_url,
+            {
+                "follow_redirects": False,
+                "timeout": 3.0,
+            },
+        )
+    ]
+
+
+def test_local_liveness_transport_rejects_noncanonical_certificate_path(
+    outbound,
+):
+    with pytest.raises(outbound.OutboundOriginDenied):
+        outbound.build_local_liveness_transport(
+            Path(".local/tls/renamed.pem"),
+            client_factory=lambda **_kwargs: pytest.fail(
+                "client constructed before certificate path validation"
+            ),
+            ssl_context_factory=lambda **_kwargs: pytest.fail(
+                "TLS context constructed before certificate path validation"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _LocalResponse(
+            url="https://localhost:8020/other",
+        ),
+        _LocalResponse(
+            url="https://localhost:8020/health/live",
+            status_code=302,
+        ),
+        _LocalResponse(
+            url="https://localhost:8020/health/live",
+            history=(object(),),
+        ),
+    ],
+)
+def test_local_liveness_transport_rejects_redirect_or_final_url_drift(
+    outbound,
+    response,
+):
+    client = _LocalClient(response)
+    transport = outbound.LocalLivenessTransport(client)
+
+    with pytest.raises(outbound.OutboundRequestFailed):
+        transport.fetch(
+            "https://localhost:8020/health/live",
+            timeout_seconds=2.0,
+        )
 
 
 def test_origin_normalizes_idna_case_and_default_port(outbound):

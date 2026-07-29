@@ -8,7 +8,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..security.outbound import OutboundPolicy, install_pinned_session
+from ..security.outbound import (
+    OutboundPolicy,
+    install_pinned_session,
+    require_origin,
+)
 from .untrusted import (
     UntrustedContent,
     UntrustedContentError,
@@ -52,17 +56,24 @@ class AlpacaNewsProvider:
         secret_key: str = "",
         client: Any = None,
         clock: Callable[[], datetime] | None = None,
+        runtime_role: str = "app",
     ) -> None:
         self._gateway = gateway
         self._api_key = api_key
         self._secret_key = secret_key
         self._client = client
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from alpaca.data.historical.news import NewsClient
 
+            require_origin(
+                self._runtime_role,
+                "alpaca.historical",
+                _ALPACA_DATA_URL,
+            )
             self._client = NewsClient(
                 self._api_key,
                 self._secret_key,

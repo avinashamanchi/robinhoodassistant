@@ -28,7 +28,12 @@ class RecordingNotifier:
         return True
 
 
-def build_notifier(config, secrets) -> Notifier:
+def build_notifier(
+    config,
+    secrets,
+    *,
+    runtime_role: str = "app",
+) -> Notifier:
     """Build the configured notifier. Telegram only if the flag AND creds are set."""
     if not config.features.telegram_notifications:
         return NullNotifier()
@@ -38,4 +43,5 @@ def build_notifier(config, secrets) -> Notifier:
         enabled=True,
         bot_token=secret_value(secrets.telegram_bot_token),
         chat_id=secret_value(secrets.telegram_chat_id),
+        runtime_role=runtime_role,
     )

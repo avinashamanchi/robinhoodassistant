@@ -6,7 +6,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..security.outbound import OutboundPolicy, new_httpx_client
+from ..security.outbound import (
+    OutboundPolicy,
+    new_httpx_client,
+    require_origin,
+)
 from .payloads import build_anthropic_payload
 
 
@@ -22,17 +26,24 @@ class AnthropicBackend:
         max_tokens: int,
         timeout_seconds: float = 45.0,
         client: Any = None,
+        runtime_role: str = "app",
     ) -> None:
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._client = client
         self._model = model
         self._max_tokens = max_tokens
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from anthropic import Anthropic
 
+            require_origin(
+                self._runtime_role,
+                "llm.anthropic",
+                _ANTHROPIC_ORIGIN,
+            )
             self._client = Anthropic(
                 api_key=self._api_key,
                 base_url=_ANTHROPIC_ORIGIN,

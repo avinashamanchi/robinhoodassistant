@@ -36,7 +36,7 @@ def login(
         value=issued.token,
         max_age=int(auth.ttl.total_seconds()),
         httponly=True,
-        secure=auth.cookie_secure,
+        secure=True,
         samesite="strict",
         path="/",
     )
@@ -90,7 +90,7 @@ def logout(
     response.delete_cookie(
         key=auth.cookie_name(),
         path="/",
-        secure=auth.cookie_secure,
+        secure=True,
         httponly=True,
         samesite="strict",
     )

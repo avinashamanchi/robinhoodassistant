@@ -739,7 +739,9 @@ def test_quarantine_composition_is_disabled_by_default_and_uses_separate_categor
         *,
         provider_budget,
         category,
+        runtime_role="app",
     ):
+        assert runtime_role == "app"
         calls.append(category)
         return BudgetedLLMBackend(
             ScriptedDelegate(_text_response(_summary_json())),

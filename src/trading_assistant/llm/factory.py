@@ -72,6 +72,7 @@ def build_llm_backend(
     *,
     provider_budget: ProviderBudgetService,
     category: str,
+    runtime_role: str = "app",
 ):
     category = _require_category(category)
     if config.llm.fallback_provider is not None:
@@ -99,6 +100,7 @@ def build_llm_backend(
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
         )
     elif provider == "gemini":
         from .gemini_backend import GeminiBackend
@@ -108,6 +110,7 @@ def build_llm_backend(
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
         )
     elif provider == "groq":
         from .groq_backend import GroqBackend
@@ -117,6 +120,7 @@ def build_llm_backend(
             model,
             llm.max_tokens,
             timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
         )
     else:
         raise ValueError(f"unknown LLM provider: {provider}")

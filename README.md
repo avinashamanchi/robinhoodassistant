@@ -161,7 +161,10 @@ contenders, breaker persistence, and reconciliation on the copy. Active WAL
 sources are supported when their regular `-wal` and `-shm` files already exist;
 the drill never creates, deletes, or recovers primary sidecars. Missing required
 credentials make preflight exit nonzero with `NOT READY`, not a conditional
-ready state.
+ready state. The five structural rows run independently even if Keychain
+provider construction or loading fails: local TLS, field-encryption metadata,
+the outbound manifest, and disabled integrations are still evaluated. Any
+failed structural row stops before broker, provider, or notifier construction.
 
 The checked-in operating profile is intentionally conservative:
 `trading.mode: paper`, autonomous pre-approved-rule execution OFF, broker bracket

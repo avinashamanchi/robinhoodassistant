@@ -75,6 +75,7 @@ def _fetch_equity_df(
     rate_limiter=None,
     client_factory=None,
     cache_dir: str | Path = ".cache/bars",
+    runtime_role: str = "app",
 ):
     from ..backtest.data import download_alpaca_bars
     from ..daemon.backoff import ALPACA_MARKET_DATA_PRINCIPAL
@@ -86,6 +87,7 @@ def _fetch_equity_df(
         timeframe="1Day",
         years=years,
         cache_dir=cache_dir,
+        runtime_role=runtime_role,
         client_factory=client_factory,
         attempt_gate=_historical_attempt_gate(
             config,
@@ -106,6 +108,7 @@ def _fetch_crypto_df(
     rate_limiter=None,
     http: Any = None,
     cache_dir: str | Path = ".cache/bars",
+    runtime_role: str = "app",
 ):
     from ..backtest.coingecko import CoinGeckoClient
     from ..daemon.backoff import COINGECKO_MARKET_DATA_PRINCIPAL
@@ -113,6 +116,7 @@ def _fetch_crypto_df(
     return CoinGeckoClient(
         http=http,
         cache_dir=cache_dir,
+        runtime_role=runtime_role,
         attempt_gate=_historical_attempt_gate(
             config,
             service=service,
@@ -132,6 +136,7 @@ def build_live_feature_provider(
     alpaca_client_factory=None,
     coingecko_http: Any = None,
     cache_dir: str | Path = ".cache/bars",
+    runtime_role: str = "app",
 ) -> Callable[[str], MarketFeatures]:
     def provider(symbol: str) -> MarketFeatures:
         ac = AssetClass.for_symbol(symbol)
@@ -144,6 +149,7 @@ def build_live_feature_provider(
                     rate_limiter=rate_limiter,
                     http=coingecko_http,
                     cache_dir=cache_dir,
+                    runtime_role=runtime_role,
                 )
                 if ac is AssetClass.CRYPTO
                 else _fetch_equity_df(
@@ -154,6 +160,7 @@ def build_live_feature_provider(
                     rate_limiter=rate_limiter,
                     client_factory=alpaca_client_factory,
                     cache_dir=cache_dir,
+                    runtime_role=runtime_role,
                 )
             )
         except RequiredDependencyUnavailable:
@@ -170,6 +177,7 @@ def build_live_feature_provider(
                 rate_limiter=rate_limiter,
                 client_factory=alpaca_client_factory,
                 cache_dir=cache_dir,
+                runtime_role=runtime_role,
             )
         except Exception:
             spy_df = None
@@ -188,6 +196,7 @@ def build_screen_source(
     alpaca_client_factory=None,
     coingecko_http: Any = None,
     cache_dir: str | Path = ".cache/bars",
+    runtime_role: str = "app",
 ):
     """Build a DataSource across the universe (+ SPY) from cached bars."""
     from ..backtest.data import DataSource
@@ -204,6 +213,7 @@ def build_screen_source(
                     rate_limiter=rate_limiter,
                     http=coingecko_http,
                     cache_dir=cache_dir,
+                    runtime_role=runtime_role,
                 )
             else:
                 frames[sym] = _fetch_equity_df(
@@ -214,6 +224,7 @@ def build_screen_source(
                     rate_limiter=rate_limiter,
                     client_factory=alpaca_client_factory,
                     cache_dir=cache_dir,
+                    runtime_role=runtime_role,
                 )
         except Exception:
             continue

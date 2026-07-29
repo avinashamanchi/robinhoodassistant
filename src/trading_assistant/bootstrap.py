@@ -69,6 +69,7 @@ from .security.candidates import (
     CandidateSigner,
 )
 from .security.secrets import RuntimeSecrets, secret_is_set
+from .security.outbound import require_configured_role_origins
 from .security.sensitive_fields import bind_sensitive_cipher
 from .service import TradingService
 
@@ -254,6 +255,8 @@ def build_quarantine_summarizer(
     config: AppConfig,
     secrets: RuntimeSecrets,
     provider_budget: ProviderBudgetService,
+    *,
+    runtime_role: str = "app",
 ) -> QuarantineSummarizer | None:
     """Compose the no-tools reader separately from the privileged analyst."""
     if not config.analyst.news_enabled:
@@ -266,6 +269,7 @@ def build_quarantine_summarizer(
             secrets,
             provider_budget=provider_budget,
             category="untrusted",
+            runtime_role=runtime_role,
         )
     )
 
@@ -361,6 +365,7 @@ def _build_container(
     effective_role = runtime_role or "app"
     if effective_role not in {"app", "daemon", "mcp"}:
         raise ValueError("runtime_role_invalid")
+    require_configured_role_origins(config, effective_role)
     startup_evidence = None
     if _consumed_startup_guard is not None:
         startup_evidence = _validate_consumed_startup_guard(
@@ -459,13 +464,18 @@ def _finish_container(
         config,
         secrets,
         provider_budget,
+        runtime_role=runtime_role,
     )
 
     production_broker = broker is None
     if broker is None:
         if runtime_tenure_guard is not None:
             runtime_tenure_guard.ensure_owned()
-        broker = build_broker(config, secrets)
+        broker = build_broker(
+            config,
+            secrets,
+            runtime_role=runtime_role,
+        )
         if runtime_tenure_guard is not None:
             runtime_tenure_guard.ensure_owned()
         _arm_production_paper_broker(broker)
@@ -475,7 +485,11 @@ def _finish_container(
                 runtime_tenure_guard,
             )
     if clock is None:
-        clock = build_clock(config, secrets)
+        clock = build_clock(
+            config,
+            secrets,
+            runtime_role=runtime_role,
+        )
     service = TradingService(
         broker,
         session_factory,

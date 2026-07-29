@@ -4,6 +4,7 @@ full order lifecycle integration (B2)."""
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -977,6 +978,286 @@ def test_structural_failure_runs_every_local_check_then_stops_before_outbound(
     ]
     assert "=> NOT READY" in output
     assert "Alpaca paper auth" not in output
+
+
+def test_structural_preflight_never_accepts_missing_keychain_provenance(
+    app_config,
+):
+    from trading_assistant import preflight
+
+    checks = preflight._structural_preflight_checks(
+        app_config,
+        _structural_preflight_secrets(app_config),
+        provider=None,
+        tls_validator=lambda _server: object(),
+        encryption_checker=lambda _config, _secrets: (
+            preflight.StructuralCheck("encryption", "passed", "ok")
+        ),
+    )
+
+    assert checks[0] == preflight.Result(
+        "KEYCHAIN",
+        preflight.FAIL,
+        "provider_unproven",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tls_cert_path", ".local/tls/renamed.pem"),
+        ("tls_key_path", ".local/tls/renamed-key.pem"),
+        ("tls_cert_path", "elsewhere/localhost.pem"),
+        ("tls_key_path", "elsewhere/localhost-key.pem"),
+    ],
+)
+def test_structural_preflight_requires_exact_canonical_tls_paths(
+    app_config,
+    field,
+    value,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    unsafe = app_config.model_copy(
+        update={
+            "server": app_config.server.model_copy(
+                update={field: value}
+            )
+        }
+    )
+    tls_calls: list[object] = []
+    checks = preflight._structural_preflight_checks(
+        unsafe,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+        tls_validator=lambda server: tls_calls.append(server),
+        encryption_checker=lambda _config, _secrets: (
+            preflight.StructuralCheck("encryption", "passed", "ok")
+        ),
+    )
+
+    assert checks[1] == preflight.Result(
+        "LOCAL_TLS",
+        preflight.FAIL,
+        "local_tls_invalid",
+    )
+    assert tls_calls == []
+
+
+def test_preflight_provider_constructor_failure_still_runs_all_five_checks(
+    app_config,
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant import preflight
+
+    calls: list[str] = []
+
+    def fail_provider():
+        calls.append("provider")
+        raise RuntimeError("fixture-provider-marker")
+
+    def tls_validator(_server):
+        calls.append("tls")
+
+    def encryption_checker(_config, secrets):
+        calls.append("encryption")
+        assert secrets is None
+        return preflight.StructuralCheck(
+            "encryption",
+            "blocked",
+            "sensitive_key_unavailable",
+        )
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("non-structural dependency was constructed")
+
+    monkeypatch.setattr(preflight, "load_config", lambda *_args: app_config)
+    monkeypatch.setattr(preflight, "_alpaca", explode)
+    monkeypatch.setattr(preflight, "_db", explode)
+    monkeypatch.setattr(preflight, "_build_service", explode)
+
+    result = preflight.run(
+        provider_factory=fail_provider,
+        tls_validator=tls_validator,
+        encryption_checker=encryption_checker,
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert calls == ["provider", "tls", "encryption"]
+    for name in (
+        "KEYCHAIN",
+        "LOCAL_TLS",
+        "FIELD_ENCRYPTION",
+        "OUTBOUND_ORIGINS",
+        "INTEGRATIONS_DISABLED",
+    ):
+        assert output.count(name) == 1
+    assert "sensitive_key_unavailable" in output
+    assert "fixture-provider-marker" not in output
+    assert "Alpaca paper auth" not in output
+
+
+def test_preflight_keychain_load_failure_still_runs_all_five_checks(
+    app_config,
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    calls: list[str] = []
+
+    class FailingBackend:
+        def get_password(self, *_args):
+            raise RuntimeError("fixture-keychain-marker")
+
+    provider = MacOSKeychainSecretProvider(backend=FailingBackend())
+    monkeypatch.setattr(preflight, "load_config", lambda *_args: app_config)
+
+    result = preflight.run(
+        provider=provider,
+        tls_validator=lambda _server: calls.append("tls"),
+        encryption_checker=lambda _config, secrets: (
+            calls.append("encryption")
+            or (
+                preflight.StructuralCheck(
+                    "encryption",
+                    "blocked",
+                    "sensitive_key_unavailable",
+                )
+                if secrets is None
+                else None
+            )
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert calls == ["tls", "encryption"]
+    for name in (
+        "KEYCHAIN",
+        "LOCAL_TLS",
+        "FIELD_ENCRYPTION",
+        "OUTBOUND_ORIGINS",
+        "INTEGRATIONS_DISABLED",
+    ):
+        assert output.count(name) == 1
+    assert "sensitive_key_unavailable" in output
+    assert "fixture-keychain-marker" not in output
+
+
+def test_preflight_constructs_loads_and_passes_one_keychain_provider(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import logging as runtime_logging
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import (
+        MacOSKeychainSecretProvider,
+    )
+
+    provider = MacOSKeychainSecretProvider(backend=object())
+    secrets = _structural_preflight_secrets(app_config)
+    observed: list[tuple[str, object]] = []
+
+    def provider_factory():
+        observed.append(("construct", provider))
+        return provider
+
+    def load(role, *, config, provider):
+        assert role == "preflight"
+        assert config is app_config
+        observed.append(("load", provider))
+        return secrets
+
+    def run_loaded(config, loaded, *, provider):
+        assert config is app_config
+        assert loaded is secrets
+        observed.append(("run", provider))
+        return 0
+
+    monkeypatch.setattr(preflight, "load_config", lambda *_args: app_config)
+    monkeypatch.setattr(preflight, "load_role_secrets", load)
+    monkeypatch.setattr(preflight, "_run", run_loaded)
+    monkeypatch.setattr(
+        runtime_logging,
+        "runtime_startup",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    assert preflight.run(provider_factory=provider_factory) == 0
+    assert observed == [
+        ("construct", provider),
+        ("load", provider),
+        ("run", provider),
+    ]
+
+
+def test_preflight_encryption_check_is_metadata_only_and_never_builds_cipher(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import preflight
+    from trading_assistant.db import session as db_session
+    from trading_assistant.security import crypto
+
+    engine = object()
+    observed: dict[str, object] = {}
+
+    class MetadataOnlyInspector:
+        def __init__(
+            self,
+            supplied_engine,
+            *,
+            schema_version,
+            active_key_id,
+            cipher=None,
+        ):
+            observed.update(
+                engine=supplied_engine,
+                schema_version=schema_version,
+                active_key_id=active_key_id,
+                cipher=cipher,
+            )
+
+        def inspect(self, *, metadata_only=False):
+            observed["metadata_only"] = metadata_only
+            return preflight.StructuralCheck("encryption", "passed", "ok")
+
+    monkeypatch.setattr(db_session, "create_db_engine", lambda _url: engine)
+    monkeypatch.setattr(
+        crypto,
+        "build_sensitive_data_cipher",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight attempted decryption setup")
+        ),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "SensitiveEncryptionStateInspector",
+        MetadataOnlyInspector,
+    )
+
+    result = preflight._default_encryption_check(
+        app_config,
+        _structural_preflight_secrets(app_config),
+    )
+
+    assert result.passed
+    assert observed == {
+        "engine": engine,
+        "schema_version": app_config.encryption.schema_version,
+        "active_key_id": app_config.encryption.active_key_id,
+        "cipher": None,
+        "metadata_only": True,
+    }
 
 
 def _install_preflight_alpaca_stubs(

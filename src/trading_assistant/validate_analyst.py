@@ -40,6 +40,7 @@ def _build_analyst(config, secrets, provider_budget) -> Analyst:
             secrets,
             provider_budget=provider_budget,
             category="backtest",
+            runtime_role="validate-analyst",
         ),
         max_tokens=config.llm.max_tokens,
         suppress_ranging=config.analyst.suppress_ranging,

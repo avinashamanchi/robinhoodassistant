@@ -20,7 +20,6 @@ from .db.schema import SchemaOutOfDate
 from .security.secrets import (
     MacOSKeychainSecretProvider,
     RuntimeSecrets,
-    SecretBoundaryError,
     SecretProvider,
     app_secret_quality_ok,
     load_role_secrets,
@@ -84,7 +83,7 @@ class SensitiveEncryptionStateInspector:
     def _timestamp(value: object) -> bool:
         return isinstance(value, datetime) and value.tzinfo is not None
 
-    def inspect(self) -> StructuralCheck:
+    def inspect(self, *, metadata_only: bool = False) -> StructuralCheck:
         try:
             from sqlalchemy import select
             from sqlalchemy.orm import Session
@@ -162,6 +161,8 @@ class SensitiveEncryptionStateInspector:
             or self._HASH.fullmatch(row.backup_path_hash) is None
         ):
             return self._blocked("sensitive_migration_state_invalid")
+        if metadata_only:
+            return StructuralCheck("encryption", "passed", "ok")
         if self._cipher is None:
             return self._blocked("sensitive_key_unavailable")
         try:
@@ -210,24 +211,38 @@ def _safe_exception_code(_exc: Exception) -> str:
 
 def _default_encryption_check(
     config,
-    secrets: RuntimeSecrets,
+    secrets: RuntimeSecrets | None,
 ) -> StructuralCheck:
-    """Inspect only configured key material and the local migration state."""
+    """Inspect key metadata and migration state without constructing a cipher."""
 
     try:
         from .db.session import create_db_engine
-        from .security.crypto import build_sensitive_data_cipher
 
-        cipher = build_sensitive_data_cipher(
-            config.encryption,
-            secrets,
+        if secrets is None:
+            return StructuralCheck(
+                "encryption",
+                "blocked",
+                "sensitive_key_unavailable",
+            )
+        expected_key_ids = (
+            config.encryption.active_key_id,
+            *config.encryption.retained_key_ids,
         )
+        if tuple(secrets.field_encryption_keys) != expected_key_ids or not all(
+            secret_is_set(secrets.field_encryption_keys[key_id])
+            for key_id in expected_key_ids
+        ):
+            return StructuralCheck(
+                "encryption",
+                "blocked",
+                "sensitive_key_unavailable",
+            )
         return SensitiveEncryptionStateInspector(
             create_db_engine(secrets.database_url),
             schema_version=config.encryption.schema_version,
             active_key_id=config.encryption.active_key_id,
-            cipher=cipher,
-        ).inspect()
+            cipher=None,
+        ).inspect(metadata_only=True)
     except Exception:
         return StructuralCheck(
             "encryption",
@@ -238,7 +253,7 @@ def _default_encryption_check(
 
 def _structural_preflight_checks(
     config,
-    secrets: RuntimeSecrets,
+    secrets: RuntimeSecrets | None,
     *,
     provider: SecretProvider | None,
     tls_validator=None,
@@ -254,39 +269,41 @@ def _structural_preflight_checks(
     tls_validator = tls_validator or validate_tls_material
     encryption_checker = encryption_checker or _default_encryption_check
 
-    keychain_ok = (
-        provider is None
-        or (
-            isinstance(provider, MacOSKeychainSecretProvider)
-            and provider.provider_name == "macos-keychain"
-        )
+    provider_proven = (
+        isinstance(provider, MacOSKeychainSecretProvider)
+        and provider.provider_name == "macos-keychain"
     )
-    try:
-        required = _required_fields("preflight", config)
-        fields_present = all(
-            secret_is_set(getattr(secrets, field_name))
-            for field_name in required
-        )
-        expected_key_ids = (
-            config.encryption.active_key_id,
-            *config.encryption.retained_key_ids,
-        )
-        field_keys_present = (
-            tuple(secrets.field_encryption_keys) == expected_key_ids
-            and all(
-                secret_is_set(secrets.field_encryption_keys[key_id])
-                for key_id in expected_key_ids
+    if not provider_proven:
+        keychain = Result("KEYCHAIN", FAIL, "provider_unproven")
+    else:
+        try:
+            required = _required_fields("preflight", config)
+            fields_present = secrets is not None and all(
+                secret_is_set(getattr(secrets, field_name))
+                for field_name in required
             )
+            expected_key_ids = (
+                config.encryption.active_key_id,
+                *config.encryption.retained_key_ids,
+            )
+            field_keys_present = (
+                secrets is not None
+                and tuple(secrets.field_encryption_keys)
+                == expected_key_ids
+                and all(
+                    secret_is_set(secrets.field_encryption_keys[key_id])
+                    for key_id in expected_key_ids
+                )
+            )
+        except Exception:
+            fields_present = False
+            field_keys_present = False
+        keychain_ok = fields_present and field_keys_present
+        keychain = Result(
+            "KEYCHAIN",
+            PASS if keychain_ok else FAIL,
+            "ok" if keychain_ok else "required_fields_missing",
         )
-    except Exception:
-        fields_present = False
-        field_keys_present = False
-    keychain_ok = keychain_ok and fields_present and field_keys_present
-    keychain = Result(
-        "KEYCHAIN",
-        PASS if keychain_ok else FAIL,
-        "ok" if keychain_ok else "required_fields_missing",
-    )
 
     try:
         if (
@@ -297,6 +314,10 @@ def _structural_preflight_checks(
             or set(config.server.allowed_hosts)
             != {"localhost", "127.0.0.1", "::1"}
             or config.server.secure_cookies is not True
+            or str(config.server.tls_cert_path)
+            != ".local/tls/localhost.pem"
+            or str(config.server.tls_key_path)
+            != ".local/tls/localhost-key.pem"
         ):
             raise RuntimeError("local transport configuration invalid")
         TransportPolicy.production(
@@ -315,27 +336,41 @@ def _structural_preflight_checks(
             isinstance(encryption, StructuralCheck)
             and encryption.passed
         )
+        encryption_detail = (
+            "ok"
+            if encryption_ok
+            else encryption.code
+            if isinstance(encryption, StructuralCheck)
+            else "encryption_state_unproven"
+        )
     except Exception:
         encryption_ok = False
+        encryption_detail = "encryption_state_unproven"
     field_encryption = Result(
         "FIELD_ENCRYPTION",
         PASS if encryption_ok else FAIL,
-        "ok" if encryption_ok else "migration_incomplete",
+        encryption_detail,
     )
 
-    outbound_ok = configured_origins_match_manifest(
-        config.provider_origins
-    )
+    try:
+        outbound_ok = configured_origins_match_manifest(
+            config.provider_origins
+        )
+    except Exception:
+        outbound_ok = False
     outbound = Result(
         "OUTBOUND_ORIGINS",
         PASS if outbound_ok else FAIL,
         "ok" if outbound_ok else "origin_manifest_mismatch",
     )
 
-    integrations_ok = (
-        config.integrations.webhooks_enabled is False
-        and config.integrations.composio_enabled is False
-    )
+    try:
+        integrations_ok = (
+            config.integrations.webhooks_enabled is False
+            and config.integrations.composio_enabled is False
+        )
+    except Exception:
+        integrations_ok = False
     integrations = Result(
         "INTEGRATIONS_DISABLED",
         PASS if integrations_ok else FAIL,
@@ -422,6 +457,7 @@ def _alpaca(
             secret_value(secrets.alpaca_api_key),
             secret_value(secrets.alpaca_secret_key),
             paper=True,
+            runtime_role="preflight",
         )
     except Exception as exc:
         detail = _safe_exception_code(exc)
@@ -466,6 +502,7 @@ def _alpaca(
             secret_value(secrets.alpaca_api_key),
             secret_value(secrets.alpaca_secret_key),
             paper=True,
+            runtime_role="preflight",
         )
         clock = Result(
             "market clock reachable",
@@ -665,193 +702,45 @@ def _print_results(results: list[Result]) -> int:
     return 1 if not_ready else 0
 
 
-def _run_partial_keychain(
-    config,
-    presence,
+def run(
+    *,
+    provider: SecretProvider | None = None,
+    provider_factory=None,
+    tls_validator=None,
+    encryption_checker=None,
 ) -> int:
-    required_accounts = {
-        "app_api_token",
-        "alpaca_api_key",
-        "alpaca_secret_key",
-        "database_url",
-        "candidate_signing_key",
-        "backup_encryption_key",
-        {
-            "anthropic": "anthropic_api_key",
-            "gemini": "gemini_api_key",
-            "groq": "groq_api_key",
-        }.get(config.llm.provider, "unsupported_llm_provider"),
-        *(
-            f"field-encryption/{key_id}"
-            for key_id in (
-                config.encryption.active_key_id,
-                *config.encryption.retained_key_ids,
-            )
-        ),
-    }
-    missing = sorted(
-        account
-        for account in required_accounts
-        if presence.get(account) is False
-    )
-    unavailable = sorted(
-        account
-        for account in required_accounts
-        if presence.get(account) is None
-    )
-    if missing:
-        role_detail = "missing=" + ",".join(missing)
-    elif unavailable:
-        role_detail = "unavailable=" + ",".join(unavailable)
-    else:
-        role_detail = "present material failed role validation"
-
-    dangerous = []
-    if config.features.auto_execute_preapproved_rules:
-        dangerous.append("autoexecute")
-    if config.execution.prefer_bracket_orders:
-        dangerous.append("brackets")
-    if config.llm.fallback_provider is not None:
-        dangerous.append("llm_fallback")
-    if presence.get("live_trading_confirm") is True:
-        dangerous.append("live_confirmation")
-
-    origins_ok = False
-    integrations_ok = False
-    try:
-        from .security.outbound import configured_origins_match_manifest
-
-        origins_ok = configured_origins_match_manifest(
-            config.provider_origins
-        )
-        integrations_ok = (
-            config.integrations.webhooks_enabled is False
-            and config.integrations.composio_enabled is False
-        )
-    except Exception:
-        pass
-
-    results = [
-        Result("KEYCHAIN", FAIL, "required_fields_missing"),
-        Result("LOCAL_TLS", NEEDS, "keychain_unavailable"),
-        Result("FIELD_ENCRYPTION", NEEDS, "keychain_unavailable"),
-        Result(
-            "OUTBOUND_ORIGINS",
-            PASS if origins_ok else FAIL,
-            "ok" if origins_ok else "origin_manifest_mismatch",
-        ),
-        Result(
-            "INTEGRATIONS_DISABLED",
-            PASS if integrations_ok else FAIL,
-            "ok" if integrations_ok else "integration_enabled",
-        ),
-        _config_parses(),
-        _paper_only(config),
-        Result("runtime secret role validation", NEEDS, role_detail),
-        Result(
-            "dangerous switches OFF",
-            FAIL if dangerous else PASS,
-            (
-                "all disabled"
-                if not dangerous
-                else "enabled=" + ",".join(dangerous)
-            ),
-        ),
-        Result(
-            "operator login secret quality",
-            NEEDS,
-            "role validation incomplete; value not displayed",
-        ),
-        Result(
-            "Alpaca paper auth",
-            NEEDS,
-            "role validation incomplete; no broker call",
-        ),
-        Result("market clock reachable", NEEDS, "no broker call"),
-        Result("data bars reachable", NEEDS, "no provider call"),
-        Result("database schema current", NEEDS, "no database call"),
-        Result("DB WAL mode", NEEDS, "no database call"),
-        Result("kill switches", NEEDS, "no database call"),
-        Result(
-            "broker/local reconciliation",
-            NEEDS,
-            "role validation incomplete; no broker call",
-        ),
-        Result(
-            "configured LLM provider",
-            NEEDS,
-            f"provider={config.llm.provider}; no provider call",
-        ),
-        (
-            Result(
-                "notification configuration",
-                NEEDS,
-                "enabled; role validation incomplete; no message sent",
-            )
-            if config.features.telegram_notifications
-            else Result(
-                "notification configuration",
-                SKIP,
-                "disabled; no message sent",
-            )
-        ),
-    ]
-    return _print_results(results)
-
-
-def run(*, provider: SecretProvider | None = None) -> int:
     from .logging import runtime_startup
 
     config = load_config("config.yaml")
+    selected_provider: SecretProvider | None = provider
+    if selected_provider is None:
+        factory = provider_factory or MacOSKeychainSecretProvider
+        try:
+            selected_provider = factory()
+        except Exception:
+            selected_provider = None
+    secrets: RuntimeSecrets | None = None
     try:
-        secrets = (
-            load_role_secrets("preflight", config=config)
-            if provider is None
-            else load_role_secrets(
-                "preflight",
-                config=config,
-                provider=provider,
-            )
-        )
-    except SecretBoundaryError:
-        if provider is not None and not isinstance(
-            provider,
+        if isinstance(
+            selected_provider,
             MacOSKeychainSecretProvider,
         ):
-            return _print_results(
-                [
-                    Result(
-                        "KEYCHAIN",
-                        FAIL,
-                        "required_fields_missing",
-                    ),
-                    Result("LOCAL_TLS", NEEDS, "keychain_unavailable"),
-                    Result(
-                        "FIELD_ENCRYPTION",
-                        NEEDS,
-                        "keychain_unavailable",
-                    ),
-                    Result(
-                        "OUTBOUND_ORIGINS",
-                        FAIL,
-                        "origin_manifest_unproven",
-                    ),
-                    Result(
-                        "INTEGRATIONS_DISABLED",
-                        FAIL,
-                        "integration_state_unproven",
-                    ),
-                ]
+            secrets = load_role_secrets(
+                "preflight",
+                config=config,
+                provider=selected_provider,
             )
-        selected = provider or MacOSKeychainSecretProvider()
-        return _run_partial_keychain(
-            config,
-            selected.read_presence(encryption=config.encryption),
-        )
+    except Exception:
+        secrets = None
+    run_options = {"provider": selected_provider}
+    if tls_validator is not None:
+        run_options["tls_validator"] = tls_validator
+    if encryption_checker is not None:
+        run_options["encryption_checker"] = encryption_checker
+    if secrets is None:
+        return _run(config, None, **run_options)
     with runtime_startup("preflight", secrets):
-        if provider is None:
-            return _run(config, secrets)
-        return _run(config, secrets, provider=provider)
+        return _run(config, secrets, **run_options)
 
 
 def _run(
@@ -859,17 +748,32 @@ def _run(
     secrets: RuntimeSecrets | None = None,
     *,
     provider: SecretProvider | None = None,
+    tls_validator=None,
+    encryption_checker=None,
 ) -> int:
-    if secrets is None:
-        secrets = config
-        config = load_config("config.yaml")
     structural = _structural_preflight_checks(
         config,
         secrets,
         provider=provider,
+        tls_validator=tls_validator,
+        encryption_checker=encryption_checker,
     )
     if any(result.status in {FAIL, NEEDS} for result in structural):
         return _print_results(structural)
+    if secrets is None or not isinstance(
+        provider,
+        MacOSKeychainSecretProvider,
+    ):
+        return _print_results(
+            [
+                Result(
+                    "KEYCHAIN",
+                    FAIL,
+                    "provider_unproven",
+                ),
+                *structural[1:],
+            ]
+        )
     results = [
         *structural,
         _config_parses(),

@@ -40,7 +40,12 @@ from zoneinfo import ZoneInfo
 
 from ..assets import AssetClass, canonicalize_broker_symbol
 from ..risk.clock import MarketClockObservation
-from ..security.outbound import PinnedWebSocket, OutboundPolicy, install_pinned_session
+from ..security.outbound import (
+    OutboundPolicy,
+    PinnedWebSocket,
+    install_pinned_session,
+    require_origin,
+)
 from .base import (
     BrokerAcceptanceUnknown,
     BrokerClient,
@@ -90,11 +95,17 @@ _STREAM_POLICY = OutboundPolicy(_ALPACA_STREAM_URL)
 
 def build_alpaca_stream(
     *,
+    runtime_role: str = "daemon",
     open_timeout: float = 5.0,
     ping_timeout: float = 30.0,
     close_timeout: float = 5.0,
 ) -> PinnedWebSocket:
     """Build the optional stream boundary with the concrete no-redirect adapter."""
+    require_origin(
+        runtime_role,
+        "alpaca.stream",
+        _ALPACA_STREAM_URL,
+    )
     return PinnedWebSocket(
         _STREAM_POLICY,
         open_timeout=open_timeout,
@@ -279,9 +290,20 @@ class AlpacaBroker(BrokerClient):
         *,
         paper: bool = True,
         timeout_seconds: float = 10.0,
+        runtime_role: str = "app",
     ) -> "AlpacaBroker":
         if paper is not True:
             raise ValueError("paper-only Alpaca client required")
+        require_origin(
+            runtime_role,
+            "alpaca.trading",
+            _OFFICIAL_PAPER_TRADING_URL,
+        )
+        require_origin(
+            runtime_role,
+            "alpaca.historical",
+            _ALPACA_DATA_URL,
+        )
         trading = TradingClient(
             api_key,
             secret_key,
@@ -721,9 +743,15 @@ class AlpacaClock:
         *,
         paper: bool = True,
         timeout_seconds: float = 10.0,
+        runtime_role: str = "app",
     ) -> "AlpacaClock":
         if paper is not True:
             raise ValueError("paper-only Alpaca client required")
+        require_origin(
+            runtime_role,
+            "alpaca.trading",
+            _OFFICIAL_PAPER_TRADING_URL,
+        )
         client = TradingClient(
             api_key,
             secret_key,

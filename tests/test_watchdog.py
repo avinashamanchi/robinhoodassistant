@@ -7,7 +7,6 @@ import re
 import subprocess
 from datetime import timedelta
 from decimal import Decimal
-from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +28,17 @@ from trading_assistant.ops.watchdog import (
 from trading_assistant.security.secrets import RuntimeSecrets
 
 _LIVE = {"alive": True, "database_reachable": True}
+_LIVE_BODY = b'{"alive":true,"database_reachable":true}'
+
+
+class _BodyLivenessTransport:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.calls: list[tuple[str, float]] = []
+
+    def fetch(self, url: str, *, timeout_seconds: float) -> bytes:
+        self.calls.append((url, timeout_seconds))
+        return self.body
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +54,11 @@ def _inject_watchdog_runtime_secrets(monkeypatch):
                 AssertionError("unexpected runtime role")
             )
         ),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "build_local_liveness_transport",
+        lambda _certificate_path: _BodyLivenessTransport(_LIVE_BODY),
     )
 
 
@@ -344,7 +359,7 @@ def test_main_polls_only_anonymous_liveness_and_restarts_nothing_when_healthy(
     observed_urls: list[str] = []
     restarted: list[str] = []
 
-    def fetch(url, timeout):
+    def fetch(url, timeout, *, transport):
         observed_urls.append(url)
         assert url.endswith("/health/live")
         assert not url.endswith("/health")
@@ -395,7 +410,9 @@ def test_main_rejects_health_target_overrides_before_any_network_call(
     monkeypatch.setattr(
         watchdog,
         "fetch_health",
-        lambda url, timeout: network_calls.append((url, timeout)),
+        lambda url, timeout, *, transport: network_calls.append(
+            (url, timeout)
+        ),
     )
     monkeypatch.setattr(
         watchdog,
@@ -409,37 +426,20 @@ def test_main_rejects_health_target_overrides_before_any_network_call(
     assert network_calls == []
 
 
-def test_fetch_health_uses_an_explicit_default_verified_tls_context(monkeypatch):
-    """The watchdog must never silently downgrade local certificate checks."""
-    verified_context = object()
-    observed: dict[str, object] = {}
-    monkeypatch.setattr(
-        watchdog,
-        "ssl",
-        SimpleNamespace(create_default_context=lambda: verified_context),
-        raising=False,
-    )
+def test_fetch_health_requires_the_injected_liveness_transport():
+    transport = _BodyLivenessTransport(_LIVE_BODY)
 
-    def urlopen(url, timeout, *, context):
-        observed.update(url=url, timeout=timeout, context=context)
-        return BytesIO(b'{"alive":true,"database_reachable":true}')
-
-    monkeypatch.setattr(watchdog, "urlopen", urlopen)
-
-    assert watchdog.fetch_health("https://localhost:8020/health/live") == _LIVE
-    assert observed["url"] == "https://localhost:8020/health/live"
-    assert observed["context"] is verified_context
+    assert watchdog.fetch_health(
+        "https://localhost:8020/health/live",
+        transport=transport,
+    ) == _LIVE
+    assert transport.calls == [
+        ("https://localhost:8020/health/live", 5.0)
+    ]
 
 
 def test_main_accepts_only_the_exact_liveness_json_contract(monkeypatch):
     restarted: list[str] = []
-    monkeypatch.setattr(
-        watchdog,
-        "urlopen",
-        lambda url, timeout, *, context: BytesIO(
-            b'{"alive":true,"database_reachable":true}'
-        ),
-    )
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
@@ -488,8 +488,8 @@ def test_main_malformed_liveness_body_restarts_app_without_crashing(
     restarted: list[str] = []
     monkeypatch.setattr(
         watchdog,
-        "urlopen",
-        lambda url, timeout, *, context: BytesIO(body),
+        "build_local_liveness_transport",
+        lambda _certificate_path: _BodyLivenessTransport(body),
     )
     monkeypatch.setattr(
         watchdog,
@@ -515,8 +515,8 @@ def test_main_oversized_liveness_body_restarts_app_without_crashing(
     )
     monkeypatch.setattr(
         watchdog,
-        "urlopen",
-        lambda url, timeout, *, context: BytesIO(oversized),
+        "build_local_liveness_transport",
+        lambda _certificate_path: _BodyLivenessTransport(oversized),
     )
     monkeypatch.setattr(
         watchdog,
@@ -546,18 +546,80 @@ def test_fetch_health_decodes_text_and_rejects_nested_duplicate_members(
         return original_loads(value, **kwargs)
 
     monkeypatch.setattr(watchdog.json, "loads", loads)
-    monkeypatch.setattr(
-        watchdog,
-        "urlopen",
-        lambda url, timeout, *, context: BytesIO(body),
-    )
-
-    assert watchdog.fetch_health("https://localhost:8020/health/live") is None
+    assert watchdog.fetch_health(
+        "https://localhost:8020/health/live",
+        transport=_BodyLivenessTransport(body),
+    ) is None
     assert observed["value_type"] is str
     hook = observed["object_pairs_hook"]
     assert callable(hook)
     with pytest.raises(ValueError):
         hook([("key", 1), ("key", 2)])
+
+
+def test_fetch_health_uses_only_injected_local_liveness_transport():
+    calls: list[tuple[str, float]] = []
+
+    class FakeTransport:
+        def fetch(self, url, *, timeout_seconds):
+            calls.append((url, timeout_seconds))
+            return b'{"alive":true,"database_reachable":true}'
+
+    assert watchdog.fetch_health(
+        "https://localhost:8020/health/live",
+        4.0,
+        transport=FakeTransport(),
+    ) == _LIVE
+    assert calls == [
+        ("https://localhost:8020/health/live", 4.0)
+    ]
+
+
+def test_main_builds_one_local_liveness_transport_from_canonical_cert(
+    monkeypatch,
+):
+    transport = object()
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        watchdog,
+        "load_config",
+        lambda: SimpleNamespace(
+            daemon=SimpleNamespace(heartbeat_stale_seconds=180),
+            server=SimpleNamespace(
+                tls_cert_path=".local/tls/localhost.pem",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "build_local_liveness_transport",
+        lambda certificate_path: (
+            observed.append(("build", certificate_path)) or transport
+        ),
+        raising=False,
+    )
+
+    def fetch(url, timeout, *, transport: object):
+        observed.append(("fetch", transport))
+        return _LIVE
+
+    monkeypatch.setattr(watchdog, "fetch_health", fetch)
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10},
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "restart_selected_components",
+        lambda *_args, **_kwargs: (),
+    )
+
+    assert watchdog.main([]) == 0
+    assert observed == [
+        ("build", ".local/tls/localhost.pem"),
+        ("fetch", transport),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -580,7 +642,7 @@ def test_main_invalid_database_age_restarts_daemon_only(
     monkeypatch.setattr(
         watchdog,
         "fetch_health",
-        lambda url, timeout: dict(_LIVE),
+        lambda url, timeout, *, transport: dict(_LIVE),
     )
     monkeypatch.setattr(
         watchdog,
@@ -607,7 +669,7 @@ def test_main_healthy_api_and_stale_daemon_restarts_daemon_only(
     monkeypatch.setattr(
         watchdog,
         "fetch_health",
-        lambda url, timeout: dict(_LIVE),
+        lambda url, timeout, *, transport: dict(_LIVE),
     )
     monkeypatch.setattr(
         watchdog,
@@ -632,7 +694,7 @@ def test_main_liveness_failure_restarts_app_only_and_sanitizes_error(
     restarted: list[str] = []
     observed_urls: list[str] = []
 
-    def fail_liveness(url, timeout):
+    def fail_liveness(url, timeout, *, transport):
         observed_urls.append(url)
         raise RuntimeError(marker)
 
@@ -663,7 +725,11 @@ def test_main_attempts_daemon_after_app_restart_failure(
     marker = "launchctl-first-secret"
     restarted: list[str] = []
 
-    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout, *, transport: None,
+    )
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
@@ -702,7 +768,11 @@ def test_main_collects_both_restart_failures_without_duplicate_attempts(
     marker = "launchctl-both-secret"
     restarted: list[str] = []
 
-    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout, *, transport: None,
+    )
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
@@ -742,7 +812,11 @@ def test_launchctl_timeout_on_app_still_attempts_daemon_once(
     marker = "launchctl-timeout-provider-secret"
     calls: list[tuple[list[str], bool, float]] = []
 
-    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout, *, transport: None,
+    )
     monkeypatch.setattr(
         watchdog,
         "read_database_health",
@@ -797,7 +871,11 @@ def test_both_launchctl_timeouts_are_collected_before_nonzero_return(
     marker = "launchctl-all-timeout-secret"
     calls: list[tuple[list[str], bool, float]] = []
 
-    monkeypatch.setattr(watchdog, "fetch_health", lambda url, timeout: None)
+    monkeypatch.setattr(
+        watchdog,
+        "fetch_health",
+        lambda url, timeout, *, transport: None,
+    )
     monkeypatch.setattr(
         watchdog,
         "read_database_health",

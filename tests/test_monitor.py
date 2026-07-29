@@ -439,7 +439,7 @@ def test_daemon_shadow_quote_denial_uses_durable_data_breaker(
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
-        lambda *_args: NullNotifier(),
+        lambda *_args, **_kwargs: NullNotifier(),
     )
     monkeypatch.setattr(
         llm_factory,
@@ -599,7 +599,7 @@ def test_production_daemon_builders_gate_every_historical_network_attempt(
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
-        lambda *_args: NullNotifier(),
+        lambda *_args, **_kwargs: NullNotifier(),
     )
     monkeypatch.setattr(
         llm_factory,
@@ -719,7 +719,7 @@ def test_production_daemon_historical_denial_trips_breakers_without_calls(
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
-        lambda *_args: NullNotifier(),
+        lambda *_args, **_kwargs: NullNotifier(),
     )
     monkeypatch.setattr(
         llm_factory,

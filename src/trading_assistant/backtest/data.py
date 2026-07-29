@@ -17,7 +17,11 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
-from ..security.outbound import OutboundPolicy, install_pinned_session
+from ..security.outbound import (
+    OutboundPolicy,
+    install_pinned_session,
+    require_origin,
+)
 
 
 _ALPACA_DATA_POLICY = OutboundPolicy("https://data.alpaca.markets")
@@ -111,6 +115,7 @@ def download_alpaca_bars(
     years: int = 5,
     cache_dir: str | Path = ".cache/bars",
     *,
+    runtime_role: str = "app",
     client_factory: Callable[[str, str], Any] | None = None,
     attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> pd.DataFrame:
@@ -129,6 +134,12 @@ def download_alpaca_bars(
 
     production_client = client_factory is None
     factory = client_factory or StockHistoricalDataClient
+    if production_client:
+        require_origin(
+            runtime_role,
+            "alpaca.historical",
+            "https://data.alpaca.markets",
+        )
     client = factory(api_key, secret_key)
     if production_client:
         install_pinned_session(

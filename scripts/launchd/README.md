@@ -27,8 +27,12 @@ Idempotent — re-run it after pulling code changes to reload with the new binar
 It regenerates both plists from the repo's current path, so it works on any
 machine where the repo is checked out and `.venv` exists (`uv sync`). Do not
 install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
-`OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. Keychain migration,
-field migration/rotation, and encrypted restore procedures are in
+`OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. The five rows execute
+independently even after a Keychain construction/load
+failure and stop before any broker, provider, or notifier is constructed.
+Field preflight is metadata-only; the startup guard owns the full envelope
+scan. Keychain migration, field migration/rotation, and encrypted restore
+procedures are in
 `docs/RUNBOOK.md`; no secret value belongs on a command line.
 For rotation, keep every writer stopped, configure and prompt for the reviewed
 retained key ID, run the field rotation, complete the coordinated

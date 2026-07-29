@@ -623,10 +623,10 @@ def test_production_rejects_insecure_cookie_configuration_at_app_construction(
         )
 
 
-def test_insecure_cookie_configuration_is_available_only_with_test_transport(
+def test_test_transport_cannot_downgrade_session_cookie_security(
     make_service,
 ):
-    """HTTP session cookies remain a deliberate in-process-test-only escape hatch."""
+    """Even an in-process transport cannot issue an insecure session cookie."""
     service = make_service()
     service.config = service.config.model_copy(
         update={
@@ -651,7 +651,9 @@ def test_insecure_cookie_configuration_is_available_only_with_test_transport(
 
     assert response.status_code == 200
     assert response.headers["set-cookie"].startswith("trading_session=")
-    assert "; Secure" not in response.headers["set-cookie"]
+    assert "; Secure" in response.headers["set-cookie"]
+    assert "; HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=strict" in response.headers["set-cookie"]
 
 
 def test_large_body_is_rejected_before_json_route_code(make_service):

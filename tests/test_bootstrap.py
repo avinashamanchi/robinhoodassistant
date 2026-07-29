@@ -222,11 +222,15 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
     from trading_assistant import bootstrap
 
     broker, trading = _paper_alpaca_broker()
-    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args, **_kwargs: broker,
+    )
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda *_args: FakeClock(is_open=True),
+        lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
 
     with _closed_runtime_container(
@@ -296,12 +300,12 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda *_args: FakeClock(is_open=True),
+        lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
     monkeypatch.setattr(
         bootstrap,
         "build_broker",
-        lambda *_args: MockBroker(),
+        lambda *_args, **_kwargs: MockBroker(),
     )
     with pytest.raises(RuntimeError, match="exact AlpacaBroker"):
         bootstrap.build_container(
@@ -312,7 +316,11 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
     broker, trading = _paper_alpaca_broker()
     trading._sandbox = False
     trading._base_url = "https://api.alpaca.markets"
-    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args, **_kwargs: broker,
+    )
     with pytest.raises(
         BrokerSubmissionRejected,
         match="not official Alpaca paper",
@@ -342,11 +350,15 @@ def test_production_container_refuses_to_serve_unknown_remote_open_order(
             asset_class=SimpleNamespace(value="us_equity"),
         )
     )
-    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args, **_kwargs: broker,
+    )
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda *_args: FakeClock(is_open=True),
+        lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
 
     with pytest.raises(
@@ -383,11 +395,15 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
             asset_class=SimpleNamespace(value="us_equity"),
         )
     )
-    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args, **_kwargs: broker,
+    )
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda *_args: FakeClock(is_open=True),
+        lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
 
     with _closed_runtime_container(
@@ -432,11 +448,15 @@ def test_daemon_container_remains_fail_closed_on_startup_reconciliation_failure(
             asset_class=SimpleNamespace(value="us_equity"),
         )
     )
-    monkeypatch.setattr(bootstrap, "build_broker", lambda *_args: broker)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_args, **_kwargs: broker,
+    )
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda *_args: FakeClock(is_open=True),
+        lambda *_args, **_kwargs: FakeClock(is_open=True),
     )
 
     with pytest.raises(StartupReconciliationFailed):
@@ -1073,7 +1093,7 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
-        lambda supplied_config, supplied_secrets: object(),
+        lambda supplied_config, supplied_secrets, **_kwargs: object(),
     )
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
     monkeypatch.setattr(mcp_server, "load_role_secrets", one_secrets)
@@ -1602,12 +1622,12 @@ def test_daemon_shadow_uses_shared_analysis_budget_and_attempt_ceiling(
     monkeypatch.setattr(
         daemon_main,
         "build_notifier",
-        lambda *_args: object(),
+        lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
         llm_factory,
         "build_llm_backend",
-        lambda cfg, supplied, *, provider_budget, category: seen.append(
+        lambda cfg, supplied, *, provider_budget, category, runtime_role: seen.append(
             (
                 "backend",
                 cfg,

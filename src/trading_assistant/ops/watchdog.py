@@ -7,16 +7,15 @@ import json
 import logging
 import math
 import os
-import ssl
 from numbers import Number
 import subprocess
 from typing import Any
-from urllib.request import urlopen
 
 from sqlalchemy import select
 
 from ..config import load_config
 from ..db.models import Heartbeat, utcnow
+from ..security.outbound import build_local_liveness_transport
 from ..security.secrets import RuntimeSecrets, load_role_secrets
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
@@ -88,13 +87,10 @@ def labels_to_restart(
 def fetch_health(
     url: str,
     timeout_seconds: float = 5.0,
+    *,
+    transport: Any,
 ) -> dict[str, bool] | None:
-    with urlopen(
-        url,
-        timeout=timeout_seconds,
-        context=ssl.create_default_context(),
-    ) as response:  # noqa: S310 - fixed local HTTPS URL
-        body = response.read(_MAX_LIVENESS_RESPONSE_BYTES + 1)
+    body = transport.fetch(url, timeout_seconds=timeout_seconds)
     if not isinstance(body, (bytes, bytearray)):
         return None
     if len(body) > _MAX_LIVENESS_RESPONSE_BYTES:
@@ -205,11 +201,22 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config()
     secrets = load_role_secrets("watchdog", config=config)
+    try:
+        liveness_transport = build_local_liveness_transport(
+            config.server.tls_cert_path
+        )
+    except Exception:
+        liveness_transport = None
     with runtime_startup("watchdog", secrets):
         try:
-            api_health = fetch_health(
-                _LIVENESS_URL,
-                args.request_timeout,
+            api_health = (
+                fetch_health(
+                    _LIVENESS_URL,
+                    args.request_timeout,
+                    transport=liveness_transport,
+                )
+                if liveness_transport is not None
+                else None
             )
         except Exception:
             api_health = None

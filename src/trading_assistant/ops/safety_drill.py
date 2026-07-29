@@ -2239,12 +2239,14 @@ def main(argv: list[str] | None = None) -> int:
                     secret_value(secrets.alpaca_secret_key),
                     paper=True,
                     timeout_seconds=config.trading.request_timeout_seconds,
+                    runtime_role="safety-drill",
                 )
                 clock = AlpacaClock.from_credentials(
                     secret_value(secrets.alpaca_api_key),
                     secret_value(secrets.alpaca_secret_key),
                     paper=True,
                     timeout_seconds=config.trading.request_timeout_seconds,
+                    runtime_role="safety-drill",
                 )
             report = run_safety_drill(
                 database_copy=args.database_copy,

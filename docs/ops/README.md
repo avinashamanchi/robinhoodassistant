@@ -22,9 +22,12 @@ uv run python -m trading_assistant.preflight
 
 `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`, `OUTBOUND_ORIGINS`, and
 `INTEGRATIONS_DISABLED` must all pass before preflight constructs any broker,
-provider, or notifier. See `docs/RUNBOOK.md` for the one-time private-file
-Keychain migration, stopped-writer field migration and rotation, and reviewed
-encrypted restore procedure. Never place secret material in these commands.
+provider, or notifier. All five execute independently even when Keychain
+construction or loading fails; TLS and encryption-metadata checks remain local
+and the preflight field check never decrypts rows. See `docs/RUNBOOK.md` for the
+one-time private-file Keychain migration, stopped-writer field migration and
+rotation, and reviewed encrypted restore procedure. Never place secret material
+in these commands.
 Rotation requires a reviewed new retained key ID, an interactive
 `set-encryption-key`, stopped-writer `encrypt_sensitive rotate`, a coordinated
 active/retained config transition, and a final Keychain audit plus envelope

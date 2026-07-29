@@ -7,6 +7,7 @@ import argparse
 import ast
 from dataclasses import dataclass, field
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -18,6 +19,9 @@ import yaml
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+_SAFE_FINDING_PATH = re.compile(
+    r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+"
+)
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -34,10 +38,16 @@ class ReleaseViolation:
         if (
             not isinstance(self.path, str)
             or not self.path
+            or self.path != "."
+            and _SAFE_FINDING_PATH.fullmatch(self.path) is None
             or self.path.startswith(("/", "\\"))
             or "://" in self.path
-            or any(char in self.path for char in ("\n", "\r", "?", "#", ":"))
+            or any(
+                char in self.path
+                for char in ("\n", "\r", "\t", "\x1b", "?", "#", ":")
+            )
             or "\\" in self.path
+            or not self.path.isascii()
         ):
             raise ValueError("release violation path is invalid")
         parts = PurePosixPath(self.path).parts
@@ -54,11 +64,458 @@ class ReleaseViolation:
 
 
 def _finding(code: str, relative: str, line: int) -> ReleaseViolation:
-    return ReleaseViolation(code, relative, line)
+    safe_path = (
+        relative
+        if (
+            isinstance(relative, str)
+            and (
+                relative == "."
+                or _SAFE_FINDING_PATH.fullmatch(relative) is not None
+            )
+            and relative.isascii()
+        )
+        else "unsafe-path"
+    )
+    safe_line = line if type(line) is int and line > 0 else 1
+    return ReleaseViolation(code, safe_path, safe_line)
 
 
 def _fail(message: str) -> None:
     raise RuntimeError(message)
+
+
+def _git_tracked_names(root: Path) -> tuple[str, ...] | None:
+    """Return tracked root-relative paths without opening any tracked file."""
+
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z", "--"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if top.returncode != 0 or tracked.returncode != 0:
+        return None
+    try:
+        git_root = Path(os.fsdecode(top.stdout).strip()).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if git_root != root:
+        return None
+    names: list[str] = []
+    for raw_name in tracked.stdout.split(b"\0"):
+        if not raw_name:
+            continue
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        path = PurePosixPath(name)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            return None
+        names.append(name)
+    return tuple(names)
+
+
+def _security_sensitive_paths(root: Path) -> tuple[Path, ...]:
+    fixed = (
+        root / "config.yaml",
+        root / ".env.example",
+        root / "pyproject.toml",
+        root / "uv.lock",
+        root / "README.md",
+        root / "docs" / "RUNBOOK.md",
+        root / "docs" / "ops" / "README.md",
+        root / "scripts" / "launchd" / "README.md",
+    )
+    discovered: list[Path] = []
+    source_root = root / "src" / "trading_assistant"
+    if source_root.exists() and not source_root.is_symlink():
+        for current, directories, files in os.walk(
+            source_root,
+            followlinks=False,
+        ):
+            current_path = Path(current)
+            discovered.extend(current_path / name for name in directories)
+            discovered.extend(
+                current_path / name
+                for name in files
+                if name.endswith(".py")
+            )
+    docs_root = root / "docs" / "superpowers"
+    if docs_root.exists() and not docs_root.is_symlink():
+        for current, directories, files in os.walk(
+            docs_root,
+            followlinks=False,
+        ):
+            current_path = Path(current)
+            discovered.extend(current_path / name for name in directories)
+            discovered.extend(
+                current_path / name
+                for name in files
+                if name.endswith(".md")
+            )
+    return tuple((*fixed, *discovered))
+
+
+def _scan_hermetic_root(root: Path) -> list[ReleaseViolation]:
+    """Prove Git and every scanned security file are rooted exactly here."""
+
+    names = _git_tracked_names(root)
+    if names is None:
+        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    candidates = set(_security_sensitive_paths(root))
+    candidates.update(root / PurePosixPath(name) for name in names)
+    try:
+        for candidate in sorted(candidates, key=lambda item: item.as_posix()):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            relative = candidate.relative_to(root)
+            current = root
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(root):
+                return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    except (OSError, RuntimeError, ValueError):
+        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    return []
+
+
+_AUTHORITY_MUTATORS = frozenset(
+    {
+        "add",
+        "append",
+        "clear",
+        "discard",
+        "extend",
+        "insert",
+        "pop",
+        "popitem",
+        "remove",
+        "reverse",
+        "setdefault",
+        "sort",
+        "update",
+    }
+)
+
+
+def _assignment_targets(node: ast.AST) -> tuple[ast.AST, ...]:
+    if isinstance(node, ast.Assign):
+        return tuple(node.targets)
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return (node.target,)
+    return ()
+
+
+def _target_root_name(node: ast.AST | None) -> str | None:
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
+
+
+def _canonical_assignment_finding(
+    tree: ast.Module,
+    *,
+    name: str,
+    code: str,
+    relative: str,
+) -> list[ReleaseViolation]:
+    all_definitions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in _assignment_targets(node)
+        )
+    ]
+    direct_definitions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in _assignment_targets(node)
+        )
+    ]
+    if len(all_definitions) != 1 or len(direct_definitions) != 1:
+        line = (
+            getattr(all_definitions[1], "lineno", 1)
+            if len(all_definitions) > 1
+            else getattr(all_definitions[0], "lineno", 1)
+            if all_definitions
+            else 1
+        )
+        return [_finding(code, relative, line)]
+
+    aliases = {name}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            if not isinstance(node.value, ast.Name) or node.value.id not in aliases:
+                continue
+            for target in _assignment_targets(node):
+                if isinstance(target, ast.Name) and target.id not in aliases:
+                    aliases.add(target.id)
+                    changed = True
+
+    mutator_aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            binds_mutator = (
+                isinstance(value, ast.Attribute)
+                and value.attr in _AUTHORITY_MUTATORS
+                and _target_root_name(value.value) in aliases
+            ) or (
+                isinstance(value, ast.Name)
+                and value.id in mutator_aliases
+            )
+            if not binds_mutator:
+                continue
+            for target in _assignment_targets(node):
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id not in mutator_aliases
+                ):
+                    mutator_aliases.add(target.id)
+                    changed = True
+
+    canonical = direct_definitions[0]
+    for node in ast.walk(tree):
+        if node is canonical:
+            continue
+        if isinstance(node, ast.AugAssign):
+            if _target_root_name(node.target) in aliases:
+                return [_finding(code, relative, node.lineno)]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in _assignment_targets(node):
+                root_name = _target_root_name(target)
+                if (
+                    root_name in aliases
+                    and not (
+                        isinstance(target, ast.Name)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id in aliases
+                    )
+                ):
+                    return [_finding(code, relative, node.lineno)]
+        elif isinstance(node, ast.Delete):
+            if any(
+                _target_root_name(target) in aliases
+                for target in node.targets
+            ):
+                return [_finding(code, relative, node.lineno)]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _AUTHORITY_MUTATORS
+            and _target_root_name(node.func.value) in aliases
+        ):
+            return [_finding(code, relative, node.lineno)]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in mutator_aliases
+        ):
+            return [_finding(code, relative, node.lineno)]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and node.args
+            and _target_root_name(node.args[0]) in aliases
+        ):
+            return [_finding(code, relative, node.lineno)]
+    return []
+
+
+def _scan_canonical_authorities(root: Path) -> list[ReleaseViolation]:
+    findings: list[ReleaseViolation] = []
+    assignments = (
+        (
+            "src/trading_assistant/app/agent.py",
+            "READ_ONLY_TOOL_SPECS",
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/security/sensitive_fields.py",
+            "SENSITIVE_FIELDS",
+            "SENSITIVE_REGISTRY_INVALID",
+        ),
+        (
+            "src/trading_assistant/security/secrets.py",
+            "_SIMPLE_SECRET_FIELDS",
+            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+        ),
+        (
+            "src/trading_assistant/security/outbound.py",
+            "OUTBOUND_ORIGIN_MANIFEST",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+    )
+    for relative, name, code in assignments:
+        path = root / relative
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        except (OSError, SyntaxError):
+            findings.append(_finding(code, relative, 1))
+            continue
+        findings.extend(
+            _canonical_assignment_finding(
+                tree,
+                name=name,
+                code=code,
+                relative=relative,
+            )
+        )
+
+    relative = "src/trading_assistant/config.py"
+    path = root / relative
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, SyntaxError):
+        return [
+            *findings,
+            _finding("COMPOSIO_ENABLED", relative, 1),
+            _finding("WEBHOOK_ROUTE_PRESENT", relative, 1),
+        ]
+    classes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "IntegrationsConfig"
+    ]
+    direct_classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "IntegrationsConfig"
+    ]
+    if len(classes) != 1 or len(direct_classes) != 1:
+        line = getattr(classes[1] if len(classes) > 1 else classes[0], "lineno", 1) if classes else 1
+        findings.extend(
+            (
+                _finding("COMPOSIO_ENABLED", relative, line),
+                _finding("WEBHOOK_ROUTE_PRESENT", relative, line),
+            )
+        )
+        return findings
+    integration_class = direct_classes[0]
+    aliases = {"IntegrationsConfig"}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id in aliases:
+                for target in _assignment_targets(node):
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id not in aliases
+                    ):
+                        aliases.add(target.id)
+                        changed = True
+    for field_name, code in (
+        ("composio_enabled", "COMPOSIO_ENABLED"),
+        ("webhooks_enabled", "WEBHOOK_ROUTE_PRESENT"),
+    ):
+        direct = [
+            node
+            for node in integration_class.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == field_name
+        ]
+        all_fields = [
+            node
+            for node in ast.walk(integration_class)
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == field_name
+                for target in _assignment_targets(node)
+            )
+        ]
+        if len(direct) != 1 or len(all_fields) != 1:
+            findings.append(
+                _finding(
+                    code,
+                    relative,
+                    getattr(all_fields[-1], "lineno", integration_class.lineno)
+                    if all_fields
+                    else integration_class.lineno,
+                )
+            )
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in _assignment_targets(node):
+                if (
+                    isinstance(target, ast.Attribute)
+                    and _target_root_name(target) in aliases
+                    and target.attr in {
+                        "composio_enabled",
+                        "webhooks_enabled",
+                    }
+                ):
+                    findings.append(
+                        _finding(
+                            "COMPOSIO_ENABLED"
+                            if target.attr == "composio_enabled"
+                            else "WEBHOOK_ROUTE_PRESENT",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and _target_root_name(node.args[0]) in aliases
+        ):
+            field_name = _literal_string(node.args[1])
+            if field_name == "composio_enabled":
+                findings.append(
+                    _finding("COMPOSIO_ENABLED", relative, node.lineno)
+                )
+            elif field_name == "webhooks_enabled":
+                findings.append(
+                    _finding("WEBHOOK_ROUTE_PRESENT", relative, node.lineno)
+                )
+            else:
+                findings.extend(
+                    (
+                        _finding("COMPOSIO_ENABLED", relative, node.lineno),
+                        _finding(
+                            "WEBHOOK_ROUTE_PRESENT",
+                            relative,
+                            node.lineno,
+                        ),
+                    )
+                )
+    return findings
 
 
 def _check_config(root: Path) -> None:
@@ -891,6 +1348,7 @@ class _EffectiveRouteGraph:
         ] = {}
         self._active_functions: set[tuple[str, int]] = set()
         self._object_sequence = 0
+        self._objects: list[_RouteObject] = []
         self.findings: list[ReleaseViolation] = []
         if app_root.exists():
             for path in sorted(app_root.rglob("*.py")):
@@ -934,12 +1392,14 @@ class _EffectiveRouteGraph:
         line: int,
     ) -> _RouteObject:
         self._object_sequence += 1
-        return _RouteObject(
+        created = _RouteObject(
             key=f"{module}:{line}:{self._object_sequence}",
             kind=kind,
             prefix=prefix,
             line=line,
         )
+        self._objects.append(created)
+        return created
 
     def _resolve(self, value: Any, seen: set[tuple[str, str]] | None = None) -> Any:
         if not isinstance(value, _RouteImport):
@@ -1339,6 +1799,21 @@ class _EffectiveRouteGraph:
             return _UnknownRouteValue(node.lineno)
         if isinstance(node, ast.Call):
             if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__getattribute__"
+                and len(node.args) == 1
+            ):
+                receiver = self._resolve(
+                    self._eval_expr(node.func.value, module, env)
+                )
+                attribute = _literal_string(node.args[0])
+                if isinstance(receiver, _RouteObject):
+                    if attribute is None:
+                        self._unproven(module, node.lineno)
+                        return _DynamicRouteMethod(receiver, node.lineno)
+                    return _RouteMethod(receiver, attribute, node.lineno)
+                return self._unproven(module, node.lineno)
+            if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
                 and len(node.args) >= 2
@@ -1449,6 +1924,22 @@ class _EffectiveRouteGraph:
                     else [statement.target]
                 )
                 for target in targets:
+                    if isinstance(target, ast.Subscript):
+                        resolved_container = self._resolve(
+                            self._eval_expr(
+                                target.value,
+                                module,
+                                env,
+                            )
+                        )
+                        if (
+                            isinstance(resolved_container, _RouteMethod)
+                            and resolved_container.name == "routes"
+                        ) or isinstance(
+                            resolved_container,
+                            _RouteObject,
+                        ):
+                            self._unproven(module, statement.lineno)
                     if isinstance(target, ast.Attribute):
                         resolved_target = self._resolve(
                             self._eval_expr(target, module, env)
@@ -1470,6 +1961,28 @@ class _EffectiveRouteGraph:
                         ):
                             self._unproven(module, statement.lineno)
                     self._bind_target(target, value, env)
+            elif isinstance(statement, ast.AugAssign):
+                target = statement.target
+                resolved_target = self._resolve(
+                    self._eval_expr(
+                        target.value
+                        if isinstance(target, (ast.Attribute, ast.Subscript))
+                        else target,
+                        module,
+                        env,
+                    )
+                )
+                if isinstance(resolved_target, (_RouteObject, _RouteMethod)):
+                    self._unproven(module, statement.lineno)
+                elif isinstance(target, (ast.Attribute, ast.Subscript)):
+                    root = target
+                    while isinstance(root, (ast.Attribute, ast.Subscript)):
+                        root = root.value
+                    if isinstance(
+                        self._resolve(self._eval_expr(root, module, env)),
+                        _RouteObject,
+                    ):
+                        self._unproven(module, statement.lineno)
             elif isinstance(
                 statement,
                 (ast.FunctionDef, ast.AsyncFunctionDef),
@@ -1519,12 +2032,44 @@ class _EffectiveRouteGraph:
                     self._eval_expr(statement.value, module, env)
                 )
             elif isinstance(statement, ast.If):
+                body_env = dict(env)
+                else_env = dict(env)
                 self._process_statements(
-                    statement.body, module, env, returns
+                    statement.body, module, body_env, returns
                 )
                 self._process_statements(
-                    statement.orelse, module, env, returns
+                    statement.orelse, module, else_env, returns
                 )
+                merged: dict[str, Any] = {}
+                for name in body_env.keys() | else_env.keys():
+                    left = body_env.get(
+                        name,
+                        _UnknownRouteValue(statement.lineno),
+                    )
+                    right = else_env.get(
+                        name,
+                        _UnknownRouteValue(statement.lineno),
+                    )
+                    if left is right or (
+                        isinstance(left, (str, int, bool, type(None)))
+                        and type(left) is type(right)
+                        and left == right
+                    ):
+                        merged[name] = left
+                        continue
+                    resolved_left = self._resolve(left)
+                    resolved_right = self._resolve(right)
+                    if isinstance(
+                        resolved_left,
+                        (_RouteObject, _RouteMethod),
+                    ) or isinstance(
+                        resolved_right,
+                        (_RouteObject, _RouteMethod),
+                    ):
+                        self._unproven(module, statement.lineno)
+                    merged[name] = _UnknownRouteValue(statement.lineno)
+                env.clear()
+                env.update(merged)
             elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
                 self._process_statements(
                     statement.body, module, env, returns
@@ -1638,6 +2183,21 @@ class _EffectiveRouteGraph:
 
     def scan(self) -> list[ReleaseViolation]:
         root_object = self._canonical_root()
+        for possible_root in self._objects:
+            for _method, possible_path, relative, line in self._effective_routes(
+                possible_root
+            ):
+                if re.search(
+                    r"(?:^/|/)(?:webhook|hooks)[^/]*",
+                    possible_path,
+                ):
+                    self.findings.append(
+                        _finding(
+                            "WEBHOOK_ROUTE_PRESENT",
+                            relative,
+                            line,
+                        )
+                    )
         if root_object is None:
             return self.findings
         effective = self._effective_routes(root_object)
@@ -2083,6 +2643,7 @@ _APPROVED_OUTBOUND_RULES = {
             {
                 "app",
                 "daemon",
+                "mcp",
                 "paper-drill",
                 "preflight",
                 "safety-drill",
@@ -2098,17 +2659,17 @@ _APPROVED_OUTBOUND_RULES = {
     ),
     "anthropic": (
         "llm.anthropic",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=anthropic",
     ),
     "gemini": (
         "llm.gemini",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=gemini",
     ),
     "groq": (
         "llm.groq",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=groq",
     ),
     "telegram": (
@@ -2125,6 +2686,7 @@ _APPROVED_OUTBOUND_RULES = {
 _APPROVED_OUTBOUND_ORIGINS = frozenset(
     _APPROVED_PROVIDER_ORIGINS.values()
 )
+_LOCAL_LIVENESS_URL = "https://localhost:8020/health/live"
 _APPROVED_ORIGINS_BY_ADAPTER_PATH = {
     "src/trading_assistant/broker/alpaca.py": frozenset(
         {
@@ -2664,6 +3226,59 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         except (OSError, SyntaxError):
             continue
+        ssl_module_aliases = {"ssl"}
+        ssl_context_factories = {"create_default_context"}
+        ssl_contexts: set[str] = set()
+        for candidate in ast.walk(tree):
+            if isinstance(candidate, ast.Import):
+                for imported in candidate.names:
+                    if imported.name == "ssl":
+                        ssl_module_aliases.add(imported.asname or "ssl")
+            elif (
+                isinstance(candidate, ast.ImportFrom)
+                and candidate.module == "ssl"
+            ):
+                for imported in candidate.names:
+                    if imported.name == "create_default_context":
+                        ssl_context_factories.add(
+                            imported.asname or imported.name
+                        )
+            elif isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                value = candidate.value
+                if not isinstance(value, ast.Call):
+                    continue
+                function_path = _attribute_path(value.func)
+                is_context_factory = (
+                    isinstance(value.func, ast.Name)
+                    and value.func.id in ssl_context_factories
+                ) or (
+                    len(function_path) == 2
+                    and function_path[0] in ssl_module_aliases
+                    and function_path[1] == "create_default_context"
+                )
+                if is_context_factory:
+                    ssl_contexts.update(
+                        target.id
+                        for target in _assignment_targets(candidate)
+                        if isinstance(target, ast.Name)
+                    )
+        changed = True
+        while changed:
+            changed = False
+            for candidate in ast.walk(tree):
+                if not isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                    continue
+                if not isinstance(candidate.value, ast.Name):
+                    continue
+                if candidate.value.id not in ssl_contexts:
+                    continue
+                before = len(ssl_contexts)
+                ssl_contexts.update(
+                    target.id
+                    for target in _assignment_targets(candidate)
+                    if isinstance(target, ast.Name)
+                )
+                changed = changed or len(ssl_contexts) != before
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(
                 node.value,
@@ -2701,6 +3316,45 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                 findings.append(
                     _finding("COMPOSIO_ENABLED", relative, node.lineno)
                 )
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = _assignment_targets(node)
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in ssl_contexts
+                    ):
+                        continue
+                    value_path = _attribute_path(node.value)
+                    if target.attr == "verify_mode" and not (
+                        len(value_path) == 2
+                        and value_path[0] in ssl_module_aliases
+                        and value_path[1] == "CERT_REQUIRED"
+                    ):
+                        findings.append(
+                            _finding("TLS_DISABLED", relative, node.lineno)
+                        )
+                    elif target.attr == "check_hostname" and not (
+                        isinstance(node.value, ast.Constant)
+                        and node.value.value is True
+                    ):
+                        findings.append(
+                            _finding("TLS_DISABLED", relative, node.lineno)
+                        )
+                    elif target.attr == "minimum_version":
+                        allowed_minimums = {
+                            (alias, "TLSVersion", version)
+                            for alias in ssl_module_aliases
+                            for version in {"TLSv1_2", "TLSv1_3"}
+                        }
+                        if value_path not in allowed_minimums:
+                            findings.append(
+                                _finding(
+                                    "TLS_DISABLED",
+                                    relative,
+                                    node.lineno,
+                                )
+                            )
             if isinstance(node, ast.Call):
                 call_name = (
                     node.func.attr
@@ -2781,6 +3435,53 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                                 node.lineno,
                             )
                         )
+                    if call_name == "CORSMiddleware":
+                        origin_regex = next(
+                            (
+                                keyword.value
+                                for keyword in node.keywords
+                                if keyword.arg == "allow_origin_regex"
+                            ),
+                            None,
+                        )
+                        if origin_regex is not None:
+                            regex_value = _literal_string(origin_regex)
+                            if (
+                                regex_value is None
+                                or regex_value not in {"", "^$"}
+                            ):
+                                findings.append(
+                                    _finding(
+                                        "WILDCARD_HOST_ORIGIN",
+                                        relative,
+                                        node.lineno,
+                                    )
+                                )
+                if call_name == "set_cookie":
+                    cookie_options = {
+                        keyword.arg: keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg is not None
+                    }
+                    secure = cookie_options.get("secure")
+                    httponly = cookie_options.get("httponly")
+                    samesite = _literal_string(
+                        cookie_options.get("samesite")
+                    )
+                    if not (
+                        isinstance(secure, ast.Constant)
+                        and secure.value is True
+                        and isinstance(httponly, ast.Constant)
+                        and httponly.value is True
+                        and samesite in {"strict", "lax"}
+                    ):
+                        findings.append(
+                            _finding(
+                                "INSECURE_COOKIE",
+                                relative,
+                                node.lineno,
+                            )
+                        )
                 if call_name in {"import_module", "__import__"} and node.args:
                     module_name = _literal_string(node.args[0])
                     if (
@@ -2845,6 +3546,34 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                 findings.append(
                     _finding("COMPOSIO_ENABLED", relative, line_number)
                 )
+    superpowers_root = root / "docs" / "superpowers"
+    if superpowers_root.exists():
+        for path in sorted(superpowers_root.rglob("*.md")):
+            relative = path.relative_to(root).as_posix()
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                findings.append(
+                    _finding("OUTBOUND_ORIGIN_UNAPPROVED", relative, 1)
+                )
+                continue
+            for line_number, line in enumerate(lines, 1):
+                normalized = " ".join(line.lower().split())
+                if "marketstack" not in normalized:
+                    continue
+                historical_removal = (
+                    "historical non-executable" in normalized
+                    and "removed" in normalized
+                    and "alpaca historical data" in normalized
+                )
+                if not historical_removal:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_ORIGIN_UNAPPROVED",
+                            relative,
+                            line_number,
+                        )
+                    )
     return findings
 
 
@@ -2926,7 +3655,93 @@ def _mapping_alias_keys(
                 if previous != merged:
                     mappings[name] = merged
                     changed = True
+        for node in ast.walk(tree):
+            assignment_target = (
+                node.target
+                if isinstance(node, ast.AnnAssign)
+                else node.targets[0]
+                if isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                else None
+            )
+            if (
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and isinstance(assignment_target, ast.Subscript)
+                and isinstance(assignment_target.value, ast.Name)
+                and assignment_target.value.id in mappings
+            ):
+                name = assignment_target.value.id
+                previous = mappings[name]
+                key = _literal_string(assignment_target.slice)
+                merged = (
+                    set(previous[0]),
+                    previous[1] or key is None,
+                )
+                if key is not None:
+                    merged[0].add(key.lower())
+                if previous != merged:
+                    mappings[name] = merged
+                    changed = True
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in mappings
+            ):
+                name = node.func.value.id
+                previous = mappings[name]
+                if len(node.args) == 1 and not node.keywords:
+                    update_keys, update_dynamic = (
+                        mappings.get(node.args[0].id)
+                        if isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in mappings
+                        else _mapping_literal_keys(node.args[0])
+                    )
+                elif not node.args:
+                    update_keys = {
+                        keyword.arg.lower()
+                        for keyword in node.keywords
+                        if keyword.arg is not None
+                    }
+                    update_dynamic = any(
+                        keyword.arg is None for keyword in node.keywords
+                    )
+                else:
+                    update_keys, update_dynamic = set(), True
+                merged = (
+                    set(previous[0]).union(update_keys),
+                    previous[1] or update_dynamic,
+                )
+                if previous != merged:
+                    mappings[name] = merged
+                    changed = True
     return mappings
+
+
+def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
+    mutated: set[str] = set()
+    for node in ast.walk(tree):
+        target = (
+            node.target
+            if isinstance(node, (ast.AnnAssign, ast.AugAssign))
+            else node.targets[0]
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            else None
+        )
+        if isinstance(target, ast.Subscript) and isinstance(
+            target.value,
+            ast.Name,
+        ):
+            mutated.add(target.value.id)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.attr in _AUTHORITY_MUTATORS
+        ):
+            mutated.add(node.func.value.id)
+    return frozenset(mutated)
 
 
 def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
@@ -2945,6 +3760,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             continue
         constants = _module_string_constants(tree)
         mapping_aliases = _mapping_alias_keys(tree)
+        mutated_mappings = _mutated_mapping_names(tree)
         verified_tls_contexts: set[str] = set()
         for assignment in ast.walk(tree):
             if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
@@ -2956,6 +3772,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             if constructor not in {
                 ("ssl", "create_default_context"),
                 ("_verified_ssl_context",),
+                ("ssl_context_factory",),
             }:
                 continue
             targets = (
@@ -2974,19 +3791,28 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
         module_aliases: set[str] = set()
         google_genai_aliases: set[str] = set()
         network_modules = {
+            "anthropic",
             "requests",
             "httpx",
             "aiohttp",
             "openai",
             "urllib3",
+            "urllib",
+            "websockets",
+            "socket",
         }
+        network_alias_paths: dict[str, tuple[str, ...]] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for imported in node.names:
                     root_module = imported.name.split(".", 1)[0]
                     if root_module in network_modules:
-                        module_aliases.add(
-                            imported.asname or root_module
+                        local = imported.asname or root_module
+                        module_aliases.add(local)
+                        network_alias_paths[local] = (
+                            tuple(imported.name.split("."))
+                            if imported.asname
+                            else (root_module,)
                         )
             elif (
                 isinstance(node, ast.ImportFrom)
@@ -2994,14 +3820,20 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 and node.module.split(".", 1)[0] in network_modules
             ):
                 for imported in node.names:
+                    local = imported.asname or imported.name
+                    network_alias_paths[local] = (
+                        *node.module.split("."),
+                        imported.name,
+                    )
                     if imported.name in _OUTBOUND_CLIENT_CONSTRUCTORS:
-                        imported_client_names.add(
-                            imported.asname or imported.name
-                        )
-                    if imported.name.lower() in _OUTBOUND_REQUEST_METHODS:
-                        imported_request_names.add(
-                            imported.asname or imported.name
-                        )
+                        imported_client_names.add(local)
+                    if (
+                        imported.name.lower()
+                        in _OUTBOUND_REQUEST_METHODS
+                        or imported.name
+                        in {"connect", "create_connection"}
+                    ):
+                        imported_request_names.add(local)
             if isinstance(node, ast.ImportFrom):
                 for imported in node.names:
                     local = imported.asname or imported.name
@@ -3033,6 +3865,12 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                     continue
                 value = node.value
                 if isinstance(value, ast.Name):
+                    if value.id in network_alias_paths:
+                        for name in names:
+                            alias_path = network_alias_paths[value.id]
+                            if network_alias_paths.get(name) != alias_path:
+                                network_alias_paths[name] = alias_path
+                                changed = True
                     if value.id in imported_client_names:
                         before = len(imported_client_names)
                         imported_client_names.update(names)
@@ -3050,14 +3888,50 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                                 changed = True
                 if (
                     isinstance(value, ast.Attribute)
-                    and isinstance(value.value, ast.Name)
-                    and value.value.id in module_aliases
                 ):
-                    if value.attr in _OUTBOUND_CLIENT_CONSTRUCTORS:
+                    value_path = _attribute_path(value)
+                    canonical_value_path = value_path
+                    if (
+                        value_path
+                        and value_path[0] in network_alias_paths
+                    ):
+                        canonical_value_path = (
+                            *network_alias_paths[value_path[0]],
+                            *value_path[1:],
+                        )
+                    if (
+                        canonical_value_path
+                        and canonical_value_path[0] in network_modules
+                    ):
+                        for name in names:
+                            if (
+                                network_alias_paths.get(name)
+                                != canonical_value_path
+                            ):
+                                network_alias_paths[name] = (
+                                    canonical_value_path
+                                )
+                                changed = True
+                    if (
+                        canonical_value_path
+                        and canonical_value_path[-1]
+                        in (
+                            _OUTBOUND_CLIENT_CONSTRUCTORS
+                            | _PROVIDER_CLIENT_IMPORTS
+                        )
+                    ):
                         before = len(imported_client_names)
                         imported_client_names.update(names)
                         changed = changed or len(imported_client_names) != before
-                    if value.attr.lower() in _OUTBOUND_REQUEST_METHODS:
+                    if (
+                        canonical_value_path
+                        and (
+                            canonical_value_path[-1].lower()
+                            in _OUTBOUND_REQUEST_METHODS
+                            or canonical_value_path[-1]
+                            in {"connect", "create_connection"}
+                        )
+                    ):
                         before = len(imported_request_names)
                         imported_request_names.update(names)
                         changed = changed or len(imported_request_names) != before
@@ -3113,15 +3987,15 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                                 node.lineno,
                             )
                         )
-                    if target_name == "verify" and (
-                        not isinstance(node.value, ast.Constant)
-                        or node.value.value is not True
-                    ):
-                        findings.append(
-                            _finding("TLS_DISABLED", relative, node.lineno)
-                        )
             if not isinstance(node, ast.Call):
                 continue
+            call_path = _attribute_path(node.func)
+            canonical_call_path = call_path
+            if call_path and call_path[0] in network_alias_paths:
+                canonical_call_path = (
+                    *network_alias_paths[call_path[0]],
+                    *call_path[1:],
+                )
             direct_client = (
                 isinstance(node.func, ast.Name)
                 and node.func.id in imported_client_names
@@ -3157,12 +4031,21 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 )
             )
             module_client = (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in module_aliases
+                bool(canonical_call_path)
+                and canonical_call_path[0] in network_modules
+                and canonical_call_path[-1] in (
+                    _OUTBOUND_CLIENT_CONSTRUCTORS
+                    | _PROVIDER_CLIENT_IMPORTS
+                )
+            )
+            module_request = (
+                bool(canonical_call_path)
+                and canonical_call_path[0] in network_modules
                 and (
-                    node.func.attr in _OUTBOUND_CLIENT_CONSTRUCTORS
-                    or node.func.attr.lower() in _OUTBOUND_REQUEST_METHODS
+                    canonical_call_path[-1].lower()
+                    in _OUTBOUND_REQUEST_METHODS
+                    or canonical_call_path[-1]
+                    in {"connect", "create_connection"}
                 )
             )
             module_getattr = (
@@ -3171,6 +4054,12 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 and node.args
                 and isinstance(node.args[0], ast.Name)
                 and node.args[0].id in module_aliases
+            )
+            module_dunder_getattr = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__getattribute__"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in module_aliases
             )
             dynamic_network_import = (
                 (
@@ -3191,10 +4080,26 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 (
                     direct_client
                     or direct_request
-                    or module_client
+                    or (
+                        module_client
+                        and canonical_call_path[-1]
+                        not in _PROVIDER_CLIENT_IMPORTS
+                    )
+                    or module_request
                 )
                 and not boundary_wrapper
+                or (
+                    module_client
+                    and canonical_call_path[-1]
+                    in _PROVIDER_CLIENT_IMPORTS
+                    and relative
+                    not in _APPROVED_PROVIDER_CLIENT_PATHS.get(
+                        canonical_call_path[-1],
+                        frozenset(),
+                    )
+                )
                 or module_getattr
+                or module_dunder_getattr
                 or dynamic_network_import
                 or provider_client_unapproved
             ):
@@ -3224,6 +4129,37 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 if isinstance(node.func, ast.Name)
                 else ""
             )
+            network_option_call = (
+                direct_client
+                or direct_request
+                or module_client
+                or module_request
+                or provider_client_name is not None
+                or call_name in _OUTBOUND_CLIENT_CONSTRUCTORS
+                or call_name.lower() in _OUTBOUND_REQUEST_METHODS
+            )
+            for keyword in node.keywords:
+                if keyword.arg is not None or not network_option_call:
+                    continue
+                mapping_name = (
+                    keyword.value.id
+                    if isinstance(keyword.value, ast.Name)
+                    else None
+                )
+                unresolved = (
+                    mapping_name is None
+                    or mapping_name not in mapping_aliases
+                    or mapping_aliases[mapping_name][1]
+                    or mapping_name in mutated_mappings
+                )
+                if unresolved:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_CLIENT_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
             for argument in url_nodes:
                 value = _literal_string(argument, constants)
                 fragments = "".join(_static_string_fragments(argument))
@@ -3297,7 +4233,14 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                         if hostname is not None
                         else ""
                     )
-                    if origin not in allowed_for_adapter:
+                    exact_local_liveness = (
+                        boundary_wrapper
+                        and value == _LOCAL_LIVENESS_URL
+                    )
+                    if (
+                        origin not in allowed_for_adapter
+                        and not exact_local_liveness
+                    ):
                         findings.append(
                             _finding(
                                 "OUTBOUND_ORIGIN_UNAPPROVED",
@@ -3358,6 +4301,10 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 if keyword.arg == "verify" and (
                     not isinstance(keyword.value, ast.Constant)
                     or keyword.value.value is not True
+                ) and not (
+                    boundary_wrapper
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id in verified_tls_contexts
                 ):
                     findings.append(
                         _finding("TLS_DISABLED", relative, node.lineno)
@@ -3428,6 +4375,12 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                         _finding("TLS_DISABLED", relative, node.lineno)
                     )
                 if keyword.arg == "params":
+                    approved_query_validation = (
+                        boundary_wrapper
+                        and isinstance(keyword.value, ast.Call)
+                        and _attribute_path(keyword.value.func)
+                        == ("_validated_query_params",)
+                    )
                     keys, dynamic = (
                         mapping_aliases.get(keyword.value.id)
                         if isinstance(keyword.value, ast.Name)
@@ -3444,6 +4397,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                         )
                     elif (
                         dynamic
+                        and not approved_query_validation
                         and relative
                         not in {
                             "src/trading_assistant/backtest/coingecko.py",
@@ -3463,27 +4417,42 @@ def _tracked_artifact_code(name: str) -> str | None:
     path = PurePosixPath(name)
     basename = path.name.lower()
     lowered = name.lower()
-    if basename == ".env" or (
+    if basename in {".env", ".envrc"} or (
         basename.startswith(".env.")
         and basename
         not in {".env.example", ".env.sample", ".env.template"}
     ):
         return "TRACKED_ENV_FILE"
-    if basename.endswith((".sqlite-wal", ".sqlite3-wal", ".db-wal")):
+    if basename.endswith(
+        (".wal", ".sqlite-wal", ".sqlite3-wal", ".db-wal")
+    ):
         return "TRACKED_SQLITE_WAL"
-    if basename.endswith((".sqlite-shm", ".sqlite3-shm", ".db-shm")):
+    if basename.endswith(
+        (".shm", ".sqlite-shm", ".sqlite3-shm", ".db-shm")
+    ):
         return "TRACKED_SQLITE_SHM"
     if (
         basename in {"id_rsa", "id_ed25519"}
         or basename.endswith(".key")
         or basename.endswith("-key.pem")
         or "private-key" in basename
+        or (
+            basename.endswith((".pem", ".der"))
+            and re.search(r"(?:^|[._-])private(?:[._-]|$)", basename)
+            is not None
+        )
+        or (
+            basename.endswith((".pem", ".der"))
+            and re.search(r"(?:^|[._-])key(?:[._-]|$)", basename)
+            is not None
+        )
     ):
         return "TRACKED_TLS_PRIVATE_KEY"
     if basename.endswith((".p12", ".pfx", ".pkcs12")):
         return "TRACKED_TLS_PRIVATE_CERTIFICATE"
     if (
         "decrypted" in lowered
+        or "plaintext" in lowered
         or "plaintext-backup" in lowered
         or (
             "backup" in lowered
@@ -3506,26 +4475,11 @@ def _tracked_artifact_code(name: str) -> str | None:
 
 
 def _scan_tracked_artifacts(root: Path) -> list[ReleaseViolation]:
-    try:
-        completed = subprocess.run(
-            ["git", "ls-files", "-z", "--"],
-            cwd=root,
-            check=False,
-            capture_output=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
-    if completed.returncode != 0:
+    tracked_names = _git_tracked_names(root)
+    if tracked_names is None:
         return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
     findings: list[ReleaseViolation] = []
-    for raw_name in completed.stdout.split(b"\0"):
-        if not raw_name:
-            continue
-        try:
-            name = raw_name.decode("utf-8")
-        except UnicodeDecodeError:
-            findings.append(_finding("GIT_TREE_UNPROVEN", ".", 1))
-            continue
+    for name in tracked_names:
         code = _tracked_artifact_code(name)
         if code is not None:
             findings.append(_finding(code, name, 1))
@@ -3813,6 +4767,48 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
             load_names,
             os_module_names,
         )
+        provider_variables: set[str] = set()
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            if (
+                isinstance(assignment.value, ast.Call)
+                and _call_name(assignment.value) in provider_names
+            ):
+                provider_variables.update(
+                    target.id
+                    for target in _assignment_targets(assignment)
+                    if isinstance(target, ast.Name)
+                )
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in provider_variables
+            ):
+                continue
+            parent = parents.get(node)
+            grandparent = parents.get(parent) if parent is not None else None
+            allowed_provider_argument = (
+                isinstance(parent, ast.keyword)
+                and parent.arg == "provider"
+                and isinstance(grandparent, ast.Call)
+                and _call_name(grandparent) in load_names
+                and grandparent.lineno in allowed_lines
+            )
+            if not allowed_provider_argument:
+                findings.append(
+                    _finding(
+                        "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                        relative,
+                        node.lineno,
+                    )
+                )
         for node in ast.walk(tree):
             if not hasattr(node, "lineno") or node.lineno in allowed_lines:
                 continue
@@ -3861,6 +4857,40 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
                         and node.func.value.id in environ_names
                     )
                 )
+                environ_receiver = (
+                    node.func.value
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                is_environ_mapping_call = (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr
+                    in {
+                        "__getitem__",
+                        "copy",
+                        "items",
+                        "keys",
+                        "values",
+                    }
+                    and (
+                        _is_os_environ(
+                            environ_receiver,
+                            os_module_names,
+                        )
+                        or (
+                            isinstance(environ_receiver, ast.Name)
+                            and environ_receiver.id in environ_names
+                        )
+                    )
+                )
+                if is_environ_mapping_call:
+                    findings.append(
+                        _finding(
+                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                            relative,
+                            node.lineno,
+                        )
+                    )
                 if is_getenv:
                     key = _literal_string(node.args[0] if node.args else None)
                     if key is None or key.upper() in registered:
@@ -4245,6 +5275,14 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
     except (OSError, SyntaxError):
         return [_finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)]
     findings: list[ReleaseViolation] = []
+    tool_router_methods = {
+        node.name: node
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef)
+        and cls.name == "ToolRouter"
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     registry = next(
         (
             node
@@ -4425,6 +5463,11 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
                         if isinstance(call.func, ast.Attribute)
                         else ()
                     )
+                    local_helper = (
+                        called is not None
+                        and call_path == ("self", called)
+                        and called in tool_router_methods
+                    )
                     if called is None:
                         findings.append(
                             _finding(
@@ -4437,6 +5480,7 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
                         called not in _CHAT_READ_METHODS
                         and called not in _CHAT_DRAFT_METHODS
                         and called != "_draft"
+                        and not local_helper
                     ):
                         findings.append(
                             _finding(
@@ -4447,7 +5491,7 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
                                 call.lineno,
                             )
                         )
-                    elif (
+                    elif not local_helper and (
                         name in _CHAT_READ_METHODS
                         and call_path != ("s", name)
                     ) or (
@@ -4562,8 +5606,134 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
                         "MUTABLE_CHAT_TOOL",
                         relative,
                         assignment.lineno,
+                )
+            )
+
+        helper_entrypoints: set[str] = set()
+        if table_assignment is not None and isinstance(
+            table_assignment.value,
+            ast.Dict,
+        ):
+            for value in table_assignment.value.values:
+                if not isinstance(value, ast.Lambda):
+                    continue
+                for call in ast.walk(value.body):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    path_parts = _attribute_path(call.func)
+                    if (
+                        len(path_parts) == 2
+                        and path_parts[0] == "self"
+                        and path_parts[1] in tool_router_methods
+                        and path_parts[1] != "_draft"
+                    ):
+                        helper_entrypoints.add(path_parts[1])
+
+        checked_helpers: set[str] = set()
+        active_helpers: set[str] = set()
+
+        def inspect_helper(name: str) -> None:
+            if name in checked_helpers:
+                return
+            if name in active_helpers:
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        tool_router_methods[name].lineno,
                     )
                 )
+                return
+            helper = tool_router_methods.get(name)
+            if helper is None:
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        dispatch.lineno,
+                    )
+                )
+                return
+            active_helpers.add(name)
+            if any(
+                isinstance(node, (ast.Lambda, ast.Import, ast.ImportFrom))
+                for node in ast.walk(helper)
+            ):
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        helper.lineno,
+                    )
+                )
+            for call in (
+                node
+                for node in ast.walk(helper)
+                if isinstance(node, ast.Call)
+            ):
+                if (
+                    isinstance(call.func, ast.Name)
+                    and call.func.id in {"getattr", "__import__"}
+                ) or (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "import_module"
+                ):
+                    findings.append(
+                        _finding(
+                            "CHAT_TOOL_REGISTRY_UNPROVEN",
+                            relative,
+                            call.lineno,
+                        )
+                    )
+                    continue
+                path_parts = _attribute_path(call.func)
+                called = (
+                    path_parts[-1]
+                    if path_parts
+                    else call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else None
+                )
+                if (
+                    len(path_parts) == 2
+                    and path_parts[0] == "self"
+                    and called in tool_router_methods
+                ):
+                    inspect_helper(called)
+                    continue
+                if (
+                    len(path_parts) == 2
+                    and path_parts[0] != "self"
+                    and called in _CHAT_READ_METHODS
+                ):
+                    continue
+                if called is not None and _mutable_tool_name(called):
+                    findings.append(
+                        _finding(
+                            "MUTABLE_CHAT_TOOL",
+                            relative,
+                            call.lineno,
+                        )
+                    )
+                    continue
+                if (
+                    isinstance(call.func, ast.Name)
+                    and call.func.id
+                    in {"bool", "dict", "int", "len", "list", "str", "tuple"}
+                ):
+                    continue
+                findings.append(
+                    _finding(
+                        "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        call.lineno,
+                    )
+                )
+            active_helpers.remove(name)
+            checked_helpers.add(name)
+
+        for helper_name in sorted(helper_entrypoints):
+            inspect_helper(helper_name)
 
     chat = _class_method(tree, "Agent", "chat")
     if chat is None:
@@ -4747,6 +5917,11 @@ _LEGACY_RELEASE_CHECKS = (
 
 _STRUCTURED_RELEASE_SCANNERS = (
     (
+        _scan_canonical_authorities,
+        "INTERNAL_GATE_ERROR",
+        "internal",
+    ),
+    (
         _scan_effective_route_graph,
         "ROUTE_REGISTRATION_UNPROVEN",
         "src/trading_assistant/app/main.py",
@@ -4785,6 +5960,9 @@ _STRUCTURED_RELEASE_SCANNERS = (
 
 
 def _collect_release_violations(root: Path) -> list[ReleaseViolation]:
+    hermetic_findings = _scan_hermetic_root(root)
+    if hermetic_findings:
+        return sorted(set(hermetic_findings))
     findings: list[ReleaseViolation] = []
     for check, code, relative in _LEGACY_RELEASE_CHECKS:
         try:
@@ -4799,12 +5977,26 @@ def _collect_release_violations(root: Path) -> list[ReleaseViolation]:
     return sorted(set(findings))
 
 
+class _ValueFreeArgumentParser(argparse.ArgumentParser):
+    """Reject malformed CLI input without reflecting it to stderr."""
+
+    def error(self, _message: str) -> None:
+        raise ValueError("invalid release-gate arguments")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
-    args = parser.parse_args(argv)
-    root = args.root.resolve()
-    findings = _collect_release_violations(root)
+    try:
+        parser = _ValueFreeArgumentParser(description=__doc__)
+        parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+        args = parser.parse_args(argv)
+        root = args.root.resolve(strict=True)
+        findings = _collect_release_violations(root)
+    except SystemExit as exc:
+        if exc.code == 0:
+            return 0
+        findings = [_finding("INTERNAL_GATE_ERROR", "internal", 1)]
+    except BaseException:
+        findings = [_finding("INTERNAL_GATE_ERROR", "internal", 1)]
     if findings:
         for finding in findings:
             print(

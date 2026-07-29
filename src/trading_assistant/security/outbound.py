@@ -26,8 +26,13 @@ from websockets.asyncio.client import connect as _WebSocketConnect
 DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_READ_TIMEOUT = 30.0
 DEFAULT_MAX_RESPONSE_BYTES = 1_000_000
+LOCAL_LIVENESS_URL = "https://localhost:8020/health/live"
+LOCAL_LIVENESS_MAX_RESPONSE_BYTES = 1024
 _SUPPORTED_SCHEMES = frozenset({"https", "wss"})
 _DEFAULT_PORTS = {"https": 443, "wss": 443}
+_QUERY_CREDENTIAL_NAMES = frozenset(
+    {"access_key", "api_key", "apikey", "credential", "secret", "token"}
+)
 _UNSET = object()
 
 
@@ -67,6 +72,7 @@ OUTBOUND_ORIGIN_MANIFEST = (
             {
                 "app",
                 "daemon",
+                "mcp",
                 "paper-drill",
                 "preflight",
                 "safety-drill",
@@ -85,21 +91,21 @@ OUTBOUND_ORIGIN_MANIFEST = (
         "anthropic",
         "llm.anthropic",
         "https://api.anthropic.com",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=anthropic",
     ),
     OutboundOriginRule(
         "gemini",
         "llm.gemini",
         "https://generativelanguage.googleapis.com",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=gemini",
     ),
     OutboundOriginRule(
         "groq",
         "llm.groq",
         "https://api.groq.com",
-        frozenset({"app", "daemon", "preflight", "validate-analyst"}),
+        frozenset({"app", "daemon", "validate-analyst"}),
         "llm.provider=groq",
     ),
     OutboundOriginRule(
@@ -120,6 +126,27 @@ OUTBOUND_ORIGIN_MANIFEST = (
 OUTBOUND_ORIGINS_BY_KEY = MappingProxyType(
     {rule.key: rule.origin for rule in OUTBOUND_ORIGIN_MANIFEST}
 )
+
+
+def require_origin(role: str, adapter: str, url: str) -> str:
+    """Return an exact manifest origin or reject without disclosing the input."""
+
+    if not all(
+        isinstance(value, str) and value
+        for value in (role, adapter, url)
+    ):
+        raise OutboundOriginDenied()
+    matches = [
+        rule
+        for rule in OUTBOUND_ORIGIN_MANIFEST
+        if rule.adapter == adapter
+        and role in rule.roles
+        and rule.origin == url
+    ]
+    if len(matches) != 1:
+        raise OutboundOriginDenied()
+    OutboundOrigin.parse(url, allow_non_default_port=True)
+    return matches[0].origin
 
 
 def configured_origins_match_manifest(configured: Any) -> bool:
@@ -157,6 +184,23 @@ def origins_for_role(config: Any, role: str) -> frozenset[str]:
             continue
         selected.add(rule.origin)
     return frozenset(selected)
+
+
+def require_configured_role_origins(
+    config: Any,
+    role: str,
+) -> frozenset[str]:
+    """Prove each enabled role/adapter destination against the manifest."""
+
+    if not configured_origins_match_manifest(config.provider_origins):
+        raise OutboundOriginDenied()
+    enabled = origins_for_role(config, role)
+    for rule in OUTBOUND_ORIGIN_MANIFEST:
+        if role not in rule.roles or rule.origin not in enabled:
+            continue
+        configured = str(getattr(config.provider_origins, rule.key))
+        require_origin(role, rule.adapter, configured)
+    return enabled
 
 
 class OutboundError(Exception):
@@ -207,6 +251,83 @@ class OutboundConnectionFailed(OutboundError, RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("outbound connection failed")
+
+
+class LocalLivenessTransport:
+    """One proxy-free client pinned to the local HTTPS liveness endpoint."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float,
+    ) -> bytes:
+        if url != LOCAL_LIVENESS_URL:
+            raise OutboundRequestFailed()
+        timeout = _positive_finite(
+            timeout_seconds,
+            name="timeout_seconds",
+        )
+        response = None
+        try:
+            response = self._client.get(
+                LOCAL_LIVENESS_URL,
+                follow_redirects=False,
+                timeout=timeout,
+            )
+            if (
+                str(getattr(response, "url", "")) != LOCAL_LIVENESS_URL
+                or getattr(response, "status_code", None) != 200
+                or bool(getattr(response, "history", ()))
+            ):
+                raise OutboundRequestFailed()
+            length = _content_length(getattr(response, "headers", {}))
+            if (
+                length is not None
+                and length > LOCAL_LIVENESS_MAX_RESPONSE_BYTES
+            ):
+                raise OutboundResponseTooLarge()
+            return _bounded_bytes(
+                response.iter_bytes(),
+                LOCAL_LIVENESS_MAX_RESPONSE_BYTES,
+            )
+        except OutboundError:
+            raise
+        except Exception:
+            raise OutboundRequestFailed() from None
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+
+def build_local_liveness_transport(
+    certificate_path: Any,
+    *,
+    client_factory: Any = None,
+    ssl_context_factory: Any = ssl.create_default_context,
+) -> LocalLivenessTransport:
+    """Build a local-only HTTPX transport without proxy/environment trust."""
+
+    if str(certificate_path) != ".local/tls/localhost.pem":
+        raise OutboundOriginDenied()
+    if client_factory is None:
+        import httpx
+
+        client_factory = httpx.Client
+    context = ssl_context_factory(cafile=str(certificate_path))
+    client = client_factory(
+        follow_redirects=False,
+        trust_env=False,
+        proxy=None,
+        verify=context,
+    )
+    return LocalLivenessTransport(client)
 
 
 def _positive_finite(value: Any, *, name: str) -> float:
@@ -423,6 +544,28 @@ def _bounded_bytes(chunks: Iterable[bytes], max_response_bytes: int) -> bytes:
     return bytes(body)
 
 
+def _validated_query_params(params: Any) -> Any:
+    """Reject unsupported/query-credential mappings before request creation."""
+
+    if params is None:
+        return None
+    if hasattr(params, "items"):
+        pairs = list(params.items())
+    elif isinstance(params, (list, tuple)):
+        pairs = list(params)
+    else:
+        raise OutboundOriginDenied()
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise OutboundOriginDenied()
+        key = pair[0]
+        if not isinstance(key, str):
+            raise OutboundOriginDenied()
+        if key.lower() in _QUERY_CREDENTIAL_NAMES:
+            raise OutboundOriginDenied()
+    return params
+
+
 def read_bounded_json(response: Any, *, max_response_bytes: int) -> Any:
     """Read a direct HTTP response once, enforcing a cap before JSON parsing."""
     length = _content_length(getattr(response, "headers", {}))
@@ -503,21 +646,67 @@ class NoRedirectSession(requests.Session):
         self._ssl_context = _verified_ssl_context()
         self.adapters["https://"] = _VerifiedHTTPAdapter(self._ssl_context)
 
-    def request(self, method: str, url: str, **kwargs: Any):
+    def request(
+        self,
+        method: str,
+        url: str,
+        params: Any = None,
+        data: Any = None,
+        headers: Any = None,
+        cookies: Any = None,
+        files: Any = None,
+        auth: Any = None,
+        timeout: Any = None,
+        allow_redirects: bool = False,
+        proxies: Any = None,
+        hooks: Any = None,
+        stream: Any = None,
+        verify: Any = None,
+        cert: Any = None,
+        json: Any = None,
+    ):
         self._policy.assert_url(url)
-        kwargs["allow_redirects"] = False
-        return super().request(method, url, **kwargs)
+        return super().request(
+            method,
+            url,
+            params=_validated_query_params(params),
+            data=data,
+            headers=headers,
+            cookies=cookies,
+            files=files,
+            auth=auth,
+            timeout=timeout,
+            allow_redirects=False,
+            proxies={},
+            hooks=hooks,
+            stream=stream,
+            verify=True,
+            cert=None,
+            json=json,
+        )
 
-    def send(self, request: requests.PreparedRequest, **kwargs: Any):
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        *,
+        stream: Any = None,
+        timeout: Any = None,
+        verify: Any = None,
+        cert: Any = None,
+        proxies: Any = None,
+        allow_redirects: bool = False,
+    ):
         """Enforce policy for direct PreparedRequest sends as well as request()."""
         self._policy.assert_url(str(request.url))
-        kwargs["allow_redirects"] = False
-        kwargs["timeout"] = (DEFAULT_CONNECT_TIMEOUT, self._default_timeout)
-        kwargs["verify"] = True
-        kwargs["stream"] = True
-        kwargs["cert"] = None
-        kwargs["proxies"] = {}
-        response = super().send(request, **kwargs)
+        response = super().send(
+            request,
+            allow_redirects=False,
+            timeout=(DEFAULT_CONNECT_TIMEOUT, self._default_timeout),
+            verify=True,
+            stream=True,
+            cert=None,
+            proxies={},
+        )
         try:
             self._policy.assert_response(response)
             length = _content_length(response.headers)

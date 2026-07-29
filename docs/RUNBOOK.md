@@ -329,9 +329,16 @@ uv run python -m trading_assistant.daemon.main
 
 Preflight always evaluates the local structural checks `KEYCHAIN`, `LOCAL_TLS`,
 `FIELD_ENCRYPTION`, `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` first. It
-constructs no broker, provider, or notifier if any structural check fails.
-Only after all five pass does it run the unchanged paper-mode, schema, WAL,
-breaker, Alpaca-read, quote, daemon, and broker/local reconciliation checks.
+evaluates all five independently, including when Keychain provider construction
+or loading fails, and constructs no broker, outbound provider, or notifier if
+any structural check fails. `LOCAL_TLS` requires the exact
+`.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` paths as well as
+the local certificate checks. `FIELD_ENCRYPTION` reads migration metadata and
+key availability only; it does not decrypt rows. The startup guard performs the
+one full envelope scan. Only after all five pass does preflight run the
+unchanged paper-mode, schema, WAL, breaker, Alpaca-read, quote, and broker/local
+reconciliation checks. There is no daemon-health preflight row; daemon
+freshness is observed separately after startup.
 It is broker-write-free: it never submits or cancels a broker order, calls an
 LLM, or sends an external notification. Reconciliation may update local audit
 and repair state while using broker reads. Both `FAIL` and `NEEDS-ME` print

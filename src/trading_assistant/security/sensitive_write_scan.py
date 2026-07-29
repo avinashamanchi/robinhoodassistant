@@ -94,7 +94,11 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             "delete": "delete",
         }
         self.object_models: dict[str, str] = {}
+        self.unknown_object_aliases: set[str] = set()
+        self.query_models: dict[str, str] = {}
         self.statement_models: dict[str, str] = {}
+        self.mutation_call_models: dict[str, str] = {}
+        self.execute_aliases: set[str] = set()
         self.structured_statements: set[str] = set()
         self.string_constants: dict[str, str] = {}
 
@@ -143,11 +147,59 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             in {"one", "one_or_none", "first", "scalar_one", "scalar_one_or_none"}
         ):
             return self._call_model(node.func.value)
+        inferred = {
+            self._model(argument)
+            for argument in node.args
+            if self._model(argument) is not None
+        }
+        if len(inferred) == 1:
+            return next(iter(inferred))
+        return None
+
+    def _query_model(self, node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Name):
+            return self.query_models.get(node.id)
+        if not isinstance(node, ast.Call):
+            return None
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "query"
+            and node.args
+        ):
+            return self._model(node.args[0])
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "filter",
+            "filter_by",
+            "join",
+            "limit",
+            "offset",
+            "order_by",
+            "where",
+        }:
+            return self._query_model(node.func.value)
+        return None
+
+    def _table_model(self, node: ast.AST | None) -> str | None:
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__table__"
+        ):
+            return self._model(node.value)
         return None
 
     def _selection_model(self, node: ast.AST | None) -> str | None:
         if not isinstance(node, ast.Call):
             return None
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+        ):
+            query_model = self._query_model(node.func.value)
+            if query_model is not None:
+                return query_model
+            table_model = self._table_model(node.func.value)
+            if table_model is not None:
+                return table_model
         if (
             self.sql_builders.get(_name(node.func) or "") == "select"
             and node.args
@@ -180,11 +232,18 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             and node.args
         ):
             return self._model(node.args[0])
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+        ):
+            return self._table_model(node.func.value)
         return None
 
     def _mutation_kind(self, node: ast.AST | None) -> str | None:
         if isinstance(node, ast.Name):
             model = self.statement_models.get(node.id)
+            if node.id in self.mutation_call_models:
+                return "update"
             return "unknown" if model is not None else None
         if not isinstance(node, ast.Call):
             return None
@@ -347,11 +406,27 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         annotated = self._model_name_from_annotation(annotation)
         if object_model is not None or annotated is not None:
             self.object_models[target.id] = object_model or annotated  # type: ignore[assignment]
+            self.unknown_object_aliases.discard(target.id)
+        elif isinstance(value, ast.Call):
+            self.unknown_object_aliases.add(target.id)
+        query_model = self._query_model(value)
+        if query_model is not None:
+            self.query_models[target.id] = query_model
         statement_model = self._mutation_model(value)
         if statement_model is not None:
             self.statement_models[target.id] = statement_model
         if self._structured_sql(value):
             self.structured_statements.add(target.id)
+        if isinstance(value, ast.Attribute):
+            if value.attr in {"execute", "exec_driver_sql"}:
+                self.execute_aliases.add(target.id)
+            if value.attr == "update":
+                mutation_model = (
+                    self._query_model(value.value)
+                    or self._table_model(value.value)
+                )
+                if mutation_model is not None:
+                    self.mutation_call_models[target.id] = mutation_model
         constant = self._constant_string(value)
         if constant is not None:
             self.string_constants[target.id] = constant
@@ -376,6 +451,18 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                     self._report(target, model, target.attr)
                 elif target.attr in self.unique_fields:
                     self._report(target, "*", target.attr)
+                elif (
+                    isinstance(target.value, ast.Name)
+                    and target.value.id in self.unknown_object_aliases
+                    and target.attr
+                    in set().union(
+                        *(
+                            fields
+                            for _, fields in self.model_fields.values()
+                        )
+                    )
+                ):
+                    self._report(target, "unknown_model", target.attr)
             self._record_target(target, node.value)
         self.generic_visit(node)
 
@@ -411,6 +498,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         prior_objects = dict(self.object_models)
+        prior_unknown_objects = set(self.unknown_object_aliases)
         for argument in (
             list(node.args.posonlyargs)
             + list(node.args.args)
@@ -421,6 +509,7 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 self.object_models[argument.arg] = model
         self.generic_visit(node)
         self.object_models = prior_objects
+        self.unknown_object_aliases = prior_unknown_objects
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -443,6 +532,28 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             self._check_mapping(
                 node,
                 mutation_model,
+                args=node.args,
+                keywords=node.keywords,
+            )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+        ):
+            query_model = self._query_model(node.func.value)
+            if query_model is not None:
+                self._check_mapping(
+                    node,
+                    query_model,
+                    args=node.args,
+                    keywords=node.keywords,
+                )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in self.mutation_call_models
+        ):
+            self._check_mapping(
+                node,
+                self.mutation_call_models[node.func.id],
                 args=node.args,
                 keywords=node.keywords,
             )
@@ -526,6 +637,10 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         if (
             isinstance(node.func, ast.Attribute)
             and node.func.attr in {"execute", "exec_driver_sql"}
+            and node.args
+        ) or (
+            isinstance(node.func, ast.Name)
+            and node.func.id in self.execute_aliases
             and node.args
         ):
             execute_model = self._mutation_model(node.args[0])

@@ -12,6 +12,7 @@ from ..security.outbound import (
     OutboundPolicy,
     new_async_httpx_client,
     new_httpx_client,
+    require_origin,
 )
 from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
 from .payloads import (
@@ -80,18 +81,25 @@ class GeminiBackend:
         max_tokens: int = 1024,
         client: Any = None,
         timeout_seconds: float = 45.0,
+        runtime_role: str = "app",
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
         self._timeout_seconds = timeout_seconds
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from google import genai
             from google.genai import types
 
+            require_origin(
+                self._runtime_role,
+                "llm.gemini",
+                _GEMINI_ORIGIN,
+            )
             self._client = genai.Client(
                 api_key=self._api_key,
                 http_options=types.HttpOptions(

@@ -7,7 +7,11 @@ import logging
 import re
 from typing import Any, Optional
 
-from ..security.outbound import OutboundPolicy, new_httpx_client
+from ..security.outbound import (
+    OutboundPolicy,
+    new_httpx_client,
+    require_origin,
+)
 from .base import LLMResponse, ToolUseBlock, from_openai
 from .payloads import build_groq_payload
 
@@ -69,17 +73,24 @@ class GroqBackend:
         max_tokens: int = 1024,
         client: Any = None,
         timeout_seconds: float = 45.0,
+        runtime_role: str = "app",
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
         self._timeout_seconds = timeout_seconds
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from groq import Groq
 
+            require_origin(
+                self._runtime_role,
+                "llm.groq",
+                _GROQ_ORIGIN,
+            )
             self._client = Groq(
                 api_key=self._api_key,
                 base_url=_GROQ_ORIGIN,

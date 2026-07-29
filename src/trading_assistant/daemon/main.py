@@ -79,7 +79,11 @@ def _finish_monitor(
         "runtime_tenure_guard",
         None,
     )
-    notifier = build_notifier(config, secrets)
+    notifier = build_notifier(
+        config,
+        secrets,
+        runtime_role="daemon",
+    )
     container.rule_worker.notifier = notifier
     shadow = None
     screen_source = None
@@ -98,6 +102,7 @@ def _finish_monitor(
                 secrets,
                 provider_budget=container.provider_budget,
                 category="analysis",
+                runtime_role="daemon",
             ),
             max_tokens=config.llm.max_tokens,
             suppress_ranging=config.analyst.suppress_ranging,
@@ -120,6 +125,7 @@ def _finish_monitor(
             build_live_feature_provider(
                 config,
                 secrets,
+                runtime_role="daemon",
                 **historical_kwargs,
             ),
             secrets,
@@ -129,6 +135,7 @@ def _finish_monitor(
             [s.upper() for s in universe],
             secrets,
             config=config,
+            runtime_role="daemon",
             **historical_kwargs,
         )
 

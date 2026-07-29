@@ -416,6 +416,7 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
     secrets = Secrets(app_api_token="watchdog-main-secret")
     calls = {"secrets": 0}
     observed = []
+    liveness_transport = object()
 
     def one_secrets(role, *, config):
         calls["secrets"] += 1
@@ -432,17 +433,32 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
         watchdog,
         "load_config",
         lambda: SimpleNamespace(
-            daemon=SimpleNamespace(heartbeat_stale_seconds=180)
+            daemon=SimpleNamespace(heartbeat_stale_seconds=180),
+            server=SimpleNamespace(
+                tls_cert_path=".local/tls/localhost.pem"
+            ),
         ),
     )
     monkeypatch.setattr(
         watchdog,
-        "fetch_health",
-        lambda _url, _timeout: {
+        "build_local_liveness_transport",
+        lambda certificate_path: (
+            liveness_transport
+            if str(certificate_path) == ".local/tls/localhost.pem"
+            else (_ for _ in ()).throw(
+                AssertionError("noncanonical liveness certificate")
+            )
+        ),
+    )
+
+    def fetch_health(_url, _timeout, *, transport):
+        assert transport is liveness_transport
+        return {
             "alive": True,
             "database_reachable": True,
-        },
-    )
+        }
+
+    monkeypatch.setattr(watchdog, "fetch_health", fetch_health)
 
     def database_health(**kwargs):
         observed.append(
@@ -543,9 +559,19 @@ def test_utility_main_reuses_one_secret_and_role_log(
     calls = {"secrets": 0}
     observed = []
 
-    def one_secrets(role, *, config):
+    selected_provider = None
+    if module_name == "preflight":
+        from trading_assistant.security.secrets import (
+            MacOSKeychainSecretProvider,
+        )
+
+        selected_provider = MacOSKeychainSecretProvider(backend=object())
+
+    def one_secrets(role, *, config, provider=None):
         calls["secrets"] += 1
         assert role == runtime_role
+        if module_name == "preflight":
+            assert provider is selected_provider
         return secrets
 
     monkeypatch.setattr(
@@ -561,11 +587,11 @@ def test_utility_main_reuses_one_secret_and_role_log(
         monkeypatch.setattr(
             module,
             "_run",
-            lambda supplied_config, supplied_secrets: (
+            lambda supplied_config, supplied_secrets, **_kwargs: (
                 observed.append((supplied_config, supplied_secrets)) or 0
             ),
         )
-        result = module.run()
+        result = module.run(provider=selected_provider)
     else:
         service = object()
         monkeypatch.setattr(
