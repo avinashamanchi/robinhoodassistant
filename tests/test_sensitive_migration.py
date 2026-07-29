@@ -22,6 +22,8 @@ from trading_assistant.db.migrate import upgrade
 from trading_assistant.db.models import (
     AnalysisReportRow,
     AuditEvent,
+    BacktestArtifact,
+    BacktestRun,
     CircuitBreakerState,
     LLMDecision,
     Order,
@@ -184,6 +186,18 @@ def _seed_all_registered_fields(engine) -> dict[tuple[str, str, str], str]:
             completed_at=NOW + timedelta(minutes=1),
             expires_at=expires,
         )
+        backtest_run = BacktestRun(
+            label="legacy sensitive artifact run",
+            config_json='{"status":"succeeded"}',
+        )
+        session.add(backtest_run)
+        session.flush()
+        backtest_artifact = BacktestArtifact(
+            run_id=backtest_run.id,
+            artifact_key="manifest",
+            schema_version=1,
+            payload_json='{"legacy":"backtest-artifact"}',
+        )
         session.add_all(
             [
                 proposal,
@@ -195,6 +209,7 @@ def _seed_all_registered_fields(engine) -> dict[tuple[str, str, str], str]:
                 breaker,
                 startup,
                 panic,
+                backtest_artifact,
             ]
         )
         session.commit()
@@ -209,6 +224,7 @@ def _seed_all_registered_fields(engine) -> dict[tuple[str, str, str], str]:
             breaker,
             startup,
             panic,
+            backtest_artifact,
         ]:
             table = instance.__table__.name
             primary_key = str(
@@ -703,7 +719,7 @@ def test_migration_backs_up_before_mutation_and_encrypts_every_registered_field(
 
     assert receipt.status == "complete"
     assert receipt.active_key_id == OLD_KEY_ID
-    assert receipt.rows_total == 10
+    assert receipt.rows_total == 11
     assert stages.index("backup_verified") < stages.index(
         "before_first_row_mutation"
     )
@@ -713,7 +729,7 @@ def test_migration_backs_up_before_mutation_and_encrypts_every_registered_field(
         ).mappings().one()
         assert state["state"] == "complete"
         assert state["active_key_id"] == OLD_KEY_ID
-        assert state["rows_total"] == state["rows_completed"] == 10
+        assert state["rows_total"] == state["rows_completed"] == 11
         assert state["backup_path_hash"] == receipt.backup_path_hash
         for (table, row, column), plaintext in originals.items():
             stored = connection.execute(
@@ -1253,7 +1269,7 @@ def test_completed_migration_allows_new_encrypted_rows_at_restart_and_verify(
     ).inspect()
 
     assert verified.status == "verified"
-    assert verified.rows_total == 13
+    assert verified.rows_total == 14
     assert startup.passed
 
 
@@ -1296,7 +1312,7 @@ def test_completed_migration_allows_encrypted_row_deletion_at_restart_and_verify
     ).inspect()
 
     assert verified.status == "verified"
-    assert verified.rows_total == 9
+    assert verified.rows_total == 10
     assert startup.passed
 
 
@@ -1400,7 +1416,7 @@ def test_rotation_resumes_mixed_old_new_and_updates_state_only_after_verify(
         engine,
         new_cipher,
         configured_active_key_id=NEW_KEY_ID,
-    ).rows_total == 10
+    ).rows_total == 11
 
 
 @pytest.mark.parametrize(

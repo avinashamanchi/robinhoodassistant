@@ -449,6 +449,9 @@ class BacktestRun(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
     rows: Mapped[list["BacktestMetricRow"]] = relationship(back_populates="run")
+    artifacts: Mapped[list["BacktestArtifact"]] = relationship(
+        back_populates="run"
+    )
 
 
 class BacktestMetricRow(Base):
@@ -462,6 +465,46 @@ class BacktestMetricRow(Base):
     metrics_json: Mapped[str] = mapped_column(Text)
 
     run: Mapped["BacktestRun"] = relationship(back_populates="rows")
+
+
+class BacktestArtifact(Base):
+    """Encrypted, truthful replay evidence for one persisted backtest run."""
+
+    __tablename__ = "backtest_artifacts"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version > 0",
+            name="ck_backtest_artifacts_schema_version_positive",
+        ),
+        UniqueConstraint(
+            "run_id",
+            "artifact_key",
+            name="uq_backtest_artifacts_run_key",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("backtest_runs.id"),
+        nullable=False,
+        index=True,
+    )
+    artifact_key: Mapped[str] = mapped_column(
+        String(160),
+        nullable=False,
+    )
+    schema_version: Mapped[int] = mapped_column(
+        default=1,
+        nullable=False,
+    )
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utcnow,
+        nullable=False,
+    )
+
+    run: Mapped["BacktestRun"] = relationship(back_populates="artifacts")
 
 
 class AnalysisReportRow(Base):

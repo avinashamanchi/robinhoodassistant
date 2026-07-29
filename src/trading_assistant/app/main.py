@@ -1427,6 +1427,7 @@ def _create_app(
                 stop_event=stop_event,
                 start_date=body.start_date,
                 end_date=body.end_date,
+                backtest_config=service.config.backtest,
             )
         except BacktestTimedOut:
             raise ApiError(
@@ -1564,8 +1565,16 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
 
     from sqlalchemy import select
 
-    from ..backtest.report import SIMULATED_LABEL
-    from ..db.models import BacktestMetricRow, BacktestRun
+    from ..backtest.report import (
+        SIMULATED_LABEL,
+        validate_persisted_artifacts,
+    )
+    from ..db.models import (
+        BacktestArtifact,
+        BacktestMetricRow,
+        BacktestRun,
+    )
+    from ..security.sensitive_fields import sensitive_store
 
     with session_factory() as s:
         run = s.get(BacktestRun, run_id)
@@ -1573,13 +1582,59 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
             return None
         config = json.loads(run.config_json)
         rows = s.execute(
-            select(BacktestMetricRow).where(BacktestMetricRow.run_id == run_id)
+            select(BacktestMetricRow)
+            .where(BacktestMetricRow.run_id == run_id)
+            .order_by(BacktestMetricRow.id)
         ).scalars().all()
-        return {
+        metric_payloads = [json.loads(r.metrics_json) for r in rows]
+        response = {
             "run_id": run.id,
             "label": run.label,
             "status": config.get("status", "succeeded"),
             "holdout_start": run.holdout_start.isoformat() if run.holdout_start else None,
             "disclaimer": SIMULATED_LABEL,
-            "rows": [json.loads(r.metrics_json) for r in rows],
+            "rows": metric_payloads,
         }
+        artifacts = s.execute(
+            select(BacktestArtifact)
+            .where(BacktestArtifact.run_id == run_id)
+            .order_by(BacktestArtifact.artifact_key)
+        ).scalars().all()
+        if not artifacts:
+            response["artifact_status"] = {
+                "status": "unavailable",
+                "reason": "not_persisted_for_legacy_run",
+            }
+            return response
+        try:
+            if any(
+                artifact.schema_version != 1
+                for artifact in artifacts
+            ):
+                raise ValueError("invalid artifact set")
+            store = sensitive_store(s, session_factory)
+            decoded = {
+                artifact.artifact_key: json.loads(
+                    store.read(artifact, "payload_json")
+                )
+                for artifact in artifacts
+            }
+            manifest, series = validate_persisted_artifacts(
+                decoded,
+                metric_payloads,
+                run.holdout_start,
+            )
+        except (KeyError, TypeError, ValueError):
+            response["artifact_status"] = {
+                "status": "unavailable",
+                "reason": "artifact_invalid",
+            }
+            return response
+        response.update(
+            {
+                "artifact_status": {"status": "available"},
+                "manifest": manifest,
+                "series": series,
+            }
+        )
+        return response

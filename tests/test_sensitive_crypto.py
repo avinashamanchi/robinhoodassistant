@@ -369,6 +369,7 @@ def test_sensitive_registry_is_exact():
         "circuit_breaker_state": {"reason"},
         "startup_reconciliation_state": {"reason", "evidence_json"},
         "panic_receipts": {"response_json"},
+        "backtest_artifacts": {"payload_json"},
     }
 
 

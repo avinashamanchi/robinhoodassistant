@@ -276,10 +276,15 @@ class _AuthorizedTestAlembic:
                 candidate_revision = ScriptDirectory.from_config(
                     cfg
                 ).get_revision("20260728_0016")
+                artifact_revision = ScriptDirectory.from_config(
+                    cfg
+                ).get_revision("20260729_0017")
                 assert revision is not None
                 assert candidate_revision is not None
+                assert artifact_revision is not None
                 revision_module = revision.module
                 candidate_revision_module = candidate_revision.module
+                artifact_revision_module = artifact_revision.module
                 with (
                     patch.object(
                         authority_module,
@@ -328,6 +333,16 @@ class _AuthorizedTestAlembic:
                     ),
                     patch.object(
                         candidate_revision_module,
+                        "migration_schema_fence",
+                        cls._schema_fence_historical,
+                    ),
+                    patch.object(
+                        artifact_revision_module,
+                        "assert_migration_authority",
+                        cls._assert_historical,
+                    ),
+                    patch.object(
+                        artifact_revision_module,
                         "migration_schema_fence",
                         cls._schema_fence_historical,
                     ),
@@ -856,7 +871,7 @@ def test_runtime_tenure_migration_is_successor_0014():
     sensitive_revision = script.get_revision("20260727_0013")
     tenure_revision = script.get_revision("20260727_0014")
 
-    assert script.get_current_head() == "20260728_0016"
+    assert script.get_current_head() == "20260729_0017"
     assert sensitive_revision is not None
     assert sensitive_revision.down_revision == "20260727_0012"
     assert sensitive_revision.path.endswith(
@@ -874,7 +889,7 @@ def test_plan_authority_migration_is_successor_0015():
     script = ScriptDirectory.from_config(cfg)
     authority_revision = script.get_revision("20260727_0015")
 
-    assert script.get_current_head() == "20260728_0016"
+    assert script.get_current_head() == "20260729_0017"
     assert authority_revision is not None
     assert authority_revision.down_revision == "20260727_0014"
     assert authority_revision.path.endswith(
@@ -887,12 +902,70 @@ def test_candidate_queue_receipt_migration_is_successor_0016():
     script = ScriptDirectory.from_config(cfg)
     receipt_revision = script.get_revision("20260728_0016")
 
-    assert script.get_current_head() == "20260728_0016"
+    assert script.get_current_head() == "20260729_0017"
     assert receipt_revision is not None
     assert receipt_revision.down_revision == "20260727_0015"
     assert receipt_revision.path.endswith(
         "20260728_0016_candidate_queue_receipts.py"
     )
+
+
+def test_backtest_artifact_migration_is_successor_0017():
+    cfg = Config("alembic.ini")
+    script = ScriptDirectory.from_config(cfg)
+    artifact_revision = script.get_revision("20260729_0017")
+
+    assert script.get_current_head() == "20260729_0017"
+    assert artifact_revision is not None
+    assert artifact_revision.down_revision == "20260728_0016"
+    assert artifact_revision.path.endswith(
+        "20260729_0017_backtest_artifacts.py"
+    )
+
+
+def test_backtest_artifact_schema_is_bounded_and_run_scoped(tmp_path):
+    engine, _cfg = _engine_at_revision(
+        tmp_path / "backtest-artifact-schema.db",
+        "head",
+    )
+    inspector = inspect(engine)
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("backtest_artifacts")
+    }
+    assert set(columns) == {
+        "id",
+        "run_id",
+        "artifact_key",
+        "schema_version",
+        "payload_json",
+        "created_at",
+    }
+    assert columns["run_id"]["nullable"] is False
+    assert columns["artifact_key"]["type"].length == 160
+    assert columns["schema_version"]["nullable"] is False
+    assert columns["payload_json"]["nullable"] is False
+    assert {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints(
+            "backtest_artifacts"
+        )
+    } == {("run_id", "artifact_key")}
+    assert {
+        tuple(index["column_names"])
+        for index in inspector.get_indexes("backtest_artifacts")
+    } == {("run_id",)}
+    assert {
+        (
+            tuple(foreign_key["constrained_columns"]),
+            foreign_key["referred_table"],
+            tuple(foreign_key["referred_columns"]),
+        )
+        for foreign_key in inspector.get_foreign_keys(
+            "backtest_artifacts"
+        )
+    } == {(("run_id",), "backtest_runs", ("id",))}
 
 
 def test_candidate_queue_receipt_downgrade_refuses_durable_state(
@@ -934,6 +1007,40 @@ def test_candidate_queue_receipt_downgrade_refuses_durable_state(
         connection.execute(text("DELETE FROM candidate_queue_receipts"))
     command.downgrade(cfg, "20260727_0015")
     assert "candidate_queue_receipts" not in inspect(engine).get_table_names()
+
+
+def test_backtest_artifact_downgrade_refuses_durable_state(tmp_path):
+    database_path = tmp_path / "backtest-artifact-downgrade.db"
+    engine, cfg = _engine_at_revision(database_path, "head")
+    with engine.begin() as connection:
+        run_id = connection.execute(
+            text(
+                "INSERT INTO backtest_runs "
+                "(label, config_json, created_at) VALUES "
+                "('artifact downgrade', '{}', CURRENT_TIMESTAMP)"
+            )
+        ).lastrowid
+        connection.execute(
+            text(
+                "INSERT INTO backtest_artifacts "
+                "(run_id, artifact_key, schema_version, payload_json, "
+                "created_at) VALUES "
+                "(:run_id, 'manifest', 1, '{}', CURRENT_TIMESTAMP)"
+            ),
+            {"run_id": run_id},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^backtest_artifact_downgrade_blocked$",
+    ):
+        command.downgrade(cfg, "20260728_0016")
+
+    assert "backtest_artifacts" in inspect(engine).get_table_names()
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM backtest_artifacts"))
+    command.downgrade(cfg, "20260728_0016")
+    assert "backtest_artifacts" not in inspect(engine).get_table_names()
 
 
 @pytest.mark.parametrize(
@@ -2109,7 +2216,7 @@ def test_sensitive_trust_downgrade_lock_failure_refuses_before_ddl(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260728_0016"
+        ) == "20260729_0017"
         assert connection.scalar(
             text("SELECT count(*) FROM candidate_nonces")
         ) == 1
@@ -2927,7 +3034,7 @@ def test_plan_cancel_intent_upgrade_backfills_only_plan_linked_markers(
         (3, "indeterminate"),
         (4, "none"),
     ]
-    assert version == "20260728_0016"
+    assert version == "20260729_0017"
 
 
 def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
@@ -2963,7 +3070,7 @@ def test_auth_session_upgrade_from_0005_adds_only_hashed_session_storage(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM alembic_version")
-        ) == "20260728_0016"
+        ) == "20260729_0017"
 
     command.downgrade(cfg, "20260724_0005")
     assert "auth_sessions" not in inspect(engine).get_table_names()
@@ -3004,7 +3111,7 @@ def test_runtime_health_upgrade_deduplicates_heartbeats_by_time_then_id(
         {"id": 4, "source": "app"},
         {"id": 3, "source": "daemon"},
     ]
-    assert version == "20260728_0016"
+    assert version == "20260729_0017"
     heartbeat_indexes = {
         index["name"]: index
         for index in inspect(engine).get_indexes("heartbeats")

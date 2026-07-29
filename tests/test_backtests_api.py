@@ -14,13 +14,19 @@ from fastapi.testclient import TestClient
 
 import trading_assistant.backtest.runner as runner
 from trading_assistant.app.limits import ConcurrencyLeaseService
+from trading_assistant.config import BacktestConfig, FillConfig
 from tests.app_factory import create_app
 from trading_assistant.db.models import (
     AuditEvent,
+    BacktestArtifact,
     BacktestRun,
     ConcurrencyLease,
     MutationInterlock,
     utcnow,
+)
+from trading_assistant.security.sensitive_fields import (
+    persist_sensitive,
+    sensitive_store,
 )
 from trading_assistant.strategies.base import SignalAction
 from tests.conftest import decrypt_test_sensitive
@@ -96,6 +102,256 @@ def test_list_and_report(client):
     first = rep["rows"][0]
     assert "metrics" in first and "benchmark_buy_and_hold" in first
     assert "beat_buy_and_hold" in first
+    assert rep["artifact_status"] == {"status": "available"}
+    manifest = rep["manifest"]
+    assert manifest["data_source"] == "synthetic"
+    assert manifest["validation"] == {
+        "status": "unavailable",
+        "reason": "not_run",
+    }
+    assert manifest["episodes"] == {"status": "not_run"}
+    assert manifest["holdout_access_log"]
+    assert rep["series"]
+    series = rep["series"][0]
+    assert series["strategy_equity"]
+    assert series["benchmark_equity"]
+    assert len(series["strategy_drawdown"]) == len(
+        series["strategy_equity"]
+    )
+    assert len(series["benchmark_drawdown"]) == len(
+        series["benchmark_equity"]
+    )
+    assert series["actual_total_fees"] >= 0
+    assert series["benchmark_actual_total_fees"] >= 0
+    assert "slippage_bps" in series["cost_assumptions"]
+    assert "realized_slippage_dollars" not in series
+    with svc.session_factory() as session:
+        manifest_row = session.query(BacktestArtifact).filter_by(
+            run_id=run_id,
+            artifact_key="manifest",
+        ).one()
+    assert manifest_row.payload_json.startswith(
+        "enc:v1:pytest-field-key-2026:"
+    )
+    assert json.loads(
+        decrypt_test_sensitive(manifest_row, "payload_json")
+    ) == manifest
+
+
+def test_runner_persists_exact_applied_cost_and_holdout_config(client):
+    c, svc = client
+    applied = BacktestConfig(
+        fills=FillConfig(
+            market="next_bar_open",
+            limit="bar_range_cross",
+            max_participation_pct=7.5,
+        ),
+        slippage_bps={"equity": 8.25, "crypto": 31.5},
+        fees_bps={"equity": 0.0, "crypto": 27.0},
+        holdout_months=6,
+    )
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:exact-config",
+        reason="persist exact applied cost model",
+        request_id="backtest-exact-config",
+        backtest_config=applied,
+    )
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {"status": "available"}
+    assert rep["manifest"]["backtest_config"] == applied.model_dump(
+        mode="json"
+    )
+    assert rep["manifest"]["holdout_start"] is not None
+    assert all(
+        row["cost_assumptions"]["slippage_bps"]
+        == applied.slippage_bps
+        for row in rep["series"]
+    )
+    assert all(
+        row["cost_assumptions"]["fees_bps"] == applied.fees_bps
+        for row in rep["series"]
+    )
+
+
+def test_runner_rejects_invalid_holdout_override_before_data_load(
+    session_factory,
+    monkeypatch,
+):
+    data_calls = 0
+
+    def forbidden_source(*args, **kwargs):
+        nonlocal data_calls
+        data_calls += 1
+        raise AssertionError("invalid config reached data loading")
+
+    monkeypatch.setattr(runner, "build_synthetic_source", forbidden_source)
+
+    with pytest.raises(ValueError):
+        runner.BacktestRunner(session_factory).run(
+            symbols=["TREND"],
+            actor="operator:test",
+            reason="reject invalid holdout override",
+            request_id="backtest-invalid-holdout",
+            bars=5,
+            holdout_months=0,
+        )
+
+    assert data_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "negative_fee",
+        "naive_timestamp",
+        "wrong_identity",
+        "cost_mismatch",
+        "schema_mismatch",
+    ],
+)
+def test_report_rejects_invalid_encrypted_series(client, mutation):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:invalid-artifact",
+        reason=f"corrupt {mutation}",
+        request_id=f"backtest-invalid-{mutation}",
+    )
+    with svc.session_factory() as session:
+        artifact = (
+            session.query(BacktestArtifact)
+            .filter(
+                BacktestArtifact.run_id == run_id,
+                BacktestArtifact.artifact_key.like("series:%"),
+            )
+            .order_by(BacktestArtifact.artifact_key)
+            .first()
+        )
+        store = sensitive_store(session, svc.session_factory)
+        payload = json.loads(store.read(artifact, "payload_json"))
+        if mutation == "negative_fee":
+            payload["actual_total_fees"] = -1.0
+        elif mutation == "naive_timestamp":
+            payload["strategy_equity"][0]["at"] = "2026-07-29T09:30:00"
+        elif mutation == "wrong_identity":
+            payload["symbol"] = "WRONG"
+        elif mutation == "cost_mismatch":
+            payload["cost_assumptions"]["slippage_bps"]["equity"] = 999
+        else:
+            payload["schema_version"] = 2
+        store.write_many(
+            artifact,
+            {
+                "payload_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            },
+        )
+        session.commit()
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "artifact_invalid",
+    }
+    assert "manifest" not in rep
+    assert "series" not in rep
+
+
+def test_report_rejects_unknown_artifact_keys(client):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:mixed-artifact",
+        reason="reject mixed artifact set",
+        request_id="backtest-mixed-artifact",
+    )
+    with svc.session_factory() as session:
+        persist_sensitive(
+            session,
+            BacktestArtifact(
+                run_id=run_id,
+                artifact_key="unexpected",
+                schema_version=1,
+            ),
+            {"payload_json": '{"schema_version":1}'},
+            session_factory=svc.session_factory,
+        )
+        session.commit()
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "artifact_invalid",
+    }
+
+
+def test_report_rejects_missing_artifact_keys(client):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:missing-artifact",
+        reason="reject incomplete artifact set",
+        request_id="backtest-missing-artifact",
+    )
+    with svc.session_factory() as session:
+        artifact = (
+            session.query(BacktestArtifact)
+            .filter(
+                BacktestArtifact.run_id == run_id,
+                BacktestArtifact.artifact_key.like("series:%"),
+            )
+            .order_by(BacktestArtifact.artifact_key.desc())
+            .first()
+        )
+        sensitive_store(
+            session,
+            svc.session_factory,
+        ).delete(artifact)
+        session.commit()
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "artifact_invalid",
+    }
+
+
+def test_legacy_report_refuses_to_reconstruct_artifacts(client):
+    c, svc = client
+    with svc.session_factory() as session:
+        run = BacktestRun(
+            label="legacy aggregate-only run",
+            config_json=json.dumps({"status": "succeeded"}),
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "not_persisted_for_legacy_run",
+    }
+    assert "manifest" not in rep
+    assert "series" not in rep
 
 
 def test_report_404(client):
@@ -465,13 +721,14 @@ def test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings(
     client,
     monkeypatch,
 ):
-    test_client, _service = client
+    test_client, service = client
     observed: dict[str, object] = {}
 
     def completed_run(*args, **kwargs):
         observed["symbols"] = kwargs["symbols"]
         observed["start_date"] = kwargs["start_date"]
         observed["end_date"] = kwargs["end_date"]
+        observed["backtest_config"] = kwargs["backtest_config"]
         return 84, _report()
 
     monkeypatch.setattr(
@@ -499,6 +756,10 @@ def test_backtest_bounds_allow_exact_symbol_and_inclusive_day_ceilings(
     assert observed["symbols"] == symbols
     assert observed["start_date"] == start
     assert observed["end_date"] == start + timedelta(days=2_999)
+    assert (
+        observed["backtest_config"]
+        == service.config.backtest
+    )
 
 
 def test_backtest_timeout_persists_status_and_stops_before_later_provider_call(

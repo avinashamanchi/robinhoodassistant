@@ -23,7 +23,7 @@ from ..strategies.breakout import Breakout
 from ..strategies.rsi_reversion import RsiReversion
 from ..strategies.sma_crossover import SmaCrossover
 from .data import DataSource
-from .evaluate import persist_report, walk_forward
+from .evaluate import BacktestArtifactContext, persist_report, walk_forward
 from .report import EvaluationReport
 from .synthetic import make_bars
 
@@ -143,6 +143,7 @@ class BacktestRunner:
         *,
         runtime_seconds: int = 1_200,
         monotonic: Callable[[], float] = time.monotonic,
+        backtest_config: BacktestConfig | None = None,
     ) -> None:
         if runtime_seconds <= 0 or runtime_seconds > 1_200:
             raise ValueError(
@@ -151,6 +152,11 @@ class BacktestRunner:
         self.session_factory = session_factory
         self.runtime_seconds = runtime_seconds
         self.monotonic = monotonic
+        self.backtest_config = (
+            BacktestConfig()
+            if backtest_config is None
+            else backtest_config.model_copy(deep=True)
+        )
 
     def run(
         self,
@@ -160,7 +166,7 @@ class BacktestRunner:
         reason: str,
         request_id: str,
         bars: int = 650,
-        holdout_months: int = 12,
+        holdout_months: int | None = None,
         label: str = "synthetic walk-forward",
         deadline: float | None = None,
         stop_event: threading.Event | None = None,
@@ -174,6 +180,8 @@ class BacktestRunner:
             raise ValueError(
                 "backtest actor, reason, and request_id must be non-empty"
             )
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = self.monotonic()
         requested_window = _requested_date_window(
             start_date,
             end_date,
@@ -194,13 +202,21 @@ class BacktestRunner:
             deadline=(
                 deadline
                 if deadline is not None
-                else self.monotonic() + self.runtime_seconds
+                else started_monotonic + self.runtime_seconds
             ),
             stop_event=event,
             monotonic=self.monotonic,
         )
         persisted_run_id: int | None = None
         timeout_stage = "replay"
+        applied_config = self.backtest_config
+        if holdout_months is not None:
+            raw_config = applied_config.model_dump(mode="python")
+            raw_config["holdout_months"] = holdout_months
+            applied_config = BacktestConfig.model_validate(
+                raw_config,
+                strict=True,
+            )
         try:
             control.check()
             source = build_synthetic_source(
@@ -215,8 +231,8 @@ class BacktestRunner:
                 source,
                 selected_symbols,
                 STRATEGIES,
-                backtest_config=BacktestConfig(),
-                holdout_months=holdout_months,
+                backtest_config=applied_config,
+                holdout_months=applied_config.holdout_months,
                 spy_symbol="SPY",
                 label=label,
                 cancel_check=control.check,
@@ -224,6 +240,7 @@ class BacktestRunner:
                 end=replay_end,
             )
             control.check()
+            completed_at = datetime.now(timezone.utc)
             persisted_run_id = persist_report(
                 self.session_factory,
                 report,
@@ -231,6 +248,22 @@ class BacktestRunner:
                 actor=actor,
                 reason=reason,
                 request_id=request_id,
+                artifact_context=BacktestArtifactContext(
+                    data_source="synthetic",
+                    requested_start=replay_start,
+                    requested_end=replay_end,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    duration_seconds=max(
+                        0.0,
+                        self.monotonic() - started_monotonic,
+                    ),
+                    backtest_config=applied_config,
+                    symbols=tuple(selected_symbols),
+                    strategies=tuple(
+                        factory().name for factory in STRATEGIES
+                    ),
+                ),
             )
             timeout_stage = "post_persistence"
             control.check()
@@ -381,7 +414,7 @@ def run_synthetic_backtest(
     reason: str,
     request_id: str,
     bars: int = 650,
-    holdout_months: int = 12,
+    holdout_months: int | None = None,
     label: str = "synthetic walk-forward",
     runtime_seconds: int = 1_200,
     deadline: float | None = None,
@@ -389,11 +422,13 @@ def run_synthetic_backtest(
     monotonic: Callable[[], float] = time.monotonic,
     start_date: date | None = None,
     end_date: date | None = None,
+    backtest_config: BacktestConfig | None = None,
 ) -> tuple[int, EvaluationReport]:
     return BacktestRunner(
         session_factory,
         runtime_seconds=runtime_seconds,
         monotonic=monotonic,
+        backtest_config=backtest_config,
     ).run(
         symbols,
         actor=actor,
