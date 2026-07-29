@@ -4278,6 +4278,13 @@ def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
     _source, workflow = _ci_workflow()
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
+    expected_action_commits = {
+        "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "astral-sh/setup-uv": "08807647e7069bb48b6ef5acd8ec9567f424441b",
+        "gitleaks/gitleaks-action": (
+            "ff98106e4c7b2bc287b24eaf42907196329070c7"
+        ),
+    }
 
     uses_steps: list[dict[str, object]] = []
     for job in jobs.values():
@@ -4295,6 +4302,8 @@ def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
         uses = step["uses"]
         assert isinstance(uses, str)
         assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", uses), uses
+        action, commit = uses.rsplit("@", 1)
+        assert commit == expected_action_commits[action]
 
     checkout_steps = [
         step
@@ -4306,6 +4315,17 @@ def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
         with_values = step.get("with")
         assert isinstance(with_values, dict)
         assert with_values.get("fetch-depth") == "0"
+        assert with_values.get("persist-credentials") == "false"
+
+    setup_uv_steps = [
+        step
+        for step in uses_steps
+        if str(step["uses"]).startswith("astral-sh/setup-uv@")
+    ]
+    assert len(setup_uv_steps) == 1
+    assert setup_uv_steps[0].get("with") == {
+        "version": "0.11.28",
+    }
 
 
 def test_ci_matches_offline_release_gate_without_runtime_authority():
@@ -4325,6 +4345,8 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
     required = (
         "uv sync --all-extras --dev",
         "uv lock --check",
+        "uv python install 3.11.15",
+        "uv run --with pip-audit==2.10.1 pip-audit",
         "trading_assistant.db.migrate --development-environment-secrets upgrade",
         "trading_assistant.db.migrate --development-environment-secrets status",
         "scripts/verify_loopback_release.py",
