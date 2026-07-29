@@ -584,10 +584,12 @@ def test_pages_have_no_inline_script_style_or_handler(page):
 
 
 @pytest.mark.parametrize("page", _PAGES)
-def test_pages_use_the_local_flight_deck_icon(page):
+def test_pages_use_the_original_local_trading_assistant_icon(page):
     text = (_STATIC / page).read_text(encoding="utf-8")
 
-    assert '<link rel="icon" href="/static/img/flight-deck.svg">' in text
+    assert '<link rel="icon" href="/static/img/trading-orbit.svg">' in text
+    assert "flight-deck.svg" not in text
+    assert "kraken" not in text.lower()
 
 
 @pytest.mark.parametrize("source", (*_PAGES, *_SCRIPTS))
@@ -612,7 +614,7 @@ def test_static_assets_are_anonymous_but_operator_pages_remain_protected(client)
         "/static/js/index.js",
         "/static/js/plans.js",
         "/static/js/backtests.js",
-        "/static/img/flight-deck.svg",
+        "/static/img/trading-orbit.svg",
     ):
         assert client.get(path).status_code == 200, path
     assert client.get("/login").status_code == 200

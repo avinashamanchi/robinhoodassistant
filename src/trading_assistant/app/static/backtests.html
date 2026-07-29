@@ -4,19 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Backtests — Trading Assistant</title>
-  <link rel="icon" href="/static/img/flight-deck.svg">
+  <link rel="icon" href="/static/img/trading-orbit.svg">
   <link rel="stylesheet" href="/static/css/console.css">
   <script type="module" src="/static/js/backtests.js"></script>
 </head>
-<body>
+<body class="app-shell">
   <a class="skip-link" href="#main-content">Skip to backtests</a>
-  <header class="app-header">
+  <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">Alpaca paper flight deck</span>
-      <h1>Backtests</h1>
+      <img class="brand-orbit" src="/static/img/trading-orbit.svg" alt="" aria-hidden="true">
+      <span class="brand-copy">
+        <strong>Trading Assistant</strong>
+        <span>Simulation evidence</span>
+      </span>
     </div>
-    <nav class="primary-nav" aria-label="Primary">
-      <a href="/">Console</a>
+    <nav class="primary-nav side-nav" aria-label="Primary">
+      <a href="/">Operations</a>
       <a href="/plans/ui">Plans</a>
       <a href="/backtests/ui" aria-current="page">Backtests</a>
     </nav>
@@ -25,6 +28,16 @@
       <button class="button-quiet" id="sign-out" type="button">Sign out</button>
     </div>
   </header>
+  <div class="environment-strip" aria-label="Current paper environment">
+    <div class="environment-cell environment-primary">
+      <span>Environment</span>
+      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+    </div>
+    <div class="environment-cell"><span>Breaker</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Daemon</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Observed</span><strong class="is-stale">Sign in to verify</strong></div>
+  </div>
   <div class="simulated-banner">Simulated — past performance does not predict future results.</div>
 
   <main class="console-layout" id="main-content">
@@ -53,7 +66,7 @@
       <section class="page-intro" aria-labelledby="backtests-page-title">
         <div>
           <p class="section-label">Evaluation ledger</p>
-          <h2 id="backtests-page-title">Treat simulation as evidence, not promise.</h2>
+          <h1 id="backtests-page-title">Treat simulation as evidence, not promise.</h1>
           <p>Walk-forward results keep holdout performance and benchmark comparisons visible.</p>
         </div>
       </section>

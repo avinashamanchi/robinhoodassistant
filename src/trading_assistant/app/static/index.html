@@ -4,19 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Operator console — Trading Assistant</title>
-  <link rel="icon" href="/static/img/flight-deck.svg">
+  <link rel="icon" href="/static/img/trading-orbit.svg">
   <link rel="stylesheet" href="/static/css/console.css">
   <script type="module" src="/static/js/index.js"></script>
 </head>
-<body>
+<body class="app-shell">
   <a class="skip-link" href="#main-content">Skip to operator console</a>
-  <header class="app-header">
+  <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">Alpaca paper flight deck</span>
-      <h1>Trading Assistant</h1>
+      <img class="brand-orbit" src="/static/img/trading-orbit.svg" alt="" aria-hidden="true">
+      <span class="brand-copy">
+        <strong>Trading Assistant</strong>
+        <span>Local operator console</span>
+      </span>
     </div>
-    <nav class="primary-nav" aria-label="Primary">
-      <a href="/" aria-current="page">Console</a>
+    <nav class="primary-nav side-nav" aria-label="Primary">
+      <a href="/" aria-current="page">Operations</a>
       <a href="/plans/ui">Plans</a>
       <a href="/backtests/ui">Backtests</a>
     </nav>
@@ -25,6 +28,29 @@
       <button class="button-quiet" id="sign-out" type="button">Sign out</button>
     </div>
   </header>
+
+  <div class="environment-strip" aria-label="Current paper environment">
+    <div class="environment-cell environment-primary">
+      <span>Environment</span>
+      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+    </div>
+    <div class="environment-cell">
+      <span>Breaker</span>
+      <strong class="is-unknown">Unknown</strong>
+    </div>
+    <div class="environment-cell">
+      <span>Daemon</span>
+      <strong class="is-unknown">Unknown</strong>
+    </div>
+    <div class="environment-cell">
+      <span>Reconciliation</span>
+      <strong class="is-unknown">Unknown</strong>
+    </div>
+    <div class="environment-cell">
+      <span>Observed</span>
+      <strong class="is-stale">Awaiting server truth</strong>
+    </div>
+  </div>
 
   <div class="critical-banner" id="critical-banner" role="alert">
     <strong id="critical-banner-title">Safety state unverified</strong>
@@ -166,7 +192,7 @@
         <section class="page-intro" aria-labelledby="console-title">
           <div>
             <p class="section-label">Decision ledger</p>
-            <h2 id="console-title">Command the system. Never guess its state.</h2>
+            <h1 id="console-title">Command the system. Never guess its state.</h1>
             <p>Proposals, human decisions, and broker receipts remain separate evidence.</p>
           </div>
           <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>

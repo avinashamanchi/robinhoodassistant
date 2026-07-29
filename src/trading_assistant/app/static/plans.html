@@ -4,19 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Plans — Trading Assistant</title>
-  <link rel="icon" href="/static/img/flight-deck.svg">
+  <link rel="icon" href="/static/img/trading-orbit.svg">
   <link rel="stylesheet" href="/static/css/console.css">
   <script type="module" src="/static/js/plans.js"></script>
 </head>
-<body>
+<body class="app-shell">
   <a class="skip-link" href="#main-content">Skip to trade plans</a>
-  <header class="app-header">
+  <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">Alpaca paper flight deck</span>
-      <h1>Trade plans</h1>
+      <img class="brand-orbit" src="/static/img/trading-orbit.svg" alt="" aria-hidden="true">
+      <span class="brand-copy">
+        <strong>Trading Assistant</strong>
+        <span>Research planning</span>
+      </span>
     </div>
-    <nav class="primary-nav" aria-label="Primary">
-      <a href="/">Console</a>
+    <nav class="primary-nav side-nav" aria-label="Primary">
+      <a href="/">Operations</a>
       <a href="/plans/ui" aria-current="page">Plans</a>
       <a href="/backtests/ui">Backtests</a>
     </nav>
@@ -25,6 +28,17 @@
       <button class="button-quiet" id="sign-out" type="button">Sign out</button>
     </div>
   </header>
+
+  <div class="environment-strip" aria-label="Current paper environment">
+    <div class="environment-cell environment-primary">
+      <span>Environment</span>
+      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+    </div>
+    <div class="environment-cell"><span>Breaker</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Daemon</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Observed</span><strong class="is-stale">Sign in to verify</strong></div>
+  </div>
 
   <main class="console-layout" id="main-content">
     <aside class="truth-rail" aria-labelledby="plan-tools-title">
@@ -68,7 +82,7 @@
       <section class="page-intro" aria-labelledby="plans-page-title">
         <div>
           <p class="section-label">Analyst workspace</p>
-          <h2 id="plans-page-title">Research stays below the human gate.</h2>
+          <h1 id="plans-page-title">Research stays below the human gate.</h1>
           <p>Unproven model output remains paper-only and cannot approve itself.</p>
         </div>
       </section>
