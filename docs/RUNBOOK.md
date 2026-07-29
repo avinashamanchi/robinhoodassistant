@@ -541,6 +541,44 @@ the system as profitable or autonomous. Those operational checks remain a
 separate, explicit operator workflow, and an unperformed check must be reported
 as `BLOCKED` or `NOT STARTED`, never inferred from CI.
 
+## Generated migration rehearsal
+
+The deterministic rehearsal
+`tests/test_sensitive_migration.py::test_generated_copy_rehearses_sensitive_migration_without_business_mutation`
+creates a new database containing representative orders, fills, rules,
+breakers, reconciliation cursors, and a heartbeat. It closes WAL cleanly, uses
+the hardened SQLite online-copy path to publish a mode-`0600` copy, and runs the
+schema/envelope migration with independent generated keys only on that copy.
+The test proves that row counts and non-sensitive execution, breaker, rules,
+reconciliation, and liveness truth are unchanged; every registered non-empty
+sensitive value becomes an authenticated envelope; no approval, submission,
+cancellation, breaker reset, broker write, or heartbeat write occurs; and the
+generated source remains byte-for-byte unchanged. Its private redacted manifest
+contains path hashes and counts, never paths, plaintext, or key material.
+
+This is software evidence, not evidence about the operator's normal database.
+The normal-database migration rehearsal is `NOT STARTED` under the operator
+authorization boundary unless the operator separately authorizes process,
+Keychain, TLS, and database inspection. When that maintenance is explicitly
+authorized, use this order and stop on any unknown result:
+
+1. validate exact ownership of app, daemon, MCP, validation, watchdog, and
+   backup processes, then cooperatively stop only the owned writers;
+2. audit Keychain metadata and required key IDs without printing values;
+3. inspect loopback TLS certificate ownership, mode, SAN, and expiry;
+4. acquire maintenance tenure and create a verified encrypted SQLite online
+   backup—never copy a live SQLite file with filesystem `cp`;
+5. apply Alembic migrations and prove one current head;
+6. run encrypted sensitive-field migration;
+7. verify every registered envelope and the encrypted backup;
+8. run read-only paper preflight and retain all blocker/broker truth;
+9. start the loopback HTTPS app only when structural and operational evidence
+   are both ready;
+10. leave daemon startup as a separate explicit operator decision.
+
+Never use generated development secrets for normal data, never retain a
+plaintext operational copy, and never clear a breaker as part of migration.
+
 ## Known dependency warning
 
 Starlette's test client uses its supported `httpx2` dependency, eliminating the

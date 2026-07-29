@@ -6,6 +6,7 @@ import asyncio
 import base64
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,15 +26,21 @@ from trading_assistant.db.models import (
     BacktestArtifact,
     BacktestRun,
     CircuitBreakerState,
+    Fill,
+    Heartbeat,
     LLMDecision,
     Order,
     PanicReceipt,
     Proposal,
+    ReconciliationCursor,
     RiskEvent,
+    Rule,
+    RuleGroup,
     SensitiveMigrationState,
     StartupReconciliationState,
     TradePlanRow,
 )
+from trading_assistant.db.schema import schema_status
 from trading_assistant.db.session import (
     create_db_engine,
     make_session_factory,
@@ -55,6 +62,7 @@ from trading_assistant.ops.encrypt_sensitive import (
     rotate_sensitive_fields,
     verify_sensitive_fields,
 )
+from trading_assistant.ops.safety_drill import _online_copy
 from trading_assistant.ops.tenure import (
     ProcessIdentity,
     ProcessProof,
@@ -75,6 +83,7 @@ from trading_assistant.security.sensitive_fields import (
     sensitive_store,
 )
 from trading_assistant.security.secrets import RuntimeSecrets
+from trading_assistant.broker.models import OrderStatus
 
 
 BACKUP_KEY = bytes(range(32))
@@ -1664,3 +1673,230 @@ def test_cli_rotate_requires_exact_new_key_id():
     with pytest.raises(SystemExit) as captured:
         sensitive_cli_main(["rotate"])
     assert captured.value.code == 2
+
+
+def _rehearsal_truth(path: Path) -> dict[str, object]:
+    """Capture value-free business and safety state from an isolated fixture."""
+    assert path.is_file()
+    with sqlite3.connect(path) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"
+            )
+        )
+        counts = tuple(
+            (
+                table,
+                connection.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0],
+            )
+            for table in tables
+            if table != "runtime_tenures"
+        )
+        queries = {
+            "orders": (
+                "SELECT id, idempotency_key, ticker, side, order_type, "
+                "status, broker_order_id, submission_attempt, "
+                "acceptance_state, plan_cancel_state, version "
+                "FROM orders ORDER BY id"
+            ),
+            "fills": (
+                "SELECT id, order_id, ticker, side, qty, price, "
+                "broker_fill_id, reconciliation_state, filled_at "
+                "FROM fills ORDER BY id"
+            ),
+            "proposals": (
+                "SELECT id, order_id, source_rule_group_id, source_rule_id, "
+                "plan_generation, ttl_minutes, created_at, expires_at "
+                "FROM proposals ORDER BY id"
+            ),
+            "rule_groups": (
+                "SELECT id, group_key, state, lease_owner, lease_expires_at, "
+                "terminal_rule_id, version, reconciliation_required "
+                "FROM rule_groups ORDER BY id"
+            ),
+            "rules": (
+                "SELECT id, group_id, ticker, condition_json, action_json, "
+                "state, plan_id, kind, fraction, hwm, deadline, "
+                "pre_approved, activation, terminal_on_trigger "
+                "FROM rules ORDER BY id"
+            ),
+            "breakers": (
+                "SELECT scope_key, kind, target, tripped, generation, "
+                "updated_at FROM circuit_breaker_state ORDER BY scope_key"
+            ),
+            "reconciliation": (
+                "SELECT broker, stream, last_activity_id, last_activity_at, "
+                "version FROM reconciliation_cursors "
+                "ORDER BY broker, stream"
+            ),
+            "startup_reconciliation": (
+                "SELECT broker, generation, completed_generation, status, "
+                "actor, request_id, started_at, completed_at, updated_at "
+                "FROM startup_reconciliation_state ORDER BY broker"
+            ),
+            "heartbeats": (
+                "SELECT id, source, at FROM heartbeats ORDER BY id"
+            ),
+        }
+        return {
+            "counts": counts,
+            **{
+                name: tuple(connection.execute(query).fetchall())
+                for name, query in queries.items()
+            },
+        }
+
+
+def test_generated_copy_rehearses_sensitive_migration_without_business_mutation(
+    tmp_path,
+):
+    """The irreversible path is proven only on generated, private copies."""
+    source_engine, source_path = _legacy_engine(tmp_path)
+    plaintext_values = _seed_all_registered_fields(source_engine)
+    with Session(source_engine) as session:
+        order = session.scalar(
+            select(Order).where(Order.idempotency_key == "legacy-order")
+        )
+        assert order is not None
+        order.status = OrderStatus.FILLED.value
+        order.broker_order_id = "generated-paper-order"
+        session.add(
+            Fill(
+                order_id=order.id,
+                ticker="AAPL",
+                side="buy",
+                qty=Decimal("2"),
+                price=Decimal("100"),
+                broker_fill_id="generated-fill",
+                filled_at=NOW,
+            )
+        )
+        group = RuleGroup(group_key="generated-copy-group", state="active")
+        session.add(group)
+        session.flush()
+        session.add(
+            Rule(
+                group_id=group.id,
+                ticker="AAPL",
+                condition_json='{"operator":"below","value":"90"}',
+                action_json='{"side":"buy","notional":"50"}',
+                state="active",
+            )
+        )
+        session.add(
+            ReconciliationCursor(
+                broker="mock",
+                stream="trade_updates",
+                last_activity_id="generated-activity",
+                last_activity_at=NOW,
+                version=4,
+            )
+        )
+        session.add(Heartbeat(source="daemon", at=NOW))
+        session.commit()
+
+    source_engine.dispose()
+    with sqlite3.connect(source_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert connection.execute(
+            "PRAGMA journal_mode=DELETE"
+        ).fetchone() == ("delete",)
+
+    source_before = _rehearsal_truth(source_path)
+    source_file_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    copy_path = _online_copy(
+        source_path.resolve(strict=True),
+        (tmp_path / "migration-rehearsal" / "source-copy.sqlite3").resolve(),
+    )
+    assert stat.S_IMODE(copy_path.stat().st_mode) == 0o600
+    copy_before = _rehearsal_truth(copy_path)
+    assert copy_before == source_before
+
+    copy_engine = create_db_engine(f"sqlite:///{copy_path}")
+    cipher = SensitiveDataCipher(
+        {OLD_KEY_ID: OLD_KEY},
+        active_key_id=OLD_KEY_ID,
+    )
+    receipt = migrate_sensitive_fields(
+        copy_engine,
+        cipher,
+        **_migration_kwargs(
+            copy_path,
+            tmp_path / "migration-rehearsal" / "encrypted-backups",
+        ),
+    )
+    verified = verify_sensitive_fields(
+        copy_engine,
+        cipher,
+        configured_active_key_id=OLD_KEY_ID,
+    )
+    copy_schema = schema_status(copy_engine)
+    sensitive_row_count = len(
+        {(table, row_id) for table, row_id, _field in plaintext_values}
+    )
+    assert receipt.status == "complete"
+    assert verified.status == "verified"
+    assert receipt.rows_total == sensitive_row_count
+    assert verified.rows_total == sensitive_row_count
+    assert copy_schema.ready is True
+    copy_engine.dispose()
+
+    copy_after = _rehearsal_truth(copy_path)
+    assert copy_after == copy_before
+    assert _rehearsal_truth(source_path) == source_before
+    assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_file_hash
+
+    with sqlite3.connect(copy_path) as connection:
+        for table, fields in SENSITIVE_FIELDS.items():
+            for field in fields:
+                values = tuple(
+                    row[0]
+                    for row in connection.execute(
+                        f'SELECT "{field}" FROM "{table}" '
+                        f'WHERE "{field}" IS NOT NULL AND "{field}" != \'\''
+                    )
+                )
+                assert all(
+                    value.startswith(f"enc:v1:{OLD_KEY_ID}:")
+                    for value in values
+                )
+        unsafe_order_count = connection.execute(
+            "SELECT COUNT(*) FROM orders WHERE status IN "
+            "('approval_recorded','approved','submitting','submitted','canceled')"
+        ).fetchone()[0]
+        assert unsafe_order_count == 0
+
+    manifest = {
+        "schema_version": 1,
+        "fixture": "generated_only",
+        "source_path_hash": hashlib.sha256(
+            str(source_path).encode("utf-8")
+        ).hexdigest(),
+        "source_bytes": source_path.stat().st_size,
+        "copy_mode": "0600",
+        "alembic_current": copy_schema.current,
+        "sensitive_status": verified.status,
+        "sensitive_rows": verified.rows_total,
+        "business_truth_unchanged": True,
+        "broker_writes": 0,
+        "normal_database_touched": False,
+    }
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert str(source_path) not in serialized
+    assert str(copy_path) not in serialized
+    assert all(value not in serialized for value in plaintext_values.values())
+    manifest_path = tmp_path / "migration-rehearsal-manifest.json"
+    descriptor = os.open(
+        manifest_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(serialized)
+        handle.write("\n")
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
