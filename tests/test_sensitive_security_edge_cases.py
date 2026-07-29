@@ -602,10 +602,30 @@ session.execute(delete(Event))
 def test_sensitive_write_scanner_can_fill_only_the_missing_default_registry(
     tmp_path: Path,
 ):
-    path = tmp_path / "benign_fixture.py"
-    path.write_text("value = 1\n", encoding="utf-8")
+    path = tmp_path / "default_registry_fixture.py"
+    path.write_text(
+        """
+session.execute(
+    "UPDATE audit_events SET reason = 'plaintext' WHERE id = 1"
+)
+""",
+        encoding="utf-8",
+    )
 
-    assert scan_sensitive_writes([path], model_fields={}) == []
+    default_diagnostics = "\n".join(scan_sensitive_writes([path]))
+    table_default_diagnostics = "\n".join(
+        scan_sensitive_writes([path], model_fields={})
+    )
+    assert "audit_events.reason" in default_diagnostics
+    assert "audit_events.reason" in table_default_diagnostics
+    assert (
+        scan_sensitive_writes(
+            [path],
+            model_fields={},
+            table_fields={},
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(

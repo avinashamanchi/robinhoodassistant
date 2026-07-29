@@ -818,11 +818,33 @@ def test_repository_submission_claim_latches_group_exactly_once(
     assert group_audits == 1
 
 
-class _NoRemoteOrderBroker(MockBroker):
+class _ReadOnlyRecoveryBroker(MockBroker):
+    """Fail immediately if a recovery path attempts a broker mutation."""
+
+    def __init__(self):
+        super().__init__()
+        self.mutation_calls = []
+
+    def submit_order(self, order):
+        self.mutation_calls.append(("submit_order", order))
+        raise AssertionError("recovery path attempted submit_order")
+
+    def submit_bracket(self, order, take_profit, stop_loss):
+        self.mutation_calls.append(
+            ("submit_bracket", order, take_profit, stop_loss)
+        )
+        raise AssertionError("recovery path attempted submit_bracket")
+
+    def cancel_order(self, order_id):
+        self.mutation_calls.append(("cancel_order", order_id))
+        raise AssertionError("recovery path attempted cancel_order")
+
+
+class _NoRemoteOrderBroker(_ReadOnlyRecoveryBroker):
     """Read-only deterministic broker view with no matching remote order."""
 
 
-class _InvalidAcceptanceBroker(MockBroker):
+class _InvalidAcceptanceBroker(_ReadOnlyRecoveryBroker):
     """Read-only deterministic broker view returning malformed order truth."""
 
     def get_order_by_client_id(self, client_order_id):
@@ -832,7 +854,7 @@ class _InvalidAcceptanceBroker(MockBroker):
         )
 
 
-class _UnavailableAcceptanceBroker(MockBroker):
+class _UnavailableAcceptanceBroker(_ReadOnlyRecoveryBroker):
     """Read-only deterministic broker view with an unavailable lookup."""
 
     def get_order_by_client_id(self, client_order_id):
@@ -910,6 +932,7 @@ def test_reconciliation_group_latch_recovers_once_after_durable_resolution(
     assert group is not None
     assert group.reconciliation_required is False
     assert clear_audits == 1
+    assert broker.mutation_calls == []
 
 
 def test_invalid_acceptance_payload_latches_once_and_survives_restart(
@@ -962,6 +985,7 @@ def test_invalid_acceptance_payload_latches_once_and_survives_restart(
     assert order.version == first_version
     assert order_audits == 1
     assert fill_count == 0
+    assert broker.mutation_calls == []
 
 
 def test_unavailable_acceptance_lookup_rolls_back_without_false_resolution(
@@ -998,3 +1022,4 @@ def test_unavailable_acceptance_lookup_rolls_back_without_false_resolution(
         service.breakers.is_tripped(BreakerScope.broker_drift())
         is False
     )
+    assert broker.mutation_calls == []

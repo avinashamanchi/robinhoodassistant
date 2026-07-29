@@ -229,25 +229,38 @@ class _FakeSession:
 
 
 class _FakeBarrier:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.exits = 0
+
     @contextmanager
     def hold_writer(self):
-        yield
+        self.entries += 1
+        try:
+            yield
+        finally:
+            self.exits += 1
 
 
 def test_legacy_trip_skips_duplicate_event_but_commits(
     monkeypatch,
 ):
     session = _FakeSession()
+    barrier = _FakeBarrier()
+    trip_calls = []
     persisted = []
     monkeypatch.setattr(
         killswitch_module,
         "SubmissionBarrier",
-        lambda _session: _FakeBarrier(),
+        lambda _session: barrier,
     )
     monkeypatch.setattr(
         killswitch_module,
         "trip_in_session",
-        lambda *_args, **_kwargs: (object(), False),
+        lambda *args, **kwargs: (
+            trip_calls.append((args, kwargs)) or object(),
+            False,
+        ),
     )
     monkeypatch.setattr(
         killswitch_module,
@@ -265,6 +278,13 @@ def test_legacy_trip_skips_duplicate_event_but_commits(
     assert session.commits == 1
     assert session.rollbacks == 0
     assert persisted == []
+    assert barrier.entries == 1
+    assert barrier.exits == 1
+    assert len(trip_calls) == 1
+    assert trip_calls[0][0][0] is session
+    assert trip_calls[0][0][1] == BreakerScope.loss(AssetClass.EQUITY)
+    assert trip_calls[0][0][2:] == ("already tripped", "daemon")
+    assert trip_calls[0][1] == {"request_id": "legacy-duplicate"}
 
 
 def test_legacy_trip_rolls_back_when_durable_trip_fails(

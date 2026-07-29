@@ -161,15 +161,31 @@ def test_candidate_base64url_round_trip_and_exact_length_gate():
 
 
 @pytest.mark.parametrize(
-    "updates",
+    ("updates", "expected_message"),
     [
-        {},
-        {"quantity": "1", "notional": "25"},
-        {"order_type": "market", "limit_price": "99"},
-        {"order_type": "limit"},
+        ({}, "exactly one of quantity or notional is required"),
+        (
+            {"quantity": "1", "notional": "25"},
+            "exactly one of quantity or notional is required",
+        ),
+        (
+            {
+                "notional": "25",
+                "order_type": "market",
+                "limit_price": "99",
+            },
+            "limit_price must be present only for limit orders",
+        ),
+        (
+            {"notional": "25", "order_type": "limit"},
+            "limit_price must be present only for limit orders",
+        ),
     ],
 )
-def test_rule_action_rejects_ambiguous_size_and_limit_shapes(updates):
+def test_rule_action_rejects_ambiguous_size_and_limit_shapes(
+    updates,
+    expected_message,
+):
     """A standing rule cannot carry two sizes or an order-type/price mismatch."""
 
     raw = {
@@ -181,7 +197,7 @@ def test_rule_action_rejects_ambiguous_size_and_limit_shapes(updates):
     }
     raw.update(updates)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match=expected_message):
         candidates.RuleActionCandidate.model_validate(raw)
 
 
@@ -753,7 +769,10 @@ def test_query_parameter_validation_rejects_unsupported_shapes_and_credentials(
 
 def test_query_parameter_validation_preserves_safe_pair_sequence():
     params = [("page", 1), ("symbol", "AAPL")]
-    assert outbound._validated_query_params(params) is params
+    validated = outbound._validated_query_params(params)
+
+    assert validated == [("page", 1), ("symbol", "AAPL")]
+    assert [key for key, _value in validated] == ["page", "symbol"]
 
 
 class _BoundedResponse:
