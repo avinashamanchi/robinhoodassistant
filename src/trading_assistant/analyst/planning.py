@@ -652,27 +652,47 @@ class PlanningService:
     def get_plans(self) -> list[dict[str, Any]]:
         with self.service.session_factory() as s:
             rows = s.execute(select(TradePlanRow).order_by(TradePlanRow.id.desc())).scalars().all()
-            return [{"plan_id": r.id, "symbol": r.symbol, "action": r.action,
-                     "status": r.status, "paper_only": r.paper_only,
-                     "authority_version": r.authority_version,
-                     "authority_digest": r.authority_digest,
-                     "review_token": (
-                         _review_token(
-                             r.id,
-                             r.authority_version,
-                             r.authority_digest,
-                         )
-                         if r.authority_version == _AUTHORITY_VERSION
-                         and isinstance(r.authority_digest, str)
-                         else None
-                     ),
-                     "created_at": r.created_at.isoformat()} for r in rows]
+            store = sensitive_store(s, self.service.session_factory)
+            plans = []
+            for row in rows:
+                plan = TradePlan.model_validate_json(
+                    store.read(row, "plan_json")
+                )
+                plans.append(
+                    {
+                        "plan_id": row.id,
+                        "symbol": row.symbol,
+                        "action": row.action,
+                        "status": row.status,
+                        "paper_only": row.paper_only,
+                        "authority_version": row.authority_version,
+                        "authority_digest": row.authority_digest,
+                        "review_token": (
+                            _review_token(
+                                row.id,
+                                row.authority_version,
+                                row.authority_digest,
+                            )
+                            if row.authority_version
+                            == _AUTHORITY_VERSION
+                            and isinstance(row.authority_digest, str)
+                            else None
+                        ),
+                        "created_at": row.created_at.isoformat(),
+                        "confidence": plan.confidence,
+                        "as_of": plan.as_of.isoformat(),
+                    }
+                )
+            return plans
 
     def get_plan(self, plan_id: int) -> Optional[dict[str, Any]]:
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
                 return None
+            store = sensitive_store(s, self.service.session_factory)
+            plan_json = store.read(row, "plan_json")
+            plan = TradePlan.model_validate_json(plan_json)
             return {
                 "plan_id": row.id, "symbol": row.symbol, "status": row.status,
                 "paper_only": row.paper_only,
@@ -688,10 +708,22 @@ class PlanningService:
                     and isinstance(row.authority_digest, str)
                     else None
                 ),
-                "plan": json.loads(
-                    sensitive_store(s).read(row, "plan_json")
-                ),
+                "plan": json.loads(plan_json),
                 "sized": json.loads(
-                    sensitive_store(s).read(row, "sized_json")
+                    store.read(row, "sized_json")
                 ),
+                "evidence_availability": {
+                    "injection_flags": "not_recorded",
+                    "uncertainties": "not_recorded",
+                    "catalysts": "not_recorded",
+                    "risks": "not_recorded",
+                    "market_context": "not_recorded",
+                    "relative_strength_vs_spy": "not_recorded",
+                    "days_to_next_earnings": "not_recorded",
+                    "source_evidence": (
+                        "references_only"
+                        if plan.cited_source_refs
+                        else "not_recorded"
+                    ),
+                },
             }

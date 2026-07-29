@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import event
 
 from trading_assistant.analyst.models import (
@@ -277,6 +278,163 @@ def test_analyze_and_plan_flow(client):
     assert audit.request_id == cancel_response.headers["X-Request-ID"]
 
 
+def test_plan_list_exposes_validated_metadata_without_sensitive_detail(
+    client,
+):
+    c, svc = client
+    analyzed = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review list metadata boundary",
+        },
+        headers={"Idempotency-Key": "plan-list-metadata"},
+    ).json()
+    plan_id = analyzed["plan_id"]
+
+    with svc.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        before = (
+            row.plan_json,
+            row.sized_json,
+            row.authority_digest,
+        )
+
+    listed = c.get("/plans")
+    detail = c.get(f"/plans/{plan_id}")
+
+    assert listed.status_code == 200
+    item = next(
+        plan
+        for plan in listed.json()["plans"]
+        if plan["plan_id"] == plan_id
+    )
+    assert item["confidence"] == 0.6
+    assert item["as_of"] == TS.isoformat()
+    for omitted in (
+        "thesis",
+        "plan",
+        "sized",
+        "cited_concepts",
+        "cited_source_refs",
+        "scenarios",
+    ):
+        assert omitted not in item
+    assert detail.status_code == 200
+
+    with svc.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        after = (
+            row.plan_json,
+            row.sized_json,
+            row.authority_digest,
+        )
+    assert after == before
+
+
+def test_plan_list_rejects_invalid_decrypted_plan_metadata(client):
+    c, svc = client
+    analyzed = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review invalid metadata boundary",
+        },
+        headers={"Idempotency-Key": "plan-list-invalid-metadata"},
+    ).json()
+    plan_id = analyzed["plan_id"]
+
+    with svc.session_factory() as session:
+        row = session.get(TradePlanRow, plan_id)
+        store = sensitive_store(session, svc.session_factory)
+        payload = json.loads(store.read(row, "plan_json"))
+        payload["confidence"] = 1.5
+        store.write_many(
+            row,
+            {"plan_json": json.dumps(payload, sort_keys=True)},
+        )
+        session.commit()
+
+    provider = lambda symbol: MarketFeatures(
+        symbol=symbol,
+        asset_class=AssetClass.EQUITY,
+        as_of=TS,
+        last_close=100.0,
+        regime=Regime.RANGING,
+    )
+    planning = PlanningService(
+        svc,
+        _StubAnalyst(),
+        provider,
+        Secrets(),
+    )
+
+    with pytest.raises(ValidationError):
+        planning.get_plans()
+
+
+def test_plan_detail_reports_only_persisted_source_references(
+    client,
+):
+    c, svc = client
+    analyzed = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review persisted source references",
+        },
+        headers={"Idempotency-Key": "plan-detail-source-refs"},
+    ).json()
+    with svc.session_factory() as session:
+        row = session.get(TradePlanRow, analyzed["plan_id"])
+        store = sensitive_store(session, svc.session_factory)
+        payload = json.loads(store.read(row, "plan_json"))
+        payload["cited_source_refs"] = ["s1", "s2"]
+        store.write_many(
+            row,
+            {"plan_json": json.dumps(payload, sort_keys=True)},
+        )
+        session.commit()
+
+    detail = c.get(f"/plans/{analyzed['plan_id']}").json()
+
+    assert detail["plan"]["cited_source_refs"] == ["s1", "s2"]
+    assert detail["evidence_availability"] == {
+        "injection_flags": "not_recorded",
+        "uncertainties": "not_recorded",
+        "catalysts": "not_recorded",
+        "risks": "not_recorded",
+        "market_context": "not_recorded",
+        "relative_strength_vs_spy": "not_recorded",
+        "days_to_next_earnings": "not_recorded",
+        "source_evidence": "references_only",
+    }
+    assert "source_evidence" not in detail["plan"]
+    assert "source_urls" not in detail
+    assert "source_facts" not in detail
+    assert "https://" not in json.dumps(detail)
+
+
+def test_plan_detail_marks_absent_source_evidence_not_recorded(client):
+    c, _ = client
+    analyzed = c.post(
+        "/analyze",
+        json={
+            "symbol": "AAPL",
+            "reason": "review absent source references",
+        },
+        headers={"Idempotency-Key": "plan-detail-no-source-refs"},
+    ).json()
+
+    detail = c.get(f"/plans/{analyzed['plan_id']}").json()
+
+    assert detail["plan"]["cited_source_refs"] == []
+    assert (
+        detail["evidence_availability"]["source_evidence"]
+        == "not_recorded"
+    )
+
+
 def test_plan_approval_requires_exact_review_token_and_rejects_stale_payload(
     client,
 ):
@@ -507,7 +665,9 @@ def test_screen_internal_failure_remains_hardened_500(
 def test_plans_ui_served(client):
     c, _ = client
     r = c.get("/plans/ui")
-    assert r.status_code == 200 and "Trade plans" in r.text
+    assert r.status_code == 200
+    assert "Trading Assistant" in r.text
+    assert "ALPACA PAPER" in r.text
 
 
 def test_plans_ui_approval_posts_a_nonempty_review_reason(client):
