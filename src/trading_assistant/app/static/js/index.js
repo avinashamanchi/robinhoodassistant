@@ -6,6 +6,15 @@ import {
   loadSession,
   logout,
 } from "/static/js/auth.js";
+import {
+  clearPosture,
+  normalizePosture,
+  renderPosture,
+} from "/static/js/posture.js";
+import {
+  queueCandidate,
+  renderCandidates,
+} from "/static/js/candidates.js";
 
 const byId = (id) => document.getElementById(id);
 const assetClasses = ["equity", "crypto"];
@@ -19,19 +28,25 @@ const unsafeLocalIdFields = [
 const dialogReturnFocus = new Map();
 const HEALTH_OBSERVATION_MAX_AGE_MS = 30000;
 const ACCOUNT_OBSERVATION_MAX_AGE_MS = 30000;
-const OPERATIONAL_REQUEST_TIMEOUT_MS = 15000;
+const OPERATIONAL_REQUEST_TIMEOUT_MS = 10000;
+const REFRESH_CADENCE_MS = 30000;
 
 let latestHealth = null;
 let healthRequestSequence = 0;
 let breakerResetInFlight = false;
 let pendingOrders = new Map();
 let pendingRequestSequence = 0;
-let pendingAbortController = null;
 let approvalDialogState = null;
 let approvalRequestSequence = 0;
 let rejectionOrderId = null;
 let unsafePanicLatched = false;
+let providerCallAllowed = false;
+let providerCallReason = "Provider call blocked before network I/O";
+let refreshCadenceId = null;
 const operationalRefreshState = {
+  health: {requestSequence: 0, controller: null, timeoutId: null},
+  posture: {requestSequence: 0, controller: null, timeoutId: null},
+  pending: {requestSequence: 0, controller: null, timeoutId: null},
   account: {requestSequence: 0, controller: null, timeoutId: null},
   holdings: {requestSequence: 0, controller: null, timeoutId: null},
   riskLog: {requestSequence: 0, controller: null, timeoutId: null},
@@ -258,8 +273,11 @@ function orderSummary(order) {
   return `${order.side} ${amount} · ${order.order_type}${limit}`;
 }
 
-function beginOperationalRefresh(resource, target, loadingMessage) {
+function beginResourceRequest(resource) {
   const state = operationalRefreshState[resource];
+  if (!state) {
+    throw new TypeError(`Unknown refresh resource: ${resource}`);
+  }
   if (
     state.timeoutId !== null
     && typeof window.clearTimeout === "function"
@@ -276,13 +294,18 @@ function beginOperationalRefresh(resource, target, loadingMessage) {
     () => controller.abort(),
     OPERATIONAL_REQUEST_TIMEOUT_MS,
   );
-  clear(target);
-  target.appendChild(node("p", loadingMessage, "empty-state"));
   return Object.freeze({
     resource,
     requestToken: state.requestSequence,
     controller,
   });
+}
+
+function beginOperationalRefresh(resource, target, loadingMessage) {
+  const request = beginResourceRequest(resource);
+  clear(target);
+  target.appendChild(node("p", loadingMessage, "empty-state"));
+  return request;
 }
 
 function operationalRefreshIsCurrent(request) {
@@ -310,12 +333,24 @@ function finishOperationalRefresh(request) {
   return true;
 }
 
+function abortAllResourceRequests() {
+  Object.values(operationalRefreshState).forEach((state) => {
+    if (
+      state.timeoutId !== null
+      && typeof window.clearTimeout === "function"
+    ) {
+      window.clearTimeout(state.timeoutId);
+    }
+    state.timeoutId = null;
+    if (state.controller) {
+      state.controller.abort();
+    }
+    state.controller = null;
+  });
+}
+
 async function refreshPending() {
-  if (pendingAbortController) {
-    pendingAbortController.abort();
-  }
-  const controller = new AbortController();
-  pendingAbortController = controller;
+  const request = beginResourceRequest("pending");
   const requestToken = ++pendingRequestSequence;
   pendingOrders = new Map();
   const list = byId("pending-list");
@@ -325,16 +360,16 @@ async function refreshPending() {
   let payload;
   try {
     payload = await api("/pending", {
-      signal: controller.signal,
+      signal: request.controller.signal,
     });
   } catch (error) {
     if (
       requestToken !== pendingRequestSequence
-      || pendingAbortController !== controller
+      || !operationalRefreshIsCurrent(request)
     ) {
       return false;
     }
-    pendingAbortController = null;
+    finishOperationalRefresh(request);
     clear(list);
     list.appendChild(node(
       "li",
@@ -346,11 +381,10 @@ async function refreshPending() {
   }
   if (
     requestToken !== pendingRequestSequence
-    || pendingAbortController !== controller
+    || !finishOperationalRefresh(request)
   ) {
     return false;
   }
-  pendingAbortController = null;
   clear(list);
   const pending = Array.isArray(payload.pending) ? payload.pending : [];
   const verifiedPending = pending
@@ -1360,19 +1394,29 @@ async function submitBreakerReset(event) {
 }
 
 async function refreshHealth() {
+  const request = beginResourceRequest("health");
   const requestToken = ++healthRequestSequence;
   renderUnknownHealth();
   let health;
   try {
-    health = await api("/health");
+    health = await api("/health", {
+      signal: request.controller.signal,
+    });
   } catch (error) {
-    if (requestToken !== healthRequestSequence) {
+    if (
+      requestToken !== healthRequestSequence
+      || !operationalRefreshIsCurrent(request)
+    ) {
       return false;
     }
+    finishOperationalRefresh(request);
     renderUnknownHealth();
     throw error;
   }
-  if (requestToken !== healthRequestSequence) {
+  if (
+    requestToken !== healthRequestSequence
+    || !finishOperationalRefresh(request)
+  ) {
     return false;
   }
   if (!healthPayloadIsComplete(health)) {
@@ -1386,6 +1430,55 @@ async function refreshHealth() {
   });
   renderHealth(health);
   return true;
+}
+
+function setModelAvailability(allowed, reason) {
+  providerCallAllowed = allowed === true;
+  providerCallReason = typeof reason === "string" && reason.trim()
+    ? reason.trim()
+    : providerCallAllowed
+      ? "Provider budget evidence is available."
+      : "Provider call blocked before network I/O";
+  const submit = byId("chat-submit");
+  const state = byId("chat-budget-state");
+  if (submit) {
+    submit.disabled = !providerCallAllowed;
+  }
+  if (state) {
+    state.textContent = providerCallReason;
+    state.className = providerCallAllowed
+      ? "field-hint is-verified"
+      : "field-hint has-error is-blocked";
+  }
+}
+
+async function refreshPosture() {
+  const request = beginResourceRequest("posture");
+  const refreshing = clearPosture({
+    message: "Refreshing security posture",
+  });
+  setModelAvailability(false, refreshing.modelReason);
+  let payload;
+  try {
+    payload = await api("/security/posture", {
+      signal: request.controller.signal,
+    });
+  } catch (error) {
+    if (!operationalRefreshIsCurrent(request)) {
+      return false;
+    }
+    finishOperationalRefresh(request);
+    const failed = clearPosture(error);
+    setModelAvailability(false, failed.modelReason);
+    throw error;
+  }
+  if (!finishOperationalRefresh(request)) {
+    return false;
+  }
+  const normalized = normalizePosture(payload);
+  const rendered = renderPosture(normalized);
+  setModelAvailability(!rendered.modelBlocked, rendered.modelReason);
+  return normalized.valid;
 }
 
 async function refreshAccount() {
@@ -1600,6 +1693,11 @@ async function submitChat(event) {
   if (!message) {
     return;
   }
+  if (!providerCallAllowed) {
+    setModelAvailability(false, providerCallReason);
+    appendChat("System", providerCallReason);
+    return;
+  }
   input.value = "";
   appendChat("Operator", message);
   try {
@@ -1611,7 +1709,34 @@ async function submitChat(event) {
       );
     });
     appendChat("Assistant", readable(result.reply, "No reply returned."));
-    await refreshPending();
+    renderCandidates(
+      byId("assistant-candidates"),
+      Array.isArray(result.candidates) ? result.candidates : [],
+      {
+        queue: (candidate, reason) => queueCandidate(
+          candidate,
+          reason,
+          {api, jsonPost},
+        ),
+        receiptHandler: (candidate, receipt) => {
+          appendReceipt(
+            candidate.kind === "order"
+              ? "Proposal queued — not executed"
+              : "Rule queued — not executed",
+            "An explicit operator queue action created a server-side target. No execution occurred.",
+            [
+              ["Target", receipt.target_id],
+              ["Status", receipt.status],
+              ["Executed", String(receipt.executed)],
+            ],
+            "receipt-safe",
+          );
+          refreshPending().catch((error) => {
+            notify(errorText(error), "notice-error");
+          });
+        },
+      },
+    );
   } catch (error) {
     appendChat("System", errorText(error));
   }
@@ -1620,6 +1745,7 @@ async function submitChat(event) {
 async function refreshAll() {
   const jobs = [
     refreshHealth(),
+    refreshPosture(),
     refreshAccount(),
     refreshPending(),
     refreshHoldings(),
@@ -1633,6 +1759,44 @@ async function refreshAll() {
   if (unsafePanicLatched) {
     byId("critical-banner").hidden = false;
   }
+}
+
+function stopRefreshCadence() {
+  if (
+    refreshCadenceId !== null
+    && typeof window.clearInterval === "function"
+  ) {
+    window.clearInterval(refreshCadenceId);
+  }
+  refreshCadenceId = null;
+}
+
+function startRefreshCadence() {
+  if (
+    document.visibilityState !== "visible"
+    || refreshCadenceId !== null
+  ) {
+    return;
+  }
+  refreshCadenceId = window.setInterval(() => {
+    if (document.visibilityState === "visible") {
+      void refreshAll();
+    }
+  }, REFRESH_CADENCE_MS);
+}
+
+function handlePageHide() {
+  stopRefreshCadence();
+  abortAllResourceRequests();
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState !== "visible") {
+    handlePageHide();
+    return;
+  }
+  void refreshAll();
+  startRefreshCadence();
 }
 
 async function initialize() {
@@ -1683,8 +1847,12 @@ async function initialize() {
   byId("breaker-reset-reason").addEventListener("input", updateBreakerReset);
   byId("chat-form").addEventListener("submit", submitChat);
 
-  await refreshAll();
-  window.setInterval(refreshAll, 10000);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("pagehide", handlePageHide);
+  if (document.visibilityState === "visible") {
+    await refreshAll();
+    startRefreshCadence();
+  }
 }
 
 initialize();

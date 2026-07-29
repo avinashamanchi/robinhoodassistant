@@ -27,6 +27,8 @@ _STATIC = pathlib.Path("src/trading_assistant/app/static")
 _PAGES = ("index.html", "plans.html", "backtests.html", "login.html")
 _SCRIPTS = (
     "js/auth.js",
+    "js/posture.js",
+    "js/candidates.js",
     "js/login.js",
     "js/index.js",
     "js/plans.js",
@@ -268,7 +270,10 @@ def _run_page_module(
           export const api = (...args) => globalThis.__api(...args);
           export const jsonPost = (body) => ({
             method: "POST",
-            headers: {"Content-Type": "application/json"},
+            headers: {
+              "Content-Type": "application/json",
+              "Idempotency-Key": "test-idempotency-key",
+            },
             body: JSON.stringify(body),
           });
           export const loadSession = () => Promise.resolve({
@@ -285,6 +290,20 @@ def _run_page_module(
           'from "/static/js/auth.js";',
           `from "${authUrl}";`,
         );
+        for (const [specifier, relativePath] of [
+          ["/static/js/posture.js", "js/posture.js"],
+          ["/static/js/candidates.js", "js/candidates.js"],
+        ]) {
+          if (!source.includes(`"${specifier}"`)) continue;
+          const dependency = fs.readFileSync(
+            new URL(relativePath, `file://${process.cwd()}/src/trading_assistant/app/static/`),
+            "utf8",
+          );
+          const dependencyUrl = `data:text/javascript;base64,${
+            Buffer.from(dependency).toString("base64")
+          }`;
+          source = source.replace(`"${specifier}"`, `"${dependencyUrl}"`);
+        }
         source = source.replace(/\ninitialize\(\);\s*$/, "\n");
         source += `\nexport {${process.argv[2]}};\n`;
         const encoded = Buffer.from(source).toString("base64");
@@ -611,6 +630,8 @@ def test_static_assets_are_anonymous_but_operator_pages_remain_protected(client)
     for path in (
         "/static/css/console.css",
         "/static/js/auth.js",
+        "/static/js/posture.js",
+        "/static/js/candidates.js",
         "/static/js/login.js",
         "/static/js/index.js",
         "/static/js/plans.js",
@@ -662,6 +683,699 @@ def test_auth_module_redirects_401_and_parses_stable_error_envelope():
         }
         """,
     )
+
+
+def test_api_request_error_captures_integer_rate_limit_metadata():
+    _run_module(
+        _STATIC / "js" / "auth.js",
+        """
+        globalThis.window = { location: { assign: () => {} } };
+        let call = 0;
+        globalThis.fetch = async () => {
+          call += 1;
+          if (call === 1) {
+            return {
+              status: 200,
+              ok: true,
+              headers: new Headers(),
+              json: async () => ({
+                actor: "operator:local",
+                csrf_token: "csrf-memory-only",
+              }),
+            };
+          }
+          return {
+            status: 429,
+            ok: false,
+            headers: new Headers({
+              "Retry-After": "17",
+              "X-RateLimit-Reset": "1785326400",
+            }),
+            json: async () => ({
+              error: {
+                code: "rate_limited",
+                message: "Request rate limit exceeded",
+                request_id: "request-429",
+              },
+            }),
+          };
+        };
+        await module.loadSession();
+        await module.api("/chat", {method: "POST"}).then(
+          () => { throw new Error("rate-limited request should reject"); },
+          (error) => {
+            if (error.retryAfter !== 17) {
+              throw new Error(`unexpected Retry-After ${error.retryAfter}`);
+            }
+            if (error.rateLimitReset !== 1785326400) {
+              throw new Error(
+                `unexpected rate-limit reset ${error.rateLimitReset}`,
+              );
+            }
+            if (error.requestId !== "request-429") throw error;
+          },
+        );
+        """,
+    )
+
+
+def test_posture_normalization_is_strict_and_never_derives_trade_authority():
+    _run_module(
+        _STATIC / "js" / "posture.js",
+        """
+        const observedAt = "2026-07-29T12:00:00Z";
+        const payload = {
+          observed_at: observedAt,
+          can_trade: false,
+          checks: [{
+            name: "provider_budget",
+            status: "pass",
+            observed_at: observedAt,
+            detail_code: "provider_budget_available",
+            scope: "gemini",
+            budget_used: 4,
+            budget_remaining: 96,
+            budget_limit: 100,
+            input_tokens_used: 1000,
+            input_tokens_remaining: 999000,
+            input_tokens_limit: 1000000,
+            output_tokens_used: 100,
+            output_tokens_remaining: 199900,
+            output_tokens_limit: 200000,
+            reset_at: "2026-07-30T00:00:00Z",
+          }, {
+            name: "quote_freshness",
+            status: "stale",
+            observed_at: observedAt,
+            detail_code: "quote_evidence_unavailable",
+          }],
+        };
+        const normalized = module.normalizePosture(
+          payload,
+          Date.parse("2026-07-29T12:00:05Z"),
+        );
+        if (!normalized.valid) {
+          throw new Error("valid posture was rejected");
+        }
+        if (normalized.canTrade !== false) {
+          throw new Error("browser derived trading authority");
+        }
+        if (normalized.checks[1].status !== "stale") {
+          throw new Error("server stale status was overwritten");
+        }
+        if (normalized.provider.blocked) {
+          throw new Error("complete available budget was blocked");
+        }
+        const exhaustedPayload = structuredClone(payload);
+        exhaustedPayload.checks[0].status = "blocked";
+        exhaustedPayload.checks[0].budget_remaining = 0;
+        if (!module.normalizePosture(exhaustedPayload).provider.blocked) {
+          throw new Error("exhausted provider budget remained callable");
+        }
+
+        for (const invalid of [
+          {},
+          {observed_at: "not-a-time", checks: [], can_trade: false},
+          {observed_at: observedAt, checks: [], can_trade: true},
+          {observed_at: observedAt, checks: "not-an-array", can_trade: false},
+        ]) {
+          const closed = module.normalizePosture(invalid);
+          if (closed.valid || !closed.provider.blocked) {
+            throw new Error("invalid posture did not fail closed");
+          }
+          if (closed.canTrade !== false) {
+            throw new Error("invalid posture derived trade authority");
+          }
+        }
+        """,
+    )
+
+
+def test_posture_failure_clears_old_posture_budget_and_environment_values():
+    _run_module(
+        _STATIC / "js" / "posture.js",
+        """
+        const ids = [
+          "security-posture-panel",
+          "security-posture-list",
+          "security-posture-observed",
+          "provider-budget-calls",
+          "provider-budget-input",
+          "provider-budget-output",
+          "provider-budget-reset",
+          "provider-budget-calls-meter",
+          "provider-budget-input-meter",
+          "provider-budget-output-meter",
+          "environment-mode",
+          "environment-breaker",
+          "environment-daemon",
+          "environment-reconciliation",
+          "environment-observed",
+          "environment-quote",
+        ];
+        const elements = Object.fromEntries(ids.map((id) => [id, {
+          id,
+          textContent: id === "security-posture-panel"
+            ? ""
+            : "STALE VERIFIED VALUE",
+          className: "is-verified",
+          children: [],
+          value: 1,
+          max: 1,
+          appendChild(child) { this.children.push(child); },
+          removeChild() { this.children.shift(); },
+          get firstChild() { return this.children[0] || null; },
+        }]));
+        globalThis.document = {
+          getElementById: (id) => elements[id] || null,
+          createElement: () => ({
+            textContent: "",
+            className: "",
+            children: [],
+            appendChild(child) { this.children.push(child); },
+          }),
+        };
+        module.clearPosture({
+          requestId: "posture-request-500",
+          message: "Posture unavailable",
+        });
+        for (const id of ids) {
+          if (elements[id].textContent.includes("STALE")) {
+            throw new Error(`${id} retained stale value`);
+          }
+          if (elements[id].className.includes("is-verified")) {
+            throw new Error(`${id} retained verified state`);
+          }
+        }
+        if (
+          !elements["security-posture-list"].textContent.includes(
+            "posture-request-500",
+          )
+        ) {
+          throw new Error("stable request ID was not rendered");
+        }
+        if (elements["environment-observed"].textContent !== "Unknown") {
+          throw new Error("failed posture retained an observed time");
+        }
+        """,
+    )
+
+
+def test_posture_runtime_tenure_status_classes_are_semantically_scoped():
+    _run_module(
+        _STATIC / "js" / "posture.js",
+        """
+        class Element {
+          constructor() {
+            this.children = [];
+            this.textContent = "";
+            this.className = "";
+          }
+          appendChild(child) { this.children.push(child); return child; }
+        }
+        const elements = {
+          "security-posture-panel": new Element(),
+          "security-posture-list": new Element(),
+          "security-posture-observed": new Element(),
+        };
+        const root = {
+          getElementById: (id) => elements[id] || null,
+          createElement: () => new Element(),
+        };
+        const observedAt = "2026-07-29T12:00:00Z";
+        const normalized = module.normalizePosture({
+          observed_at: observedAt,
+          can_trade: false,
+          checks: [
+            {
+              name: "runtime_tenure",
+              status: "held",
+              scope: "app",
+              observed_at: observedAt,
+              detail_code: "runtime_tenure_held",
+            },
+            {
+              name: "runtime_tenure",
+              status: "released",
+              scope: "daemon",
+              observed_at: observedAt,
+              detail_code: "runtime_tenure_released",
+            },
+            {
+              name: "runtime_tenure",
+              status: "fenced",
+              scope: "mcp",
+              observed_at: observedAt,
+              detail_code: "runtime_tenure_fenced",
+            },
+          ],
+        });
+        module.renderPosture(normalized, root);
+        const rows = elements["security-posture-list"].children;
+        const observed = rows.map((row) => row.className);
+        if (!observed[0].includes("is-verified")) {
+          throw new Error(`held tenure was not verified: ${observed[0]}`);
+        }
+        if (!observed[1].includes("is-caution")) {
+          throw new Error(`released tenure was not caution: ${observed[1]}`);
+        }
+        if (!observed[2].includes("is-blocked")) {
+          throw new Error(`fenced tenure was not blocked: ${observed[2]}`);
+        }
+        """,
+    )
+
+
+def test_candidate_renderer_never_auto_queues_and_requires_operator_reason():
+    _run_module(
+        _STATIC / "js" / "candidates.js",
+        r"""
+        class Element {
+          constructor(tagName) {
+            this.tagName = tagName.toUpperCase();
+            this.children = [];
+            this.listeners = new Map();
+            this._textContent = "";
+            this.className = "";
+            this.value = "";
+            this.disabled = false;
+            this.type = "";
+            this.id = "";
+          }
+          get textContent() {
+            return this._textContent
+              + this.children.map((child) => child.textContent).join("");
+          }
+          set textContent(value) {
+            this._textContent = String(value ?? "");
+            this.children = [];
+          }
+          appendChild(child) { this.children.push(child); return child; }
+          append(...children) { children.forEach((child) => this.appendChild(child)); }
+          addEventListener(name, callback) { this.listeners.set(name, callback); }
+          async emit(name) {
+            const callback = this.listeners.get(name);
+            if (callback) await callback({preventDefault() {}, currentTarget: this});
+          }
+        }
+        globalThis.document = {createElement: (tag) => new Element(tag)};
+        const target = new Element("div");
+        const candidate = {
+          version: 1,
+          kind: "order",
+          actor: "operator:local",
+          session_binding: "binding",
+          issued_at: "2026-07-29T12:00:00Z",
+          expires_at: "2099-07-29T12:05:00Z",
+          nonce: "nonce",
+          payload: {
+            ticker: "AAPL",
+            side: "buy",
+            quantity: null,
+            notional: "100",
+            order_type: "limit",
+            limit_price: "190",
+            reference_price: "191",
+            quote_as_of: "2026-07-29T11:59:59Z",
+            thesis: "<img src=x onerror=alert(1)>",
+          },
+          signature: "signature",
+        };
+        let queued = 0;
+        let queuedCandidate = null;
+        let queuedReason = null;
+        module.renderCandidates(target, [candidate], {
+          now: () => Date.parse("2026-07-29T12:01:00Z"),
+          queue: async (envelope, reason) => {
+            queued += 1;
+            queuedCandidate = envelope;
+            queuedReason = reason;
+            return {status: "proposed", target_id: 44, executed: false};
+          },
+        });
+        if (queued !== 0) throw new Error("candidate auto-queued while rendering");
+        const card = target.children[0];
+        const form = card.children.find((child) => child.tagName === "FORM");
+        const reason = form.children.find((child) => child.tagName === "TEXTAREA");
+        const button = form.children.find((child) => child.tagName === "BUTTON");
+        const status = card.children.find((child) => child.className.includes("candidate-status"));
+        await button.emit("click");
+        if (queued !== 0 || !status.textContent.includes("reason")) {
+          throw new Error("blank reason queued or lacked guidance");
+        }
+        reason.value = "operator reviewed the complete envelope";
+        await button.emit("click");
+        if (queued !== 1 || queuedCandidate !== candidate) {
+          throw new Error("queue did not receive the unchanged envelope");
+        }
+        if (queuedReason !== "operator reviewed the complete envelope") {
+          throw new Error("queue did not receive the operator reason");
+        }
+        if (!status.textContent.includes("Proposal queued — not executed")) {
+          throw new Error(`untruthful success status: ${status.textContent}`);
+        }
+        if (!status.textContent.includes("44") || !status.textContent.includes("false")) {
+          throw new Error("target receipt or executed false was omitted");
+        }
+        if (!target.textContent.includes("<img src=x onerror=alert(1)>")) {
+          throw new Error("model text was not rendered as text");
+        }
+        """,
+    )
+
+
+def test_queue_candidate_posts_the_full_envelope_through_json_post():
+    _run_module(
+        _STATIC / "js" / "candidates.js",
+        """
+        const envelope = {
+          version: 1,
+          kind: "rule",
+          actor: "operator:local",
+          session_binding: "binding",
+          issued_at: "2026-07-29T12:00:00Z",
+          expires_at: "2099-07-29T12:05:00Z",
+          nonce: "nonce",
+          payload: {
+            ticker: "AAPL",
+            condition: {
+              comparator: "price_below",
+              trigger_price: "180",
+            },
+            action: {
+              side: "buy",
+              quantity: null,
+              notional: "100",
+              order_type: "market",
+              limit_price: null,
+            },
+            reference_price: "191",
+            quote_as_of: "2026-07-29T11:59:59Z",
+            thesis: "wait for price",
+          },
+          signature: "signature",
+        };
+        let posted = null;
+        const result = await module.queueCandidate(
+          envelope,
+          "reviewed rule candidate",
+          {
+            api: async (path, options) => {
+              posted = {path, options};
+              return {status: "queued", target_id: 9, executed: false};
+            },
+            jsonPost: (body) => ({
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Idempotency-Key": "unique-idempotency",
+              },
+              body: JSON.stringify(body),
+            }),
+          },
+        );
+        if (posted.path !== "/candidates/rule/queue") {
+          throw new Error(`unexpected queue path ${posted.path}`);
+        }
+        const body = JSON.parse(posted.options.body);
+        if (JSON.stringify(body.candidate) !== JSON.stringify(envelope)) {
+          throw new Error("queue changed the signed envelope");
+        }
+        if (body.reason !== "reviewed rule candidate") {
+          throw new Error("queue changed the operator reason");
+        }
+        if (!posted.options.headers["Idempotency-Key"]) {
+          throw new Error("queue omitted shared idempotency metadata");
+        }
+        if (result.executed !== false) {
+          throw new Error("queue result overclaimed execution");
+        }
+        """,
+    )
+
+
+def test_candidate_failures_and_invalid_receipts_disable_only_governed_action():
+    _run_module(
+        _STATIC / "js" / "candidates.js",
+        r"""
+        class Element {
+          constructor(tagName) {
+            this.tagName = tagName.toUpperCase();
+            this.children = [];
+            this.listeners = new Map();
+            this._textContent = "";
+            this.className = "";
+            this.value = "";
+            this.disabled = false;
+            this.type = "";
+            this.id = "";
+          }
+          get textContent() {
+            return this._textContent
+              + this.children.map((child) => child.textContent).join("");
+          }
+          set textContent(value) {
+            this._textContent = String(value ?? "");
+            this.children = [];
+          }
+          appendChild(child) { this.children.push(child); return child; }
+          append(...children) { children.forEach((child) => this.appendChild(child)); }
+          addEventListener(name, callback) { this.listeners.set(name, callback); }
+          async emit(name) {
+            const callback = this.listeners.get(name);
+            if (callback) await callback({preventDefault() {}, currentTarget: this});
+          }
+        }
+        globalThis.document = {createElement: (tag) => new Element(tag)};
+        const base = (ticker, nonce) => ({
+          version: 1,
+          kind: "order",
+          actor: "operator:local",
+          session_binding: "binding",
+          issued_at: "2026-07-29T12:00:00Z",
+          expires_at: "2099-07-29T12:05:00Z",
+          nonce,
+          payload: {
+            ticker,
+            side: "buy",
+            quantity: null,
+            notional: "100",
+            order_type: "market",
+            limit_price: null,
+            reference_price: "100",
+            quote_as_of: "2026-07-29T11:59:59Z",
+            thesis: "test",
+          },
+          signature: `signature-${nonce}`,
+        });
+        const rule = (ticker, nonce) => ({
+          version: 1,
+          kind: "rule",
+          actor: "operator:local",
+          session_binding: "binding",
+          issued_at: "2026-07-29T12:00:00Z",
+          expires_at: "2099-07-29T12:05:00Z",
+          nonce,
+          payload: {
+            ticker,
+            condition: {
+              comparator: "price_below",
+              trigger_price: "90",
+            },
+            action: {
+              side: "buy",
+              quantity: null,
+              notional: "100",
+              order_type: "market",
+              limit_price: null,
+            },
+            reference_price: "100",
+            quote_as_of: "2026-07-29T11:59:59Z",
+            thesis: "test rule",
+          },
+          signature: `signature-${nonce}`,
+        });
+        const target = new Element("div");
+        let call = 0;
+        module.renderCandidates(target, [
+          base("AAPL", "a"),
+          base("MSFT", "b"),
+          base("NVDA", "c"),
+          rule("AMD", "d"),
+        ], {
+          now: () => Date.parse("2026-07-29T12:01:00Z"),
+          queue: async () => {
+            call += 1;
+            if (call === 1) {
+              throw {
+                code: "candidate_expired",
+                requestId: "candidate-expired-request",
+                message: "Candidate queue request was rejected",
+              };
+            }
+            if (call === 2) {
+              throw {
+                code: "rate_limited",
+                status: 429,
+                requestId: "candidate-rate-request",
+                retryAfter: 19,
+                rateLimitReset: 1785326400,
+                message: "Request rate limit exceeded",
+              };
+            }
+            if (call === 3) {
+              return {status: "rejected", target_id: 71, executed: false};
+            }
+            return {status: "proposed", target_id: 72, executed: false};
+          },
+        });
+        const controls = target.children.map((card) => {
+          const form = card.children.find((child) => child.tagName === "FORM");
+          return {
+            reason: form.children.find((child) => child.tagName === "TEXTAREA"),
+            button: form.children.find((child) => child.tagName === "BUTTON"),
+            status: card.children.find(
+              (child) => child.className.includes("candidate-status"),
+            ),
+          };
+        });
+        controls[0].reason.value = "reviewed first";
+        await controls[0].button.emit("click");
+        if (!controls[0].button.disabled) {
+          throw new Error("expired candidate action remained available");
+        }
+        if (!controls[0].status.textContent.includes("candidate-expired-request")) {
+          throw new Error("terminal failure omitted request ID");
+        }
+        if (controls[1].button.disabled) {
+          throw new Error("terminal failure disabled an unrelated action");
+        }
+        controls[1].reason.value = "reviewed second";
+        await controls[1].button.emit("click");
+        if (!controls[1].button.disabled) {
+          throw new Error("rate-governed candidate action remained available");
+        }
+        if (
+          !controls[1].status.textContent.includes("Retry after 19 seconds")
+          || !controls[1].status.textContent.includes("candidate-rate-request")
+        ) {
+          throw new Error("rate failure omitted retry metadata or request ID");
+        }
+        controls[2].reason.value = "reviewed rejected receipt";
+        await controls[2].button.emit("click");
+        if (
+          !controls[2].button.disabled
+          || !controls[2].status.textContent.includes("receipt was invalid")
+          || controls[2].status.textContent.includes("queued — not executed")
+        ) {
+          throw new Error("rejected order receipt rendered as queue success");
+        }
+        if (controls[3].button.disabled) {
+          throw new Error("invalid order receipt disabled the rule action");
+        }
+        controls[3].reason.value = "reviewed mismatched rule receipt";
+        await controls[3].button.emit("click");
+        if (
+          !controls[3].button.disabled
+          || !controls[3].status.textContent.includes("receipt was invalid")
+          || controls[3].status.textContent.includes("queued — not executed")
+        ) {
+          throw new Error("wrong-kind rule receipt rendered as queue success");
+        }
+        """,
+    )
+
+
+def test_model_budget_blocks_chat_before_network_io():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("setModelAvailability", "submitChat"),
+        r"""
+        const elements = installDom([
+          "chat-input",
+          "chat-submit",
+          "chat-budget-state",
+          "chat-log",
+        ]);
+        let calls = 0;
+        globalThis.__api = () => {
+          calls += 1;
+          return Promise.resolve({reply: "must not happen", candidates: []});
+        };
+        module.setModelAvailability(
+          false,
+          "Provider call blocked before network I/O",
+        );
+        elements["chat-input"].value = "research AAPL";
+        await module.submitChat({preventDefault() {}});
+        if (calls !== 0) {
+          throw new Error("blocked model chat reached network I/O");
+        }
+        if (!elements["chat-submit"].disabled) {
+          throw new Error("blocked model chat control remained enabled");
+        }
+        if (
+          !elements["chat-budget-state"].textContent.includes(
+            "Provider call blocked before network I/O",
+          )
+        ) {
+          throw new Error("model budget denial was not explained");
+        }
+        """,
+    )
+
+
+def test_resource_requests_abort_superseded_work_and_pagehide_cleans_up():
+    _run_page_module(
+        _STATIC / "js" / "index.js",
+        ("beginResourceRequest", "startRefreshCadence", "handlePageHide"),
+        r"""
+        installDom([]);
+        let intervalDelay = null;
+        let clearedInterval = null;
+        window.setTimeout = () => 12;
+        window.clearTimeout = () => {};
+        window.setInterval = (_callback, delay) => {
+          intervalDelay = delay;
+          return 77;
+        };
+        window.clearInterval = (id) => { clearedInterval = id; };
+        document.visibilityState = "visible";
+        const first = module.beginResourceRequest("account");
+        const second = module.beginResourceRequest("account");
+        if (!first.controller.signal.aborted) {
+          throw new Error("superseded account request was not aborted");
+        }
+        if (second.controller.signal.aborted) {
+          throw new Error("current account request was already aborted");
+        }
+        module.startRefreshCadence();
+        if (intervalDelay !== 30000) {
+          throw new Error(`unexpected refresh cadence ${intervalDelay}`);
+        }
+        module.handlePageHide();
+        if (!second.controller.signal.aborted) {
+          throw new Error("pagehide did not abort active resource request");
+        }
+        if (clearedInterval !== 77) {
+          throw new Error("pagehide did not clear the cadence timer");
+        }
+        """,
+    )
+
+
+def test_refresh_lifecycle_is_visible_only_and_has_no_automatic_retry_loop():
+    text = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
+
+    assert "document.visibilityState" in text
+    assert '"visibilitychange"' in text
+    assert '"pagehide"' in text
+    assert "30000" in text
+    assert "10000" in text
+    assert "setInterval" in text
+    assert "setInterval(refreshAll, 10000)" not in text
+    assert "setInterval(refreshAll, 30000)" not in text
+    assert 'api("/positions"' not in text
 
     _run_module(
         _STATIC / "js" / "auth.js",
@@ -1613,24 +2327,6 @@ def test_account_snapshot_renders_positions_from_same_response():
             "2 open broker positions",
         ),
         (
-            "refreshPositions",
-            "/positions",
-            "positions",
-            (),
-            (
-                '{positions: [{ticker: "OLD-POS", qty: "1", '
-                'avg_entry_price: "10", current_price: "10", '
-                'market_value: "10"}]}'
-            ),
-            (
-                '{positions: [{ticker: "NEW-POS", qty: "2", '
-                'avg_entry_price: "20", current_price: "21", '
-                'market_value: "42"}]}'
-            ),
-            "OLD-POS",
-            "NEW-POS",
-        ),
-        (
             "refreshHoldings",
             "/holdings",
             "holdings",
@@ -1781,18 +2477,6 @@ def test_operational_refreshes_bind_rendering_to_latest_generation(
                 'observed_at: new Date().toISOString()}'
             ),
             "2 open broker positions",
-        ),
-        (
-            "refreshPositions",
-            "/positions",
-            "positions",
-            (),
-            (
-                '{positions: [{ticker: "CURRENT-POS", qty: "2", '
-                'avg_entry_price: "20", current_price: "21", '
-                'market_value: "42"}]}'
-            ),
-            "CURRENT-POS",
         ),
         (
             "refreshHoldings",

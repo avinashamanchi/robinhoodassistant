@@ -5,13 +5,25 @@ let sessionPromise = null;
 let reauthenticationRequester = requestReauthenticationInput;
 
 export class ApiRequestError extends Error {
-  constructor(message, {code, status, requestId, body}) {
+  constructor(
+    message,
+    {
+      code,
+      status,
+      requestId,
+      body,
+      retryAfter = null,
+      rateLimitReset = null,
+    },
+  ) {
     super(message);
     this.name = "ApiRequestError";
     this.code = code;
     this.status = status;
     this.requestId = requestId;
     this.body = body;
+    this.retryAfter = retryAfter;
+    this.rateLimitReset = rateLimitReset;
   }
 }
 
@@ -36,12 +48,35 @@ function errorFromResponse(response, body) {
   const requestId = typeof envelope.request_id === "string"
     ? envelope.request_id
     : null;
+  const retryAfter = integerHeader(response, "Retry-After");
+  const rateLimitReset = integerHeader(response, "X-RateLimit-Reset");
   return new ApiRequestError(message, {
     code,
     status: response.status,
     requestId,
     body,
+    retryAfter,
+    rateLimitReset,
   });
+}
+
+function integerHeader(response, name) {
+  if (
+    !response
+    || !response.headers
+    || typeof response.headers.get !== "function"
+  ) {
+    return null;
+  }
+  const value = response.headers.get(name);
+  if (
+    typeof value !== "string"
+    || !/^(?:0|[1-9]\d*)$/.test(value)
+  ) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function redirectForAuthentication() {
