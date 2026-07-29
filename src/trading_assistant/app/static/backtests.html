@@ -38,49 +38,134 @@
     <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Unknown</strong></div>
     <div class="environment-cell"><span>Observed</span><strong class="is-stale">Sign in to verify</strong></div>
   </div>
-  <div class="simulated-banner">Simulated — past performance does not predict future results.</div>
+  <div class="simulated-banner">
+    Simulated — past performance does not predict future results.
+  </div>
 
-  <main class="console-layout" id="main-content">
-    <aside class="truth-rail" aria-labelledby="backtest-tools-title">
-      <div class="rail-heading">
-        <p class="eyebrow">Simulation controls</p>
-        <h2 id="backtest-tools-title">Launch a run</h2>
-        <p>Backtests do not place orders.</p>
+  <main class="backtests-main" id="main-content">
+    <section class="page-intro backtests-intro" aria-labelledby="backtests-page-title">
+      <div>
+        <p class="section-label">Evaluation ledger</p>
+        <h1 id="backtests-page-title">Treat simulation as evidence, not promise.</h1>
+        <p>
+          Development, Validation, and Final holdout results stay distinct from
+          broker truth. No broker orders are placed.
+        </p>
       </div>
-      <form class="breaker-control" id="backtest-form">
-        <div class="field">
-          <label for="backtest-reason">Run reason</label>
-          <textarea id="backtest-reason" rows="4" required></textarea>
-        </div>
-        <button class="button-primary" type="submit">Run backtest</button>
-      </form>
-      <div class="breaker-control">
-        <h3>Saved runs</h3>
-        <div id="backtest-runs">
-          <p class="empty-state">Loading runs…</p>
-        </div>
-      </div>
-    </aside>
+      <span class="status-chip is-caution">Simulation only</span>
+    </section>
 
-    <div class="workspace">
-      <section class="page-intro" aria-labelledby="backtests-page-title">
-        <div>
-          <p class="section-label">Evaluation ledger</p>
-          <h1 id="backtests-page-title">Treat simulation as evidence, not promise.</h1>
-          <p>Walk-forward results keep holdout performance and benchmark comparisons visible.</p>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="report-title">
+    <div class="backtests-workspace">
+      <aside
+        class="panel backtest-policy-pane"
+        id="backtest-policy-pane"
+        aria-labelledby="backtest-tools-title"
+      >
         <div class="section-heading">
           <div>
-            <p class="section-label">Simulation report</p>
+            <p class="section-label">Bounded replay</p>
+            <h2 id="backtest-tools-title">Launch policy</h2>
+          </div>
+        </div>
+        <div class="section-body backtest-policy-body">
+          <p class="simulated-inline">
+            Simulated — past performance does not predict future results.
+          </p>
+
+          <dl class="backtest-policy-grid">
+            <div>
+              <dt>Runtime ceiling</dt>
+              <dd class="is-unknown" id="backtest-runtime-limit">Unknown</dd>
+            </div>
+            <div>
+              <dt>Symbol ceiling</dt>
+              <dd class="is-unknown" id="backtest-symbol-limit">Unknown</dd>
+            </div>
+            <div>
+              <dt>Date-range ceiling</dt>
+              <dd class="is-unknown" id="backtest-range-limit">Unknown</dd>
+            </div>
+            <div>
+              <dt>LLM mode</dt>
+              <dd class="is-unknown" id="backtest-provider-mode">Unknown</dd>
+            </div>
+            <div>
+              <dt>Run budget</dt>
+              <dd class="is-unknown" id="backtest-run-budget">Unknown</dd>
+            </div>
+            <div>
+              <dt>Active run</dt>
+              <dd class="is-unknown" id="backtest-active-state">Unknown</dd>
+            </div>
+          </dl>
+
+          <form id="backtest-form">
+            <p class="form-boundary">
+              This launches a deterministic local simulation. It never submits
+              an order or enables a strategy.
+            </p>
+            <div class="field">
+              <label for="backtest-symbols">Symbols (optional, comma separated)</label>
+              <input
+                id="backtest-symbols"
+                autocomplete="off"
+                placeholder="AAPL, MSFT"
+              >
+            </div>
+            <div class="backtest-date-grid">
+              <div class="field">
+                <label for="backtest-start-date">Start date (optional)</label>
+                <input id="backtest-start-date" type="date">
+              </div>
+              <div class="field">
+                <label for="backtest-end-date">End date (optional)</label>
+                <input id="backtest-end-date" type="date">
+              </div>
+            </div>
+            <div class="field">
+              <label for="backtest-reason">Run reason</label>
+              <textarea id="backtest-reason" rows="4" required></textarea>
+            </div>
+            <button class="button-primary" id="backtest-submit" type="submit">
+              Run bounded backtest
+            </button>
+          </form>
+
+          <section class="saved-backtests" aria-labelledby="saved-backtests-title">
+            <div class="plan-subheading">
+              <div>
+                <p class="section-label">Persisted results</p>
+                <h3 id="saved-backtests-title">Saved runs</h3>
+              </div>
+              <button class="button-quiet" id="refresh-runs" type="button">
+                Refresh runs
+              </button>
+            </div>
+            <div id="backtest-runs">
+              <p class="empty-state">Loading runs…</p>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <section class="panel backtest-report-pane" aria-labelledby="report-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Comparative evidence</p>
             <h2 id="report-title">Choose a run</h2>
           </div>
-          <button class="button-quiet" id="refresh-runs" type="button">Refresh runs</button>
+          <span class="status-chip is-caution">Buy-and-hold benchmark required</span>
         </div>
-        <div class="section-body" id="backtest-report">
-          <p class="empty-state">Run a backtest or choose a saved run.</p>
+        <div class="section-body">
+          <p class="simulated-inline">
+            Simulated — past performance does not predict future results.
+          </p>
+          <div id="backtest-report">
+            <p class="empty-state">
+              Simulated — past performance does not predict future results.
+              Run a backtest or choose a saved run.
+            </p>
+          </div>
         </div>
       </section>
     </div>

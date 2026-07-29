@@ -138,6 +138,52 @@ def test_list_and_report(client):
     ) == manifest
 
 
+def test_list_exposes_only_bounded_simulation_policy(client):
+    c, svc = client
+
+    response = c.get("/backtests").json()
+
+    assert response["simulation_policy"] == {
+        "max_runtime_seconds": (
+            svc.config.security.backtest_limits.runtime_seconds
+        ),
+        "max_symbols": svc.config.security.backtest_limits.max_symbols,
+        "max_calendar_days": (
+            svc.config.security.backtest_limits.max_calendar_days
+        ),
+        "window_requests": (
+            svc.config.security.rate_limits.backtest.requests
+        ),
+        "global_window_requests": (
+            svc.config.security.rate_limits.backtest.global_requests
+        ),
+        "window_seconds": (
+            svc.config.security.rate_limits.backtest.window_seconds
+        ),
+        "daily_requests": (
+            svc.config.security.rate_limits.backtest.daily_requests
+        ),
+        "global_daily_requests": (
+            svc.config.security.rate_limits.backtest.global_daily_requests
+        ),
+        "concurrency": (
+            svc.config.security.rate_limits.backtest.concurrency
+        ),
+        "llm_enabled": (
+            svc.config.security.provider_budget.backtest_llm_enabled
+        ),
+    }
+    serialized = json.dumps(response["simulation_policy"])
+    for forbidden in (
+        "api_key",
+        "secret",
+        "database",
+        "password",
+        "credential",
+    ):
+        assert forbidden not in serialized.lower()
+
+
 def test_runner_persists_exact_applied_cost_and_holdout_config(client):
     c, svc = client
     applied = BacktestConfig(

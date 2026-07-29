@@ -109,6 +109,7 @@ def _run_page_module(
             this.hidden = false;
             this.open = false;
             this.type = "";
+            this.attributes = {};
           }
 
           get firstChild() {
@@ -135,6 +136,17 @@ def _run_page_module(
 
           append(...children) {
             children.forEach((child) => this.appendChild(child));
+          }
+
+          setAttribute(name, value) {
+            this.attributes[name] = String(value);
+          }
+
+          getAttribute(name) {
+            return Object.prototype.hasOwnProperty.call(
+              this.attributes,
+              name,
+            ) ? this.attributes[name] : null;
           }
 
           prepend(child) {
@@ -231,6 +243,9 @@ def _run_page_module(
           globalThis.document = {
             activeElement: null,
             createElement: (tagName) => new FakeElement("", tagName),
+            createElementNS: (_namespace, tagName) => (
+              new FakeElement("", tagName)
+            ),
             getElementById: (id) => elements.get(id) || null,
           };
           globalThis.window = {
@@ -3000,6 +3015,123 @@ def test_backtest_report_response_identity_mismatch_fails_closed():
           throw new Error(
             `mismatched report was rendered: ${title} / ${body}`,
           );
+        }
+        """,
+    )
+
+
+def test_backtest_report_renders_validated_svg_and_rejects_nonfinite_curve():
+    _run_page_module(
+        _STATIC / "js" / "backtests.js",
+        ("showReport",),
+        _BACKTEST_REPORT_DOM_SETUP
+        + r"""
+        const artifactReport = (runId, invalid = false) => {
+          const value = (at, equity) => ({at, equity});
+          const drawdown = (at, drawdown_pct) => ({at, drawdown_pct});
+          return {
+            ...report(
+              runId,
+              invalid ? "Invalid curve" : "Validated curve",
+              "AAPL",
+              "Simulated — past performance does not predict future results.",
+            ),
+            artifact_status: {status: "available"},
+            manifest: {
+              data_source: "synthetic",
+              actual_range: {
+                start: "2025-01-01T00:00:00+00:00",
+                end: "2025-01-02T00:00:00+00:00",
+              },
+              duration_seconds: 1.25,
+              backtest_config: {
+                slippage_bps: {equity: 5, crypto: 20},
+                fees_bps: {equity: 0, crypto: 25},
+              },
+              symbols: ["AAPL"],
+              strategies: ["sma_crossover"],
+              holdout_start: "2025-01-02T00:00:00+00:00",
+              holdout_access_log: [{
+                at: "2025-01-02T00:00:00+00:00",
+                context: "evaluation",
+                blocked: false,
+              }],
+              validation: {status: "unavailable", reason: "not_run"},
+              episodes: {status: "not_run"},
+            },
+            series: [{
+              symbol: "AAPL",
+              strategy: "sma_crossover",
+              window: "holdout",
+              strategy_equity: [
+                value("2025-01-01T00:00:00+00:00", 100),
+                value(
+                  "2025-01-02T00:00:00+00:00",
+                  invalid ? Number.NaN : 105,
+                ),
+              ],
+              benchmark_equity: [
+                value("2025-01-01T00:00:00+00:00", 100),
+                value("2025-01-02T00:00:00+00:00", 102),
+              ],
+              strategy_drawdown: [
+                drawdown("2025-01-01T00:00:00+00:00", 0),
+                drawdown("2025-01-02T00:00:00+00:00", -1),
+              ],
+              benchmark_drawdown: [
+                drawdown("2025-01-01T00:00:00+00:00", 0),
+                drawdown("2025-01-02T00:00:00+00:00", -2),
+              ],
+              actual_total_fees: 1,
+              benchmark_actual_total_fees: 0,
+              cost_assumptions: {
+                slippage_bps: {equity: 5, crypto: 20},
+                fees_bps: {equity: 0, crypto: 25},
+              },
+            }],
+          };
+        };
+        const countTag = (root, tag) => {
+          let count = root.tagName === tag ? 1 : 0;
+          root.children.forEach((child) => {
+            count += countTag(child, tag);
+          });
+          return count;
+        };
+        globalThis.__api = (path) => {
+          if (path === "/backtests/4/report") {
+            return Promise.resolve(artifactReport(4));
+          }
+          if (path === "/backtests/5/report") {
+            return Promise.resolve(artifactReport(5, true));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showReport(4);
+        const validBody = elements["backtest-report"];
+        if (
+          countTag(validBody, "SVG") !== 2
+          || countTag(validBody, "POLYLINE") !== 4
+          || !validBody.textContent.includes("Validation not run")
+          || !validBody.textContent.includes(
+            "Historical episodes not run",
+          )
+        ) {
+          throw new Error(
+            `validated artifact was not rendered safely: ${
+              validBody.textContent
+            }`,
+          );
+        }
+
+        await module.showReport(5);
+        const invalidBody = elements["backtest-report"];
+        if (
+          countTag(invalidBody, "SVG") !== 0
+          || !invalidBody.textContent.includes("Chart unavailable")
+        ) {
+          throw new Error("non-finite curve was rendered as a chart");
         }
         """,
     )

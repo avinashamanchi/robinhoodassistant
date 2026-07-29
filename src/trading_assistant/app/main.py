@@ -1389,7 +1389,12 @@ def _create_app(
     def list_backtests(
         principal: SessionPrincipal = Depends(current_principal),
     ):
-        return {"backtests": _list_backtests(service.session_factory)}
+        return {
+            "backtests": _list_backtests(service.session_factory),
+            "simulation_policy": _backtest_simulation_policy(
+                service.config
+            ),
+        }
 
     @app.post("/backtests/run")
     def run_backtest_endpoint(
@@ -1536,6 +1541,25 @@ def create_app(*args, **kwargs) -> FastAPI:
 
 
 # ── backtest DB helpers ────────────────────────────────────────
+def _backtest_simulation_policy(config) -> dict:
+    limits = config.security.backtest_limits
+    requests = config.security.rate_limits.backtest
+    return {
+        "max_runtime_seconds": limits.runtime_seconds,
+        "max_symbols": limits.max_symbols,
+        "max_calendar_days": limits.max_calendar_days,
+        "window_requests": requests.requests,
+        "global_window_requests": requests.global_requests,
+        "window_seconds": requests.window_seconds,
+        "daily_requests": requests.daily_requests,
+        "global_daily_requests": requests.global_daily_requests,
+        "concurrency": requests.concurrency,
+        "llm_enabled": (
+            config.security.provider_budget.backtest_llm_enabled
+        ),
+    }
+
+
 def _list_backtests(session_factory) -> list[dict]:
     import json
 

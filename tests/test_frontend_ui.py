@@ -103,7 +103,18 @@ BEHAVIOR_HOOKS = {
         "main-content",
         "session-actor",
         "sign-out",
+        "backtest-policy-pane",
+        "backtest-runtime-limit",
+        "backtest-symbol-limit",
+        "backtest-range-limit",
+        "backtest-provider-mode",
+        "backtest-run-budget",
+        "backtest-active-state",
         "backtest-form",
+        "backtest-symbols",
+        "backtest-start-date",
+        "backtest-end-date",
+        "backtest-submit",
         "backtest-runs",
         "backtest-report",
         "refresh-runs",
@@ -455,3 +466,43 @@ def test_plans_css_stacks_the_evidence_workspace_at_compact_widths():
         css,
         re.DOTALL,
     )
+
+
+def test_backtests_page_keeps_simulation_warning_at_every_decision_surface():
+    """Run controls, empty reports, and chart regions cannot lose the disclaimer."""
+    html = static_text("backtests.html")
+
+    warning = (
+        "Simulated — past performance does not predict future results."
+    )
+    assert html.count(warning) >= 3
+    assert 'id="backtest-policy-pane"' in html
+    assert 'id="backtest-form"' in html
+    assert 'id="backtest-report"' in html
+    assert "No broker orders are placed." in html
+    assert "Development" in html
+    assert "Validation" in html
+    assert "Final holdout" in html
+
+
+def test_backtest_renderer_uses_local_accessible_svg_and_truthful_sections():
+    """Charts must be DOM/SVG evidence and missing phases must remain explicit."""
+    script = static_text("js/backtests.js")
+
+    assert "document.createElementNS" in script
+    assert "Number.isFinite" in script
+    assert "strategy_equity" in script
+    assert "benchmark_equity" in script
+    assert "strategy_drawdown" in script
+    assert "benchmark_drawdown" in script
+    assert "Holdout access" in script
+    assert "Validation not run" in script
+    assert "Historical episodes not run" in script
+    assert "not_persisted_for_legacy_run" in script
+    assert "artifact_invalid" in script
+    assert "backtest_busy" in script
+    assert "backtest_timed_out" in script
+    assert "backtest_bounds_exceeded" in script
+    assert "createElement(\"canvas\")" not in script
+    assert "innerHTML" not in script
+    assert "insertAdjacentHTML" not in script
