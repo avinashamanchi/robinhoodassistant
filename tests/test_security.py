@@ -2583,14 +2583,16 @@ def test_operational_refreshes_ignore_late_error_after_newer_success(
             "refreshPlans",
             "/plans",
             "plans-list",
-            (
-                '{plans: [{plan_id: 1, symbol: "OLD-PLAN", '
-                'action: "buy", status: "proposed"}]}'
-            ),
-            (
-                '{plans: [{plan_id: 2, symbol: "NEW-PLAN", '
-                'action: "sell", status: "approved"}]}'
-            ),
+                (
+                    '{plans: [{plan_id: 1, symbol: "OLD-PLAN", '
+                    'action: "buy", status: "proposed", paper_only: true, '
+                    'confidence: 0.5, as_of: "2026-07-25T10:00:00Z"}]}'
+                ),
+                (
+                    '{plans: [{plan_id: 2, symbol: "NEW-PLAN", '
+                    'action: "sell", status: "approved", paper_only: true, '
+                    'confidence: 0.6, as_of: "2026-07-25T10:01:00Z"}]}'
+                ),
             "OLD-PLAN",
             "NEW-PLAN",
         ),
@@ -2692,10 +2694,11 @@ def test_saved_resource_refresh_ignores_superseded_success(
             "refreshPlans",
             "/plans",
             "plans-list",
-            (
-                '{plans: [{plan_id: 2, symbol: "CURRENT-PLAN", '
-                'action: "sell", status: "approved"}]}'
-            ),
+                (
+                    '{plans: [{plan_id: 2, symbol: "CURRENT-PLAN", '
+                    'action: "sell", status: "approved", paper_only: true, '
+                    'confidence: 0.6, as_of: "2026-07-25T10:01:00Z"}]}'
+                ),
             "CURRENT-PLAN",
         ),
         (
@@ -3253,6 +3256,9 @@ _PLAN_DOM_SETUP = r"""
       "plan-approval-target-action",
       "plan-cancel-dialog",
       "plan-cancel-reason",
+      "plan-cancel-target-id",
+      "plan-cancel-target-symbol",
+      "plan-cancel-target-action",
       "status-region",
     ]);
     const planDetail = (planId, symbol) => ({
@@ -4172,6 +4178,164 @@ def test_plan_detail_response_id_mismatch_fails_closed():
         }
         if (!elements["plan-detail"].textContent.toLowerCase().includes("mismatch")) {
           throw new Error("mismatched plan identity was not explained");
+        }
+        """,
+    )
+
+
+def test_plan_mutation_receipts_must_match_exact_frozen_target():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "showPlan",
+            "submitPlanApproval",
+            "submitPlanCancel",
+            "closeDialog",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        const calls = [];
+        globalThis.__api = (path, options = {}) => {
+          calls.push({path, options});
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans/1/approve") {
+            return Promise.resolve({
+              plan_id: 999,
+              status: "canceled",
+              paper_only: true,
+              rules_created: 1,
+              bracket: null,
+            });
+          }
+          if (path === "/plans/1/cancel") {
+            return Promise.resolve({
+              plan_id: 777,
+              status: "approved",
+              rules_canceled: 1,
+            });
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        elements["plan-approval-reason"].value = "exact approval";
+        await module.submitPlanApproval({preventDefault() {}});
+        if (
+          elements["status-region"].textContent.includes("notice-success")
+          || elements["status-region"].textContent.includes(
+            "server response: status",
+          )
+          || !elements["status-region"].textContent.includes(
+            "did not prove",
+          )
+        ) {
+          throw new Error(
+            "mismatched approval receipt was presented as success",
+          );
+        }
+
+        module.closeDialog(elements["plan-approval-dialog"]);
+        findButton(elements["plan-detail"], "Cancel plan").click();
+        elements["plan-cancel-reason"].value = "exact cancellation";
+        await module.submitPlanCancel({preventDefault() {}});
+        if (
+          elements["status-region"].textContent.includes("Plan 1 canceled")
+          || !elements["status-region"].textContent.includes(
+            "did not prove",
+          )
+        ) {
+          throw new Error(
+            "mismatched cancellation receipt was presented as success",
+          );
+        }
+        """,
+    )
+
+
+def test_plan_list_failure_or_malformed_envelope_clears_stale_authority():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("showPlan", "refreshPlans"),
+        _PLAN_DOM_SETUP
+        + r"""
+        elements["plans-list"] = document.createElement("div");
+        elements["plan-filter"] = document.createElement("input");
+        document.getElementById = (id) => elements[id] || null;
+        let listMode = "failure";
+        globalThis.__api = (path) => {
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          if (path === "/plans") {
+            if (listMode === "failure") {
+              return Promise.reject(new Error("list unavailable"));
+            }
+            return Promise.resolve(null);
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+        const assertCleared = (stage) => {
+          const detail = elements["plan-detail"].textContent;
+          if (
+            detail.includes("AAPL test thesis")
+            || findButton(elements["plan-detail"], "Review plan approval")
+            || findButton(elements["plan-detail"], "Cancel plan")
+            || elements["plan-approval-dialog"].open
+            || !detail.includes("unavailable")
+          ) {
+            throw new Error(`${stage} retained stale plan authority`);
+          }
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        await module.refreshPlans().then(
+          () => {
+            throw new Error("failed list refresh unexpectedly succeeded");
+          },
+          () => {},
+        );
+        assertCleared("failed refresh");
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Review plan approval").click();
+        listMode = "malformed";
+        await module.refreshPlans().then(
+          () => {
+            throw new Error("malformed list envelope was accepted");
+          },
+          () => {},
+        );
+        assertCleared("malformed refresh");
+        """,
+    )
+
+
+def test_plan_cancellation_dialog_binds_exact_identity():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("showPlan",),
+        _PLAN_DOM_SETUP
+        + r"""
+        globalThis.__api = (path) => {
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.showPlan(1);
+        findButton(elements["plan-detail"], "Cancel plan").click();
+
+        if (
+          elements["plan-cancel-target-id"].textContent !== "1"
+          || elements["plan-cancel-target-symbol"].textContent !== "AAPL"
+          || elements["plan-cancel-target-action"].textContent !== "buy"
+        ) {
+          throw new Error("cancellation dialog omitted exact plan identity");
         }
         """,
     )

@@ -96,6 +96,9 @@ BEHAVIOR_HOOKS = {
         "plan-detail",
         "plan-approval-dialog",
         "plan-cancel-dialog",
+        "plan-cancel-target-id",
+        "plan-cancel-target-symbol",
+        "plan-cancel-target-action",
         "reauth-dialog",
         "status-region",
     },
@@ -444,6 +447,19 @@ def test_plans_approval_copy_preserves_the_exact_paper_safety_boundary():
     assert "remains subject to execution and risk gates" in visible_copy
     for forbidden in ("AI pick", "winner", "guaranteed"):
         assert forbidden.lower() not in html.lower()
+
+
+def test_plan_cancellation_dialog_names_the_immutable_target():
+    """A destructive plan decision must show the same identity bound in JavaScript."""
+    html = static_text("plans.html")
+
+    for label, target_id in (
+        ("Plan ID", "plan-cancel-target-id"),
+        ("Symbol", "plan-cancel-target-symbol"),
+        ("Action", "plan-cancel-target-action"),
+    ):
+        assert label in html
+        assert f'id="{target_id}"' in html
 
 
 def test_plans_css_stacks_the_evidence_workspace_at_compact_widths():

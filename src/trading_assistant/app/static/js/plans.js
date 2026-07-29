@@ -461,6 +461,56 @@ function renderPlanQueue() {
   });
 }
 
+function validPlanSummary(plan) {
+  return Boolean(
+    plan
+    && typeof plan === "object"
+    && !Array.isArray(plan)
+    && canonicalPlanId(plan.plan_id) !== null
+    && typeof plan.symbol === "string"
+    && Boolean(plan.symbol.trim())
+    && typeof plan.action === "string"
+    && Boolean(plan.action.trim())
+    && typeof plan.status === "string"
+    && Boolean(plan.status.trim())
+    && typeof plan.paper_only === "boolean"
+    && Number.isFinite(Number(plan.confidence))
+    && typeof plan.as_of === "string"
+    && Number.isFinite(Date.parse(plan.as_of))
+  );
+}
+
+function clearSelectedPlanAuthority(message) {
+  savedPlansState = [];
+  selectedPlanId = null;
+  beginPlanWorkspace();
+  const approvalDialog = byId("plan-approval-dialog");
+  const cancelDialog = byId("plan-cancel-dialog");
+  if (approvalDialog && approvalDialog.open) {
+    closeDialog(approvalDialog);
+  } else {
+    poisonPlanApprovalState();
+  }
+  if (cancelDialog && cancelDialog.open) {
+    closeDialog(cancelDialog);
+  } else {
+    poisonPlanCancelState();
+  }
+  const title = byId("plan-detail-title");
+  if (title) {
+    title.textContent = "Plan detail unavailable";
+  }
+  const detail = byId("plan-detail");
+  if (detail) {
+    clear(detail);
+    detail.appendChild(node(
+      "p",
+      message,
+      "banner-caution",
+    ));
+  }
+}
+
 async function refreshPlans() {
   const target = byId("plans-list");
   if (plansAbortController) {
@@ -480,6 +530,15 @@ async function refreshPlans() {
     payload = await api("/plans", {
       signal: controller.signal,
     });
+    if (
+      !payload
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || !Array.isArray(payload.plans)
+      || payload.plans.some((plan) => !validPlanSummary(plan))
+    ) {
+      throw new Error("Saved plan response was invalid");
+    }
   } catch (error) {
     if (
       requestToken !== plansRequestSequence
@@ -488,7 +547,9 @@ async function refreshPlans() {
       return false;
     }
     plansAbortController = null;
-    savedPlansState = [];
+    clearSelectedPlanAuthority(
+      "Saved plan truth is unavailable; prior plan authority was cleared.",
+    );
     clear(target);
     target.appendChild(node(
       "p",
@@ -504,9 +565,7 @@ async function refreshPlans() {
     return false;
   }
   plansAbortController = null;
-  savedPlansState = Array.isArray(payload.plans)
-    ? payload.plans.slice()
-    : [];
+  savedPlansState = payload.plans.slice();
   renderPlanQueue();
   return true;
 }
@@ -688,14 +747,23 @@ function currentDetailMatches(planId, detailRequestToken) {
 function poisonPlanApprovalState() {
   planApprovalRequestSequence += 1;
   planApprovalState = null;
-  byId("plan-approval-reason").value = "";
-  byId("plan-approval-submit").disabled = true;
+  const reason = byId("plan-approval-reason");
+  const submit = byId("plan-approval-submit");
+  if (reason) {
+    reason.value = "";
+  }
+  if (submit) {
+    submit.disabled = true;
+  }
 }
 
 function poisonPlanCancelState() {
   planCancelRequestSequence += 1;
   planCancelState = null;
-  byId("plan-cancel-reason").value = "";
+  const reason = byId("plan-cancel-reason");
+  if (reason) {
+    reason.value = "";
+  }
 }
 
 function planApprovalIsActionable() {
@@ -725,8 +793,13 @@ function planApprovalIsActionable() {
 }
 
 function updatePlanApprovalButton() {
-  const reason = byId("plan-approval-reason").value.trim();
-  byId("plan-approval-submit").disabled = !(
+  const reasonElement = byId("plan-approval-reason");
+  const submit = byId("plan-approval-submit");
+  if (!reasonElement || !submit) {
+    return;
+  }
+  const reason = reasonElement.value.trim();
+  submit.disabled = !(
     planApprovalIsActionable() && reason
   );
 }
@@ -775,9 +848,16 @@ function openPlanCancel(plan, detailRequestToken, invoker) {
     targetPlanId,
     detailRequestToken,
     requestToken: ++planCancelRequestSequence,
+    symbol: plan.symbol,
+    action: plan.plan && plan.plan.action,
     invoker,
     submitting: false,
   });
+  byId("plan-cancel-target-id").textContent = String(targetPlanId);
+  byId("plan-cancel-target-symbol").textContent = readable(plan.symbol);
+  byId("plan-cancel-target-action").textContent = readable(
+    plan.plan && plan.plan.action,
+  );
   byId("plan-cancel-reason").value = "";
   showDialog(byId("plan-cancel-dialog"), invoker);
   byId("plan-cancel-reason").focus();
@@ -1137,6 +1217,46 @@ async function showPlan(planId) {
   }
 }
 
+function boundedReceiptCount(value) {
+  return (
+    Number.isSafeInteger(value)
+    && value >= 0
+    && value <= 10000
+  );
+}
+
+function validPlanApprovalReceipt(result, planId) {
+  const bracket = result && result.bracket;
+  return Boolean(
+    result
+    && typeof result === "object"
+    && !Array.isArray(result)
+    && canonicalPlanId(result.plan_id) === planId
+    && result.status === "approved"
+    && result.paper_only === true
+    && boundedReceiptCount(result.rules_created)
+    && (
+      result.rules_created > 0
+      || (
+        bracket
+        && typeof bracket === "object"
+        && !Array.isArray(bracket)
+      )
+    )
+  );
+}
+
+function validPlanCancellationReceipt(result, planId) {
+  return Boolean(
+    result
+    && typeof result === "object"
+    && !Array.isArray(result)
+    && canonicalPlanId(result.plan_id) === planId
+    && result.status === "canceled"
+    && boundedReceiptCount(result.rules_canceled)
+  );
+}
+
 async function submitPlanApproval(event) {
   event.preventDefault();
   const state = planApprovalState;
@@ -1166,13 +1286,18 @@ async function submitPlanApproval(event) {
       `/plans/${planId}/approve`,
       jsonPost({reason, review_token: state.reviewToken}),
     );
+    if (!validPlanApprovalReceipt(result, planId)) {
+      throw new Error(
+        "Server response did not prove exact paper plan approval",
+      );
+    }
     closeDialog(byId("plan-approval-dialog"));
     notify(
-      `Plan ${planId} server response: status ${readable(result.status)} · `
+      `Plan ${planId} paper approval recorded · `
       + (
         result.bracket
-          ? "paper broker bracket returned"
-          : `${readable(result.rules_created, 0)} paper-only rules returned`
+          ? "paper broker bracket receipt recorded"
+          : `${result.rules_created} paper-only rules recorded`
       )
       + ".",
       "notice-success",
@@ -1198,6 +1323,10 @@ async function submitPlanCancel(event) {
       state.targetPlanId,
       state.detailRequestToken,
     )
+    || state.symbol !== planDetailState.plan.symbol
+    || state.action !== (
+      planDetailState.plan.plan && planDetailState.plan.plan.action
+    )
   ) {
     notify("A non-empty cancellation reason is required.", "notice-error");
     return;
@@ -1208,10 +1337,22 @@ async function submitPlanCancel(event) {
     submitting: true,
   });
   try {
-    await api(`/plans/${planId}/cancel`, jsonPost({reason}));
+    const result = await api(
+      `/plans/${planId}/cancel`,
+      jsonPost({reason}),
+    );
+    if (!validPlanCancellationReceipt(result, planId)) {
+      throw new Error(
+        "Server response did not prove exact plan cancellation",
+      );
+    }
     poisonPlanCancelState();
     closeDialog(byId("plan-cancel-dialog"));
-    notify(`Plan ${planId} canceled.`, "notice-success");
+    notify(
+      `Plan ${planId} canceled · ${result.rules_canceled} paper-only `
+        + "rules canceled.",
+      "notice-success",
+    );
     await refreshPlans();
     await showPlan(planId);
   } catch (error) {
