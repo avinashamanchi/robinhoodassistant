@@ -1720,6 +1720,21 @@ git add src/trading_assistant/operations/security_posture.py src/trading_assista
 git commit -m "feat(operations): report redacted security posture"
 ```
 
+- [x] **Fix round 1: close posture trust-boundary review findings**
+
+The fix round adds an explicit lease-free bounded-read policy capability for
+posture only; replaces public startup evidence injection with an
+identity-bound opaque guard receipt and private production composition;
+removes route-time encryption scanning/decryption; shares one pure
+safe-column reconciliation validator with the authority gate; validates all
+counted persisted state domains; aggregates breakers into fixed redacted
+categories; and makes posture scalar validation strict.
+
+Implementation: `8e553d4ab1bf20e99bbfa41594f1d8d8733b0c0e`.
+Final focused gate: `314 passed`. Exactly one full suite:
+`3297 passed, 1 skipped, 1 warning`. Static release gate: PASS.
+Task 11 remains untouched.
+
 ---
 
 ### Task 11: Make trust-boundary regressions fail the release gate

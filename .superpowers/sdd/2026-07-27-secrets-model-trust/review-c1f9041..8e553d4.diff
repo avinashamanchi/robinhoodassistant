@@ -1,0 +1,3403 @@
+diff --git a/src/trading_assistant/app/main.py b/src/trading_assistant/app/main.py
+index 285d341..ba9e565 100644
+--- a/src/trading_assistant/app/main.py
++++ b/src/trading_assistant/app/main.py
+@@ -85,7 +85,7 @@ _ACCOUNT_CACHE_TTL_SECONDS = 2.0
+ 
+ if TYPE_CHECKING:
+     from ..bootstrap import ApplicationContainer
+-    from ..operations.security_posture import StartupPostureEvidence
++    from ..operations.security_posture import StartupGuardReceipt
+ 
+ 
+ class _AssetOnlyStaticFiles(StaticFiles):
+@@ -366,8 +366,10 @@ def _create_app(
+     transport_policy: TransportPolicy | None = None,
+     candidate_signer: CandidateSigner | None = None,
+     candidate_queue: CandidateQueueService | None = None,
+-    startup_evidence: "StartupPostureEvidence | None" = None,
++    _startup_guard_receipt: "StartupGuardReceipt | None" = None,
+ ) -> FastAPI:
++    if container is None and _startup_guard_receipt is not None:
++        raise RuntimeError("startup_guard_receipt_invalid")
+     if container is None and ((service is None) != (agent is None)):
+         raise RuntimeError(
+             "service and agent must be injected together"
+@@ -380,20 +382,38 @@ def _create_app(
+         container = build_default_container()
+         service = container.service
+         agent = _build_agent(container)
++    startup_evidence = None
+     if container is not None:
+-        container_startup_evidence = getattr(
++        container_receipt = getattr(
+             container,
+-            "startup_evidence",
++            "startup_guard_receipt",
+             None,
+         )
+-        if (
+-            startup_evidence is not None
+-            and startup_evidence is not container_startup_evidence
+-        ):
++        if _startup_guard_receipt is None and container_receipt is not None:
+             raise RuntimeError(
+-                "container and startup evidence do not match"
++                "guarded container requires guarded app composition"
++            )
++        if _startup_guard_receipt is not None:
++            if _startup_guard_receipt is not container_receipt:
++                raise RuntimeError("startup_guard_receipt_mismatch")
++            from ..operations.security_posture import (
++                _validate_startup_guard_receipt,
+             )
+-        startup_evidence = container_startup_evidence
++
++            startup_evidence = _validate_startup_guard_receipt(
++                _startup_guard_receipt,
++                config=container.config,
++                secrets=container.secrets,
++            )
++            if (
++                getattr(
++                    container.operations,
++                    "_startup_guard_receipt",
++                    None,
++                )
++                is not _startup_guard_receipt
++            ):
++                raise RuntimeError("startup_guard_receipt_mismatch")
+         if (
+             runtime_secrets is not None
+             and runtime_secrets is not container.secrets
+@@ -614,15 +634,10 @@ def _create_app(
+                 if container is not None
+                 else None
+             ),
+-            startup_evidence=startup_evidence,
+-            engine=(
+-                getattr(container, "engine", None)
+-                if container is not None
+-                else None
+-            ),
+-            sensitive_cipher=(
+-                getattr(container, "sensitive_cipher", None)
+-                if container is not None
++            _startup_guard_receipt=_startup_guard_receipt,
++            _startup_secrets=(
++                runtime_secrets
++                if _startup_guard_receipt is not None
+                 else None
+             ),
+         )
+@@ -1431,9 +1446,28 @@ def _create_app(
+     return app
+ 
+ 
++def _create_guarded_app(
++    *,
++    container: "ApplicationContainer",
++    startup_guard_receipt: "StartupGuardReceipt",
++    **kwargs,
++) -> FastAPI:
++    """Private launcher entrypoint for one validated startup receipt."""
++
++    return _create_app(
++        container=container,
++        _startup_guard_receipt=startup_guard_receipt,
++        **kwargs,
++    )
++
++
+ @wraps(_create_app)
+ def create_app(*args, **kwargs) -> FastAPI:
+     """Build the automatic production app inside its role log boundary."""
++    if "_startup_guard_receipt" in kwargs:
++        raise TypeError(
++            "startup guard receipt requires private guarded composition"
++        )
+     bound = inspect.signature(_create_app).bind_partial(
+         *args,
+         **kwargs,
+diff --git a/src/trading_assistant/app/policy.py b/src/trading_assistant/app/policy.py
+index 7259a8f..13ae69e 100644
+--- a/src/trading_assistant/app/policy.py
++++ b/src/trading_assistant/app/policy.py
+@@ -76,6 +76,7 @@ class RoutePolicy:
+     target_param: str | None = None
+     mutation_operation: str | None = None
+     receipt_managed_idempotency: bool = False
++    lease_free_bounded_read: bool = False
+ 
+     def __post_init__(self) -> None:
+         if self.receipt_managed_idempotency and (
+@@ -85,6 +86,22 @@ class RoutePolicy:
+             raise ValueError(
+                 "receipt-managed idempotency cannot use a generic interlock"
+             )
++        if type(self.lease_free_bounded_read) is not bool:
++            raise ValueError("lease-free bounded read flag is invalid")
++        if self.lease_free_bounded_read and (
++            self.method.upper() != "GET"
++            or self.requires_idempotency
++            or self.audit_mutation
++            or self.broker_read
++            or self.provider_category is not None
++            or self.mutation_operation is not None
++            or self.receipt_managed_idempotency
++            or self.concurrency_behavior != "reject"
++            or self.target_param is not None
++        ):
++            raise ValueError(
++                "lease-free bounded read cannot carry mutation authority"
++            )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -193,6 +210,7 @@ ROUTE_POLICIES = (
+         "/security/posture",
+         AuthLevel.SESSION,
+         "session_read",
++        lease_free_bounded_read=True,
+     ),
+     RoutePolicy("GET", "/pending", AuthLevel.SESSION, "session_read"),
+     RoutePolicy(
+@@ -1670,6 +1688,8 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
+             )
+             if bounds_response is not None:
+                 return bounds_response
++        if policy.lease_free_bounded_read:
++            return await call_next(request)
+         lease_keys = _lease_keys(
+             app,
+             resolved,
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 274845d..7de77bf 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -39,7 +39,10 @@ from .orders.reconciliation import ReconciliationService
+ from .orders.snapshot import PortfolioSnapshotService
+ from .orders.submission import OrderSubmissionService
+ from .operations import AuditRecorder, OperationsService
+-from .operations.security_posture import StartupPostureEvidence
++from .operations.security_posture import (
++    StartupGuardReceipt,
++    _validate_startup_guard_receipt,
++)
+ from .ops.tenure import (
+     LocalProcessInspector,
+     ProcessIdentity,
+@@ -108,7 +111,7 @@ class ApplicationContainer:
+     candidate_signer: CandidateSigner | None = None
+     candidate_drafts: CandidateDraftService | None = None
+     candidate_queue: CandidateQueueService | None = None
+-    startup_evidence: StartupPostureEvidence | None = None
++    startup_guard_receipt: StartupGuardReceipt | None = None
+ 
+ 
+ def prepare_database_runtime(
+@@ -273,7 +276,6 @@ def build_container(
+     process_inspector=None,
+     tenure_clock=None,
+     tenure_owner_factory=None,
+-    startup_evidence: StartupPostureEvidence | None = None,
+ ) -> ApplicationContainer:
+     config = config or load_config()
+     if secrets is None:
+@@ -288,7 +290,36 @@ def build_container(
+         process_inspector=process_inspector,
+         tenure_clock=tenure_clock,
+         tenure_owner_factory=tenure_owner_factory,
+-        startup_evidence=startup_evidence,
++    )
++
++
++def _build_guarded_container(
++    config: AppConfig,
++    secrets: RuntimeSecrets,
++    *,
++    runtime_role: str,
++    startup_guard_receipt: StartupGuardReceipt,
++    process_identity: ProcessIdentity | None = None,
++    process_inspector=None,
++    tenure_clock=None,
++    tenure_owner_factory=None,
++) -> ApplicationContainer:
++    """Private production path for the exact startup-guard composition."""
++
++    _validate_startup_guard_receipt(
++        startup_guard_receipt,
++        config=config,
++        secrets=secrets,
++    )
++    return _build_container(
++        config,
++        secrets,
++        runtime_role=runtime_role,
++        process_identity=process_identity,
++        process_inspector=process_inspector,
++        tenure_clock=tenure_clock,
++        tenure_owner_factory=tenure_owner_factory,
++        startup_guard_receipt=startup_guard_receipt,
+     )
+ 
+ 
+@@ -298,7 +329,6 @@ def build_test_container(
+     *,
+     broker: BrokerClient,
+     clock,
+-    startup_evidence: StartupPostureEvidence | None = None,
+ ) -> ApplicationContainer:
+     """Compose with explicit fakes while retaining production-safe config."""
+     return _build_container(
+@@ -307,7 +337,6 @@ def build_test_container(
+         broker=broker,
+         clock=clock,
+         enforce_runtime_tenure=False,
+-        startup_evidence=startup_evidence,
+     )
+ 
+ 
+@@ -323,9 +352,15 @@ def _build_container(
+     tenure_clock=None,
+     tenure_owner_factory=None,
+     enforce_runtime_tenure: bool = True,
+-    startup_evidence: StartupPostureEvidence | None = None,
++    startup_guard_receipt: StartupGuardReceipt | None = None,
+ ) -> ApplicationContainer:
+     _guard_runtime(config, secrets)
++    if startup_guard_receipt is not None:
++        _validate_startup_guard_receipt(
++            startup_guard_receipt,
++            config=config,
++            secrets=secrets,
++        )
+     effective_role = runtime_role or "app"
+     if effective_role not in {"app", "daemon", "mcp"}:
+         raise ValueError("runtime_role_invalid")
+@@ -364,7 +399,7 @@ def _build_container(
+             clock=clock,
+             sensitive_cipher=sensitive_cipher,
+             runtime_tenure_guard=runtime_tenure_guard,
+-            startup_evidence=startup_evidence,
++            startup_guard_receipt=startup_guard_receipt,
+         )
+     except BaseException:
+         if runtime_tenure_guard is not None:
+@@ -383,7 +418,7 @@ def _finish_container(
+     clock,
+     sensitive_cipher: SensitiveDataCipher | None,
+     runtime_tenure_guard: RuntimeTenureGuard | None,
+-    startup_evidence: StartupPostureEvidence | None,
++    startup_guard_receipt: StartupGuardReceipt | None,
+ ) -> ApplicationContainer:
+     session_factory = runtime.session_factory
+     if runtime_tenure_guard is not None:
+@@ -505,9 +540,10 @@ def _finish_container(
+         leases=leases,
+         policy_store_maintenance=policy_store_maintenance,
+         provider_budget=provider_budget,
+-        startup_evidence=startup_evidence,
+-        engine=runtime.engine,
+-        sensitive_cipher=sensitive_cipher,
++        _startup_guard_receipt=startup_guard_receipt,
++        _startup_secrets=(
++            secrets if startup_guard_receipt is not None else None
++        ),
+     )
+     return ApplicationContainer(
+         config=config,
+@@ -535,5 +571,5 @@ def _finish_container(
+         candidate_signer=candidate_signer,
+         candidate_drafts=candidate_drafts,
+         candidate_queue=candidate_queue,
+-        startup_evidence=startup_evidence,
++        startup_guard_receipt=startup_guard_receipt,
+     )
+diff --git a/src/trading_assistant/operations/security_posture.py b/src/trading_assistant/operations/security_posture.py
+index 3cb74f2..799082b 100644
+--- a/src/trading_assistant/operations/security_posture.py
++++ b/src/trading_assistant/operations/security_posture.py
+@@ -6,6 +6,7 @@ imports or consumes these models.
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from enum import Enum
+ from typing import Callable, Literal
+@@ -30,11 +31,17 @@ from ..config import AppConfig, TradingMode
+ from ..db.models import (
+     CircuitBreakerState,
+     FILL_RECONCILIATION_QUARANTINED,
++    FILL_RECONCILIATION_REQUIRED,
+     FILL_RECONCILIATION_SUPERSEDED,
++    FILL_RECONCILIATION_TRUSTED,
+     Fill,
+     Heartbeat,
+     MutationInterlock,
+     Order,
++    PLAN_CANCEL_INDETERMINATE,
++    PLAN_CANCEL_NONE,
++    PLAN_CANCEL_REQUESTED,
++    PLAN_CANCEL_SETTLED,
+     Rule,
+     RuleGroup,
+     RuntimeTenure,
+@@ -46,8 +53,9 @@ from ..llm.budget import (
+     ProviderBudgetService,
+     ProviderBudgetUnavailable,
+ )
+-from ..preflight import SensitiveEncryptionStateInspector
+-from ..risk.breakers import BreakerScope
++from ..orders.startup import validate_startup_reconciliation_snapshot
++from ..risk.breakers import BreakerKind, BreakerScope
++from ..rules.models import RuleState
+ 
+ 
+ UTC = timezone.utc
+@@ -183,6 +191,7 @@ class PostureDetailCode(str, Enum):
+     QUARANTINE_ITEMS_PRESENT = "quarantine_items_present"
+     BREAKER_CLEAR = "breaker_clear"
+     BREAKER_TRIPPED = "breaker_tripped"
++    BREAKER_SCOPE_INVALID = "breaker_scope_invalid"
+     DAEMON_HEARTBEAT_MISSING = "daemon_heartbeat_missing"
+     DAEMON_HEARTBEAT_FRESH = "daemon_heartbeat_fresh"
+     DAEMON_HEARTBEAT_STALE = "daemon_heartbeat_stale"
+@@ -193,6 +202,9 @@ class PostureDetailCode(str, Enum):
+     RECONCILIATION_FAILED = "reconciliation_failed"
+     RECONCILIATION_CURRENT = "reconciliation_current"
+     RECONCILIATION_STALE = "reconciliation_stale"
++    RECONCILIATION_EVIDENCE_INVALID = (
++        "reconciliation_evidence_invalid"
++    )
+     QUOTE_EVIDENCE_UNAVAILABLE = "quote_evidence_unavailable"
+     RUNTIME_TENURE_MISSING = "runtime_tenure_missing"
+     RUNTIME_TENURE_HELD = "runtime_tenure_held"
+@@ -201,13 +213,18 @@ class PostureDetailCode(str, Enum):
+     RUNTIME_TENURE_STALE = "runtime_tenure_stale"
+     UNSAFE_STATE_CLEAR = "unsafe_state_clear"
+     UNSAFE_STATE_PRESENT = "unsafe_state_present"
++    STATE_DOMAIN_INVALID = "state_domain_invalid"
+     UNCERTAIN_INTERLOCKS_CLEAR = "uncertain_interlocks_clear"
+     UNCERTAIN_INTERLOCKS_PRESENT = "uncertain_interlocks_present"
+     DATABASE_EVIDENCE_UNAVAILABLE = "database_evidence_unavailable"
+ 
+ 
+ class StartupStructuralCheck(BaseModel):
+-    model_config = ConfigDict(extra="forbid", frozen=True)
++    model_config = ConfigDict(
++        extra="forbid",
++        frozen=True,
++        strict=True,
++    )
+ 
+     name: StartupCheckName
+     status: Literal["pass", "blocked", "unknown"]
+@@ -217,7 +234,11 @@ class StartupStructuralCheck(BaseModel):
+ class StartupPostureEvidence(BaseModel):
+     """Immutable output from the one production startup-evidence chain."""
+ 
+-    model_config = ConfigDict(extra="forbid", frozen=True)
++    model_config = ConfigDict(
++        extra="forbid",
++        frozen=True,
++        strict=True,
++    )
+ 
+     observed_at: AwareDatetime
+     structural_checks: tuple[StartupStructuralCheck, ...]
+@@ -237,10 +258,102 @@ class StartupPostureEvidence(BaseModel):
+         return self
+ 
+ 
++_STARTUP_GUARD_RECEIPT_SEAL = object()
++
++
++class StartupGuardReceipt:
++    """Opaque capability binding startup evidence to exact composition inputs."""
++
++    __slots__ = ("_seal", "_config", "_secrets", "_evidence")
++
++    def __new__(cls, *_args, **_kwargs):
++        raise TypeError("StartupGuardReceipt is issued by the startup guard")
++
++    def __setattr__(self, _name, _value) -> None:
++        raise TypeError("StartupGuardReceipt is immutable")
++
++    def __repr__(self) -> str:
++        return "<StartupGuardReceipt sealed>"
++
++
++def _issue_startup_guard_receipt(
++    *,
++    config,
++    secrets,
++    checks,
++    observed_at: datetime,
++    secret_loaded_at: datetime,
++) -> StartupGuardReceipt:
++    """Issue the internal receipt after one successful structural guard."""
++
++    evidence = startup_posture_evidence(
++        checks=checks,
++        observed_at=observed_at,
++        secret_loaded_at=secret_loaded_at,
++    )
++    canonical = {
++        StartupCheckName.RUNTIME_CONFIGURATION,
++        StartupCheckName.LOOPBACK_HTTPS,
++        StartupCheckName.TLS,
++        StartupCheckName.DATABASE,
++        StartupCheckName.ENCRYPTION,
++    }
++    observed_names = {
++        check.name for check in evidence.structural_checks
++    }
++    if (
++        len(observed_names) != len(evidence.structural_checks)
++        or observed_names != canonical
++        or any(
++            check.status != "pass"
++            or check.detail_code is not StartupDetailCode.OK
++            for check in evidence.structural_checks
++        )
++        or evidence.secret_load_status != "pass"
++        or evidence.secret_loaded_at is None
++        or evidence.secret_loaded_at > evidence.observed_at
++    ):
++        raise RuntimeError("startup_guard_receipt_invalid")
++    receipt = object.__new__(StartupGuardReceipt)
++    object.__setattr__(receipt, "_seal", _STARTUP_GUARD_RECEIPT_SEAL)
++    object.__setattr__(receipt, "_config", config)
++    object.__setattr__(receipt, "_secrets", secrets)
++    object.__setattr__(receipt, "_evidence", evidence)
++    return receipt
++
++
++def _validate_startup_guard_receipt(
++    receipt: StartupGuardReceipt,
++    *,
++    config,
++    secrets,
++) -> StartupPostureEvidence:
++    """Fail closed unless a sealed receipt matches exact composition objects."""
++
++    try:
++        valid_seal = (
++            type(receipt) is StartupGuardReceipt
++            and receipt._seal is _STARTUP_GUARD_RECEIPT_SEAL
++            and type(receipt._evidence) is StartupPostureEvidence
++        )
++    except Exception:
++        valid_seal = False
++    if not valid_seal:
++        raise RuntimeError("startup_guard_receipt_invalid")
++    if receipt._config is not config or receipt._secrets is not secrets:
++        raise RuntimeError("startup_guard_receipt_mismatch")
++    return receipt._evidence
++
++
+ class PostureCheck(BaseModel):
+     """One value-free, typed observation."""
+ 
+-    model_config = ConfigDict(extra="forbid", frozen=True)
++    model_config = ConfigDict(
++        extra="forbid",
++        frozen=True,
++        strict=True,
++        allow_inf_nan=False,
++    )
+ 
+     name: PostureName
+     status: PostureStatus
+@@ -278,6 +391,47 @@ class PostureCheck(BaseModel):
+     rows_total: int | None = Field(default=None, ge=0)
+     rows_completed: int | None = Field(default=None, ge=0)
+ 
++    @field_validator(
++        "count",
++        "generation",
++        "completed_generation",
++        "budget_used",
++        "budget_remaining",
++        "budget_limit",
++        "input_tokens_used",
++        "input_tokens_remaining",
++        "input_tokens_limit",
++        "output_tokens_used",
++        "output_tokens_remaining",
++        "output_tokens_limit",
++        "schema_version",
++        "rows_total",
++        "rows_completed",
++        mode="before",
++    )
++    @classmethod
++    def integer_evidence_is_exact(
++        cls,
++        value: object,
++    ) -> object:
++        if value is not None and type(value) is not int:
++            raise ValueError("integer posture evidence must be exact")
++        return value
++
++    @field_validator(
++        "age_seconds",
++        "max_age_seconds",
++        mode="before",
++    )
++    @classmethod
++    def float_evidence_is_exact(
++        cls,
++        value: object,
++    ) -> object:
++        if value is not None and type(value) is not float:
++            raise ValueError("float posture evidence must be exact")
++        return value
++
+     @field_validator("scope")
+     @classmethod
+     def scope_is_typed(cls, value: str | None, info):
+@@ -285,7 +439,15 @@ class PostureCheck(BaseModel):
+             return value
+         name = info.data.get("name")
+         if name is PostureName.CIRCUIT_BREAKER:
+-            BreakerScope.parse(value)
++            if value not in {
++                "account",
++                "equity",
++                "crypto",
++                "liquidity",
++            }:
++                raise ValueError(
++                    "posture scope is not a breaker category"
++                )
+             return value
+         allowed: dict[PostureName, set[str]] = {
+             PostureName.REQUEST_BUDGET: {
+@@ -329,12 +491,23 @@ class PostureCheck(BaseModel):
+ class SecurityPostureReport(BaseModel):
+     """Read-only evidence that can never represent trading authority."""
+ 
+-    model_config = ConfigDict(extra="forbid", frozen=True)
++    model_config = ConfigDict(
++        extra="forbid",
++        frozen=True,
++        strict=True,
++    )
+ 
+     observed_at: AwareDatetime
+     checks: tuple[PostureCheck, ...]
+     can_trade: Literal[False] = False
+ 
++    @field_validator("can_trade", mode="before")
++    @classmethod
++    def can_trade_is_exact_false(cls, value: object) -> bool:
++        if type(value) is not bool or value is not False:
++            raise ValueError("can_trade must be exactly False")
++        return False
++
+ 
+ def _as_utc(value: datetime) -> datetime:
+     if value.tzinfo is None:
+@@ -350,13 +523,20 @@ def startup_posture_evidence(
+ ) -> StartupPostureEvidence:
+     """Convert startup guard output without carrying paths or secret metadata."""
+ 
++    if (
++        not isinstance(observed_at, datetime)
++        or observed_at.tzinfo is None
++        or not isinstance(secret_loaded_at, datetime)
++        or secret_loaded_at.tzinfo is None
++    ):
++        raise RuntimeError("startup_guard_receipt_invalid")
+     return StartupPostureEvidence(
+         observed_at=_as_utc(observed_at),
+         structural_checks=tuple(
+             StartupStructuralCheck(
+-                name=check.name,
++                name=StartupCheckName(check.name),
+                 status="pass" if check.passed else "blocked",
+-                detail_code=check.code,
++                detail_code=StartupDetailCode(check.code),
+             )
+             for check in checks
+         ),
+@@ -374,6 +554,44 @@ _LIVE_OR_UNKNOWN_ORDER_STATUSES = (
+     OrderStatus.SUBMITTED.value,
+     OrderStatus.PARTIALLY_FILLED.value,
+ )
++_KNOWN_ORDER_STATUSES = frozenset(
++    status.value for status in OrderStatus
++)
++_KNOWN_ORDER_ACCEPTANCE_STATES = frozenset(
++    {
++        "not_started",
++        "pending",
++        "accepted",
++        FILL_RECONCILIATION_REQUIRED,
++        *_KNOWN_ORDER_STATUSES,
++    }
++)
++_KNOWN_PLAN_CANCEL_STATES = frozenset(
++    {
++        PLAN_CANCEL_NONE,
++        PLAN_CANCEL_REQUESTED,
++        PLAN_CANCEL_INDETERMINATE,
++        PLAN_CANCEL_SETTLED,
++    }
++)
++_KNOWN_FILL_RECONCILIATION_STATES = frozenset(
++    {
++        FILL_RECONCILIATION_REQUIRED,
++        FILL_RECONCILIATION_TRUSTED,
++        FILL_RECONCILIATION_QUARANTINED,
++        FILL_RECONCILIATION_SUPERSEDED,
++    }
++)
++_KNOWN_RULE_STATES = frozenset(state.value for state in RuleState)
++_KNOWN_RULE_GROUP_STATES = frozenset(
++    {
++        RuleState.PENDING.value,
++        RuleState.ACTIVE.value,
++        RuleState.TRIGGERED.value,
++        RuleState.CANCELED.value,
++        RuleState.FAILED.value,
++    }
++)
+ _SAFETY_LATCH_ERROR_CODES = (
+     "broker_submission_unknown",
+     "cumulative_fill_contradiction",
+@@ -389,6 +607,195 @@ _SAFETY_LATCH_ERROR_CODES = (
+ )
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class SensitiveEncryptionPostureSnapshot:
++    """Safe-column-only encryption migration evidence."""
++
++    status: PostureStatus
++    detail_code: PostureDetailCode | StartupDetailCode
++    migration_state: Literal[
++        "required",
++        "migrating",
++        "complete",
++        "rotating",
++        "failed",
++    ] | None = None
++    schema_version: int | None = None
++    rows_total: int | None = None
++    rows_completed: int | None = None
++    started_at: datetime | None = None
++    completed_at: datetime | None = None
++    updated_at: datetime | None = None
++
++
++class SensitiveEncryptionPostureInspector:
++    """Inspect migration metadata without selecting ciphertext or key IDs."""
++
++    _BLOCKED_CODES = {
++        "required": StartupDetailCode.SENSITIVE_MIGRATION_REQUIRED,
++        "migrating": StartupDetailCode.SENSITIVE_MIGRATION_MIGRATING,
++        "rotating": StartupDetailCode.SENSITIVE_MIGRATION_ROTATING,
++        "failed": StartupDetailCode.SENSITIVE_MIGRATION_FAILED,
++    }
++
++    def __init__(
++        self,
++        session_factory,
++        *,
++        schema_version: int,
++        startup_evidence: StartupPostureEvidence | None,
++    ) -> None:
++        self._session_factory = session_factory
++        self._schema_version = schema_version
++        self._startup_evidence = startup_evidence
++
++    @staticmethod
++    def _invalid(
++        **safe_state,
++    ) -> SensitiveEncryptionPostureSnapshot:
++        return SensitiveEncryptionPostureSnapshot(
++            status=PostureStatus.UNKNOWN,
++            detail_code=(
++                StartupDetailCode.SENSITIVE_MIGRATION_STATE_INVALID
++            ),
++            **safe_state,
++        )
++
++    def inspect(
++        self,
++        *,
++        observed_at: datetime,
++    ) -> SensitiveEncryptionPostureSnapshot:
++        with self._session_factory() as session:
++            row = session.execute(
++                select(
++                    SensitiveMigrationState.singleton_id,
++                    SensitiveMigrationState.schema_version,
++                    SensitiveMigrationState.state,
++                    SensitiveMigrationState.rows_total,
++                    SensitiveMigrationState.rows_completed,
++                    SensitiveMigrationState.started_at,
++                    SensitiveMigrationState.completed_at,
++                    SensitiveMigrationState.updated_at,
++                )
++            ).one_or_none()
++        if row is None or type(row.singleton_id) is not int:
++            return self._invalid()
++        if (
++            row.singleton_id != 1
++            or type(row.schema_version) is not int
++            or row.schema_version <= 0
++            or type(row.rows_total) is not int
++            or row.rows_total < 0
++            or type(row.rows_completed) is not int
++            or not 0 <= row.rows_completed <= row.rows_total
++            or row.state
++            not in {
++                "required",
++                "migrating",
++                "complete",
++                "rotating",
++                "failed",
++            }
++            or not isinstance(row.updated_at, datetime)
++        ):
++            return self._invalid()
++        started_at = (
++            _as_utc(row.started_at)
++            if isinstance(row.started_at, datetime)
++            else None
++        )
++        completed_at = (
++            _as_utc(row.completed_at)
++            if isinstance(row.completed_at, datetime)
++            else None
++        )
++        updated_at = _as_utc(row.updated_at)
++        safe_state = {
++            "migration_state": row.state,
++            "schema_version": row.schema_version,
++            "rows_total": row.rows_total,
++            "rows_completed": row.rows_completed,
++            "started_at": started_at,
++            "completed_at": completed_at,
++            "updated_at": updated_at,
++        }
++        if updated_at > observed_at:
++            return self._invalid(**safe_state)
++        if row.schema_version != self._schema_version:
++            return SensitiveEncryptionPostureSnapshot(
++                status=PostureStatus.BLOCKED,
++                detail_code=StartupDetailCode.SENSITIVE_SCHEMA_MISMATCH,
++                **safe_state,
++            )
++        if row.state == "required":
++            if (
++                started_at is not None
++                or completed_at is not None
++                or row.rows_completed != 0
++            ):
++                return self._invalid(**safe_state)
++            return SensitiveEncryptionPostureSnapshot(
++                status=PostureStatus.BLOCKED,
++                detail_code=self._BLOCKED_CODES[row.state],
++                **safe_state,
++            )
++        if row.state in {"migrating", "rotating", "failed"}:
++            if (
++                started_at is None
++                or completed_at is not None
++                or not started_at <= updated_at
++            ):
++                return self._invalid(**safe_state)
++            return SensitiveEncryptionPostureSnapshot(
++                status=PostureStatus.BLOCKED,
++                detail_code=self._BLOCKED_CODES[row.state],
++                **safe_state,
++            )
++        if (
++            started_at is None
++            or completed_at is None
++            or row.rows_completed != row.rows_total
++            or not started_at <= completed_at <= updated_at
++        ):
++            return self._invalid(**safe_state)
++        startup = self._startup_evidence
++        if startup is None:
++            return SensitiveEncryptionPostureSnapshot(
++                status=PostureStatus.UNKNOWN,
++                detail_code=(
++                    PostureDetailCode.STARTUP_EVIDENCE_UNAVAILABLE
++                ),
++                **safe_state,
++            )
++        startup_check = next(
++            (
++                check
++                for check in startup.structural_checks
++                if check.name is StartupCheckName.ENCRYPTION
++            ),
++            None,
++        )
++        if (
++            startup_check is None
++            or startup_check.status != "pass"
++            or startup_check.detail_code is not StartupDetailCode.OK
++            or updated_at > startup.observed_at
++        ):
++            return SensitiveEncryptionPostureSnapshot(
++                status=PostureStatus.UNKNOWN,
++                detail_code=(
++                    PostureDetailCode.ENCRYPTION_EVIDENCE_UNAVAILABLE
++                ),
++                **safe_state,
++            )
++        return SensitiveEncryptionPostureSnapshot(
++            status=PostureStatus.PASS,
++            detail_code=StartupDetailCode.OK,
++            **safe_state,
++        )
++
++
+ class SecurityPostureService:
+     """Build a local snapshot without calling or mutating any dependency."""
+ 
+@@ -399,22 +806,31 @@ class SecurityPostureService:
+         session_factory,
+         reconciliation_key: str,
+         reconciliation_enabled: bool,
+-        startup_evidence: StartupPostureEvidence | None = None,
+         rate_limiter: DurableRateLimiter | None = None,
+         provider_budget: ProviderBudgetService | None = None,
+-        engine=None,
+-        sensitive_cipher=None,
+         clock: Callable[[], datetime] | None = None,
++        _startup_guard_receipt: StartupGuardReceipt | None = None,
++        _startup_secrets=None,
+     ) -> None:
+         self._config = config
+         self._session_factory = session_factory
+         self._reconciliation_key = reconciliation_key
+         self._reconciliation_enabled = reconciliation_enabled
+-        self._startup_evidence = startup_evidence
++        if _startup_guard_receipt is None:
++            if _startup_secrets is not None:
++                raise RuntimeError("startup_guard_receipt_invalid")
++            self._startup_evidence = None
++        else:
++            if _startup_secrets is None:
++                raise RuntimeError("startup_guard_receipt_invalid")
++            self._startup_evidence = _validate_startup_guard_receipt(
++                _startup_guard_receipt,
++                config=config,
++                secrets=_startup_secrets,
++            )
++        self._startup_guard_receipt = _startup_guard_receipt
+         self._rate_limiter = rate_limiter
+         self._provider_budget = provider_budget
+-        self._engine = engine
+-        self._sensitive_cipher = sensitive_cipher
+         self._clock = clock or (lambda: datetime.now(UTC))
+ 
+     @staticmethod
+@@ -577,73 +993,12 @@ class SecurityPostureService:
+                 PostureName.SENSITIVE_ENCRYPTION,
+                 observed_at,
+             )
+-        if self._engine is None:
+-            return self._check(
+-                PostureName.SENSITIVE_ENCRYPTION,
+-                PostureStatus.UNKNOWN,
+-                observed_at,
+-                PostureDetailCode.ENCRYPTION_EVIDENCE_UNAVAILABLE,
+-            )
+         try:
+-            result = SensitiveEncryptionStateInspector(
+-                self._engine,
++            result = SensitiveEncryptionPostureInspector(
++                self._session_factory,
+                 schema_version=self._config.encryption.schema_version,
+-                active_key_id=self._config.encryption.active_key_id,
+-                cipher=self._sensitive_cipher,
+-            ).inspect()
+-        except Exception:
+-            return self._unknown(
+-                PostureName.SENSITIVE_ENCRYPTION,
+-                observed_at,
+-            )
+-        safe_state: dict[str, object] = {}
+-        try:
+-            with self._session_factory() as session:
+-                row = session.execute(
+-                    select(
+-                        SensitiveMigrationState.schema_version,
+-                        SensitiveMigrationState.state,
+-                        SensitiveMigrationState.rows_total,
+-                        SensitiveMigrationState.rows_completed,
+-                        SensitiveMigrationState.started_at,
+-                        SensitiveMigrationState.completed_at,
+-                        SensitiveMigrationState.updated_at,
+-                    )
+-                ).one_or_none()
+-            if (
+-                row is not None
+-                and type(row.schema_version) is int
+-                and row.schema_version > 0
+-                and row.state
+-                in {
+-                    "required",
+-                    "migrating",
+-                    "complete",
+-                    "rotating",
+-                    "failed",
+-                }
+-                and type(row.rows_total) is int
+-                and row.rows_total >= 0
+-                and type(row.rows_completed) is int
+-                and 0 <= row.rows_completed <= row.rows_total
+-            ):
+-                safe_state = {
+-                    "migration_state": row.state,
+-                    "schema_version": row.schema_version,
+-                    "rows_total": row.rows_total,
+-                    "rows_completed": row.rows_completed,
+-                    "started_at": (
+-                        _as_utc(row.started_at)
+-                        if row.started_at is not None
+-                        else None
+-                    ),
+-                    "completed_at": (
+-                        _as_utc(row.completed_at)
+-                        if row.completed_at is not None
+-                        else None
+-                    ),
+-                    "updated_at": _as_utc(row.updated_at),
+-                }
++                startup_evidence=self._startup_evidence,
++            ).inspect(observed_at=observed_at)
+         except Exception:
+             return self._unknown(
+                 PostureName.SENSITIVE_ENCRYPTION,
+@@ -651,14 +1006,16 @@ class SecurityPostureService:
+             )
+         return self._check(
+             PostureName.SENSITIVE_ENCRYPTION,
+-            (
+-                PostureStatus.PASS
+-                if result.passed
+-                else PostureStatus.BLOCKED
+-            ),
++            result.status,
+             observed_at,
+-            result.code,
+-            **safe_state,
++            result.detail_code,
++            migration_state=result.migration_state,
++            schema_version=result.schema_version,
++            rows_total=result.rows_total,
++            rows_completed=result.rows_completed,
++            started_at=result.started_at,
++            completed_at=result.completed_at,
++            updated_at=result.updated_at,
+         )
+ 
+     def _request_budget_checks(
+@@ -885,47 +1242,77 @@ class SecurityPostureService:
+                 CircuitBreakerState.updated_at,
+             ).order_by(CircuitBreakerState.scope_key)
+         ).all()
+-        checks: list[PostureCheck] = []
+-        for row in rows:
+-            scope = BreakerScope.parse(row.scope_key)
+-            if (
+-                scope.kind.value != row.kind
+-                or scope.target != row.target
+-                or type(row.tripped) is not bool
+-                or type(row.generation) is not int
+-                or row.generation < 0
+-            ):
+-                raise ValueError("invalid breaker evidence")
+-            checks.append(
+-                self._check(
+-                    PostureName.CIRCUIT_BREAKER,
+-                    (
+-                        PostureStatus.TRIPPED
+-                        if row.tripped
+-                        else PostureStatus.CLEAR
+-                    ),
+-                    observed_at,
+-                    (
+-                        PostureDetailCode.BREAKER_TRIPPED
+-                        if row.tripped
+-                        else PostureDetailCode.BREAKER_CLEAR
+-                    ),
+-                    scope=row.scope_key,
+-                    generation=row.generation,
+-                    updated_at=_as_utc(row.updated_at),
++        categories = ("account", "equity", "crypto", "liquidity")
++        aggregated = {
++            category: {"tripped": 0, "generation": 0}
++            for category in categories
++        }
++        try:
++            for row in rows:
++                scope = BreakerScope.parse(row.scope_key)
++                updated_at = _as_utc(row.updated_at)
++                if (
++                    scope.kind.value != row.kind
++                    or scope.target != row.target
++                    or type(row.tripped) is not bool
++                    or type(row.generation) is not int
++                    or row.generation <= 0
++                    or updated_at > observed_at
++                ):
++                    raise ValueError("invalid breaker evidence")
++                if scope.kind in {
++                    BreakerKind.OPERATOR_GLOBAL,
++                    BreakerKind.BROKER_DRIFT,
++                }:
++                    category = "account"
++                elif scope.kind in {
++                    BreakerKind.DATA,
++                    BreakerKind.LOSS,
++                    BreakerKind.DRAWDOWN,
++                }:
++                    category = scope.target
++                elif scope.kind is BreakerKind.LIQUIDITY:
++                    category = "liquidity"
++                else:
++                    raise ValueError("invalid breaker evidence")
++                state = aggregated[category]
++                state["generation"] = max(
++                    state["generation"],
++                    row.generation,
+                 )
+-            )
+-        if not checks:
+-            checks.append(
++                if row.tripped:
++                    state["tripped"] += 1
++        except Exception:
++            return [
+                 self._check(
+                     PostureName.CIRCUIT_BREAKER,
+-                    PostureStatus.CLEAR,
++                    PostureStatus.UNKNOWN,
+                     observed_at,
+-                    PostureDetailCode.BREAKER_CLEAR,
+-                    count=0,
++                    PostureDetailCode.BREAKER_SCOPE_INVALID,
++                    scope=category,
+                 )
++                for category in categories
++            ]
++        return [
++            self._check(
++                PostureName.CIRCUIT_BREAKER,
++                (
++                    PostureStatus.TRIPPED
++                    if aggregated[category]["tripped"]
++                    else PostureStatus.CLEAR
++                ),
++                observed_at,
++                (
++                    PostureDetailCode.BREAKER_TRIPPED
++                    if aggregated[category]["tripped"]
++                    else PostureDetailCode.BREAKER_CLEAR
++                ),
++                scope=category,
++                count=aggregated[category]["tripped"],
++                generation=aggregated[category]["generation"],
+             )
+-        return checks
++            for category in categories
++        ]
+ 
+     def _heartbeat_check(
+         self,
+@@ -999,22 +1386,28 @@ class SecurityPostureService:
+                 generation=0,
+                 completed_generation=0,
+             )
+-        if (
+-            type(row.generation) is not int
+-            or row.generation < 0
+-            or type(row.completed_generation) is not int
+-            or row.completed_generation < 0
+-            or row.completed_generation > row.generation
+-            or row.status not in {"required", "current", "failed"}
+-        ):
+-            raise ValueError("invalid reconciliation evidence")
+-        started_at = _as_utc(row.started_at)
+-        completed_at = (
+-            _as_utc(row.completed_at)
+-            if row.completed_at is not None
+-            else None
++        validation = validate_startup_reconciliation_snapshot(
++            generation=row.generation,
++            completed_generation=row.completed_generation,
++            status=row.status,
++            started_at=row.started_at,
++            completed_at=row.completed_at,
++            updated_at=row.updated_at,
++            observed_at=observed_at,
+         )
+-        updated_at = _as_utc(row.updated_at)
++        if not validation.valid:
++            return self._unknown(
++                PostureName.STARTUP_RECONCILIATION,
++                observed_at,
++                detail=(
++                    PostureDetailCode.RECONCILIATION_EVIDENCE_INVALID
++                ),
++            )
++        started_at = validation.started_at
++        completed_at = validation.completed_at
++        updated_at = validation.updated_at
++        assert started_at is not None
++        assert updated_at is not None
+         common = {
+             "generation": row.generation,
+             "completed_generation": row.completed_generation,
+@@ -1038,12 +1431,14 @@ class SecurityPostureService:
+                 PostureDetailCode.RECONCILIATION_FAILED,
+                 **common,
+             )
+-        if (
+-            completed_at is None
+-            or row.completed_generation != row.generation
+-            or completed_at > observed_at
+-        ):
+-            raise ValueError("invalid reconciliation evidence")
++        if not validation.current or completed_at is None:
++            return self._unknown(
++                PostureName.STARTUP_RECONCILIATION,
++                observed_at,
++                detail=(
++                    PostureDetailCode.RECONCILIATION_EVIDENCE_INVALID
++                ),
++            )
+         age = (observed_at - completed_at).total_seconds()
+         max_age = self._config.trading.reconciliation_max_age_seconds
+         stale = age > max_age
+@@ -1139,70 +1534,164 @@ class SecurityPostureService:
+         session,
+         observed_at: datetime,
+     ) -> list[PostureCheck]:
+-        order_count = session.scalar(
+-            select(func.count(Order.id)).where(
+-                or_(
+-                    Order.status.in_(_LIVE_OR_UNKNOWN_ORDER_STATUSES),
+-                    Order.acceptance_state
+-                    == "fill_reconcile_required",
+-                    Order.last_error_code.in_(
+-                        _SAFETY_LATCH_ERROR_CODES
+-                    ),
++        def known_values(column, known: frozenset[str]) -> bool:
++            values = session.scalars(
++                select(column).distinct()
++            ).all()
++            return all(
++                type(value) is str and value in known
++                for value in values
++            )
++
++        order_domain_known = (
++            known_values(Order.status, _KNOWN_ORDER_STATUSES)
++            and known_values(
++                Order.acceptance_state,
++                _KNOWN_ORDER_ACCEPTANCE_STATES,
++            )
++            and known_values(
++                Order.plan_cancel_state,
++                _KNOWN_PLAN_CANCEL_STATES,
++            )
++        )
++        fill_domain_known = known_values(
++            Fill.reconciliation_state,
++            _KNOWN_FILL_RECONCILIATION_STATES,
++        )
++        rule_domain_known = known_values(
++            Rule.state,
++            _KNOWN_RULE_STATES,
++        )
++        group_domain_known = known_values(
++            RuleGroup.state,
++            _KNOWN_RULE_GROUP_STATES,
++        )
++        order_count = (
++            session.scalar(
++                select(func.count(Order.id)).where(
++                    or_(
++                        Order.status.in_(
++                            _LIVE_OR_UNKNOWN_ORDER_STATUSES
++                        ),
++                        Order.acceptance_state
++                        == FILL_RECONCILIATION_REQUIRED,
++                        Order.plan_cancel_state.in_(
++                            (
++                                PLAN_CANCEL_REQUESTED,
++                                PLAN_CANCEL_INDETERMINATE,
++                            )
++                        ),
++                        Order.last_error_code.in_(
++                            _SAFETY_LATCH_ERROR_CODES
++                        ),
++                    )
+                 )
+             )
++            if order_domain_known
++            else None
+         )
+-        fill_count = session.scalar(
+-            select(func.count(Fill.id)).where(
+-                or_(
+-                    Fill.order_id.is_(None),
+-                    Fill.reconciliation_state
+-                    == FILL_RECONCILIATION_QUARANTINED,
+-                    (
+-                        Fill.reconciliation_state
+-                        != FILL_RECONCILIATION_SUPERSEDED
++        fill_count = (
++            session.scalar(
++                select(func.count(Fill.id)).where(
++                    or_(
++                        Fill.order_id.is_(None),
++                        Fill.reconciliation_state.in_(
++                            (
++                                FILL_RECONCILIATION_REQUIRED,
++                                FILL_RECONCILIATION_QUARANTINED,
++                            )
++                        ),
++                        (
++                            Fill.reconciliation_state
++                            != FILL_RECONCILIATION_SUPERSEDED
++                        )
++                        & or_(
++                            Fill.broker_fill_id.is_(None),
++                            func.trim(Fill.broker_fill_id) == "",
++                        ),
+                     )
+-                    & or_(
+-                        Fill.broker_fill_id.is_(None),
+-                        func.trim(Fill.broker_fill_id) == "",
+-                    ),
+                 )
+             )
++            if fill_domain_known
++            else None
+         )
+-        rule_count = session.scalar(
+-            select(func.count(Rule.id)).where(
+-                Rule.state.in_(("pending", "active", "processing"))
++        rule_count = (
++            session.scalar(
++                select(func.count(Rule.id)).where(
++                    Rule.state.in_(("pending", "active", "processing"))
++                )
+             )
++            if rule_domain_known
++            else None
+         )
+-        group_count = session.scalar(
+-            select(func.count(RuleGroup.id)).where(
+-                or_(
+-                    RuleGroup.state.in_(("pending", "active")),
+-                    RuleGroup.reconciliation_required.is_(True),
++        group_count = (
++            session.scalar(
++                select(func.count(RuleGroup.id)).where(
++                    or_(
++                        RuleGroup.state.in_(("pending", "active")),
++                        RuleGroup.reconciliation_required.is_(True),
++                    )
+                 )
+             )
++            if group_domain_known
++            else None
+         )
+         return [
+-            self._count_check(
+-                PostureName.UNSAFE_ORDERS,
+-                observed_at,
+-                int(order_count or 0),
++            (
++                self._count_check(
++                    PostureName.UNSAFE_ORDERS,
++                    observed_at,
++                    int(order_count or 0),
++                )
++                if order_domain_known
++                else self._unknown(
++                    PostureName.UNSAFE_ORDERS,
++                    observed_at,
++                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
++                )
+             ),
+-            self._count_check(
+-                PostureName.UNSAFE_FILLS,
+-                observed_at,
+-                int(fill_count or 0),
++            (
++                self._count_check(
++                    PostureName.UNSAFE_FILLS,
++                    observed_at,
++                    int(fill_count or 0),
++                )
++                if fill_domain_known
++                else self._unknown(
++                    PostureName.UNSAFE_FILLS,
++                    observed_at,
++                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
++                )
+             ),
+-            self._count_check(
+-                PostureName.UNSAFE_RULES,
+-                observed_at,
+-                int(rule_count or 0),
+-                scope="rules",
++            (
++                self._count_check(
++                    PostureName.UNSAFE_RULES,
++                    observed_at,
++                    int(rule_count or 0),
++                    scope="rules",
++                )
++                if rule_domain_known
++                else self._unknown(
++                    PostureName.UNSAFE_RULES,
++                    observed_at,
++                    scope="rules",
++                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
++                )
+             ),
+-            self._count_check(
+-                PostureName.UNSAFE_RULES,
+-                observed_at,
+-                int(group_count or 0),
+-                scope="rule_groups",
++            (
++                self._count_check(
++                    PostureName.UNSAFE_RULES,
++                    observed_at,
++                    int(group_count or 0),
++                    scope="rule_groups",
++                )
++                if group_domain_known
++                else self._unknown(
++                    PostureName.UNSAFE_RULES,
++                    observed_at,
++                    scope="rule_groups",
++                    detail=PostureDetailCode.STATE_DOMAIN_INVALID,
++                )
+             ),
+         ]
+ 
+@@ -1292,12 +1781,21 @@ class SecurityPostureService:
+             )
+             for state in ("received", "summarized", "rejected", "failed")
+         ]
++        checks.extend(
++            self._unknown(
++                PostureName.CIRCUIT_BREAKER,
++                observed_at,
++                scope=scope,
++            )
++            for scope in (
++                "account",
++                "equity",
++                "crypto",
++                "liquidity",
++            )
++        )
+         checks.extend(
+             [
+-                self._unknown(
+-                    PostureName.CIRCUIT_BREAKER,
+-                    observed_at,
+-                ),
+                 self._unknown(
+                     PostureName.DAEMON_HEARTBEAT,
+                     observed_at,
+diff --git a/src/trading_assistant/operations/service.py b/src/trading_assistant/operations/service.py
+index a50cdc5..45e646f 100644
+--- a/src/trading_assistant/operations/service.py
++++ b/src/trading_assistant/operations/service.py
+@@ -13,7 +13,7 @@ from .health import (
+ from .security_posture import (
+     SecurityPostureReport,
+     SecurityPostureService,
+-    StartupPostureEvidence,
++    StartupGuardReceipt,
+ )
+ 
+ _LOG = logging.getLogger(__name__)
+@@ -29,17 +29,22 @@ class OperationsService:
+         leases=None,
+         provider_budget=None,
+         policy_store_maintenance=None,
+-        startup_evidence: StartupPostureEvidence | None = None,
+-        engine=None,
+-        sensitive_cipher=None,
+         security_posture_reader: SecurityPostureService | None = None,
++        _startup_guard_receipt: StartupGuardReceipt | None = None,
++        _startup_secrets=None,
+     ) -> None:
++        if (
++            security_posture_reader is not None
++            and _startup_guard_receipt is not None
++        ):
++            raise RuntimeError("startup_guard_receipt_invalid")
+         self.service = service
+         self.audit = audit or AuditRecorder(service.session_factory)
+         self.rate_limiter = rate_limiter
+         self.leases = leases
+         self.provider_budget = provider_budget
+         self.policy_store_maintenance = policy_store_maintenance
++        self._startup_guard_receipt = _startup_guard_receipt
+         reconciliation = service.startup_reconciliation
+         self._security_posture_reader = (
+             security_posture_reader
+@@ -49,11 +54,10 @@ class OperationsService:
+                 session_factory=service.session_factory,
+                 reconciliation_key=reconciliation.broker_key,
+                 reconciliation_enabled=reconciliation.enabled,
+-                startup_evidence=startup_evidence,
+                 rate_limiter=rate_limiter,
+                 provider_budget=provider_budget,
+-                engine=engine,
+-                sensitive_cipher=sensitive_cipher,
++                _startup_guard_receipt=_startup_guard_receipt,
++                _startup_secrets=_startup_secrets,
+             )
+         )
+ 
+diff --git a/src/trading_assistant/ops/serve.py b/src/trading_assistant/ops/serve.py
+index 2bacd3a..79d1256 100644
+--- a/src/trading_assistant/ops/serve.py
++++ b/src/trading_assistant/ops/serve.py
+@@ -15,8 +15,8 @@ from typing import Protocol
+ import uvicorn
+ from sqlalchemy import text
+ 
+-from ..app.main import create_app
+-from ..bootstrap import build_container
++from ..app.main import _create_guarded_app
++from ..bootstrap import _build_guarded_container
+ from ..config import load_config
+ from ..db.schema import require_current_schema
+ from ..db.session import create_db_engine
+@@ -25,7 +25,10 @@ from ..preflight import (
+     StructuralCheck,
+     structural_runtime_check,
+ )
+-from ..operations.security_posture import startup_posture_evidence
++from ..operations.security_posture import (
++    StartupGuardReceipt,
++    _issue_startup_guard_receipt,
++)
+ from ..security.crypto import build_sensitive_data_cipher
+ from ..security.secrets import (
+     MacOSKeychainSecretProvider,
+@@ -93,7 +96,8 @@ def run_startup_guard(
+     config=None,
+     secrets: RuntimeSecrets | None = None,
+     encryption_inspector: EncryptionStateInspector | None = None,
+-) -> tuple[StructuralCheck, ...]:
++    secret_loaded_at: datetime,
++) -> StartupGuardReceipt:
+     """Run local structural checks and raise before app construction on failure."""
+     config = config or load_config()
+     if secrets is None:
+@@ -143,7 +147,13 @@ def run_startup_guard(
+     )
+     if any(not check.passed for check in checks):
+         raise StartupGuardBlocked(checks)
+-    return checks
++    return _issue_startup_guard_receipt(
++        config=config,
++        secrets=secrets,
++        checks=checks,
++        observed_at=datetime.now(timezone.utc),
++        secret_loaded_at=secret_loaded_at,
++    )
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+@@ -167,10 +177,6 @@ def main(argv: list[str] | None = None) -> int:
+                 ),
+             )
+         ) from None
+-    checks = run_startup_guard(
+-        config=config,
+-        secrets=secrets,
+-    )
+     secret_loaded_at = secret_provider.last_successful_role_load_at
+     if secret_loaded_at is None:
+         raise StartupGuardBlocked(
+@@ -182,23 +188,23 @@ def main(argv: list[str] | None = None) -> int:
+                 ),
+             )
+         )
+-    evidence = startup_posture_evidence(
+-        checks=checks,
+-        observed_at=datetime.now(timezone.utc),
++    startup_guard_receipt = run_startup_guard(
++        config=config,
++        secrets=secrets,
+         secret_loaded_at=secret_loaded_at,
+     )
+     control = start_app_control(Path.cwd())
+     app = None
+     try:
+-        container = build_container(
++        container = _build_guarded_container(
+             config,
+             secrets,
+             runtime_role="app",
+-            startup_evidence=evidence,
++            startup_guard_receipt=startup_guard_receipt,
+         )
+-        app = create_app(
++        app = _create_guarded_app(
+             container=container,
+-            startup_evidence=evidence,
++            startup_guard_receipt=startup_guard_receipt,
+         )
+         server = uvicorn.Server(
+             uvicorn.Config(
+diff --git a/src/trading_assistant/orders/startup.py b/src/trading_assistant/orders/startup.py
+index 6c96076..d3fea3f 100644
+--- a/src/trading_assistant/orders/startup.py
++++ b/src/trading_assistant/orders/startup.py
+@@ -3,8 +3,10 @@
+ from __future__ import annotations
+ 
+ import json
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+ import re
++from typing import Callable
+ 
+ from sqlalchemy.orm import Session, sessionmaker
+ 
+@@ -23,6 +25,101 @@ class StartupReconciliationFailed(RuntimeError):
+ _FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{2,63}\Z")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class StartupReconciliationValidation:
++    """Pure validation result over non-narrative reconciliation columns."""
++
++    valid: bool
++    current: bool
++    started_at: datetime | None
++    completed_at: datetime | None
++    updated_at: datetime | None
++
++
++def _persisted_utc(value: object) -> datetime | None:
++    if not isinstance(value, datetime):
++        return None
++    if value.tzinfo is None:
++        return value.replace(tzinfo=timezone.utc)
++    return value.astimezone(timezone.utc)
++
++
++def validate_startup_reconciliation_snapshot(
++    *,
++    generation: object,
++    completed_generation: object,
++    status: object,
++    started_at: object,
++    completed_at: object,
++    updated_at: object,
++    observed_at: object,
++    expected_generation: int | None = None,
++) -> StartupReconciliationValidation:
++    """Validate exactly the safe columns used by reconciliation authority."""
++
++    observed = _persisted_utc(observed_at)
++    started = _persisted_utc(started_at)
++    completed = (
++        _persisted_utc(completed_at)
++        if completed_at is not None
++        else None
++    )
++    updated = _persisted_utc(updated_at)
++    invalid = StartupReconciliationValidation(
++        valid=False,
++        current=False,
++        started_at=started,
++        completed_at=completed,
++        updated_at=updated,
++    )
++    if (
++        observed is None
++        or not isinstance(observed_at, datetime)
++        or observed_at.tzinfo is None
++        or type(generation) is not int
++        or generation <= 0
++        or type(completed_generation) is not int
++        or completed_generation < 0
++        or completed_generation > generation
++        or status not in {"required", "current", "failed"}
++        or started is None
++        or updated is None
++        or not started <= updated <= observed
++        or (
++            expected_generation is not None
++            and (
++                type(expected_generation) is not int
++                or expected_generation <= 0
++                or generation != expected_generation
++            )
++        )
++    ):
++        return invalid
++    if status == "current":
++        if (
++            completed_generation != generation
++            or completed is None
++            or not started <= completed <= updated
++        ):
++            return invalid
++        return StartupReconciliationValidation(
++            valid=True,
++            current=True,
++            started_at=started,
++            completed_at=completed,
++            updated_at=updated,
++        )
++    if completed_generation >= generation or completed is not None:
++        return invalid
++    return StartupReconciliationValidation(
++        valid=True,
++        current=False,
++        started_at=started,
++        completed_at=None,
++        updated_at=updated,
++    )
++
++
+ def _context(
+     actor: str,
+     reason: str,
+@@ -48,10 +145,12 @@ class StartupReconciliationGate:
+         broker_key: str,
+         *,
+         enabled: bool,
++        clock: Callable[[], datetime] | None = None,
+     ) -> None:
+         self.session_factory = session_factory
+         self.broker_key = broker_key
+         self.enabled = enabled
++        self._clock = clock or (lambda: datetime.now(timezone.utc))
+         self.submission_barrier = SubmissionBarrier(session_factory)
+ 
+     def require(
+@@ -65,7 +164,7 @@ class StartupReconciliationGate:
+         actor, reason, request_id = _context(actor, reason, request_id)
+         if not self.enabled:
+             raise RuntimeError("startup reconciliation gate is disabled")
+-        now = datetime.now(timezone.utc)
++        now = self._clock()
+         with self.submission_barrier.hold_writer():
+             with self.session_factory() as session:
+                 state = session.get(
+@@ -130,7 +229,7 @@ class StartupReconciliationGate:
+             raise ValueError("startup reconciliation generation must be positive")
+         if not self.enabled:
+             return True
+-        now = datetime.now(timezone.utc)
++        now = self._clock()
+         encoded_evidence = json.dumps(evidence, sort_keys=True)
+         with self.submission_barrier.hold_writer():
+             with self.session_factory() as session:
+@@ -197,7 +296,7 @@ class StartupReconciliationGate:
+             raise ValueError("startup reconciliation failure code is invalid")
+         if not self.enabled:
+             return False
+-        now = datetime.now(timezone.utc)
++        now = self._clock()
+         detail = {**evidence, "failure_code": failure_code}
+         encoded_evidence = json.dumps(detail, sort_keys=True)
+         with self.submission_barrier.hold_writer():
+@@ -292,18 +391,31 @@ class StartupReconciliationGate:
+     def is_current(self, generation: int | None = None) -> bool:
+         if not self.enabled:
+             return True
+-        with self.session_factory() as session:
+-            state = session.get(
+-                StartupReconciliationState,
+-                self.broker_key,
+-            )
+-            return (
+-                state is not None
+-                and state.generation > 0
+-                and state.status == "current"
+-                and state.completed_generation == state.generation
+-                and (
+-                    generation is None
+-                    or state.generation == generation
+-                )
++        try:
++            with self.session_factory() as session:
++                row = session.query(
++                    StartupReconciliationState.generation,
++                    StartupReconciliationState.completed_generation,
++                    StartupReconciliationState.status,
++                    StartupReconciliationState.started_at,
++                    StartupReconciliationState.completed_at,
++                    StartupReconciliationState.updated_at,
++                ).filter(
++                    StartupReconciliationState.broker
++                    == self.broker_key
++                ).one_or_none()
++            if row is None:
++                return False
++            validation = validate_startup_reconciliation_snapshot(
++                generation=row.generation,
++                completed_generation=row.completed_generation,
++                status=row.status,
++                started_at=row.started_at,
++                completed_at=row.completed_at,
++                updated_at=row.updated_at,
++                observed_at=self._clock(),
++                expected_generation=generation,
+             )
++            return validation.valid and validation.current
++        except Exception:
++            return False
+diff --git a/tests/test_bootstrap.py b/tests/test_bootstrap.py
+index ab86517..ef78ea7 100644
+--- a/tests/test_bootstrap.py
++++ b/tests/test_bootstrap.py
+@@ -494,11 +494,14 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
+     assert app.state.provider_budget is container.provider_budget
+ 
+ 
+-def test_create_app_preserves_exact_container_startup_evidence_identity(
++def test_public_create_app_rejects_raw_startup_evidence_and_injection_is_unknown(
+     make_service,
+ ):
+     from trading_assistant.operations.security_posture import (
++        StartupCheckName,
++        StartupDetailCode,
+         StartupPostureEvidence,
++        StartupStructuralCheck,
+     )
+ 
+     service = make_service()
+@@ -507,39 +510,188 @@ def test_create_app_preserves_exact_container_startup_evidence_identity(
+     )
+     evidence = StartupPostureEvidence(
+         observed_at=datetime.now(timezone.utc),
+-        structural_checks=(),
++        structural_checks=(
++            StartupStructuralCheck(
++                name=StartupCheckName.LOOPBACK_HTTPS,
++                status="pass",
++                detail_code=StartupDetailCode.OK,
++            ),
++        ),
+         secret_provider="macos_keychain",
+         secret_load_status="pass",
+         secret_loaded_at=datetime.now(timezone.utc),
+     )
+     container = _injected_container(service, secrets)
+-    container.startup_evidence = evidence
+-    container.operations = OperationsService(
+-        service,
+-        container.audit,
+-        rate_limiter=container.rate_limiter,
+-        provider_budget=container.provider_budget,
+-        startup_evidence=evidence,
+-    )
+ 
++    with pytest.raises(TypeError):
++        create_app(
++            container=container,
++            agent=_StubAgent(),
++            planning=None,
++            startup_evidence=evidence,
++        )
+     app = create_app(
+         container=container,
+         agent=_StubAgent(),
+         planning=None,
+-        startup_evidence=evidence,
++    )
++    report = app.state.operations.security_posture(
++        limit_principal="session:1:operator",
+     )
+ 
+-    assert app.state.startup_evidence is evidence
++    assert app.state.startup_evidence is None
++    secret_check = next(
++        check
++        for check in report.checks
++        if check.name.value == "secret_provider"
++    )
++    assert secret_check.status.value == "unknown"
++
++
++def test_fabricated_startup_guard_receipt_is_rejected_before_composition(
++    make_service,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.operations.security_posture import (
++        StartupGuardReceipt,
++    )
++
++    service = make_service()
++    secrets = Secrets(
++        app_api_token="startup-receipt-fabrication-secret",
++    )
++    composed = []
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_container",
++        lambda *_args, **_kwargs: composed.append("built"),
++    )
++    fabricated = object.__new__(StartupGuardReceipt)
++
+     with pytest.raises(
+         RuntimeError,
+-        match="container and startup evidence do not match",
++        match="startup_guard_receipt_invalid",
++    ):
++        bootstrap._build_guarded_container(
++            service.config,
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=fabricated,
++        )
++
++    assert composed == []
++
++
++def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
++    make_service,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.app import main as app_main
++    from trading_assistant.operations import security_posture as posture
++
++    service = make_service()
++    secrets = Secrets(
++        app_api_token="startup-receipt-canonical-secret",
++    )
++    checks = (
++        SimpleNamespace(
++            name="runtime_configuration",
++            passed=True,
++            code="ok",
++        ),
++        SimpleNamespace(name="loopback_https", passed=True, code="ok"),
++        SimpleNamespace(name="tls", passed=True, code="ok"),
++        SimpleNamespace(name="database", passed=True, code="ok"),
++        SimpleNamespace(name="encryption", passed=True, code="ok"),
++    )
++    secret_loaded_at = datetime.now(timezone.utc)
++    receipt = posture._issue_startup_guard_receipt(
++        config=service.config,
++        secrets=secrets,
++        checks=checks,
++        observed_at=secret_loaded_at + timedelta(seconds=1),
++        secret_loaded_at=secret_loaded_at,
++    )
++    evidence = posture._validate_startup_guard_receipt(
++        receipt,
++        config=service.config,
++        secrets=secrets,
++    )
++    captured = []
++
++    def fake_build(config, loaded, **kwargs):
++        captured.append((config, loaded, kwargs))
++        return "guarded-container"
++
++    monkeypatch.setattr(bootstrap, "_build_container", fake_build)
++    with pytest.raises(TypeError):
++        bootstrap.build_container(
++            service.config,
++            secrets,
++            runtime_role="app",
++            startup_evidence=evidence,
++        )
++    assert (
++        bootstrap._build_guarded_container(
++            service.config,
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=receipt,
++        )
++        == "guarded-container"
++    )
++    assert captured[0][0] is service.config
++    assert captured[0][1] is secrets
++    assert captured[0][2]["startup_guard_receipt"] is receipt
++    with pytest.raises(
++        RuntimeError,
++        match="startup_guard_receipt_mismatch",
++    ):
++        bootstrap._build_guarded_container(
++            service.config.model_copy(),
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=receipt,
++        )
++
++    container = _injected_container(service, secrets)
++    container.startup_guard_receipt = receipt
++    container.operations = OperationsService(
++        service,
++        container.audit,
++        rate_limiter=container.rate_limiter,
++        provider_budget=container.provider_budget,
++        _startup_guard_receipt=receipt,
++        _startup_secrets=secrets,
++    )
++    with pytest.raises(
++        RuntimeError,
++        match="guarded container requires guarded app composition",
+     ):
+         create_app(
+             container=container,
+             agent=_StubAgent(),
+             planning=None,
+-            startup_evidence=evidence.model_copy(),
+         )
++    app = app_main._create_guarded_app(
++        container=container,
++        startup_guard_receipt=receipt,
++        agent=_StubAgent(),
++        planning=None,
++    )
++    report = app.state.operations.security_posture(
++        limit_principal="session:1:operator",
++    )
++    secret_check = next(
++        check
++        for check in report.checks
++        if check.name.value == "secret_provider"
++    )
++
++    assert app.state.startup_evidence is evidence
++    assert secret_check.status.value == "pass"
+ 
+ 
+ def test_automatic_planning_and_screen_use_exact_injected_secrets(
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index f5a79e7..b34410d 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -98,6 +98,7 @@ def test_startup_guard_uses_database_encryption_inspector_and_blocks_required(
+                     )
+                 },
+             ),
++            secret_loaded_at=datetime.now(timezone.utc),
+         )
+ 
+     codes = {check.code for check in captured.value.checks}
+@@ -146,23 +147,36 @@ def test_startup_guard_allows_only_internally_consistent_complete_encryption(
+         lambda _config: StructuralCheck("tls", "passed", "ok"),
+     )
+ 
+-    checks = serve.run_startup_guard(
++    secrets = Secrets(
++        database_url=url,
++        app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
++        field_encryption_keys={
++            config.encryption.active_key_id: (
++                base64.b64encode(b"l" * 32).decode()
++            )
++        },
++    )
++    receipt = serve.run_startup_guard(
+         config=config,
+-        secrets=Secrets(
+-            database_url=url,
+-            app_api_token="A7v!9qL2#mN4$pR6&tU8*wX0-zB3_cD5",
+-            field_encryption_keys={
+-                config.encryption.active_key_id: (
+-                    base64.b64encode(b"l" * 32).decode()
+-                )
+-            },
+-        ),
++        secrets=secrets,
++        secret_loaded_at=now,
+     )
++    from trading_assistant.operations import security_posture as posture
+ 
+-    assert all(check.passed for check in checks)
++    evidence = posture._validate_startup_guard_receipt(
++        receipt,
++        config=config,
++        secrets=secrets,
++    )
++
++    assert all(
++        check.status == "pass"
++        for check in evidence.structural_checks
++    )
+     assert any(
+-        check.name == "encryption" and check.code == "ok"
+-        for check in checks
++        check.name is posture.StartupCheckName.ENCRYPTION
++        and check.detail_code is posture.StartupDetailCode.OK
++        for check in evidence.structural_checks
+     )
+ 
+ 
+diff --git a/tests/test_route_policy.py b/tests/test_route_policy.py
+index ce1e430..e409883 100644
+--- a/tests/test_route_policy.py
++++ b/tests/test_route_policy.py
+@@ -178,6 +178,8 @@ def test_every_api_route_has_exact_policy(make_service):
+     posture = registry.get("GET", "/security/posture")
+     assert posture.auth is AuthLevel.SESSION
+     assert posture.limit_name == "session_read"
++    assert posture.lease_free_bounded_read is True
++    assert registry.get("GET", "/pending").lease_free_bounded_read is False
+     assert posture.broker_read is False
+     assert posture.provider_category is None
+     for path in (
+@@ -253,6 +255,37 @@ def test_duplicate_and_unclassified_routes_fail_inventory_validation():
+         validate_route_inventory(app)
+ 
+ 
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"method": "POST"},
++        {"requires_idempotency": True},
++        {"audit_mutation": True},
++        {"broker_read": True},
++        {"provider_category": "chat"},
++        {"mutation_operation": "order_cancel"},
++        {"concurrency_behavior": "coalesce_panic"},
++    ],
++)
++def test_lease_free_capability_is_restricted_to_bounded_local_reads(
++    overrides,
++):
++    values = {
++        "method": "GET",
++        "path": "/bounded",
++        "auth": AuthLevel.SESSION,
++        "limit_name": "session_read",
++        "lease_free_bounded_read": True,
++        **overrides,
++    }
++
++    with pytest.raises(
++        ValueError,
++        match="lease-free bounded read",
++    ):
++        RoutePolicy(**values)
++
++
+ def test_route_inventory_rejects_mounts_websockets_and_imperative_routes():
+     app = FastAPI(
+         docs_url=None,
+@@ -444,14 +477,37 @@ def test_security_posture_requires_session_and_uses_session_read_limit(
+         "/auth/login",
+         json={"secret": "posture-route-policy-secret"},
+     ).status_code == 200
++    with service.session_factory() as session:
++        before_leases = tuple(
++            session.execute(
++                select(
++                    ConcurrencyLease.resource_key,
++                    ConcurrencyLease.owner,
++                    ConcurrencyLease.expires_at,
++                    ConcurrencyLease.generation,
++                ).order_by(ConcurrencyLease.resource_key)
++            ).all()
++        )
+     allowed = client.get("/security/posture")
+     denied = client.get("/security/posture")
++    with service.session_factory() as session:
++        after_leases = tuple(
++            session.execute(
++                select(
++                    ConcurrencyLease.resource_key,
++                    ConcurrencyLease.owner,
++                    ConcurrencyLease.expires_at,
++                    ConcurrencyLease.generation,
++                ).order_by(ConcurrencyLease.resource_key)
++            ).all()
++        )
+ 
+     assert allowed.status_code == 200
+     assert allowed.json()["can_trade"] is False
+     assert denied.status_code == 429
+     assert denied.json()["error"]["code"] == "rate_limit_exceeded"
+     assert denied.headers["X-RateLimit-Limit"] == "1"
++    assert after_leases == before_leases
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/test_security_posture.py b/tests/test_security_posture.py
+index a4a80d8..74bac89 100644
+--- a/tests/test_security_posture.py
++++ b/tests/test_security_posture.py
+@@ -20,12 +20,18 @@ from trading_assistant.db.models import (
+     AuditEvent,
+     Base,
+     CircuitBreakerState,
++    ConcurrencyLease,
++    FILL_RECONCILIATION_REQUIRED,
++    FILL_RECONCILIATION_SUPERSEDED,
++    FILL_RECONCILIATION_TRUSTED,
+     Fill,
+     Heartbeat,
+     MutationInterlock,
+     Order,
++    PLAN_CANCEL_NONE,
+     ProviderBudgetDay,
+     ProviderReservation,
++    RateWindow,
+     Rule,
+     RuleGroup,
+     RuntimeTenure,
+@@ -35,6 +41,9 @@ from trading_assistant.db.models import (
+ )
+ from trading_assistant.app.limits import DurableRateLimiter
+ from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
++from trading_assistant.notifications.base import NullNotifier
++from trading_assistant.orders.startup import StartupReconciliationGate
++from trading_assistant.rules.models import RuleState
+ from trading_assistant.security.crypto import (
+     SensitiveDataCipher,
+     SensitiveFieldRef,
+@@ -57,19 +66,25 @@ def _reader(
+     *,
+     app_config,
+     session_factory,
+-    engine=None,
+-    startup_evidence=None,
++    startup_guard_receipt=None,
++    startup_secrets=None,
+     reconciliation_enabled=True,
+-    sensitive_cipher=None,
+ ):
+     posture = _posture_module()
+     configured = app_config.security.provider_budget
++    startup_kwargs = (
++        {
++            "_startup_guard_receipt": startup_guard_receipt,
++            "_startup_secrets": startup_secrets,
++        }
++        if startup_guard_receipt is not None
++        else {}
++    )
+     return posture.SecurityPostureService(
+         config=app_config,
+         session_factory=session_factory,
+         reconciliation_key="mock",
+         reconciliation_enabled=reconciliation_enabled,
+-        startup_evidence=startup_evidence,
+         rate_limiter=DurableRateLimiter(session_factory),
+         provider_budget=ProviderBudgetService(
+             session_factory,
+@@ -83,10 +98,41 @@ def _reader(
+             ),
+             clock=lambda: NOW,
+         ),
+-        engine=engine,
+-        sensitive_cipher=sensitive_cipher,
+         clock=lambda: NOW,
++        **startup_kwargs,
++    )
++
++
++def _issued_startup_receipt(
++    app_config,
++    *,
++    secrets=None,
++    checks=None,
++):
++    posture = _posture_module()
++    secrets = secrets or RuntimeSecrets(
++        app_api_token="posture-receipt-test-secret-0123456789",
++        database_url="sqlite:///posture-receipt-never-opened.db",
+     )
++    checks = checks or (
++        SimpleNamespace(
++            name="runtime_configuration",
++            passed=True,
++            code="ok",
++        ),
++        SimpleNamespace(name="loopback_https", passed=True, code="ok"),
++        SimpleNamespace(name="tls", passed=True, code="ok"),
++        SimpleNamespace(name="database", passed=True, code="ok"),
++        SimpleNamespace(name="encryption", passed=True, code="ok"),
++    )
++    receipt = posture._issue_startup_guard_receipt(
++        config=app_config,
++        secrets=secrets,
++        checks=checks,
++        observed_at=NOW,
++        secret_loaded_at=NOW - timedelta(seconds=2),
++    )
++    return receipt, secrets
+ 
+ 
+ def _checks_by_name(report, name):
+@@ -144,10 +190,10 @@ def test_security_posture_reports_evidence_not_permission(
+ def test_posture_models_are_frozen_extra_forbid_and_cannot_authorize():
+     posture = _posture_module()
+     check = posture.PostureCheck(
+-        name="quote_freshness",
+-        status="unknown",
++        name=posture.PostureName.QUOTE_FRESHNESS,
++        status=posture.PostureStatus.UNKNOWN,
+         observed_at=NOW,
+-        detail_code="quote_evidence_unavailable",
++        detail_code=posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE,
+     )
+     report = posture.SecurityPostureReport(
+         observed_at=NOW,
+@@ -173,20 +219,92 @@ def test_posture_models_are_frozen_extra_forbid_and_cannot_authorize():
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    ("field", "value"),
++    [
++        ("count", True),
++        ("generation", "1"),
++        ("budget_used", 1.0),
++        ("age_seconds", True),
++        ("max_age_seconds", "1.0"),
++    ],
++)
++def test_posture_models_reject_coercive_or_boolean_numeric_scalars(
++    field,
++    value,
++):
++    posture = _posture_module()
++
++    with pytest.raises(ValidationError):
++        posture.PostureCheck(
++            name=posture.PostureName.QUOTE_FRESHNESS,
++            status=posture.PostureStatus.UNKNOWN,
++            observed_at=NOW,
++            detail_code=(
++                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
++            ),
++            **{field: value},
++        )
++
++
++def test_posture_models_are_strict_and_can_trade_is_exact_false_bool():
++    posture = _posture_module()
++    check = posture.PostureCheck(
++        name=posture.PostureName.QUOTE_FRESHNESS,
++        status=posture.PostureStatus.UNKNOWN,
++        observed_at=NOW,
++        detail_code=posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE,
++    )
++    report = posture.SecurityPostureReport(
++        observed_at=NOW,
++        checks=(check,),
++    )
++
++    assert report.can_trade is False
++    assert type(report.can_trade) is bool
++    for value in (0, 0.0, "false", None):
++        with pytest.raises(ValidationError):
++            posture.SecurityPostureReport(
++                observed_at=NOW,
++                checks=(check,),
++                can_trade=value,
++            )
++    with pytest.raises(ValidationError):
++        posture.PostureCheck(
++            name="quote_freshness",
++            status=posture.PostureStatus.UNKNOWN,
++            observed_at=NOW,
++            detail_code=(
++                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
++            ),
++        )
++    with pytest.raises(ValidationError):
++        posture.PostureCheck(
++            name=posture.PostureName.QUOTE_FRESHNESS,
++            status=posture.PostureStatus.UNKNOWN,
++            observed_at=NOW.isoformat(),
++            detail_code=(
++                posture.PostureDetailCode.QUOTE_EVIDENCE_UNAVAILABLE
++            ),
++        )
++
++
+ def test_startup_posture_evidence_is_typed_redacted_and_immutable():
+     posture = _posture_module()
+     evidence = posture.StartupPostureEvidence(
+         observed_at=NOW,
+         structural_checks=(
+             posture.StartupStructuralCheck(
+-                name="loopback_https",
++                name=posture.StartupCheckName.LOOPBACK_HTTPS,
+                 status="pass",
+-                detail_code="ok",
++                detail_code=posture.StartupDetailCode.OK,
+             ),
+             posture.StartupStructuralCheck(
+-                name="tls",
++                name=posture.StartupCheckName.TLS,
+                 status="blocked",
+-                detail_code="tls_certificate_san_invalid",
++                detail_code=(
++                    posture.StartupDetailCode.TLS_CERTIFICATE_SAN_INVALID
++                ),
+             ),
+         ),
+         secret_provider="macos_keychain",
+@@ -211,6 +329,68 @@ def test_startup_posture_evidence_is_typed_redacted_and_immutable():
+             secret_loaded_at=NOW,
+             secret_presence=True,
+         )
++    with pytest.raises(ValidationError):
++        posture.StartupStructuralCheck(
++            name="tls",
++            status="pass",
++            detail_code=posture.StartupDetailCode.OK,
++        )
++
++
++@pytest.mark.parametrize(
++    "checks",
++    [
++        (
++            SimpleNamespace(
++                name="loopback_https",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(name="tls", passed=True, code="ok"),
++            SimpleNamespace(name="encryption", passed=True, code="ok"),
++        ),
++        (
++            SimpleNamespace(
++                name="runtime_configuration",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(
++                name="loopback_https",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(
++                name="tls",
++                passed=True,
++                code="tls_material_parse_failed",
++            ),
++            SimpleNamespace(name="database", passed=True, code="ok"),
++            SimpleNamespace(name="encryption", passed=True, code="ok"),
++        ),
++    ],
++)
++def test_startup_receipt_issuer_rejects_partial_or_inconsistent_guard_checks(
++    app_config,
++    checks,
++):
++    posture = _posture_module()
++    secrets = RuntimeSecrets(
++        app_api_token="receipt-validation-test-secret-0123456789",
++        database_url="sqlite:///receipt-validation-never-opened.db",
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="startup_guard_receipt_invalid",
++    ):
++        posture._issue_startup_guard_receipt(
++            config=app_config,
++            secrets=secrets,
++            checks=checks,
++            observed_at=NOW,
++            secret_loaded_at=NOW - timedelta(seconds=1),
++        )
+ 
+ 
+ def test_provider_budget_inspection_reports_expired_ambiguous_without_mutation(
+@@ -352,8 +532,11 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
+         "app": 0,
+     }
+     checks = (
++        StructuralCheck("runtime_configuration", "passed", "ok"),
+         StructuralCheck("loopback_https", "passed", "ok"),
+         StructuralCheck("tls", "passed", "ok"),
++        StructuralCheck("database", "passed", "ok"),
++        StructuralCheck("encryption", "passed", "ok"),
+     )
+ 
+     def load_once(role, *, config, provider: object):
+@@ -363,35 +546,49 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
+         assert provider is provider_instance
+         return loaded
+ 
+-    def guard_once(*, config, secrets, **_kwargs):
++    def guard_once(*, config, secrets, secret_loaded_at, **_kwargs):
+         calls["guard"] += 1
+         assert config is app_config
+         assert secrets is loaded
+-        return checks
++        assert secret_loaded_at is provider.last_successful_role_load_at
++        posture = _posture_module()
++        return posture._issue_startup_guard_receipt(
++            config=config,
++            secrets=secrets,
++            checks=checks,
++            observed_at=NOW,
++            secret_loaded_at=secret_loaded_at,
++        )
+ 
+     def build_once(
+         config,
+         secrets,
+         *,
+         runtime_role,
+-        startup_evidence,
++        startup_guard_receipt,
+     ):
+         calls["build"] += 1
+         assert config is app_config
+         assert secrets is loaded
+         assert runtime_role == "app"
+-        assert startup_evidence.secret_loaded_at == (
+-            provider.last_successful_role_load_at
++        evidence = _posture_module()._validate_startup_guard_receipt(
++            startup_guard_receipt,
++            config=config,
++            secrets=secrets,
+         )
++        assert evidence.secret_loaded_at is provider.last_successful_role_load_at
+         return SimpleNamespace(
+             secrets=secrets,
+-            startup_evidence=startup_evidence,
++            startup_guard_receipt=startup_guard_receipt,
+         )
+ 
+-    def create_once(*, container, startup_evidence):
++    def create_once(*, container, startup_guard_receipt):
+         calls["app"] += 1
+         assert container.secrets is loaded
+-        assert container.startup_evidence is startup_evidence
++        assert (
++            container.startup_guard_receipt
++            is startup_guard_receipt
++        )
+         return SimpleNamespace(
+             state=SimpleNamespace(
+                 install_controlled_shutdown=lambda _callback: None,
+@@ -425,8 +622,8 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
+     )
+     monkeypatch.setattr(serve, "load_role_secrets", load_once)
+     monkeypatch.setattr(serve, "run_startup_guard", guard_once)
+-    monkeypatch.setattr(serve, "build_container", build_once)
+-    monkeypatch.setattr(serve, "create_app", create_once)
++    monkeypatch.setattr(serve, "_build_guarded_container", build_once)
++    monkeypatch.setattr(serve, "_create_guarded_app", create_once)
+     monkeypatch.setattr(
+         serve,
+         "start_app_control",
+@@ -462,12 +659,12 @@ def test_launcher_keychain_failure_is_stable_and_stops_composition(
+     )
+     monkeypatch.setattr(
+         serve,
+-        "build_container",
++        "_build_guarded_container",
+         lambda *_args, **_kwargs: composed.append("container"),
+     )
+     monkeypatch.setattr(
+         serve,
+-        "create_app",
++        "_create_guarded_app",
+         lambda *_args, **_kwargs: composed.append("app"),
+     )
+ 
+@@ -490,14 +687,16 @@ def test_startup_failures_remain_independent_typed_evidence(
+         observed_at=NOW - timedelta(seconds=3),
+         structural_checks=(
+             posture.StartupStructuralCheck(
+-                name="loopback_https",
++                name=posture.StartupCheckName.LOOPBACK_HTTPS,
+                 status="pass",
+-                detail_code="ok",
++                detail_code=posture.StartupDetailCode.OK,
+             ),
+             posture.StartupStructuralCheck(
+-                name="tls",
++                name=posture.StartupCheckName.TLS,
+                 status="blocked",
+-                detail_code="tls_certificate_san_invalid",
++                detail_code=(
++                    posture.StartupDetailCode.TLS_CERTIFICATE_SAN_INVALID
++                ),
+             ),
+         ),
+         secret_provider="macos_keychain",
+@@ -507,7 +706,6 @@ def test_startup_failures_remain_independent_typed_evidence(
+     report = _reader(
+         app_config=app_config,
+         session_factory=session_factory,
+-        startup_evidence=evidence,
+     ).report(limit_principal="session:1:operator")
+     by_name = {
+         check.name.value: check
+@@ -515,14 +713,23 @@ def test_startup_failures_remain_independent_typed_evidence(
+         if check.name.value in {"loopback_https", "tls", "secret_provider"}
+     }
+ 
+-    assert by_name["loopback_https"].status.value == "pass"
+-    assert by_name["tls"].status.value == "blocked"
++    assert by_name["loopback_https"].status.value == "unknown"
++    assert by_name["tls"].status.value == "unknown"
+     assert (
+         by_name["tls"].detail_code.value
+-        == "tls_certificate_san_invalid"
++        == "startup_evidence_unavailable"
+     )
+-    assert by_name["secret_provider"].status.value == "blocked"
++    assert by_name["secret_provider"].status.value == "unknown"
+     assert report.can_trade is False
++    with pytest.raises(TypeError):
++        posture.SecurityPostureService(
++            config=app_config,
++            session_factory=session_factory,
++            reconciliation_key="mock",
++            reconciliation_enabled=True,
++            startup_evidence=evidence,
++            clock=lambda: NOW,
++        )
+ 
+ 
+ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
+@@ -651,7 +858,11 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
+         session_factory=session_factory,
+     ).report(limit_principal="session:1:operator")
+ 
+-    breaker = _checks_by_name(report, "circuit_breaker")[0]
++    breaker = next(
++        check
++        for check in _checks_by_name(report, "circuit_breaker")
++        if check.scope == "liquidity"
++    )
+     heartbeat = _checks_by_name(report, "daemon_heartbeat")[0]
+     reconciliation = _checks_by_name(
+         report,
+@@ -669,10 +880,11 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
+     )
+ 
+     assert (breaker.scope, breaker.status.value, breaker.generation) == (
+-        "liquidity:AAPL",
++        "liquidity",
+         "tripped",
+         4,
+     )
++    assert breaker.count == 1
+     assert heartbeat.status.value == "stale"
+     assert reconciliation.status.value == "stale"
+     assert reconciliation.generation == 7
+@@ -701,6 +913,439 @@ def test_posture_reports_stale_and_unsafe_local_state_without_narratives(
+         assert forbidden not in encoded
+ 
+ 
++@pytest.mark.parametrize(
++    ("table", "column", "check_name", "scope"),
++    [
++        ("orders", "status", "unsafe_orders", None),
++        ("orders", "acceptance_state", "unsafe_orders", None),
++        ("orders", "plan_cancel_state", "unsafe_orders", None),
++        ("fills", "reconciliation_state", "unsafe_fills", None),
++        ("rules", "state", "unsafe_rules", "rules"),
++        ("rule_groups", "state", "unsafe_rules", "rule_groups"),
++    ],
++)
++def test_unknown_persisted_state_domains_are_unknown_never_clear(
++    app_config,
++    session_factory,
++    engine,
++    table,
++    column,
++    check_name,
++    scope,
++):
++    marker = "APP_API_TOKEN_CORRUPT_STATE"
++    with session_factory() as session:
++        order = Order(
++            idempotency_key=f"unknown-domain-{table}-{column}",
++            ticker="AAPL",
++            side="buy",
++            order_type="market",
++            notional=Decimal("10"),
++            status=OrderStatus.FILLED.value,
++            acceptance_state="accepted",
++            plan_cancel_state=PLAN_CANCEL_NONE,
++        )
++        group = RuleGroup(
++            group_key=f"unknown-domain-{table}-{column}",
++            state=RuleState.TRIGGERED.value,
++            reconciliation_required=False,
++        )
++        persist_sensitive(
++            session,
++            order,
++            {"approval_reason": "unknown domain fixture"},
++        )
++        session.add(group)
++        session.flush()
++        fill = Fill(
++            order_id=order.id,
++            ticker="AAPL",
++            side="buy",
++            qty=Decimal("1"),
++            price=Decimal("100"),
++            broker_fill_id=f"fill-{table}-{column}",
++            reconciliation_state=FILL_RECONCILIATION_TRUSTED,
++            filled_at=NOW - timedelta(minutes=1),
++        )
++        rule = Rule(
++            group_id=group.id,
++            ticker="AAPL",
++            condition_json="{}",
++            action_json="{}",
++            state=RuleState.TRIGGERED.value,
++        )
++        session.add_all((fill, rule))
++        session.commit()
++        row_id = {
++            "orders": order.id,
++            "fills": fill.id,
++            "rules": rule.id,
++            "rule_groups": group.id,
++        }[table]
++
++    with engine.begin() as connection:
++        connection.exec_driver_sql(
++            f"UPDATE {table} SET {column} = ? WHERE id = ?",
++            (marker, row_id),
++        )
++
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    check = next(
++        item
++        for item in _checks_by_name(report, check_name)
++        if item.scope == scope
++    )
++
++    assert check.status.value == "unknown"
++    assert check.detail_code.value == "state_domain_invalid"
++    assert check.count is None
++    assert marker not in report.model_dump_json()
++
++
++def test_rule_group_rejects_rule_only_processing_state(
++    app_config,
++    session_factory,
++):
++    with session_factory() as session:
++        session.add(
++            RuleGroup(
++                group_key="invalid-processing-group-state",
++                state=RuleState.PROCESSING.value,
++                reconciliation_required=False,
++            )
++        )
++        session.commit()
++
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    check = next(
++        item
++        for item in _checks_by_name(report, "unsafe_rules")
++        if item.scope == "rule_groups"
++    )
++
++    assert check.status.value == "unknown"
++    assert check.detail_code.value == "state_domain_invalid"
++    assert check.count is None
++
++
++def test_breakers_are_aggregated_into_fixed_categories_without_targets(
++    app_config,
++    session_factory,
++):
++    rows = (
++        ("operator_global", "operator_global", "", False, 2),
++        ("data:equity", "data", "equity", False, 3),
++        ("loss:crypto", "loss", "crypto", True, 4),
++        (
++            "liquidity:APP_API_TOKEN",
++            "liquidity",
++            "APP_API_TOKEN",
++            True,
++            5,
++        ),
++    )
++    with session_factory() as session:
++        for scope_key, kind, target, tripped, generation in rows:
++            persist_sensitive(
++                session,
++                CircuitBreakerState(
++                    scope_key=scope_key,
++                    kind=kind,
++                    target=target,
++                    tripped=tripped,
++                    actor=NARRATIVE_MARKER,
++                    generation=generation,
++                    updated_at=NOW - timedelta(minutes=1),
++                ),
++                {"reason": NARRATIVE_MARKER},
++            )
++        session.commit()
++
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    breakers = {
++        check.scope: check
++        for check in _checks_by_name(report, "circuit_breaker")
++    }
++
++    assert set(breakers) == {
++        "account",
++        "equity",
++        "crypto",
++        "liquidity",
++    }
++    assert (breakers["account"].status.value, breakers["account"].count) == (
++        "clear",
++        0,
++    )
++    assert (breakers["equity"].status.value, breakers["equity"].count) == (
++        "clear",
++        0,
++    )
++    assert (
++        breakers["crypto"].status.value,
++        breakers["crypto"].count,
++        breakers["crypto"].generation,
++    ) == ("tripped", 1, 4)
++    assert (
++        breakers["liquidity"].status.value,
++        breakers["liquidity"].count,
++        breakers["liquidity"].generation,
++    ) == ("tripped", 1, 5)
++    encoded = report.model_dump_json()
++    assert "liquidity:APP_API_TOKEN" not in encoded
++    assert "APP_API_TOKEN" not in encoded
++
++
++def test_malformed_breaker_scope_makes_breaker_evidence_unknown_without_echo(
++    app_config,
++    session_factory,
++):
++    marker = "APP_API_TOKEN"
++    with session_factory() as session:
++        persist_sensitive(
++            session,
++            CircuitBreakerState(
++                scope_key=f"liquidity:bad:{marker}",
++                kind="liquidity",
++                target=f"bad:{marker}",
++                tripped=True,
++                actor=NARRATIVE_MARKER,
++                generation=1,
++                updated_at=NOW - timedelta(minutes=1),
++            ),
++            {"reason": NARRATIVE_MARKER},
++        )
++        session.commit()
++
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    breakers = _checks_by_name(report, "circuit_breaker")
++
++    assert breakers
++    assert all(check.status.value == "unknown" for check in breakers)
++    assert all(
++        check.detail_code.value == "breaker_scope_invalid"
++        for check in breakers
++    )
++    assert marker not in report.model_dump_json()
++
++
++def test_malformed_breaker_generation_is_unknown_never_clear(
++    app_config,
++    session_factory,
++):
++    with session_factory() as session:
++        persist_sensitive(
++            session,
++            CircuitBreakerState(
++                scope_key="operator_global",
++                kind="operator_global",
++                target="",
++                tripped=False,
++                actor=NARRATIVE_MARKER,
++                generation=0,
++                updated_at=NOW - timedelta(minutes=1),
++            ),
++            {"reason": NARRATIVE_MARKER},
++        )
++        session.commit()
++
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    breakers = _checks_by_name(report, "circuit_breaker")
++
++    assert breakers
++    assert all(check.status.value == "unknown" for check in breakers)
++    assert all(
++        check.detail_code.value == "breaker_scope_invalid"
++        for check in breakers
++    )
++    assert NARRATIVE_MARKER not in report.model_dump_json()
++
++
++@pytest.mark.parametrize(
++    (
++        "generation",
++        "completed_generation",
++        "status",
++        "started_at",
++        "completed_at",
++        "updated_at",
++        "gate_current",
++        "posture_status",
++        "detail_code",
++    ),
++    [
++        (
++            3,
++            3,
++            "current",
++            NOW - timedelta(minutes=2),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=30),
++            True,
++            "pass",
++            "reconciliation_current",
++        ),
++        (
++            3,
++            2,
++            "required",
++            NOW - timedelta(minutes=2),
++            None,
++            NOW - timedelta(minutes=1),
++            False,
++            "blocked",
++            "reconciliation_required",
++        ),
++        (
++            0,
++            0,
++            "current",
++            NOW - timedelta(minutes=2),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=30),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++        (
++            3,
++            2,
++            "current",
++            NOW - timedelta(minutes=2),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=30),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++        (
++            3,
++            3,
++            "current",
++            NOW + timedelta(seconds=1),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=30),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++        (
++            3,
++            3,
++            "current",
++            NOW - timedelta(minutes=2),
++            NOW + timedelta(seconds=1),
++            NOW + timedelta(seconds=2),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++        (
++            3,
++            3,
++            "current",
++            NOW - timedelta(seconds=30),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=10),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++        (
++            3,
++            3,
++            "required",
++            NOW - timedelta(minutes=2),
++            NOW - timedelta(minutes=1),
++            NOW - timedelta(seconds=30),
++            False,
++            "unknown",
++            "reconciliation_evidence_invalid",
++        ),
++    ],
++    ids=[
++        "fresh-current",
++        "required",
++        "zero-generation",
++        "incomplete-current",
++        "future-start",
++        "future-completion",
++        "timestamps-out-of-order",
++        "required-with-completion",
++    ],
++)
++def test_reconciliation_posture_matches_authoritative_safe_column_gate(
++    app_config,
++    session_factory,
++    generation,
++    completed_generation,
++    status,
++    started_at,
++    completed_at,
++    updated_at,
++    gate_current,
++    posture_status,
++    detail_code,
++):
++    with session_factory() as session:
++        persist_sensitive(
++            session,
++            StartupReconciliationState(
++                broker="mock",
++                generation=generation,
++                completed_generation=completed_generation,
++                status=status,
++                actor=NARRATIVE_MARKER,
++                request_id=NARRATIVE_MARKER,
++                started_at=started_at,
++                completed_at=completed_at,
++                updated_at=updated_at,
++            ),
++            {
++                "reason": NARRATIVE_MARKER,
++                "evidence_json": json.dumps(
++                    {"external": NARRATIVE_MARKER}
++                ),
++            },
++        )
++        session.commit()
++
++    gate = StartupReconciliationGate(
++        session_factory,
++        "mock",
++        enabled=True,
++        clock=lambda: NOW,
++    )
++    report = _reader(
++        app_config=app_config,
++        session_factory=session_factory,
++    ).report(limit_principal="session:1:operator")
++    check = _checks_by_name(
++        report,
++        "startup_reconciliation",
++    )[0]
++
++    assert gate.is_current() is gate_current
++    assert check.status.value == posture_status
++    assert check.detail_code.value == detail_code
++    assert NARRATIVE_MARKER not in report.model_dump_json()
++
++
+ def test_posture_is_repeatable_concurrent_and_preserves_every_table(
+     app_config,
+     session_factory,
+@@ -732,24 +1377,7 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
+     app_config,
+ ):
+     posture = _posture_module()
+-    evidence = posture.StartupPostureEvidence(
+-        observed_at=NOW,
+-        structural_checks=(
+-            posture.StartupStructuralCheck(
+-                name="loopback_https",
+-                status="pass",
+-                detail_code="ok",
+-            ),
+-            posture.StartupStructuralCheck(
+-                name="tls",
+-                status="pass",
+-                detail_code="ok",
+-            ),
+-        ),
+-        secret_provider="macos_keychain",
+-        secret_load_status="pass",
+-        secret_loaded_at=NOW,
+-    )
++    receipt, secrets = _issued_startup_receipt(app_config)
+ 
+     class BrokenFactory:
+         def __call__(self):
+@@ -760,7 +1388,8 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
+         session_factory=BrokenFactory(),
+         reconciliation_key="mock",
+         reconciliation_enabled=True,
+-        startup_evidence=evidence,
++        _startup_guard_receipt=receipt,
++        _startup_secrets=secrets,
+         clock=lambda: NOW,
+     )
+ 
+@@ -782,6 +1411,13 @@ def test_database_failure_keeps_config_and_startup_checks_reportable(
+     assert checks["tls"].status.value == "pass"
+     assert checks["unsafe_orders"].status.value == "unknown"
+     assert checks["daemon_heartbeat"].status.value == "unknown"
++    breaker_checks = _checks_by_name(report, "circuit_breaker")
++    assert {
++        check.scope for check in breaker_checks
++    } == {"account", "equity", "crypto", "liquidity"}
++    assert all(
++        check.status.value == "unknown" for check in breaker_checks
++    )
+     assert NARRATIVE_MARKER not in report.model_dump_json()
+ 
+ 
+@@ -885,31 +1521,27 @@ def test_request_and_provider_exhaustion_are_read_only_blocked_evidence(
+     assert _snapshot_all_tables(session_factory) == before
+ 
+ 
+-def test_mixed_sensitive_encryption_is_blocked_without_key_ids_or_values(
++def test_posture_never_calls_decrypting_encryption_inspection_or_cipher(
+     app_config,
+     session_factory,
+     engine,
++    monkeypatch,
+ ):
++    from trading_assistant import preflight
++    from trading_assistant.ops import encrypt_sensitive
++
+     active_key_id = app_config.encryption.active_key_id
+-    old_key_id = "local-retained-2026-06"
+-    cipher = SensitiveDataCipher(
+-        {
+-            active_key_id: b"a" * 32,
+-            old_key_id: b"o" * 32,
+-        },
++    writer_cipher = SensitiveDataCipher(
++        {active_key_id: b"a" * 32},
+         active_key_id=active_key_id,
+     )
+-    old_cipher = SensitiveDataCipher(
+-        {old_key_id: b"o" * 32},
+-        active_key_id=old_key_id,
+-    )
+     started_at = NOW - timedelta(minutes=3)
+     completed_at = NOW - timedelta(minutes=2)
+-    encrypted_reason = old_cipher.encrypt(
++    encrypted_reason = writer_cipher.encrypt(
+         NARRATIVE_MARKER,
+         SensitiveFieldRef("audit_events", "1", "reason", 1),
+     )
+-    encrypted_detail = old_cipher.encrypt(
++    encrypted_detail = writer_cipher.encrypt(
+         json.dumps({"external": NARRATIVE_MARKER}),
+         SensitiveFieldRef(
+             "audit_events",
+@@ -959,39 +1591,70 @@ def test_mixed_sensitive_encryption_is_blocked_without_key_ids_or_values(
+         )
+         connection.commit()
+ 
+-    report = _reader(
++    calls = {"inspector": 0, "scan": 0, "decrypt": 0}
++    real_inspect = preflight.SensitiveEncryptionStateInspector.inspect
++    real_scan = encrypt_sensitive.inspect_sensitive_envelopes
++
++    def counted_inspect(inspector):
++        calls["inspector"] += 1
++        return real_inspect(inspector)
++
++    def counted_scan(*args, **kwargs):
++        calls["scan"] += 1
++        return real_scan(*args, **kwargs)
++
++    class RaisingCipher(SensitiveDataCipher):
++        def decrypt(self, *args, **kwargs):
++            calls["decrypt"] += 1
++            raise AssertionError("posture attempted ciphertext decryption")
++
++    raising_cipher = RaisingCipher(
++        {active_key_id: b"a" * 32},
++        active_key_id=active_key_id,
++    )
++    monkeypatch.setattr(
++        preflight.SensitiveEncryptionStateInspector,
++        "inspect",
++        counted_inspect,
++    )
++    monkeypatch.setattr(
++        encrypt_sensitive,
++        "inspect_sensitive_envelopes",
++        counted_scan,
++    )
++    reader = _reader(
+         app_config=app_config,
+         session_factory=session_factory,
+-        engine=engine,
+-        sensitive_cipher=cipher,
+-    ).report(limit_principal="session:1:operator")
++    )
++    reader._engine = engine
++    reader._sensitive_cipher = raising_cipher
++
++    report = reader.report(limit_principal="session:1:operator")
+     encryption = _checks_by_name(
+         report,
+         "sensitive_encryption",
+     )[0]
+ 
+-    assert encryption.status.value == "blocked"
+-    assert encryption.detail_code.value == "sensitive_mixed_key"
++    assert calls == {"inspector": 0, "scan": 0, "decrypt": 0}
++    assert encryption.status.value == "unknown"
++    assert (
++        encryption.detail_code.value
++        == "startup_evidence_unavailable"
++    )
+     assert encryption.migration_state == "complete"
+     assert encryption.schema_version == 1
+     assert encryption.rows_total == 1
+     assert encryption.rows_completed == 1
+     encoded = report.model_dump_json()
+     assert active_key_id not in encoded
+-    assert old_key_id not in encoded
+     assert NARRATIVE_MARKER not in encoded
+ 
+ 
+-def test_complete_sensitive_encryption_reports_only_safe_migration_fields(
++def test_complete_encryption_uses_canonical_startup_receipt_and_safe_columns(
+     app_config,
+     session_factory,
+-    engine,
+ ):
+     active_key_id = app_config.encryption.active_key_id
+-    cipher = SensitiveDataCipher(
+-        {active_key_id: b"a" * 32},
+-        active_key_id=active_key_id,
+-    )
+     with session_factory() as session:
+         session.add(
+             SensitiveMigrationState(
+@@ -1009,11 +1672,12 @@ def test_complete_sensitive_encryption_reports_only_safe_migration_fields(
+         )
+         session.commit()
+ 
++    receipt, secrets = _issued_startup_receipt(app_config)
+     report = _reader(
+         app_config=app_config,
+         session_factory=session_factory,
+-        engine=engine,
+-        sensitive_cipher=cipher,
++        startup_guard_receipt=receipt,
++        startup_secrets=secrets,
+     ).report(limit_principal="session:1:operator")
+     encryption = _checks_by_name(
+         report,
+@@ -1031,8 +1695,12 @@ def test_route_access_never_loads_keychain_or_calls_broker(
+     authenticated_client,
+     monkeypatch,
+ ):
++    from trading_assistant import preflight
++    from trading_assistant.ops import encrypt_sensitive
++
+     client, _csrf = authenticated_client
+     service = client.trading_service
++    session_factory = service.session_factory
+ 
+     def forbidden(*_args, **_kwargs):
+         raise AssertionError("posture attempted forbidden I/O")
+@@ -1056,6 +1724,29 @@ def test_route_access_never_loads_keychain_or_calls_broker(
+         "__init__",
+         forbidden,
+     )
++    monkeypatch.setattr(
++        ProviderBudgetService,
++        "status",
++        forbidden,
++    )
++    monkeypatch.setattr(
++        ProviderBudgetService,
++        "reserve",
++        forbidden,
++    )
++    monkeypatch.setattr(NullNotifier, "send", forbidden)
++    monkeypatch.setattr(
++        preflight.SensitiveEncryptionStateInspector,
++        "inspect",
++        forbidden,
++    )
++    monkeypatch.setattr(
++        encrypt_sensitive,
++        "inspect_sensitive_envelopes",
++        forbidden,
++    )
++    monkeypatch.setattr(SensitiveDataCipher, "decrypt", forbidden)
++    before = _snapshot_all_tables(session_factory)
+ 
+     first = client.get("/security/posture")
+     second = client.get("/security/posture")
+@@ -1076,6 +1767,15 @@ def test_route_access_never_loads_keychain_or_calls_broker(
+         response.json()["can_trade"] is False
+         for response in concurrent
+     )
++    after = _snapshot_all_tables(session_factory)
++    assert (
++        after[ConcurrencyLease.__tablename__]
++        == before[ConcurrencyLease.__tablename__]
++    )
++    for table_name in before:
++        if table_name == RateWindow.__tablename__:
++            continue
++        assert after[table_name] == before[table_name], table_name
+ 
+ 
+ def test_no_production_consumer_treats_posture_as_authority():
+diff --git a/tests/test_transport_boundary.py b/tests/test_transport_boundary.py
+index 6d101cf..2c4c5de 100644
+--- a/tests/test_transport_boundary.py
++++ b/tests/test_transport_boundary.py
+@@ -66,7 +66,9 @@ class _CountingSessionFactory:
+ 
+ 
+ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
+-    """Keep launcher tests on one injected secrets/evidence/container chain."""
++    """Keep launcher tests on one injected secrets/receipt/container chain."""
++
++    from trading_assistant.operations import security_posture as posture
+ 
+     secrets = object()
+     provider = SimpleNamespace(
+@@ -84,26 +86,66 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
+         lambda *_args, **_kwargs: secrets,
+     )
+ 
++    def run_guard(*, config, secrets: object, secret_loaded_at, **_kwargs):
++        return posture._issue_startup_guard_receipt(
++            config=config,
++            secrets=secrets,
++            checks=(
++                SimpleNamespace(
++                    name="runtime_configuration",
++                    passed=True,
++                    code="ok",
++                ),
++                SimpleNamespace(
++                    name="loopback_https",
++                    passed=True,
++                    code="ok",
++                ),
++                SimpleNamespace(name="tls", passed=True, code="ok"),
++                SimpleNamespace(
++                    name="database",
++                    passed=True,
++                    code="ok",
++                ),
++                SimpleNamespace(
++                    name="encryption",
++                    passed=True,
++                    code="ok",
++                ),
++            ),
++            observed_at=secret_loaded_at,
++            secret_loaded_at=secret_loaded_at,
++        )
++
++    monkeypatch.setattr(serve, "run_startup_guard", run_guard)
++
+     def build_container(
+         config,
+         loaded,
+         *,
+         runtime_role,
+-        startup_evidence,
++        startup_guard_receipt,
+     ):
+         assert loaded is secrets
+         assert runtime_role == "app"
+-        container.startup_evidence = startup_evidence
++        container.startup_guard_receipt = startup_guard_receipt
+         return container
+ 
+-    monkeypatch.setattr(serve, "build_container", build_container)
++    monkeypatch.setattr(
++        serve,
++        "_build_guarded_container",
++        build_container,
++    )
+ 
+-    def create_app(*, container: object, startup_evidence):
++    def create_app(*, container: object, startup_guard_receipt):
+         assert container is not None
+-        assert container.startup_evidence is startup_evidence
++        assert (
++            container.startup_guard_receipt
++            is startup_guard_receipt
++        )
+         return app
+ 
+-    monkeypatch.setattr(serve, "create_app", create_app)
++    monkeypatch.setattr(serve, "_create_guarded_app", create_app)
+ 
+ 
+ def _durable_perimeter_state(
+@@ -988,7 +1030,11 @@ def test_startup_guard_never_constructs_app_when_encryption_state_is_invalid(
+         serve.StartupGuardBlocked,
+         match="sensitive_migration_state_invalid",
+     ):
+-        serve.run_startup_guard(config=config, secrets=secrets)
++        serve.run_startup_guard(
++            config=config,
++            secrets=secrets,
++            secret_loaded_at=datetime.now(timezone.utc),
++        )
+ 
+ 
+ def test_strict_launcher_stops_before_uvicorn_on_structural_failure(monkeypatch):

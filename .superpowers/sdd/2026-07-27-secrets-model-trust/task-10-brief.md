@@ -35,13 +35,18 @@ paths, certificate names, URLs, exception text, or narrative.
 2. instantiate one explicit `MacOSKeychainSecretProvider`;
 3. call `load_role_secrets("app", ...)` exactly once;
 4. run the startup guard against that exact `RuntimeSecrets` object;
-5. freeze the returned structural checks plus provider/load evidence;
-6. build one container from the same config/secrets/evidence;
-7. call `create_app` with that exact container/evidence.
+5. seal the returned structural checks plus provider/load evidence in an
+   opaque `StartupGuardReceipt` bound by object identity to the exact config
+   and secrets;
+6. build one container through the private guarded composition entrypoint;
+7. call the private guarded app entrypoint with that exact
+   container/receipt.
 
 The posture route never retains or calls the provider. An injected unit app
 without startup evidence reports startup-derived checks as `unknown`; it does
-not infer a pass from config.
+not infer a pass from config. Public `build_container` and `create_app`
+cannot accept startup evidence or a receipt, and a guarded container is
+rejected by public app composition.
 
 ## Posture response
 
@@ -66,7 +71,8 @@ Checks independently cover:
 - broker paper mode;
 - startup loopback transport and TLS evidence;
 - macOS Keychain provider and successful-load time evidence;
-- sensitive encryption schema, migration, and envelope state;
+- sensitive encryption schema/migration state from safe columns, anchored to
+  the successful startup envelope scan without rereading ciphertext;
 - request budgets for every registered limit class and their resets;
 - selected-provider daily calls/input/output usage, remaining budget, and UTC
   reset;
@@ -87,7 +93,8 @@ Checks independently cover:
 Add non-mutating inspection APIs:
 
 - `DurableRateLimiter.inspect_pair(...)`;
-- `ProviderBudgetService.inspect(...)`.
+- `ProviderBudgetService.inspect(...)`;
+- `SensitiveEncryptionPostureInspector.inspect(...)`.
 
 Neither API opens `BEGIN IMMEDIATE`, commits, releases, sweeps, latches, or
 updates state. Provider inspection must report expired `started` and `unknown`
@@ -96,10 +103,13 @@ latch unchanged. `ProviderBudgetService.status()` remains mutating and is
 never called by posture.
 
 The posture reader uses only local config, immutable startup evidence, and
-local SQLite SELECTs. It never calls
+local SQLite SELECTs. The encryption reader selects no active key ID,
+registered ciphertext field, backup hash, or decrypted value. It never calls
+the startup encryption inspector, envelope scanner, or cipher. It never calls
 `StartupReconciliationGate.posture()` because that method decrypts a failure
 narrative. It selects only reconciliation status, generation counters, and
-timestamps.
+timestamps, and shares one pure safe-column validator with
+`StartupReconciliationGate.is_current()`.
 
 If the durable store is unavailable, every DB-derived check is `unknown` with
 a stable code while config/startup checks remain independently reportable.
@@ -128,13 +138,16 @@ RoutePolicy(
     "/security/posture",
     AuthLevel.SESSION,
     "session_read",
+    lease_free_bounded_read=True,
 )
 ```
 
 The route requires an authenticated operator session. Durable
-`session_read` accounting is the only expected middleware mutation. Direct
-posture aggregation itself is idempotent and leaves every domain and policy
-table byte-for-byte unchanged.
+`session_read` `RateWindow` accounting is the only expected middleware
+mutation. The explicit capability bypasses `ConcurrencyLease` acquisition for
+this bounded read only; every other route retains the default concurrency
+behavior. Direct posture aggregation itself is idempotent and leaves every
+domain and policy table byte-for-byte unchanged.
 
 ## TDD and verification
 
@@ -145,12 +158,19 @@ command/output in the report.
 Focused coverage includes:
 
 - route absence and exact response contract;
-- frozen/extra-forbid models and `Literal[False]`;
+- strict frozen/extra-forbid models, exact scalar types, and
+  exact-bool `Literal[False]`;
 - one startup secret load and zero route-time provider loads;
+- sealed receipt provenance, identity binding, public composition rejection,
+  and canonical guard-check completeness;
 - unavailable Keychain and invalid TLS evidence;
-- complete and mixed encryption;
+- startup mixed-encryption rejection plus route-time safe-column inspection
+  with zero scanner/decrypt calls;
 - exhausted request/provider budgets and expired unresolved provider usage;
 - stale daemon and reconciliation evidence;
+- authoritative reconciliation differential cases for corrupt/future rows;
+- fixed-category breaker aggregation with no target serialization;
+- complete known order/fill/rule/rule-group state-domain validation;
 - tripped breakers and runtime tenure;
 - unavailable quote evidence;
 - unsafe local state and uncertain interlocks;
@@ -187,3 +207,37 @@ started or accessed.
 
 All Task 10 checks are complete at the implementation gate. Task 11 remains
 untouched.
+
+## Fix round 1 checkpoint
+
+Fresh review findings were addressed in implementation commit
+`8e553d4ab1bf20e99bbfa41594f1d8d8733b0c0e`:
+
+- posture alone uses authenticated/rate-limited lease-free bounded-read
+  middleware behavior and never mutates `ConcurrencyLease`;
+- route-time encryption inspection is safe-column-only and non-decrypting;
+- reconciliation authority and posture share one pure validator;
+- every counted order/fill/rule/rule-group state domain is validated before
+  a clear/unsafe count is emitted;
+- startup evidence reaches production only through the sealed private
+  receipt/container/app composition chain;
+- breakers emit only fixed categories, aggregate counts, and generations;
+- posture models reject coercive scalar values and preserve exact
+  `bool(False)`.
+
+Verification:
+
+- Initial exact RED:
+  `48 failed, 262 passed, 1 warning in 21.19s`
+- Final focused gate:
+  `314 passed, 1 warning in 20.23s`
+- Sole full suite:
+  `3297 passed, 1 skipped, 1 warning in 251.65s`
+- Static gate:
+  `release static checks: PASS`
+- Review package:
+  `review-c1f9041..8e553d4.diff` (3,403 lines / 116,945 bytes)
+
+No Task 11, service, daemon, MCP, real Keychain/credential, ignored runtime
+database, broker/provider/notifier/network, trade, reconciliation, reset, or
+push action was performed.
