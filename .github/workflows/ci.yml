@@ -47,10 +47,14 @@ jobs:
           node_source="$(command -v node)"
           verifier_python="$(uv python find --managed-python \
             --no-project --no-config --resolve-links 3.11.15)"
-          sudo install -o root -g root -m 0555 \
-            "$uv_source" /usr/local/bin/uv
-          sudo install -o root -g root -m 0555 \
-            "$node_source" /usr/local/bin/node
+          if [[ "$uv_source" != "/usr/local/bin/uv" ]]; then
+            sudo install -o root -g root -m 0555 \
+              "$uv_source" /usr/local/bin/uv
+          fi
+          if [[ "$node_source" != "/usr/local/bin/node" ]]; then
+            sudo install -o root -g root -m 0555 \
+              "$node_source" /usr/local/bin/node
+          fi
           export PATH="/usr/local/bin:/usr/bin:/bin"
           "$verifier_python" -I -S scripts/verify_loopback_release.py
 

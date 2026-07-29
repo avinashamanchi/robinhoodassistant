@@ -4413,12 +4413,14 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
                 '--no-project --no-config --resolve-links 3.11.15)"'
             ),
             (
+                'if [[ "$uv_source" != "/usr/local/bin/uv" ]]; then '
                 "sudo install -o root -g root -m 0555 "
-                '"$uv_source" /usr/local/bin/uv'
+                '"$uv_source" /usr/local/bin/uv fi'
             ),
             (
+                'if [[ "$node_source" != "/usr/local/bin/node" ]]; then '
                 "sudo install -o root -g root -m 0555 "
-                '"$node_source" /usr/local/bin/node'
+                '"$node_source" /usr/local/bin/node fi'
             ),
             'export PATH="/usr/local/bin:/usr/bin:/bin"',
             '"$verifier_python" -I -S scripts/verify_loopback_release.py',
