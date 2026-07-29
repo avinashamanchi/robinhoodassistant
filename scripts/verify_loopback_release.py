@@ -352,21 +352,33 @@ class ToolIdentity:
 @dataclass(frozen=True, slots=True)
 class Toolchain:
     git: ToolIdentity
+    node: ToolIdentity
     uv: ToolIdentity
     python: ToolIdentity
 
     def __post_init__(self) -> None:
         if (
             self.git.name != "git"
+            or self.node.name != "node"
             or self.uv.name != "uv"
             or self.python.name != "python"
         ):
             raise ValueError("toolchain names are invalid")
-        if len({self.git.path, self.uv.path, self.python.path}) != 3:
+        if (
+            len(
+                {
+                    self.git.path,
+                    self.node.path,
+                    self.uv.path,
+                    self.python.path,
+                }
+            )
+            != 4
+        ):
             raise ValueError("toolchain executables must be distinct")
 
     def identities(self) -> tuple[ToolIdentity, ...]:
-        return (self.git, self.uv, self.python)
+        return (self.git, self.node, self.uv, self.python)
 
     def is_current(self) -> bool:
         return all(identity.is_current() for identity in self.identities())
@@ -544,13 +556,14 @@ class SubprocessRunner:
 def _resolve_toolchain() -> Toolchain:
     candidates = {
         "git": shutil.which("git"),
+        "node": shutil.which("node"),
         "uv": shutil.which("uv"),
         "python": sys.executable,
     }
     if any(not value for value in candidates.values()):
         raise RuntimeError("required verifier tool is unavailable")
     identities: dict[str, ToolIdentity] = {}
-    for name in ("git", "uv", "python"):
+    for name in ("git", "node", "uv", "python"):
         raw_path = candidates[name]
         if raw_path is None:
             raise RuntimeError("required verifier tool is unavailable")
@@ -566,6 +579,7 @@ def _resolve_toolchain() -> Toolchain:
             raise RuntimeError("required verifier tool is unproven") from None
     return Toolchain(
         git=identities["git"],
+        node=identities["node"],
         uv=identities["uv"],
         python=identities["python"],
     )
@@ -588,6 +602,14 @@ def _tool_path_is_trusted(name: str, path: Path) -> bool:
             Path("/usr/local/bin"),
             Path("/opt/homebrew/Cellar/git"),
             Path("/home/linuxbrew/.linuxbrew/Cellar/git"),
+        )
+    elif name == "node":
+        roots = (
+            Path("/usr/bin"),
+            Path("/usr/local/bin"),
+            Path("/opt/homebrew/Cellar/node"),
+            Path("/home/linuxbrew/.linuxbrew/Cellar/node"),
+            Path("/opt/hostedtoolcache/node"),
         )
     elif name == "uv":
         roots = (
@@ -655,6 +677,7 @@ def _prove_tool_versions(
         proven[identity.name] = updated
     return Toolchain(
         git=proven["git"],
+        node=proven["node"],
         uv=proven["uv"],
         python=proven["python"],
     )
@@ -1644,6 +1667,7 @@ class ReleaseVerifier:
         toolchain = self._require_toolchain()
         replacements = {
             "git": str(toolchain.git.path),
+            "node": str(toolchain.node.path),
             "uv": str(toolchain.uv.path),
             "python": str(toolchain.python.path),
         }

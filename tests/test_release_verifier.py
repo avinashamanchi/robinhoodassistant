@@ -610,7 +610,13 @@ def test_injected_trusted_tools_are_recorded_before_ambient_path_changes(
     )
     assert payload["state"] == "completed"
     assert payload["tool_isolation"] == "canonical_fingerprint"
-    assert set(payload["tools"]) == {"git", "python", "uv"}
+    assert set(payload["tools"]) == {"git", "node", "python", "uv"}
+    resolved_node = shutil.which(
+        "node",
+        path=runner.calls[0]["env"]["PATH"],
+    )
+    assert resolved_node is not None
+    assert Path(resolved_node).resolve() == toolchain.node.path
     for evidence in payload["tools"].values():
         assert evidence["fingerprint"].startswith("sha256:")
         assert len(evidence["fingerprint"]) == len("sha256:") + 64
@@ -670,7 +676,7 @@ def test_constructor_rejects_preexisting_path_spoofed_git_and_uv(
 ):
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
-    for name in ("git", "uv"):
+    for name in ("git", "node", "uv"):
         executable = fake_bin / name
         executable.write_text(
             "#!/bin/sh\nprintf '%s\\n' 'synthetic version'\n",
@@ -711,6 +717,7 @@ def test_tool_mutation_between_command_checks_fails_closed(
             git_path,
             version="git test version",
         ),
+        node=verifier_module._resolve_toolchain().node,
         uv=verifier_module.ToolIdentity.capture(
             "uv",
             fake_uv,
