@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import logging
 from types import SimpleNamespace
 
@@ -332,6 +333,206 @@ def test_create_test_app_rejects_post_issuance_nested_broker_tampering(
             container=container,
             planning=None,
         )
+
+
+def test_test_container_rejects_mock_subclass_with_production_delegate(
+    app_config,
+    session_factory,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.risk.clock import FakeClock
+    from trading_assistant.service import TradingService
+    from tests.app_factory import build_test_app_container
+
+    class ProductionDelegatingMock(MockBroker):
+        def __init__(self, delegate):
+            super().__init__()
+            self.delegate = delegate
+
+        def submit_order(self, order):
+            return self.delegate.submit_order(order)
+
+    broker = ProductionDelegatingMock(
+        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
+    )
+    service = TradingService(
+        broker,
+        session_factory,
+        app_config,
+        FakeClock(is_open=True),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-direct-delegate-token"
+            ),
+        )
+
+
+def test_test_container_rejects_nested_owned_production_delegate(
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    service = make_service()
+    service.broker.owned_state = {
+        "adapters": [
+            SimpleNamespace(
+                delegate=AlpacaBroker(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                )
+            )
+        ]
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-nested-delegate-token"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "forwarder_kind",
+    ("bound_method", "partial", "closure"),
+)
+def test_test_container_rejects_production_callable_capture(
+    forwarder_kind,
+    make_service,
+):
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from tests.app_factory import build_test_app_container
+
+    service = make_service()
+    production_broker = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+    if forwarder_kind == "bound_method":
+        forwarder = production_broker.submit_order
+    elif forwarder_kind == "partial":
+        forwarder = partial(production_broker.submit_order)
+    else:
+        def forwarder(order):
+            return production_broker.submit_order(order)
+
+    service.broker.submit_order = forwarder
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-callable-delegate-token"
+            ),
+        )
+
+
+def test_create_test_app_rejects_production_delegate_inserted_after_issuance(
+    make_service,
+):
+    from trading_assistant.app import main as app_main
+    from trading_assistant.broker.alpaca import AlpacaBroker
+    from trading_assistant.broker.mock import MockBroker
+    from tests.app_factory import build_test_app_container
+
+    class ProductionDelegatingMock(MockBroker):
+        def submit_order(self, order):
+            return self.delegate.submit_order(order)
+
+    service = make_service(broker=ProductionDelegatingMock())
+    container = build_test_app_container(
+        service,
+        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+        secrets=Secrets(
+            app_api_token="plan2-post-issuance-delegate-token"
+        ),
+    )
+    service.broker.delegate = AlpacaBroker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^test_container_required$",
+    ):
+        app_main.create_test_app(
+            container=container,
+            planning=None,
+        )
+
+
+def test_test_container_rejects_unbounded_owned_state(
+    make_service,
+):
+    from tests.app_factory import build_test_app_container
+
+    service = make_service()
+    nested = []
+    for _ in range(64):
+        nested = [nested]
+    service.broker.owned_state = nested
+
+    with pytest.raises(
+        RuntimeError,
+        match="^production_test_capability_forbidden$",
+    ):
+        build_test_app_container(
+            service,
+            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+            secrets=Secrets(
+                app_api_token="plan2-bounded-state-token"
+            ),
+        )
+
+
+def test_test_container_accepts_spy_broker_and_cycle_safe_state(
+    make_service,
+):
+    from threading import Event
+
+    from trading_assistant.app import main as app_main
+    from tests.app_factory import build_test_app_container
+
+    service = make_service()
+    cycle = []
+    cycle.append(cycle)
+    service.broker.cycle = cycle
+    service.broker.test_event = Event()
+    container = build_test_app_container(
+        service,
+        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
+        secrets=Secrets(
+            app_api_token="plan2-legitimate-spy-token"
+        ),
+    )
+
+    app = app_main.create_test_app(
+        container=container,
+        planning=None,
+    )
+
+    assert type(service.broker).__name__ == "SpyBroker"
+    assert app.state.trading_service is service
 
 
 def test_non_app_test_composition_is_not_an_app_test_authority(

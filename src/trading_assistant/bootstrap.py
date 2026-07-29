@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import timedelta
+from functools import partial
+from types import FunctionType, MethodType, SimpleNamespace
 from uuid import uuid4
 
 from sqlalchemy.engine import Engine
@@ -122,6 +125,33 @@ class ApplicationContainer:
 
 
 _TEST_CONTAINER_SEAL = object()
+_TEST_BROKER_GRAPH_MAX_DEPTH = 24
+_TEST_BROKER_GRAPH_MAX_NODES = 512
+_TEST_BROKER_METHODS = (
+    "get_quote",
+    "get_account",
+    "get_positions",
+    "submit_order",
+    "submit_bracket",
+    "get_order_by_client_id",
+    "get_open_orders",
+    "get_order_status",
+    "get_fill_activities",
+    "cancel_order",
+)
+_TEST_BROKER_REQUIRED_METHODS = frozenset(
+    {
+        "get_quote",
+        "get_account",
+        "get_positions",
+        "submit_order",
+        "get_order_by_client_id",
+        "get_open_orders",
+        "get_order_status",
+        "cancel_order",
+    }
+)
+_STATIC_ATTRIBUTE_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -517,17 +547,20 @@ def _require_test_broker_identity(
     expected_broker: object,
     source: object | None = None,
 ) -> None:
-    """Require one exact MockBroker throughout the app service graph."""
+    """Require one bounded fake broker graph throughout the app stack."""
     from .broker.mock import MockBroker
 
     if type(service) is not TradingService:
         raise RuntimeError("production_test_capability_forbidden")
+    broker_key = _require_bounded_test_broker_graph(
+        expected_broker,
+        mock_broker_type=MockBroker,
+    )
     snapshot_service = service.snapshot_service
     order_submission = service.order_submission
     reconciliation = service.reconciliation
     if (
-        not isinstance(expected_broker, MockBroker)
-        or type(snapshot_service) is not PortfolioSnapshotService
+        type(snapshot_service) is not PortfolioSnapshotService
         or type(order_submission) is not OrderSubmissionService
         or type(reconciliation) is not ReconciliationService
         or service.broker is not expected_broker
@@ -536,11 +569,11 @@ def _require_test_broker_identity(
         or reconciliation.broker is not expected_broker
         or order_submission.snapshot_service is not snapshot_service
         or reconciliation.broker_key
-        != expected_broker.reconciliation_key
+        != broker_key
         or service.startup_reconciliation.broker_key
-        != expected_broker.reconciliation_key
+        != broker_key
         or snapshot_service.startup_reconciliation_key
-        not in (None, expected_broker.reconciliation_key)
+        not in (None, broker_key)
     ):
         raise RuntimeError("production_test_capability_forbidden")
     if source is not None and (
@@ -560,6 +593,128 @@ def _require_test_broker_identity(
         is not service
     ):
         raise RuntimeError("production_test_capability_forbidden")
+
+
+def _require_bounded_test_broker_graph(
+    root: object,
+    *,
+    mock_broker_type: type,
+) -> str:
+    """Reject retained broker authority in a bounded static fake-owned graph."""
+    if not isinstance(root, mock_broker_type):
+        raise RuntimeError("production_test_capability_forbidden")
+    try:
+        root_state = vars(root)
+    except TypeError:
+        raise RuntimeError(
+            "production_test_capability_forbidden"
+        ) from None
+    if type(root_state) is not dict:
+        raise RuntimeError("production_test_capability_forbidden")
+
+    broker_key = _static_broker_attribute(
+        root,
+        root_state,
+        "reconciliation_key",
+    )
+    if type(broker_key) is not str or not broker_key:
+        raise RuntimeError("production_test_capability_forbidden")
+
+    stack = [
+        (value, 1)
+        for value in root_state.values()
+    ]
+    for method_name in _TEST_BROKER_METHODS:
+        method = _static_broker_attribute(
+            root,
+            root_state,
+            method_name,
+        )
+        if method is _STATIC_ATTRIBUTE_MISSING:
+            if method_name in _TEST_BROKER_REQUIRED_METHODS:
+                raise RuntimeError(
+                    "production_test_capability_forbidden"
+                )
+            continue
+        if type(method) not in {FunctionType, MethodType, partial}:
+            raise RuntimeError("production_test_capability_forbidden")
+        stack.append((method, 1))
+
+    seen = {id(root)}
+    visited = 0
+    while stack:
+        value, depth = stack.pop()
+        if depth > _TEST_BROKER_GRAPH_MAX_DEPTH:
+            raise RuntimeError("production_test_capability_forbidden")
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        visited += 1
+        if visited > _TEST_BROKER_GRAPH_MAX_NODES:
+            raise RuntimeError("production_test_capability_forbidden")
+        if isinstance(value, BrokerClient):
+            raise RuntimeError("production_test_capability_forbidden")
+        children = _test_broker_owned_children(value)
+        if len(children) > _TEST_BROKER_GRAPH_MAX_NODES:
+            raise RuntimeError("production_test_capability_forbidden")
+        stack.extend((child, depth + 1) for child in children)
+    return broker_key
+
+
+def _static_broker_attribute(
+    root: object,
+    root_state: dict,
+    name: str,
+):
+    if name in root_state:
+        return root_state[name]
+    for owner in type(root).__mro__:
+        namespace = vars(owner)
+        if name in namespace:
+            return namespace[name]
+    return _STATIC_ATTRIBUTE_MISSING
+
+
+def _test_broker_owned_children(value: object) -> tuple[object, ...]:
+    value_type = type(value)
+    if value_type is dict:
+        return tuple(value.keys()) + tuple(value.values())
+    if value_type in {list, tuple, set, frozenset, deque}:
+        return tuple(value)
+    if value_type is SimpleNamespace:
+        return tuple(vars(value).values())
+    if value_type is partial:
+        keywords = value.keywords or {}
+        return (value.func, *value.args, *keywords.keys(), *keywords.values())
+    if value_type is MethodType:
+        return (value.__self__, value.__func__)
+    if value_type is FunctionType:
+        captured = []
+        if value.__defaults__:
+            captured.extend(value.__defaults__)
+        if value.__kwdefaults__:
+            captured.extend(value.__kwdefaults__.keys())
+            captured.extend(value.__kwdefaults__.values())
+        for cell in value.__closure__ or ():
+            try:
+                captured.append(cell.cell_contents)
+            except ValueError:
+                continue
+        return tuple(captured)
+    if is_dataclass(value) and not isinstance(value, type):
+        try:
+            state = vars(value)
+        except TypeError:
+            raise RuntimeError(
+                "production_test_capability_forbidden"
+            ) from None
+        return tuple(
+            state[data_field.name]
+            for data_field in fields(value)
+            if data_field.name in state
+        )
+    return ()
 
 
 def _is_test_application_container(container: object) -> bool:
