@@ -15,8 +15,18 @@ import pytest
 from scripts import verify_loopback_release as verifier_module
 from scripts.verify_loopback_release import (
     Command,
+    OutputLimitExceeded,
     ReleaseVerifier,
     SubprocessRunner,
+    TestManifest as ReleaseTestManifest,
+    verify_release,
+)
+
+
+_ONE_TEST_MANIFEST = ReleaseTestManifest(
+    count=1,
+    digest="sha256:72ea70040faee6d700055c748ce27a6a2"
+    "b7ae6303ff1d0f3f03d991622351569",
 )
 
 
@@ -31,10 +41,23 @@ class ScriptedRunner:
             "name=\"test_example\" file=\"tests/test_example.py\"/>"
             "</testsuite>"
         ),
+        pytest_evidence: dict[str, object] | None = None,
     ) -> None:
         self._responses = iter(responses)
         self.calls: list[dict[str, object]] = []
         self.junit_xml = junit_xml
+        self.pytest_evidence = pytest_evidence or {
+            "schema_version": 1,
+            "exitstatus": 0,
+            "collected": ["tests/test_example.py::test_example"],
+            "deselected": [],
+            "outcomes": [
+                {
+                    "nodeid": "tests/test_example.py::test_example",
+                    "outcome": "passed",
+                }
+            ],
+        }
 
     def run(
         self,
@@ -64,6 +87,16 @@ class ScriptedRunner:
             junit_path = Path(junit_argument.split("=", 1)[1])
             junit_path.write_text(self.junit_xml, encoding="utf-8")
             junit_path.chmod(0o600)
+        pytest_evidence_path = env.get(
+            "TRADING_ASSISTANT_PYTEST_EVIDENCE_PATH"
+        )
+        if pytest_evidence_path:
+            path = Path(pytest_evidence_path)
+            path.write_text(
+                json.dumps(self.pytest_evidence),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
         response = next(self._responses)
         if isinstance(response, BaseException):
             raise response
@@ -210,7 +243,10 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.fixture
-def clean_repository(tmp_path: Path) -> Path:
+def clean_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
     root = tmp_path / "repository"
     versions = root / "migrations" / "versions"
     versions.mkdir(parents=True)
@@ -232,6 +268,11 @@ def clean_repository(tmp_path: Path) -> Path:
         "-qm",
         "fixture",
     )
+    monkeypatch.setattr(
+        verifier_module,
+        "TRUSTED_ANCESTRY_ANCHOR",
+        _git(root, "rev-parse", "HEAD").stdout.strip(),
+    )
     return root
 
 
@@ -246,6 +287,7 @@ def _one_test_command(
         timeout_seconds=timeout_seconds,
         network=network,
         expects_tests=True,
+        test_manifest=_ONE_TEST_MANIFEST,
     )
 
 
@@ -255,6 +297,7 @@ def _run_one(
     runner: ScriptedRunner,
     *,
     command: Command | None = None,
+    trusted_ancestry_anchor: str | None = None,
 ):
     output_dir = tmp_path / "evidence"
     result = ReleaseVerifier(
@@ -262,8 +305,83 @@ def _run_one(
         runner=runner,
         output_dir=output_dir,
         commands=(command or _one_test_command(),),
+        trusted_ancestry_anchor=trusted_ancestry_anchor,
     ).run()
     return result, output_dir
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    (
+        ("grafts", "GIT_HISTORY_GRAFTS"),
+        ("replace", "GIT_HISTORY_REPLACE_REFS"),
+        ("alternates", "GIT_HISTORY_ALTERNATES"),
+        ("partial-clone", "GIT_HISTORY_PARTIAL_CLONE"),
+    ),
+)
+def test_repository_preflight_rejects_history_indirection_before_commands(
+    clean_repository: Path,
+    tmp_path: Path,
+    state: str,
+    expected_code: str,
+):
+    head = _git(clean_repository, "rev-parse", "HEAD").stdout.strip()
+    if state == "grafts":
+        path = clean_repository / Path(
+            _git(
+                clean_repository,
+                "rev-parse",
+                "--git-path",
+                "info/grafts",
+            ).stdout.strip()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{head}\n", encoding="ascii")
+    elif state == "replace":
+        _git(clean_repository, "replace", head, head)
+    elif state == "alternates":
+        path = clean_repository / Path(
+            _git(
+                clean_repository,
+                "rev-parse",
+                "--git-path",
+                "objects/info/alternates",
+            ).stdout.strip()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("/nonexistent/verifier-alternate\n", encoding="ascii")
+    else:
+        _git(clean_repository, "config", "remote.origin.promisor", "true")
+    runner = ScriptedRunner([_completed()])
+
+    result, _ = _run_one(
+        clean_repository,
+        tmp_path,
+        runner,
+        trusted_ancestry_anchor=head,
+    )
+
+    assert result.passed is False
+    assert result.detail_code == expected_code
+    assert runner.calls == []
+
+
+def test_repository_preflight_requires_the_pinned_anchor_to_be_an_ancestor(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    runner = ScriptedRunner([_completed()])
+
+    result, _ = _run_one(
+        clean_repository,
+        tmp_path,
+        runner,
+        trusted_ancestry_anchor="0" * 40,
+    )
+
+    assert result.passed is False
+    assert result.detail_code == "TRUSTED_ANCESTRY_UNPROVEN"
+    assert runner.calls == []
 
 
 def test_release_verifier_has_only_the_exact_offline_commands():
@@ -400,13 +518,16 @@ def test_runner_receives_only_sanitized_offline_environment(
         "PATH",
         "PIP_CONFIG_FILE",
         "PYTHONDONTWRITEBYTECODE",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
         "PYTHONHASHSEED",
         "PYTHONNOUSERSITE",
         "PYTHONPATH",
         "PYTHON_KEYRING_BACKEND",
-        "TRADING_ASSISTANT_OFFLINE_VERIFY",
-        "TRADING_ASSISTANT_PYTHON_NETWORK_GUARD",
-        "TRADING_ASSISTANT_VERIFIED_GIT",
+        "TRADING_ASSISTANT_LOCAL_VERIFY",
+            "TRADING_ASSISTANT_PYTHON_NETWORK_GUARD",
+            "TRADING_ASSISTANT_PYTEST_EVIDENCE_PATH",
+            "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR",
+            "TRADING_ASSISTANT_VERIFIED_GIT",
         "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT",
         "UV_OFFLINE",
         "UV_CONFIG_FILE",
@@ -415,7 +536,7 @@ def test_runner_receives_only_sanitized_offline_environment(
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
     }
-    assert environment["TRADING_ASSISTANT_OFFLINE_VERIFY"] == "1"
+    assert environment["TRADING_ASSISTANT_LOCAL_VERIFY"] == "1"
     assert environment["UV_OFFLINE"] == "1"
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert (
@@ -440,7 +561,7 @@ def test_runner_receives_only_sanitized_offline_environment(
     }
 
 
-def test_tools_are_resolved_once_and_recorded_before_ambient_path_changes(
+def test_injected_trusted_tools_are_recorded_before_ambient_path_changes(
     clean_repository: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -452,12 +573,14 @@ def test_tools_are_resolved_once_and_recorded_before_ambient_path_changes(
         ("uv", "run", "python", "-m", "compileall", "-q", "src"),
         timeout_seconds=30.0,
     )
+    toolchain = verifier_module._resolve_toolchain()
     output_dir = tmp_path / "evidence"
     verifier = ReleaseVerifier(
         root=clean_repository,
         runner=runner,
         output_dir=output_dir,
         commands=(command,),
+        toolchain=toolchain,
     )
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -494,21 +617,69 @@ def test_tools_are_resolved_once_and_recorded_before_ambient_path_changes(
         assert evidence["version"]
 
 
-def test_constructor_resolves_tool_files_without_executing_pre_evidence_commands(
+def test_toolchain_resolution_starts_only_after_stale_pass_is_invalidated(
     clean_repository: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def reject_pre_evidence_execution(*_args, **_kwargs):
-        raise AssertionError("tool executed before IN_PROGRESS evidence")
+    output_dir = tmp_path / "evidence"
+    output_dir.mkdir()
+    evidence_path = output_dir / "release-results.json"
+    evidence_path.write_text(
+        '{"state":"completed","passed":true,"detail_code":"PASS"}',
+        encoding="utf-8",
+    )
+    verifier = ReleaseVerifier(
+        root=clean_repository,
+        runner=ScriptedRunner([_completed()]),
+        output_dir=output_dir,
+        commands=(
+            Command(
+                "compile",
+                ("python", "-m", "compileall", "-q", "src"),
+                timeout_seconds=30.0,
+            ),
+        ),
+    )
+    assert verifier.toolchain is None
+
+    def interrupt_toolchain_resolution():
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert payload["passed"] is False
+        assert payload["detail_code"] == "PREFLIGHT_TOOLCHAIN"
+        raise KeyboardInterrupt
 
     monkeypatch.setattr(
-        verifier_module.SubprocessRunner,
-        "run",
-        reject_pre_evidence_execution,
+        verifier_module,
+        "_resolve_toolchain",
+        interrupt_toolchain_resolution,
     )
 
-    verifier = ReleaseVerifier(
+    with pytest.raises(KeyboardInterrupt):
+        verifier.run()
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["detail_code"] == "PREFLIGHT_TOOLCHAIN"
+
+
+def test_constructor_rejects_preexisting_path_spoofed_git_and_uv(
+    clean_repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    for name in ("git", "uv"):
+        executable = fake_bin / name
+        executable.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'synthetic version'\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    result = ReleaseVerifier(
         root=clean_repository,
         runner=ScriptedRunner([_completed()]),
         output_dir=tmp_path / "evidence",
@@ -519,11 +690,10 @@ def test_constructor_resolves_tool_files_without_executing_pre_evidence_commands
                 timeout_seconds=30.0,
             ),
         ),
-    )
+    ).run()
 
-    assert verifier.toolchain.git.path.is_absolute()
-    assert verifier.toolchain.uv.path.is_absolute()
-    assert verifier.toolchain.python.path.is_absolute()
+    assert result.passed is False
+    assert result.detail_code == "TOOLCHAIN_UNPROVEN"
 
 
 def test_tool_mutation_between_command_checks_fails_closed(
@@ -726,6 +896,37 @@ def test_generic_bearer_token_is_redacted_before_assignment_patterns(
 
 
 @pytest.mark.parametrize(
+    "authorization",
+    (
+        "Authorization: Basic c3ludGhldGljOnNlY3JldA==",
+        "Authorization: Digest "
+        'username="synthetic", response="0123456789abcdef"',
+        "Authorization: SyntheticScheme synthetic-credential-value",
+        "Authorization:\n  Basic c3ludGhldGljOnNlY3JldA==",
+    ),
+)
+def test_authorization_redaction_removes_the_complete_credential_value(
+    clean_repository: Path,
+    tmp_path: Path,
+    authorization: str,
+):
+    runner = ScriptedRunner(
+        [_completed(returncode=1, stderr=f"{authorization}\n")]
+    )
+
+    result, output_dir = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    serialized = (output_dir / "release-results.json").read_text(
+        encoding="utf-8"
+    )
+    assert "c3ludGhldGljOnNlY3JldA==" not in serialized
+    assert "synthetic-credential-value" not in serialized
+    assert "0123456789abcdef" not in serialized
+    assert "username=" not in serialized
+
+
+@pytest.mark.parametrize(
     ("response", "expected_status", "expected_detail"),
     [
         (
@@ -782,6 +983,29 @@ def test_subprocess_runner_uses_private_bounded_regular_spools(tmp_path: Path):
     assert completed.stdout.startswith("regular=True\nmode=0o600\n")
     assert len(completed.stdout) < 40_000
     assert completed.stdout.endswith("[TRUNCATED]\n")
+
+
+def test_subprocess_runner_enforces_output_file_limit_while_child_runs(
+    tmp_path: Path,
+):
+    runner = SubprocessRunner(max_output_file_bytes=4096)
+    source = (
+        "import os\n"
+        "block = b'x' * 1024\n"
+        "for _ in range(1024):\n"
+        "    os.write(1, block)\n"
+    )
+
+    with pytest.raises(OutputLimitExceeded) as raised:
+        runner.run(
+            argv=(sys.executable, "-c", source),
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", os.defpath)},
+            timeout_seconds=5.0,
+        )
+
+    assert len(raised.value.output.encode("utf-8")) <= 4096
+    assert len(raised.value.stderr.encode("utf-8")) <= 4096
 
 
 def test_subprocess_runner_timeout_has_a_finite_cleanup_deadline(
@@ -970,6 +1194,187 @@ def test_junit_rejects_partial_unapproved_skips_despite_passing_cases(
     assert result.detail_code == "UNAPPROVED_TEST_SKIP"
 
 
+@pytest.mark.parametrize(
+    "junit",
+    (
+        (
+            "<testsuite tests=\"999\" failures=\"998\" errors=\"0\" "
+            "skipped=\"0\">"
+            "<testcase classname=\"tests.test_example\" "
+            "name=\"test_example\" file=\"tests/test_example.py\"/>"
+            "</testsuite>"
+        ),
+        (
+            "<testsuites tests=\"2\" failures=\"0\" errors=\"0\" "
+            "skipped=\"0\">"
+            "<testsuite tests=\"1\" failures=\"0\" errors=\"0\" "
+            "skipped=\"0\">"
+            "<testcase classname=\"tests.test_example\" "
+            "name=\"test_example\" file=\"tests/test_example.py\"/>"
+            "</testsuite>"
+            "</testsuites>"
+        ),
+    ),
+)
+def test_junit_aggregate_totals_must_match_exact_testcase_evidence(
+    clean_repository: Path,
+    tmp_path: Path,
+    junit: str,
+):
+    runner = ScriptedRunner([_completed()], junit_xml=junit)
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "JUNIT_AGGREGATE_MISMATCH"
+
+
+def test_junit_rejects_duplicate_testcase_identities(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    testcase = (
+        "<testcase classname=\"tests.test_example\" "
+        "name=\"test_example\" file=\"tests/test_example.py\"/>"
+    )
+    junit = (
+        "<testsuite tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"0\">"
+        f"{testcase}{testcase}</testsuite>"
+    )
+    runner = ScriptedRunner([_completed()], junit_xml=junit)
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "DUPLICATE_TEST_IDENTITY"
+
+
+def test_junit_skip_allowlist_is_exact_by_node_id_not_file(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    junit = (
+        "<testsuite tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"1\">"
+        "<testcase classname=\"tests.test_example\" "
+        "name=\"test_example\" file=\"tests/test_example.py\"/>"
+        "<testcase classname=\"tests.test_alpaca_paper_integration\" "
+        "name=\"test_future_sensitive_case\" "
+        "file=\"tests/test_alpaca_paper_integration.py\">"
+        "<skipped message=\"credentials absent\"/></testcase>"
+        "</testsuite>"
+    )
+    runner = ScriptedRunner([_completed()], junit_xml=junit)
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "UNAPPROVED_TEST_SKIP"
+
+
+def test_pinned_test_manifest_rejects_partial_collection(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    command = Command(
+        "full-tests",
+        ("python", "-m", "pytest"),
+        timeout_seconds=30.0,
+        expects_tests=True,
+        test_manifest=ReleaseTestManifest(
+            count=2,
+            digest="sha256:a332f36f5bbc6e074ad16ef253d337bf"
+            "5a8b53bc08356b1c0c1cda410a29c7ad",
+        ),
+    )
+    runner = ScriptedRunner([_completed()])
+
+    result, _ = _run_one(
+        clean_repository,
+        tmp_path,
+        runner,
+        command=command,
+    )
+
+    assert result.passed is False
+    assert result.detail_code == "TEST_MANIFEST_MISMATCH"
+
+
+def test_pytest_evidence_rejects_any_deselected_node_id(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    runner = ScriptedRunner(
+        [_completed()],
+        pytest_evidence={
+            "schema_version": 1,
+            "exitstatus": 0,
+            "collected": ["tests/test_example.py::test_example"],
+            "deselected": ["tests/test_example.py::test_hidden"],
+            "outcomes": [
+                {
+                    "nodeid": "tests/test_example.py::test_example",
+                    "outcome": "passed",
+                }
+            ],
+        },
+    )
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "TESTS_DESELECTED"
+
+
+def test_pytest_evidence_rejects_duplicate_collected_node_ids(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    runner = ScriptedRunner(
+        [_completed()],
+        pytest_evidence={
+            "schema_version": 1,
+            "exitstatus": 0,
+            "collected": [
+                "tests/test_example.py::test_example",
+                "tests/test_example.py::test_example",
+            ],
+            "deselected": [],
+            "outcomes": [
+                {
+                    "nodeid": "tests/test_example.py::test_example",
+                    "outcome": "passed",
+                }
+            ],
+        },
+    )
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "DUPLICATE_COLLECTED_NODEID"
+
+
+def test_junit_identities_must_match_the_exact_pytest_node_ids(
+    clean_repository: Path,
+    tmp_path: Path,
+):
+    runner = ScriptedRunner(
+        [_completed()],
+        junit_xml=(
+            "<testsuite tests=\"1\" failures=\"0\" errors=\"0\" "
+            "skipped=\"0\">"
+            "<testcase classname=\"tests.test_example\" "
+            "name=\"test_different\" file=\"tests/test_example.py\"/>"
+            "</testsuite>"
+        ),
+    )
+
+    result, _ = _run_one(clean_repository, tmp_path, runner)
+
+    assert result.passed is False
+    assert result.detail_code == "PYTEST_JUNIT_IDENTITY_MISMATCH"
+
+
 def test_junit_proves_each_explicit_focused_test_file_contributed_cases(
     clean_repository: Path,
     tmp_path: Path,
@@ -986,6 +1391,11 @@ def test_junit_proves_each_explicit_focused_test_file_contributed_cases(
         ),
         timeout_seconds=30.0,
         expects_tests=True,
+        test_manifest=ReleaseTestManifest(
+            count=2,
+            digest="sha256:a332f36f5bbc6e074ad16ef253d337bf"
+            "5a8b53bc08356b1c0c1cda410a29c7ad",
+        ),
     )
     runner = ScriptedRunner([_completed(stdout="1 passed\n")])
 
@@ -1022,10 +1432,47 @@ def test_junit_skip_allowlist_is_exact_and_value_free(
         ("uv", "run", "pytest"),
         timeout_seconds=30.0,
         expects_tests=True,
+        test_manifest=ReleaseTestManifest(
+            count=3,
+            digest="sha256:45f793b8e9076c0f56fb72628c32593"
+            "cb2bc132cb87ab987b5d6322a93b41e0f",
+        ),
     )
     runner = ScriptedRunner(
         [_completed(stdout="1 passed, 2 skipped\n")],
         junit_xml=junit,
+        pytest_evidence={
+            "schema_version": 1,
+            "exitstatus": 0,
+            "collected": [
+                "tests/test_example.py::test_passed",
+                (
+                    "tests/test_alpaca_paper_integration.py"
+                    "::test_paper_account_and_quote"
+                ),
+                "tests/test_llm_runner.py::test_budget_aborts_run",
+            ],
+            "deselected": [],
+            "outcomes": [
+                {
+                    "nodeid": "tests/test_example.py::test_passed",
+                    "outcome": "passed",
+                },
+                {
+                    "nodeid": (
+                        "tests/test_alpaca_paper_integration.py"
+                        "::test_paper_account_and_quote"
+                    ),
+                    "outcome": "skipped",
+                },
+                {
+                    "nodeid": (
+                        "tests/test_llm_runner.py::test_budget_aborts_run"
+                    ),
+                    "outcome": "skipped",
+                },
+            ],
+        },
     )
 
     result, output_dir = _run_one(
@@ -1135,7 +1582,30 @@ def test_python_network_guard_blocks_inet_but_allows_unix_socket_creation(
         "kind": "python_socket_guard",
         "os_enforced": False,
         "status": "verified",
+        "boundary": "python_runtime_only",
+        "hostile_local_process_boundary": "external_clean_ci_required",
     }
+
+
+def test_local_verifier_does_not_claim_hostile_process_or_os_isolation():
+    source = Path("scripts/verify_loopback_release.py").read_text(
+        encoding="utf-8"
+    )
+    guard_source = Path("scripts/verifier_network_guard.py").read_text(
+        encoding="utf-8"
+    )
+    runbook = Path("docs/RUNBOOK.md").read_text(encoding="utf-8")
+    normalized_runbook = " ".join(runbook.split())
+
+    assert "offline-only" not in source
+    assert "without credentials or network authority" not in source
+    assert "TRADING_ASSISTANT_OFFLINE_VERIFY" not in source
+    assert "offline release verifier" not in guard_source
+    assert "clean external CI runner" in normalized_runbook
+    assert (
+        "not an OS network, home, or Keychain sandbox"
+        in normalized_runbook
+    )
 
 
 def test_python_network_guard_blocks_default_inet_socket_constructor(
@@ -1259,6 +1729,153 @@ def test_command_that_changes_candidate_tree_cannot_produce_pass(
     assert payload["passed"] is False
     assert payload["detail_code"] == "DIRTY_TREE"
     assert not (output_dir / "PASS").exists()
+
+
+def test_preflight_interruption_invalidates_prior_passing_evidence(
+    clean_repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_dir = tmp_path / "evidence"
+    output_dir.mkdir()
+    evidence_path = output_dir / "release-results.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "state": "completed",
+                "run_id": "prior-passing-run",
+                "passed": True,
+                "detail_code": "PASS",
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_path.chmod(0o600)
+
+    def interrupt_repository_preflight(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        verifier_module,
+        "_repository_state",
+        interrupt_repository_preflight,
+    )
+    verifier = ReleaseVerifier(
+        root=clean_repository,
+        runner=ScriptedRunner([_completed()]),
+        output_dir=output_dir,
+        commands=(
+            Command(
+                "compile",
+                ("python", "-m", "compileall", "-q", "src"),
+                timeout_seconds=30.0,
+            ),
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        verifier.run()
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["state"] == "preflight"
+    assert payload["detail_code"] == "PREFLIGHT_REPOSITORY"
+    assert payload["run_id"] != "prior-passing-run"
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_detail"),
+    (
+        ("_safe_environment", "PREFLIGHT_ENVIRONMENT"),
+        ("_migration_head", "PREFLIGHT_MIGRATION"),
+    ),
+)
+def test_each_preflight_stage_reinvalidates_stale_pass_before_interrupt(
+    clean_repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    expected_detail: str,
+):
+    output_dir = tmp_path / "evidence"
+    output_dir.mkdir()
+    evidence_path = output_dir / "release-results.json"
+    evidence_path.write_text(
+        '{"state":"completed","passed":true,"detail_code":"PASS"}',
+        encoding="utf-8",
+    )
+
+    def interrupt_stage(*_args, **_kwargs):
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert payload["passed"] is False
+        assert payload["detail_code"] == expected_detail
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(verifier_module, target, interrupt_stage)
+    verifier = ReleaseVerifier(
+        root=clean_repository,
+        runner=ScriptedRunner([_completed()]),
+        output_dir=output_dir,
+        commands=(
+            Command(
+                "compile",
+                ("python", "-m", "compileall", "-q", "src"),
+                timeout_seconds=30.0,
+            ),
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        verifier.run()
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["detail_code"] == expected_detail
+
+
+def test_public_wrapper_invalidates_stale_pass_before_constructor(
+    clean_repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_dir = tmp_path / "evidence"
+    output_dir.mkdir()
+    evidence_path = output_dir / "release-results.json"
+    evidence_path.write_text(
+        '{"state":"completed","passed":true,"detail_code":"PASS"}',
+        encoding="utf-8",
+    )
+
+    class InterruptedConstructor:
+        def __init__(self, **_kwargs):
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            assert payload["passed"] is False
+            assert payload["detail_code"] == "PREFLIGHT_CONSTRUCTION"
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        verifier_module,
+        "ReleaseVerifier",
+        InterruptedConstructor,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        verify_release(
+            root=clean_repository,
+            output_dir=output_dir,
+            commands=(
+                Command(
+                    "compile",
+                    ("python", "-m", "compileall", "-q", "src"),
+                    timeout_seconds=30.0,
+                ),
+            ),
+        )
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["detail_code"] == "PREFLIGHT_CONSTRUCTION"
 
 
 def test_failed_command_still_rechecks_candidate_tree_before_reporting_failure(

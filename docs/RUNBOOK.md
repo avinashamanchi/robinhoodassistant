@@ -524,6 +524,24 @@ generates independent test key material and exposes it only to the explicit
 `--development-environment-secrets` migration and mock-drill commands. Those
 commands cannot authorize an app, daemon, MCP process, provider, or broker.
 
+The local verifier is a sanitized-process software check, not an OS network,
+home, or Keychain sandbox. Its Python socket guard is defense in depth for
+Python code only; `os_enforced: false` is recorded in the evidence. It cannot
+exclude a hostile same-user process, a native executable that bypasses the
+Python guard, executable replacement between kernel operations, detached
+reparented descendants, or a transient mutate-then-restore attack. Only a clean
+external CI runner provides the hostile-local-process boundary. Local PASS
+evidence must never be described as full offline isolation.
+
+The public CLI invalidates any prior PASS before verifier construction, then
+rewrites fail-closed preflight evidence before toolchain resolution, sanitized
+environment creation, repository/ancestry inspection, and migration
+inspection. Test commands must match pinned collected-node manifests, produce
+one outcome per exact node ID, and agree with JUnit testcase identities and
+aggregate totals. Grafts, replace refs, alternates, partial clones, shallow
+history, or failure to prove the pinned trusted ancestry anchor are release
+failures. Child output files are kernel-size-limited during execution.
+
 The job then:
 
 1. upgrades the isolated database to the sole migration head and verifies it;

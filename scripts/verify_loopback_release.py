@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run deterministic release checks without credentials or network authority."""
+"""Run bounded release checks with sanitized process inputs."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
+import resource
 import signal
 import shutil
 import subprocess
@@ -29,13 +31,21 @@ NETWORK_GUARD_PATH = Path(__file__).resolve().with_name(
     "verifier_network_guard.py"
 )
 EXPECTED_MIGRATION_HEAD = "20260729_0017"
+TRUSTED_ANCESTRY_ANCHOR = "4807cc0dc9dd20f21cf174e81034fea656162e3d"
 _MAX_CAPTURE_CHARS = 32_768
 _MAX_CAPTURE_BYTES = 32_768
+_MAX_OUTPUT_FILE_BYTES = 64 * 1024 * 1024
 _MAX_JUNIT_BYTES = 32 * 1024 * 1024
+_MAX_PYTEST_EVIDENCE_BYTES = 32 * 1024 * 1024
 _TERMINATE_GRACE_SECONDS = 0.5
 _KILL_GRACE_SECONDS = 0.5
 _COMMAND_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _SHA = re.compile(r"[0-9a-f]{40,64}")
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?im)\bauthorization\b\s*[:=]\s*[^\r\n]*"
+    r"(?:\r?\n[ \t]+[^\r\n]*)*"
+)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(?:api[-_]?key|authorization|credential|password|secret|token)"
     r"\b\s*[:=]\s*[^\s,;]+"
@@ -51,8 +61,15 @@ _PRIVATE_PATH = re.compile(
 _SAFE_TEST_PATH = re.compile(
     r"tests/(?:[A-Za-z0-9._+-]+/)*test_[A-Za-z0-9._+-]+\.py"
 )
-_ALLOWED_SKIPPED_TEST_FILE = "tests/test_alpaca_paper_integration.py"
-_ALLOWED_SKIPPED_NODEID = "tests/test_llm_runner.py::test_budget_aborts_run"
+_ALLOWED_SKIPPED_NODEIDS = frozenset(
+    {
+        (
+            "tests/test_alpaca_paper_integration.py"
+            "::test_paper_account_and_quote"
+        ),
+        "tests/test_llm_runner.py::test_budget_aborts_run",
+    }
+)
 _ROOT_CREDENTIAL_NAMES = frozenset(
     {
         ".env",
@@ -65,6 +82,115 @@ _ROOT_CREDENTIAL_NAMES = frozenset(
         "service_account.json",
     }
 )
+_PYTEST_PLUGIN_SOURCE = """\
+from __future__ import annotations
+
+import json
+import os
+
+_COLLECTED = []
+_DESELECTED = []
+_OUTCOMES = []
+
+
+def pytest_collection_finish(session):
+    _COLLECTED[:] = [item.nodeid for item in session.items]
+
+
+def pytest_deselected(items):
+    _DESELECTED.extend(item.nodeid for item in items)
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        _OUTCOMES.append(
+            {"nodeid": report.nodeid, "outcome": report.outcome}
+        )
+    elif report.when in {"setup", "teardown"} and report.outcome != "passed":
+        _OUTCOMES.append(
+            {"nodeid": report.nodeid, "outcome": report.outcome}
+        )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    del session
+    path = os.environ["TRADING_ASSISTANT_PYTEST_EVIDENCE_PATH"]
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "exitstatus": int(exitstatus),
+                "collected": _COLLECTED,
+                "deselected": _DESELECTED,
+                "outcomes": _OUTCOMES,
+            },
+            handle,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        handle.write("\\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class TestManifest:
+    """Pinned exact pytest collection identity for one release command."""
+
+    count: int
+    digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.count, bool)
+            or not isinstance(self.count, int)
+            or self.count <= 0
+            or _SHA256_DIGEST.fullmatch(self.digest) is None
+        ):
+            raise ValueError("test manifest is invalid")
+
+
+_MIGRATION_TEST_MANIFEST = TestManifest(
+    count=182,
+    digest=(
+        "sha256:8b7fc05ee92e1ad2a257e8967cdba00f"
+        "5948795a5ea98ac61aeeed3a9b09e8ce"
+    ),
+)
+_SECURITY_TEST_MANIFEST = TestManifest(
+    count=660,
+    digest=(
+        "sha256:7b45fe87f34aa26180c48a7bde37fb90"
+        "56d95b6854d988cbf7aea34fedbd91a8"
+    ),
+)
+_SAFETY_TEST_MANIFEST = TestManifest(
+    count=142,
+    digest=(
+        "sha256:76c19857c99746deec00743d33567335f"
+        "43b7c5bf11869834a1a9eb8bfd100ab"
+    ),
+)
+_FRONTEND_TEST_MANIFEST = TestManifest(
+    count=188,
+    digest=(
+        "sha256:14111d111fa8f069aeca5e898ffea6d5d"
+        "09136d6a281624b7c7796ecf866b034"
+    ),
+)
+_FULL_TEST_MANIFEST = TestManifest(
+    count=3992,
+    digest=(
+        "sha256:6a19f01269cb10ed3171d9cd250ba9fce"
+        "4dc3d8786010c4af9c67a85afa30c22"
+    ),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +202,7 @@ class Command:
     timeout_seconds: float
     network: bool = False
     expects_tests: bool = False
+    test_manifest: TestManifest | None = None
 
     def __post_init__(self) -> None:
         if _COMMAND_NAME.fullmatch(self.name) is None:
@@ -102,11 +229,13 @@ class Command:
             raise ValueError("command timeout must be finite and positive")
         if type(self.network) is not bool or type(self.expects_tests) is not bool:
             raise ValueError("command classification must be boolean")
+        if self.expects_tests != (self.test_manifest is not None):
+            raise ValueError("test command manifest classification is invalid")
 
 
 @dataclass(frozen=True, slots=True)
 class VerificationStep:
-    """Redacted evidence for one attempted offline command."""
+    """Redacted evidence for one attempted local verification command."""
 
     name: str
     argv: tuple[str, ...]
@@ -128,6 +257,14 @@ class JUnitEvidence:
     failures: int
     errors: int
     skipped: int
+    nodeids: tuple[str, ...]
+    skipped_nodeids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PytestEvidence:
+    collected: tuple[str, ...]
+    skipped: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,8 +400,40 @@ class Runner(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
+class OutputLimitExceeded(subprocess.SubprocessError):
+    """A child reached the verifier's kernel-enforced file-size ceiling."""
+
+    def __init__(self, *, output: str, stderr: str) -> None:
+        super().__init__("command output limit exceeded")
+        self.output = output
+        self.stderr = stderr
+
+
 class SubprocessRunner:
     """Run fixed argv with private bounded captures and finite cleanup waits."""
+
+    def __init__(
+        self,
+        *,
+        max_output_file_bytes: int = _MAX_OUTPUT_FILE_BYTES,
+    ) -> None:
+        if (
+            isinstance(max_output_file_bytes, bool)
+            or not isinstance(max_output_file_bytes, int)
+            or max_output_file_bytes <= 0
+        ):
+            raise ValueError("output file limit must be a positive integer")
+        self.max_output_file_bytes = max_output_file_bytes
+
+    def _limit_child_files(self) -> None:
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE,
+            (
+                self.max_output_file_bytes,
+                self.max_output_file_bytes,
+            ),
+        )
+        signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
 
     @staticmethod
     def _capture(handle) -> str:
@@ -338,6 +507,7 @@ class SubprocessRunner:
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
+                preexec_fn=self._limit_child_files,
             )
             try:
                 process.wait(timeout=timeout_seconds)
@@ -354,8 +524,15 @@ class SubprocessRunner:
             except BaseException:
                 self._bounded_stop(process)
                 raise
+            output_limit_reached = any(
+                os.fstat(handle.fileno()).st_size
+                >= self.max_output_file_bytes
+                for handle in (stdout_handle, stderr_handle)
+            )
             stdout = self._capture(stdout_handle)
             stderr = self._capture(stderr_handle)
+            if output_limit_reached:
+                raise OutputLimitExceeded(output=stdout, stderr=stderr)
             return subprocess.CompletedProcess(
                 args=argv,
                 returncode=process.returncode,
@@ -377,6 +554,8 @@ def _resolve_toolchain() -> Toolchain:
         raw_path = candidates[name]
         if raw_path is None:
             raise RuntimeError("required verifier tool is unavailable")
+        if not _tool_path_is_trusted(name, Path(raw_path)):
+            raise RuntimeError("required verifier tool is unproven")
         try:
             identities[name] = ToolIdentity.capture(
                 name,
@@ -390,6 +569,49 @@ def _resolve_toolchain() -> Toolchain:
         uv=identities["uv"],
         python=identities["python"],
     )
+
+
+def _tool_path_is_trusted(name: str, path: Path) -> bool:
+    try:
+        canonical = path.resolve(strict=True)
+        account_home = Path(
+            pwd.getpwuid(os.getuid()).pw_dir
+        ).resolve(strict=True)
+        interpreter = Path(sys.executable).resolve(strict=True)
+    except (KeyError, OSError, RuntimeError):
+        return False
+    if name == "python":
+        return canonical == interpreter
+    if name == "git":
+        roots = (
+            Path("/usr/bin"),
+            Path("/usr/local/bin"),
+            Path("/opt/homebrew/Cellar/git"),
+            Path("/home/linuxbrew/.linuxbrew/Cellar/git"),
+        )
+    elif name == "uv":
+        roots = (
+            Path("/usr/bin"),
+            Path("/usr/local/bin"),
+            Path("/opt/homebrew/Cellar/uv"),
+            Path("/home/linuxbrew/.linuxbrew/Cellar/uv"),
+            Path("/opt/hostedtoolcache/uv"),
+            account_home / ".local" / "bin",
+            account_home / ".local" / "share" / "uv",
+        )
+    else:
+        return False
+    for root in roots:
+        try:
+            trusted_root = root.resolve(strict=True)
+            canonical.relative_to(trusted_root)
+            mode = trusted_root.stat().st_mode
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if mode & 0o022:
+            continue
+        return True
+    return False
 
 
 def _prove_tool_versions(
@@ -490,6 +712,10 @@ def _safe_environment(
         "from scripts.verifier_network_guard import install_network_guard\n"
         "install_network_guard()\n",
     )
+    _private_file(
+        injection / "verifier_pytest_plugin.py",
+        _PYTEST_PLUGIN_SOURCE,
+    )
     git_config = _private_file(runtime_dir / "gitconfig", "")
     pip_config = _private_file(runtime_dir / "pip.conf", "")
     uv_config = _private_file(runtime_dir / "uv.toml", "")
@@ -506,12 +732,16 @@ def _safe_environment(
         "PATH": os.pathsep.join((*sorted(tool_directories), os.defpath)),
         "PIP_CONFIG_FILE": str(pip_config),
         "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": os.pathsep.join((str(injection), str(DEFAULT_ROOT))),
         "PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring",
-        "TRADING_ASSISTANT_OFFLINE_VERIFY": "1",
+        "TRADING_ASSISTANT_LOCAL_VERIFY": "1",
         "TRADING_ASSISTANT_PYTHON_NETWORK_GUARD": "python_socket_guard_v1",
+        "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR": (
+            TRUSTED_ANCESTRY_ANCHOR
+        ),
         "TRADING_ASSISTANT_VERIFIED_GIT": str(toolchain.git.path),
         "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT": (
             toolchain.git.fingerprint
@@ -538,6 +768,7 @@ def _redact(value: str | bytes | None, *, root: Path) -> str:
     root_text = str(root)
     if root_text:
         text = text.replace(root_text, "<repo>")
+    text = _AUTHORIZATION_HEADER.sub("Authorization: [REDACTED]", text)
     text = _BEARER.sub("Bearer [REDACTED]", text)
     text = _SECRET_ASSIGNMENT.sub("[REDACTED]", text)
     text = _ANTHROPIC_KEY.sub("[REDACTED]", text)
@@ -610,6 +841,115 @@ def _repository_state(
     if commit.returncode != 0 or _SHA.fullmatch(candidate) is None:
         return None, "GIT_STATE_UNPROVEN"
     return candidate, None
+
+
+def _git_common_directory(
+    root: Path,
+    *,
+    git_path: Path,
+    environment: dict[str, str],
+) -> Path | None:
+    completed = _git(
+        root,
+        git_path,
+        environment,
+        "rev-parse",
+        "--git-common-dir",
+    )
+    if completed.returncode != 0:
+        return None
+    candidate = Path(completed.stdout.strip())
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        common = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return common if common.is_dir() else None
+
+
+def _repository_history_error(
+    root: Path,
+    *,
+    git_path: Path,
+    environment: dict[str, str],
+    trusted_ancestry_anchor: str,
+) -> str | None:
+    if _SHA.fullmatch(trusted_ancestry_anchor) is None:
+        return "TRUSTED_ANCESTRY_UNPROVEN"
+    common = _git_common_directory(
+        root,
+        git_path=git_path,
+        environment=environment,
+    )
+    if common is None:
+        return "GIT_HISTORY_UNPROVEN"
+    if os.path.lexists(common / "info" / "grafts"):
+        return "GIT_HISTORY_GRAFTS"
+    if os.path.lexists(common / "objects" / "info" / "alternates"):
+        return "GIT_HISTORY_ALTERNATES"
+
+    replacements = _git(
+        root,
+        git_path,
+        environment,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace",
+    )
+    if replacements.returncode != 0:
+        return "GIT_HISTORY_UNPROVEN"
+    if replacements.stdout.strip():
+        return "GIT_HISTORY_REPLACE_REFS"
+
+    partial = _git(
+        root,
+        git_path,
+        environment,
+        "config",
+        "--local",
+        "--get-regexp",
+        r"^(extensions\.partialclone|remote\..*\.promisor)$",
+    )
+    if partial.returncode not in {0, 1}:
+        return "GIT_HISTORY_UNPROVEN"
+    if partial.returncode == 0 or partial.stdout.strip():
+        return "GIT_HISTORY_PARTIAL_CLONE"
+
+    shallow = _git(
+        root,
+        git_path,
+        environment,
+        "rev-parse",
+        "--is-shallow-repository",
+    )
+    if shallow.returncode != 0:
+        return "GIT_HISTORY_UNPROVEN"
+    if shallow.stdout.strip() == "true":
+        return "GIT_HISTORY_SHALLOW"
+    if shallow.stdout.strip() != "false":
+        return "GIT_HISTORY_UNPROVEN"
+
+    anchor = _git(
+        root,
+        git_path,
+        environment,
+        "cat-file",
+        "-e",
+        f"{trusted_ancestry_anchor}^{{commit}}",
+    )
+    ancestry = _git(
+        root,
+        git_path,
+        environment,
+        "merge-base",
+        "--is-ancestor",
+        trusted_ancestry_anchor,
+        "HEAD",
+    )
+    if anchor.returncode != 0 or ancestry.returncode != 0:
+        return "TRUSTED_ANCESTRY_UNPROVEN"
+    return None
 
 
 def _ignored_root_credential_exists(
@@ -784,6 +1124,146 @@ def _required_test_files(command: Command) -> tuple[str, ...]:
     return tuple(required)
 
 
+def _safe_nodeid(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or any(char in value for char in ("\n", "\r", "\x00", "\x1b"))
+    ):
+        return None
+    relative, separator, remainder = value.partition("::")
+    if (
+        separator != "::"
+        or not remainder
+        or _SAFE_TEST_PATH.fullmatch(relative) is None
+    ):
+        return None
+    return value
+
+
+def _test_manifest(nodeids: tuple[str, ...]) -> TestManifest:
+    canonical = "".join(f"{nodeid}\n" for nodeid in sorted(nodeids)).encode(
+        "utf-8"
+    )
+    return TestManifest(
+        count=len(nodeids),
+        digest=f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+    )
+
+
+def _pytest_evidence(
+    path: Path,
+    *,
+    command: Command,
+) -> tuple[PytestEvidence | None, str | None]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None, "PYTEST_EVIDENCE_MISSING"
+        path.chmod(0o600)
+        if path.stat().st_size > _MAX_PYTEST_EVIDENCE_BYTES:
+            return None, "PYTEST_EVIDENCE_TOO_LARGE"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "PYTEST_EVIDENCE_MALFORMED"
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("exitstatus") != 0
+    ):
+        return None, "PYTEST_EVIDENCE_MALFORMED"
+    raw_collected = payload.get("collected")
+    raw_deselected = payload.get("deselected")
+    raw_outcomes = payload.get("outcomes")
+    if (
+        not isinstance(raw_collected, list)
+        or not isinstance(raw_deselected, list)
+        or not isinstance(raw_outcomes, list)
+    ):
+        return None, "PYTEST_EVIDENCE_MALFORMED"
+    collected = tuple(_safe_nodeid(value) for value in raw_collected)
+    deselected = tuple(_safe_nodeid(value) for value in raw_deselected)
+    if any(value is None for value in (*collected, *deselected)):
+        return None, "PYTEST_EVIDENCE_MALFORMED"
+    canonical_collected = tuple(
+        value for value in collected if value is not None
+    )
+    canonical_deselected = tuple(
+        value for value in deselected if value is not None
+    )
+    if len(set(canonical_collected)) != len(canonical_collected):
+        return None, "DUPLICATE_COLLECTED_NODEID"
+    if len(set(canonical_deselected)) != len(canonical_deselected):
+        return None, "DUPLICATE_DESELECTED_NODEID"
+    if canonical_deselected:
+        return None, "TESTS_DESELECTED"
+    if not canonical_collected:
+        return None, "EXPECTED_SUITE_EMPTY"
+    if command.test_manifest is None:
+        return None, "TEST_MANIFEST_UNPINNED"
+    if _test_manifest(canonical_collected) != command.test_manifest:
+        return None, "TEST_MANIFEST_MISMATCH"
+
+    outcomes: dict[str, str] = {}
+    for raw in raw_outcomes:
+        if not isinstance(raw, dict):
+            return None, "PYTEST_EVIDENCE_MALFORMED"
+        nodeid = _safe_nodeid(raw.get("nodeid"))
+        outcome = raw.get("outcome")
+        if nodeid is None or outcome not in {"passed", "failed", "skipped"}:
+            return None, "PYTEST_EVIDENCE_MALFORMED"
+        if nodeid in outcomes:
+            return None, "DUPLICATE_TEST_OUTCOME"
+        outcomes[nodeid] = outcome
+    if set(outcomes) != set(canonical_collected):
+        return None, "INCOMPLETE_TEST_EXECUTION"
+    if any(outcome == "failed" for outcome in outcomes.values()):
+        return None, "PYTEST_REPORTED_FAILURE"
+    skipped = tuple(
+        sorted(
+            nodeid
+            for nodeid, outcome in outcomes.items()
+            if outcome == "skipped"
+        )
+    )
+    if any(nodeid not in _ALLOWED_SKIPPED_NODEIDS for nodeid in skipped):
+        return None, "UNAPPROVED_TEST_SKIP"
+    return (
+        PytestEvidence(
+            collected=tuple(sorted(canonical_collected)),
+            skipped=skipped,
+        ),
+        None,
+    )
+
+
+def _junit_nodeid(
+    *,
+    relative: str,
+    classname: str,
+    name: str,
+) -> str | None:
+    if (
+        not classname
+        or len(classname) > 4096
+        or any(char in classname for char in ("\n", "\r", "\x00", "\x1b"))
+    ):
+        return None
+    module_name = relative.removesuffix(".py").replace("/", ".")
+    if classname == module_name:
+        candidate = f"{relative}::{name}"
+    elif classname.startswith(f"{module_name}."):
+        scope = classname[len(module_name) + 1 :]
+        if not scope or any(not part for part in scope.split(".")):
+            return None
+        candidate = (
+            f"{relative}::{scope.replace('.', '::')}::{name}"
+        )
+    else:
+        return None
+    return _safe_nodeid(candidate)
+
+
 def _junit_evidence(
     path: Path,
     *,
@@ -804,14 +1284,27 @@ def _junit_evidence(
         root = ET.fromstring(payload)
     except ET.ParseError:
         return None, "JUNIT_EVIDENCE_MALFORMED"
-    cases = tuple(root.iter("testcase"))
+    if root.tag == "testsuite":
+        suites = (root,)
+    elif root.tag == "testsuites":
+        suites = tuple(root.findall("testsuite"))
+        if len(suites) != len(tuple(root)):
+            return None, "JUNIT_EVIDENCE_MALFORMED"
+    else:
+        return None, "JUNIT_EVIDENCE_MALFORMED"
+    if not suites:
+        return None, "EXPECTED_SUITE_EMPTY"
+    cases = tuple(case for suite in suites for case in suite.findall("testcase"))
     if not cases:
         return None, "EXPECTED_SUITE_EMPTY"
 
     contributed: set[str] = set()
+    identities: set[tuple[str, str, str]] = set()
     failures = 0
     errors = 0
     skipped = 0
+    nodeids: set[str] = set()
+    skipped_nodeids: set[str] = set()
     for case in cases:
         relative = case.attrib.get("file", "")
         name = case.attrib.get("name", "")
@@ -821,6 +1314,19 @@ def _junit_evidence(
             or any(char in name for char in ("\n", "\r", "\x00"))
         ):
             return None, "JUNIT_EVIDENCE_MALFORMED"
+        classname = case.attrib.get("classname", "")
+        identity = (relative, classname, name)
+        if identity in identities:
+            return None, "DUPLICATE_TEST_IDENTITY"
+        identities.add(identity)
+        nodeid = _junit_nodeid(
+            relative=relative,
+            classname=classname,
+            name=name,
+        )
+        if nodeid is None or nodeid in nodeids:
+            return None, "JUNIT_EVIDENCE_MALFORMED"
+        nodeids.add(nodeid)
         contributed.add(relative)
         if case.find("failure") is not None:
             failures += 1
@@ -828,13 +1334,51 @@ def _junit_evidence(
             errors += 1
         if case.find("skipped") is not None:
             skipped += 1
-            nodeid = f"{relative}::{name}"
-            if (
-                relative != _ALLOWED_SKIPPED_TEST_FILE
-                and nodeid != _ALLOWED_SKIPPED_NODEID
-            ):
+            skipped_nodeids.add(nodeid)
+            if nodeid not in _ALLOWED_SKIPPED_NODEIDS:
                 return None, "UNAPPROVED_TEST_SKIP"
 
+    expected_totals = {
+        "tests": len(cases),
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+    }
+    for suite in suites:
+        suite_cases = tuple(suite.findall("testcase"))
+        suite_totals = {
+            "tests": len(suite_cases),
+            "failures": sum(
+                case.find("failure") is not None for case in suite_cases
+            ),
+            "errors": sum(
+                case.find("error") is not None for case in suite_cases
+            ),
+            "skipped": sum(
+                case.find("skipped") is not None for case in suite_cases
+            ),
+        }
+        try:
+            declared = {
+                name: int(suite.attrib[name])
+                for name in ("tests", "failures", "errors", "skipped")
+            }
+        except (KeyError, TypeError, ValueError):
+            return None, "JUNIT_EVIDENCE_MALFORMED"
+        if declared != suite_totals:
+            return None, "JUNIT_AGGREGATE_MISMATCH"
+    outer_names = ("tests", "failures", "errors", "skipped")
+    if root.tag == "testsuites" and any(
+        name in root.attrib for name in outer_names
+    ):
+        try:
+            outer_totals = {
+                name: int(root.attrib[name]) for name in outer_names
+            }
+        except (KeyError, TypeError, ValueError):
+            return None, "JUNIT_EVIDENCE_MALFORMED"
+        if outer_totals != expected_totals:
+            return None, "JUNIT_AGGREGATE_MISMATCH"
     if failures or errors:
         return None, "JUNIT_REPORTED_FAILURE"
     if len(cases) - skipped <= 0:
@@ -847,6 +1391,8 @@ def _junit_evidence(
             failures=failures,
             errors=errors,
             skipped=skipped,
+            nodeids=tuple(sorted(nodeids)),
+            skipped_nodeids=tuple(sorted(skipped_nodeids)),
         ),
         None,
     )
@@ -966,6 +1512,47 @@ def _write_in_progress(
             "tool_isolation": "canonical_fingerprint",
             "tools": _tools_payload(tools, root=root),
             "network_isolation": {
+                "boundary": "python_runtime_only",
+                "hostile_local_process_boundary": (
+                    "external_clean_ci_required"
+                ),
+                "kind": "python_socket_guard",
+                "os_enforced": False,
+                "status": "unproven",
+            },
+        },
+        output_dir=output_dir,
+    )
+
+
+def _write_preflight(
+    *,
+    run_id: str,
+    started_at: str,
+    output_dir: Path,
+    root: Path,
+    tools: tuple[ToolIdentity, ...] = (),
+    detail_code: str = "PREFLIGHT_STARTED",
+) -> Path:
+    return _write_payload(
+        {
+            "schema_version": 2,
+            "state": "preflight",
+            "run_id": run_id,
+            "passed": False,
+            "detail_code": detail_code,
+            "commit": None,
+            "migration_head": None,
+            "started_at": started_at,
+            "finished_at": None,
+            "steps": [],
+            "tool_isolation": "canonical_fingerprint",
+            "tools": _tools_payload(tools, root=root),
+            "network_isolation": {
+                "boundary": "python_runtime_only",
+                "hostile_local_process_boundary": (
+                    "external_clean_ci_required"
+                ),
                 "kind": "python_socket_guard",
                 "os_enforced": False,
                 "status": "unproven",
@@ -999,6 +1586,10 @@ def _write_result(
             "tool_isolation": "canonical_fingerprint",
             "tools": _tools_payload(result.tools, root=root),
             "network_isolation": {
+                "boundary": "python_runtime_only",
+                "hostile_local_process_boundary": (
+                    "external_clean_ci_required"
+                ),
                 "kind": "python_socket_guard",
                 "os_enforced": False,
                 "status": (
@@ -1013,7 +1604,7 @@ def _write_result(
 
 
 class ReleaseVerifier:
-    """Orchestrate a fixed, offline-only software verification program."""
+    """Orchestrate fixed checks; this is not a hostile-host sandbox."""
 
     def __init__(
         self,
@@ -1023,11 +1614,19 @@ class ReleaseVerifier:
         output_dir: Path | None = None,
         commands: tuple[Command, ...] | None = None,
         toolchain: Toolchain | None = None,
+        trusted_ancestry_anchor: str | None = None,
     ) -> None:
         self.root = root.resolve(strict=True)
         self.runner = runner or SubprocessRunner()
         self._toolchain_injected = toolchain is not None
-        self.toolchain = toolchain or _resolve_toolchain()
+        self.toolchain = toolchain
+        self.trusted_ancestry_anchor = (
+            trusted_ancestry_anchor
+            if trusted_ancestry_anchor is not None
+            else TRUSTED_ANCESTRY_ANCHOR
+        )
+        if _SHA.fullmatch(self.trusted_ancestry_anchor) is None:
+            raise ValueError("trusted ancestry anchor is invalid")
         self._python_network_guard_verified = False
         self.output_dir = (
             output_dir
@@ -1036,11 +1635,17 @@ class ReleaseVerifier:
         )
         self.commands = commands if commands is not None else self.default_commands()
 
+    def _require_toolchain(self) -> Toolchain:
+        if self.toolchain is None:
+            raise RuntimeError("verifier toolchain is unresolved")
+        return self.toolchain
+
     def _resolved_argv(self, command: Command) -> tuple[str, ...]:
+        toolchain = self._require_toolchain()
         replacements = {
-            "git": str(self.toolchain.git.path),
-            "uv": str(self.toolchain.uv.path),
-            "python": str(self.toolchain.python.path),
+            "git": str(toolchain.git.path),
+            "uv": str(toolchain.uv.path),
+            "python": str(toolchain.python.path),
         }
         return tuple(replacements.get(part, part) for part in command.argv)
 
@@ -1050,11 +1655,20 @@ class ReleaseVerifier:
         expected_commit: str,
         environment: dict[str, str],
     ) -> str | None:
-        if not self.toolchain.is_current():
+        toolchain = self._require_toolchain()
+        if not toolchain.is_current():
             return "TOOL_IDENTITY_CHANGED"
+        history_error = _repository_history_error(
+            self.root,
+            git_path=toolchain.git.path,
+            environment=environment,
+            trusted_ancestry_anchor=self.trusted_ancestry_anchor,
+        )
+        if history_error is not None:
+            return history_error
         current_commit, repository_error = _repository_state(
             self.root,
-            git_path=self.toolchain.git.path,
+            git_path=toolchain.git.path,
             environment=environment,
         )
         if repository_error is not None:
@@ -1085,6 +1699,7 @@ class ReleaseVerifier:
                 ),
                 timeout_seconds=900.0,
                 expects_tests=True,
+                test_manifest=_MIGRATION_TEST_MANIFEST,
             ),
             Command(
                 "security-tests",
@@ -1106,6 +1721,7 @@ class ReleaseVerifier:
                 ),
                 timeout_seconds=1200.0,
                 expects_tests=True,
+                test_manifest=_SECURITY_TEST_MANIFEST,
             ),
             Command(
                 "safety-tests",
@@ -1125,6 +1741,7 @@ class ReleaseVerifier:
                 ),
                 timeout_seconds=1200.0,
                 expects_tests=True,
+                test_manifest=_SAFETY_TEST_MANIFEST,
             ),
             Command(
                 "frontend-tests",
@@ -1141,12 +1758,14 @@ class ReleaseVerifier:
                 ),
                 timeout_seconds=1200.0,
                 expects_tests=True,
+                test_manifest=_FRONTEND_TEST_MANIFEST,
             ),
             Command(
                 "full-tests",
                 ("uv", "run", "python", "-m", "pytest"),
                 timeout_seconds=1800.0,
                 expects_tests=True,
+                test_manifest=_FULL_TEST_MANIFEST,
             ),
             Command(
                 "branch-coverage",
@@ -1166,6 +1785,7 @@ class ReleaseVerifier:
                 ),
                 timeout_seconds=1800.0,
                 expects_tests=True,
+                test_manifest=_FULL_TEST_MANIFEST,
             ),
             Command(
                 "static-gate",
@@ -1185,6 +1805,11 @@ class ReleaseVerifier:
         started_at: str,
         steps: list[VerificationStep],
     ) -> VerificationResult:
+        tools = (
+            self.toolchain.identities()
+            if self.toolchain is not None
+            else ()
+        )
         result = VerificationResult(
             state="completed",
             run_id=run_id,
@@ -1195,7 +1820,7 @@ class ReleaseVerifier:
             started_at=started_at,
             finished_at=_utc_now(),
             steps=tuple(steps),
-            tools=self.toolchain.identities(),
+            tools=tools,
             python_network_guard_verified=self._python_network_guard_verified,
         )
         _write_result(
@@ -1209,16 +1834,64 @@ class ReleaseVerifier:
         started_at = _utc_now()
         run_id = uuid.uuid4().hex
         self._python_network_guard_verified = False
+        _write_preflight(
+            run_id=run_id,
+            started_at=started_at,
+            output_dir=self.output_dir,
+            root=self.root,
+            tools=(
+                self.toolchain.identities()
+                if self.toolchain is not None
+                else ()
+            ),
+        )
+        _write_preflight(
+            run_id=run_id,
+            started_at=started_at,
+            output_dir=self.output_dir,
+            root=self.root,
+            tools=(
+                self.toolchain.identities()
+                if self.toolchain is not None
+                else ()
+            ),
+            detail_code="PREFLIGHT_TOOLCHAIN",
+        )
+        if self.toolchain is None:
+            try:
+                self.toolchain = _resolve_toolchain()
+            except (OSError, RuntimeError, ValueError):
+                return self._finish(
+                    run_id=run_id,
+                    passed=False,
+                    detail_code="TOOLCHAIN_UNPROVEN",
+                    commit=None,
+                    migration_head=None,
+                    started_at=started_at,
+                    steps=[],
+                )
+        toolchain = self._require_toolchain()
         with tempfile.TemporaryDirectory(
             prefix="trading-assistant-verifier-"
         ) as runtime_name:
             runtime_dir = Path(runtime_name)
             runtime_dir.chmod(0o700)
+            _write_preflight(
+                run_id=run_id,
+                started_at=started_at,
+                output_dir=self.output_dir,
+                root=self.root,
+                tools=toolchain.identities(),
+                detail_code="PREFLIGHT_ENVIRONMENT",
+            )
             try:
                 environment = _safe_environment(
-                    self.toolchain,
+                    toolchain,
                     runtime_dir=runtime_dir,
                 )
+                environment[
+                    "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR"
+                ] = self.trusted_ancestry_anchor
             except (OSError, RuntimeError, ValueError):
                 return self._finish(
                     run_id=run_id,
@@ -1242,7 +1915,16 @@ class ReleaseVerifier:
         run_id: str,
         environment: dict[str, str],
     ) -> VerificationResult:
-        if not self.toolchain.is_current():
+        toolchain = self._require_toolchain()
+        _write_preflight(
+            run_id=run_id,
+            started_at=started_at,
+            output_dir=self.output_dir,
+            root=self.root,
+            tools=toolchain.identities(),
+            detail_code="PREFLIGHT_REPOSITORY",
+        )
+        if not toolchain.is_current():
             return self._finish(
                 run_id=run_id,
                 passed=False,
@@ -1252,9 +1934,25 @@ class ReleaseVerifier:
                 started_at=started_at,
                 steps=[],
             )
+        history_error = _repository_history_error(
+            self.root,
+            git_path=toolchain.git.path,
+            environment=environment,
+            trusted_ancestry_anchor=self.trusted_ancestry_anchor,
+        )
+        if history_error is not None:
+            return self._finish(
+                run_id=run_id,
+                passed=False,
+                detail_code=history_error,
+                commit=None,
+                migration_head=None,
+                started_at=started_at,
+                steps=[],
+            )
         commit, repository_error = _repository_state(
             self.root,
-            git_path=self.toolchain.git.path,
+            git_path=toolchain.git.path,
             environment=environment,
         )
         if repository_error is not None:
@@ -1269,7 +1967,7 @@ class ReleaseVerifier:
             )
         ignored_credential = _ignored_root_credential_exists(
             self.root,
-            git_path=self.toolchain.git.path,
+            git_path=toolchain.git.path,
             environment=environment,
         )
         if ignored_credential is None:
@@ -1292,6 +1990,14 @@ class ReleaseVerifier:
                 started_at=started_at,
                 steps=[],
             )
+        _write_preflight(
+            run_id=run_id,
+            started_at=started_at,
+            output_dir=self.output_dir,
+            root=self.root,
+            tools=toolchain.identities(),
+            detail_code="PREFLIGHT_MIGRATION",
+        )
         migration_head, migration_error = _migration_head(self.root)
         if migration_error is not None:
             return self._finish(
@@ -1321,11 +2027,11 @@ class ReleaseVerifier:
             started_at=started_at,
             output_dir=self.output_dir,
             root=self.root,
-            tools=self.toolchain.identities(),
+            tools=toolchain.identities(),
         )
         if not self._toolchain_injected:
             proven_toolchain = _prove_tool_versions(
-                self.toolchain,
+                toolchain,
                 root=self.root,
                 environment=environment,
             )
@@ -1340,6 +2046,7 @@ class ReleaseVerifier:
                     steps=[],
                 )
             self.toolchain = proven_toolchain
+            toolchain = proven_toolchain
             state_error = self._candidate_state_error(
                 expected_commit=commit,
                 environment=environment,
@@ -1355,7 +2062,7 @@ class ReleaseVerifier:
                     steps=[],
                 )
         if not _python_guard_is_active(
-            python_path=self.toolchain.python.path,
+            python_path=toolchain.python.path,
             root=self.root,
             environment=environment,
         ):
@@ -1413,28 +2120,52 @@ class ReleaseVerifier:
             started = time.monotonic()
             resolved_argv = self._resolved_argv(command)
             junit_path: Path | None = None
+            pytest_evidence_path: Path | None = None
+            command_environment = dict(environment)
             if command.expects_tests:
                 junit_path = (
                     evidence_directory
                     / f".junit-{run_id}-{command.name}.xml"
                 )
+                pytest_evidence_path = (
+                    evidence_directory
+                    / f".pytest-evidence-{run_id}-{command.name}.json"
+                )
                 junit_path.unlink(missing_ok=True)
+                pytest_evidence_path.unlink(missing_ok=True)
+                command_environment[
+                    "TRADING_ASSISTANT_PYTEST_EVIDENCE_PATH"
+                ] = str(pytest_evidence_path)
                 resolved_argv = (
                     *resolved_argv,
                     f"--junitxml={junit_path}",
                     "-o",
                     "junit_family=legacy",
+                    "-o",
+                    "addopts=",
+                    "-p",
+                    "verifier_pytest_plugin",
+                    "-p",
+                    "no:cacheprovider",
                 )
+                if any(part.startswith("--cov") for part in command.argv):
+                    resolved_argv = (
+                        *resolved_argv,
+                        "-p",
+                        "pytest_cov.plugin",
+                    )
             try:
                 completed = self.runner.run(
                     argv=resolved_argv,
                     cwd=self.root,
-                    env=dict(environment),
+                    env=command_environment,
                     timeout_seconds=float(command.timeout_seconds),
                 )
             except subprocess.TimeoutExpired as exc:
                 if junit_path is not None:
                     junit_path.unlink(missing_ok=True)
+                if pytest_evidence_path is not None:
+                    pytest_evidence_path.unlink(missing_ok=True)
                 steps.append(
                     VerificationStep(
                         name=command.name,
@@ -1460,9 +2191,41 @@ class ReleaseVerifier:
                     started_at=started_at,
                     steps=steps,
                 )
+            except OutputLimitExceeded as exc:
+                if junit_path is not None:
+                    junit_path.unlink(missing_ok=True)
+                if pytest_evidence_path is not None:
+                    pytest_evidence_path.unlink(missing_ok=True)
+                steps.append(
+                    VerificationStep(
+                        name=command.name,
+                        argv=resolved_argv,
+                        status="failed",
+                        returncode=None,
+                        duration_seconds=time.monotonic() - started,
+                        detail_code="COMMAND_OUTPUT_LIMIT",
+                        stdout=_redact(exc.output, root=self.root),
+                        stderr=_redact(exc.stderr, root=self.root),
+                    )
+                )
+                after_error = self._candidate_state_error(
+                    expected_commit=commit,
+                    environment=environment,
+                )
+                return self._finish(
+                    run_id=run_id,
+                    passed=False,
+                    detail_code=after_error or "COMMAND_OUTPUT_LIMIT",
+                    commit=commit,
+                    migration_head=migration_head,
+                    started_at=started_at,
+                    steps=steps,
+                )
             except BaseException:
                 if junit_path is not None:
                     junit_path.unlink(missing_ok=True)
+                if pytest_evidence_path is not None:
+                    pytest_evidence_path.unlink(missing_ok=True)
                 steps.append(
                     VerificationStep(
                         name=command.name,
@@ -1494,6 +2257,8 @@ class ReleaseVerifier:
             stderr = _redact(completed.stderr, root=self.root)
             junit: JUnitEvidence | None = None
             junit_error: str | None = None
+            pytest_evidence: PytestEvidence | None = None
+            pytest_error: str | None = None
             if completed.returncode == 0 and command.expects_tests:
                 if junit_path is None:
                     junit_error = "JUNIT_EVIDENCE_MISSING"
@@ -1502,8 +2267,40 @@ class ReleaseVerifier:
                         junit_path,
                         command=command,
                     )
+                if junit_error is None:
+                    if pytest_evidence_path is None:
+                        pytest_error = "PYTEST_EVIDENCE_MISSING"
+                    else:
+                        pytest_evidence, pytest_error = _pytest_evidence(
+                            pytest_evidence_path,
+                            command=command,
+                        )
+                if (
+                    junit_error is None
+                    and pytest_error is None
+                    and junit is not None
+                    and pytest_evidence is not None
+                    and (
+                        junit.total != len(pytest_evidence.collected)
+                        or junit.skipped != len(pytest_evidence.skipped)
+                    )
+                ):
+                    pytest_error = "PYTEST_JUNIT_MISMATCH"
+                if (
+                    junit_error is None
+                    and pytest_error is None
+                    and junit is not None
+                    and pytest_evidence is not None
+                    and (
+                        junit.nodeids != pytest_evidence.collected
+                        or junit.skipped_nodeids != pytest_evidence.skipped
+                    )
+                ):
+                    pytest_error = "PYTEST_JUNIT_IDENTITY_MISMATCH"
             if junit_path is not None:
                 junit_path.unlink(missing_ok=True)
+            if pytest_evidence_path is not None:
+                pytest_evidence_path.unlink(missing_ok=True)
             if completed.returncode < 0:
                 status = "signaled"
                 detail_code = "COMMAND_SIGNAL"
@@ -1513,6 +2310,9 @@ class ReleaseVerifier:
             elif junit_error is not None:
                 status = "failed"
                 detail_code = junit_error
+            elif pytest_error is not None:
+                status = "failed"
+                detail_code = pytest_error
             else:
                 status = "passed"
                 detail_code = "PASS"
@@ -1563,7 +2363,7 @@ class ReleaseVerifier:
 
         final_commit, final_repository_error = _repository_state(
             self.root,
-            git_path=self.toolchain.git.path,
+            git_path=toolchain.git.path,
             environment=environment,
         )
         if final_repository_error is not None:
@@ -1597,9 +2397,45 @@ class ReleaseVerifier:
         )
 
 
+def verify_release(
+    *,
+    root: Path = DEFAULT_ROOT,
+    runner: Runner | None = None,
+    output_dir: Path | None = None,
+    commands: tuple[Command, ...] | None = None,
+    toolchain: Toolchain | None = None,
+    trusted_ancestry_anchor: str | None = None,
+) -> VerificationResult:
+    """Public orchestration boundary that invalidates PASS before construction."""
+
+    candidate_root = Path(os.path.abspath(root))
+    destination = (
+        output_dir
+        if output_dir is not None
+        else candidate_root / DEFAULT_OUTPUT_RELATIVE
+    )
+    _write_preflight(
+        run_id=uuid.uuid4().hex,
+        started_at=_utc_now(),
+        output_dir=destination,
+        root=candidate_root,
+        tools=toolchain.identities() if toolchain is not None else (),
+        detail_code="PREFLIGHT_CONSTRUCTION",
+    )
+    verifier = ReleaseVerifier(
+        root=candidate_root,
+        runner=runner,
+        output_dir=destination,
+        commands=commands,
+        toolchain=toolchain,
+        trusted_ancestry_anchor=trusted_ancestry_anchor,
+    )
+    return verifier.run()
+
+
 def main() -> int:
     try:
-        result = ReleaseVerifier().run()
+        result = verify_release()
     except BaseException:
         print("release verification: FAIL (INTERNAL_VERIFIER_ERROR)", file=sys.stderr)
         return 1

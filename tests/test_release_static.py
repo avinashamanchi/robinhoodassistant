@@ -15,6 +15,7 @@ import yaml
 
 
 _STATIC = Path("src/trading_assistant/app/static")
+_TRUSTED_ANCESTRY_ANCHORS: dict[Path, str] = {}
 
 
 def test_release_static_gate_passes_for_the_committed_runtime_sources():
@@ -1056,10 +1057,42 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
     if git:
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "--all"], cwd=root, check=True)
+        anchor = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Release Test",
+                "-c",
+                "user.email=release-test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture baseline",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert anchor.returncode == 0
+        _TRUSTED_ANCESTRY_ANCHORS[root.resolve()] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     return root
 
 
-def _run_trust_gate(root: Path) -> subprocess.CompletedProcess[str]:
+def _run_trust_gate(
+    root: Path,
+    *,
+    trusted_ancestry_anchor: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    anchor = trusted_ancestry_anchor or _TRUSTED_ANCESTRY_ANCHORS.get(
+        root.resolve(),
+        "0" * 40,
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -1070,6 +1103,10 @@ def _run_trust_gate(root: Path) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        env={
+            **os.environ,
+            "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR": anchor,
+        },
     )
 
 
@@ -3829,6 +3866,7 @@ def _commit_release_fixture(root: Path, message: str) -> str:
             "commit",
             "-qm",
             message,
+            "--allow-empty",
         ],
         cwd=root,
         check=True,
@@ -3968,6 +4006,91 @@ def test_shallow_history_is_rejected_before_it_can_hide_a_retired_credential(
     assert token not in completed.stderr
 
 
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    (
+        ("grafts", "GIT_HISTORY_GRAFTS"),
+        ("replace", "GIT_HISTORY_REPLACE_REFS"),
+        ("alternates", "GIT_HISTORY_ALTERNATES"),
+        ("partial-clone", "GIT_HISTORY_PARTIAL_CLONE"),
+    ),
+)
+def test_history_indirection_and_partial_clone_state_are_rejected(
+    tmp_path,
+    state,
+    expected_code,
+):
+    root = _trust_fixture(tmp_path)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if state == "grafts":
+        path = root / Path(
+            subprocess.run(
+                ["git", "rev-parse", "--git-path", "info/grafts"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{head}\n", encoding="ascii")
+    elif state == "replace":
+        subprocess.run(
+            ["git", "replace", head, head],
+            cwd=root,
+            check=True,
+        )
+    elif state == "alternates":
+        path = root / Path(
+            subprocess.run(
+                [
+                    "git",
+                    "rev-parse",
+                    "--git-path",
+                    "objects/info/alternates",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("/nonexistent/verifier-alternate\n", encoding="ascii")
+    else:
+        subprocess.run(
+            ["git", "config", "remote.origin.promisor", "true"],
+            cwd=root,
+            check=True,
+        )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert completed.stderr.splitlines()[0] == f"{expected_code} .:1"
+
+
+def test_history_scan_requires_the_configured_trusted_anchor(tmp_path):
+    root = _trust_fixture(tmp_path)
+
+    completed = _run_trust_gate(
+        root,
+        trusted_ancestry_anchor="0" * 40,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        completed.stderr.splitlines()[0]
+        == "TRUSTED_ANCESTRY_UNPROVEN .:1"
+    )
+
+
 @pytest.mark.parametrize("surface", ("commit", "tag"))
 def test_historical_ref_messages_are_scanned_without_printing_values(
     tmp_path,
@@ -4027,6 +4150,9 @@ def test_static_gate_uses_verified_git_identity_not_later_path_resolution(
         "PATH": str(fake_bin),
         "TRADING_ASSISTANT_VERIFIED_GIT": str(git_path),
         "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT": fingerprint,
+        "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR": (
+            _TRUSTED_ANCESTRY_ANCHORS[root.resolve()]
+        ),
     }
 
     completed = subprocess.run(
@@ -4043,6 +4169,40 @@ def test_static_gate_uses_verified_git_identity_not_later_path_resolution(
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_static_gate_rejects_preexisting_path_spoofed_git(tmp_path):
+    root = _trust_fixture(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": str(fake_bin),
+        "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR": (
+            _TRUSTED_ANCESTRY_ANCHORS[root.resolve()]
+        ),
+    }
+    environment.pop("TRADING_ASSISTANT_VERIFIED_GIT", None)
+    environment.pop("TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr.splitlines()[0] == "GIT_TOOL_UNPROVEN internal:1"
 
 
 def test_static_gate_rejects_mismatched_verified_git_without_path_or_hash_leak(
@@ -4117,8 +4277,20 @@ def test_static_gate_git_runner_uses_private_bounded_regular_spools(tmp_path):
     assert completed.stderr == (
         b"stderr_regular=True\nstderr_mode=0o600\n"
     )
+    marker = tmp_path / "output-limit-marker"
+    output_limit_probe = (
+        "import os, pathlib, signal\n"
+        "signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n"
+        "try:\n"
+        "    for _ in range(10000):\n"
+        "        os.write(1, b'x' * 1024)\n"
+        "except OSError:\n"
+        f"    pathlib.Path({str(marker)!r}).write_text('enforced')\n"
+        "else:\n"
+        f"    pathlib.Path({str(marker)!r}).write_text('missed')\n"
+    )
     oversized = module._run_bounded_process(
-        argv=(sys.executable, "-c", "print('x' * 10000)"),
+        argv=(sys.executable, "-c", output_limit_probe),
         cwd=tmp_path,
         env={"PATH": os.defpath},
         input_bytes=None,
@@ -4127,6 +4299,7 @@ def test_static_gate_git_runner_uses_private_bounded_regular_spools(tmp_path):
         max_stderr_bytes=128,
     )
     assert oversized is None
+    assert marker.read_text(encoding="utf-8") == "enforced"
 
 
 def _ci_workflow() -> tuple[str, dict[str, object]]:

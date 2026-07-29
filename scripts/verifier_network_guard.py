@@ -1,4 +1,4 @@
-"""Python-process socket guard used only by the offline release verifier.
+"""Python-process socket guard used only by the local release verifier.
 
 This is intentionally described as a Python guard, not an OS network sandbox.
 It blocks Python AF_INET/AF_INET6 sockets and DNS helpers while preserving

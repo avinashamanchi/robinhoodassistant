@@ -10,7 +10,9 @@ import hashlib
 import importlib.util
 import math
 import os
+import pwd
 import re
+import resource
 import signal
 import shutil
 import subprocess
@@ -24,6 +26,7 @@ import yaml
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+TRUSTED_ANCESTRY_ANCHOR = "4807cc0dc9dd20f21cf174e81034fea656162e3d"
 _SAFE_FINDING_PATH = re.compile(
     r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+"
 )
@@ -34,6 +37,33 @@ _STATIC_STDERR_BYTES = 1024 * 1024
 _TRACKED_NAMES_BYTES = 32 * 1024 * 1024
 _PROCESS_TERMINATE_SECONDS = 0.5
 _PROCESS_KILL_SECONDS = 0.5
+
+
+def _git_path_is_trusted(path: Path) -> bool:
+    try:
+        canonical = path.resolve(strict=True)
+        account_home = Path(
+            pwd.getpwuid(os.getuid()).pw_dir
+        ).resolve(strict=True)
+    except (KeyError, OSError, RuntimeError):
+        return False
+    roots = (
+        Path("/usr/bin"),
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/Cellar/git"),
+        Path("/home/linuxbrew/.linuxbrew/Cellar/git"),
+        account_home / ".local" / "bin",
+    )
+    for root in roots:
+        try:
+            trusted_root = root.resolve(strict=True)
+            canonical.relative_to(trusted_root)
+            mode = trusted_root.stat().st_mode
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not mode & 0o022:
+            return True
+    return False
 
 
 def _resolve_git_executable() -> Path | None:
@@ -52,7 +82,8 @@ def _resolve_git_executable() -> Path | None:
     except OSError:
         return None
     if (
-        not path.is_file()
+        not _git_path_is_trusted(path)
+        or not path.is_file()
         or not os.access(path, os.X_OK)
         or before.st_mode & 0o002
     ):
@@ -166,6 +197,15 @@ def _run_bounded_process(
         if input_bytes is not None:
             stdin_handle.write(input_bytes)
         stdin_handle.seek(0)
+        output_file_limit = max(max_stdout_bytes, max_stderr_bytes, 1)
+
+        def limit_child_files() -> None:
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE,
+                (output_file_limit, output_file_limit),
+            )
+            signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+
         try:
             process = subprocess.Popen(
                 argv,
@@ -175,6 +215,7 @@ def _run_bounded_process(
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
+                preexec_fn=limit_child_files,
             )
         except OSError:
             return None
@@ -185,6 +226,11 @@ def _run_bounded_process(
             return None
         except BaseException:
             _bounded_stop(process)
+            return None
+        if (
+            os.fstat(stdout_handle.fileno()).st_size >= max_stdout_bytes
+            or os.fstat(stderr_handle.fileno()).st_size >= max_stderr_bytes
+        ):
             return None
         stdout = _bounded_contents(stdout_handle, max_stdout_bytes)
         stderr = _bounded_contents(stderr_handle, max_stderr_bytes)
@@ -5621,6 +5667,105 @@ def _history_is_shallow(root: Path) -> bool | None:
     return None
 
 
+def _configured_trusted_ancestry_anchor(root: Path) -> str | None:
+    if root == DEFAULT_ROOT.resolve():
+        candidate = TRUSTED_ANCESTRY_ANCHOR
+    else:
+        candidate = os.environ.get(
+            "TRADING_ASSISTANT_TRUSTED_ANCESTRY_ANCHOR",
+            "",
+        )
+    if re.fullmatch(r"[0-9a-f]{40,64}", candidate) is None:
+        return None
+    return candidate
+
+
+def _history_common_directory(root: Path) -> Path | None:
+    completed = _history_git(
+        root,
+        ("rev-parse", "--git-common-dir"),
+        max_output_bytes=64 * 1024,
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    try:
+        raw = os.fsdecode(completed.stdout).strip()
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        common = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return common if common.is_dir() else None
+
+
+def _history_state_findings(root: Path) -> list[ReleaseViolation]:
+    common = _history_common_directory(root)
+    if common is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if os.path.lexists(common / "info" / "grafts"):
+        return [_finding("GIT_HISTORY_GRAFTS", ".", 1)]
+    if os.path.lexists(common / "objects" / "info" / "alternates"):
+        return [_finding("GIT_HISTORY_ALTERNATES", ".", 1)]
+
+    replacements = _history_git(
+        root,
+        (
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/replace",
+        ),
+        max_output_bytes=1024 * 1024,
+    )
+    if replacements is None or replacements.returncode != 0:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if replacements.stdout.strip():
+        return [_finding("GIT_HISTORY_REPLACE_REFS", ".", 1)]
+
+    partial = _history_git(
+        root,
+        (
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ),
+        max_output_bytes=1024 * 1024,
+    )
+    if partial is None or partial.returncode not in {0, 1}:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if partial.returncode == 0 or partial.stdout.strip():
+        return [_finding("GIT_HISTORY_PARTIAL_CLONE", ".", 1)]
+
+    shallow = _history_is_shallow(root)
+    if shallow is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if shallow:
+        return [_finding("GIT_HISTORY_SHALLOW", ".", 1)]
+
+    anchor = _configured_trusted_ancestry_anchor(root)
+    if anchor is None:
+        return [_finding("TRUSTED_ANCESTRY_UNPROVEN", ".", 1)]
+    object_check = _history_git(
+        root,
+        ("cat-file", "-e", f"{anchor}^{{commit}}"),
+        max_output_bytes=64 * 1024,
+    )
+    ancestry = _history_git(
+        root,
+        ("merge-base", "--is-ancestor", anchor, "HEAD"),
+        max_output_bytes=64 * 1024,
+    )
+    if (
+        object_check is None
+        or object_check.returncode != 0
+        or ancestry is None
+        or ancestry.returncode != 0
+    ):
+        return [_finding("TRUSTED_ANCESTRY_UNPROVEN", ".", 1)]
+    return []
+
+
 def _history_message_findings(
     root: Path,
     commits: tuple[str, ...],
@@ -5826,11 +5971,9 @@ def _history_blob_payloads(
 
 
 def _scan_git_history(root: Path) -> list[ReleaseViolation]:
-    shallow = _history_is_shallow(root)
-    if shallow is None:
-        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
-    if shallow:
-        return [_finding("GIT_HISTORY_SHALLOW", ".", 1)]
+    state_findings = _history_state_findings(root)
+    if state_findings:
+        return state_findings
     commits = _history_commits(root)
     if commits is None:
         return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
