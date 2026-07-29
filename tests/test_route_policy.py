@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -23,6 +24,7 @@ from trading_assistant.app.policy import (
     AuthLevel,
     RoutePolicy,
     RoutePolicyRegistry,
+    install_route_inventory_lifespan,
     validate_route_inventory,
 )
 from trading_assistant.app.limits import (
@@ -450,6 +452,297 @@ def test_dynamic_shadow_posture_handler_fails_at_app_startup(make_service):
     ):
         with TestClient(app):
             pass
+
+
+@pytest.mark.parametrize("registration", ["direct", "router"])
+def test_later_startup_callback_cannot_shadow_posture_handler(
+    make_service,
+    registration,
+):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="late-startup-shadow-secret",
+        planning=None,
+    )
+    handler_calls = 0
+
+    def shadow_posture():
+        nonlocal handler_calls
+        handler_calls += 1
+        return {"can_trade": True}
+
+    def register_shadow() -> None:
+        if registration == "direct":
+            app.add_api_route(
+                "/security/posture",
+                shadow_posture,
+                methods=["GET"],
+            )
+            return
+        router = APIRouter()
+        router.add_api_route(
+            "/security/posture",
+            shadow_posture,
+            methods=["GET"],
+        )
+        app.include_router(router)
+
+    app.router.add_event_handler("startup", register_shadow)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*security/posture",
+    ):
+        with TestClient(app):
+            pass
+
+    assert handler_calls == 0
+
+
+def test_later_startup_direct_route_list_mutation_cannot_bypass_inventory():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_api_route(
+        "/security/posture",
+        lambda: {"source": "canonical"},
+        methods=["GET"],
+    )
+    shadow_router = APIRouter()
+    shadow_router.add_api_route(
+        "/security/posture",
+        lambda: {"source": "shadow"},
+        methods=["GET"],
+    )
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/security/posture",
+                AuthLevel.SESSION,
+                "session_read",
+                lease_free_bounded_read=True,
+            ),
+        )
+    )
+    install_route_inventory_lifespan(app)
+
+    def append_shadow_route() -> None:
+        app.routes.append(shadow_router.routes[0])
+
+    app.router.add_event_handler("startup", append_shadow_route)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*security/posture",
+    ):
+        with TestClient(app):
+            pass
+
+
+def test_unique_route_added_by_later_startup_callback_is_served():
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_api_route(
+        "/ready",
+        lambda: {"ready": True},
+        methods=["GET"],
+    )
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/ready",
+                AuthLevel.PUBLIC,
+                "session_read",
+            ),
+            RoutePolicy(
+                "GET",
+                "/late-unique",
+                AuthLevel.PUBLIC,
+                "session_read",
+            ),
+        )
+    )
+    install_route_inventory_lifespan(app)
+
+    def add_unique_route() -> None:
+        app.add_api_route(
+            "/late-unique",
+            lambda: {"late": True},
+            methods=["GET"],
+        )
+
+    app.router.add_event_handler("startup", add_unique_route)
+
+    with TestClient(app) as client:
+        response = client.get("/late-unique")
+
+    assert response.status_code == 200
+    assert response.json() == {"late": True}
+
+
+def test_route_inventory_lifespan_is_installed_once_and_preserves_state():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def original_lifespan(_app):
+        events.append("app_startup")
+        try:
+            yield {"app_lifespan_marker": "preserved"}
+        finally:
+            events.append("app_shutdown")
+
+    @asynccontextmanager
+    async def router_lifespan(_app):
+        events.append("router_startup")
+        try:
+            yield {"router_lifespan_marker": "preserved"}
+        finally:
+            events.append("router_shutdown")
+
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=original_lifespan,
+    )
+    router = APIRouter(lifespan=router_lifespan)
+
+    @router.get("/ready")
+    def ready(request: Request):
+        return {
+            "app": request.state.app_lifespan_marker,
+            "router": request.state.router_lifespan_marker,
+        }
+
+    app.include_router(router)
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/ready",
+                AuthLevel.PUBLIC,
+                "session_read",
+            ),
+        )
+    )
+
+    install_route_inventory_lifespan(app)
+    installed = app.router.lifespan_context
+    install_route_inventory_lifespan(app)
+
+    assert app.router.lifespan_context is installed
+    with TestClient(app) as client:
+        response = client.get("/ready")
+
+    assert response.json() == {
+        "app": "preserved",
+        "router": "preserved",
+    }
+    assert events == [
+        "app_startup",
+        "router_startup",
+        "router_shutdown",
+        "app_shutdown",
+    ]
+
+
+def test_inventory_failure_runs_original_lifespan_cleanup():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def original_lifespan(app: FastAPI):
+        events.append("startup")
+        app.add_api_route(
+            "/security/posture",
+            lambda: {"source": "shadow"},
+            methods=["GET"],
+        )
+        try:
+            yield
+        finally:
+            events.append("shutdown")
+
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=original_lifespan,
+    )
+    app.add_api_route(
+        "/security/posture",
+        lambda: {"source": "canonical"},
+        methods=["GET"],
+    )
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/security/posture",
+                AuthLevel.SESSION,
+                "session_read",
+                lease_free_bounded_read=True,
+            ),
+        )
+    )
+    install_route_inventory_lifespan(app)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"handlers=.*GET.*security/posture",
+    ):
+        with TestClient(app):
+            pass
+
+    assert events == ["startup", "shutdown"]
+
+
+@pytest.mark.parametrize("phase", ["startup", "shutdown"])
+def test_original_lifespan_exceptions_propagate_unchanged(phase):
+    expected = RuntimeError(f"{phase}_sentinel")
+
+    @asynccontextmanager
+    async def original_lifespan(_app):
+        if phase == "startup":
+            raise expected
+        yield
+        raise expected
+
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=original_lifespan,
+    )
+    app.add_api_route(
+        "/ready",
+        lambda: {"ready": True},
+        methods=["GET"],
+    )
+    app.state.route_policy_registry = RoutePolicyRegistry(
+        (
+            RoutePolicy(
+                "GET",
+                "/ready",
+                AuthLevel.PUBLIC,
+                "session_read",
+            ),
+        )
+    )
+    install_route_inventory_lifespan(app)
+
+    with pytest.raises(RuntimeError) as captured:
+        with TestClient(app):
+            pass
+
+    assert captured.value is expected
 
 
 def test_route_inventory_rejects_mounts_websockets_and_imperative_routes():

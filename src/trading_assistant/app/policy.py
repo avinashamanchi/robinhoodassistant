@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
@@ -601,6 +602,35 @@ def validate_route_inventory(app: FastAPI) -> None:
             f"handlers={handler_duplicates!r} "
             f"unclassified={unclassified!r}"
         )
+
+
+def install_route_inventory_lifespan(app: FastAPI) -> None:
+    """Validate the final route inventory after the original startup chain."""
+
+    installed = getattr(
+        app.state,
+        "_route_inventory_lifespan_wrapper",
+        None,
+    )
+    if installed is not None:
+        if app.router.lifespan_context is not installed:
+            raise RuntimeError(
+                "route inventory lifespan wrapper was displaced"
+            )
+        return
+
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def route_inventory_lifespan(application: FastAPI):
+        async with original_lifespan(application) as state:
+            validate_route_inventory(application)
+            yield state
+
+    app.router.lifespan_context = route_inventory_lifespan
+    app.state._route_inventory_lifespan_wrapper = (
+        route_inventory_lifespan
+    )
 
 
 def _limit_spec(app: FastAPI, policy: RoutePolicy) -> LimitSpec:
@@ -2203,8 +2233,4 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                 )
         return response
 
-    app.router.add_event_handler(
-        "startup",
-        lambda: validate_route_inventory(app),
-    )
     return registry

@@ -70,6 +70,7 @@ from .limits import (
     MutationInterlockService,
     session_limit_principal,
 )
+from .policy import install_route_inventory_lifespan
 from .routers.auth import router as auth_router
 from .security import (
     csrf_protected,
@@ -1450,6 +1451,7 @@ def _create_app(
         TransportBoundaryMiddleware,
         policy=transport_policy,
     )
+    install_route_inventory_lifespan(app)
     return app
 
 
