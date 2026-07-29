@@ -6,11 +6,16 @@ import {
   loadSession,
   logout,
 } from "/static/js/auth.js";
+import {
+  normalizePosture,
+} from "/static/js/posture.js";
 
 const byId = (id) => document.getElementById(id);
 const dialogReturnFocus = new Map();
 let plansRequestSequence = 0;
 let plansAbortController = null;
+let savedPlansState = [];
+let selectedPlanId = null;
 let planDetailState = null;
 let planDetailRequestSequence = 0;
 let planWorkspaceRequestSequence = 0;
@@ -20,6 +25,10 @@ let planCancelState = null;
 let planCancelRequestSequence = 0;
 let screenRequestSequence = 0;
 let screenAbortController = null;
+let postureRequestSequence = 0;
+let postureAbortController = null;
+let providerCallAllowed = false;
+let providerCallReason = "Provider call blocked before network I/O";
 
 function node(tag, value, className) {
   const element = document.createElement(tag);
@@ -44,9 +53,34 @@ function readable(value, fallback = "Unavailable") {
     : String(value);
 }
 
+function exactNonnegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function rateMetadata(error) {
+  const metadata = [];
+  if (exactNonnegativeInteger(error && error.retryAfter)) {
+    metadata.push(`Retry after ${error.retryAfter} seconds`);
+  }
+  if (exactNonnegativeInteger(error && error.rateLimitReset)) {
+    const resetTimestamp = new Date(error.rateLimitReset * 1000);
+    const resetLabel = Number.isFinite(resetTimestamp.getTime())
+      ? resetTimestamp.toISOString()
+      : "time unavailable";
+    metadata.push(
+      `Rate limit reset ${error.rateLimitReset} (${resetLabel})`,
+    );
+  }
+  return metadata.join(" · ");
+}
+
 function errorText(error) {
   const request = error && error.requestId ? ` Request ${error.requestId}.` : "";
-  return `${readable(error && error.message, "Request failed")}.${request}`;
+  const rate = rateMetadata(error);
+  return (
+    `${readable(error && error.message, "Request failed")}.${request}`
+    + (rate ? ` ${rate}.` : "")
+  );
 }
 
 function notify(message, kind = "") {
@@ -120,6 +154,313 @@ function metricTable(headers, rows) {
   return wrapper;
 }
 
+function setBudgetValue(id, value, className) {
+  const element = byId(id);
+  if (!element) {
+    return;
+  }
+  element.textContent = value;
+  element.className = className;
+}
+
+function setPaidAvailability(allowed, reason) {
+  providerCallAllowed = allowed === true;
+  providerCallReason = typeof reason === "string" && reason.trim()
+    ? reason.trim()
+    : providerCallAllowed
+      ? "Provider budget evidence is available."
+      : "Provider call blocked before network I/O";
+  ["analysis-submit", "proposal-submit"].forEach((id) => {
+    const button = byId(id);
+    if (button) {
+      button.disabled = !providerCallAllowed;
+    }
+  });
+  const state = byId("plans-budget-state");
+  if (state) {
+    state.textContent = providerCallReason;
+    state.className = providerCallAllowed
+      ? "field-hint is-verified"
+      : "field-hint has-error is-blocked";
+  }
+}
+
+function clearPlanBudget(error = null) {
+  [
+    "plans-budget-calls",
+    "plans-budget-input",
+    "plans-budget-output",
+    "plans-budget-reset",
+  ].forEach((id) => setBudgetValue(id, "Unknown", "is-unknown"));
+  const detail = error ? errorText(error) : "";
+  setPaidAvailability(
+    false,
+    "Provider call blocked before network I/O"
+      + (detail ? `. ${detail}` : ""),
+  );
+}
+
+function completeProviderCheck(check) {
+  return Boolean(
+    check
+    && typeof check.scope === "string"
+    && check.scope.trim()
+    && [
+      "budget_remaining",
+      "budget_limit",
+      "input_tokens_remaining",
+      "input_tokens_limit",
+      "output_tokens_remaining",
+      "output_tokens_limit",
+    ].every((field) => exactNonnegativeInteger(check[field]))
+    && typeof check.reset_at === "string"
+    && Number.isFinite(Date.parse(check.reset_at))
+  );
+}
+
+function providerBudgetSummary(checks, remainingField, limitField) {
+  return checks.map((check) => (
+    `${check.scope}: ${check[remainingField]} / ${check[limitField]}`
+  )).join(" · ");
+}
+
+function renderPlanBudget(normalized) {
+  const checks = normalized
+    && normalized.provider
+    && Array.isArray(normalized.provider.checks)
+    ? normalized.provider.checks
+    : [];
+  if (
+    !normalized
+    || normalized.valid !== true
+    || checks.length === 0
+    || checks.some((check) => !completeProviderCheck(check))
+  ) {
+    clearPlanBudget();
+    return false;
+  }
+  const className = normalized.provider.blocked
+    ? "is-blocked"
+    : "is-verified";
+  setBudgetValue(
+    "plans-budget-calls",
+    providerBudgetSummary(checks, "budget_remaining", "budget_limit"),
+    className,
+  );
+  setBudgetValue(
+    "plans-budget-input",
+    providerBudgetSummary(
+      checks,
+      "input_tokens_remaining",
+      "input_tokens_limit",
+    ),
+    className,
+  );
+  setBudgetValue(
+    "plans-budget-output",
+    providerBudgetSummary(
+      checks,
+      "output_tokens_remaining",
+      "output_tokens_limit",
+    ),
+    className,
+  );
+  setBudgetValue(
+    "plans-budget-reset",
+    [...new Set(checks.map((check) => check.reset_at))].join(" · "),
+    className,
+  );
+  setPaidAvailability(
+    !normalized.provider.blocked,
+    normalized.provider.reason,
+  );
+  return !normalized.provider.blocked;
+}
+
+async function refreshPlanPosture() {
+  if (postureAbortController) {
+    postureAbortController.abort();
+  }
+  const controller = new AbortController();
+  postureAbortController = controller;
+  const requestToken = ++postureRequestSequence;
+  clearPlanBudget();
+  try {
+    const payload = await api("/security/posture", {
+      signal: controller.signal,
+    });
+    if (
+      requestToken !== postureRequestSequence
+      || postureAbortController !== controller
+    ) {
+      return false;
+    }
+    postureAbortController = null;
+    const normalized = normalizePosture(payload);
+    renderPlanBudget(normalized);
+    return normalized.valid;
+  } catch (error) {
+    if (
+      requestToken !== postureRequestSequence
+      || postureAbortController !== controller
+    ) {
+      return false;
+    }
+    postureAbortController = null;
+    clearPlanBudget(error);
+    return false;
+  }
+}
+
+function blockPaidCallBeforeNetwork() {
+  if (providerCallAllowed) {
+    return false;
+  }
+  notify(providerCallReason, "notice-error");
+  return true;
+}
+
+function handlePaidCallFailure(error) {
+  if (
+    exactNonnegativeInteger(error && error.retryAfter)
+    || exactNonnegativeInteger(error && error.rateLimitReset)
+  ) {
+    clearPlanBudget(error);
+  }
+}
+
+function freshnessLabel(value, now = Date.now()) {
+  const observedAt = Date.parse(value);
+  if (!Number.isFinite(observedAt)) {
+    return "Freshness unknown";
+  }
+  const ageMs = now - observedAt;
+  if (ageMs < 0) {
+    return "Freshness: future timestamp";
+  }
+  const minutes = Math.floor(ageMs / 60000);
+  if (minutes < 1) {
+    return "Freshness: under 1 minute old";
+  }
+  if (minutes < 60) {
+    return `Freshness: ${minutes}m old`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) {
+    return `Freshness: ${hours}h old`;
+  }
+  return `Freshness: ${Math.floor(hours / 24)}d old`;
+}
+
+function planStatusClass(status) {
+  if (status === "proposed") {
+    return "plan-status-proposed";
+  }
+  if (status === "approved") {
+    return "plan-status-approved";
+  }
+  if (status === "canceled") {
+    return "plan-status-canceled";
+  }
+  return "plan-status-neutral";
+}
+
+function planMatchesFilter(plan, query) {
+  if (!query) {
+    return true;
+  }
+  return [
+    plan.plan_id,
+    plan.symbol,
+    plan.action,
+    plan.status,
+  ].some((value) => readable(value, "").toLowerCase().includes(query));
+}
+
+function renderPlanQueue() {
+  const target = byId("plans-list");
+  if (!target) {
+    return;
+  }
+  const filter = byId("plan-filter");
+  const query = filter ? filter.value.trim().toLowerCase() : "";
+  const plans = savedPlansState.filter(
+    (plan) => planMatchesFilter(plan, query),
+  );
+  clear(target);
+  if (!savedPlansState.length) {
+    target.appendChild(node("p", "No saved plans.", "empty-state"));
+    return;
+  }
+  if (!plans.length) {
+    target.appendChild(node(
+      "p",
+      "No saved plans match this local filter.",
+      "empty-state",
+    ));
+    return;
+  }
+  plans.forEach((plan) => {
+    const planId = canonicalPlanId(plan.plan_id);
+    const button = node(
+      "button",
+      null,
+      "plan-item plan-queue-row"
+        + (selectedPlanId === planId ? " is-selected" : ""),
+    );
+    button.type = "button";
+    button.disabled = planId === null;
+    if (typeof button.setAttribute === "function") {
+      button.setAttribute(
+        "aria-pressed",
+        selectedPlanId === planId ? "true" : "false",
+      );
+    }
+
+    const heading = node("span", null, "plan-queue-heading");
+    heading.appendChild(node(
+      "strong",
+      `#${readable(plan.plan_id)} · ${readable(plan.symbol)}`,
+    ));
+    heading.appendChild(node(
+      "span",
+      readable(plan.status),
+      `status-chip plan-status-chip ${planStatusClass(plan.status)}`,
+    ));
+    button.appendChild(heading);
+
+    const facts = node("span", null, "plan-queue-facts");
+    [
+      `Action ${readable(plan.action)}`,
+      `Confidence ${readable(plan.confidence)}`,
+      `As of ${readable(plan.as_of)}`,
+      freshnessLabel(plan.as_of),
+    ].forEach((fact) => facts.appendChild(node("span", fact)));
+    button.appendChild(facts);
+    button.appendChild(node(
+      "span",
+      plan.paper_only === true ? "Paper-only" : "Paper status unknown",
+      plan.paper_only === true
+        ? "status-chip is-caution"
+        : "status-chip is-unknown",
+    ));
+    button.appendChild(node(
+      "span",
+      "Regime context available in detail.",
+      "plan-queue-context",
+    ));
+    button.addEventListener("click", () => {
+      if (planId === null) {
+        return;
+      }
+      selectedPlanId = planId;
+      renderPlanQueue();
+      showPlan(planId);
+    });
+    target.appendChild(button);
+  });
+}
+
 async function refreshPlans() {
   const target = byId("plans-list");
   if (plansAbortController) {
@@ -147,6 +488,7 @@ async function refreshPlans() {
       return false;
     }
     plansAbortController = null;
+    savedPlansState = [];
     clear(target);
     target.appendChild(node(
       "p",
@@ -162,32 +504,18 @@ async function refreshPlans() {
     return false;
   }
   plansAbortController = null;
-  clear(target);
-  const plans = Array.isArray(payload.plans) ? payload.plans : [];
-  if (!plans.length) {
-    target.appendChild(node("p", "No saved plans.", "empty-state"));
-    return true;
-  }
-  plans.forEach((plan) => {
-    const button = node("button", null, "plan-item");
-    button.type = "button";
-    button.appendChild(node(
-      "strong",
-      `#${readable(plan.plan_id)} · ${readable(plan.symbol)}`,
-    ));
-    button.appendChild(node(
-      "div",
-      `${readable(plan.action)} · ${readable(plan.status)}`,
-      "item-meta",
-    ));
-    button.addEventListener("click", () => showPlan(plan.plan_id));
-    target.appendChild(button);
-  });
+  savedPlansState = Array.isArray(payload.plans)
+    ? payload.plans.slice()
+    : [];
+  renderPlanQueue();
   return true;
 }
 
 async function submitAnalysis(event) {
   event.preventDefault();
+  if (blockPaidCallBeforeNetwork()) {
+    return false;
+  }
   const symbol = byId("analysis-symbol").value.trim().toUpperCase();
   const reason = byId("analysis-reason").value.trim();
   if (!symbol || !reason) {
@@ -212,6 +540,7 @@ async function submitAnalysis(event) {
     if (workspaceToken !== planWorkspaceRequestSequence) {
       return false;
     }
+    handlePaidCallFailure(error);
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
     return false;
@@ -220,6 +549,9 @@ async function submitAnalysis(event) {
 
 async function submitProposals(event) {
   event.preventDefault();
+  if (blockPaidCallBeforeNetwork()) {
+    return false;
+  }
   const reason = byId("proposal-reason").value.trim();
   if (!reason) {
     notify("A non-empty proposal reason is required.", "notice-error");
@@ -257,6 +589,7 @@ async function submitProposals(event) {
     if (workspaceToken !== planWorkspaceRequestSequence) {
       return false;
     }
+    handlePaidCallFailure(error);
     clear(target);
     target.appendChild(node("p", errorText(error), "banner-caution"));
     return false;
@@ -480,6 +813,250 @@ function appendPlanActions(target, plan, detailRequestToken) {
   target.appendChild(actions);
 }
 
+function definitionGrid(items, className = "plan-evidence-grid") {
+  const list = node("dl", null, className);
+  items.forEach(([label, value, valueClass = ""]) => {
+    const item = node("div");
+    item.appendChild(node("dt", label));
+    item.appendChild(node("dd", value, valueClass));
+    list.appendChild(item);
+  });
+  return list;
+}
+
+function evidenceSection(title) {
+  const section = node("section", null, "plan-evidence-section");
+  section.appendChild(node("h3", title));
+  return section;
+}
+
+function percentage(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? `${numeric * 100}%`
+    : "Unavailable";
+}
+
+function nullableEvidence(value) {
+  return value === null || value === undefined || value === ""
+    ? "Not recorded"
+    : String(value);
+}
+
+function optionalSetting(value) {
+  return value === null || value === undefined || value === ""
+    ? "Not set"
+    : String(value);
+}
+
+function availabilityText(value) {
+  if (value === "not_recorded") {
+    return "Not recorded";
+  }
+  if (value === "references_only") {
+    return "References only";
+  }
+  return "Availability unknown";
+}
+
+function appendStringList(section, values, className, emptyLabel) {
+  if (!Array.isArray(values) || values.length === 0) {
+    section.appendChild(node("p", emptyLabel, "muted"));
+    return;
+  }
+  const list = node("ul", null, className);
+  values.forEach((value) => {
+    list.appendChild(node("li", readable(value)));
+  });
+  section.appendChild(list);
+}
+
+function appendSourceReferences(section, thesis, availability) {
+  const state = availability.source_evidence;
+  section.appendChild(node(
+    "p",
+    availabilityText(state),
+    state === "references_only" ? "banner-caution" : "muted",
+  ));
+  if (state !== "references_only") {
+    return;
+  }
+  const references = Array.isArray(thesis.cited_source_refs)
+    ? thesis.cited_source_refs
+    : [];
+  if (!references.length) {
+    section.appendChild(node(
+      "p",
+      "No opaque reference identifiers were returned.",
+      "muted",
+    ));
+    return;
+  }
+  const list = node("ul", null, "plan-reference-list");
+  references.forEach((reference) => {
+    const item = node("li");
+    item.appendChild(node("code", readable(reference)));
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+}
+
+function renderPersistedPlan(target, plan, detailRequestToken) {
+  const thesis = plan.plan || {};
+  const sized = plan.sized || {};
+  const availability = plan.evidence_availability || {};
+
+  if (plan.paper_only === true) {
+    target.appendChild(node(
+      "p",
+      "Research / paper-only · persisted analyst evidence is not proof of profitability.",
+      "banner-caution",
+    ));
+  } else {
+    target.appendChild(node(
+      "p",
+      "Paper-only authority is not verified for this record.",
+      "banner-caution",
+    ));
+  }
+
+  const identity = evidenceSection("Plan identity");
+  const heading = node("div", null, "plan-detail-heading");
+  heading.appendChild(node("strong", readable(plan.symbol)));
+  heading.appendChild(node(
+    "span",
+    readable(plan.status),
+    `status-chip plan-status-chip ${planStatusClass(plan.status)}`,
+  ));
+  heading.appendChild(node(
+    "span",
+    plan.paper_only === true ? "Paper-only" : "Paper status unknown",
+    plan.paper_only === true
+      ? "status-chip is-caution"
+      : "status-chip is-unknown",
+  ));
+  identity.appendChild(heading);
+  identity.appendChild(definitionGrid([
+    ["Plan ID", readable(plan.plan_id)],
+    ["Action", readable(thesis.action)],
+    ["Confidence", readable(thesis.confidence)],
+    ["Reference price", readable(thesis.reference_price)],
+    ["As of", readable(thesis.as_of)],
+    ["Status", readable(plan.status)],
+  ]));
+  target.appendChild(identity);
+
+  const thesisSection = evidenceSection("Persisted thesis");
+  thesisSection.appendChild(node("p", readable(thesis.thesis)));
+  target.appendChild(thesisSection);
+
+  const context = evidenceSection("Recorded context");
+  context.appendChild(definitionGrid([
+    ["Regime context", readable(thesis.regime_note)],
+    ["Earnings note", nullableEvidence(thesis.earnings_note)],
+    ["Correlation note", nullableEvidence(thesis.correlation_note)],
+  ]));
+  context.appendChild(node("h4", "Cited playbook concepts"));
+  appendStringList(
+    context,
+    thesis.cited_concepts,
+    "plan-concept-list",
+    "Not recorded",
+  );
+  target.appendChild(context);
+
+  const scenarios = evidenceSection("Scenarios");
+  scenarios.appendChild(metricTable(
+    ["Case", "Target", "Days", "Probability"],
+    (Array.isArray(thesis.scenarios) ? thesis.scenarios : []).map((scenario) => [
+      scenario.name,
+      scenario.price_target,
+      scenario.horizon_days,
+      percentage(scenario.probability),
+    ]),
+  ));
+  target.appendChild(scenarios);
+
+  const entry = evidenceSection("Entry plan and deterministic sizing");
+  const entryPlan = thesis.entry_plan || {};
+  entry.appendChild(definitionGrid([
+    ["Entry type", readable(entryPlan.type)],
+    ["Direction", readable(sized.direction)],
+    ["Total shares", readable(sized.total_shares)],
+    ["Risk budget", readable(sized.risk_budget)],
+    ["Zero-size reason", readable(sized.zero_reason, "None")],
+  ]));
+  entry.appendChild(node("h4", "Persisted entry levels"));
+  entry.appendChild(metricTable(
+    ["Level", "Fraction"],
+    (Array.isArray(entryPlan.tranches) ? entryPlan.tranches : []).map(
+      (tranche) => [
+        tranche.price_level,
+        percentage(tranche.fraction),
+      ],
+    ),
+  ));
+  entry.appendChild(node("h4", "Deterministic sized tranches"));
+  entry.appendChild(metricTable(
+    ["Level", "Fraction", "Shares", "Notional"],
+    (Array.isArray(sized.tranches) ? sized.tranches : []).map((tranche) => [
+      tranche.price_level,
+      percentage(tranche.fraction),
+      tranche.shares,
+      tranche.notional,
+    ]),
+  ));
+  target.appendChild(entry);
+
+  const invalidation = thesis.invalidation || {};
+  const invalidationSection = evidenceSection("Invalidation");
+  invalidationSection.appendChild(definitionGrid([
+    ["Price level", readable(invalidation.price_level)],
+    ["Rationale", readable(invalidation.rationale)],
+  ]));
+  target.appendChild(invalidationSection);
+
+  const exitPlan = thesis.exit_plan || {};
+  const exits = evidenceSection("Exit plan");
+  exits.appendChild(metricTable(
+    ["Target", "Fraction to sell"],
+    (Array.isArray(exitPlan.targets) ? exitPlan.targets : []).map((exit) => [
+      exit.price_level,
+      percentage(exit.fraction_to_sell),
+    ]),
+  ));
+  exits.appendChild(definitionGrid([
+    ["Stop", readable(exitPlan.stop)],
+    ["Trailing stop %", optionalSetting(exitPlan.trailing_stop_pct)],
+    ["Time stop days", optionalSetting(exitPlan.time_stop_days)],
+  ]));
+  target.appendChild(exits);
+
+  const availabilitySection = evidenceSection("Evidence availability");
+  availabilitySection.appendChild(definitionGrid([
+    ["Injection flags", availabilityText(availability.injection_flags)],
+    ["Uncertainties", availabilityText(availability.uncertainties)],
+    ["Catalysts", availabilityText(availability.catalysts)],
+    ["Risks", availabilityText(availability.risks)],
+    ["Market context", availabilityText(availability.market_context)],
+    [
+      "Relative strength vs SPY",
+      availabilityText(availability.relative_strength_vs_spy),
+    ],
+    [
+      "Days to next earnings",
+      availabilityText(availability.days_to_next_earnings),
+    ],
+  ], "plan-availability-grid"));
+  target.appendChild(availabilitySection);
+
+  const sources = evidenceSection("Source references");
+  appendSourceReferences(sources, thesis, availability);
+  target.appendChild(sources);
+
+  appendPlanActions(target, plan, detailRequestToken);
+}
+
 async function showPlan(planId) {
   const workspaceToken = beginPlanWorkspace();
   const targetPlanId = canonicalPlanId(planId);
@@ -540,67 +1117,9 @@ async function showPlan(planId) {
       + readable(plan.status)
     );
     clear(target);
-    if (plan.paper_only === true) {
-      target.appendChild(node(
-        "p",
-        "Unproven analyst gate — paper mode only.",
-        "banner-caution",
-      ));
-    }
-    const thesis = plan.plan || {};
-    const sized = plan.sized || {};
-    target.appendChild(node(
-      "p",
-      `${readable(thesis.action).toUpperCase()} · confidence `
-      + `${readable(thesis.confidence)} · ${readable(thesis.regime_note)}`,
-    ));
-    target.appendChild(node("p", readable(thesis.thesis)));
-
-    target.appendChild(node("h2", "Scenarios"));
-    target.appendChild(metricTable(
-      ["Case", "Target", "Days", "Probability"],
-      (Array.isArray(thesis.scenarios) ? thesis.scenarios : []).map((scenario) => [
-        scenario.name,
-        scenario.price_target,
-        scenario.horizon_days,
-        `${Number(scenario.probability || 0) * 100}%`,
-      ]),
-    ));
-
-    target.appendChild(node("h2", "Entry ladder"));
-    target.appendChild(metricTable(
-      ["Level", "Fraction", "Shares", "Notional"],
-      (Array.isArray(sized.tranches) ? sized.tranches : []).map((tranche) => [
-        tranche.price_level,
-        `${Number(tranche.fraction || 0) * 100}%`,
-        tranche.shares,
-        tranche.notional,
-      ]),
-    ));
-    target.appendChild(node(
-      "p",
-      `Total ${readable(sized.total_shares)} shares · risk budget `
-      + `${readable(sized.risk_budget)}`,
-      "muted",
-    ));
-
-    const exitPlan = thesis.exit_plan || {};
-    target.appendChild(node("h2", "Exits"));
-    target.appendChild(metricTable(
-      ["Target", "Fraction to sell"],
-      (Array.isArray(exitPlan.targets) ? exitPlan.targets : []).map((exit) => [
-        exit.price_level,
-        `${Number(exit.fraction_to_sell || 0) * 100}%`,
-      ]),
-    ));
-    target.appendChild(node(
-      "p",
-      `Stop ${readable(exitPlan.stop)} · trailing `
-      + `${readable(exitPlan.trailing_stop_pct, "not set")} · time stop `
-      + `${readable(exitPlan.time_stop_days, "not set")}`,
-      "muted",
-    ));
-    appendPlanActions(target, plan, requestToken);
+    selectedPlanId = targetPlanId;
+    renderPlanQueue();
+    renderPersistedPlan(target, plan, requestToken);
     updatePlanApprovalButton();
   } catch (error) {
     if (!planDetailTokenIsCurrent(requestToken, targetPlanId)) {
@@ -649,7 +1168,13 @@ async function submitPlanApproval(event) {
     );
     closeDialog(byId("plan-approval-dialog"));
     notify(
-      `Plan ${planId} approval returned ${result.bracket ? "broker bracket" : `${readable(result.rules_created, 0)} rules`}.`,
+      `Plan ${planId} server response: status ${readable(result.status)} · `
+      + (
+        result.bracket
+          ? "paper broker bracket returned"
+          : `${readable(result.rules_created, 0)} paper-only rules returned`
+      )
+      + ".",
       "notice-success",
     );
     await refreshPlans();
@@ -717,6 +1242,11 @@ async function initialize() {
   byId("proposal-form").addEventListener("submit", submitProposals);
   byId("screen-button").addEventListener("click", runScreen);
   byId("refresh-plans").addEventListener("click", refreshPlans);
+  byId("refresh-plan-budget").addEventListener(
+    "click",
+    refreshPlanPosture,
+  );
+  byId("plan-filter").addEventListener("input", renderPlanQueue);
   byId("plan-approval-form").addEventListener("submit", submitPlanApproval);
   byId("plan-approval-reason").addEventListener(
     "input",
@@ -731,7 +1261,11 @@ async function initialize() {
     "click",
     () => closeDialog(byId("plan-cancel-dialog")),
   );
-  await refreshPlans();
+  clearPlanBudget();
+  await Promise.allSettled([
+    refreshPlanPosture(),
+    refreshPlans(),
+  ]);
 }
 
 initialize();

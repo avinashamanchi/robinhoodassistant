@@ -40,79 +40,144 @@
     <div class="environment-cell"><span>Observed</span><strong class="is-stale">Sign in to verify</strong></div>
   </div>
 
-  <main class="console-layout" id="main-content">
-    <aside class="truth-rail" aria-labelledby="plan-tools-title">
-      <div class="rail-heading">
-        <p class="eyebrow">Research inputs</p>
-        <h2 id="plan-tools-title">Plan tools</h2>
-        <p>Every paid analysis records an operator reason.</p>
+  <main class="plans-main" id="main-content">
+    <section class="page-intro plans-intro" aria-labelledby="plans-page-title">
+      <div>
+        <p class="section-label">Analyst evidence workspace</p>
+        <h1 id="plans-page-title">Research stays below the human gate.</h1>
+        <p>Persisted evidence remains paper-only and cannot approve itself.</p>
       </div>
-      <div class="breaker-control">
-        <form id="analysis-form">
-          <div class="field">
-            <label for="analysis-symbol">Symbol</label>
-            <input id="analysis-symbol" autocomplete="off" placeholder="AAPL" required>
-          </div>
-          <div class="field">
-            <label for="analysis-reason">Analysis reason</label>
-            <textarea id="analysis-reason" rows="3" required></textarea>
-          </div>
-          <button class="button-primary" type="submit">Analyze symbol</button>
-        </form>
-      </div>
-      <div class="breaker-control">
-        <form id="proposal-form">
-          <div class="field">
-            <label for="proposal-reason">Proposal reason</label>
-            <textarea id="proposal-reason" rows="3" required></textarea>
-          </div>
-          <button class="button-primary" type="submit">Generate proposals</button>
-        </form>
-        <button class="button-quiet" id="screen-button" type="button">Refresh screener only</button>
-      </div>
-      <div class="breaker-control">
-        <h3>Screener</h3>
-        <div id="screen-results">
-          <p class="empty-state">Run the screener to inspect candidates.</p>
-        </div>
-      </div>
-    </aside>
+      <span class="status-chip is-caution" id="research-paper-badge">Research / paper-only</span>
+    </section>
 
-    <div class="workspace">
-      <section class="page-intro" aria-labelledby="plans-page-title">
-        <div>
-          <p class="section-label">Analyst workspace</p>
-          <h1 id="plans-page-title">Research stays below the human gate.</h1>
-          <p>Unproven model output remains paper-only and cannot approve itself.</p>
+    <div class="plans-workspace">
+      <aside
+        class="panel plan-actions-pane"
+        id="plan-actions-pane"
+        aria-labelledby="plan-tools-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Actions and filters</p>
+            <h2 id="plan-tools-title">Research controls</h2>
+          </div>
+        </div>
+        <div class="section-body plan-actions-body">
+          <section class="plan-budget" aria-labelledby="plan-budget-title">
+            <div class="plan-subheading">
+              <div>
+                <p class="section-label">Provider boundary</p>
+                <h3 id="plan-budget-title">Model budget</h3>
+              </div>
+              <button class="button-quiet" id="refresh-plan-budget" type="button">Refresh budget</button>
+            </div>
+            <p class="field-hint has-error is-blocked" id="plans-budget-state">
+              Provider call blocked before network I/O
+            </p>
+            <dl class="plan-budget-grid">
+              <div>
+                <dt>Calls remaining</dt>
+                <dd class="is-unknown" id="plans-budget-calls">Unknown</dd>
+              </div>
+              <div>
+                <dt>Input tokens</dt>
+                <dd class="is-unknown" id="plans-budget-input">Unknown</dd>
+              </div>
+              <div>
+                <dt>Output tokens</dt>
+                <dd class="is-unknown" id="plans-budget-output">Unknown</dd>
+              </div>
+              <div>
+                <dt>Reset</dt>
+                <dd class="is-unknown" id="plans-budget-reset">Unknown</dd>
+              </div>
+            </dl>
+          </section>
+
+          <div class="field">
+            <label for="plan-filter">Filter saved plans</label>
+            <input
+              id="plan-filter"
+              type="search"
+              autocomplete="off"
+              placeholder="Symbol, action, or status"
+            >
+          </div>
+
+          <form id="analysis-form">
+            <div class="field">
+              <label for="analysis-symbol">Symbol</label>
+              <input id="analysis-symbol" autocomplete="off" placeholder="AAPL" required>
+            </div>
+            <div class="field">
+              <label for="analysis-reason">Analysis reason</label>
+              <textarea id="analysis-reason" rows="3" required></textarea>
+            </div>
+            <button class="button-primary" id="analysis-submit" type="submit" disabled>
+              Analyze symbol
+            </button>
+          </form>
+
+          <form id="proposal-form">
+            <div class="field">
+              <label for="proposal-reason">Proposal reason</label>
+              <textarea id="proposal-reason" rows="3" required></textarea>
+            </div>
+            <button class="button-primary" id="proposal-submit" type="submit" disabled>
+              Generate proposals
+            </button>
+          </form>
+
+          <section class="plan-screener" aria-labelledby="plan-screener-title">
+            <div class="plan-subheading">
+              <div>
+                <p class="section-label">Deterministic path</p>
+                <h3 id="plan-screener-title">Screener</h3>
+              </div>
+              <button class="button-quiet" id="screen-button" type="button">
+                Refresh screener only
+              </button>
+            </div>
+            <div id="screen-results">
+              <p class="empty-state">Run the screener to inspect candidates.</p>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <section
+        class="panel plan-queue-pane"
+        id="plan-queue-pane"
+        aria-labelledby="plans-list-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Saved research</p>
+            <h2 id="plans-list-title">Plan queue</h2>
+            <p>Regime context is available in selected detail.</p>
+          </div>
+          <button class="button-quiet" id="refresh-plans" type="button">Refresh</button>
+        </div>
+        <div class="section-body plan-queue" id="plans-list">
+          <p class="empty-state">Loading plans…</p>
         </div>
       </section>
 
-      <div class="plans-layout">
-        <section class="panel" aria-labelledby="plans-list-title">
-          <div class="section-heading">
-            <div>
-              <p class="section-label">Saved research</p>
-              <h2 id="plans-list-title">Plans</h2>
-            </div>
-            <button class="button-quiet" id="refresh-plans" type="button">Refresh</button>
+      <section
+        class="panel plan-evidence-pane"
+        id="plan-evidence-pane"
+        aria-labelledby="plan-detail-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Selected persisted evidence</p>
+            <h2 id="plan-detail-title">Plan detail</h2>
           </div>
-          <div class="section-body" id="plans-list">
-            <p class="empty-state">Loading plans…</p>
-          </div>
-        </section>
-
-        <section class="panel" aria-labelledby="plan-detail-title">
-          <div class="section-heading">
-            <div>
-              <p class="section-label">Review</p>
-              <h2 id="plan-detail-title">Plan detail</h2>
-            </div>
-          </div>
-          <div class="section-body" id="plan-detail">
-            <p class="empty-state">Analyze a symbol or choose a saved plan.</p>
-          </div>
-        </section>
-      </div>
+        </div>
+        <div class="section-body plan-evidence" id="plan-detail">
+          <p class="empty-state">Analyze a symbol or choose a saved plan.</p>
+        </div>
+      </section>
     </div>
   </main>
 
@@ -120,8 +185,12 @@
     <form id="plan-approval-form">
       <div class="dialog-header">
         <p class="section-label">Human gate</p>
-        <h2 id="plan-approval-title">Approve plan and arm rules</h2>
-        <p>Recent sign-in may be required. Execution remains paper-only.</p>
+        <h2 id="plan-approval-title">Approve exact paper plan</h2>
+        <p>
+          Approving this exact paper plan may create an ALPACA PAPER bracket or arm
+          paper-only rules. It does not prove profitability and remains subject to
+          execution and risk gates. Recent sign-in may be required.
+        </p>
       </div>
       <div class="dialog-body">
         <dl class="proof-grid">

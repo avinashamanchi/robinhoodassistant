@@ -3132,41 +3132,488 @@ _PLAN_DOM_SETUP = r"""
       status: "proposed",
       paper_only: true,
       plan: {
+        symbol,
+        as_of: "2026-07-29T16:00:00+00:00",
         action: "buy",
         confidence: 0.8,
         regime_note: "test regime",
+        earnings_note: null,
+        correlation_note: null,
+        cited_concepts: ["trend confirmation", "risk-defined entry"],
+        cited_source_refs: [`opaque-ref-${planId}-${symbol}`],
+        reference_price: "100.000000",
         thesis: `${symbol} test thesis`,
-        scenarios: [],
+        scenarios: [{
+          name: "bear",
+          price_target: "90.000000",
+          horizon_days: 30,
+          probability: 0.2,
+        }, {
+          name: "base",
+          price_target: "110.000000",
+          horizon_days: 30,
+          probability: 0.5,
+        }, {
+          name: "bull",
+          price_target: "125.000000",
+          horizon_days: 30,
+          probability: 0.3,
+        }],
+        invalidation: {
+          price_level: "88.000000",
+          rationale: "test invalidation",
+        },
+        entry_plan: {
+          type: "single",
+          tranches: [{
+            price_level: "99.000000",
+            fraction: 1,
+          }],
+        },
         exit_plan: {
-          targets: [],
+          targets: [{
+            price_level: "120.000000",
+            fraction_to_sell: 1,
+          }],
           stop: "90.000000",
           trailing_stop_pct: null,
           time_stop_days: 30,
         },
       },
       sized: {
+        symbol,
+        direction: "long",
         total_shares: 2,
         risk_budget: "20.000000",
-        tranches: [],
+        tranches: [{
+          price_level: "99.000000",
+          fraction: 1,
+          shares: "2",
+          notional: "198.00",
+        }],
+        zero_reason: null,
+      },
+      evidence_availability: {
+        injection_flags: "not_recorded",
+        uncertainties: "not_recorded",
+        catalysts: "not_recorded",
+        risks: "not_recorded",
+        market_context: "not_recorded",
+        relative_strength_vs_spy: "not_recorded",
+        days_to_next_earnings: "not_recorded",
+        source_evidence: "references_only",
       },
     });
+    const availablePlanPosture = () => ({
+      observed_at: "2026-07-29T16:00:00Z",
+      can_trade: false,
+      checks: [{
+        name: "provider_budget",
+        status: "pass",
+        observed_at: "2026-07-29T16:00:00Z",
+        detail_code: "provider_budget_available",
+        scope: "anthropic",
+        budget_used: 4,
+        budget_remaining: 96,
+        budget_limit: 100,
+        input_tokens_used: 1000,
+        input_tokens_remaining: 999000,
+        input_tokens_limit: 1000000,
+        output_tokens_used: 100,
+        output_tokens_remaining: 199900,
+        output_tokens_limit: 200000,
+        reset_at: "2026-07-30T00:00:00Z",
+      }],
+    });
 """
+
+
+def test_plan_budget_failure_clears_old_values_and_renders_rate_metadata():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("refreshPlanPosture",),
+        r"""
+        const elements = installDom([
+          "plans-budget-state",
+          "plans-budget-calls",
+          "plans-budget-input",
+          "plans-budget-output",
+          "plans-budget-reset",
+          "analysis-submit",
+          "proposal-submit",
+        ]);
+        const observedAt = "2026-07-29T16:00:00Z";
+        const available = {
+          observed_at: observedAt,
+          can_trade: false,
+          checks: [{
+            name: "provider_budget",
+            status: "pass",
+            observed_at: observedAt,
+            detail_code: "provider_budget_available",
+            scope: "anthropic",
+            budget_used: 4,
+            budget_remaining: 96,
+            budget_limit: 100,
+            input_tokens_used: 1000,
+            input_tokens_remaining: 999000,
+            input_tokens_limit: 1000000,
+            output_tokens_used: 100,
+            output_tokens_remaining: 199900,
+            output_tokens_limit: 200000,
+            reset_at: "2026-07-30T00:00:00Z",
+          }],
+        };
+        let call = 0;
+        globalThis.__api = () => {
+          call += 1;
+          if (call === 1) return Promise.resolve(available);
+          const error = new Error("Provider rate limit reached");
+          error.requestId = "plans-posture-429";
+          error.retryAfter = 17;
+          error.rateLimitReset = 1785369600;
+          return Promise.reject(error);
+        };
+
+        const first = await module.refreshPlanPosture();
+        if (!first) throw new Error("available budget did not normalize");
+        if (
+          elements["analysis-submit"].disabled
+          || elements["proposal-submit"].disabled
+        ) {
+          throw new Error("available budget left paid actions disabled");
+        }
+        if (!elements["plans-budget-calls"].textContent.includes("96 / 100")) {
+          throw new Error("available call budget was not rendered");
+        }
+
+        await module.refreshPlanPosture().catch(() => false);
+        for (const id of [
+          "plans-budget-calls",
+          "plans-budget-input",
+          "plans-budget-output",
+          "plans-budget-reset",
+        ]) {
+          if (
+            elements[id].textContent.includes("96 / 100")
+            || elements[id].textContent.includes("999000")
+          ) {
+            throw new Error(`${id} retained stale provider evidence`);
+          }
+        }
+        const state = elements["plans-budget-state"].textContent;
+        for (const expected of [
+          "Provider call blocked before network I/O",
+          "plans-posture-429",
+          "17",
+          "1785369600",
+        ]) {
+          if (!state.includes(expected)) {
+            throw new Error(`missing rate metadata ${expected}: ${state}`);
+          }
+        }
+        if (
+          !elements["analysis-submit"].disabled
+          || !elements["proposal-submit"].disabled
+        ) {
+          throw new Error("unknown provider state did not fail closed");
+        }
+        """,
+    )
+
+
+def test_plan_budget_blocks_only_paid_calls_before_network_io():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        (
+            "refreshPlanPosture",
+            "submitAnalysis",
+            "submitProposals",
+            "runScreen",
+            "showPlan",
+        ),
+        _PLAN_DOM_SETUP
+        + r"""
+        for (const id of [
+          "plans-budget-state",
+          "plans-budget-calls",
+          "plans-budget-input",
+          "plans-budget-output",
+          "plans-budget-reset",
+          "analysis-submit",
+          "proposal-submit",
+          "screen-button",
+          "screen-results",
+          "analysis-symbol",
+          "analysis-reason",
+          "proposal-reason",
+          "plans-list",
+        ]) {
+          elements[id] = document.createElement(
+            id.endsWith("reason") ? "textarea" : "div",
+          );
+          elements[id].id = id;
+        }
+        document.getElementById = (id) => elements[id] || null;
+        elements["analysis-symbol"].value = "AAPL";
+        elements["analysis-reason"].value = "paid analysis must remain local";
+        elements["proposal-reason"].value = "paid proposals must remain local";
+        const observedAt = "2026-07-29T16:00:00Z";
+        const calls = [];
+        globalThis.__api = (path) => {
+          calls.push(path);
+          if (path === "/security/posture") {
+            return Promise.resolve({
+              observed_at: observedAt,
+              can_trade: false,
+              checks: [{
+                name: "provider_budget",
+                status: "blocked",
+                observed_at: observedAt,
+                detail_code: "provider_budget_exhausted",
+                scope: "anthropic",
+                budget_used: 100,
+                budget_remaining: 0,
+                budget_limit: 100,
+                input_tokens_used: 1000000,
+                input_tokens_remaining: 0,
+                input_tokens_limit: 1000000,
+                output_tokens_used: 200000,
+                output_tokens_remaining: 0,
+                output_tokens_limit: 200000,
+                reset_at: "2026-07-30T00:00:00Z",
+              }],
+            });
+          }
+          if (path === "/screen") {
+            return Promise.resolve({candidates: []});
+          }
+          if (path === "/plans/1") {
+            return Promise.resolve(planDetail(1, "AAPL"));
+          }
+          throw new Error(`unexpected network call ${path}`);
+        };
+
+        await module.refreshPlanPosture();
+        await module.submitAnalysis({preventDefault() {}});
+        await module.submitProposals({preventDefault() {}});
+        await module.runScreen();
+        await module.showPlan(1);
+
+        if (
+          calls.includes("/analyze")
+          || calls.includes("/propose")
+        ) {
+          throw new Error("blocked paid action reached network I/O");
+        }
+        if (!calls.includes("/screen")) {
+          throw new Error("deterministic screener was incorrectly blocked");
+        }
+        if (elements["screen-button"].disabled) {
+          throw new Error("budget state disabled the deterministic screener");
+        }
+        if (!elements["plans-budget-state"].textContent.includes(
+          "Provider call blocked before network I/O",
+        )) {
+          throw new Error("provider denial was not explained");
+        }
+        for (const label of ["Review plan approval", "Cancel plan"]) {
+          const action = findButton(elements["plan-detail"], label);
+          if (!action || action.disabled) {
+            throw new Error(`${label} was blocked by provider budget`);
+          }
+        }
+        """,
+    )
+
+
+def test_saved_plan_queue_is_summary_only_and_click_only_selects():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("refreshPlans",),
+        _PLAN_DOM_SETUP
+        + r"""
+        elements["plans-list"] = document.createElement("div");
+        elements["plan-filter"] = document.createElement("input");
+        document.getElementById = (id) => elements[id] || null;
+        const calls = [];
+        globalThis.__api = (path) => {
+          calls.push(path);
+          if (path === "/plans") {
+            return Promise.resolve({plans: [{
+              plan_id: 9,
+              symbol: "AAPL",
+              action: "buy",
+              status: "approved",
+              paper_only: true,
+              authority_version: 1,
+              authority_digest: "digest-9-AAPL",
+              review_token: "plan:9:authority:v1:digest-9-AAPL",
+              created_at: "2026-07-29T15:00:00+00:00",
+              confidence: 0.73,
+              as_of: "2026-07-29T14:30:00+00:00",
+              thesis: "PRIVATE NARRATIVE MUST NOT ENTER THE QUEUE",
+              regime: "INVENTED ENUM MUST NOT ENTER THE QUEUE",
+              scenarios: ["PRIVATE SCENARIO"],
+            }]});
+          }
+          if (path === "/plans/9") {
+            return Promise.resolve(planDetail(9, "AAPL"));
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+
+        await module.refreshPlans();
+        const rendered = elements["plans-list"].textContent;
+        for (const expected of [
+          "AAPL",
+          "buy",
+          "approved",
+          "0.73",
+          "2026-07-29T14:30:00+00:00",
+          "Freshness",
+          "Paper-only",
+        ]) {
+          if (!rendered.includes(expected)) {
+            throw new Error(`queue omitted ${expected}: ${rendered}`);
+          }
+        }
+        for (const forbidden of [
+          "PRIVATE NARRATIVE",
+          "INVENTED ENUM",
+          "PRIVATE SCENARIO",
+          "Armed",
+          "Blocked",
+        ]) {
+          if (rendered.includes(forbidden)) {
+            throw new Error(`queue leaked or invented ${forbidden}`);
+          }
+        }
+
+        elements["plans-list"].children[0].click();
+        await flush();
+        if (!calls.includes("/plans/9")) {
+          throw new Error("queue row did not select its detail");
+        }
+        if (
+          calls.some((path) => path.endsWith("/approve"))
+          || calls.some((path) => path.endsWith("/cancel"))
+        ) {
+          throw new Error("queue row performed a consequential action");
+        }
+        """,
+    )
+
+
+def test_plan_detail_renders_only_persisted_evidence_and_clears_on_failure():
+    _run_page_module(
+        _STATIC / "js" / "plans.js",
+        ("showPlan",),
+        _PLAN_DOM_SETUP
+        + r"""
+        const first = planDetail(1, "AAPL");
+        first.plan.cited_source_refs = [
+          "opaque:sec-filing:0001",
+          "https://opaque-reference.invalid/not-a-link",
+        ];
+        let request = 0;
+        globalThis.__api = (path) => {
+          request += 1;
+          if (path === "/plans/1") return Promise.resolve(first);
+          if (path === "/plans/2") {
+            const error = new Error("Detail unavailable");
+            error.requestId = "plan-detail-request-2";
+            return Promise.reject(error);
+          }
+          throw new Error(`unexpected API path ${path}`);
+        };
+        const collectTags = (root, tagName) => {
+          const own = root.tagName === tagName ? [root] : [];
+          return root.children.reduce(
+            (all, child) => all.concat(collectTags(child, tagName)),
+            own,
+          );
+        };
+
+        await module.showPlan(1);
+        const rendered = elements["plan-detail"].textContent;
+        for (const expected of [
+          "AAPL test thesis",
+          "trend confirmation",
+          "test regime",
+          "test invalidation",
+          "100.000000",
+          "References only",
+          "opaque:sec-filing:0001",
+          "Injection flags",
+          "Uncertainties",
+          "Catalysts",
+          "Risks",
+          "Market context",
+          "Relative strength vs SPY",
+          "Days to next earnings",
+        ]) {
+          if (!rendered.includes(expected)) {
+            throw new Error(`detail omitted ${expected}: ${rendered}`);
+          }
+        }
+        const unavailableCount = rendered.split("Not recorded").length - 1;
+        if (unavailableCount < 9) {
+          throw new Error(
+            `unavailable evidence was not explicit: ${unavailableCount}`,
+          );
+        }
+        if (collectTags(elements["plan-detail"], "A").length !== 0) {
+          throw new Error("opaque source reference became a link");
+        }
+
+        await module.showPlan(2);
+        const failed = elements["plan-detail"].textContent;
+        for (const stale of [
+          "AAPL test thesis",
+          "opaque:sec-filing:0001",
+          "https://opaque-reference.invalid/not-a-link",
+          "References only",
+        ]) {
+          if (failed.includes(stale)) {
+            throw new Error(`failed selection retained ${stale}`);
+          }
+        }
+        if (!failed.includes("plan-detail-request-2")) {
+          throw new Error("detail failure omitted its stable request ID");
+        }
+        """,
+    )
 
 
 def test_latest_analysis_submission_owns_plan_detail_workspace():
     _run_page_module(
         _STATIC / "js" / "plans.js",
-        ("submitAnalysis",),
+        ("refreshPlanPosture", "submitAnalysis"),
         _PLAN_DOM_SETUP
         + r"""
         elements["analysis-symbol"] = document.createElement("input");
         elements["analysis-reason"] = document.createElement("textarea");
         elements["plans-list"] = document.createElement("div");
+        for (const id of [
+          "plans-budget-state",
+          "plans-budget-calls",
+          "plans-budget-input",
+          "plans-budget-output",
+          "plans-budget-reset",
+          "analysis-submit",
+          "proposal-submit",
+        ]) {
+          elements[id] = document.createElement("div");
+        }
         document.getElementById = (id) => elements[id] || null;
         const older = deferred();
         const newer = deferred();
         let analysisCall = 0;
         globalThis.__api = (path, _options = {}) => {
+          if (path === "/security/posture") {
+            return Promise.resolve(availablePlanPosture());
+          }
           if (path === "/analyze") {
             analysisCall += 1;
             return analysisCall === 1 ? older.promise : newer.promise;
@@ -3181,6 +3628,7 @@ def test_latest_analysis_submission_owns_plan_detail_workspace():
           throw new Error(`unexpected API path ${path}`);
         };
 
+        await module.refreshPlanPosture();
         elements["analysis-symbol"].value = "AAPL";
         elements["analysis-reason"].value = "older analysis";
         const oldSubmission = module.submitAnalysis({
@@ -3212,16 +3660,30 @@ def test_latest_analysis_submission_owns_plan_detail_workspace():
 def test_latest_proposal_submission_owns_plan_detail_workspace():
     _run_page_module(
         _STATIC / "js" / "plans.js",
-        ("submitProposals",),
+        ("refreshPlanPosture", "submitProposals"),
         _PLAN_DOM_SETUP
         + r"""
         elements["proposal-reason"] = document.createElement("textarea");
         elements["plans-list"] = document.createElement("div");
+        for (const id of [
+          "plans-budget-state",
+          "plans-budget-calls",
+          "plans-budget-input",
+          "plans-budget-output",
+          "plans-budget-reset",
+          "analysis-submit",
+          "proposal-submit",
+        ]) {
+          elements[id] = document.createElement("div");
+        }
         document.getElementById = (id) => elements[id] || null;
         const older = deferred();
         const newer = deferred();
         let proposalCall = 0;
         globalThis.__api = (path, _options = {}) => {
+          if (path === "/security/posture") {
+            return Promise.resolve(availablePlanPosture());
+          }
           if (path === "/propose") {
             proposalCall += 1;
             return proposalCall === 1 ? older.promise : newer.promise;
@@ -3230,6 +3692,7 @@ def test_latest_proposal_submission_owns_plan_detail_workspace():
           throw new Error(`unexpected API path ${path}`);
         };
 
+        await module.refreshPlanPosture();
         elements["proposal-reason"].value = "older proposal scan";
         const oldSubmission = module.submitProposals({
           preventDefault() {},

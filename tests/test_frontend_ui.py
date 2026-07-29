@@ -75,8 +75,21 @@ BEHAVIOR_HOOKS = {
         "main-content",
         "session-actor",
         "sign-out",
+        "plan-actions-pane",
+        "plan-queue-pane",
+        "plan-evidence-pane",
+        "research-paper-badge",
+        "plan-filter",
+        "plans-budget-state",
+        "plans-budget-calls",
+        "plans-budget-input",
+        "plans-budget-output",
+        "plans-budget-reset",
+        "refresh-plan-budget",
         "analysis-form",
+        "analysis-submit",
         "proposal-form",
+        "proposal-submit",
         "screen-button",
         "screen-results",
         "plans-list",
@@ -376,3 +389,69 @@ def test_operations_layout_moves_the_proof_rail_without_shrinking_actions():
     assert ".proof-rail" in css
     assert "grid-template-areas:" in css
     assert "min-height: 44px;" in css
+
+
+def test_plans_page_exposes_a_three_pane_paper_research_workspace():
+    """Plan research must separate paid actions, saved summaries, and persisted evidence."""
+    html = static_text("plans.html")
+    parsed = parse_page("plans.html")
+    ordered_ids = (
+        "plan-actions-pane",
+        "plan-queue-pane",
+        "plan-evidence-pane",
+    )
+    offsets = [html.index(f'id="{element_id}"') for element_id in ordered_ids]
+
+    assert offsets == sorted(offsets)
+    assert 'class="plans-workspace"' in html
+    assert "Research / paper-only" in html
+    assert {
+        "plans-budget-state",
+        "plans-budget-calls",
+        "plans-budget-input",
+        "plans-budget-output",
+        "plans-budget-reset",
+        "analysis-submit",
+        "proposal-submit",
+        "screen-button",
+        "refresh-plans",
+    } <= parsed.ids
+    assert "Regime context is available in selected detail." in html
+
+
+def test_plans_approval_copy_preserves_the_exact_paper_safety_boundary():
+    """Approval copy cannot imply execution certainty, profitability, or live authority."""
+    html = static_text("plans.html")
+    visible_copy = " ".join(html.split())
+
+    assert "Approve exact paper plan" in visible_copy
+    assert (
+        "may create an ALPACA PAPER bracket or arm paper-only rules"
+        in visible_copy
+    )
+    assert "does not prove profitability" in visible_copy
+    assert "remains subject to execution and risk gates" in visible_copy
+    for forbidden in ("AI pick", "winner", "guaranteed"):
+        assert forbidden.lower() not in html.lower()
+
+
+def test_plans_css_stacks_the_evidence_workspace_at_compact_widths():
+    """The three panes must become one readable flow below the desktop breakpoint."""
+    css = static_text("css/console.css")
+
+    assert ".plans-workspace" in css
+    assert ".plan-actions-pane" in css
+    assert ".plan-queue-pane" in css
+    assert ".plan-evidence-pane" in css
+    assert re.search(
+        r"@media \(min-width: 1180px\).*?\.plans-workspace\s*\{"
+        r".*?grid-template-columns:",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(min-width: 760px\) and \(max-width: 1179px\).*?"
+        r"\.plans-workspace\s*\{.*?grid-template-columns:\s*minmax\(0,\s*1fr\)",
+        css,
+        re.DOTALL,
+    )
