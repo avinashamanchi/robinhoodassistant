@@ -601,6 +601,7 @@ def test_ui_sources_forbid_browser_secrets_and_html_sinks(source):
         "sessionStorage",
         "X-API-Key",
         "innerHTML",
+        "insertAdjacentHTML",
         "unsafe-inline",
     ):
         assert forbidden not in text

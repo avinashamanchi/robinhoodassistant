@@ -101,3 +101,14 @@ hooks, and safety copy.
   behavior tasks bind them to server evidence.
 - The legacy `flight-deck.svg` file remains unreferenced for history safety; no
   page, assertion, or served-asset contract uses it.
+
+## Independent review disposition
+
+The bounded review found no implementation violation, but correctly identified
+two missing negative assertions. The security suite now rejects
+`insertAdjacentHTML`, remote CSS imports/URLs, and remote SVG links. The
+complete focused matrix after that correction is:
+
+```text
+132 passed in 6.66s
+```

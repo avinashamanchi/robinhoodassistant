@@ -155,6 +155,20 @@ def test_console_declares_the_approved_dark_tokens_and_accessibility_modes():
     assert "@media (forced-colors: active)" in css
 
 
+def test_shared_css_and_original_mark_have_no_remote_asset_escape():
+    """CSS imports, font/image URLs, and SVG links must remain self-hosted."""
+    css = static_text("css/console.css")
+    mark = static_text("img/trading-orbit.svg")
+
+    assert "@import" not in css
+    assert not re.search(r"url\(\s*[\"']?https?://", css, re.IGNORECASE)
+    assert not re.search(
+        r"(?:href|xlink:href)\s*=\s*[\"']https?://",
+        mark,
+        re.IGNORECASE,
+    )
+
+
 @pytest.mark.parametrize("page", PAGES)
 def test_every_page_uses_the_original_local_identity_and_explicit_paper_mode(page):
     """A shared page cannot regress to an exchange identity or ambiguous trading mode."""
