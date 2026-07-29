@@ -3808,3 +3808,123 @@ def test_local_client_verify_keyword_is_not_network_transport(tmp_path):
     completed = _run_trust_gate(root)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+# ── Plan 4 Task 1: current and historical release artifacts ───────────
+
+
+def _commit_release_fixture(root: Path, message: str) -> str:
+    subprocess.run(["git", "add", "--all"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "commit",
+            "-qm",
+            message,
+        ],
+        cwd=root,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "code"),
+    [
+        (".local/operator-note.txt", "TRACKED_LOCAL_ARTIFACT"),
+        ("certificates/localhost.pem", "TRACKED_TLS_CERTIFICATE"),
+        ("state/runtime.sqlite.snapshot", "TRACKED_SQLITE_DATABASE"),
+    ],
+)
+def test_expanded_current_artifact_rules_reject_private_surfaces(
+    tmp_path,
+    relative_path,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, "private fixture value\n")
+    subprocess.run(
+        ["git", "add", "--", relative_path],
+        cwd=root,
+        check=True,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+    assert "private fixture value" not in completed.stderr
+
+
+def test_current_credential_fingerprint_is_reported_without_value(tmp_path):
+    root = _trust_fixture(tmp_path)
+    token = "ck_" + "MixedCase9ValueWithEnoughEntropy"
+    relative_path = "docs/current-provider-fixture.md"
+    _write_fixture_file(root, relative_path, f"credential: {token}\n")
+    subprocess.run(
+        ["git", "add", "--", relative_path],
+        cwd=root,
+        check=True,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "COMPOSIO_CREDENTIAL_FINGERPRINT" in completed.stderr
+    assert token not in completed.stderr
+    assert "credential:" not in completed.stderr
+
+
+def test_deleted_historical_private_artifact_is_still_rejected(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _commit_release_fixture(root, "baseline")
+    relative_path = ".local/retired-provider-output.txt"
+    _write_fixture_file(root, relative_path, "retired private value\n")
+    offending_commit = _commit_release_fixture(root, "add private artifact")
+    (root / relative_path).unlink()
+    _commit_release_fixture(root, "remove private artifact")
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert (
+        f"TRACKED_LOCAL_ARTIFACT {offending_commit} {relative_path}"
+        in completed.stderr
+    )
+    assert "retired private value" not in completed.stderr
+    assert "add private artifact" not in completed.stderr
+
+
+def test_deleted_historical_credential_reports_only_rule_commit_and_path(
+    tmp_path,
+):
+    root = _trust_fixture(tmp_path)
+    _commit_release_fixture(root, "baseline")
+    token = "ck_" + "MixedCase9ValueWithEnoughEntropy"
+    relative_path = "docs/retired-provider-fixture.md"
+    _write_fixture_file(root, relative_path, f"credential: {token}\n")
+    offending_commit = _commit_release_fixture(root, "add retired credential")
+    (root / relative_path).unlink()
+    _commit_release_fixture(root, "remove retired credential")
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    finding = (
+        f"COMPOSIO_CREDENTIAL_FINGERPRINT "
+        f"{offending_commit} {relative_path}"
+    )
+    assert finding in completed.stderr
+    assert token not in completed.stderr
+    assert "credential:" not in completed.stderr
+    assert "add retired credential" not in completed.stderr

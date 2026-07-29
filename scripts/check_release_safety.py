@@ -31,6 +31,7 @@ class ReleaseViolation:
     code: str
     path: str
     line: int
+    commit: str = ""
 
     def __post_init__(self) -> None:
         if re.fullmatch(r"[A-Z][A-Z0-9_]*", self.code) is None:
@@ -61,6 +62,8 @@ class ReleaseViolation:
             or self.line <= 0
         ):
             raise ValueError("release violation line is invalid")
+        if self.commit and re.fullmatch(r"[0-9a-f]{40,64}", self.commit) is None:
+            raise ValueError("release violation commit is invalid")
 
 
 def _finding(code: str, relative: str, line: int) -> ReleaseViolation:
@@ -78,6 +81,37 @@ def _finding(code: str, relative: str, line: int) -> ReleaseViolation:
     )
     safe_line = line if type(line) is int and line > 0 else 1
     return ReleaseViolation(code, safe_path, safe_line)
+
+
+def _history_finding(
+    code: str,
+    commit: str,
+    relative: str,
+) -> ReleaseViolation:
+    safe_path = (
+        relative
+        if (
+            isinstance(relative, str)
+            and _SAFE_FINDING_PATH.fullmatch(relative) is not None
+            and relative.isascii()
+            and not relative.startswith(("/", "\\"))
+            and "\\" not in relative
+            and all(
+                part not in {"", ".", ".."}
+                for part in PurePosixPath(relative).parts
+            )
+        )
+        else "unsafe-path"
+    )
+    safe_commit = (
+        commit
+        if isinstance(commit, str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", commit) is not None
+        else ""
+    )
+    if not safe_commit:
+        return _finding("GIT_HISTORY_UNPROVEN", ".", 1)
+    return ReleaseViolation(code, safe_path, 1, safe_commit)
 
 
 def _fail(message: str) -> None:
@@ -5160,6 +5194,13 @@ def _tracked_artifact_code(name: str) -> str | None:
         return "TRACKED_TLS_PRIVATE_KEY"
     if basename.endswith((".p12", ".pfx", ".pkcs12")):
         return "TRACKED_TLS_PRIVATE_CERTIFICATE"
+    if ".local" in {part.lower() for part in path.parts}:
+        return "TRACKED_LOCAL_ARTIFACT"
+    if (
+        basename.endswith(".pem")
+        and (not path.parts or path.parts[0].lower() != "certs")
+    ):
+        return "TRACKED_TLS_CERTIFICATE"
     encrypted_suffix = basename.endswith((".aesgcm", ".age", ".gpg"))
     backup_directory = bool(
         parent_names.intersection({"backup", "backups"})
@@ -5206,7 +5247,7 @@ def _tracked_artifact_code(name: str) -> str | None:
         and not encrypted_suffix
     ):
         return "TRACKED_DECRYPTED_BACKUP"
-    if basename.endswith((".sqlite", ".sqlite3", ".db")):
+    if ".sqlite" in basename or basename.endswith(".db"):
         return "TRACKED_SQLITE_DATABASE"
     if basename.endswith(".log") or "/logs/" in f"/{lowered}":
         return "TRACKED_RUNTIME_LOG"
@@ -5229,6 +5270,333 @@ def _scan_tracked_artifacts(root: Path) -> list[ReleaseViolation]:
         code = _tracked_artifact_code(name)
         if code is not None:
             findings.append(_finding(code, name, 1))
+    return findings
+
+
+_CREDENTIAL_FINGERPRINTS: tuple[
+    tuple[str, re.Pattern[bytes]],
+    ...,
+] = (
+    (
+        "COMPOSIO_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![A-Za-z0-9_])ck_"
+            rb"(?=[A-Za-z0-9_-]{20,80}(?![A-Za-z0-9_-]))"
+            rb"(?=[A-Za-z0-9_-]{0,79}[A-Z])"
+            rb"(?=[A-Za-z0-9_-]{0,79}[a-z])"
+            rb"(?=[A-Za-z0-9_-]{0,79}[0-9])"
+            rb"[A-Za-z0-9_-]{20,80}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "ANTHROPIC_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![A-Za-z0-9_-])sk-ant-"
+            rb"[A-Za-z0-9_-]{20,160}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "OPENAI_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![A-Za-z0-9_-])sk-(?:proj-)?"
+            rb"[A-Za-z0-9_-]{20,160}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "GITHUB_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{30,255}"
+            rb"(?![A-Za-z0-9])"
+        ),
+    ),
+    (
+        "AWS_CREDENTIAL_FINGERPRINT",
+        re.compile(rb"(?<![A-Z0-9])AKIA[A-Z0-9]{16}(?![A-Z0-9])"),
+    ),
+    (
+        "ALPACA_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![A-Z0-9])PK(?=[A-Z0-9]{18,30}(?![A-Z0-9]))"
+            rb"(?=[A-Z0-9]{0,29}[0-9])[A-Z0-9]{18,30}(?![A-Z0-9])"
+        ),
+    ),
+    (
+        "TELEGRAM_CREDENTIAL_FINGERPRINT",
+        re.compile(
+            rb"(?<![0-9])\d{8,12}:[A-Za-z0-9_-]{35,80}"
+            rb"(?![A-Za-z0-9_-])"
+        ),
+    ),
+)
+_MAX_SCANNED_BLOB_BYTES = 5 * 1024 * 1024
+_MAX_HISTORY_BATCH_BYTES = 128 * 1024 * 1024
+
+
+def _credential_fingerprint_matches(
+    payload: bytes,
+) -> tuple[tuple[str, int], ...]:
+    matches: list[tuple[str, int]] = []
+    for code, pattern in _CREDENTIAL_FINGERPRINTS:
+        match = pattern.search(payload)
+        if match is not None:
+            matches.append((code, match.start()))
+    return tuple(matches)
+
+
+def _scan_current_credential_fingerprints(
+    root: Path,
+) -> list[ReleaseViolation]:
+    tracked_names = _git_tracked_names(root)
+    if tracked_names is None:
+        return [_finding("GIT_TREE_UNPROVEN", ".", 1)]
+    findings: list[ReleaseViolation] = []
+    for name in tracked_names:
+        path = root / PurePosixPath(name)
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+            size = path.stat().st_size
+            if size > _MAX_SCANNED_BLOB_BYTES:
+                findings.append(
+                    _finding("GIT_CURRENT_BLOB_UNSCANNED", name, 1)
+                )
+                continue
+            payload = path.read_bytes()
+        except OSError:
+            findings.append(_finding("GIT_TREE_UNPROVEN", ".", 1))
+            continue
+        for code, offset in _credential_fingerprint_matches(payload):
+            line = payload.count(b"\n", 0, offset) + 1
+            findings.append(_finding(code, name, line))
+    return findings
+
+
+def _history_git(
+    root: Path,
+    arguments: tuple[str, ...],
+    *,
+    input_bytes: bytes | None = None,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess[bytes] | None:
+    environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", os.defpath),
+    }
+    try:
+        return subprocess.run(
+            ("git", *arguments),
+            cwd=root,
+            env=environment,
+            input=input_bytes,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _history_commits(root: Path) -> tuple[str, ...] | None:
+    completed = _history_git(root, ("log", "--all", "--format=%H"))
+    if completed is None or completed.returncode != 0:
+        return None
+    commits: list[str] = []
+    seen: set[str] = set()
+    for raw in completed.stdout.splitlines():
+        try:
+            commit = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+            return None
+        if commit not in seen:
+            seen.add(commit)
+            commits.append(commit)
+    return tuple(commits)
+
+
+def _history_tree(
+    root: Path,
+    commit: str,
+) -> tuple[tuple[str, str], ...] | None:
+    completed = _history_git(
+        root,
+        ("ls-tree", "-r", "-z", "--full-tree", commit, "--"),
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if separator != b"\t" or len(fields) != 3:
+            return None
+        _mode, object_type, raw_object = fields
+        if object_type != b"blob":
+            continue
+        try:
+            object_id = raw_object.decode("ascii")
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if (
+            re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+            or _SAFE_FINDING_PATH.fullmatch(path) is None
+            or not path.isascii()
+            or path.startswith(("/", "\\"))
+            or "\\" in path
+            or any(
+                part in {"", ".", ".."}
+                for part in PurePosixPath(path).parts
+            )
+        ):
+            return None
+        entries.append((path, object_id))
+    return tuple(entries)
+
+
+def _history_blob_sizes(
+    root: Path,
+    object_ids: tuple[str, ...],
+) -> dict[str, int] | None:
+    if not object_ids:
+        return {}
+    input_bytes = b"".join(
+        object_id.encode("ascii") + b"\n"
+        for object_id in object_ids
+    )
+    completed = _history_git(
+        root,
+        ("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"),
+        input_bytes=input_bytes,
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    lines = completed.stdout.splitlines()
+    if len(lines) != len(object_ids):
+        return None
+    sizes: dict[str, int] = {}
+    for expected, line in zip(object_ids, lines, strict=True):
+        fields = line.split()
+        if len(fields) != 3:
+            return None
+        raw_object, object_type, raw_size = fields
+        try:
+            object_id = raw_object.decode("ascii")
+            size = int(raw_size)
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if (
+            object_id != expected
+            or object_type != b"blob"
+            or size < 0
+        ):
+            return None
+        sizes[object_id] = size
+    return sizes
+
+
+def _history_blob_payloads(
+    root: Path,
+    object_ids: tuple[str, ...],
+    sizes: dict[str, int],
+) -> dict[str, bytes] | None:
+    if not object_ids:
+        return {}
+    input_bytes = b"".join(
+        object_id.encode("ascii") + b"\n"
+        for object_id in object_ids
+    )
+    completed = _history_git(
+        root,
+        ("cat-file", "--batch"),
+        input_bytes=input_bytes,
+        timeout=120.0,
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    output = completed.stdout
+    cursor = 0
+    payloads: dict[str, bytes] = {}
+    for expected in object_ids:
+        header_end = output.find(b"\n", cursor)
+        if header_end < 0:
+            return None
+        header = output[cursor:header_end].split()
+        if len(header) != 3:
+            return None
+        raw_object, object_type, raw_size = header
+        try:
+            object_id = raw_object.decode("ascii")
+            size = int(raw_size)
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if (
+            object_id != expected
+            or object_type != b"blob"
+            or size != sizes.get(expected)
+        ):
+            return None
+        start = header_end + 1
+        end = start + size
+        if end >= len(output) or output[end : end + 1] != b"\n":
+            return None
+        payloads[object_id] = output[start:end]
+        cursor = end + 1
+    if cursor != len(output):
+        return None
+    return payloads
+
+
+def _scan_git_history(root: Path) -> list[ReleaseViolation]:
+    commits = _history_commits(root)
+    if commits is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if not commits:
+        return []
+
+    findings: list[ReleaseViolation] = []
+    references: dict[str, list[tuple[str, str]]] = {}
+    for commit in commits:
+        entries = _history_tree(root, commit)
+        if entries is None:
+            return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+        for path, object_id in entries:
+            artifact_code = _tracked_artifact_code(path)
+            if artifact_code is not None:
+                findings.append(
+                    _history_finding(artifact_code, commit, path)
+                )
+            references.setdefault(object_id, []).append((commit, path))
+
+    object_ids = tuple(sorted(references))
+    sizes = _history_blob_sizes(root, object_ids)
+    if sizes is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if any(size > _MAX_SCANNED_BLOB_BYTES for size in sizes.values()):
+        return [_finding("GIT_HISTORY_BLOB_UNSCANNED", ".", 1)]
+    if sum(sizes.values()) > _MAX_HISTORY_BATCH_BYTES:
+        return [_finding("GIT_HISTORY_BLOB_UNSCANNED", ".", 1)]
+    payloads = _history_blob_payloads(root, object_ids, sizes)
+    if payloads is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+
+    matches_by_object = {
+        object_id: tuple(
+            code
+            for code, _offset in _credential_fingerprint_matches(payload)
+        )
+        for object_id, payload in payloads.items()
+    }
+    for object_id, matches in matches_by_object.items():
+        for code in matches:
+            for commit, path in references[object_id]:
+                findings.append(_history_finding(code, commit, path))
     return findings
 
 
@@ -6892,6 +7260,16 @@ _STRUCTURED_RELEASE_SCANNERS = (
         "GIT_TREE_UNPROVEN",
         ".",
     ),
+    (
+        _scan_current_credential_fingerprints,
+        "GIT_TREE_UNPROVEN",
+        ".",
+    ),
+    (
+        _scan_git_history,
+        "GIT_HISTORY_UNPROVEN",
+        ".",
+    ),
 )
 
 
@@ -6935,10 +7313,16 @@ def main(argv: list[str] | None = None) -> int:
         findings = [_finding("INTERNAL_GATE_ERROR", "internal", 1)]
     if findings:
         for finding in findings:
-            print(
-                f"{finding.code} {finding.path}:{finding.line}",
-                file=sys.stderr,
-            )
+            if finding.commit:
+                print(
+                    f"{finding.code} {finding.commit} {finding.path}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"{finding.code} {finding.path}:{finding.line}",
+                    file=sys.stderr,
+                )
         count = len(findings)
         noun = "violation" if count == 1 else "violations"
         print(
