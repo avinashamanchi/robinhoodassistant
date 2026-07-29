@@ -211,17 +211,7 @@ def test_release_static_gate_rejects_negative_fixtures(
     root = _static_fixture(tmp_path)
     _write_static_mutation(root, relative_path, source)
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/check_release_safety.py",
-            "--root",
-            str(root),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_trust_gate(root)
 
     assert completed.returncode == 1
     assert _legacy_expected_code(expected) in completed.stderr
@@ -301,17 +291,7 @@ def test_release_static_gate_rejects_task6_review_bypasses(
     root = _static_fixture(tmp_path)
     _write_static_mutation(root, relative_path, source)
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/check_release_safety.py",
-            "--root",
-            str(root),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_trust_gate(root)
 
     assert completed.returncode == 1
     assert _legacy_expected_code(expected) in completed.stderr
@@ -752,17 +732,7 @@ def test_release_static_gate_accepts_exact_noncanonical_route_paths(
         "    return None\n",
     )
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/check_release_safety.py",
-            "--root",
-            str(root),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_trust_gate(root)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -808,17 +778,7 @@ def test_release_static_gate_ignores_backend_and_rate_limiter_text(tmp_path):
         encoding="utf-8",
     )
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "scripts/check_release_safety.py",
-            "--root",
-            str(root),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_trust_gate(root)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -1089,9 +1049,14 @@ def _run_trust_gate(
     *,
     trusted_ancestry_anchor: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    anchor = trusted_ancestry_anchor or _TRUSTED_ANCESTRY_ANCHORS.get(
-        root.resolve(),
-        "0" * 40,
+    try:
+        resolved_root = root.resolve()
+    except (OSError, RuntimeError):
+        resolved_root = None
+    anchor = trusted_ancestry_anchor or (
+        _TRUSTED_ANCESTRY_ANCHORS.get(resolved_root, "0" * 40)
+        if resolved_root is not None
+        else "0" * 40
     )
     return subprocess.run(
         [
