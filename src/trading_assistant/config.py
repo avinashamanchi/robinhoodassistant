@@ -16,6 +16,7 @@ is always paper-targeted: this release is hard-locked to Alpaca paper trading.
 from __future__ import annotations
 
 import enum
+import math
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -283,6 +284,8 @@ class FillConfig(_Strict):
 class BacktestConfig(_Strict):
     """Simulation cost model. Fees and slippage are deliberately separate (Phase 7)."""
 
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
     fills: FillConfig = Field(default_factory=FillConfig)
     slippage_bps: dict[str, float] = Field(
         default_factory=lambda: {"equity": 5.0, "crypto": 20.0}
@@ -291,6 +294,34 @@ class BacktestConfig(_Strict):
         default_factory=lambda: {"equity": 0.0, "crypto": 25.0}
     )
     holdout_months: int = Field(default=12, gt=0)
+
+    @field_validator("slippage_bps", "fees_bps", mode="before")
+    @classmethod
+    def _require_exact_finite_cost_maps(
+        cls,
+        value: object,
+    ) -> dict[str, float]:
+        if not isinstance(value, dict):
+            raise ValueError("cost map must be an object")
+        expected = {"equity", "crypto"}
+        if set(value) != expected:
+            raise ValueError(
+                "cost map must contain exactly equity and crypto"
+            )
+        normalized: dict[str, float] = {}
+        for asset_class in sorted(expected):
+            raw = value[asset_class]
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(
+                    f"{asset_class} cost must be a number"
+                )
+            cost = float(raw)
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError(
+                    f"{asset_class} cost must be finite and nonnegative"
+                )
+            normalized[asset_class] = cost
+        return normalized
 
 
 class ScreenerConfig(_Strict):

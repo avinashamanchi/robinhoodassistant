@@ -11,6 +11,7 @@ import yaml
 from pydantic import AnyUrl, ValidationError
 
 from trading_assistant.config import (
+    BacktestConfig,
     ProviderOriginsConfig,
     Secrets,
     ServerConfig,
@@ -125,6 +126,40 @@ def test_deployed_config_keeps_automatic_execution_disabled():
     assert cfg.security.session_hours == 8
     assert cfg.security.reauthentication_minutes == 5
     assert cfg.server.secure_cookies is True
+
+
+def test_backtest_cost_maps_have_explicit_asset_class_defaults():
+    config = BacktestConfig()
+
+    assert config.slippage_bps == {"equity": 5.0, "crypto": 20.0}
+    assert config.fees_bps == {"equity": 0.0, "crypto": 25.0}
+
+
+@pytest.mark.parametrize("field", ["slippage_bps", "fees_bps"])
+@pytest.mark.parametrize(
+    "invalid_map",
+    [
+        {"equity": 5.0},
+        {"equity": 5.0, "crypto": 20.0, "options": 10.0},
+        {"equity": -0.01, "crypto": 20.0},
+        {"equity": float("nan"), "crypto": 20.0},
+        {"equity": float("inf"), "crypto": 20.0},
+        {"equity": True, "crypto": 20.0},
+        {"equity": "5.0", "crypto": 20.0},
+    ],
+)
+def test_backtest_cost_maps_fail_closed_at_startup(
+    tmp_path,
+    field,
+    invalid_map,
+):
+    raw = yaml.safe_load(Path("config.yaml").read_text())
+    raw["backtest"][field] = invalid_map
+    path = tmp_path / "invalid-backtest-cost.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValidationError, match=field):
+        load_config(path)
 
 
 def test_loopback_server_defaults_are_explicit(app_config):

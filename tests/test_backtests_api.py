@@ -268,6 +268,67 @@ def test_report_rejects_invalid_encrypted_series(client, mutation):
     assert "series" not in rep
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_asset_class",
+        "unknown_asset_class",
+        "negative_cost",
+        "boolean_cost",
+    ],
+)
+def test_report_rejects_invalid_persisted_cost_maps(client, mutation):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:invalid-cost-map",
+        reason=f"corrupt persisted cost map: {mutation}",
+        request_id=f"backtest-invalid-cost-map-{mutation}",
+    )
+    with svc.session_factory() as session:
+        artifact = (
+            session.query(BacktestArtifact)
+            .filter(
+                BacktestArtifact.run_id == run_id,
+                BacktestArtifact.artifact_key == "manifest",
+            )
+            .one()
+        )
+        store = sensitive_store(session, svc.session_factory)
+        payload = json.loads(store.read(artifact, "payload_json"))
+        costs = payload["backtest_config"]["slippage_bps"]
+        if mutation == "missing_asset_class":
+            del costs["crypto"]
+        elif mutation == "unknown_asset_class":
+            costs["options"] = 10.0
+        elif mutation == "negative_cost":
+            costs["equity"] = -0.01
+        else:
+            costs["equity"] = True
+        store.write_many(
+            artifact,
+            {
+                "payload_json": json.dumps(
+                    payload,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            },
+        )
+        session.commit()
+
+    rep = c.get(f"/backtests/{run_id}/report").json()
+
+    assert rep["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "artifact_invalid",
+    }
+    assert "manifest" not in rep
+    assert "series" not in rep
+
+
 def test_report_rejects_unknown_artifact_keys(client):
     c, svc = client
     run_id, _ = runner.run_synthetic_backtest(
