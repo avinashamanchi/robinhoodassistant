@@ -31,8 +31,11 @@ install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
 independently even after a Keychain construction/load
 failure and stop before any broker, provider, or notifier is constructed.
 Field preflight is metadata-only; the startup guard owns the full envelope
-scan. Keychain migration, field migration/rotation, and encrypted restore
-procedures are in
+scan. Local TLS requires `rootCA.pem`, `localhost.pem`, and
+`localhost-key.pem`; the watchdog trusts only the CA file. After structural
+success, preflight uses a dedicated composition that constructs no LLM
+provider, agent, app, or notifier. Keychain migration, field
+migration/rotation, and encrypted restore procedures are in
 `docs/RUNBOOK.md`; no secret value belongs on a command line.
 For rotation, keep every writer stopped, configure and prompt for the reviewed
 retained key ID, run the field rotation, complete the coordinated

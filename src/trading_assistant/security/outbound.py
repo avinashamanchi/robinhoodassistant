@@ -15,7 +15,7 @@ import ssl
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Iterable
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 import certifi
 import requests
@@ -307,20 +307,20 @@ class LocalLivenessTransport:
 
 
 def build_local_liveness_transport(
-    certificate_path: Any,
+    ca_certificate_path: Any,
     *,
     client_factory: Any = None,
     ssl_context_factory: Any = ssl.create_default_context,
 ) -> LocalLivenessTransport:
     """Build a local-only HTTPX transport without proxy/environment trust."""
 
-    if str(certificate_path) != ".local/tls/localhost.pem":
+    if str(ca_certificate_path) != ".local/tls/rootCA.pem":
         raise OutboundOriginDenied()
     if client_factory is None:
         import httpx
 
         client_factory = httpx.Client
-    context = ssl_context_factory(cafile=str(certificate_path))
+    context = ssl_context_factory(cafile=str(ca_certificate_path))
     client = client_factory(
         follow_redirects=False,
         trust_env=False,
@@ -499,6 +499,14 @@ class OutboundPolicy:
                 allow_non_default_port=True,
                 allow_request_components=True,
             )
+            if any(
+                name.lower() in _QUERY_CREDENTIAL_NAMES
+                for name, _value in parse_qsl(
+                    parts.query,
+                    keep_blank_values=True,
+                )
+            ):
+                _deny()
             if OutboundOrigin(scheme, hostname, port) not in self._origins:
                 _deny()
         except (AttributeError, TypeError, ValueError):

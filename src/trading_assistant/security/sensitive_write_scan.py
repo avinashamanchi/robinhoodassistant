@@ -402,11 +402,16 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         model_alias = self._model(value)
         if model_alias is not None:
             self.class_aliases[target.id] = model_alias
-        object_model = self._call_model(value)
+        object_model = self._object_model(value) or self._call_model(value)
         annotated = self._model_name_from_annotation(annotation)
         if object_model is not None or annotated is not None:
             self.object_models[target.id] = object_model or annotated  # type: ignore[assignment]
             self.unknown_object_aliases.discard(target.id)
+        elif (
+            isinstance(value, ast.Name)
+            and value.id in self.unknown_object_aliases
+        ):
+            self.unknown_object_aliases.add(target.id)
         elif isinstance(value, ast.Call):
             self.unknown_object_aliases.add(target.id)
         query_model = self._query_model(value)
@@ -427,6 +432,13 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 )
                 if mutation_model is not None:
                     self.mutation_call_models[target.id] = mutation_model
+        elif isinstance(value, ast.Name):
+            if value.id in self.execute_aliases:
+                self.execute_aliases.add(target.id)
+            if value.id in self.mutation_call_models:
+                self.mutation_call_models[target.id] = (
+                    self.mutation_call_models[value.id]
+                )
         constant = self._constant_string(value)
         if constant is not None:
             self.string_constants[target.id] = constant

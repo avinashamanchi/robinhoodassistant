@@ -53,6 +53,7 @@ class ServerConfig(_Strict):
     allowed_hosts: list[Literal["localhost", "127.0.0.1", "::1"]] = Field(
         default_factory=lambda: ["localhost", "127.0.0.1", "::1"]
     )
+    tls_ca_path: Path = Path(".local/tls/rootCA.pem")
     tls_cert_path: Path = Path(".local/tls/localhost.pem")
     tls_key_path: Path = Path(".local/tls/localhost-key.pem")
     secure_cookies: Literal[True] = True

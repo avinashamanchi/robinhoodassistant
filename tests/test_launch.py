@@ -1007,8 +1007,10 @@ def test_structural_preflight_never_accepts_missing_keychain_provenance(
     [
         ("tls_cert_path", ".local/tls/renamed.pem"),
         ("tls_key_path", ".local/tls/renamed-key.pem"),
+        ("tls_ca_path", ".local/tls/renamed-root.pem"),
         ("tls_cert_path", "elsewhere/localhost.pem"),
         ("tls_key_path", "elsewhere/localhost-key.pem"),
+        ("tls_ca_path", "elsewhere/rootCA.pem"),
     ],
 )
 def test_structural_preflight_requires_exact_canonical_tls_paths(

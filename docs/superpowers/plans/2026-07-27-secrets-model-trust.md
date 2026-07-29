@@ -152,6 +152,7 @@ class ServerConfig(_Strict):
     allowed_hosts: list[Literal["localhost", "127.0.0.1", "::1"]] = Field(
         default_factory=lambda: ["localhost", "127.0.0.1", "::1"]
     )
+    tls_ca_path: Path = Path(".local/tls/rootCA.pem")
     tls_cert_path: Path = Path(".local/tls/localhost.pem")
     tls_key_path: Path = Path(".local/tls/localhost-key.pem")
     secure_cookies: Literal[True] = True
@@ -562,8 +563,9 @@ Remove `CORSMiddleware`; no cross-origin route is supported.
 1. uses `set -euo pipefail` and `umask 077`;
 2. refuses if `mkcert` is absent and prints `brew install mkcert`;
 3. runs `mkcert -install`;
-4. writes `.local/tls/localhost.pem` and
-   `.local/tls/localhost-key.pem` for `localhost`, `127.0.0.1`, and `::1`;
+4. copies the public mkcert root to `.local/tls/rootCA.pem`, then writes
+   `.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` for
+   `localhost`, `127.0.0.1`, and `::1`;
 5. sets directory mode `0700`, certificate `0644`, private key `0600`;
 6. runs `python -m trading_assistant.ops.tls inspect`.
 
@@ -1833,8 +1835,11 @@ Normal readiness requires:
   unchanged. Daemon freshness remains a separate post-start observation; there
   is no daemon-health preflight row.
 
-Preflight remains read-only and never resets a breaker, starts a daemon, or
-submits/cancels an order.
+Preflight never resets a breaker, starts a daemon, submits a new order, calls
+an LLM, or sends a notification. Its existing broker-truth reconciliation may
+perform the fail-closed repair or cancellation actions required for
+already-known paper-order state, so it remains an explicit operator-controlled
+readiness step.
 
 - [x] **Step 5: Document operator commands and hard limits**
 

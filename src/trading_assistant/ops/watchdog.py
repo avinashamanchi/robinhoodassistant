@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     secrets = load_role_secrets("watchdog", config=config)
     try:
         liveness_transport = build_local_liveness_transport(
-            config.server.tls_cert_path
+            config.server.tls_ca_path
         )
     except Exception:
         liveness_transport = None

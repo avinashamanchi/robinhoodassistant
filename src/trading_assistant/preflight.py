@@ -314,6 +314,8 @@ def _structural_preflight_checks(
             or set(config.server.allowed_hosts)
             != {"localhost", "127.0.0.1", "::1"}
             or config.server.secure_cookies is not True
+            or str(config.server.tls_ca_path)
+            != ".local/tls/rootCA.pem"
             or str(config.server.tls_cert_path)
             != ".local/tls/localhost.pem"
             or str(config.server.tls_key_path)
@@ -601,12 +603,11 @@ def _reconciliation(service) -> Result:
 
 @contextmanager
 def _build_service(config, secrets: RuntimeSecrets):
-    from .bootstrap import build_container
+    from .bootstrap import build_preflight_service
 
-    container = build_container(
+    container = build_preflight_service(
         config,
         secrets,
-        runtime_role="app",
     )
     primary_failure = False
     try:

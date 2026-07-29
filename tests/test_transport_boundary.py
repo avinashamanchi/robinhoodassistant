@@ -768,6 +768,28 @@ def _write_tls_pair(
 ) -> SimpleNamespace:
     tls_directory = tmp_path / ".local" / "tls"
     tls_directory.mkdir(parents=True)
+    root_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    root_name = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "fixture local CA")]
+    )
+    now = datetime.now(timezone.utc)
+    root_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(root_name)
+        .issuer_name(root_name)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=2))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
     certificate_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
@@ -777,11 +799,10 @@ def _write_tls_pair(
         if key_matches_certificate
         else rsa.generate_private_key(public_exponent=65537, key_size=2048)
     )
-    now = datetime.now(timezone.utc)
     certificate = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]))
-        .issuer_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(root_name)
         .public_key(certificate_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_valid_before or now - timedelta(minutes=1))
@@ -796,10 +817,18 @@ def _write_tls_pair(
             ),
             critical=False,
         )
-        .sign(certificate_key, hashes.SHA256())
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256())
     )
+    ca_path = tls_directory / "rootCA.pem"
     certificate_path = tls_directory / "localhost.pem"
     key_path = tls_directory / "localhost-key.pem"
+    ca_path.write_bytes(
+        root_certificate.public_bytes(serialization.Encoding.PEM)
+    )
     certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
     key_path.write_bytes(
         private_key.private_bytes(
@@ -809,9 +838,11 @@ def _write_tls_pair(
         )
     )
     os.chmod(tls_directory, 0o700)
+    os.chmod(ca_path, 0o644)
     os.chmod(certificate_path, 0o644)
     os.chmod(key_path, 0o600)
     return SimpleNamespace(
+        tls_ca_path=Path(".local/tls/rootCA.pem"),
         tls_cert_path=Path(".local/tls/localhost.pem"),
         tls_key_path=Path(".local/tls/localhost-key.pem"),
     )
@@ -830,6 +861,7 @@ def test_tls_inspection_requires_local_sans_permissions_and_matching_key(
     status = validate_tls_material(server)
 
     assert status.sans == ("localhost", "127.0.0.1", "::1")
+    assert status.ca_certificate_path.name == "rootCA.pem"
     os.chmod(tmp_path / ".local/tls/localhost-key.pem", 0o644)
     with pytest.raises(TLSMaterialError, match="tls_private_key_permissions_invalid"):
         validate_tls_material(server)
@@ -838,6 +870,7 @@ def test_tls_inspection_requires_local_sans_permissions_and_matching_key(
 @pytest.mark.parametrize(
     ("target", "mode", "code"),
     [
+        ("rootCA.pem", 0o600, "tls_ca_permissions_invalid"),
         ("localhost.pem", 0o600, "tls_certificate_permissions_invalid"),
         ("localhost-key.pem", 0o644, "tls_private_key_permissions_invalid"),
     ],
@@ -863,6 +896,30 @@ def test_tls_inspection_rejects_unsafe_certificate_and_key_modes(
     assert "PRIVATE KEY" not in str(exc_info.value)
 
 
+def test_tls_inspection_requires_a_valid_ca_that_signed_the_local_leaf(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
+
+    server = _write_tls_pair(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    ca_path = tmp_path / ".local/tls/rootCA.pem"
+    leaf_path = tmp_path / ".local/tls/localhost.pem"
+
+    ca_path.write_bytes(leaf_path.read_bytes())
+    with pytest.raises(TLSMaterialError) as exc_info:
+        validate_tls_material(server)
+    assert exc_info.value.code == "tls_ca_invalid"
+
+    other = tmp_path / "other"
+    _write_tls_pair(other)
+    ca_path.write_bytes((other / ".local/tls/rootCA.pem").read_bytes())
+    with pytest.raises(TLSMaterialError) as exc_info:
+        validate_tls_material(server)
+    assert exc_info.value.code == "tls_ca_chain_invalid"
+
+
 def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
     tmp_path,
     monkeypatch,
@@ -876,6 +933,7 @@ def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
     outside.write_text("not tls", encoding="utf-8")
     os.chmod(outside, 0o644)
     escaped = SimpleNamespace(
+        tls_ca_path=server.tls_ca_path,
         tls_cert_path=outside,
         tls_key_path=server.tls_key_path,
     )
@@ -887,6 +945,7 @@ def test_tls_inspection_rejects_paths_outside_and_symlink_escapes(
     symlink = tmp_path / ".local/tls/escaped.pem"
     symlink.symlink_to(outside)
     escaped_symlink = SimpleNamespace(
+        tls_ca_path=server.tls_ca_path,
         tls_cert_path=Path(".local/tls/escaped.pem"),
         tls_key_path=server.tls_key_path,
     )

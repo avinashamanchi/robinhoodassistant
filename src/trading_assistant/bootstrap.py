@@ -118,6 +118,14 @@ class ApplicationContainer:
     startup_evidence: StartupPostureEvidence | None = None
 
 
+@dataclass(frozen=True)
+class PreflightServiceContainer:
+    """Minimal preflight owner with no app, agent, notifier, or LLM surface."""
+
+    service: TradingService
+    runtime_tenure_guard: None = None
+
+
 def prepare_database_runtime(
     secrets: RuntimeSecrets,
     *,
@@ -346,6 +354,49 @@ def build_test_container(
         clock=clock,
         enforce_runtime_tenure=False,
     )
+
+
+def build_preflight_service(
+    config: AppConfig,
+    secrets: RuntimeSecrets,
+) -> PreflightServiceContainer:
+    """Compose only paper broker reconciliation for the preflight role."""
+
+    require_configured_role_origins(config, "preflight")
+    _guard_runtime(config, secrets)
+    runtime = prepare_database_runtime(
+        secrets,
+        runtime_role="preflight",
+    )
+    try:
+        sensitive_cipher = build_sensitive_data_cipher(
+            config.encryption,
+            secrets,
+        )
+    except Exception:
+        raise StartupEncryptionBlocked(
+            "sensitive_key_unavailable"
+        ) from None
+    bind_sensitive_cipher(runtime.session_factory, sensitive_cipher)
+    broker = build_broker(
+        config,
+        secrets,
+        runtime_role="preflight",
+    )
+    _arm_production_paper_broker(broker)
+    clock = build_clock(
+        config,
+        secrets,
+        runtime_role="preflight",
+    )
+    service = TradingService(
+        broker,
+        runtime.session_factory,
+        config,
+        clock,
+        external_source=None,
+    )
+    return PreflightServiceContainer(service=service)
 
 
 def _build_container(

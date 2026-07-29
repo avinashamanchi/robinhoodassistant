@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import io
+import ipaddress
 from pathlib import Path
 import ssl
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 import pytest
 import requests
 from requests.adapters import BaseAdapter
@@ -215,6 +220,142 @@ class _LocalClient:
         return self.response
 
 
+def _write_mkcert_style_chain(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create a root-signed localhost leaf without using a socket or Keychain."""
+
+    now = datetime.now(timezone.utc)
+    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root_name = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "fixture local CA")]
+    )
+    root_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(root_name)
+        .issuer_name(root_name)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=2))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_name = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]
+    )
+    leaf_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_name)
+        .issuer_name(root_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                    x509.IPAddress(ipaddress.ip_address("::1")),
+                ]
+            ),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    ca_path = tmp_path / "rootCA.pem"
+    leaf_path = tmp_path / "localhost.pem"
+    key_path = tmp_path / "localhost-key.pem"
+    ca_path.write_bytes(
+        root_certificate.public_bytes(serialization.Encoding.PEM)
+    )
+    leaf_path.write_bytes(
+        leaf_certificate.public_bytes(serialization.Encoding.PEM)
+    )
+    key_path.write_bytes(
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return ca_path, leaf_path, key_path
+
+
+def _memory_bio_tls_handshake(
+    client_context: ssl.SSLContext,
+    server_context: ssl.SSLContext,
+) -> None:
+    """Drive a complete TLS handshake entirely in memory."""
+
+    client_in = ssl.MemoryBIO()
+    client_out = ssl.MemoryBIO()
+    server_in = ssl.MemoryBIO()
+    server_out = ssl.MemoryBIO()
+    client = client_context.wrap_bio(
+        client_in,
+        client_out,
+        server_hostname="localhost",
+    )
+    server = server_context.wrap_bio(
+        server_in,
+        server_out,
+        server_side=True,
+    )
+    client_done = False
+    server_done = False
+    for _attempt in range(20):
+        if not client_done:
+            try:
+                client.do_handshake()
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                pass
+            else:
+                client_done = True
+        outbound = client_out.read()
+        if outbound:
+            server_in.write(outbound)
+        if not server_done:
+            try:
+                server.do_handshake()
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                pass
+            else:
+                server_done = True
+        outbound = server_out.read()
+        if outbound:
+            client_in.write(outbound)
+        if client_done and server_done:
+            return
+    raise AssertionError("fixture TLS handshake did not complete")
+
+
+def test_mkcert_leaf_is_not_a_ca_but_root_chain_verifies_in_memory(tmp_path):
+    """Characterize the reviewer claim without opening a network socket."""
+
+    ca_path, leaf_path, key_path = _write_mkcert_style_chain(tmp_path)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(leaf_path, key_path)
+
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _memory_bio_tls_handshake(
+            ssl.create_default_context(cafile=str(leaf_path)),
+            server_context,
+        )
+
+    _memory_bio_tls_handshake(
+        ssl.create_default_context(cafile=str(ca_path)),
+        server_context,
+    )
+
+
 def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
     outbound,
 ):
@@ -229,7 +370,7 @@ def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
         return client
 
     transport = outbound.build_local_liveness_transport(
-        Path(".local/tls/localhost.pem"),
+        Path(".local/tls/rootCA.pem"),
         client_factory=client_factory,
         ssl_context_factory=lambda *, cafile: (
             observed.update(cafile=cafile) or verified_context
@@ -243,7 +384,7 @@ def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
     assert observed["trust_env"] is False
     assert observed["proxy"] is None
     assert observed["verify"] is verified_context
-    assert observed["cafile"] == ".local/tls/localhost.pem"
+    assert observed["cafile"] == ".local/tls/rootCA.pem"
     assert client.calls == [
         (
             expected_url,
@@ -258,16 +399,20 @@ def test_local_liveness_transport_builds_proxy_free_pinned_https_client(
 def test_local_liveness_transport_rejects_noncanonical_certificate_path(
     outbound,
 ):
-    with pytest.raises(outbound.OutboundOriginDenied):
-        outbound.build_local_liveness_transport(
-            Path(".local/tls/renamed.pem"),
-            client_factory=lambda **_kwargs: pytest.fail(
-                "client constructed before certificate path validation"
-            ),
-            ssl_context_factory=lambda **_kwargs: pytest.fail(
-                "TLS context constructed before certificate path validation"
-            ),
-        )
+    for path in (
+        Path(".local/tls/renamed.pem"),
+        Path(".local/tls/localhost.pem"),
+    ):
+        with pytest.raises(outbound.OutboundOriginDenied):
+            outbound.build_local_liveness_transport(
+                path,
+                client_factory=lambda **_kwargs: pytest.fail(
+                    "client constructed before CA path validation"
+                ),
+                ssl_context_factory=lambda **_kwargs: pytest.fail(
+                    "TLS context constructed before CA path validation"
+                ),
+            )
 
 
 @pytest.mark.parametrize(
@@ -352,6 +497,76 @@ def test_policy_accepts_request_paths_and_queries_only_after_exact_origin_match(
     assert alpaca_policy.assert_url(
         "https://PAPER-API.ALPACA.MARKETS:443/v2/orders?status=open"
     ) is None
+
+
+@pytest.mark.parametrize(
+    "query_name",
+    [
+        "access_key",
+        "api_key",
+        "apikey",
+        "credential",
+        "secret",
+        "token",
+        "API_KEY",
+    ],
+)
+def test_policy_rejects_credential_query_names_without_value_leak(
+    query_name,
+    alpaca_policy,
+    outbound,
+):
+    marker = "fixture-query-secret-marker"
+
+    with pytest.raises(outbound.OutboundOriginDenied) as raised:
+        alpaca_policy.assert_url(
+            "https://paper-api.alpaca.markets/v2/orders"
+            f"?{query_name}={marker}"
+        )
+
+    assert marker not in str(raised.value)
+    assert "?" not in str(raised.value)
+
+
+def test_prebuilt_requests_and_httpx_urls_reject_query_credentials_before_io(
+    alpaca_policy,
+    outbound,
+):
+    import httpx
+
+    marker = "fixture-prebuilt-query-marker"
+    url = (
+        "https://paper-api.alpaca.markets/v2/account"
+        f"?api_key={marker}"
+    )
+
+    requests_adapter = _ResponseAdapter()
+    session = outbound.NoRedirectSession(alpaca_policy)
+    session.mount("https://", requests_adapter)
+    prepared = requests.Request("GET", url).prepare()
+    with pytest.raises(outbound.OutboundOriginDenied) as requests_error:
+        session.send(prepared)
+    assert requests_adapter.calls == []
+    assert marker not in str(requests_error.value)
+
+    httpx_calls: list[object] = []
+
+    def transport(request):
+        httpx_calls.append(request)
+        raise AssertionError("HTTPX transport reached")
+
+    client = outbound.new_httpx_client(
+        alpaca_policy,
+        transport=httpx.MockTransport(transport),
+    )
+    request = client.build_request("GET", url)
+    try:
+        with pytest.raises(outbound.OutboundOriginDenied) as httpx_error:
+            client.send(request)
+    finally:
+        client.close()
+    assert httpx_calls == []
+    assert marker not in str(httpx_error.value)
 
 
 def test_policy_allows_explicitly_configured_non_default_port(outbound):

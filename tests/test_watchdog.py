@@ -575,7 +575,7 @@ def test_fetch_health_uses_only_injected_local_liveness_transport():
     ]
 
 
-def test_main_builds_one_local_liveness_transport_from_canonical_cert(
+def test_main_builds_one_local_liveness_transport_from_canonical_ca(
     monkeypatch,
 ):
     transport = object()
@@ -587,6 +587,7 @@ def test_main_builds_one_local_liveness_transport_from_canonical_cert(
             daemon=SimpleNamespace(heartbeat_stale_seconds=180),
             server=SimpleNamespace(
                 tls_cert_path=".local/tls/localhost.pem",
+                tls_ca_path=".local/tls/rootCA.pem",
             ),
         ),
     )
@@ -617,7 +618,7 @@ def test_main_builds_one_local_liveness_transport_from_canonical_cert(
 
     assert watchdog.main([]) == 0
     assert observed == [
-        ("build", ".local/tls/localhost.pem"),
+        ("build", ".local/tls/rootCA.pem"),
         ("fetch", transport),
     ]
 

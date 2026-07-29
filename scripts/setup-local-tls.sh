@@ -13,9 +13,12 @@ fi
 mkdir -p .local/tls
 chmod 700 .local .local/tls
 mkcert -install
+mkcert_ca_root="$(mkcert -CAROOT)"
+install -m 0644 "$mkcert_ca_root/rootCA.pem" .local/tls/rootCA.pem
 mkcert -cert-file .local/tls/localhost.pem \
   -key-file .local/tls/localhost-key.pem \
   localhost 127.0.0.1 ::1
 chmod 0644 .local/tls/localhost.pem
+chmod 0644 .local/tls/rootCA.pem
 chmod 0600 .local/tls/localhost-key.pem
 python -m trading_assistant.ops.tls inspect

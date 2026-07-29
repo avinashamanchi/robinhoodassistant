@@ -28,6 +28,10 @@ and the preflight field check never decrypts rows. See `docs/RUNBOOK.md` for the
 one-time private-file Keychain migration, stopped-writer field migration and
 rotation, and reviewed encrypted restore procedure. Never place secret material
 in these commands.
+The TLS setup installs the canonical `rootCA.pem`, `localhost.pem`, and
+`localhost-key.pem` layout; watchdog verification uses the CA file, never the
+leaf as a trust bundle. After the five structural rows pass, preflight uses a
+dedicated non-LLM reconciliation composition.
 Rotation requires a reviewed new retained key ID, an interactive
 `set-encryption-key`, stopped-writer `encrypt_sensitive rotate`, a coordinated
 active/retained config transition, and a final Keychain audit plus envelope

@@ -268,7 +268,7 @@ def _canonical_assignment_finding(
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
-            if not isinstance(node.value, ast.Name) or node.value.id not in aliases:
+            if _target_root_name(node.value) not in aliases:
                 continue
             for target in _assignment_targets(node):
                 if isinstance(target, ast.Name) and target.id not in aliases:
@@ -305,6 +305,12 @@ def _canonical_assignment_finding(
     for node in ast.walk(tree):
         if node is canonical:
             continue
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"globals", "vars"}
+        ):
+            return [_finding(code, relative, node.lineno)]
         if isinstance(node, ast.AugAssign):
             if _target_root_name(node.target) in aliases:
                 return [_finding(code, relative, node.lineno)]
@@ -2737,6 +2743,8 @@ _OUTBOUND_CLIENT_CONSTRUCTORS = frozenset(
         "PoolManager",
         "ProxyManager",
         "Session",
+        "HTTPConnection",
+        "HTTPSConnection",
     }
 )
 _OUTBOUND_REQUEST_METHODS = frozenset(
@@ -3041,6 +3049,8 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                 server.get("bind_host") != "127.0.0.1"
                 or server.get("port") != 8020
                 or origin != "https://localhost:8020"
+                or server.get("tls_ca_path")
+                != ".local/tls/rootCA.pem"
                 or server.get("tls_cert_path")
                 != ".local/tls/localhost.pem"
                 or server.get("tls_key_path")
@@ -3226,14 +3236,25 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
         except (OSError, SyntaxError):
             continue
+        transport_mapping_entries = _mapping_alias_entries(tree)
         ssl_module_aliases = {"ssl"}
         ssl_context_factories = {"create_default_context"}
+        ssl_unverified_factories = {"_create_unverified_context"}
         ssl_contexts: set[str] = set()
+        cookie_callables: set[str] = set()
+        cors_middleware_names = {"CORSMiddleware"}
+        trusted_host_middleware_names = {"TrustedHostMiddleware"}
+        uvicorn_module_names: set[str] = set()
+        uvicorn_run_names: set[str] = set()
         for candidate in ast.walk(tree):
             if isinstance(candidate, ast.Import):
                 for imported in candidate.names:
                     if imported.name == "ssl":
                         ssl_module_aliases.add(imported.asname or "ssl")
+                    if imported.name == "uvicorn":
+                        uvicorn_module_names.add(
+                            imported.asname or "uvicorn"
+                        )
             elif (
                 isinstance(candidate, ast.ImportFrom)
                 and candidate.module == "ssl"
@@ -3243,7 +3264,113 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                         ssl_context_factories.add(
                             imported.asname or imported.name
                         )
-            elif isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                    if imported.name == "_create_unverified_context":
+                        ssl_unverified_factories.add(
+                            imported.asname or imported.name
+                        )
+            elif isinstance(candidate, ast.ImportFrom):
+                for imported in candidate.names:
+                    local = imported.asname or imported.name
+                    if imported.name == "CORSMiddleware":
+                        cors_middleware_names.add(local)
+                    if imported.name == "TrustedHostMiddleware":
+                        trusted_host_middleware_names.add(local)
+                    if (
+                        candidate.module == "uvicorn"
+                        and imported.name == "run"
+                    ):
+                        uvicorn_run_names.add(local)
+
+        changed = True
+        while changed:
+            changed = False
+            for candidate in ast.walk(tree):
+                if not isinstance(
+                    candidate,
+                    (ast.Assign, ast.AnnAssign),
+                ):
+                    continue
+                targets = [
+                    target.id
+                    for target in _assignment_targets(candidate)
+                    if isinstance(target, ast.Name)
+                ]
+                if not targets:
+                    continue
+                value = candidate.value
+                value_path = _attribute_path(value)
+                if (
+                    len(value_path) == 2
+                    and value_path[0] in ssl_module_aliases
+                    and value_path[1] == "create_default_context"
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in ssl_context_factories
+                ):
+                    before = len(ssl_context_factories)
+                    ssl_context_factories.update(targets)
+                    changed = (
+                        changed
+                        or len(ssl_context_factories) != before
+                    )
+                if (
+                    len(value_path) == 2
+                    and value_path[0] in ssl_module_aliases
+                    and value_path[1] == "_create_unverified_context"
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in ssl_unverified_factories
+                ):
+                    before = len(ssl_unverified_factories)
+                    ssl_unverified_factories.update(targets)
+                    changed = (
+                        changed
+                        or len(ssl_unverified_factories) != before
+                    )
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "set_cookie"
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in cookie_callables
+                ):
+                    before = len(cookie_callables)
+                    cookie_callables.update(targets)
+                    changed = changed or len(cookie_callables) != before
+                if (
+                    isinstance(value, ast.Name)
+                    and value.id in cors_middleware_names
+                ):
+                    before = len(cors_middleware_names)
+                    cors_middleware_names.update(targets)
+                    changed = (
+                        changed or len(cors_middleware_names) != before
+                    )
+                if (
+                    isinstance(value, ast.Name)
+                    and value.id in trusted_host_middleware_names
+                ):
+                    before = len(trusted_host_middleware_names)
+                    trusted_host_middleware_names.update(targets)
+                    changed = (
+                        changed
+                        or len(trusted_host_middleware_names) != before
+                    )
+                if (
+                    isinstance(value, ast.Attribute)
+                    and len(value_path) == 2
+                    and value_path[0] in uvicorn_module_names
+                    and value_path[1] == "run"
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in uvicorn_run_names
+                ):
+                    before = len(uvicorn_run_names)
+                    uvicorn_run_names.update(targets)
+                    changed = changed or len(uvicorn_run_names) != before
+
+        for candidate in ast.walk(tree):
+            if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
                 value = candidate.value
                 if not isinstance(value, ast.Call):
                     continue
@@ -3356,13 +3483,78 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                                 )
                             )
             if isinstance(node, ast.Call):
-                call_name = (
+                raw_call_name = (
                     node.func.attr
                     if isinstance(node.func, ast.Attribute)
                     else node.func.id
                     if isinstance(node.func, ast.Name)
                     else ""
                 )
+                call_path = _attribute_path(node.func)
+                call_name = (
+                    "set_cookie"
+                    if isinstance(node.func, ast.Name)
+                    and node.func.id in cookie_callables
+                    else "CORSMiddleware"
+                    if isinstance(node.func, ast.Name)
+                    and node.func.id in cors_middleware_names
+                    else "TrustedHostMiddleware"
+                    if isinstance(node.func, ast.Name)
+                    and node.func.id in trusted_host_middleware_names
+                    else raw_call_name
+                )
+                if call_name == "add_middleware" and node.args:
+                    middleware = node.args[0]
+                    middleware_name = (
+                        middleware.id
+                        if isinstance(middleware, ast.Name)
+                        else middleware.attr
+                        if isinstance(middleware, ast.Attribute)
+                        else ""
+                    )
+                    if middleware_name in cors_middleware_names:
+                        call_name = "CORSMiddleware"
+                    elif middleware_name in trusted_host_middleware_names:
+                        call_name = "TrustedHostMiddleware"
+                effective_keywords = [
+                    keyword
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                ]
+                unpacked_dynamic = False
+                for keyword in node.keywords:
+                    if keyword.arg is not None:
+                        continue
+                    if isinstance(keyword.value, ast.Dict):
+                        entries, dynamic = _mapping_literal_entries(
+                            keyword.value
+                        )
+                    elif (
+                        isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in transport_mapping_entries
+                    ):
+                        entries, dynamic = transport_mapping_entries[
+                            keyword.value.id
+                        ]
+                    else:
+                        entries, dynamic = {}, True
+                    effective_keywords.extend(
+                        ast.keyword(arg=name, value=value)
+                        for name, value in entries.items()
+                    )
+                    unpacked_dynamic = unpacked_dynamic or dynamic
+                unverified_context = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in ssl_unverified_factories
+                ) or (
+                    len(call_path) == 2
+                    and call_path[0] in ssl_module_aliases
+                    and call_path[1] == "_create_unverified_context"
+                )
+                if unverified_context:
+                    findings.append(
+                        _finding("TLS_DISABLED", relative, node.lineno)
+                    )
                 if "composio" in call_name.lower():
                     findings.append(
                         _finding(
@@ -3406,7 +3598,7 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                     configured = next(
                         (
                             keyword.value
-                            for keyword in node.keywords
+                            for keyword in effective_keywords
                             if keyword.arg == keyword_name
                         ),
                         None,
@@ -3439,7 +3631,7 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                         origin_regex = next(
                             (
                                 keyword.value
-                                for keyword in node.keywords
+                                for keyword in effective_keywords
                                 if keyword.arg == "allow_origin_regex"
                             ),
                             None,
@@ -3457,10 +3649,21 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                                         node.lineno,
                                     )
                                 )
+                if call_name in {
+                    "CORSMiddleware",
+                    "TrustedHostMiddleware",
+                } and unpacked_dynamic:
+                    findings.append(
+                        _finding(
+                            "WILDCARD_HOST_ORIGIN",
+                            relative,
+                            node.lineno,
+                        )
+                    )
                 if call_name == "set_cookie":
                     cookie_options = {
                         keyword.arg: keyword.value
-                        for keyword in node.keywords
+                        for keyword in effective_keywords
                         if keyword.arg is not None
                     }
                     secure = cookie_options.get("secure")
@@ -3478,6 +3681,46 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                         findings.append(
                             _finding(
                                 "INSECURE_COOKIE",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                    if unpacked_dynamic:
+                        findings.append(
+                            _finding(
+                                "INSECURE_COOKIE",
+                                relative,
+                                node.lineno,
+                            )
+                        )
+                uvicorn_run = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in uvicorn_run_names
+                ) or (
+                    len(call_path) == 2
+                    and call_path[0] in uvicorn_module_names
+                    and call_path[1] == "run"
+                )
+                if uvicorn_run:
+                    uvicorn_options = {
+                        keyword.arg: keyword.value
+                        for keyword in effective_keywords
+                        if keyword.arg is not None
+                    }
+                    proxy_headers = uvicorn_options.get("proxy_headers")
+                    forwarded = uvicorn_options.get(
+                        "forwarded_allow_ips"
+                    )
+                    if (
+                        unpacked_dynamic
+                        or not isinstance(proxy_headers, ast.Constant)
+                        or proxy_headers.value is not False
+                        or not isinstance(forwarded, ast.Constant)
+                        or forwarded.value != ""
+                    ):
+                        findings.append(
+                            _finding(
+                                "PROXY_HEADERS_TRUSTED",
                                 relative,
                                 node.lineno,
                             )
@@ -3578,16 +3821,23 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
 
 
 def _mapping_literal_keys(node: ast.AST | None) -> tuple[set[str], bool]:
+    entries, dynamic = _mapping_literal_entries(node)
+    return set(entries), dynamic
+
+
+def _mapping_literal_entries(
+    node: ast.AST | None,
+) -> tuple[dict[str, ast.AST], bool]:
     if not isinstance(node, ast.Dict):
-        return set(), True
-    keys: set[str] = set()
+        return {}, True
+    entries: dict[str, ast.AST] = {}
     dynamic = False
-    for key in node.keys:
+    for key, value in zip(node.keys, node.values, strict=True):
         if isinstance(key, ast.Constant) and isinstance(key.value, str):
-            keys.add(key.value.lower())
+            entries[key.value.lower()] = value
         else:
             dynamic = True
-    return keys, dynamic
+    return entries, dynamic
 
 
 def _static_string_fragments(node: ast.AST | None) -> tuple[str, ...]:
@@ -3612,136 +3862,187 @@ def _static_string_fragments(node: ast.AST | None) -> tuple[str, ...]:
     return ()
 
 
-def _mapping_alias_keys(
+def _mapping_alias_entries(
     tree: ast.AST,
-) -> dict[str, tuple[set[str], bool]]:
-    mappings: dict[str, tuple[set[str], bool]] = {}
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = (
-                node.targets
-                if isinstance(node, ast.Assign)
-                else [node.target]
-            )
-            names = {
-                target.id
-                for target in targets
-                if isinstance(target, ast.Name)
-            }
-            if not names:
-                continue
-            if isinstance(node.value, ast.Dict):
-                resolved = _mapping_literal_keys(node.value)
-            elif isinstance(node.value, ast.Name):
-                resolved = mappings.get(node.value.id)
-                if resolved is None:
-                    continue
-            else:
-                continue
-            for name in names:
-                previous = mappings.get(name)
-                merged = (
-                    (set(resolved[0]), resolved[1])
-                    if previous is None
-                    else (
-                        set(previous[0]).union(resolved[0]),
-                        previous[1] or resolved[1],
-                    )
-                )
-                if previous != merged:
-                    mappings[name] = merged
-                    changed = True
-        for node in ast.walk(tree):
-            assignment_target = (
-                node.target
-                if isinstance(node, ast.AnnAssign)
-                else node.targets[0]
-                if isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                else None
-            )
-            if (
-                isinstance(node, (ast.Assign, ast.AnnAssign))
-                and isinstance(assignment_target, ast.Subscript)
-                and isinstance(assignment_target.value, ast.Name)
-                and assignment_target.value.id in mappings
-            ):
-                name = assignment_target.value.id
-                previous = mappings[name]
-                key = _literal_string(assignment_target.slice)
-                merged = (
-                    set(previous[0]),
-                    previous[1] or key is None,
-                )
-                if key is not None:
-                    merged[0].add(key.lower())
-                if previous != merged:
-                    mappings[name] = merged
-                    changed = True
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "update"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in mappings
-            ):
-                name = node.func.value.id
-                previous = mappings[name]
-                if len(node.args) == 1 and not node.keywords:
-                    update_keys, update_dynamic = (
-                        mappings.get(node.args[0].id)
-                        if isinstance(node.args[0], ast.Name)
-                        and node.args[0].id in mappings
-                        else _mapping_literal_keys(node.args[0])
-                    )
-                elif not node.args:
-                    update_keys = {
-                        keyword.arg.lower()
-                        for keyword in node.keywords
-                        if keyword.arg is not None
-                    }
-                    update_dynamic = any(
-                        keyword.arg is None for keyword in node.keywords
-                    )
-                else:
-                    update_keys, update_dynamic = set(), True
-                merged = (
-                    set(previous[0]).union(update_keys),
-                    previous[1] or update_dynamic,
-                )
-                if previous != merged:
-                    mappings[name] = merged
-                    changed = True
-    return mappings
+) -> dict[str, tuple[dict[str, ast.AST], bool]]:
+    """Resolve mapping aliases as shared objects and union every mutation."""
 
+    parent: dict[str, str] = {}
 
-def _mutated_mapping_names(tree: ast.AST) -> frozenset[str]:
-    mutated: set[str] = set()
-    for node in ast.walk(tree):
-        target = (
-            node.target
-            if isinstance(node, (ast.AnnAssign, ast.AugAssign))
-            else node.targets[0]
-            if isinstance(node, ast.Assign) and len(node.targets) == 1
-            else None
+    def add(name: str) -> None:
+        parent.setdefault(name, name)
+
+    def find(name: str) -> str:
+        add(name)
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
+    for node in assignments:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
         )
-        if isinstance(target, ast.Subscript) and isinstance(
-            target.value,
-            ast.Name,
-        ):
-            mutated.add(target.value.id)
-        if (
+        names = [
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        ]
+        if isinstance(node.value, ast.Dict):
+            for name in names:
+                add(name)
+        elif isinstance(node.value, ast.Name):
+            for name in names:
+                union(name, node.value.id)
+
+    component_entries: dict[str, dict[str, ast.AST]] = {}
+    component_dynamic: dict[str, bool] = {}
+
+    def merge(
+        name: str,
+        entries: dict[str, ast.AST],
+        dynamic: bool,
+    ) -> None:
+        root_name = find(name)
+        current = component_entries.setdefault(root_name, {})
+        for key, value in entries.items():
+            previous = current.get(key)
+            if (
+                previous is not None
+                and ast.dump(previous, include_attributes=False)
+                != ast.dump(value, include_attributes=False)
+            ):
+                component_dynamic[root_name] = True
+            current[key] = value
+        component_dynamic[root_name] = (
+            component_dynamic.get(root_name, False) or dynamic
+        )
+
+    for node in assignments:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        names = [
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        ]
+        if isinstance(node.value, ast.Dict):
+            entries, dynamic = _mapping_literal_entries(node.value)
+            for name in names:
+                merge(name, entries, dynamic)
+        elif names and not isinstance(node.value, ast.Name):
+            for name in names:
+                if name in parent:
+                    merge(name, {}, True)
+
+        for target in targets:
+            if not (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in parent
+            ):
+                continue
+            key = _literal_string(target.slice)
+            merge(
+                target.value.id,
+                {key.lower(): node.value} if key is not None else {},
+                key is None,
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id in parent:
+                entries, dynamic = _mapping_literal_entries(node.value)
+                merge(node.target.id, entries, dynamic)
+            elif (
+                isinstance(node.target, ast.Subscript)
+                and isinstance(node.target.value, ast.Name)
+                and node.target.value.id in parent
+            ):
+                merge(node.target.value.id, {}, True)
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in parent
+                ):
+                    merge(target.value.id, {}, True)
+        if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
-            and node.func.attr in _AUTHORITY_MUTATORS
+            and node.func.value.id in parent
         ):
-            mutated.add(node.func.value.id)
-    return frozenset(mutated)
+            continue
+        name = node.func.value.id
+        if node.func.attr == "setdefault":
+            key = _literal_string(node.args[0] if node.args else None)
+            value = node.args[1] if len(node.args) >= 2 else ast.Constant(None)
+            merge(
+                name,
+                {key.lower(): value} if key is not None else {},
+                key is None or len(node.args) not in {1, 2} or bool(node.keywords),
+            )
+        elif node.func.attr == "update":
+            entries: dict[str, ast.AST] = {}
+            dynamic = False
+            if len(node.args) == 1:
+                argument = node.args[0]
+                if isinstance(argument, ast.Dict):
+                    entries, dynamic = _mapping_literal_entries(argument)
+                elif isinstance(argument, ast.Name) and argument.id in parent:
+                    source_root = find(argument.id)
+                    entries = dict(
+                        component_entries.get(source_root, {})
+                    )
+                    dynamic = component_dynamic.get(source_root, False)
+                else:
+                    dynamic = True
+            elif node.args:
+                dynamic = True
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    dynamic = True
+                else:
+                    entries[keyword.arg.lower()] = keyword.value
+            merge(name, entries, dynamic)
+        elif node.func.attr in _AUTHORITY_MUTATORS:
+            merge(name, {}, True)
+
+    resolved: dict[str, tuple[dict[str, ast.AST], bool]] = {}
+    for name in parent:
+        root_name = find(name)
+        resolved[name] = (
+            dict(component_entries.get(root_name, {})),
+            component_dynamic.get(root_name, False),
+        )
+    return resolved
+
+
+def _mapping_alias_keys(
+    tree: ast.AST,
+) -> dict[str, tuple[set[str], bool]]:
+    return {
+        name: (set(entries), dynamic)
+        for name, (entries, dynamic) in _mapping_alias_entries(tree).items()
+    }
 
 
 def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
@@ -3758,9 +4059,42 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 _finding("OUTBOUND_CLIENT_UNAPPROVED", relative, 1)
             )
             continue
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+
+        def enclosing_context(
+            candidate: ast.AST,
+        ) -> tuple[
+            ast.FunctionDef | ast.AsyncFunctionDef | None,
+            ast.ClassDef | None,
+        ]:
+            function = None
+            class_node = None
+            current = parents.get(candidate)
+            while current is not None:
+                if (
+                    function is None
+                    and isinstance(
+                        current,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                ):
+                    function = current
+                if isinstance(current, ast.ClassDef):
+                    class_node = current
+                    break
+                current = parents.get(current)
+            return function, class_node
+
         constants = _module_string_constants(tree)
-        mapping_aliases = _mapping_alias_keys(tree)
-        mutated_mappings = _mutated_mapping_names(tree)
+        mapping_entries = _mapping_alias_entries(tree)
+        mapping_aliases = {
+            name: (set(entries), dynamic)
+            for name, (entries, dynamic) in mapping_entries.items()
+        }
         verified_tls_contexts: set[str] = set()
         for assignment in ast.walk(tree):
             if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
@@ -3792,6 +4126,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
         google_genai_aliases: set[str] = set()
         network_modules = {
             "anthropic",
+            "http",
             "requests",
             "httpx",
             "aiohttp",
@@ -4079,15 +4414,15 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             if (
                 (
                     direct_client
-                    or direct_request
                     or (
                         module_client
                         and canonical_call_path[-1]
                         not in _PROVIDER_CLIENT_IMPORTS
                     )
-                    or module_request
                 )
                 and not boundary_wrapper
+                or direct_request
+                or module_request
                 or (
                     module_client
                     and canonical_call_path[-1]
@@ -4111,13 +4446,6 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                     )
                 )
 
-            url_nodes = list(node.args)
-            url_nodes.extend(
-                keyword.value
-                for keyword in node.keywords
-                if keyword.arg
-                in {"url", "base_url", "baseUrl", "url_override"}
-            )
             allowed_for_adapter = _APPROVED_ORIGINS_BY_ADAPTER_PATH.get(
                 relative,
                 frozenset(),
@@ -4138,19 +4466,95 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 or call_name in _OUTBOUND_CLIENT_CONSTRUCTORS
                 or call_name.lower() in _OUTBOUND_REQUEST_METHODS
             )
+            if (
+                boundary_wrapper
+                and call_name.lower() in _OUTBOUND_REQUEST_METHODS
+                and not module_request
+                and not direct_request
+            ):
+                request_url_node = (
+                    node.args[1]
+                    if call_name.lower() == "request"
+                    and len(node.args) >= 2
+                    else node.args[0]
+                    if node.args
+                    else next(
+                        (
+                            keyword.value
+                            for keyword in node.keywords
+                            if keyword.arg == "url"
+                        ),
+                        None,
+                    )
+                )
+                request_url = _literal_string(
+                    request_url_node,
+                    constants,
+                )
+                function, class_node = enclosing_context(node)
+                approved_dynamic_request = (
+                    request_url is None
+                    and function is not None
+                    and class_node is not None
+                    and class_node.name == "NoRedirectSession"
+                    and function.name == "request"
+                    and call_name.lower() == "request"
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Call)
+                    and isinstance(node.func.value.func, ast.Name)
+                    and node.func.value.func.id == "super"
+                    and any(
+                        isinstance(guard, ast.Call)
+                        and _attribute_path(guard.func)
+                        == ("self", "_policy", "assert_url")
+                        and guard.args
+                        and isinstance(request_url_node, ast.Name)
+                        and isinstance(guard.args[0], ast.Name)
+                        and guard.args[0].id == request_url_node.id
+                        for guard in ast.walk(function)
+                    )
+                )
+                if request_url is None and not approved_dynamic_request:
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_CLIENT_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+            effective_keywords = [
+                keyword
+                for keyword in node.keywords
+                if keyword.arg is not None
+            ]
             for keyword in node.keywords:
                 if keyword.arg is not None or not network_option_call:
                     continue
-                mapping_name = (
-                    keyword.value.id
-                    if isinstance(keyword.value, ast.Name)
-                    else None
-                )
-                unresolved = (
-                    mapping_name is None
-                    or mapping_name not in mapping_aliases
-                    or mapping_aliases[mapping_name][1]
-                    or mapping_name in mutated_mappings
+                if isinstance(keyword.value, ast.Dict):
+                    entries, unresolved = _mapping_literal_entries(
+                        keyword.value
+                    )
+                    # Inline unpacking is unsupported even when its contents
+                    # are also inspected for a more specific finding.
+                    findings.append(
+                        _finding(
+                            "OUTBOUND_CLIENT_UNAPPROVED",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                elif (
+                    isinstance(keyword.value, ast.Name)
+                    and keyword.value.id in mapping_entries
+                ):
+                    entries, unresolved = mapping_entries[
+                        keyword.value.id
+                    ]
+                else:
+                    entries, unresolved = {}, True
+                effective_keywords.extend(
+                    ast.keyword(arg=name, value=value)
+                    for name, value in entries.items()
                 )
                 if unresolved:
                     findings.append(
@@ -4160,6 +4564,14 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             node.lineno,
                         )
                     )
+            url_nodes = list(node.args)
+            url_nodes.extend(
+                keyword.value
+                for keyword in effective_keywords
+                if keyword.arg is not None
+                and keyword.arg.lower()
+                in {"url", "base_url", "baseurl", "url_override"}
+            )
             for argument in url_nodes:
                 value = _literal_string(argument, constants)
                 fragments = "".join(_static_string_fragments(argument))
@@ -4266,10 +4678,15 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                         )
                     )
 
-            for keyword in node.keywords:
+            for keyword in effective_keywords:
+                keyword_name = (
+                    keyword.arg.lower()
+                    if keyword.arg is not None
+                    else ""
+                )
                 if (
-                    keyword.arg
-                    in {"base_url", "baseUrl", "url_override"}
+                    keyword_name
+                    in {"base_url", "baseurl", "url_override"}
                     and call_name != "AlpacaExecutionTarget"
                 ):
                     base_url = _literal_string(
@@ -4285,7 +4702,9 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             )
                         )
                 if (
-                    keyword.arg in {"follow_redirects", "allow_redirects"}
+                    keyword_name
+                    in {"follow_redirects", "allow_redirects"}
+                    and (network_option_call or boundary_wrapper)
                     and (
                         not isinstance(keyword.value, ast.Constant)
                         or keyword.value.value is not False
@@ -4298,18 +4717,23 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             node.lineno,
                         )
                     )
-                if keyword.arg == "verify" and (
+                if (
+                    keyword_name == "verify"
+                    and (network_option_call or boundary_wrapper)
+                    and (
                     not isinstance(keyword.value, ast.Constant)
                     or keyword.value.value is not True
-                ) and not (
+                    )
+                    and not (
                     boundary_wrapper
                     and isinstance(keyword.value, ast.Name)
                     and keyword.value.id in verified_tls_contexts
+                    )
                 ):
                     findings.append(
                         _finding("TLS_DISABLED", relative, node.lineno)
                     )
-                if keyword.arg in {
+                if keyword_name in {
                     "trust_env",
                     "proxy_headers",
                 } and (
@@ -4323,9 +4747,12 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             node.lineno,
                         )
                     )
-                if keyword.arg == "forwarded_allow_ips" and (
+                if (
+                    keyword_name == "forwarded_allow_ips"
+                    and (
                     not isinstance(keyword.value, ast.Constant)
                     or keyword.value.value != ""
+                    )
                 ):
                     findings.append(
                         _finding(
@@ -4334,12 +4761,16 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             node.lineno,
                         )
                     )
-                if keyword.arg in {"proxy", "proxies"} and (
+                if (
+                    keyword_name in {"proxy", "proxies"}
+                    and (
                     not isinstance(keyword.value, ast.Constant)
                     or keyword.value.value not in {None, False}
-                ) and not (
+                    )
+                    and not (
                     isinstance(keyword.value, ast.Dict)
                     and not keyword.value.keys
+                    )
                 ):
                     findings.append(
                         _finding(
@@ -4348,7 +4779,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                             node.lineno,
                         )
                     )
-                if keyword.arg in {
+                if keyword_name in {
                     "ssl",
                     "tls",
                     "use_ssl",
@@ -4357,14 +4788,14 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                     or keyword.value.value is not True
                 ) and not (
                     boundary_wrapper
-                    and keyword.arg == "ssl"
+                    and keyword_name == "ssl"
                     and isinstance(keyword.value, ast.Name)
                     and keyword.value.id in verified_tls_contexts
                 ):
                     findings.append(
                         _finding("TLS_DISABLED", relative, node.lineno)
                     )
-                if keyword.arg in {
+                if keyword_name in {
                     "ssl_certfile",
                     "ssl_keyfile",
                 } and (
@@ -4374,7 +4805,10 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                     findings.append(
                         _finding("TLS_DISABLED", relative, node.lineno)
                     )
-                if keyword.arg == "params":
+                if (
+                    keyword_name == "params"
+                    and (network_option_call or boundary_wrapper)
+                ):
                     approved_query_validation = (
                         boundary_wrapper
                         and isinstance(keyword.value, ast.Call)
@@ -4417,6 +4851,7 @@ def _tracked_artifact_code(name: str) -> str | None:
     path = PurePosixPath(name)
     basename = path.name.lower()
     lowered = name.lower()
+    parent_names = {part.lower() for part in path.parts[:-1]}
     if basename in {".env", ".envrc"} or (
         basename.startswith(".env.")
         and basename
@@ -4450,15 +4885,41 @@ def _tracked_artifact_code(name: str) -> str | None:
         return "TRACKED_TLS_PRIVATE_KEY"
     if basename.endswith((".p12", ".pfx", ".pkcs12")):
         return "TRACKED_TLS_PRIVATE_CERTIFICATE"
-    if (
-        "decrypted" in lowered
-        or "plaintext" in lowered
-        or "plaintext-backup" in lowered
-        or (
-            "backup" in lowered
-            and basename.endswith((".bak", ".sqlite", ".sqlite3", ".db"))
+    encrypted_suffix = basename.endswith((".aesgcm", ".age", ".gpg"))
+    backup_directory = bool(
+        parent_names.intersection({"backup", "backups"})
+    )
+    backup_payload = basename.endswith(
+        (
+            ".bak",
+            ".csv",
+            ".db",
+            ".dump",
+            ".json",
+            ".sql",
+            ".sqlite",
+            ".sqlite3",
+            ".tar",
+            ".txt",
+            ".zip",
         )
-    ) and not basename.endswith((".aesgcm", ".age", ".gpg")):
+    )
+    plaintext_marker = (
+        "decrypted" in lowered or "plaintext" in lowered
+    )
+    if (
+        (
+            backup_directory
+            and backup_payload
+            or plaintext_marker
+            and backup_payload
+            and not (
+                path.suffix.lower() == ".md"
+                and "docs" in parent_names
+            )
+        )
+        and not encrypted_suffix
+    ):
         return "TRACKED_DECRYPTED_BACKUP"
     if basename.endswith((".sqlite", ".sqlite3", ".db")):
         return "TRACKED_SQLITE_DATABASE"
@@ -4698,6 +5159,7 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
         os_module_names = {"os"}
         getenv_names: set[str] = set()
         environ_names: set[str] = set()
+        environment_mapping_copy_names = {"dict"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for imported in node.names:
@@ -4738,10 +5200,27 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
                     before = len(provider_names)
                     provider_names.update(names)
                     changed = changed or len(provider_names) != before
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "EnvironmentSecretProvider"
+                ):
+                    before = len(provider_names)
+                    provider_names.update(names)
+                    changed = changed or len(provider_names) != before
                 if isinstance(value, ast.Name) and value.id in getenv_names:
                     before = len(getenv_names)
                     getenv_names.update(names)
                     changed = changed or len(getenv_names) != before
+                if (
+                    isinstance(value, ast.Name)
+                    and value.id in environment_mapping_copy_names
+                ):
+                    before = len(environment_mapping_copy_names)
+                    environment_mapping_copy_names.update(names)
+                    changed = (
+                        changed
+                        or len(environment_mapping_copy_names) != before
+                    )
                 if isinstance(value, ast.Name) and value.id in environ_names:
                     before = len(environ_names)
                     environ_names.update(names)
@@ -4884,6 +5363,24 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
                     )
                 )
                 if is_environ_mapping_call:
+                    findings.append(
+                        _finding(
+                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+                            relative,
+                            node.lineno,
+                        )
+                    )
+                copies_environment_mapping = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in environment_mapping_copy_names
+                    and any(
+                        _is_os_environ(argument, os_module_names)
+                        or isinstance(argument, ast.Name)
+                        and argument.id in environ_names
+                        for argument in node.args
+                    )
+                )
+                if copies_environment_mapping:
                     findings.append(
                         _finding(
                             "ENVIRONMENT_SECRETS_IN_PRODUCTION",
@@ -5655,6 +6152,41 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
                 )
                 return
             active_helpers.add(name)
+            for mutation in (
+                node
+                for node in ast.walk(helper)
+                if isinstance(
+                    node,
+                    (
+                        ast.Assign,
+                        ast.AnnAssign,
+                        ast.AugAssign,
+                        ast.Delete,
+                        ast.NamedExpr,
+                    ),
+                )
+            ):
+                targets = (
+                    mutation.targets
+                    if isinstance(mutation, (ast.Assign, ast.Delete))
+                    else [mutation.target]
+                )
+                state_mutation = any(
+                    isinstance(target, (ast.Attribute, ast.Subscript))
+                    for target in targets
+                ) or isinstance(
+                    mutation,
+                    (ast.AugAssign, ast.Delete),
+                )
+                findings.append(
+                    _finding(
+                        "MUTABLE_CHAT_TOOL"
+                        if state_mutation
+                        else "CHAT_TOOL_REGISTRY_UNPROVEN",
+                        relative,
+                        mutation.lineno,
+                    )
+                )
             if any(
                 isinstance(node, (ast.Lambda, ast.Import, ast.ImportFrom))
                 for node in ast.walk(helper)

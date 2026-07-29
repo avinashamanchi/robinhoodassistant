@@ -333,7 +333,6 @@ def test_every_production_role_has_private_bounded_startup_log(
 @pytest.mark.parametrize(
     ("builder_name", "runtime_role"),
     [
-        ("preflight", "app"),
         ("paper_drill", "app"),
     ],
 )
@@ -361,14 +360,152 @@ def test_service_utility_roots_pass_exact_role_and_secrets(
         )
 
     monkeypatch.setattr(bootstrap, "build_container", build)
-    if builder_name == "preflight":
-        owner = preflight._build_service(app_config, secrets)
-    else:
-        owner = paper_drill.build_paper_service(app_config, secrets)
+    owner = paper_drill.build_paper_service(app_config, secrets)
 
     with owner as result:
         assert result is service
     assert observed == [(app_config, secrets, runtime_role)]
+
+
+def test_preflight_uses_dedicated_non_llm_service_composition(
+    app_config,
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap, preflight
+
+    service = make_service()
+    secrets = Secrets(app_api_token="preflight-role-secret")
+    observed: list[tuple[object, object]] = []
+
+    def build_preflight(config, supplied_secrets):
+        observed.append((config, supplied_secrets))
+        return SimpleNamespace(
+            service=service,
+            runtime_tenure_guard=None,
+        )
+
+    monkeypatch.setattr(
+        bootstrap,
+        "build_preflight_service",
+        build_preflight,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: pytest.fail(
+            "preflight must not use the app/LLM container"
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_quarantine_summarizer",
+        lambda *_args, **_kwargs: pytest.fail(
+            "preflight must never construct an LLM provider"
+        ),
+    )
+
+    with preflight._build_service(app_config, secrets) as result:
+        assert result is service
+
+    assert observed == [(app_config, secrets)]
+
+
+def test_dedicated_preflight_builder_constructs_no_llm_capability(
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    secrets = Secrets(app_api_token="preflight-builder-secret")
+    session_factory = object()
+    runtime = SimpleNamespace(
+        engine=object(),
+        session_factory=session_factory,
+    )
+    broker = object()
+    clock = object()
+    cipher = object()
+    service = object()
+    observed: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        bootstrap,
+        "require_configured_role_origins",
+        lambda config, role: observed.append(("origins", role)),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_guard_runtime",
+        lambda config, supplied: observed.append(("guard", supplied)),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "prepare_database_runtime",
+        lambda supplied, *, runtime_role: (
+            observed.append(("database_role", runtime_role)) or runtime
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_sensitive_data_cipher",
+        lambda encryption, supplied: (
+            observed.append(("cipher", supplied)) or cipher
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "bind_sensitive_cipher",
+        lambda factory, supplied_cipher: observed.append(
+            ("bind_cipher", (factory, supplied_cipher))
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda config, supplied, *, runtime_role: (
+            observed.append(("broker_role", runtime_role)) or broker
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_arm_production_paper_broker",
+        lambda supplied_broker: observed.append(
+            ("arm_broker", supplied_broker)
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_clock",
+        lambda config, supplied, *, runtime_role: (
+            observed.append(("clock_role", runtime_role)) or clock
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "TradingService",
+        lambda supplied_broker, factory, config, supplied_clock, **kwargs: (
+            observed.append(("service", kwargs)) or service
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_quarantine_summarizer",
+        lambda *_args, **_kwargs: pytest.fail(
+            "dedicated preflight composition reached an LLM builder"
+        ),
+    )
+
+    container = bootstrap.build_preflight_service(app_config, secrets)
+
+    assert container.service is service
+    assert container.runtime_tenure_guard is None
+    assert ("origins", "preflight") in observed
+    assert ("database_role", "preflight") in observed
+    assert ("broker_role", "preflight") in observed
+    assert ("clock_role", "preflight") in observed
+    assert ("service", {"external_source": None}) in observed
 
 
 def test_watchdog_database_runtime_reuses_explicit_secrets_and_role(
@@ -435,18 +572,18 @@ def test_watchdog_main_reuses_one_secret_and_passes_runtime_role(
         lambda: SimpleNamespace(
             daemon=SimpleNamespace(heartbeat_stale_seconds=180),
             server=SimpleNamespace(
-                tls_cert_path=".local/tls/localhost.pem"
+                tls_ca_path=".local/tls/rootCA.pem"
             ),
         ),
     )
     monkeypatch.setattr(
         watchdog,
         "build_local_liveness_transport",
-        lambda certificate_path: (
+        lambda ca_certificate_path: (
             liveness_transport
-            if str(certificate_path) == ".local/tls/localhost.pem"
+            if str(ca_certificate_path) == ".local/tls/rootCA.pem"
             else (_ for _ in ()).throw(
-                AssertionError("noncanonical liveness certificate")
+                AssertionError("noncanonical liveness CA")
             )
         ),
     )

@@ -654,7 +654,7 @@ browser evidence from Plan 3.
 
 ```bash
 curl --fail --silent --show-error \
-  --cacert .local/tls/localhost.pem \
+  --cacert .local/tls/rootCA.pem \
   https://localhost:8020/health/live
 ```
 
