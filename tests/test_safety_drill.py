@@ -1,4 +1,5 @@
 import base64
+import builtins
 import json
 import os
 import sqlite3
@@ -3319,3 +3320,106 @@ def test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed(
     assert report.safe is False
     assert "alpaca_paper:passed" not in report.details
     assert "alpaca_paper:unconfirmed" in report.details
+
+
+def test_credentialed_paper_drill_is_separate_from_offline_release_verifier(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    primary = tmp_path / "primary.db"
+    _upgrade_database(primary)
+    _seed_preexisting_paper_order(primary)
+    _credentialed_environment(monkeypatch, primary)
+    verifier_module = "scripts.verify_loopback_release"
+    real_import = builtins.__import__
+    real_popen = subprocess.Popen
+
+    def reject_verifier_import(
+        name,
+        globals=None,
+        locals=None,
+        fromlist=(),
+        level=0,
+    ):
+        verifier_fromlist = (
+            name == "scripts"
+            and "verify_loopback_release" in fromlist
+        )
+        if (
+            name == verifier_module
+            or name.startswith(f"{verifier_module}.")
+            or verifier_fromlist
+        ):
+            pytest.fail("credentialed paper drill imported release verifier")
+        return real_import(name, globals, locals, fromlist, level)
+
+    def reject_verifier_process(argv, *args, **kwargs):
+        parts = argv if isinstance(argv, (tuple, list)) else (argv,)
+        if any("verify_loopback_release" in str(part) for part in parts):
+            pytest.fail("credentialed paper drill invoked release verifier")
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_verifier_import)
+    monkeypatch.setattr(subprocess, "Popen", reject_verifier_process)
+    monkeypatch.setattr(
+        safety_drill_module,
+        "_validate_credentialed_paper",
+        lambda broker, secrets, config: None,
+    )
+
+    report = run_safety_drill(
+        database_copy=tmp_path / "separate-authorization-copy.db",
+        config=_safe_config(app_config),
+        broker=PaperStateBroker(identity_failures=2),
+        credentialed_paper=True,
+        clock=FakeClock(is_open=True),
+    )
+
+    assert report.details[0] == "mode:alpaca_paper"
+    assert "alpaca_paper:unconfirmed" in report.details
+
+
+def test_offline_release_verifier_import_and_commands_exclude_safety_drill():
+    root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import json",
+                    "import sys",
+                    "from scripts.verify_loopback_release import ReleaseVerifier",
+                    "commands = ReleaseVerifier.default_commands()",
+                    "print(json.dumps({",
+                    '    "drill_imported": '
+                    '"trading_assistant.ops.safety_drill" in sys.modules,',
+                    '    "argv": [list(command.argv) for command in commands],',
+                    "}, sort_keys=True))",
+                )
+            ),
+        ),
+        cwd=root,
+        env={
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.environ.get("PATH", os.defpath),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    payload = json.loads(probe.stdout)
+    assert payload["drill_imported"] is False
+    assert all(
+        "safety_drill" not in part
+        for argv in payload["argv"]
+        for part in argv
+    )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fcntl
+import importlib
+import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -742,3 +744,135 @@ def test_writer_arriving_after_snapshot_invalidates_claim_and_is_waited_for(
             os.close(descriptor)
 
     assert guard.writer_pending is True
+
+
+@pytest.mark.parametrize(
+    (
+        "tests_passed",
+        "preflight_value",
+        "expected_software",
+        "expected_operational",
+        "expected_details",
+    ),
+    [
+        (
+            True,
+            "ready",
+            "verified",
+            "ready",
+            ["SOFTWARE_TESTS_PASSED", "PREFLIGHT_READY"],
+        ),
+        (
+            True,
+            "breaker_tripped",
+            "verified",
+            "blocked",
+            ["SOFTWARE_TESTS_PASSED", "BREAKER_TRIPPED"],
+        ),
+        (
+            True,
+            "broker_truth_unknown",
+            "verified",
+            "blocked",
+            ["SOFTWARE_TESTS_PASSED", "BROKER_TRUTH_UNKNOWN"],
+        ),
+        (
+            True,
+            "daemon_stale",
+            "verified",
+            "blocked",
+            ["SOFTWARE_TESTS_PASSED", "DAEMON_STALE"],
+        ),
+        (
+            True,
+            "encryption_mixed",
+            "blocked",
+            "blocked",
+            ["SOFTWARE_TESTS_PASSED", "ENCRYPTION_MIXED"],
+        ),
+        (
+            False,
+            "ready",
+            "blocked",
+            "blocked",
+            ["SOFTWARE_TESTS_FAILED", "PREFLIGHT_READY"],
+        ),
+    ],
+)
+def test_release_status_keeps_software_and_operations_independent(
+    tests_passed,
+    preflight_value,
+    expected_software,
+    expected_operational,
+    expected_details,
+):
+    release_status = importlib.import_module(
+        "trading_assistant.ops.release_status"
+    )
+
+    result = release_status.evaluate_release_status(
+        tests_passed=tests_passed,
+        preflight=release_status.PreflightEvidence(preflight_value),
+    )
+
+    assert result.as_dict() == {
+        "software_status": expected_software,
+        "operational_status": expected_operational,
+        "detail_codes": expected_details,
+        "paper_only": True,
+        "execution_authorized": False,
+    }
+
+
+def test_release_status_vocabulary_never_claims_unproved_trading_state():
+    release_status = importlib.import_module(
+        "trading_assistant.ops.release_status"
+    )
+
+    for tests_passed in (False, True):
+        for preflight in release_status.PreflightEvidence:
+            result = release_status.evaluate_release_status(
+                tests_passed=tests_passed,
+                preflight=preflight,
+            )
+            rendered = (
+                json.dumps(result.as_dict(), sort_keys=True)
+                + " "
+                + result.summary
+            ).lower()
+            assert all(
+                forbidden not in rendered
+                for forbidden in (
+                    "live",
+                    "profitable",
+                    "autonomous",
+                    "daemon running",
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("tests_passed", "preflight"),
+    [
+        (1, "ready"),
+        (True, "ready"),
+    ],
+)
+def test_release_status_rejects_coerced_or_unclassified_evidence(
+    tests_passed,
+    preflight,
+):
+    release_status = importlib.import_module(
+        "trading_assistant.ops.release_status"
+    )
+    classified = (
+        release_status.PreflightEvidence(preflight)
+        if type(tests_passed) is not bool
+        else preflight
+    )
+
+    with pytest.raises(TypeError):
+        release_status.evaluate_release_status(
+            tests_passed=tests_passed,
+            preflight=classified,
+        )
