@@ -42,12 +42,28 @@ BEHAVIOR_HOOKS = {
         "proof-daemon",
         "proof-reconciliation",
         "proof-safety",
+        "environment-mode",
+        "environment-breaker",
+        "environment-daemon",
+        "environment-reconciliation",
+        "environment-observed",
+        "environment-quote",
+        "security-posture-panel",
+        "security-posture-list",
+        "security-posture-observed",
+        "provider-budget-calls",
+        "provider-budget-input",
+        "provider-budget-output",
+        "provider-budget-reset",
         "pending-list",
         "positions",
         "holdings",
         "receipt-panel",
         "chat-form",
         "chat-log",
+        "chat-submit",
+        "chat-budget-state",
+        "assistant-candidates",
         "risk-log",
         "breaker-reset-form",
         "panic-dialog",
@@ -261,3 +277,102 @@ def test_shared_components_define_distinct_non_optimistic_states():
         "empty-state",
     ):
         assert f".{component}" in css
+
+
+def test_operations_console_exposes_the_proof_decision_hierarchy():
+    """Removing a proof, budget, or signed-candidate region hides operator authority."""
+    html = static_text("index.html")
+    parsed = parse_page("index.html")
+    required = {
+        "environment-mode",
+        "environment-breaker",
+        "environment-daemon",
+        "environment-reconciliation",
+        "environment-observed",
+        "environment-quote",
+        "critical-banner",
+        "security-posture-panel",
+        "security-posture-list",
+        "security-posture-observed",
+        "provider-budget-calls",
+        "provider-budget-input",
+        "provider-budget-output",
+        "provider-budget-reset",
+        "pending-list",
+        "positions",
+        "holdings",
+        "receipt-panel",
+        "chat-form",
+        "chat-log",
+        "chat-submit",
+        "chat-budget-state",
+        "assistant-candidates",
+        "risk-log",
+        "breaker-reset-button",
+        "panic-open",
+        "approval-dialog",
+        "rejection-dialog",
+        "panic-dialog",
+    }
+
+    assert required <= parsed.ids
+    assert re.search(
+        r'id="environment-mode"[^>]*>ALPACA PAPER<',
+        html,
+    )
+    assert "Candidates never queue themselves." in html
+    assert "Queueing creates a proposal or rule only." in html
+    assert "Approval later reruns risk." in html
+    assert "Approval always performs a fresh execution-time risk check." in html
+    assert 'id="assistant-form"' not in html
+    assert 'id="assistant-messages"' not in html
+    assert 'id="execution-log"' not in html
+
+
+def test_operations_priority_order_keeps_decisions_before_research():
+    """Mobile source order must keep blockers and decisions ahead of model research."""
+    html = static_text("index.html")
+    ordered_ids = (
+        "console-title",
+        "critical-banner",
+        "account-equity",
+        "pending-list",
+        "positions",
+        "assistant-candidates",
+        "risk-log",
+    )
+    offsets = [html.index(f'id="{element_id}"') for element_id in ordered_ids]
+
+    assert offsets == sorted(offsets)
+    assert 'class="operations-layout"' in html
+    assert 'class="primary-workspace"' in html
+    assert 'class="proof-rail"' in html
+
+
+def test_pending_renderer_keeps_only_available_order_facts_and_fresh_risk_copy():
+    """Pending cards must retain server fields without inventing absent provenance."""
+    script = static_text("js/index.js")
+
+    for field in (
+        "ticker",
+        "side",
+        "qty",
+        "notional",
+        "order_type",
+        "limit_price",
+        "expires_at",
+    ):
+        assert f"order.{field}" in script
+    assert "Fresh risk check occurs after approval." in script
+    assert 'api("/positions"' not in script
+
+
+def test_operations_layout_moves_the_proof_rail_without_shrinking_actions():
+    """Compact/mobile CSS must move proof below decisions and retain touch sizing."""
+    css = static_text("css/console.css")
+
+    assert ".operations-layout" in css
+    assert ".primary-workspace" in css
+    assert ".proof-rail" in css
+    assert "grid-template-areas:" in css
+    assert "min-height: 44px;" in css

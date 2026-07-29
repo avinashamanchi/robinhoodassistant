@@ -29,35 +29,48 @@
     </div>
   </header>
 
-  <div class="environment-strip" aria-label="Current paper environment">
+  <div class="environment-strip" id="operations-environment-strip" aria-label="Current paper environment">
     <div class="environment-cell environment-primary">
       <span>Environment</span>
-      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+      <strong class="status-chip is-caution" id="environment-mode">ALPACA PAPER</strong>
     </div>
     <div class="environment-cell">
       <span>Breaker</span>
-      <strong class="is-unknown">Unknown</strong>
+      <strong class="is-unknown" id="environment-breaker">Unknown</strong>
     </div>
     <div class="environment-cell">
       <span>Daemon</span>
-      <strong class="is-unknown">Unknown</strong>
+      <strong class="is-unknown" id="environment-daemon">Unknown</strong>
     </div>
     <div class="environment-cell">
       <span>Reconciliation</span>
-      <strong class="is-unknown">Unknown</strong>
+      <strong class="is-unknown" id="environment-reconciliation">Unknown</strong>
+    </div>
+    <div class="environment-cell">
+      <span>Quotes</span>
+      <strong class="is-unknown" id="environment-quote">Unknown</strong>
     </div>
     <div class="environment-cell">
       <span>Observed</span>
-      <strong class="is-stale">Awaiting server truth</strong>
+      <strong class="is-stale" id="environment-observed">Awaiting server truth</strong>
     </div>
   </div>
 
-  <div class="critical-banner" id="critical-banner" role="alert">
-    <strong id="critical-banner-title">Safety state unverified</strong>
-    <span id="critical-banner-message">Waiting for complete persisted local safety evidence; broker open orders are unverified.</span>
-  </div>
+  <main class="operations-main" id="main-content">
+    <section class="page-intro operations-heading" aria-labelledby="console-title">
+      <div>
+        <p class="section-label">Paper decision ledger</p>
+        <h1 id="console-title">Decide from proof, not momentum.</h1>
+        <p>Broker facts, human decisions, model drafts, and receipts remain separate evidence.</p>
+      </div>
+      <button class="button-quiet" id="refresh-console" type="button">Refresh all local truth</button>
+    </section>
 
-  <main id="main-content">
+    <div class="critical-banner" id="critical-banner" role="alert">
+      <strong id="critical-banner-title">Safety state unverified</strong>
+      <span id="critical-banner-message">Waiting for complete persisted local safety evidence; broker open orders are unverified.</span>
+    </div>
+
     <section class="proof-tape" aria-label="Current operational proof" tabindex="0">
       <div class="proof-tape-cell">
         <span>Broker target</span>
@@ -119,85 +132,7 @@
       </div>
     </section>
 
-    <div class="console-layout">
-      <aside class="truth-rail" aria-labelledby="truth-title">
-      <div class="rail-heading">
-        <p class="eyebrow">Server-observed</p>
-        <h2 id="truth-title">Operational truth</h2>
-        <p>Only state the server can currently report.</p>
-      </div>
-      <dl class="truth-list">
-        <div class="truth-row">
-          <dt>Broker</dt>
-          <dd id="truth-broker">Unknown</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Trading mode</dt>
-          <dd id="truth-mode">Unknown</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Operator</dt>
-          <dd id="truth-operator">Unknown</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Database</dt>
-          <dd id="truth-database" class="state state-caution">Checking</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Daemon</dt>
-          <dd id="truth-daemon" class="state state-caution">Checking</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Persisted safety</dt>
-          <dd id="truth-safety" class="state state-caution">Unknown</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Equity breaker</dt>
-          <dd id="truth-equity-breaker" class="state state-caution">Unknown</dd>
-        </div>
-        <div class="truth-row">
-          <dt>Crypto breaker</dt>
-          <dd id="truth-crypto-breaker" class="state state-caution">Unknown</dd>
-        </div>
-      </dl>
-      <form class="breaker-control" id="breaker-reset-form">
-        <h3>Reset one breaker scope</h3>
-        <div class="field">
-          <label for="breaker-scope">Active breaker</label>
-          <select id="breaker-scope" name="scope">
-            <option value="">Waiting for verified health…</option>
-          </select>
-        </div>
-        <div class="breaker-proof">
-          <span>Observed generation</span>
-          <output id="breaker-generation">None</output>
-          <span>Server health</span>
-          <output id="breaker-health">Unconfirmed</output>
-        </div>
-        <div class="field">
-          <label for="breaker-reset-reason">Reason</label>
-          <textarea
-            id="breaker-reset-reason"
-            name="reason"
-            rows="3"
-            required
-          ></textarea>
-        </div>
-        <p class="field-hint">A reset requires a tripped scope, a positive observed generation, complete health, and recent sign-in.</p>
-        <button id="breaker-reset-button" type="submit" disabled>Reset selected scope</button>
-      </form>
-      </aside>
-
-      <div class="workspace">
-        <section class="page-intro" aria-labelledby="console-title">
-          <div>
-            <p class="section-label">Decision ledger</p>
-            <h1 id="console-title">Command the system. Never guess its state.</h1>
-            <p>Proposals, human decisions, and broker receipts remain separate evidence.</p>
-          </div>
-          <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>
-        </section>
-
+    <div class="operations-layout">
       <section class="ledger" aria-labelledby="pending-title">
         <div class="section-heading">
           <div>
@@ -205,7 +140,6 @@
             <h2 id="pending-title">Pending decisions</h2>
             <p>Approval always performs a fresh execution-time risk check.</p>
           </div>
-          <button class="button-quiet" id="refresh-console" type="button">Refresh truth</button>
         </div>
         <div class="section-body">
           <ol class="ledger-list" id="pending-list">
@@ -214,71 +148,212 @@
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="receipts-title">
-        <div class="section-heading">
-          <div>
-            <p class="section-label">Observed outcomes</p>
-            <h2 id="receipts-title">Action receipts</h2>
-          </div>
-        </div>
-        <div class="section-body">
-          <div class="receipt-panel" id="receipt-panel">
-            <p class="empty-state">No operator action receipts in this page session.</p>
-          </div>
-        </div>
-      </section>
-
-      <div class="data-grid">
-        <section class="panel" aria-labelledby="positions-title">
+      <aside class="proof-rail" aria-label="Security, budget, and safety proof">
+        <section class="panel posture-panel has-error" id="security-posture-panel" aria-labelledby="security-posture-title">
           <div class="section-heading">
             <div>
-              <p class="section-label">Broker positions</p>
-              <h2 id="positions-title">Alpaca positions</h2>
+              <p class="section-label">Read-only evidence</p>
+              <h2 id="security-posture-title">Security posture</h2>
+              <p id="security-posture-observed">Observed: Unknown</p>
             </div>
           </div>
-          <div class="section-body" id="positions">
-            <p class="empty-state">Loading positions…</p>
+          <div class="section-body">
+            <div class="posture-list" id="security-posture-list">
+              <p class="empty-state">Security posture is unavailable until verified.</p>
+            </div>
           </div>
         </section>
 
-        <section class="panel" aria-labelledby="holdings-title">
+        <section class="panel budget-panel has-error" aria-labelledby="provider-budget-title">
           <div class="section-heading">
             <div>
-              <p class="section-label">Exposure context</p>
-              <h2 id="holdings-title">Combined holdings</h2>
-              <p id="external-stale">Checking external source…</p>
+              <p class="section-label">Paid provider authority</p>
+              <h2 id="provider-budget-title">Model budget</h2>
+              <p>Unknown or exhausted budget blocks model calls before network I/O.</p>
             </div>
           </div>
-          <div class="section-body" id="holdings">
-            <p class="empty-state">Loading holdings…</p>
+          <div class="section-body budget-stack">
+            <div class="budget-row">
+              <span>Calls remaining</span>
+              <strong id="provider-budget-calls">Unknown</strong>
+              <progress id="provider-budget-calls-meter" max="1" value="0" aria-label="Provider calls remaining"></progress>
+            </div>
+            <div class="budget-row">
+              <span>Input tokens remaining</span>
+              <strong id="provider-budget-input">Unknown</strong>
+              <progress id="provider-budget-input-meter" max="1" value="0" aria-label="Provider input tokens remaining"></progress>
+            </div>
+            <div class="budget-row">
+              <span>Output tokens remaining</span>
+              <strong id="provider-budget-output">Unknown</strong>
+              <progress id="provider-budget-output-meter" max="1" value="0" aria-label="Provider output tokens remaining"></progress>
+            </div>
+            <div class="budget-reset">
+              <span>UTC reset</span>
+              <strong id="provider-budget-reset">Unknown</strong>
+            </div>
           </div>
         </section>
-      </div>
 
-      <section class="panel" aria-labelledby="assistant-title">
-        <div class="section-heading">
-          <div>
-            <p class="section-label">Research only</p>
-            <h2 id="assistant-title">Assistant</h2>
-            <p>Model output cannot approve or execute an order.</p>
+        <section class="panel truth-rail" aria-labelledby="truth-title">
+          <div class="rail-heading">
+            <p class="eyebrow">Server-observed</p>
+            <h2 id="truth-title">Operational truth</h2>
+            <p>Only state the server can currently report.</p>
           </div>
-        </div>
-        <div class="section-body">
-          <div class="chat-log" id="chat-log" aria-live="polite"></div>
-          <form class="compose-row" id="chat-form">
+          <dl class="truth-list">
+            <div class="truth-row">
+              <dt>Broker</dt>
+              <dd id="truth-broker">Unknown</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Trading mode</dt>
+              <dd id="truth-mode">Unknown</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Operator</dt>
+              <dd id="truth-operator">Unknown</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Database</dt>
+              <dd id="truth-database" class="state state-caution">Checking</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Daemon</dt>
+              <dd id="truth-daemon" class="state state-caution">Checking</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Persisted safety</dt>
+              <dd id="truth-safety" class="state state-caution">Unknown</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Equity breaker</dt>
+              <dd id="truth-equity-breaker" class="state state-caution">Unknown</dd>
+            </div>
+            <div class="truth-row">
+              <dt>Crypto breaker</dt>
+              <dd id="truth-crypto-breaker" class="state state-caution">Unknown</dd>
+            </div>
+          </dl>
+          <form class="breaker-control" id="breaker-reset-form">
+            <h3>Reset one breaker scope</h3>
             <div class="field">
-              <label for="chat-input">Message</label>
-              <input id="chat-input" autocomplete="off">
+              <label for="breaker-scope">Active breaker</label>
+              <select id="breaker-scope" name="scope">
+                <option value="">Waiting for verified health…</option>
+              </select>
             </div>
-            <button class="button-primary" type="submit">Send message</button>
+            <div class="breaker-proof">
+              <span>Observed generation</span>
+              <output id="breaker-generation">None</output>
+              <span>Server health</span>
+              <output id="breaker-health">Unconfirmed</output>
+            </div>
+            <div class="field">
+              <label for="breaker-reset-reason">Reason</label>
+              <textarea
+                id="breaker-reset-reason"
+                name="reason"
+                rows="3"
+                required
+              ></textarea>
+            </div>
+            <p class="field-hint">A reset requires a tripped scope, a positive observed generation, complete health, and recent sign-in.</p>
+            <button id="breaker-reset-button" type="submit" disabled>Reset selected scope</button>
           </form>
+        </section>
+
+        <section class="panel panic-panel" aria-labelledby="panic-procedure-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Account-scoped emergency</p>
+              <h2 id="panic-procedure-title">Panic procedure</h2>
+              <p>Cancellation, rule disablement, and breaker latching require an explicit reason and a safe receipt.</p>
+            </div>
+          </div>
+          <div class="section-body">
+            <button class="button-danger" id="panic-open" type="button">Begin panic procedure</button>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="receipts-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Observed outcomes</p>
+              <h2 id="receipts-title">Action receipts</h2>
+            </div>
+          </div>
+          <div class="section-body">
+            <div class="receipt-panel" id="receipt-panel">
+              <p class="empty-state">No operator action receipts in this page session.</p>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <div class="primary-workspace">
+        <div class="data-grid">
+          <section class="panel" aria-labelledby="positions-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Broker positions</p>
+                <h2 id="positions-title">Alpaca positions</h2>
+              </div>
+            </div>
+            <div class="section-body" id="positions">
+              <p class="empty-state">Loading positions…</p>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="holdings-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Exposure context</p>
+                <h2 id="holdings-title">Combined holdings</h2>
+                <p id="external-stale">Checking external source…</p>
+              </div>
+            </div>
+            <div class="section-body" id="holdings">
+              <p class="empty-state">Loading holdings…</p>
+            </div>
+          </section>
         </div>
-      </section>
+
+        <section class="panel" aria-labelledby="assistant-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">Research only</p>
+              <h2 id="assistant-title">Assistant</h2>
+              <p>Model output cannot approve or execute an order.</p>
+            </div>
+          </div>
+          <div class="section-body assistant-workspace">
+            <p class="candidate-boundary-copy">Candidates never queue themselves. Queueing creates a proposal or rule only. Approval later reruns risk.</p>
+            <div class="chat-log" id="chat-log" aria-live="polite"></div>
+            <form class="compose-row" id="chat-form">
+              <div class="field">
+                <label for="chat-input">Message</label>
+                <input id="chat-input" autocomplete="off">
+              </div>
+              <button class="button-primary" id="chat-submit" type="submit" disabled>Send message</button>
+            </form>
+            <p class="field-hint has-error" id="chat-budget-state" role="status">Provider call blocked before network I/O until current budget proof is available.</p>
+            <section class="candidate-region" aria-labelledby="assistant-candidates-title">
+              <div class="candidate-region-heading">
+                <h3 id="assistant-candidates-title">Signed candidate drafts</h3>
+                <span class="status-chip is-unknown">Explicit queue only</span>
+              </div>
+              <div id="assistant-candidates">
+                <p class="empty-state">No signed candidates in this page session.</p>
+              </div>
+            </section>
+          </div>
+        </section>
 
         <section class="panel" aria-labelledby="risk-log-title">
           <div class="section-heading">
             <div>
-              <p class="section-label">Audit trail</p>
+              <p class="section-label">Immutable activity</p>
               <h2 id="risk-log-title">Execution and risk log</h2>
             </div>
           </div>

@@ -355,6 +355,10 @@ pre {
   box-shadow: inset 3px 0 0 var(--brand);
 }
 
+#operations-environment-strip {
+  grid-template-columns: minmax(180px, 1.15fr) repeat(5, minmax(120px, 1fr));
+}
+
 .status-chip {
   display: inline-flex;
   width: fit-content;
@@ -824,6 +828,241 @@ dialog::backdrop {
   overflow: hidden;
 }
 
+.operations-main {
+  display: grid;
+  gap: 20px;
+  padding-bottom: 32px;
+}
+
+.operations-heading,
+.operations-main > .critical-banner,
+.operations-main > .proof-tape {
+  width: min(1480px, calc(100% - 48px));
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.operations-heading {
+  padding: 24px 4px 0;
+}
+
+.operations-main > .critical-banner,
+.operations-main > .proof-tape {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+}
+
+.operations-layout {
+  display: grid;
+  grid-template-areas:
+    "pending proof"
+    "primary proof";
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+  gap: 20px;
+  width: min(1480px, calc(100% - 48px));
+  margin: 0 auto;
+}
+
+.operations-layout > .ledger {
+  grid-area: pending;
+}
+
+.primary-workspace {
+  display: grid;
+  grid-area: primary;
+  align-content: start;
+  gap: 20px;
+  min-width: 0;
+}
+
+.proof-rail {
+  display: grid;
+  grid-area: proof;
+  align-content: start;
+  gap: 16px;
+  min-width: 0;
+}
+
+.proof-rail .truth-rail {
+  position: static;
+  width: auto;
+}
+
+.posture-list {
+  display: grid;
+  gap: 8px;
+}
+
+.posture-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.posture-row:last-child {
+  border-bottom: 0;
+}
+
+.posture-row strong {
+  font: 650 12px/1.3 var(--font-mono);
+}
+
+.posture-row small {
+  grid-column: 1 / -1;
+}
+
+.budget-stack,
+.budget-row {
+  display: grid;
+  gap: 8px;
+}
+
+.budget-stack {
+  gap: 16px;
+}
+
+.budget-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.budget-row > span,
+.budget-reset > span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.budget-row > strong,
+.budget-reset > strong {
+  font: 650 12px/1.3 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget-row progress {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 7px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-interactive);
+  accent-color: var(--brand);
+}
+
+.budget-row progress::-webkit-progress-bar {
+  background: var(--surface-interactive);
+}
+
+.budget-row progress::-webkit-progress-value {
+  background: var(--brand);
+}
+
+.budget-reset {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.panic-panel .button-danger {
+  width: 100%;
+}
+
+.assistant-workspace,
+.candidate-region,
+#assistant-candidates {
+  display: grid;
+  gap: 12px;
+}
+
+.candidate-boundary-copy {
+  padding: 12px;
+  border: 1px solid rgb(240 180 93 / 38%);
+  border-radius: var(--radius-control);
+  background: var(--caution-wash);
+  color: #f5d3a4;
+  font-size: 12px;
+}
+
+.candidate-region {
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.candidate-region-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.candidate-region-heading h3 {
+  margin-bottom: 0;
+}
+
+.candidate-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-raised);
+}
+
+.candidate-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.candidate-fact {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.candidate-fact dt,
+.candidate-fact dd {
+  margin: 0;
+}
+
+.candidate-fact dt {
+  color: var(--text-muted);
+  font: 10px/1.2 var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.candidate-fact dd {
+  margin-top: 4px;
+  font: 650 12px/1.35 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.candidate-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.candidate-form textarea {
+  min-height: 72px;
+}
+
+.candidate-status {
+  min-height: 22px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .account-heading {
   display: flex;
   align-items: flex-start;
@@ -1256,6 +1495,18 @@ pre {
     position: sticky;
     top: 136px;
   }
+
+  .proof-rail {
+    position: sticky;
+    top: 132px;
+    max-height: calc(100vh - 148px);
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+
+  .proof-rail .truth-rail {
+    position: static;
+  }
 }
 
 @media (min-width: 760px) and (max-width: 1179px) {
@@ -1274,6 +1525,10 @@ pre {
     grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
+  #operations-environment-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .proof-tape {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -1284,6 +1539,18 @@ pre {
 
   .console-layout {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .operations-layout {
+    grid-template-areas:
+      "pending"
+      "proof"
+      "primary";
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .proof-rail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .truth-list {
@@ -1327,6 +1594,10 @@ pre {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  #operations-environment-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .environment-cell {
     border-bottom: 1px solid var(--border);
   }
@@ -1348,7 +1619,11 @@ pre {
   }
 
   .account-masthead,
-  .login-shell {
+  .login-shell,
+  .operations-heading,
+  .operations-main > .critical-banner,
+  .operations-main > .proof-tape,
+  .operations-layout {
     width: calc(100% - 24px);
   }
 
@@ -1381,6 +1656,19 @@ pre {
     padding: 12px;
   }
 
+  .operations-layout {
+    grid-template-areas:
+      "pending"
+      "proof"
+      "primary";
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .proof-rail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .truth-list,
   .data-grid,
   .plans-layout,
@@ -1398,9 +1686,15 @@ pre {
 
   .compose-row,
   .action-row,
-  .dialog-actions {
+  .dialog-actions,
+  .candidate-form {
     align-items: stretch;
+    grid-template-columns: minmax(0, 1fr);
     flex-direction: column;
+  }
+
+  .candidate-facts {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .receipt-grid,

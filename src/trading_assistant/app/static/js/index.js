@@ -33,7 +33,6 @@ let rejectionOrderId = null;
 let unsafePanicLatched = false;
 const operationalRefreshState = {
   account: {requestSequence: 0, controller: null, timeoutId: null},
-  positions: {requestSequence: 0, controller: null, timeoutId: null},
   holdings: {requestSequence: 0, controller: null, timeoutId: null},
   riskLog: {requestSequence: 0, controller: null, timeoutId: null},
 };
@@ -385,6 +384,11 @@ async function refreshPending() {
       "div",
       `Expires ${readable(order.expires_at)}`,
       "ledger-entry-data",
+    ));
+    content.appendChild(node(
+      "div",
+      "Fresh risk check occurs after approval.",
+      "ledger-entry-data fresh-risk-note",
     ));
 
     const actions = node("div", null, "ledger-actions");
@@ -1467,39 +1471,6 @@ function renderPositions(positions) {
       position.market_value,
     ]),
   ));
-}
-
-async function refreshPositions() {
-  const target = byId("positions");
-  const request = beginOperationalRefresh(
-    "positions",
-    target,
-    "Refreshing positions…",
-  );
-  let payload;
-  try {
-    payload = await api("/positions", {
-      signal: request.controller.signal,
-    });
-  } catch (error) {
-    if (!operationalRefreshIsCurrent(request)) {
-      return false;
-    }
-    finishOperationalRefresh(request);
-    clear(target);
-    target.appendChild(node(
-      "p",
-      "Position truth is unavailable.",
-      "empty-state",
-    ));
-    throw error;
-  }
-  if (!finishOperationalRefresh(request)) {
-    return false;
-  }
-  const positions = Array.isArray(payload.positions) ? payload.positions : [];
-  renderPositions(positions);
-  return true;
 }
 
 async function refreshHoldings() {
