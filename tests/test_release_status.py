@@ -557,15 +557,25 @@ def test_trusted_policy_not_receipt_controls_heartbeat_freshness():
     assert "DAEMON_HEARTBEAT_STALE" in result.operational_detail_codes
 
 
-def test_reconciliation_evidence_is_typed_nonempty_and_domain_bound():
+def test_reconciliation_evidence_is_typed_and_domain_bound_including_empty():
     release_status = _module()
-    with pytest.raises(ValueError, match="nonempty"):
-        release_status.ReconciliationEvidence.collect(
-            domain=release_status.ReconciliationDomain.ORDERS,
-            generation=1,
-            local_records=(),
-            broker_records=(),
-        )
+    empty_orders = release_status.ReconciliationEvidence.collect(
+        domain=release_status.ReconciliationDomain.ORDERS,
+        generation=1,
+        local_records=(),
+        broker_records=(),
+    )
+    empty_positions = release_status.ReconciliationEvidence.collect(
+        domain=release_status.ReconciliationDomain.POSITIONS,
+        generation=1,
+        local_records=(),
+        broker_records=(),
+    )
+    assert empty_orders.local_count == empty_orders.broker_count == 0
+    assert empty_positions.local_count == empty_positions.broker_count == 0
+    assert empty_orders.local_digest == empty_orders.broker_digest
+    assert empty_positions.local_digest == empty_positions.broker_digest
+    assert empty_orders.local_digest != empty_positions.local_digest
     with pytest.raises(ValueError, match="positive"):
         release_status.ReconciliationEvidence.collect(
             domain=release_status.ReconciliationDomain.ORDERS,

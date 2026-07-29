@@ -165,8 +165,8 @@ def _canonical_reconciliation_records(
     *,
     name: str,
 ) -> tuple[str, ...]:
-    if not isinstance(values, tuple) or not values:
-        raise ValueError(f"{name} must be a nonempty tuple")
+    if not isinstance(values, tuple):
+        raise ValueError(f"{name} must be a tuple")
     canonical: list[str] = []
     for value in values:
         if (
@@ -212,7 +212,7 @@ def _reconciliation_digest(
 
 @dataclass(frozen=True, slots=True, init=False)
 class ReconciliationEvidence:
-    """Opaque typed summary built only from nonempty collector manifests."""
+    """Opaque typed summary built only from collector manifests."""
 
     domain: ReconciliationDomain
     generation: int
@@ -294,7 +294,7 @@ def _validate_reconciliation_evidence(
         if (
             isinstance(value, bool)
             or not isinstance(value, int)
-            or value <= 0
+            or value < 0
         ):
             raise ValueError(f"reconciliation {name} is invalid")
     _canonical_digest(
