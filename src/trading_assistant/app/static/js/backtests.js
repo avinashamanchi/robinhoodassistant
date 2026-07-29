@@ -59,6 +59,11 @@ const RUN_SUMMARY_KEYS = new Set([
   "holdout_start",
 ]);
 const PAGINATION_KEYS = new Set(["limit", "next_cursor"]);
+const ACTIVE_RUN_KEYS = new Set([
+  "state",
+  "observed_at",
+  "retry_after_seconds",
+]);
 const SIMULATION_POLICY_KEYS = new Set([
   "max_runtime_seconds",
   "max_symbols",
@@ -76,6 +81,7 @@ const BACKTEST_LIST_KEYS = new Set([
   "backtests",
   "pagination",
   "simulation_policy",
+  "active_run",
 ]);
 const byId = (id) => document.getElementById(id);
 
@@ -92,6 +98,8 @@ let reportAbortController = null;
 let simulationPolicy = null;
 let runBusy = false;
 let serverBusy = false;
+let localRunInFlight = false;
+let authoritativeRunState = null;
 let runRequestSequence = 0;
 
 function node(tag, value, className) {
@@ -388,10 +396,61 @@ function setRunBusy(busy, message = "") {
 
 function setServerBusy() {
   serverBusy = true;
+  authoritativeRunState = null;
   setRunBusy(
     true,
     "Busy · another server-side run owns the lease",
   );
+}
+
+function normalizeActiveRun(value) {
+  if (
+    !hasExactKeys(value, ACTIVE_RUN_KEYS)
+    || !["busy", "clear"].includes(value.state)
+    || !exactTimestamp(value.observed_at)
+    || !exactNonnegativeInteger(value.retry_after_seconds)
+    || (
+      value.state === "busy"
+      && value.retry_after_seconds === 0
+    )
+    || (
+      value.state === "clear"
+      && value.retry_after_seconds !== 0
+    )
+  ) {
+    return null;
+  }
+  return Object.freeze({...value});
+}
+
+function renderRunActivity() {
+  if (localRunInFlight) {
+    setRunBusy(
+      true,
+      "In progress · single-run lease requested",
+    );
+    return;
+  }
+  if (serverBusy) {
+    const retry = (
+      authoritativeRunState
+      && authoritativeRunState.state === "busy"
+    )
+      ? ` · retry after ${authoritativeRunState.retry_after_seconds} seconds`
+      : "";
+    setRunBusy(
+      true,
+      `Busy · another server-side run owns the lease${retry}`,
+    );
+    return;
+  }
+  setRunBusy(false);
+}
+
+function reconcileActiveRun(activeRun) {
+  authoritativeRunState = activeRun;
+  serverBusy = activeRun.state === "busy";
+  renderRunActivity();
 }
 
 function invalidateSelectedReport(title, message) {
@@ -424,8 +483,10 @@ function normalizeRunPage(payload, cursor = null) {
   }
   const policy = normalizeSimulationPolicy(payload.simulation_policy);
   const pagination = payload.pagination;
+  const activeRun = normalizeActiveRun(payload.active_run);
   if (
     !policy
+    || !activeRun
     || !hasExactKeys(pagination, PAGINATION_KEYS)
     || !exactPositiveInteger(pagination.limit)
     || pagination.limit !== policy.saved_run_page_limit
@@ -480,6 +541,7 @@ function normalizeRunPage(payload, cursor = null) {
     && cursor !== null
   ) {
     return Object.freeze({
+      activeRun,
       policy,
       runs: Object.freeze([]),
       nextCursor: null,
@@ -493,6 +555,7 @@ function normalizeRunPage(payload, cursor = null) {
     return null;
   }
   return Object.freeze({
+    activeRun,
     policy,
     runs: Object.freeze(runs),
     nextCursor: pagination.next_cursor,
@@ -581,8 +644,8 @@ async function requestRunPage({
   let payload;
   try {
     const path = cursor === null
-      ? "/backtests"
-      : `/backtests?cursor=${cursor}`;
+      ? "/backtests/v1"
+      : `/backtests/v1?cursor=${cursor}`;
     payload = await api(path, {
       signal: controller.signal,
     });
@@ -619,6 +682,7 @@ async function requestRunPage({
     page.runs.forEach((run) => renderedRunIds.add(run.run_id));
   }
   runsNextCursor = page.nextCursor;
+  reconcileActiveRun(page.activeRun);
   renderSimulationPolicy(page.policy);
   renderSavedRuns();
   return true;
@@ -1517,7 +1581,9 @@ async function submitBacktest(event) {
     return;
   }
   const requestToken = ++runRequestSequence;
+  localRunInFlight = true;
   serverBusy = false;
+  authoritativeRunState = null;
   setRunBusy(true, "In progress · single-run lease requested");
   const reportTransitionToken = beginReportTransition(
     "Running backtest",
@@ -1533,6 +1599,7 @@ async function submitBacktest(event) {
     if (requestToken !== runRequestSequence) {
       return;
     }
+    localRunInFlight = false;
     if (error && error.code === "backtest_busy") {
       setServerBusy();
     }
@@ -1547,8 +1614,8 @@ async function submitBacktest(event) {
       ));
     }
     await refreshBacktestPosture();
-    if (requestToken === runRequestSequence && !serverBusy) {
-      setRunBusy(false);
+    if (requestToken === runRequestSequence) {
+      renderRunActivity();
     }
     return;
   }
@@ -1566,7 +1633,8 @@ async function submitBacktest(event) {
     }
     await refreshBacktestPosture();
     if (requestToken === runRequestSequence) {
-      setRunBusy(false);
+      localRunInFlight = false;
+      renderRunActivity();
     }
     return;
   }
@@ -1592,7 +1660,8 @@ async function submitBacktest(event) {
     "notice-success",
   );
   if (requestToken === runRequestSequence) {
-    setRunBusy(false);
+    localRunInFlight = false;
+    renderRunActivity();
   }
 }
 
@@ -1621,8 +1690,10 @@ async function initialize() {
       notify(errorText(error), "notice-error");
     }
   });
+  localRunInFlight = false;
   serverBusy = false;
-  setRunBusy(false);
+  authoritativeRunState = null;
+  renderRunActivity();
   clearSimulationPolicy();
   await Promise.allSettled([
     refreshRuns(),

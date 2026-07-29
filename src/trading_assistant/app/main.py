@@ -83,6 +83,7 @@ _AUTO_PLANNING = object()
 _ACCOUNT_CACHE_TTL_SECONDS = 2.0
 _GUARDED_APP_COMPOSITION_SEAL = object()
 _BACKTEST_LIST_PAGE_LIMIT = 25
+_SQLITE_SIGNED_INT_MAX = 2**63 - 1
 _BACKTEST_STATUSES = frozenset(
     {"succeeded", "timed_out", "failed", "canceled"}
 )
@@ -244,68 +245,6 @@ class BacktestRunIn(BaseModel):
             and self.end_date < self.start_date
         ):
             raise ValueError("end_date must not precede start_date")
-        return self
-
-
-class _BacktestMetricValues(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    total_return_pct: float = Field(allow_inf_nan=False)
-    cagr_pct: float = Field(allow_inf_nan=False)
-    sharpe: float = Field(allow_inf_nan=False)
-    sortino: float = Field(allow_inf_nan=False)
-    max_drawdown_pct: float = Field(le=0, allow_inf_nan=False)
-    win_rate_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
-    profit_factor: float | None = Field(
-        ge=0,
-        allow_inf_nan=False,
-    )
-    avg_win: float = Field(ge=0, allow_inf_nan=False)
-    avg_loss: float = Field(le=0, allow_inf_nan=False)
-    exposure_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
-    turnover: float = Field(ge=0, allow_inf_nan=False)
-    num_trades: int = Field(ge=0)
-    pnl_by_regime: dict[str, float]
-
-    @field_validator("pnl_by_regime")
-    @classmethod
-    def validate_regime_values(
-        cls,
-        value: dict[str, float],
-    ) -> dict[str, float]:
-        if any(
-            not isinstance(name, str)
-            or not name
-            or isinstance(amount, bool)
-            or not isinstance(amount, float)
-            for name, amount in value.items()
-        ):
-            raise ValueError("regime attribution is invalid")
-        return value
-
-
-class _BacktestMetricRowPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    symbol: str = Field(
-        min_length=1,
-        max_length=20,
-        pattern=r"^[A-Z0-9./-]+$",
-    )
-    strategy: str = Field(min_length=1, max_length=100)
-    window: Literal["development", "holdout", "full"]
-    metrics: _BacktestMetricValues
-    benchmark_buy_and_hold: _BacktestMetricValues
-    beat_buy_and_hold: bool
-
-    @model_validator(mode="after")
-    def beat_flag_matches_returns(self):
-        expected = (
-            self.metrics.total_return_pct
-            > self.benchmark_buy_and_hold.total_return_pct
-        )
-        if self.beat_buy_and_hold is not expected:
-            raise ValueError("benchmark comparison is inconsistent")
         return self
 
 
@@ -1474,7 +1413,32 @@ def _create_app(
     # ── backtests (Phase 7) ────────────────────────────────────
     @app.get("/backtests")
     def list_backtests(
-        cursor: int | None = Query(default=None, gt=0),
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        runs, next_cursor = _list_backtests(
+            service.session_factory,
+        )
+        if next_cursor is not None:
+            raise ApiError(
+                "backtest_list_contract_upgrade_required",
+                409,
+                "Saved backtest history requires the paginated API",
+            )
+        return {
+            "backtests": runs,
+            "simulation_policy": _backtest_simulation_policy(
+                service.config,
+                paginated=False,
+            ),
+        }
+
+    @app.get("/backtests/v1")
+    def list_backtests_v1(
+        cursor: int | None = Query(
+            default=None,
+            gt=0,
+            le=_SQLITE_SIGNED_INT_MAX,
+        ),
         principal: SessionPrincipal = Depends(current_principal),
     ):
         runs, next_cursor = _list_backtests(
@@ -1488,8 +1452,10 @@ def _create_app(
                 "next_cursor": next_cursor,
             },
             "simulation_policy": _backtest_simulation_policy(
-                service.config
+                service.config,
+                paginated=True,
             ),
+            "active_run": _backtest_active_run(leases),
         }
 
     @app.post("/backtests/run")
@@ -1637,10 +1603,14 @@ def create_app(*args, **kwargs) -> FastAPI:
 
 
 # ── backtest DB helpers ────────────────────────────────────────
-def _backtest_simulation_policy(config) -> dict:
+def _backtest_simulation_policy(
+    config,
+    *,
+    paginated: bool,
+) -> dict:
     limits = config.security.backtest_limits
     requests = config.security.rate_limits.backtest
-    return {
+    policy = {
         "max_runtime_seconds": limits.runtime_seconds,
         "max_symbols": limits.max_symbols,
         "max_calendar_days": limits.max_calendar_days,
@@ -1653,7 +1623,28 @@ def _backtest_simulation_policy(config) -> dict:
         "llm_enabled": (
             config.security.provider_budget.backtest_llm_enabled
         ),
-        "saved_run_page_limit": _BACKTEST_LIST_PAGE_LIMIT,
+    }
+    if paginated:
+        policy["saved_run_page_limit"] = _BACKTEST_LIST_PAGE_LIMIT
+    return policy
+
+
+def _backtest_active_run(
+    leases: ConcurrencyLeaseService,
+) -> dict:
+    from ..db.models import utcnow
+
+    observed_at = utcnow()
+    decision = leases.inspect(
+        "backtest:global",
+        now=observed_at,
+    )
+    return {
+        "state": "busy" if decision.acquired else "clear",
+        "observed_at": observed_at.isoformat(),
+        "retry_after_seconds": (
+            decision.retry_after_seconds if decision.acquired else 0
+        ),
     }
 
 
@@ -1707,25 +1698,25 @@ def _list_backtests(
 
 
 def _validated_backtest_metric_rows(rows) -> list[dict]:
+    from ..backtest.report import validate_metric_row_payload
+
     validated: list[dict] = []
     for row in rows:
         payload = json.loads(row.metrics_json)
-        model = _BacktestMetricRowPayload.model_validate(
-            payload,
-            strict=True,
-        )
+        model = validate_metric_row_payload(payload)
         if (
-            model.symbol != row.symbol
-            or model.strategy != row.strategy
-            or model.window != row.window
+            model["symbol"] != row.symbol
+            or model["strategy"] != row.strategy
+            or model["window"] != row.window
         ):
             raise ValueError("metric row identity is inconsistent")
-        validated.append(model.model_dump(mode="json"))
+        validated.append(model)
     return validated
 
 
 def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
     from ..backtest.report import (
+        BACKTEST_ARTIFACT_SCHEMA_VERSION,
         SIMULATED_LABEL,
         validate_persisted_artifacts,
     )
@@ -1775,7 +1766,8 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
             return response
         try:
             if any(
-                artifact.schema_version != 1
+                artifact.schema_version
+                != BACKTEST_ARTIFACT_SCHEMA_VERSION
                 for artifact in artifacts
             ):
                 raise ValueError("invalid artifact set")

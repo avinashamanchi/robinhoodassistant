@@ -422,6 +422,7 @@ ROUTE_POLICIES = (
         "session_read",
     ),
     RoutePolicy("GET", "/backtests", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/backtests/v1", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
         "POST",
         "/backtests/run",

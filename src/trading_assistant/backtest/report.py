@@ -5,13 +5,115 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import hashlib
+import hmac
+import json
 import math
-from typing import Optional
+from typing import Literal, Optional
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from ..config import BacktestConfig
 from .metrics import Metrics
 
 SIMULATED_LABEL = "Simulated — past performance does not predict future results."
+BACKTEST_ARTIFACT_SCHEMA_VERSION = 2
+MAX_REGIME_PNL_ROWS = 50
+MAX_REGIME_NAME_LENGTH = 100
+
+
+class BacktestMetricValues(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    total_return_pct: float = Field(allow_inf_nan=False)
+    cagr_pct: float = Field(allow_inf_nan=False)
+    sharpe: float = Field(allow_inf_nan=False)
+    sortino: float = Field(allow_inf_nan=False)
+    max_drawdown_pct: float = Field(le=0, allow_inf_nan=False)
+    win_rate_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    profit_factor: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    avg_win: float = Field(ge=0, allow_inf_nan=False)
+    avg_loss: float = Field(le=0, allow_inf_nan=False)
+    exposure_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    turnover: float = Field(ge=0, allow_inf_nan=False)
+    num_trades: int = Field(ge=0)
+    pnl_by_regime: dict[str, float]
+
+    @field_validator("pnl_by_regime")
+    @classmethod
+    def validate_regime_values(
+        cls,
+        value: dict[str, float],
+    ) -> dict[str, float]:
+        if len(value) > MAX_REGIME_PNL_ROWS:
+            raise ValueError("regime attribution is oversized")
+        if any(
+            not isinstance(name, str)
+            or not name
+            or len(name) > MAX_REGIME_NAME_LENGTH
+            or isinstance(amount, bool)
+            or not isinstance(amount, float)
+            or not math.isfinite(amount)
+            for name, amount in value.items()
+        ):
+            raise ValueError("regime attribution is invalid")
+        return value
+
+
+class BacktestMetricRowPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    symbol: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^[A-Z0-9./-]+$",
+    )
+    strategy: str = Field(min_length=1, max_length=100)
+    window: Literal["development", "holdout", "full"]
+    metrics: BacktestMetricValues
+    benchmark_buy_and_hold: BacktestMetricValues
+    beat_buy_and_hold: bool
+
+    @model_validator(mode="after")
+    def beat_flag_matches_returns(self):
+        expected = (
+            self.metrics.total_return_pct
+            > self.benchmark_buy_and_hold.total_return_pct
+        )
+        if self.beat_buy_and_hold is not expected:
+            raise ValueError("benchmark comparison is inconsistent")
+        return self
+
+
+def validate_metric_row_payload(payload: object) -> dict:
+    return BacktestMetricRowPayload.model_validate(
+        payload,
+        strict=True,
+    ).model_dump(mode="json")
+
+
+def canonical_metric_rows_digest(metric_rows: list[dict]) -> str:
+    validated = [
+        validate_metric_row_payload(payload)
+        for payload in metric_rows
+    ]
+    encoded = json.dumps(
+        validated,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass
@@ -141,6 +243,7 @@ def _validate_manifest(
         "backtest_config",
         "symbols",
         "strategies",
+        "metric_rows_sha256",
         "holdout_start",
         "holdout_access_log",
         "validation",
@@ -148,7 +251,7 @@ def _validate_manifest(
     }
     if not isinstance(payload, dict) or set(payload) != expected_keys:
         raise ValueError("invalid artifact manifest")
-    if payload["schema_version"] != 1:
+    if payload["schema_version"] != BACKTEST_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("invalid artifact schema")
     if payload["data_source"] != "synthetic":
         raise ValueError("invalid artifact source")
@@ -214,6 +317,23 @@ def _validate_manifest(
         for row in metric_rows
     ):
         raise ValueError("manifest does not cover metric identities")
+    metric_rows_sha256 = payload["metric_rows_sha256"]
+    expected_metric_rows_sha256 = canonical_metric_rows_digest(
+        metric_rows
+    )
+    if (
+        not isinstance(metric_rows_sha256, str)
+        or len(metric_rows_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in metric_rows_sha256
+        )
+        or not hmac.compare_digest(
+            metric_rows_sha256,
+            expected_metric_rows_sha256,
+        )
+    ):
+        raise ValueError("metric row digest mismatch")
 
     holdout_start = _parse_utc(payload["holdout_start"])
     if (
@@ -260,7 +380,7 @@ def _series_with_drawdown(
     if not isinstance(payload, dict) or set(payload) != expected_keys:
         raise ValueError("invalid series artifact")
     if (
-        payload["schema_version"] != 1
+        payload["schema_version"] != BACKTEST_ARTIFACT_SCHEMA_VERSION
         or payload["row_index"] != expected_index
         or payload["symbol"] != expected_row.get("symbol")
         or payload["strategy"] != expected_row.get("strategy")

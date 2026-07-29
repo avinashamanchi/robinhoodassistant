@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,6 +92,56 @@ def _two_authenticated_clients(service, authenticate_client):
     return app, first, first_csrf, second, second_csrf
 
 
+def _artifact_payload(service, session, run_id, artifact_key):
+    artifact = (
+        session.query(BacktestArtifact)
+        .filter_by(run_id=run_id, artifact_key=artifact_key)
+        .one()
+    )
+    store = sensitive_store(session, service.session_factory)
+    return artifact, store, json.loads(
+        store.read(artifact, "payload_json")
+    )
+
+
+def _write_artifact_payload(store, artifact, payload):
+    store.write_many(
+        artifact,
+        {
+            "payload_json": json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        },
+    )
+
+
+def _parse_precommit_backtest_list(response):
+    response.raise_for_status()
+    payload = response.json()
+    expected_policy_keys = {
+        "max_runtime_seconds",
+        "max_symbols",
+        "max_calendar_days",
+        "window_requests",
+        "global_window_requests",
+        "window_seconds",
+        "daily_requests",
+        "global_daily_requests",
+        "concurrency",
+        "llm_enabled",
+    }
+    if (
+        set(payload) != {"backtests", "simulation_policy"}
+        or not isinstance(payload["backtests"], list)
+        or set(payload["simulation_policy"]) != expected_policy_keys
+    ):
+        raise ValueError("pre-commit backtest list contract changed")
+    return payload["backtests"]
+
+
 def test_list_and_report(client):
     c, svc = client
     run_id = _seed(svc)
@@ -112,6 +163,16 @@ def test_list_and_report(client):
     }
     assert manifest["episodes"] == {"status": "not_run"}
     assert manifest["holdout_access_log"]
+    canonical_rows = json.dumps(
+        rep["rows"],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    assert manifest["metric_rows_sha256"] == hashlib.sha256(
+        canonical_rows
+    ).hexdigest()
     assert rep["series"]
     series = rep["series"][0]
     assert series["strategy_equity"]
@@ -139,10 +200,176 @@ def test_list_and_report(client):
     ) == manifest
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("metric_value", "row_order", "identity"),
+)
+def test_encrypted_manifest_rejects_valid_metric_row_tampering(
+    client,
+    mutation,
+):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:metric-digest",
+        reason=f"tamper canonical metric rows: {mutation}",
+        request_id=f"backtest-metric-digest-{mutation}",
+    )
+    with svc.session_factory() as session:
+        rows = list(
+            session.query(BacktestMetricRow)
+            .filter_by(run_id=run_id)
+            .order_by(BacktestMetricRow.id)
+            .limit(2)
+        )
+        assert len(rows) == 2
+        if mutation == "metric_value":
+            payload = json.loads(rows[0].metrics_json)
+            payload["metrics"]["total_return_pct"] = 999_999.0
+            payload["benchmark_buy_and_hold"][
+                "total_return_pct"
+            ] = -99.0
+            payload["beat_buy_and_hold"] = True
+            rows[0].metrics_json = json.dumps(
+                payload,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        elif mutation == "row_order":
+            identities = [
+                (
+                    row.symbol,
+                    row.strategy,
+                    row.window,
+                    row.metrics_json,
+                )
+                for row in rows
+            ]
+            (
+                rows[0].symbol,
+                rows[0].strategy,
+                rows[0].window,
+                rows[0].metrics_json,
+            ) = identities[1]
+            (
+                rows[1].symbol,
+                rows[1].strategy,
+                rows[1].window,
+                rows[1].metrics_json,
+            ) = identities[0]
+
+            first, store, first_payload = _artifact_payload(
+                svc,
+                session,
+                run_id,
+                "series:000000",
+            )
+            second, _, second_payload = _artifact_payload(
+                svc,
+                session,
+                run_id,
+                "series:000001",
+            )
+            first_payload, second_payload = (
+                second_payload,
+                first_payload,
+            )
+            first_payload["row_index"] = 0
+            second_payload["row_index"] = 1
+            _write_artifact_payload(store, first, first_payload)
+            _write_artifact_payload(store, second, second_payload)
+        else:
+            replacement_strategy = rows[1].strategy
+            payload = json.loads(rows[0].metrics_json)
+            payload["strategy"] = replacement_strategy
+            rows[0].strategy = replacement_strategy
+            rows[0].metrics_json = json.dumps(
+                payload,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            artifact, store, series = _artifact_payload(
+                svc,
+                session,
+                run_id,
+                "series:000000",
+            )
+            series["strategy"] = replacement_strategy
+            _write_artifact_payload(store, artifact, series)
+        session.commit()
+
+    report = c.get(f"/backtests/{run_id}/report")
+
+    assert report.status_code == 200
+    assert report.json()["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "artifact_invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "nan",
+        "positive_infinity",
+        "negative_infinity",
+        "oversized_key",
+        "oversized_map",
+    ),
+)
+def test_report_rejects_unbounded_or_nonfinite_regime_pnl(
+    client,
+    mutation,
+):
+    c, svc = client
+    run_id, _ = runner.run_synthetic_backtest(
+        svc.session_factory,
+        symbols=["TREND"],
+        bars=5,
+        actor="test:regime-pnl-bounds",
+        reason=f"reject regime P&L mutation: {mutation}",
+        request_id=f"backtest-regime-pnl-{mutation}",
+    )
+    with svc.session_factory() as session:
+        row = (
+            session.query(BacktestMetricRow)
+            .filter_by(run_id=run_id)
+            .order_by(BacktestMetricRow.id)
+            .first()
+        )
+        payload = json.loads(row.metrics_json)
+        if mutation == "nan":
+            regime_pnl = {"ranging": float("nan")}
+        elif mutation == "positive_infinity":
+            regime_pnl = {"ranging": float("inf")}
+        elif mutation == "negative_infinity":
+            regime_pnl = {"ranging": float("-inf")}
+        elif mutation == "oversized_key":
+            regime_pnl = {"r" * 101: 1.0}
+        else:
+            regime_pnl = {
+                f"regime-{index:02d}": float(index)
+                for index in range(51)
+            }
+        payload["metrics"]["pnl_by_regime"] = regime_pnl
+        row.metrics_json = json.dumps(payload)
+        session.commit()
+
+    response = c.get(f"/backtests/{run_id}/report")
+
+    assert response.status_code == 200
+    assert response.json()["artifact_status"] == {
+        "status": "unavailable",
+        "reason": "metric_rows_invalid",
+    }
+
+
 def test_list_exposes_only_bounded_simulation_policy(client):
     c, svc = client
 
-    response = c.get("/backtests").json()
+    response = c.get("/backtests/v1").json()
 
     assert response["simulation_policy"] == {
         "max_runtime_seconds": (
@@ -184,6 +411,62 @@ def test_list_exposes_only_bounded_simulation_policy(client):
         "credential",
     ):
         assert forbidden not in serialized.lower()
+
+
+def test_legacy_list_preserves_complete_precommit_contract_within_cap(
+    client,
+):
+    c, svc = client
+    with svc.session_factory() as session:
+        session.add_all(
+            [
+                BacktestRun(
+                    label=f"legacy run {index:02d}",
+                    config_json=json.dumps({"status": "succeeded"}),
+                )
+                for index in range(25)
+            ]
+        )
+        session.commit()
+
+    response = c.get("/backtests")
+
+    assert response.status_code == 200
+    payload = response.json()
+    precommit_rows = _parse_precommit_backtest_list(response)
+    precommit_client_ids = [
+        row["run_id"] for row in precommit_rows
+    ]
+    assert len(precommit_client_ids) == 25
+    assert precommit_client_ids == sorted(
+        precommit_client_ids,
+        reverse=True,
+    )
+    assert set(payload) == {"backtests", "simulation_policy"}
+    assert "saved_run_page_limit" not in payload["simulation_policy"]
+
+
+def test_legacy_list_refuses_silent_truncation_above_cap(client):
+    c, svc = client
+    with svc.session_factory() as session:
+        session.add_all(
+            [
+                BacktestRun(
+                    label=f"overflow run {index:02d}",
+                    config_json=json.dumps({"status": "succeeded"}),
+                )
+                for index in range(26)
+            ]
+        )
+        session.commit()
+
+    response = c.get("/backtests")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == (
+        "backtest_list_contract_upgrade_required"
+    )
+    assert "backtests" not in response.json()
 
 
 def test_missing_or_unknown_run_status_never_defaults_to_success(client):
@@ -232,7 +515,7 @@ def test_list_backtests_uses_strict_cursor_pages(client):
         )
         session.commit()
 
-    first = c.get("/backtests")
+    first = c.get("/backtests/v1")
 
     assert first.status_code == 200
     first_payload = first.json()
@@ -245,7 +528,7 @@ def test_list_backtests_uses_strict_cursor_pages(client):
     assert first_payload["pagination"]["next_cursor"] == first_ids[-1]
 
     second = c.get(
-        "/backtests",
+        "/backtests/v1",
         params={"cursor": first_payload["pagination"]["next_cursor"]},
     )
 
@@ -263,14 +546,55 @@ def test_list_backtests_uses_strict_cursor_pages(client):
     }
 
 
-@pytest.mark.parametrize("cursor", ("0", "-1", "not-an-integer"))
+@pytest.mark.parametrize(
+    "cursor",
+    ("0", "-1", "not-an-integer", str(2**63)),
+)
 def test_list_backtests_rejects_invalid_cursor(client, cursor):
     c, _svc = client
 
-    response = c.get("/backtests", params={"cursor": cursor})
+    response = c.get("/backtests/v1", params={"cursor": cursor})
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_paginated_list_reports_authoritative_durable_backtest_lease(
+    client,
+):
+    c, svc = client
+    leases = ConcurrencyLeaseService(svc.session_factory)
+    held = leases.acquire(
+        "backtest:global",
+        owner="test:durable-backtest-owner",
+        ttl_seconds=60,
+    )
+    assert held.acquired is True
+
+    busy_response = c.get("/backtests/v1")
+
+    assert busy_response.status_code == 200
+    busy = busy_response.json()["active_run"]
+    assert busy["state"] == "busy"
+    assert busy["retry_after_seconds"] > 0
+    assert "owner" not in busy
+    assert datetime.fromisoformat(busy["observed_at"]).tzinfo is not None
+
+    assert leases.release(
+        "backtest:global",
+        owner=held.owner,
+        generation=held.generation,
+    )
+    clear_response = c.get("/backtests/v1")
+
+    assert clear_response.status_code == 200
+    assert clear_response.json()["active_run"] == {
+        "state": "clear",
+        "observed_at": clear_response.json()["active_run"][
+            "observed_at"
+        ],
+        "retry_after_seconds": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -441,7 +765,7 @@ def test_report_rejects_invalid_encrypted_series(client, mutation):
         elif mutation == "cost_mismatch":
             payload["cost_assumptions"]["slippage_bps"]["equity"] = 999
         else:
-            payload["schema_version"] = 2
+            payload["schema_version"] = 3
         store.write_many(
             artifact,
             {
@@ -541,9 +865,9 @@ def test_report_rejects_unknown_artifact_keys(client):
             BacktestArtifact(
                 run_id=run_id,
                 artifact_key="unexpected",
-                schema_version=1,
+                schema_version=2,
             ),
-            {"payload_json": '{"schema_version":1}'},
+            {"payload_json": '{"schema_version":2}'},
             session_factory=svc.session_factory,
         )
         session.commit()

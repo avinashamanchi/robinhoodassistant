@@ -29,7 +29,12 @@ from .data import DataSource
 from .engine import BacktestResult, run_backtest
 from .holdout import HoldoutGuard
 from .metrics import Metrics, compute_metrics
-from .report import EvaluationReport, ReportRow
+from .report import (
+    BACKTEST_ARTIFACT_SCHEMA_VERSION,
+    EvaluationReport,
+    ReportRow,
+    canonical_metric_rows_digest,
+)
 
 StrategyFactory = Callable[[], Strategy]
 
@@ -314,8 +319,9 @@ def _persist_artifacts(
         raise ValueError("successful backtest has no equity evidence")
     actual_start = min(timestamp for timestamp, _ in all_points)
     actual_end = max(timestamp for timestamp, _ in all_points)
+    metric_rows = [row.to_dict() for row in report.rows]
     manifest = {
-        "schema_version": 1,
+        "schema_version": BACKTEST_ARTIFACT_SCHEMA_VERSION,
         "data_source": context.data_source,
         "requested_range": {
             "start": _utc_iso(
@@ -340,6 +346,9 @@ def _persist_artifacts(
         "backtest_config": context.backtest_config.model_dump(mode="json"),
         "symbols": list(context.symbols),
         "strategies": list(context.strategies),
+        "metric_rows_sha256": canonical_metric_rows_digest(
+            metric_rows
+        ),
         "holdout_start": _utc_iso(
             report.holdout_start,
             name="holdout_start",
@@ -381,7 +390,7 @@ def _persist_artifacts(
         if not strategy_curve or not benchmark_curve:
             raise ValueError("backtest row is missing equity evidence")
         payload = {
-            "schema_version": 1,
+            "schema_version": BACKTEST_ARTIFACT_SCHEMA_VERSION,
             "row_index": index,
             "symbol": row.symbol,
             "strategy": row.strategy,
@@ -424,7 +433,7 @@ def _add_artifact(
         BacktestArtifact(
             run_id=run_id,
             artifact_key=artifact_key,
-            schema_version=1,
+            schema_version=BACKTEST_ARTIFACT_SCHEMA_VERSION,
         ),
         {"payload_json": encoded},
     )

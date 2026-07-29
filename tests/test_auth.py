@@ -87,6 +87,7 @@ def test_all_non_liveness_routes_require_session(client):
         "/plans",
         "/plans/ui",
         "/backtests",
+        "/backtests/v1",
         "/backtests/ui",
     ]:
         assert client.get(path).status_code == 401, path
