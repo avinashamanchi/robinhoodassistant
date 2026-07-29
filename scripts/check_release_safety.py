@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import ast
 from dataclasses import dataclass, field
+import hashlib
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -22,6 +24,63 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 _SAFE_FINDING_PATH = re.compile(
     r"(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+"
 )
+_GIT_EXECUTABLE: Path | None = None
+_GIT_RESOLUTION_ATTEMPTED = False
+
+
+def _resolve_git_executable() -> Path | None:
+    configured_path = os.environ.get("TRADING_ASSISTANT_VERIFIED_GIT")
+    configured_fingerprint = os.environ.get(
+        "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT"
+    )
+    if bool(configured_path) != bool(configured_fingerprint):
+        return None
+    raw_path = configured_path or shutil.which("git")
+    if not raw_path:
+        return None
+    try:
+        path = Path(raw_path).resolve(strict=True)
+        before = path.stat()
+    except OSError:
+        return None
+    if (
+        not path.is_file()
+        or not os.access(path, os.X_OK)
+        or before.st_mode & 0o002
+    ):
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError:
+        return None
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        return None
+    fingerprint = f"sha256:{digest.hexdigest()}"
+    if configured_fingerprint and configured_fingerprint != fingerprint:
+        return None
+    return path
+
+
+def _git_executable() -> Path | None:
+    global _GIT_EXECUTABLE, _GIT_RESOLUTION_ATTEMPTED
+    if not _GIT_RESOLUTION_ATTEMPTED:
+        _GIT_EXECUTABLE = _resolve_git_executable()
+        _GIT_RESOLUTION_ATTEMPTED = True
+    return _GIT_EXECUTABLE
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -121,15 +180,18 @@ def _fail(message: str) -> None:
 def _git_tracked_names(root: Path) -> tuple[str, ...] | None:
     """Return tracked root-relative paths without opening any tracked file."""
 
+    git = _git_executable()
+    if git is None:
+        return None
     try:
         top = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            [str(git), "rev-parse", "--show-toplevel"],
             cwd=root,
             check=False,
             capture_output=True,
         )
         tracked = subprocess.run(
-            ["git", "ls-files", "-z", "--"],
+            [str(git), "ls-files", "-z", "--"],
             cwd=root,
             check=False,
             capture_output=True,
@@ -5330,6 +5392,7 @@ _CREDENTIAL_FINGERPRINTS: tuple[
 )
 _MAX_SCANNED_BLOB_BYTES = 5 * 1024 * 1024
 _MAX_HISTORY_BATCH_BYTES = 128 * 1024 * 1024
+_MAX_HISTORY_MESSAGE_BYTES = 1024 * 1024
 
 
 def _credential_fingerprint_matches(
@@ -5378,6 +5441,9 @@ def _history_git(
     input_bytes: bytes | None = None,
     timeout: float = 60.0,
 ) -> subprocess.CompletedProcess[bytes] | None:
+    git = _git_executable()
+    if git is None:
+        return None
     environment = {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -5387,7 +5453,7 @@ def _history_git(
     }
     try:
         return subprocess.run(
-            ("git", *arguments),
+            (str(git), *arguments),
             cwd=root,
             env=environment,
             input=input_bytes,
@@ -5416,6 +5482,85 @@ def _history_commits(root: Path) -> tuple[str, ...] | None:
             seen.add(commit)
             commits.append(commit)
     return tuple(commits)
+
+
+def _history_is_shallow(root: Path) -> bool | None:
+    completed = _history_git(
+        root,
+        ("rev-parse", "--is-shallow-repository"),
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    answer = completed.stdout.strip()
+    if answer == b"true":
+        return True
+    if answer == b"false":
+        return False
+    return None
+
+
+def _history_message_findings(
+    root: Path,
+    commits: tuple[str, ...],
+) -> list[ReleaseViolation] | None:
+    findings: list[ReleaseViolation] = []
+    for commit in commits:
+        completed = _history_git(
+            root,
+            ("show", "-s", "--format=%B", commit),
+        )
+        if completed is None or completed.returncode != 0:
+            return None
+        if len(completed.stdout) > _MAX_HISTORY_MESSAGE_BYTES:
+            return [
+                _finding("GIT_HISTORY_MESSAGE_UNSCANNED", ".", 1)
+            ]
+        for code, _offset in _credential_fingerprint_matches(
+            completed.stdout
+        ):
+            findings.append(
+                _history_finding(code, commit, "commit-message")
+            )
+
+    tags = _history_git(
+        root,
+        (
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype)",
+            "refs/tags",
+        ),
+    )
+    if tags is None or tags.returncode != 0:
+        return None
+    for raw_line in tags.stdout.splitlines():
+        fields = raw_line.split()
+        if len(fields) != 2:
+            return None
+        raw_object, object_type = fields
+        try:
+            object_id = raw_object.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None:
+            return None
+        if object_type == b"commit":
+            continue
+        if object_type != b"tag":
+            return None
+        completed = _history_git(root, ("cat-file", "tag", object_id))
+        if completed is None or completed.returncode != 0:
+            return None
+        if len(completed.stdout) > _MAX_HISTORY_MESSAGE_BYTES:
+            return [
+                _finding("GIT_HISTORY_MESSAGE_UNSCANNED", ".", 1)
+            ]
+        for code, _offset in _credential_fingerprint_matches(
+            completed.stdout
+        ):
+            findings.append(
+                _history_finding(code, object_id, "tag-message")
+            )
+    return findings
 
 
 def _history_tree(
@@ -5554,6 +5699,11 @@ def _history_blob_payloads(
 
 
 def _scan_git_history(root: Path) -> list[ReleaseViolation]:
+    shallow = _history_is_shallow(root)
+    if shallow is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    if shallow:
+        return [_finding("GIT_HISTORY_SHALLOW", ".", 1)]
     commits = _history_commits(root)
     if commits is None:
         return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
@@ -5561,6 +5711,10 @@ def _scan_git_history(root: Path) -> list[ReleaseViolation]:
         return []
 
     findings: list[ReleaseViolation] = []
+    message_findings = _history_message_findings(root, commits)
+    if message_findings is None:
+        return [_finding("GIT_HISTORY_UNPROVEN", ".", 1)]
+    findings.extend(message_findings)
     references: dict[str, list[tuple[str, str]]] = {}
     for commit in commits:
         entries = _history_tree(root, commit)
@@ -7304,7 +7458,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
         args = parser.parse_args(argv)
         root = args.root.resolve(strict=True)
-        findings = _collect_release_violations(root)
+        if _git_executable() is None:
+            findings = [_finding("GIT_TOOL_UNPROVEN", "internal", 1)]
+        else:
+            findings = _collect_release_violations(root)
     except SystemExit as exc:
         if exc.code == 0:
             return 0

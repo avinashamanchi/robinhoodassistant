@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 import importlib.util
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -3929,6 +3932,150 @@ def test_deleted_historical_credential_reports_only_rule_commit_and_path(
     assert token not in completed.stderr
     assert "credential:" not in completed.stderr
     assert "add retired credential" not in completed.stderr
+
+
+def test_shallow_history_is_rejected_before_it_can_hide_a_retired_credential(
+    tmp_path,
+):
+    origin_parent = tmp_path / "origin"
+    origin_parent.mkdir()
+    origin = _trust_fixture(origin_parent)
+    _commit_release_fixture(origin, "baseline")
+    token = "ck_" + "MixedCase9ShallowHistoryCredential"
+    relative_path = "docs/retired-shallow-credential.md"
+    _write_fixture_file(origin, relative_path, f"credential: {token}\n")
+    _commit_release_fixture(origin, "add retired credential")
+    (origin / relative_path).unlink()
+    _commit_release_fixture(origin, "remove retired credential")
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--depth=1",
+            origin.resolve().as_uri(),
+            str(shallow),
+        ],
+        check=True,
+    )
+
+    completed = _run_trust_gate(shallow)
+
+    assert completed.returncode == 1
+    assert completed.stderr.splitlines()[0] == "GIT_HISTORY_SHALLOW .:1"
+    assert token not in completed.stderr
+
+
+@pytest.mark.parametrize("surface", ("commit", "tag"))
+def test_historical_ref_messages_are_scanned_without_printing_values(
+    tmp_path,
+    surface,
+):
+    root = _trust_fixture(tmp_path)
+    _commit_release_fixture(root, "baseline")
+    token = "ck_" + "MixedCase9RefMessageCredential"
+    if surface == "commit":
+        _write_fixture_file(root, "docs/message-change.md", "safe\n")
+        offending_object = _commit_release_fixture(
+            root,
+            f"message contains {token}",
+        )
+        expected_path = "commit-message"
+    else:
+        subprocess.run(
+            ["git", "tag", "-a", "release-test", "-m", f"tag contains {token}"],
+            cwd=root,
+            check=True,
+        )
+        offending_object = subprocess.run(
+            ["git", "rev-parse", "refs/tags/release-test"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        expected_path = "tag-message"
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert (
+        f"COMPOSIO_CREDENTIAL_FINGERPRINT "
+        f"{offending_object} {expected_path}"
+        in completed.stderr
+    )
+    assert token not in completed.stderr
+
+
+def test_static_gate_uses_verified_git_identity_not_later_path_resolution(
+    tmp_path,
+):
+    root = _trust_fixture(tmp_path)
+    _commit_release_fixture(root, "baseline")
+    git_path = Path(shutil.which("git") or "").resolve()
+    assert git_path.is_file()
+    fingerprint = "sha256:" + hashlib.sha256(git_path.read_bytes()).hexdigest()
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    fake_git.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": str(fake_bin),
+        "TRADING_ASSISTANT_VERIFIED_GIT": str(git_path),
+        "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT": fingerprint,
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_static_gate_rejects_mismatched_verified_git_without_path_or_hash_leak(
+    tmp_path,
+):
+    root = _trust_fixture(tmp_path)
+    _commit_release_fixture(root, "baseline")
+    git_path = Path(shutil.which("git") or "").resolve()
+    assert git_path.is_file()
+    bad_fingerprint = "sha256:" + "0" * 64
+    environment = {
+        **os.environ,
+        "TRADING_ASSISTANT_VERIFIED_GIT": str(git_path),
+        "TRADING_ASSISTANT_VERIFIED_GIT_FINGERPRINT": bad_fingerprint,
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_release_safety.py",
+            "--root",
+            str(root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr.splitlines()[0] == "GIT_TOOL_UNPROVEN internal:1"
+    assert str(git_path) not in completed.stderr
+    assert bad_fingerprint not in completed.stderr
 
 
 def _ci_workflow() -> tuple[str, dict[str, object]]:
