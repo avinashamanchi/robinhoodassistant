@@ -65,7 +65,7 @@
 - Defines CSS token names, state semantics, responsive breakpoints, and page landmarks.
 - Produces reusable static assertions before markup changes.
 
-- [ ] **Step 1: Write the repository design contract**
+- [x] **Step 1: Write the repository design contract**
 
 Use these exact core tokens:
 
@@ -99,7 +99,7 @@ Use these exact core tokens:
 - desktop `>=1180`, compact `760–1179`, mobile `<760`;
 - no trademark or remote asset usage.
 
-- [ ] **Step 2: Write failing page/token tests**
+- [x] **Step 2: Write failing page/token tests**
 
 ```python
 def test_console_declares_approved_tokens():
@@ -126,7 +126,7 @@ label, local stylesheet/script, no remote URL, no inline style/script, no
 `innerHTML`, no `insertAdjacentHTML`, no `<img src="http`, and no unlabelled
 form control.
 
-- [ ] **Step 3: Run and verify current-style failures**
+- [x] **Step 3: Run and verify current-style failures**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py -v
@@ -134,7 +134,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py -v
 
 Expected: FAIL because the approved tokens/mark/page contract are absent.
 
-- [ ] **Step 4: Keep the red test uncommitted and proceed to Task 2**
+- [x] **Step 4: Keep the red test uncommitted and proceed to Task 2**
 
 Record the exact failing assertions in the task notes. Do not commit a red test
 suite; Task 2 implements the shared system and commits the test with its passing
@@ -162,7 +162,7 @@ code.
   `.button`, `.dialog`, `.skeleton`, and `.empty-state` components.
 - Keeps static assets self-hosted and immutable.
 
-- [ ] **Step 1: Create an original geometric mark**
+- [x] **Step 1: Create an original geometric mark**
 
 Use a 32×32 SVG with:
 
@@ -173,7 +173,7 @@ Use a 32×32 SVG with:
 - accessible use through adjacent visible product text, so the SVG itself is
   `aria-hidden="true"`.
 
-- [ ] **Step 2: Replace the stylesheet with token-driven layers**
+- [x] **Step 2: Replace the stylesheet with token-driven layers**
 
 Order CSS sections exactly:
 
@@ -193,7 +193,7 @@ Use `font-variant-numeric: tabular-nums` for quantities, prices, times, budgets,
 and percentages. Body minimum size is 14px; metadata may be 12px. No gradient
 behind body text. Purple glow is limited to focus/selected/action surfaces.
 
-- [ ] **Step 3: Install one shared shell in all authenticated pages**
+- [x] **Step 3: Install one shared shell in all authenticated pages**
 
 Each page gets:
 
@@ -207,7 +207,7 @@ Each page gets:
 Preserve existing route links and element IDs used by JavaScript. Replace the
 text “flight deck” everywhere.
 
-- [ ] **Step 4: Implement component states**
+- [x] **Step 4: Implement component states**
 
 Every dynamic component must have CSS classes for:
 
@@ -225,7 +225,7 @@ has-error
 Unknown and stale cannot inherit verified color. Disabled destructive buttons
 must remain visibly disabled and retain explanatory text.
 
-- [ ] **Step 5: Run static component tests**
+- [x] **Step 5: Run static component tests**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security_headers.py -v
@@ -233,7 +233,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security_headers.py -v
 
 Expected: all tests written through Task 2 PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add DESIGN.md src/trading_assistant/app/static/img/trading-orbit.svg src/trading_assistant/app/static/css/console.css src/trading_assistant/app/static/index.html src/trading_assistant/app/static/plans.html src/trading_assistant/app/static/backtests.html src/trading_assistant/app/static/login.html tests/test_frontend_ui.py tests/test_security.py tests/test_security_headers.py
