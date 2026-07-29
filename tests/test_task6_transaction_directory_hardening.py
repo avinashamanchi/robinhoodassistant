@@ -71,12 +71,49 @@ def _create(source: Path, destination: Path, **kwargs):
 
 
 def _process_context():
-    method = (
-        "fork"
-        if "fork" in multiprocessing.get_all_start_methods()
-        else "spawn"
-    )
-    return multiprocessing.get_context(method)
+    return multiprocessing.get_context("spawn")
+
+
+def _join_fixture_process(
+    process,
+    *,
+    expected_exitcode: int,
+    timeout: float = 10,
+) -> None:
+    process.join(timeout=timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        pytest.fail("fixture_process_timeout")
+    assert process.exitcode == expected_exitcode
+
+
+def test_crash_fixture_processes_use_fresh_interpreter_context():
+    assert _process_context().get_start_method() == "spawn"
+
+
+def test_timed_out_fixture_process_is_terminated_and_reaped():
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=time.sleep, args=(60,))
+    process.start()
+    try:
+        with pytest.raises(
+            pytest.fail.Exception,
+            match="^fixture_process_timeout$",
+        ):
+            _join_fixture_process(
+                process,
+                expected_exitcode=0,
+                timeout=0.01,
+            )
+        assert not process.is_alive()
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
 
 
 def _crash_at_stage(
@@ -262,9 +299,7 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
         args=(source, destination, stage),
     )
     process.start()
-    process.join(timeout=10)
-
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transactions = _transaction_directories(destination)
     assert len(transactions) == 1
     transaction = transactions[0]
@@ -322,9 +357,7 @@ def test_manifest_is_durable_only_after_all_members_are_precreated(tmp_path):
         args=(source, destination, "transaction_manifest_durable"),
     )
     process.start()
-    process.join(timeout=10)
-
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     assert {candidate.name for candidate in transaction.iterdir()} == (
         _TRANSACTION_MEMBERS
@@ -352,8 +385,7 @@ def test_recovery_preserves_operator_replacement_at_every_crash_stage(
         args=(source, destination, stage),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     replacement = transaction / "encrypted.aesgcm"
     if replacement.exists() or replacement.is_symlink():
@@ -391,8 +423,7 @@ def test_recovery_preserves_unrecorded_old_sidecar_name(
         args=(source, destination, stage),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     sidecar = transaction / "snapshot.sqlite3-wal"
     sidecar.write_bytes(b"operator-owned-sidecar")
@@ -440,8 +471,7 @@ def test_recovery_converges_when_recorded_members_are_already_absent(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     for name in missing_names:
         (transaction / name).unlink()
@@ -479,8 +509,7 @@ def test_partial_recovery_preserves_extra_or_replaced_entries(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     (transaction / "encrypted.aesgcm").unlink()
     if damage == "extra":
@@ -537,8 +566,7 @@ def test_aged_partial_active_transaction_is_protected_by_manifest_lock(
     assert elapsed < 1.5
     assert _namespace_identities(transaction) == before_recovery
     release.set()
-    process.join(timeout=10)
-    assert process.exitcode == 0
+    _join_fixture_process(process, expected_exitcode=0)
 
     for _attempt in range(2):
         backup_module._recover_backup_orphans(
@@ -579,8 +607,7 @@ def test_busy_transaction_manifest_is_bounded_and_preserved(tmp_path):
     assert elapsed < 1.5
     assert transaction.exists()
     release.set()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
 
     _age_tree(transaction, recovery_now - 120)
     backup_module._recover_backup_orphans(
@@ -610,8 +637,7 @@ def test_recovery_preserves_ambiguous_transaction_directories(
         args=(source, destination, "snapshot_created"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     if damage == "corrupt_manifest":
         manifest = transaction / "manifest"
@@ -648,8 +674,7 @@ def test_manifest_copy_and_symlink_namespace_are_not_adopted(tmp_path):
         args=(source, destination, "snapshot_created"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     original = _transaction_directories(destination)[0]
     copied = destination / f"{_TRANSACTION_PREFIX}{'c' * 32}"
     copied.mkdir(mode=0o700)
@@ -710,8 +735,7 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
         args=(source, destination, "before_artifact_commit"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     assert _transaction_directories(destination) == ()
     assert list_committed_backups(destination) == ()
     assert len(tuple(destination.glob(".*.commit-state"))) == 1
@@ -753,8 +777,7 @@ def test_partial_cleanup_recovery_converges_after_unlink_failure(
         args=(source, destination, "snapshot_created"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -829,8 +852,7 @@ def test_recovery_preserves_replacement_at_identity_unlink_seam(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -886,8 +908,7 @@ def test_recovery_member_lock_is_bounded_and_preserves_namespace(tmp_path):
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -913,8 +934,7 @@ def test_recovery_member_lock_is_bounded_and_preserves_namespace(tmp_path):
     assert transaction.exists()
     assert _namespace_identities(transaction) == before_recovery
     release.set()
-    holder.join(timeout=10)
-    assert holder.exitcode == 0
+    _join_fixture_process(holder, expected_exitcode=0)
 
     for _attempt in range(2):
         backup_module._recover_backup_orphans(
@@ -938,8 +958,7 @@ def test_recovery_preserves_external_hardlink_and_transaction(tmp_path):
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     operator_link = destination / "operator-snapshot-link"
     os.link(transaction / "snapshot.sqlite3", operator_link)
@@ -978,8 +997,7 @@ def test_post_isolation_ambiguity_restores_original_namespace(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -1057,8 +1075,7 @@ def test_new_original_name_after_isolation_is_never_overwritten(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     original_members = _namespace_identities(transaction)
     recovery_now = time.time()
@@ -1125,8 +1142,7 @@ def test_ambiguous_successful_isolation_is_restored_without_cleanup(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -1186,8 +1202,7 @@ def test_isolation_parent_fsync_failure_restores_without_cleanup(
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -1238,8 +1253,7 @@ def test_real_crash_after_quarantine_rename_is_recoverable(tmp_path):
         args=(source, destination, "quick_check_complete"),
     )
     process.start()
-    process.join(timeout=10)
-    assert process.exitcode == 73
+    _join_fixture_process(process, expected_exitcode=73)
     transaction = _transaction_directories(destination)[0]
     recovery_now = time.time()
     _age_tree(transaction, recovery_now - 120)
@@ -1248,9 +1262,7 @@ def test_real_crash_after_quarantine_rename_is_recoverable(tmp_path):
         args=(destination, recovery_now),
     )
     recovery.start()
-    recovery.join(timeout=10)
-
-    assert recovery.exitcode == 79
+    _join_fixture_process(recovery, expected_exitcode=79)
     assert _transaction_directories(destination) == ()
     quarantines = _quarantine_directories(destination)
     assert len(quarantines) == 1

@@ -123,7 +123,7 @@ def test_preflight_builder_constructs_only_narrow_read_only_service(
     ]
 
 
-def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
+def test_read_only_preflight_probe_performs_no_trading_table_dml_or_broker_mutation(
     make_service,
 ):
     from sqlalchemy import event
@@ -143,7 +143,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
     broker = ReadOnlyBroker()
     mutable_service = make_service(broker=broker)
     engine = mutable_service.session_factory.kw["bind"]
-    writes: list[str] = []
+    trading_table_dml: list[str] = []
 
     def record_statement(
         _connection,
@@ -155,7 +155,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
     ):
         verb = statement.lstrip().partition(" ")[0].upper()
         if verb in {"DELETE", "INSERT", "REPLACE", "UPDATE"}:
-            writes.append(verb)
+            trading_table_dml.append(verb)
 
     event.listen(engine, "before_cursor_execute", record_statement)
     try:
@@ -169,7 +169,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
 
     assert snapshot.orders_match is True
     assert snapshot.positions_match is True
-    assert writes == []
+    assert trading_table_dml == []
     assert {
         name
         for name in dir(type(probe))

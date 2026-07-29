@@ -391,6 +391,30 @@ class MacOSKeychainSecretProvider:
         )
         return loaded
 
+    def load_for_role(
+        self,
+        *,
+        role: str,
+        config: AppConfig,
+    ) -> RuntimeSecrets:
+        """Read only the Keychain accounts visible to one runtime role."""
+        values = {
+            field_name: self._get(field_name) or ""
+            for field_name in _role_simple_secret_fields(role, config)
+        }
+        field_keys: dict[str, str] = {}
+        if _role_requires_key_material(role):
+            for key_id in _configured_key_ids(config.encryption):
+                account = f"field-encryption/{key_id}"
+                value = self._get(account)
+                if value is None or not value:
+                    raise SecretUnavailable(account, "missing")
+                field_keys[key_id] = value
+        return RuntimeSecrets(
+            **values,
+            field_encryption_keys=field_keys,
+        )
+
     def read_presence(
         self,
         *,
@@ -552,6 +576,45 @@ def _required_fields(role: str, config: AppConfig) -> tuple[str, ...]:
     return tuple(fields)
 
 
+def _role_requires_key_material(role: str) -> bool:
+    """Watchdog is the sole role with no cryptographic write capability."""
+    return role != "watchdog"
+
+
+def _role_simple_secret_fields(
+    role: str,
+    config: AppConfig,
+) -> tuple[str, ...]:
+    fields = list(_required_fields(role, config))
+    if _role_requires_key_material(role):
+        fields.extend(
+            (
+                "candidate_signing_key",
+                "backup_encryption_key",
+            )
+        )
+    return tuple(dict.fromkeys(fields))
+
+
+def _project_role_secrets(
+    role: str,
+    config: AppConfig,
+    loaded: RuntimeSecrets,
+) -> RuntimeSecrets:
+    """Drop every secret outside the selected role's capability set."""
+    return RuntimeSecrets(
+        **{
+            field_name: getattr(loaded, field_name)
+            for field_name in _role_simple_secret_fields(role, config)
+        },
+        field_encryption_keys=(
+            loaded.field_encryption_keys
+            if _role_requires_key_material(role)
+            else {}
+        ),
+    )
+
+
 def _validate_required_fields(
     role: str,
     config: AppConfig,
@@ -675,13 +738,22 @@ def load_role_secrets(
             raise UnsafeSecretProvider(
                 f"production role={role} requires macOS Keychain"
             )
-    loaded = selected.load(encryption=config.encryption)
+    loaded = (
+        selected.load_for_role(role=role, config=config)
+        if isinstance(selected, MacOSKeychainSecretProvider)
+        else _project_role_secrets(
+            role,
+            config,
+            selected.load(encryption=config.encryption),
+        )
+    )
 
     from ..logging import register_all_secrets
 
     register_all_secrets(loaded)
     _validate_required_fields(role, config, loaded)
-    _validate_key_material(config, loaded)
+    if _role_requires_key_material(role):
+        _validate_key_material(config, loaded)
     if hasattr(selected, "last_successful_role_load_at"):
         selected.last_successful_role_load_at = datetime.now(timezone.utc)
     return loaded

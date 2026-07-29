@@ -344,10 +344,11 @@ not decrypt rows. The startup guard performs the one full envelope scan. Only
 after all five pass does preflight run the paper-mode, schema, WAL, breaker,
 Alpaca-read, quote, and broker/local reconciliation checks. Reconciliation uses
 a dedicated read-only `preflight` service exposing one snapshot probe. It calls
-only broker open-order/position reads and local SQL `SELECT`s; it constructs no
-mutable `TradingService`, clock client, field cipher, LLM provider, agent, app,
-or notifier. There is no daemon-health preflight row; daemon freshness is
-observed separately after startup.
+only broker open-order/position reads and performs no trading-table DML. Local
+SQLite setup still establishes WAL and applies sidecar permissions before the
+probe. The probe constructs no mutable `TradingService`, clock client, field
+cipher, LLM provider, agent, app, or notifier. There is no daemon-health
+preflight row; daemon freshness is observed separately after startup.
 
 Preflight never submits a new order, calls an LLM, or sends an external
 notification, repairs order state, cancels an order, or writes reconciliation

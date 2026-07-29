@@ -32,8 +32,10 @@ The TLS setup installs the canonical `rootCA.pem`, `localhost.pem`, and
 `localhost-key.pem` layout; watchdog verification uses the CA file, never the
 leaf as a trust bundle. After the five structural rows pass, preflight uses a
 dedicated read-only reconciliation service. That service exposes one snapshot
-probe, calls only broker open-order/position reads and local SQL `SELECT`s, and
-cannot repair, cancel, submit, notify, or construct a mutable trading service.
+probe, calls only broker open-order/position reads, and performs no trading-table DML.
+SQLite setup still establishes WAL and applies sidecar
+permissions. The probe cannot repair, cancel, submit, notify, or construct a
+mutable trading service.
 Rotation requires a reviewed new retained key ID, an interactive
 `set-encryption-key`, stopped-writer `encrypt_sensitive rotate`, a coordinated
 active/retained config transition, and a final Keychain audit plus envelope

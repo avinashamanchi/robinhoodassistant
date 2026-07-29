@@ -568,9 +568,16 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 + list(nested.args.args)
                 + list(nested.args.kwonlyargs)
             )
+            nested_by_name = {
+                parameter.arg: parameter
+                for parameter in nested_arguments
+            }
             nested_bindings: dict[str, str] = {}
             for parameter, argument in zip(
-                nested_arguments,
+                (
+                    list(nested.args.posonlyargs)
+                    + list(nested.args.args)
+                ),
                 statement.args,
             ):
                 model = (
@@ -581,6 +588,26 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
                 )
                 if model is not None:
                     nested_bindings[parameter.arg] = model
+            for keyword in statement.keywords:
+                if (
+                    keyword.arg is None
+                    or keyword.arg not in nested_by_name
+                ):
+                    if keyword.arg is None:
+                        self._report(
+                            statement,
+                            "unknown_model",
+                            "**helper_flow",
+                        )
+                    continue
+                model = (
+                    local_bindings.get(keyword.value.id)
+                    if isinstance(keyword.value, ast.Name)
+                    else self._object_model(keyword.value)
+                    or self._call_model(keyword.value)
+                )
+                if model is not None:
+                    nested_bindings[keyword.arg] = model
             if nested_bindings:
                 self._inspect_local_helper(
                     nested,
@@ -709,11 +736,20 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             isinstance(node.func, ast.Name)
             and node.func.id in self.mutation_call_models
         ):
+            values_mapping = self._keyword(node, "values")
             self._check_mapping(
                 node,
                 self.mutation_call_models[node.func.id],
-                args=node.args,
-                keywords=node.keywords,
+                args=(
+                    (*node.args, values_mapping)
+                    if values_mapping is not None
+                    else node.args
+                ),
+                keywords=(
+                    keyword
+                    for keyword in node.keywords
+                    if keyword.arg != "values"
+                ),
             )
 
         call_name = _name(node.func)

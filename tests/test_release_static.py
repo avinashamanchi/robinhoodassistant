@@ -1842,6 +1842,7 @@ def test_composio_must_remain_explicitly_disabled(
         ),
         (
             "src/trading_assistant/proxy.py",
+            "from httpx import Client\n"
             "client = Client(trust_env=True)\n",
             "PROXY_HEADERS_TRUSTED",
         ),
@@ -3679,3 +3680,131 @@ def test_computed_credential_query_key_is_rejected(tmp_path):
 
     assert completed.returncode == 1
     assert "QUERY_SECRET" in completed.stderr
+
+
+# ── Task 11 review round 4 regressions ────────────────────────────────
+
+
+def test_final_authority_rejects_mutation_built_collection_alias(tmp_path):
+    root = _trust_fixture(tmp_path)
+    target = root / "src/trading_assistant/security/sensitive_fields.py"
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + (
+            "\nregistry_box = []\n"
+            "registry_box.append(SENSITIVE_FIELDS)\n"
+            "registry_box[0].clear()\n"
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
+
+
+def test_sensitive_bound_update_alias_resolves_keyword_values(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/bound_sensitive_update.py",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "mutate = session.query(AuditEvent).update\n"
+        "mutate(values={'reason': 'round4-fixture'})\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
+    assert "round4-fixture" not in completed.stderr
+
+
+def test_sensitive_nested_keyword_only_helper_propagates_model(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/nested_sensitive_helper.py",
+        "from trading_assistant.db.models import AuditEvent\n"
+        "def nested(*, record):\n"
+        "    record.reason = 'round4-fixture'\n"
+        "def outer(record):\n"
+        "    nested(record=record)\n"
+        "event = session.get(AuditEvent, 1)\n"
+        "outer(event)\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
+    assert "round4-fixture" not in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        (
+            "import starlette.middleware.cors as cors\n"
+            "middlewares = []\n"
+            "middlewares.append(cors.CORSMiddleware)\n"
+            "app.add_middleware(middlewares[0], allow_origins=['*'])\n",
+            "WILDCARD_HOST_ORIGIN",
+        ),
+        (
+            "import http.client as http_client\n"
+            "clients = []\n"
+            "clients.insert(0, http_client.HTTPSConnection)\n"
+            "clients[0]('example.invalid')\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "cookies = []\n"
+            "cookies.extend([response.set_cookie])\n"
+            "cookies[0]('session', secure=False, httponly=True, "
+            "samesite='strict')\n",
+            "INSECURE_COOKIE",
+        ),
+        (
+            "import ssl as tls\n"
+            "factories = {}\n"
+            "factories.update(factory=tls._create_unverified_context)\n"
+            "factories['factory']()\n",
+            "TLS_DISABLED",
+        ),
+    ],
+    ids=("cors-append", "http-insert", "cookie-extend", "ssl-update"),
+)
+def test_mutation_built_security_identity_collections_fail_closed(
+    tmp_path,
+    source,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/mutation_built_security_identity.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_local_client_verify_keyword_is_not_network_transport(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/local_client.py",
+        "class Client:\n"
+        "    def __init__(self, *, verify):\n"
+        "        self.verify = verify\n"
+        "client = Client(verify=False)\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr

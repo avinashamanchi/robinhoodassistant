@@ -34,9 +34,10 @@ Field preflight is metadata-only; the startup guard owns the full envelope
 scan. Local TLS requires `rootCA.pem`, `localhost.pem`, and
 `localhost-key.pem`; the watchdog trusts only the CA file. After structural
 success, preflight uses a dedicated read-only snapshot service that performs
-only broker open-order/position reads and local SQL `SELECT`s. It cannot repair
-or cancel orders and constructs no mutable trading service, LLM provider,
-agent, app, or notifier. Keychain migration, field
+only broker open-order/position reads and performs no trading-table DML. SQLite
+setup still establishes WAL and applies sidecar permissions. The probe cannot
+repair or cancel orders and constructs no mutable trading service, LLM
+provider, agent, app, or notifier. Keychain migration, field
 migration/rotation, and encrypted restore procedures are in
 `docs/RUNBOOK.md`; no secret value belongs on a command line.
 For rotation, keep every writer stopped, configure and prompt for the reviewed

@@ -361,6 +361,19 @@ def _canonical_assignment_finding(
             return [_finding(code, relative, node.lineno)]
         elif (
             isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _AUTHORITY_MUTATORS
+            and any(
+                _contains_loaded_name(expression, aliases)
+                for expression in (
+                    *node.args,
+                    *(keyword.value for keyword in node.keywords),
+                )
+            )
+        ):
+            return [_finding(code, relative, node.lineno)]
+        elif (
+            isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id in mutator_aliases
         ):
@@ -3430,6 +3443,19 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
                 indirect_expression = candidate.value
             elif (
                 isinstance(candidate, ast.Call)
+                and isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr
+                in {"append", "extend", "insert", "update"}
+            ):
+                indirect_expression = ast.Tuple(
+                    elts=[
+                        *candidate.args,
+                        *(keyword.value for keyword in candidate.keywords),
+                    ],
+                    ctx=ast.Load(),
+                )
+            elif (
+                isinstance(candidate, ast.Call)
                 and isinstance(candidate.func, ast.Subscript)
             ):
                 indirect_expression = candidate.func.value
@@ -4365,16 +4391,32 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             return expression_path
 
         for candidate in ast.walk(tree):
-            if not (
+            indirect_expression = None
+            if (
                 isinstance(candidate, (ast.Assign, ast.AnnAssign))
                 and isinstance(
                     candidate.value,
                     (ast.Dict, ast.List, ast.Set, ast.Tuple),
                 )
             ):
+                indirect_expression = candidate.value
+            elif (
+                isinstance(candidate, ast.Call)
+                and isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr
+                in {"append", "extend", "insert", "update"}
+            ):
+                indirect_expression = ast.Tuple(
+                    elts=[
+                        *candidate.args,
+                        *(keyword.value for keyword in candidate.keywords),
+                    ],
+                    ctx=ast.Load(),
+                )
+            if indirect_expression is None:
                 continue
             indirect_network_identity = False
-            for item in ast.walk(candidate.value):
+            for item in ast.walk(indirect_expression):
                 if not isinstance(item, (ast.Name, ast.Attribute)):
                     continue
                 identity_path = canonical_network_path(item)
@@ -4603,7 +4645,6 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 or module_client
                 or module_request
                 or provider_client_name is not None
-                or call_name in _OUTBOUND_CLIENT_CONSTRUCTORS
                 or (
                     boundary_wrapper
                     and call_name.lower() in _OUTBOUND_REQUEST_METHODS

@@ -1955,19 +1955,31 @@ def test_sensitive_trust_downgrade_lock_closes_checked_after_race(
     migration_errors: list[BaseException] = []
     mutation_errors: list[BaseException] = []
     mutation_committed: list[bool] = []
+    paused_drop_points: list[tuple[str, str | None]] = []
     original_drop_index = alembic_op.drop_index
-    first_drop = True
 
-    def pause_after_gate(*args, **kwargs):
-        nonlocal first_drop
-        if first_drop:
-            first_drop = False
+    def pause_at_sensitive_0013_drop(*args, **kwargs):
+        drop_point = (
+            args[0] if args else "",
+            kwargs.get("table_name"),
+        )
+        if drop_point == (
+            "ux_untrusted_ingest_source_content",
+            "untrusted_ingest_events",
+        ):
+            paused_drop_points.append(
+                drop_point
+            )
             gate_checked.set()
             if not allow_ddl.wait(timeout=10):
                 raise RuntimeError("test_downgrade_pause_timeout")
         return original_drop_index(*args, **kwargs)
 
-    monkeypatch.setattr(alembic_op, "drop_index", pause_after_gate)
+    monkeypatch.setattr(
+        alembic_op,
+        "drop_index",
+        pause_at_sensitive_0013_drop,
+    )
 
     def run_downgrade() -> None:
         try:
@@ -1978,6 +1990,12 @@ def test_sensitive_trust_downgrade_lock_closes_checked_after_race(
     migration_thread = threading.Thread(target=run_downgrade)
     migration_thread.start()
     assert gate_checked.wait(timeout=10)
+    assert paused_drop_points == [
+        (
+            "ux_untrusted_ingest_source_content",
+            "untrusted_ingest_events",
+        )
+    ]
 
     concurrent_engine = create_db_engine(_url(database_path))
 

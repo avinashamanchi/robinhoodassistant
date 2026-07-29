@@ -13,6 +13,7 @@ from ..assets import broker_symbol_matches_local
 from ..broker.base import BrokerClient
 from ..broker.models import OrderStatus
 from ..db.models import (
+    FILL_RECONCILIATION_SUPERSEDED,
     FILL_RECONCILIATION_TRUSTED,
     PLAN_CANCEL_INDETERMINATE,
     PLAN_CANCEL_REQUESTED,
@@ -86,6 +87,7 @@ class ReadOnlyPreflightService:
                     Order.status,
                     Order.broker_order_id,
                     Order.plan_cancel_state,
+                    Order.qty,
                 ).where(
                     Order.status.in_(
                         _LOCAL_BROKER_OPEN_STATUSES
@@ -105,60 +107,95 @@ class ReadOnlyPreflightService:
 
         local_by_client: dict[
             str,
-            tuple[str, str, str | None, str],
+            tuple[str, str, str, str, Decimal],
         ] = {}
+        local_broker_ids: set[str] = set()
         orders_match = True
-        for client_id, ticker, status, broker_id, cancel_state in local_orders:
+        for (
+            client_id,
+            ticker,
+            status,
+            broker_id,
+            cancel_state,
+            qty,
+        ) in local_orders:
             if (
                 not isinstance(client_id, str)
-                or not client_id
+                or not client_id.strip()
                 or client_id in local_by_client
                 or status in _LOCAL_UNCERTAIN_STATUSES
                 or not isinstance(broker_id, str)
-                or not broker_id
+                or not broker_id.strip()
+                or broker_id in local_broker_ids
                 or cancel_state in _UNRESOLVED_CANCEL_STATES
+                or not isinstance(qty, Decimal)
+                or not qty.is_finite()
+                or qty <= 0
             ):
                 orders_match = False
             else:
+                local_broker_ids.add(broker_id)
                 local_by_client[client_id] = (
                     ticker,
                     status,
                     broker_id,
                     cancel_state,
+                    qty,
                 )
 
         remote_by_client: dict[str, object] = {}
+        remote_broker_ids: set[str] = set()
         for remote in remote_orders:
             client_id = getattr(remote, "idempotency_key", None)
             broker_id = getattr(remote, "broker_order_id", None)
             status = getattr(remote, "status", None)
             ticker = getattr(remote, "ticker", None)
+            filled_qty = getattr(remote, "filled_qty", None)
             if (
                 not isinstance(client_id, str)
-                or not client_id
+                or not client_id.strip()
                 or client_id in remote_by_client
                 or not isinstance(broker_id, str)
-                or not broker_id
+                or not broker_id.strip()
+                or broker_id in remote_broker_ids
                 or status not in _REMOTE_OPEN_STATUSES
                 or not isinstance(ticker, str)
-                or not ticker
+                or not ticker.strip()
+                or not isinstance(filled_qty, Decimal)
+                or not filled_qty.is_finite()
+                or filled_qty < 0
             ):
                 orders_match = False
                 continue
+            remote_broker_ids.add(broker_id)
             remote_by_client[client_id] = remote
 
         if set(local_by_client) != set(remote_by_client):
             orders_match = False
         for client_id in set(local_by_client).intersection(remote_by_client):
-            local_ticker, local_status, local_broker_id, _ = local_by_client[
-                client_id
-            ]
+            (
+                local_ticker,
+                local_status,
+                local_broker_id,
+                _,
+                local_qty,
+            ) = local_by_client[client_id]
             remote = remote_by_client[client_id]
             remote_status = getattr(remote, "status")
             remote_ticker = getattr(remote, "ticker")
+            remote_filled_qty = getattr(remote, "filled_qty")
             if (
                 getattr(remote, "broker_order_id") != local_broker_id
                 or remote_status.value != local_status
+                or remote_filled_qty > local_qty
+                or (
+                    remote_status is OrderStatus.SUBMITTED
+                    and remote_filled_qty != 0
+                )
+                or (
+                    remote_status is OrderStatus.PARTIALLY_FILLED
+                    and not (0 < remote_filled_qty < local_qty)
+                )
             ):
                 orders_match = False
             try:
@@ -181,6 +218,8 @@ class ReadOnlyPreflightService:
             broker_fill_id,
             reconciliation_state,
         ) in local_fills:
+            if reconciliation_state == FILL_RECONCILIATION_SUPERSEDED:
+                continue
             symbol = str(ticker).upper()
             if (
                 reconciliation_state != FILL_RECONCILIATION_TRUSTED
