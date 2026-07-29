@@ -87,14 +87,15 @@ def downgrade() -> None:
         allowed_modes=frozenset({"maintenance"}),
     )
     try:
-        # This singleton always exists after revision 0013. Updating an empty
-        # artifact table does not necessarily acquire SQLite's writer lock,
-        # which could let this migration perform DDL before a lower protected
-        # downgrade detects a concurrent writer.
+        # Alembic's version row always exists while a revision is running.
+        # Touch it to acquire SQLite's writer lock without re-validating a
+        # deliberately corrupt protected-domain row. A lower revision must
+        # retain authority to classify that row with its own stable blocker.
+        # Updating an empty artifact table does not necessarily acquire the
+        # lock, which could otherwise allow DDL before the lower check.
         connection.execute(
             sa.text(
-                "UPDATE sensitive_migration_state "
-                "SET singleton_id=singleton_id"
+                "UPDATE alembic_version SET version_num=version_num"
             )
         )
         rows = connection.scalar(
