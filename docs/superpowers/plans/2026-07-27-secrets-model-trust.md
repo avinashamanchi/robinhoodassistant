@@ -2180,6 +2180,41 @@ that public and test-only app construction were fully sealed.
   `a830889..5b28a24`, coherent brief/report/progress/plan evidence, and review
   supersession in a separate evidence-only commit.
 
+### Final Plan 2 deep broker-identity correction
+
+This correction supersedes only the prior package's overstatement that
+top-level fake broker validation proved the complete app service graph.
+
+- [x] Verify the P1 against base
+  `0062579231b7d718afd123eaf6e65766a973cb24`.
+- [x] Record exact RED:
+  `4 failed, 1 warning in 1.39s`.
+- [x] Inventory every direct broker holder reachable from the test app:
+  `TradingService`, snapshot, submission, and reconciliation.
+- [x] Define one typed invariant requiring the exact same `MockBroker` object,
+  exact cached broker identity, exact container aliases, and exact operations
+  service. Invoke it before/after issuance and again at consumption.
+- [x] Prove a shallow top-level broker replacement and post-issuance tampering
+  of each nested broker holder fail closed. Preserve existing stable errors
+  and `MockBroker` subclass ergonomics.
+- [x] Final focused proof:
+  exact selection `4 passed, 1 warning in 1.83s`; capability/error ordering
+  `6 passed, 1 warning in 1.12s`; complete file
+  `38 passed, 1 warning in 1.63s`.
+- [x] Preserve the affected-matrix fixture correction:
+  initial `3 failed, 1230 passed, 1 warning in 210.07s`; exact nodes
+  `3 passed, 1 warning in 1.33s`; final matrix
+  `1233 passed, 1 warning in 209.69s`.
+- [x] Static fixtures:
+  `304 passed in 92.98s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3716 passed, 1 skipped, 1 warning in 606.85s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `8e75752cee387384da2edad614fa206a2095da65`; package bounded diff
+  `0062579..8e75752`, coherent evidence, and prior-package supersession in a
+  separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

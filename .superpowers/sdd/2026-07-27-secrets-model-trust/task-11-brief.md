@@ -617,3 +617,43 @@ No production service, real Keychain/credential, ignored runtime database,
 network, broker/provider/notifier/integration call, trading action,
 reconciliation write, notification, breaker reset, Plan 3 work, or push
 occurred.
+
+## Final Plan 2 deep broker-identity correction
+
+This correction supersedes only the prior construction package's overstatement
+that fake-only closure followed from validating `service.broker`. The review
+confirmed that `TradingService` copies its broker into snapshot, submission,
+and reconciliation subservices, which the prior validator did not inspect.
+
+- [x] Record exact RED against unchanged production:
+  `4 failed, 1 warning in 1.39s`.
+- [x] Prove a service built with an inert production-like broker cannot become
+  test-safe by replacing only `service.broker` with `MockBroker`.
+- [x] Prove post-issuance snapshot, submission, and reconciliation broker
+  tampering is rejected when `create_test_app` consumes the container.
+- [x] Inventory all four direct broker holders and define one typed canonical
+  invariant requiring the exact same `MockBroker` object, exact container
+  aliases, exact cached broker identity, and exact operations service.
+- [x] Invoke the invariant before and after marked-container issuance and
+  again at consumption; preserve existing stable errors and `MockBroker`
+  subclass ergonomics.
+- [x] Exact new green:
+  `4 passed, 1 warning in 1.83s`; capability/error-order selection:
+  `6 passed, 1 warning in 1.12s`; complete focused file:
+  `38 passed, 1 warning in 1.63s`.
+- [x] Preserve affected-matrix fixture correction:
+  initial `3 failed, 1230 passed, 1 warning in 210.07s`; exact fixture nodes
+  `3 passed, 1 warning in 1.33s`; final matrix
+  `1233 passed, 1 warning in 209.69s`.
+- [x] Static fixtures:
+  `304 passed in 92.98s`; repository gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3716 passed, 1 skipped, 1 warning in 606.85s`; pytest exited normally.
+- [x] Commit implementation/tests as
+  `8e75752cee387384da2edad614fa206a2095da65`; package bounded diff
+  `review-0062579..8e75752.diff` and corrected closure evidence separately.
+
+No production receipt boundary or runtime capability was widened. No service,
+credential, ignored runtime database, external call, trade, reconciliation
+write, notification, breaker reset, Plan 3 work, or push occurred.

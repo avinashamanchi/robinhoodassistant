@@ -124,3 +124,14 @@ full suite ran.
 - Verification used temporary databases and local fakes only. It did not
   start services, access real resources, make external calls, push, trade,
   reconcile, notify, or reset a breaker.
+
+## Supersession
+
+The deep broker-identity review against base `0062579` found that this
+package's fake-only conclusion was incomplete. The validator checked
+`service.broker` but not the broker references retained by snapshot,
+submission, and reconciliation services, so replacing only the top-level
+reference could pass. That claim is superseded by implementation `8e75752`
+and `task-11-review-package-plan2-deep-broker-identity.md`. This package's
+production receipt, startup lifecycle, test-container marking, clock checks,
+and live-rejection conclusions remain valid.

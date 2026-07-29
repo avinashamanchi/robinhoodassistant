@@ -1437,3 +1437,121 @@ Verification used temporary databases, explicit fake brokers/clocks/agents,
 and local fixtures only. It did not start app/daemon/MCP, access the ignored
 runtime database or real Keychain/credentials, make external calls, push,
 trade, reconcile, notify, or reset a breaker.
+
+# Final Plan 2 Deep Broker-Identity Closure
+
+## Supersession and verified defect
+
+The previous construction-boundary report correctly sealed public production
+construction and marked test-container issuance, but it overstated fake-only
+closure. Its broker validation was shallow: it checked `service.broker` while
+`TradingService` retained constructor-time broker references in
+`snapshot_service`, `order_submission`, and `reconciliation`.
+
+The reviewer reproducer was valid. A hermetic temporary-SQLite service built
+with an inert `AlpacaBroker` could have only its top-level broker replaced by
+`MockBroker`; the prior issuer and consumer accepted it while the approval
+path's submission and snapshot services still retained the production-like
+broker.
+
+## Implemented invariant
+
+The direct broker-holder inventory is exact:
+
+- `TradingService.broker`;
+- `PortfolioSnapshotService.broker`;
+- `OrderSubmissionService.broker`; and
+- `ReconciliationService.broker`.
+
+Other app-reachable operations, rule, candidate, and chat components retain
+the canonical `TradingService` rather than independent broker references.
+The container also exposes exact aliases for the broker-bearing subservices.
+
+One typed `_require_test_broker_identity` helper now requires a real
+`TradingService`, typed snapshot/submission/reconciliation services, and the
+same `MockBroker` object in all four direct locations. It additionally binds
+submission to the exact snapshot service, checks reconciliation/startup keys,
+checks container broker/subservice aliases, and checks
+`operations.service`. It does not accept duck-typed substitutes.
+
+The helper runs against the supplied service before source validation, against
+the completed source graph before issuance, and again from
+`create_test_app`'s consumption validator. This preserves the existing stable
+capability-error ordering and rejects post-issuance mutation. `MockBroker`
+subclasses remain supported for existing local outage/race fakes, but every
+reference must be the same object.
+
+## TDD and verification evidence
+
+Exact RED before implementation:
+
+```text
+4 failed, 1 warning in 1.39s
+```
+
+The four failures were the shallow replacement reproducer and the three
+post-issuance nested tamper cases. Focused green:
+
+```text
+Exact new selection:
+4 passed, 1 warning in 1.83s
+
+Capability/error-order selection:
+6 passed, 1 warning in 1.12s
+
+Complete construction-boundary file:
+38 passed, 1 warning in 1.63s
+```
+
+The first affected matrix exposed three test-only `_injected_container`
+fixtures that omitted real container aliases:
+
+```text
+3 failed, 1230 passed, 1 warning in 210.07s
+```
+
+The fixtures' service graphs were safe. They were made structurally complete
+instead of weakening the invariant. Their exact rerun passed
+`3 passed, 1 warning in 1.33s`; the final matrix passed:
+
+```text
+1233 passed, 1 warning in 209.69s
+```
+
+Release verification:
+
+```text
+Static fixtures:
+304 passed in 92.98s
+
+release static checks: PASS
+compileall: PASS
+git diff --check: PASS
+
+uv run pytest:
+3716 passed, 1 skipped, 1 warning in 606.85s
+```
+
+The no-argument suite was the only full-suite run for this correction and
+started only after focused, affected, static, compile, and diff gates were
+green. Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning.
+
+## Review package and hard limits
+
+- Base: `0062579231b7d718afd123eaf6e65766a973cb24`
+- Implementation:
+  `8e75752cee387384da2edad614fa206a2095da65`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-0062579..8e75752.diff`
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-plan2-deep-broker-identity.md`
+
+Production construction still requires the exact one-shot receipt. The
+release remains paper-only, manually approved, breaker- and broker-truth-gated,
+webhook-free, and Composio-disabled pending provider-side rotation.
+
+Verification used temporary SQLite, `MockBroker` test doubles, and inert
+unconnected Alpaca-shaped objects only. It did not start services, access
+credentials or the ignored runtime database, make broker/provider/network
+calls, push, submit/cancel orders, reconcile, notify, or reset a breaker.
