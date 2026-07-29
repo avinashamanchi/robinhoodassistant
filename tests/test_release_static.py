@@ -4413,14 +4413,32 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
                 '--no-project --no-config --resolve-links 3.11.15)"'
             ),
             (
-                'if [[ "$uv_source" != "/usr/local/bin/uv" ]]; then '
                 "sudo install -o root -g root -m 0555 "
-                '"$uv_source" /usr/local/bin/uv fi'
+                '"$uv_source" '
+                "/usr/local/bin/.trading-assistant-uv-stage"
             ),
             (
-                'if [[ "$node_source" != "/usr/local/bin/node" ]]; then '
                 "sudo install -o root -g root -m 0555 "
-                '"$node_source" /usr/local/bin/node fi'
+                '"$node_source" '
+                "/usr/local/bin/.trading-assistant-node-stage"
+            ),
+            (
+                "sudo mv -f -- /usr/local/bin/.trading-assistant-uv-stage "
+                "/usr/local/bin/uv"
+            ),
+            (
+                "sudo mv -f -- /usr/local/bin/.trading-assistant-node-stage "
+                "/usr/local/bin/node"
+            ),
+            'test ! -L /usr/local/bin/uv',
+            'test ! -L /usr/local/bin/node',
+            (
+                'test "$(stat -c \'%u:%g:%a\' /usr/local/bin/uv)" '
+                '= "0:0:555"'
+            ),
+            (
+                'test "$(stat -c \'%u:%g:%a\' /usr/local/bin/node)" '
+                '= "0:0:555"'
             ),
             'export PATH="/usr/local/bin:/usr/bin:/bin"',
             '"$verifier_python" -I -S scripts/verify_loopback_release.py',
