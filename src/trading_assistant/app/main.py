@@ -1752,7 +1752,6 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
                 "reason": "metric_rows_invalid",
             }
             return response
-        response["rows"] = metric_payloads
         artifacts = s.execute(
             select(BacktestArtifact)
             .where(BacktestArtifact.run_id == run_id)
@@ -1792,6 +1791,7 @@ def _load_backtest_report(session_factory, run_id: int) -> Optional[dict]:
         response.update(
             {
                 "artifact_status": {"status": "available"},
+                "rows": metric_payloads,
                 "manifest": manifest,
                 "series": series,
             }

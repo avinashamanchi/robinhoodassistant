@@ -303,10 +303,12 @@ def test_encrypted_manifest_rejects_valid_metric_row_tampering(
     report = c.get(f"/backtests/{run_id}/report")
 
     assert report.status_code == 200
-    assert report.json()["artifact_status"] == {
+    payload = report.json()
+    assert payload["artifact_status"] == {
         "status": "unavailable",
         "reason": "artifact_invalid",
     }
+    assert payload["rows"] == []
 
 
 @pytest.mark.parametrize(
