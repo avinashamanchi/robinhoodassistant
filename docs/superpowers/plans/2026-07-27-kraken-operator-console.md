@@ -639,7 +639,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py tests/test_backte
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/trading_assistant/app/static/backtests.html src/trading_assistant/app/static/js/backtests.js src/trading_assistant/app/static/css/console.css tests/test_frontend_ui.py tests/test_security.py tests/test_backtests_api.py
@@ -667,7 +667,7 @@ git commit -m "feat(ui): present backtests as simulated evidence"
 - Every dialog traps/restores focus and supports Escape/cancel.
 - Mobile preserves dangerous-action context.
 
-- [ ] **Step 1: Write accessibility and responsive contract tests**
+- [x] **Step 1: Write accessibility and responsive contract tests**
 
 Assert:
 
@@ -683,7 +683,7 @@ Assert:
 - no horizontal page overflow at 390px;
 - tables use a scroll wrapper with a visible cue rather than clipping.
 
-- [ ] **Step 2: Run and verify failures**
+- [x] **Step 2: Run and verify failures**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "accessibility or responsive or login" -v
@@ -691,7 +691,7 @@ uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "accessibility
 
 Expected: FAIL.
 
-- [ ] **Step 3: Rework login**
+- [x] **Step 3: Rework login**
 
 Show:
 
@@ -706,7 +706,7 @@ Show:
 On submit, immediately copy the value into the request body, clear the DOM
 input, send once, and clear the local variable in `finally`.
 
-- [ ] **Step 4: Implement shared dialog focus behavior**
+- [x] **Step 4: Implement shared dialog focus behavior**
 
 In `auth.js`, provide:
 
@@ -719,7 +719,7 @@ Store the opener, focus the first meaningful control, contain Tab/Shift+Tab,
 close on Escape when cancellation is safe, and restore focus. Panic/approval
 submission cannot close by backdrop click during an in-flight request.
 
-- [ ] **Step 5: Complete responsive and preference styles**
+- [x] **Step 5: Complete responsive and preference styles**
 
 - desktop side rail fixed within content, never viewport-overlay;
 - compact two-column proof grid;
@@ -729,7 +729,7 @@ submission cannot close by backdrop click during an in-flight request.
 - `forced-colors: active` adds system borders and preserves focus;
 - print hides controls and labels every report paper/simulated.
 
-- [ ] **Step 6: Run all frontend/static tests**
+- [x] **Step 6: Run all frontend/static tests**
 
 ```bash
 uv run pytest tests/test_frontend_ui.py tests/test_security.py tests/test_security_headers.py -v
