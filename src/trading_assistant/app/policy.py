@@ -1607,6 +1607,26 @@ async def _mark_interlock_uncertain(
         return False
 
 
+async def _mark_interlock_uncertain_before_exit(
+    app: FastAPI,
+    hold: _LeaseHold,
+    *,
+    outcome_code: str,
+    worker_finished: bool,
+) -> bool:
+    """Make cancellation-visible completion wait for the durable fence."""
+
+    marker = asyncio.create_task(
+        _mark_interlock_uncertain(
+            app,
+            hold,
+            outcome_code=outcome_code,
+            worker_finished=worker_finished,
+        )
+    )
+    return await _await_task_shielded(marker)
+
+
 async def _settle_and_release_interlock(
     app: FastAPI,
     hold: _LeaseHold,
@@ -2082,7 +2102,7 @@ def install_route_policy(app: FastAPI) -> RoutePolicyRegistry:
                     None,
                 )
             if generic_interlock:
-                await _mark_interlock_uncertain(
+                await _mark_interlock_uncertain_before_exit(
                     app,
                     hold,
                     outcome_code=(

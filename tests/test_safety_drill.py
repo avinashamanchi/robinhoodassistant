@@ -3452,6 +3452,7 @@ def test_release_verifier_and_drill_have_separate_import_graphs(
             "XDG_CACHE_HOME": str(tmp_path / "cache"),
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "PATH": os.environ.get("PATH", os.defpath),
+            "PYTHONPATH": str(root / "src"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",

@@ -43,6 +43,7 @@ from .backup_transaction import (
     BackupTransaction as _BackupTransaction,
     EncryptedBackupError,
     acquire_bounded_lock as _acquire_bounded_lock,
+    authorize_transaction_artifact_links as _authorize_transaction_artifact_links,
     close_backup_transaction as _close_backup_transaction,
     create_backup_transaction as _create_backup_transaction,
     decode_checksummed_record as _decode_checksummed_record,
@@ -1328,6 +1329,10 @@ def create_encrypted_database_backup(
             raise EncryptedBackupError(
                 "encrypted_backup_state_invalid"
             )
+        _authorize_transaction_artifact_links(
+            transaction,
+            additional_links=2,
+        )
 
         # All plaintext/ciphertext operation members and their manifest are
         # removed and both directories fsynced before commit can begin.

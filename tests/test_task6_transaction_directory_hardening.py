@@ -32,6 +32,9 @@ _TRANSACTION_MEMBERS = {
     "snapshot.sqlite3",
     "verification.sqlite3",
     "encrypted.aesgcm",
+    ".backup-owner-snapshot.sqlite3",
+    ".backup-owner-verification.sqlite3",
+    ".backup-owner-encrypted.aesgcm",
 }
 _CRASH_STAGES = [
     "transaction_manifest_durable",
@@ -366,6 +369,7 @@ def test_manifest_is_durable_only_after_all_members_are_precreated(tmp_path):
         member = transaction / name
         assert member.is_file()
         assert member.stat().st_size == 0
+        assert member.stat().st_nlink == 2
         assert stat.S_IMODE(member.stat().st_mode) == 0o600
 
 
@@ -821,7 +825,9 @@ def test_partial_cleanup_recovery_converges_after_unlink_failure(
     assert {candidate.name for candidate in transaction.iterdir()} == {
         "manifest",
         "snapshot.sqlite3",
+        ".backup-owner-snapshot.sqlite3",
         "verification.sqlite3",
+        ".backup-owner-verification.sqlite3",
     }
     assert directory_fsyncs >= 1
 

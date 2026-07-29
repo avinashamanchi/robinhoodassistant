@@ -30,7 +30,7 @@ QUARANTINE_DIRECTORY = re.compile(
     r"([0-9a-f]{32})-([0-9a-f]{32})"
 )
 TRANSACTION_MANIFEST_MAGIC = b"TA-BACKUP-TRANSACTION\x00"
-TRANSACTION_MANIFEST_VERSION = 2
+TRANSACTION_MANIFEST_VERSION = 3
 TRANSACTION_MANIFEST_BYTES = 2048
 TRANSACTION_MANIFEST_NAME = "manifest"
 SNAPSHOT_NAME = "snapshot.sqlite3"
@@ -41,8 +41,16 @@ OPERATION_MEMBER_NAMES = (
     VERIFICATION_NAME,
     ENCRYPTED_NAME,
 )
+OWNERSHIP_LINK_PREFIX = ".backup-owner-"
+OWNERSHIP_LINK_NAMES = frozenset(
+    f"{OWNERSHIP_LINK_PREFIX}{name}" for name in OPERATION_MEMBER_NAMES
+)
 TRANSACTION_MEMBER_NAMES = frozenset(
-    {TRANSACTION_MANIFEST_NAME, *OPERATION_MEMBER_NAMES}
+    {
+        TRANSACTION_MANIFEST_NAME,
+        *OPERATION_MEMBER_NAMES,
+        *OWNERSHIP_LINK_NAMES,
+    }
 )
 _RECORD_DIGEST_BYTES = hashlib.sha256().digest_size
 _TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
@@ -91,13 +99,16 @@ class BackupTransaction:
     manifest_descriptor: int
     manifest: _BackupTransactionManifest
     manifest_locked: bool = True
+    authorized_artifact_links: int = 0
 
 
 @dataclass(frozen=True)
 class _RecoveryMemberHandle:
     member: _BackupTransactionMember
-    descriptor: int
-    initial_stat: os.stat_result
+    primary_descriptor: int | None
+    ownership_descriptor: int
+    initial_primary_stat: os.stat_result | None
+    initial_ownership_stat: os.stat_result
 
 
 def _canonical_json(value: dict[str, object]) -> bytes:
@@ -691,13 +702,22 @@ def _stable_member_identity_matches(
     )
 
 
-def _open_recorded_member(
+def _ownership_link_name(member_name: str) -> str:
+    if member_name not in OPERATION_MEMBER_NAMES:
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    return f"{OWNERSHIP_LINK_PREFIX}{member_name}"
+
+
+def _open_recorded_name(
     transaction: BackupTransaction,
     member: _BackupTransactionMember,
+    name: str,
     flags: int,
 ) -> int:
     descriptor = os.open(
-        member.name,
+        name,
         flags
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0),
@@ -706,7 +726,7 @@ def _open_recorded_member(
     try:
         descriptor_stat = os.fstat(descriptor)
         path_stat = os.stat(
-            member.name,
+            name,
             dir_fd=transaction.directory_descriptor,
             follow_symlinks=False,
         )
@@ -724,6 +744,49 @@ def _open_recorded_member(
         raise
 
 
+def _open_recorded_member(
+    transaction: BackupTransaction,
+    member: _BackupTransactionMember,
+    flags: int,
+) -> int:
+    return _open_recorded_name(
+        transaction,
+        member,
+        member.name,
+        flags,
+    )
+
+
+def _owned_pair_matches(
+    primary_stat: os.stat_result,
+    ownership_stat: os.stat_result,
+    member: _BackupTransactionMember,
+    *,
+    expected_nlink: int,
+) -> bool:
+    return (
+        _member_stat_matches(
+            primary_stat,
+            ownership_stat,
+            member,
+        )
+        and primary_stat.st_nlink == expected_nlink
+        and ownership_stat.st_nlink == expected_nlink
+    )
+
+
+def _expected_member_link_count(
+    transaction: BackupTransaction,
+    member: _BackupTransactionMember,
+) -> int:
+    additional = (
+        transaction.authorized_artifact_links
+        if member.name == ENCRYPTED_NAME
+        else 0
+    )
+    return 2 + additional
+
+
 def validate_backup_transaction(
     transaction: BackupTransaction,
 ) -> set[str]:
@@ -736,17 +799,54 @@ def validate_backup_transaction(
     descriptors: list[int] = []
     try:
         for member in transaction.manifest.members:
-            descriptors.append(
-                _open_recorded_member(
+            primary_descriptor = _open_recorded_member(
+                transaction,
+                member,
+                os.O_RDONLY,
+            )
+            descriptors.append(primary_descriptor)
+            ownership_descriptor = _open_recorded_name(
+                transaction,
+                member,
+                _ownership_link_name(member.name),
+                os.O_RDONLY,
+            )
+            descriptors.append(ownership_descriptor)
+            if not _owned_pair_matches(
+                os.fstat(primary_descriptor),
+                os.fstat(ownership_descriptor),
+                member,
+                expected_nlink=_expected_member_link_count(
                     transaction,
                     member,
-                    os.O_RDONLY,
+                ),
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
                 )
-            )
     finally:
         for descriptor in descriptors:
             os.close(descriptor)
     return members
+
+
+def authorize_transaction_artifact_links(
+    transaction: BackupTransaction,
+    *,
+    additional_links: int,
+) -> None:
+    """Authorize a proven publication's exact extra encrypted-file links."""
+
+    if additional_links != 2 or transaction.authorized_artifact_links != 0:
+        raise EncryptedBackupError(
+            "encrypted_backup_transaction_invalid"
+        )
+    transaction.authorized_artifact_links = additional_links
+    try:
+        validate_backup_transaction(transaction)
+    except BaseException:
+        transaction.authorized_artifact_links = 0
+        raise
 
 
 def _open_recovery_members(
@@ -763,11 +863,14 @@ def _open_recovery_members(
     recorded_names = {
         member.name for member in transaction.manifest.members
     }
+    ownership_names = {
+        _ownership_link_name(name) for name in recorded_names
+    }
     namespace = set(os.listdir(transaction.directory_descriptor))
     present_names = namespace - {TRANSACTION_MANIFEST_NAME}
     if (
         TRANSACTION_MANIFEST_NAME not in namespace
-        or not present_names <= recorded_names
+        or not present_names <= (recorded_names | ownership_names)
     ):
         raise EncryptedBackupError(
             "encrypted_backup_transaction_invalid"
@@ -775,56 +878,82 @@ def _open_recovery_members(
     opened: list[_RecoveryMemberHandle] = []
     try:
         for member in transaction.manifest.members:
-            if member.name not in present_names:
+            primary_present = member.name in present_names
+            ownership_name = _ownership_link_name(member.name)
+            ownership_present = ownership_name in present_names
+            if primary_present and not ownership_present:
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            if not ownership_present:
                 continue
-            descriptor = _open_recorded_member(
+            ownership_descriptor = _open_recorded_name(
                 transaction,
                 member,
+                ownership_name,
                 os.O_RDONLY,
             )
+            primary_descriptor: int | None = None
             try:
-                acquire_bounded_lock(descriptor, fcntl.LOCK_EX)
-                initial_stat = os.fstat(descriptor)
-                if initial_stat.st_nlink != 1:
+                acquire_bounded_lock(
+                    ownership_descriptor,
+                    fcntl.LOCK_EX,
+                )
+                initial_ownership_stat = os.fstat(
+                    ownership_descriptor
+                )
+                initial_primary_stat: os.stat_result | None = None
+                if primary_present:
+                    primary_descriptor = _open_recorded_member(
+                        transaction,
+                        member,
+                        os.O_RDONLY,
+                    )
+                    initial_primary_stat = os.fstat(
+                        primary_descriptor
+                    )
+                    if not _owned_pair_matches(
+                        initial_primary_stat,
+                        initial_ownership_stat,
+                        member,
+                        expected_nlink=2,
+                    ):
+                        raise EncryptedBackupError(
+                            "encrypted_backup_transaction_invalid"
+                        )
+                elif initial_ownership_stat.st_nlink != 1:
                     raise EncryptedBackupError(
                         "encrypted_backup_transaction_invalid"
                     )
                 opened.append(
                     _RecoveryMemberHandle(
                         member=member,
-                        descriptor=descriptor,
-                        initial_stat=initial_stat,
+                        primary_descriptor=primary_descriptor,
+                        ownership_descriptor=ownership_descriptor,
+                        initial_primary_stat=initial_primary_stat,
+                        initial_ownership_stat=initial_ownership_stat,
                     )
                 )
             except BaseException:
-                os.close(descriptor)
+                if primary_descriptor is not None:
+                    os.close(primary_descriptor)
+                os.close(ownership_descriptor)
                 raise
         if set(os.listdir(transaction.directory_descriptor)) != namespace:
             raise EncryptedBackupError(
                 "encrypted_backup_transaction_invalid"
             )
-        for handle in opened:
-            descriptor_stat = os.fstat(handle.descriptor)
-            path_stat = os.stat(
-                handle.member.name,
-                dir_fd=transaction.directory_descriptor,
-                follow_symlinks=False,
-            )
-            if not _member_stat_matches(
-                descriptor_stat,
-                path_stat,
-                handle.member,
-            ) or not _stable_member_identity_matches(
-                handle.initial_stat,
-                descriptor_stat,
-            ):
-                raise EncryptedBackupError(
-                    "encrypted_backup_transaction_invalid"
-                )
+        _validate_recovery_namespace(
+            transaction,
+            namespace_name,
+            opened,
+        )
         return opened
     except BaseException:
         for handle in opened:
-            os.close(handle.descriptor)
+            if handle.primary_descriptor is not None:
+                os.close(handle.primary_descriptor)
+            os.close(handle.ownership_descriptor)
         raise
 
 
@@ -863,10 +992,13 @@ def _capture_member(
 def _unlink_captured_member(
     directory_descriptor: int,
     member: _BackupTransactionMember,
+    *,
+    name: str | None = None,
 ) -> None:
+    owned_name = member.name if name is None else name
     try:
         path_stat = os.stat(
-            member.name,
+            owned_name,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
@@ -878,7 +1010,7 @@ def _unlink_captured_member(
         and path_stat.st_ino == member.inode
         and stat.S_IMODE(path_stat.st_mode) == member.mode
     ):
-        os.unlink(member.name, dir_fd=directory_descriptor)
+        os.unlink(owned_name, dir_fd=directory_descriptor)
 
 
 def create_backup_transaction(destination: Path) -> BackupTransaction:
@@ -952,13 +1084,34 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
             try:
                 os.fchmod(descriptor, 0o600)
                 retry_fsync(descriptor)
-                operation_members.append(
-                    _capture_member(
-                        directory_descriptor,
-                        name,
-                        descriptor,
-                    )
+                member = _capture_member(
+                    directory_descriptor,
+                    name,
+                    descriptor,
                 )
+                operation_members.append(member)
+                ownership_name = _ownership_link_name(name)
+                os.link(
+                    name,
+                    ownership_name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                ownership_stat = os.stat(
+                    ownership_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if not _owned_pair_matches(
+                    os.fstat(descriptor),
+                    ownership_stat,
+                    member,
+                    expected_nlink=2,
+                ):
+                    raise EncryptedBackupError(
+                        "encrypted_backup_transaction_invalid"
+                    )
             finally:
                 os.close(descriptor)
         retry_fsync(directory_descriptor)
@@ -998,6 +1151,14 @@ def create_backup_transaction(destination: Path) -> BackupTransaction:
                     _unlink_captured_member(
                         directory_descriptor,
                         member,
+                    )
+                except OSError:
+                    pass
+                try:
+                    _unlink_captured_member(
+                        directory_descriptor,
+                        member,
+                        name=_ownership_link_name(member.name),
                     )
                 except OSError:
                     pass
@@ -1148,17 +1309,30 @@ def fsync_and_hash_transaction_artifact(
 
 def _remove_backup_transaction(transaction: BackupTransaction) -> None:
     validate_backup_transaction(transaction)
-    opened: list[tuple[_BackupTransactionMember, int]] = []
+    opened: list[tuple[_BackupTransactionMember, int, int]] = []
     try:
         for member in transaction.manifest.members:
+            primary_descriptor = _open_recorded_member(
+                transaction,
+                member,
+                os.O_RDONLY,
+            )
+            ownership_descriptor: int | None = None
+            try:
+                ownership_descriptor = _open_recorded_name(
+                    transaction,
+                    member,
+                    _ownership_link_name(member.name),
+                    os.O_RDONLY,
+                )
+            except BaseException:
+                os.close(primary_descriptor)
+                raise
             opened.append(
                 (
                     member,
-                    _open_recorded_member(
-                        transaction,
-                        member,
-                        os.O_RDONLY,
-                    ),
+                    primary_descriptor,
+                    ownership_descriptor,
                 )
             )
         if set(os.listdir(transaction.directory_descriptor)) != (
@@ -1167,45 +1341,72 @@ def _remove_backup_transaction(transaction: BackupTransaction) -> None:
             raise EncryptedBackupError(
                 "encrypted_backup_transaction_invalid"
             )
-        for member, descriptor in opened:
-            descriptor_stat = os.fstat(descriptor)
-            path_stat = os.stat(
-                member.name,
-                dir_fd=transaction.directory_descriptor,
-                follow_symlinks=False,
-            )
-            if not _member_stat_matches(
-                descriptor_stat,
-                path_stat,
+        for member, primary_descriptor, ownership_descriptor in opened:
+            if not _owned_pair_matches(
+                os.fstat(primary_descriptor),
+                os.fstat(ownership_descriptor),
                 member,
+                expected_nlink=_expected_member_link_count(
+                    transaction,
+                    member,
+                ),
             ):
                 raise EncryptedBackupError(
                     "encrypted_backup_transaction_invalid"
                 )
         _unlink_opened_members(transaction, opened)
     finally:
-        for _member, descriptor in opened:
-            os.close(descriptor)
+        for (
+            _member,
+            primary_descriptor,
+            ownership_descriptor,
+        ) in opened:
+            os.close(primary_descriptor)
+            os.close(ownership_descriptor)
     _finish_backup_transaction_removal(transaction)
 
 
 def _unlink_opened_members(
     transaction: BackupTransaction,
-    opened: list[tuple[_BackupTransactionMember, int]],
+    opened: list[tuple[_BackupTransactionMember, int, int]],
 ) -> None:
     failure: BaseException | None = None
-    for member, descriptor in opened:
+    for member, primary_descriptor, ownership_descriptor in opened:
         try:
-            descriptor_stat = os.fstat(descriptor)
-            path_stat = os.stat(
+            primary_stat = os.fstat(primary_descriptor)
+            primary_path_stat = os.stat(
                 member.name,
                 dir_fd=transaction.directory_descriptor,
                 follow_symlinks=False,
             )
-            if not _member_stat_matches(
-                descriptor_stat,
-                path_stat,
+            ownership_name = _ownership_link_name(member.name)
+            ownership_stat = os.fstat(ownership_descriptor)
+            ownership_path_stat = os.stat(
+                ownership_name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            expected_link_count = _expected_member_link_count(
+                transaction,
                 member,
+            )
+            if not (
+                _owned_pair_matches(
+                    primary_stat,
+                    ownership_stat,
+                    member,
+                    expected_nlink=expected_link_count,
+                )
+                and _member_stat_matches(
+                    primary_stat,
+                    primary_path_stat,
+                    member,
+                )
+                and _member_stat_matches(
+                    ownership_stat,
+                    ownership_path_stat,
+                    member,
+                )
             ):
                 raise EncryptedBackupError(
                     "encrypted_backup_transaction_invalid"
@@ -1214,14 +1415,47 @@ def _unlink_opened_members(
                 member.name,
                 dir_fd=transaction.directory_descriptor,
             )
+            retry_fsync(transaction.directory_descriptor)
+            ownership_stat = os.fstat(ownership_descriptor)
+            ownership_path_stat = os.stat(
+                ownership_name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not (
+                _member_stat_matches(
+                    ownership_stat,
+                    ownership_path_stat,
+                    member,
+                )
+                and ownership_stat.st_nlink
+                == expected_link_count - 1
+                and ownership_path_stat.st_nlink
+                == expected_link_count - 1
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            try:
+                os.stat(
+                    member.name,
+                    dir_fd=transaction.directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            os.unlink(
+                ownership_name,
+                dir_fd=transaction.directory_descriptor,
+            )
+            retry_fsync(transaction.directory_descriptor)
         except BaseException as exc:
             failure = exc
             break
-    try:
-        retry_fsync(transaction.directory_descriptor)
-    except BaseException as exc:
-        if failure is None:
-            failure = exc
     if failure is not None:
         raise failure
 
@@ -1304,7 +1538,15 @@ def _validate_recovery_namespace(
     )
     expected_namespace = {
         TRANSACTION_MANIFEST_NAME,
-        *(handle.member.name for handle in opened),
+        *(
+            handle.member.name
+            for handle in opened
+            if handle.primary_descriptor is not None
+        ),
+        *(
+            _ownership_link_name(handle.member.name)
+            for handle in opened
+        ),
     }
     if set(os.listdir(transaction.directory_descriptor)) != (
         expected_namespace
@@ -1313,25 +1555,59 @@ def _validate_recovery_namespace(
             "encrypted_backup_transaction_invalid"
         )
     for handle in opened:
-        descriptor_stat = os.fstat(handle.descriptor)
-        path_stat = os.stat(
+        ownership_name = _ownership_link_name(handle.member.name)
+        ownership_stat = os.fstat(handle.ownership_descriptor)
+        ownership_path_stat = os.stat(
+            ownership_name,
+            dir_fd=transaction.directory_descriptor,
+            follow_symlinks=False,
+        )
+        if not _member_stat_matches(
+            ownership_stat,
+            ownership_path_stat,
+            handle.member,
+        ) or not _stable_member_identity_matches(
+            handle.initial_ownership_stat,
+            ownership_stat,
+        ):
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        if handle.primary_descriptor is None:
+            if ownership_stat.st_nlink != 1:
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            continue
+        if handle.initial_primary_stat is None:
+            raise EncryptedBackupError(
+                "encrypted_backup_transaction_invalid"
+            )
+        primary_stat = os.fstat(handle.primary_descriptor)
+        primary_path_stat = os.stat(
             handle.member.name,
             dir_fd=transaction.directory_descriptor,
             follow_symlinks=False,
         )
         if not (
-            _member_stat_matches(
-                descriptor_stat,
-                path_stat,
+            _owned_pair_matches(
+                primary_stat,
+                ownership_stat,
+                handle.member,
+                expected_nlink=2,
+            )
+            and _member_stat_matches(
+                primary_stat,
+                primary_path_stat,
                 handle.member,
             )
             and _stable_member_identity_matches(
-                handle.initial_stat,
-                descriptor_stat,
+                handle.initial_primary_stat,
+                primary_stat,
             )
             and _stable_member_identity_matches(
-                descriptor_stat,
-                path_stat,
+                primary_stat,
+                primary_path_stat,
             )
         ):
             raise EncryptedBackupError(
@@ -1481,8 +1757,45 @@ def _remove_isolated_recovery_namespace(
             remaining,
         )
         handle = remaining[0]
+        ownership_name = _ownership_link_name(handle.member.name)
+        if handle.primary_descriptor is not None:
+            os.unlink(
+                handle.member.name,
+                dir_fd=transaction.directory_descriptor,
+            )
+            retry_fsync(transaction.directory_descriptor)
+            ownership_stat = os.fstat(handle.ownership_descriptor)
+            ownership_path_stat = os.stat(
+                ownership_name,
+                dir_fd=transaction.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not (
+                _member_stat_matches(
+                    ownership_stat,
+                    ownership_path_stat,
+                    handle.member,
+                )
+                and ownership_stat.st_nlink == 1
+                and ownership_path_stat.st_nlink == 1
+            ):
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
+            try:
+                os.stat(
+                    handle.member.name,
+                    dir_fd=transaction.directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise EncryptedBackupError(
+                    "encrypted_backup_transaction_invalid"
+                )
         os.unlink(
-            handle.member.name,
+            ownership_name,
             dir_fd=transaction.directory_descriptor,
         )
         retry_fsync(transaction.directory_descriptor)
@@ -1523,7 +1836,12 @@ def _remove_recovered_backup_transaction(
     removed = False
     try:
         if any(
-            os.fstat(handle.descriptor).st_mtime >= cutoff
+            os.fstat(handle.ownership_descriptor).st_mtime >= cutoff
+            or (
+                handle.primary_descriptor is not None
+                and os.fstat(handle.primary_descriptor).st_mtime
+                >= cutoff
+            )
             for handle in opened
         ):
             return False
@@ -1577,7 +1895,9 @@ def _remove_recovered_backup_transaction(
                 quarantine_name,
             )
         for handle in opened:
-            os.close(handle.descriptor)
+            if handle.primary_descriptor is not None:
+                os.close(handle.primary_descriptor)
+            os.close(handle.ownership_descriptor)
     return True
 
 
