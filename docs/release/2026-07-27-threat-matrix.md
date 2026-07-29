@@ -8,31 +8,50 @@ call.
 
 ## Two-dimensional release status
 
-Software verification and operational readiness are independent claims. The
-pure evaluator is
-`src/trading_assistant/ops/release_status.py::evaluate_release_status`.
-Every result also reports `paper_only=true` and
-`execution_authorized=false`.
+Software verification and operational readiness are independent claims.
+`src/trading_assistant/ops/release_status.py::evaluate_release_status` accepts
+two immutable Ed25519-signed evidence receipts and classifies each
+dimension without consulting the other:
 
-| Deterministic tests | Fresh operational evidence | Software status | Operational status |
-| --- | --- | --- | --- |
-| Pass | Preflight ready | Verified | Ready |
-| Pass | Breaker tripped | Verified | Blocked |
-| Pass | Broker truth unknown | Verified | Blocked |
-| Pass | Daemon stale | Verified | Blocked |
-| Pass | Encryption mixed | Blocked | Blocked |
-| Fail | Preflight ready | Blocked | Blocked |
+- The software receipt contains a canonical run UUID, exact candidate commit,
+  UTC start/finish/expiry times, and the exact eight-step release manifest with
+  passed and failed steps.
+- The operational receipt contains a canonical run UUID and commit, bounded
+  UTC observation/expiry/authentication/heartbeat times, the official Alpaca
+  paper endpoint and an account-identity fingerprint, matching
+  local/broker order and position digests, tripped breaker scopes, daemon
+  heartbeat bounds, and sensitive-encryption state.
+- `ReleaseEvidenceSigner` is the collector-only private-key capability.
+  `ReleaseEvidenceVerifier` contains only its public key and cannot issue
+  evidence. Evaluation accepts the verifier, not the signer. This classifier
+  neither loads key material nor collects operational evidence.
+- `evaluate_combined_release_gate` separately combines the two dimensions for
+  publication only. It always reports `execution_authorized=false`.
 
-“Operational ready” means only that the bounded paper preflight supplied its
-required evidence. It is not execution authority. The status vocabulary does
-not claim profitable behavior, unattended authority, a running daemon, or a
-non-paper trading mode. Unclassified evidence is rejected rather than coerced.
+| Authenticated software evidence | Authenticated operational evidence | Software status | Operational status | Combined gate |
+| --- | --- | --- | --- | --- |
+| Complete, current, exact commit | Current official-paper evidence, all controls clear | Verified | Ready | Satisfied |
+| Incomplete or invalid | Current official-paper evidence, all controls clear | Blocked | Ready | Blocked |
+| Complete, current, exact commit | Breaker tripped | Verified | Blocked | Blocked |
+| Complete, current, exact commit | Broker identity or reconciliation unproved | Verified | Blocked | Blocked |
+| Complete, current, exact commit | Daemon heartbeat stale | Verified | Blocked | Blocked |
+| Complete, current, exact commit | Encryption mixed | Verified | Blocked | Blocked |
+
+`paper_only=true` appears only when a current authenticated operational receipt
+proves the official Alpaca paper target. It is `null` when that target is
+unproved. “Operational ready” is not execution authority and the combined
+publication gate is not an order gate. The status vocabulary does not claim
+profitable behavior, unattended authority, a running daemon, or a non-paper
+trading mode.
 
 Exact release-state evidence:
 
-- `tests/test_release_gate_branches.py::test_release_status_keeps_software_and_operations_independent`
-- `tests/test_release_gate_branches.py::test_release_status_vocabulary_never_claims_unproved_trading_state`
-- `tests/test_release_gate_branches.py::test_release_status_rejects_coerced_or_unclassified_evidence`
+- `tests/test_release_status.py::test_ready_status_requires_authenticated_complete_evidence_and_paper_target`
+- `tests/test_release_status.py::test_evaluation_verifier_has_no_evidence_issuing_capability`
+- `tests/test_release_status.py::test_status_dimensions_are_independent_and_combined_gate_is_separate`
+- `tests/test_release_status.py::test_tampered_or_nonpaper_evidence_cannot_mint_readiness_claims`
+- `tests/test_release_status.py::test_operational_controls_block_only_operational_status`
+- `tests/test_release_status.py::test_authenticated_partial_software_manifest_is_still_blocked`
 
 ## 1. Paid-call and resource exhaustion
 
@@ -235,26 +254,39 @@ Exact release-state evidence:
 - **Exact tests:** `tests/test_security.py::test_plan_list_failure_or_malformed_envelope_clears_stale_authority`,
   `tests/test_security.py::test_plan_mutation_receipts_must_match_exact_frozen_target`,
   `tests/test_frontend_ui.py::test_every_page_uses_the_original_local_identity_and_explicit_paper_mode`,
-  `tests/test_release_gate_branches.py::test_release_status_keeps_software_and_operations_independent`.
+  `tests/test_release_status.py::test_status_dimensions_are_independent_and_combined_gate_is_separate`.
 
 ## 12. Dependency, build, or publication compromise
 
-- **Prevention:** `.github/workflows/ci.yml` pins action commits and uses full
-  history; `scripts/check_release_safety.py` inspects current tree and history;
-  `scripts/verify_loopback_release.py` runs a fixed offline command manifest
-  from a clean commit with a sanitized environment and private evidence.
-- **Detection:** dirty-tree, migration-head, skipped-suite, network-command,
-  history-secret, unsafe-artifact, action-pin, and changed-during-run checks
-  fail closed.
-- **Recovery:** block publication, preserve the failing evidence, repair the
-  dependency/history/migration issue, and rerun from a clean exact commit. Do
-  not bypass a scanner, force-push, weaken a breaker, or publish a partial pass.
+- **Currently proven:** `.github/workflows/ci.yml` pins action commits and asks
+  checkout for complete history. The verifier has a fixed direct command
+  manifest, refuses a dirty initial snapshot, compares repository snapshots
+  before and after commands, checks the migration head, and writes its normal
+  result file with private permissions.
+- **Not proven by this matrix revision:** OS-enforced network denial; isolation
+  from the operator home, Keychain, and ambient executables; positive
+  machine-readable execution counts for every required test file; rejection
+  of shallow/incomplete ancestry; immutable candidate source during the run;
+  bounded output and descendant cleanup; or invalidation of a prior result
+  before an interrupted rerun. Command metadata and a minimized environment do
+  not prove those properties.
+- **Release consequence:** the matrix and existing verifier tests alone must
+  not be translated into `SOFTWARE VERIFIED`. Publication remains blocked
+  until hardened verifier evidence authenticates the exact commit and complete
+  manifest required by `release_status.py`.
+- **Recovery:** preserve failing evidence, implement and test each missing
+  boundary, then rerun from an exact commit. Do not bypass a scanner,
+  force-push, weaken a breaker, or publish a partial pass.
 - **Owner:** release maintainer; repository owner for branch protection and
   provider-side controls.
-- **Exact tests:** `tests/test_release_verifier.py::test_release_verifier_has_only_the_exact_offline_commands`,
-  `tests/test_release_verifier.py::test_dirty_tree_blocks_before_any_verification_command`,
-  `tests/test_release_verifier.py::test_command_that_changes_candidate_tree_cannot_produce_pass`,
-  `tests/test_release_static.py::test_ci_actions_are_commit_pinned_and_checkout_complete_history`.
+- **Scope-limited tests:** `tests/test_release_verifier.py::test_release_verifier_has_only_the_exact_offline_commands`
+  proves the configured direct argv manifest, not network isolation;
+  `tests/test_release_verifier.py::test_dirty_tree_blocks_before_any_verification_command`
+  proves initial dirty-tree refusal;
+  `tests/test_release_verifier.py::test_command_that_changes_candidate_tree_cannot_produce_pass`
+  proves detection for its controlled mutation; and
+  `tests/test_release_static.py::test_ci_actions_are_commit_pinned_and_checkout_complete_history`
+  proves the workflow declarations.
 
 ## Separately authorized credentialed paper drill
 
@@ -265,12 +297,21 @@ validation, and its dedicated database copy. It is not a release-verifier
 step, a prerequisite for software verification, or permission for routine
 execution.
 
-The offline verifier neither imports nor invokes this drill, and the drill
-does not import or invoke the offline verifier. This release task runs neither
-credentialed path.
+Fresh-interpreter probes install an import rejection hook before importing
+either module and prove that their module import graphs are separate. A
+fake-broker credentialed-branch test rejects Python imports and subprocess
+launches of the verifier during that path, and direct-command inspection proves
+that the verifier manifest contains no credentialed drill command.
+
+The verifier's full `pytest` command intentionally collects isolated mock
+safety-drill tests. Therefore this matrix does not claim that full test
+execution never imports or exercises mock drill code. It claims only that the
+credentialed broker drill is a separate, explicitly authorized command. This
+release task runs no credentialed broker path.
 
 Exact separation evidence:
 
 - `tests/test_release_verifier.py::test_release_verifier_has_only_the_exact_offline_commands`
-- `tests/test_safety_drill.py::test_credentialed_paper_drill_is_separate_from_offline_release_verifier`
-- `tests/test_safety_drill.py::test_offline_release_verifier_import_and_commands_exclude_safety_drill`
+- `tests/test_safety_drill.py::test_fake_credentialed_drill_runtime_does_not_import_or_spawn_verifier`
+- `tests/test_safety_drill.py::test_release_verifier_and_drill_have_separate_import_graphs`
+- `tests/test_safety_drill.py::test_offline_verifier_has_no_direct_credentialed_drill_command`

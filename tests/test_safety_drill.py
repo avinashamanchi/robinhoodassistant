@@ -1,5 +1,6 @@
 import base64
 import builtins
+import importlib
 import json
 import os
 import sqlite3
@@ -3322,7 +3323,7 @@ def test_credentialed_label_never_passes_when_crash_gate_is_unconfirmed(
     assert "alpaca_paper:unconfirmed" in report.details
 
 
-def test_credentialed_paper_drill_is_separate_from_offline_release_verifier(
+def test_fake_credentialed_drill_runtime_does_not_import_or_spawn_verifier(
     tmp_path,
     app_config,
     monkeypatch,
@@ -3333,6 +3334,7 @@ def test_credentialed_paper_drill_is_separate_from_offline_release_verifier(
     _credentialed_environment(monkeypatch, primary)
     verifier_module = "scripts.verify_loopback_release"
     real_import = builtins.__import__
+    real_import_module = importlib.import_module
     real_popen = subprocess.Popen
 
     def reject_verifier_import(
@@ -3351,16 +3353,29 @@ def test_credentialed_paper_drill_is_separate_from_offline_release_verifier(
             or name.startswith(f"{verifier_module}.")
             or verifier_fromlist
         ):
-            pytest.fail("credentialed paper drill imported release verifier")
+            pytest.fail("fake drill runtime imported release verifier")
         return real_import(name, globals, locals, fromlist, level)
 
     def reject_verifier_process(argv, *args, **kwargs):
         parts = argv if isinstance(argv, (tuple, list)) else (argv,)
         if any("verify_loopback_release" in str(part) for part in parts):
-            pytest.fail("credentialed paper drill invoked release verifier")
+            pytest.fail("fake drill runtime invoked release verifier")
         return real_popen(argv, *args, **kwargs)
 
+    def reject_verifier_import_module(name, package=None):
+        if (
+            name == verifier_module
+            or name.startswith(f"{verifier_module}.")
+        ):
+            pytest.fail("fake drill runtime imported release verifier")
+        return real_import_module(name, package)
+
     monkeypatch.setattr(builtins, "__import__", reject_verifier_import)
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        reject_verifier_import_module,
+    )
     monkeypatch.setattr(subprocess, "Popen", reject_verifier_process)
     monkeypatch.setattr(
         safety_drill_module,
@@ -3380,7 +3395,24 @@ def test_credentialed_paper_drill_is_separate_from_offline_release_verifier(
     assert "alpaca_paper:unconfirmed" in report.details
 
 
-def test_offline_release_verifier_import_and_commands_exclude_safety_drill():
+@pytest.mark.parametrize(
+    ("target_module", "forbidden_module"),
+    [
+        (
+            "trading_assistant.ops.safety_drill",
+            "scripts.verify_loopback_release",
+        ),
+        (
+            "scripts.verify_loopback_release",
+            "trading_assistant.ops.safety_drill",
+        ),
+    ],
+)
+def test_release_verifier_and_drill_have_separate_import_graphs(
+    tmp_path,
+    target_module,
+    forbidden_module,
+):
     root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         (
@@ -3388,14 +3420,22 @@ def test_offline_release_verifier_import_and_commands_exclude_safety_drill():
             "-c",
             "\n".join(
                 (
+                    "import importlib",
+                    "import importlib.abc",
                     "import json",
                     "import sys",
-                    "from scripts.verify_loopback_release import ReleaseVerifier",
-                    "commands = ReleaseVerifier.default_commands()",
+                    f"target = {target_module!r}",
+                    f"forbidden = {forbidden_module!r}",
+                    "class RejectForbidden(importlib.abc.MetaPathFinder):",
+                    "    def find_spec(self, fullname, path=None, target=None):",
+                    "        if fullname == forbidden or fullname.startswith(forbidden + '.'):",
+                    "            raise RuntimeError('forbidden import attempted')",
+                    "        return None",
+                    "sys.meta_path.insert(0, RejectForbidden())",
+                    "importlib.import_module(target)",
                     "print(json.dumps({",
-                    '    "drill_imported": '
-                    '"trading_assistant.ops.safety_drill" in sys.modules,',
-                    '    "argv": [list(command.argv) for command in commands],',
+                    '    "target_imported": target in sys.modules,',
+                    '    "forbidden_imported": forbidden in sys.modules,',
                     "}, sort_keys=True))",
                 )
             ),
@@ -3404,9 +3444,13 @@ def test_offline_release_verifier_import_and_commands_exclude_safety_drill():
         env={
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "HOME": str(tmp_path),
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "PATH": os.environ.get("PATH", os.defpath),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
         },
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -3417,9 +3461,63 @@ def test_offline_release_verifier_import_and_commands_exclude_safety_drill():
 
     assert probe.returncode == 0, probe.stderr
     payload = json.loads(probe.stdout)
-    assert payload["drill_imported"] is False
-    assert all(
-        "safety_drill" not in part
-        for argv in payload["argv"]
-        for part in argv
+    assert payload == {
+        "forbidden_imported": False,
+        "target_imported": True,
+    }
+
+
+def test_offline_verifier_has_no_direct_credentialed_drill_command(
+    tmp_path,
+):
+    root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import json",
+                    "from scripts.verify_loopback_release import ReleaseVerifier",
+                    "commands = ReleaseVerifier.default_commands()",
+                    "direct = []",
+                    "for command in commands:",
+                    "    argv = tuple(part.lower() for part in command.argv)",
+                    "    module_call = any(",
+                    "        argv[index:index + 2] == ('-m', 'trading_assistant.ops.safety_drill')",
+                    "        for index in range(max(0, len(argv) - 1))",
+                    "    )",
+                    "    script_call = any(",
+                    "        part.endswith('trading_assistant/ops/safety_drill.py')",
+                    "        for part in argv",
+                    "    )",
+                    "    credentialed = '--alpaca-paper' in argv",
+                    "    if module_call or script_call or credentialed:",
+                    "        direct.append(command.name)",
+                    "print(json.dumps({'direct_credentialed_drill_commands': direct}))",
+                )
+            ),
+        ),
+        cwd=root,
+        env={
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(tmp_path),
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "PATH": os.environ.get("PATH", os.defpath),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
+
+    assert probe.returncode == 0, probe.stderr
+    assert json.loads(probe.stdout) == {
+        "direct_credentialed_drill_commands": []
+    }
