@@ -249,8 +249,9 @@ instructions above.
   safe checks.
 - `OUTBOUND_ORIGINS` verifies the exact manifest/config.
 - `INTEGRATIONS_DISABLED` verifies webhook and Composio are off.
-- Existing paper-mode, reconciliation, breaker, quote, and daemon checks remain
-  unchanged and run only after the structural gate.
+- Existing paper-mode, reconciliation, breaker, and quote checks remain
+  unchanged and run only after the structural gate. Daemon freshness is
+  observed separately after startup; there is no daemon-health preflight row.
 - Tests use fakes that raise if outbound construction or calls occur.
 
 ### Documentation and verification
@@ -268,3 +269,38 @@ instructions above.
   tests. The repository static gate must pass. Run exactly one full suite;
   reuse that result for the completion checkpoint rather than running it
   again.
+
+## Fix round 1 completion
+
+- [x] Canonical final authorities reject duplicate/conditional definitions,
+  rebinding, direct mutation, alias mutation, and dynamic construction.
+- [x] Route branch unions, route-list mutation, `__getattribute__`
+  registration, recursive chat helpers, sensitive-write bypasses, environment
+  mapping access, direct clients, option provenance, TLS/cookie drift,
+  hermetic-root failure, safe output, and broad artifact names have exact
+  negative fixtures.
+- [x] Watchdog uses the injected pinned local-liveness transport; every runtime
+  adapter/role checks the outbound manifest before production client
+  construction.
+- [x] Preflight requires explicit macOS Keychain provenance, executes all five
+  local rows independently, uses canonical TLS paths, and keeps its encryption
+  check metadata-only.
+- [x] All four operator documents and the executable plan remove stale
+  MarketStack instructions and accurately state preflight and daemon limits.
+- [x] Implementation/tests/operator docs committed separately as
+  `1f63080bc18894d025a20690dfbd6b4e7d6dd946`.
+- [x] Final static-fixture file: `245 passed`.
+- [x] Final trust/affected matrix: `1575 passed, 1 warning`.
+- [x] Repository static gate: `release static checks: PASS`.
+- [x] Exactly one full suite:
+  `3535 passed, 7 failed, 1 skipped, 1 warning`; all seven stale fixture
+  interfaces were corrected, then the exact set passed `8/8` and complete
+  affected files passed `228/228`. No second full run was made.
+- [x] Bounded review diff and round-1 review package prepared with zero open
+  code findings.
+
+Residual release evidence is explicit: the single full-suite artifact is not
+green, while the final tree has exact focused, complete affected, matrix,
+compile, diff, and repository-static proof. Composio remains disabled pending
+external provider-side revocation/rotation; no webhook, live mode, autonomous
+execution, or profit guarantee was introduced.

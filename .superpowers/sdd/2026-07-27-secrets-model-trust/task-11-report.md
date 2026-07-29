@@ -15,7 +15,9 @@ transport settings, disabled integrations, and tracked private artifacts.
 Preflight now evaluates `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
 `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` before constructing or calling
 any broker, model provider, or notifier. Existing paper, reconciliation,
-breaker, quote, and daemon checks remain after that structural barrier.
+breaker, and quote checks remain after that structural barrier. Daemon
+freshness is observed separately after startup; preflight has no daemon-health
+row.
 
 MarketStack was removed from runtime, configuration, secret models, tests, and
 operator documentation. Historical equities use the pinned Alpaca data origin.
@@ -124,15 +126,16 @@ All five local checks run before the operational preflight:
    fields required by the preflight role, including configured field keys.
 2. `LOCAL_TLS` proves exact loopback configuration, secure cookies, transport
    policy, private-key mode, matching certificate, SANs, and validity.
-3. `FIELD_ENCRYPTION` proves the configured key, singleton migration state,
-   current schema/key ID, completed progress, and valid encrypted envelopes
-   through local checks.
+3. `FIELD_ENCRYPTION` proves configured-key availability plus singleton
+   migration metadata, current schema/key ID, and completed progress without
+   decrypting rows. The startup guard owns the one full envelope scan.
 4. `OUTBOUND_ORIGINS` proves exact configuration/manifest equality.
 5. `INTEGRATIONS_DISABLED` proves webhook and Composio false.
 
 Every check returns fixed detail text. Any failure prints all five structural
 results and exits before broker, provider, notifier, reconciliation, quote, or
-daemon checks. Tests inject fakes that raise if those later paths are reached.
+other operational checks. Tests inject fakes that raise if those later paths
+are reached.
 
 ## Documentation
 
@@ -319,3 +322,169 @@ Task 12/Plan 3 scope. No open code-review finding remains.
   feature/role-scoped alongside Alpaca, Anthropic, and Telegram.
 - This release remains paper-only, has no webhook receiver or live-mode path,
   and makes no profit or return guarantee.
+
+# Task 11 Fix Round 1 Addendum
+
+## Outcome
+
+The review findings were closed in implementation commit
+`1f63080bc18894d025a20690dfbd6b4e7d6dd946`.
+
+The release gate now requires one unconditional canonical definition for every
+final authority and rejects rebinding, direct or aliased mutation, conditional
+definitions, dynamic construction, and integration-class mutation. Route
+analysis unions branch possibilities, rejects unresolved branch side effects,
+and gates `routes` list mutation plus `__getattribute__` registration. Chat
+dispatch helpers are traversed recursively and fail closed on lambda, external,
+dynamic, or mutable paths.
+
+Sensitive-write analysis now includes ORM `Query.update`,
+`Model.__table__.update().values`, helper-returned model aliases, aliased
+`execute`, raw update/text DML, and bulk mappings. Environment analysis includes
+mapping copies/views/getitem and prevents the two development-only providers
+from escaping their exact `load_role_secrets` call chain.
+
+The direct-client gate covers module-qualified and aliased Anthropic/OpenAI,
+requests/httpx/aiohttp, urllib, WebSocket, and socket construction/calls.
+Network option provenance rejects unresolved or mutated `**kwargs` and
+credential-bearing query mappings without treating unrelated `verify` or
+`params` attributes as network settings. Cookie, CORS-regex, SSL verification,
+hostname, and minimum-TLS settings are gated.
+
+Git-tree proof now requires the resolved scanned root to equal the resolved Git
+toplevel, rejects scanned symlinks and outside-root resolution, and emits only
+value-free stable output for path or CLI failures. Private artifact matching
+includes broad environment, database/sidecar, private key/certificate,
+decrypted-backup, log, and raw-export names while public certificate names
+remain accepted.
+
+Runtime composition now checks each adapter/role against the exact outbound
+manifest before client construction. The manifest includes the MCP Alpaca-data
+role and excludes preflight LLM roles. Watchdog liveness uses an injected,
+proxy-free, no-redirect HTTPX transport pinned to the exact loopback HTTPS URL
+and canonical local certificate.
+
+Preflight constructs at most one explicit
+`MacOSKeychainSecretProvider`, loads through that same provider, and never
+accepts `provider=None` as proof. Provider construction/load failure still
+produces all five independent structural rows. `LOCAL_TLS` requires the exact
+certificate/key paths, and `FIELD_ENCRYPTION` is metadata-only.
+
+## Exact round-1 RED evidence
+
+The review probes were run against the pre-fix implementation with credential
+variables removed:
+
+```text
+env -u COMPOSIO_API_KEY -u ALPACA_API_KEY -u ALPACA_SECRET_KEY \
+  -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u GROQ_API_KEY \
+  -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+  -u FIELD_ENCRYPTION_KEYS_JSON -u APP_API_TOKEN \
+  -u CANDIDATE_SIGNING_KEY -u BACKUP_ENCRYPTION_KEY \
+  uv run pytest tests/test_release_static.py tests/test_launch.py \
+  tests/test_outbound_policy.py tests/test_watchdog.py -q --tb=no \
+  -k 'final_authorities or route_branch_union or
+  route_list_and_dunder or route_mutation_fixture or chat_reachable or
+  sensitive_write_round_one or environment_mapping or
+  development_environment_provider or module_qualified or
+  network_option_provenance or non_network_verify or transport_round_one or
+  secure_cookie_call or scanned_root or security_sensitive_symlinks or
+  root_symlink_loop or unsafe_tracked_path or broad_private or
+  public_certificate or executable_plan or historical_marketstack or
+  never_accepts_missing_keychain or exact_canonical_tls_paths or
+  provider_constructor_failure or keychain_load_failure or
+  constructs_loads_and_passes_one or metadata_only_and_never_builds_cipher or
+  require_origin_enforces or local_liveness_transport or
+  uses_only_injected_local_liveness or builds_one_local_liveness'
+
+RED_FAILED=72
+```
+
+The evidence count came from the command's 72 emitted `FAILED` records. Two
+later strict authority probes independently failed `2/13`, and the value-free
+CLI parse probe independently failed `1/1` before their focused fixes.
+
+## Final focused and static verification
+
+```text
+uv run pytest tests/test_release_static.py --tb=short
+245 passed in 41.84s
+
+uv run pytest tests/test_monitor.py \
+  tests/test_task9_round2.py tests/test_watchdog.py tests/test_launch.py \
+  -v --tb=short
+228 passed, 1 warning in 6.66s
+
+uv run pytest <25-file trust and affected matrix> --tb=short
+1575 passed, 1 warning in 132.37s
+
+uv run python scripts/check_release_safety.py
+release static checks: PASS
+
+uv run python -m compileall -q scripts/check_release_safety.py \
+  src/trading_assistant tests/test_release_static.py \
+  tests/test_monitor.py tests/test_task9_round2.py
+PASS
+
+git diff --check
+PASS
+```
+
+The matrix is the Task 11 trust matrix plus affected provider, transport,
+backtest, configuration, watchdog, bootstrap, model-trust, safety-drill,
+startup-schema, authentication, and security-header files. The warning is the
+existing third-party `websockets.legacy` deprecation warning.
+
+## Sole round-1 full-suite run
+
+Exactly one no-argument full suite was run after focused and static green:
+
+```text
+uv run pytest
+3535 passed, 7 failed, 1 skipped, 1 warning in 289.19s
+```
+
+All seven failures were stale fake signatures at the newly explicit
+boundaries: five daemon notifier fakes did not accept `runtime_role`, one
+watchdog fake omitted the injected liveness transport/certificate config, and
+one preflight compatibility test assumed the now-forbidden provider-less call.
+Production behavior was not loosened. The legacy tests were updated to use the
+explicit interfaces.
+
+Per the exactly-one-full-suite constraint, the full suite was not rerun. The
+exact failed set plus the paired utility parameter passed `8/8`; all complete
+affected monitor, Task 9 compatibility, watchdog, and preflight files then
+passed `228/228`; the final 1,575-test matrix and repository static gate passed.
+This remains an explicit full-suite evidence caveat.
+
+## Round-1 review package
+
+- Base: `1f25c102c7886fb8425c88198dbaf1618ddb090a`
+- Implementation: `1f63080bc18894d025a20690dfbd6b4e7d6dd946`
+- Diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-1f25c10..1f63080.diff`
+- Diff size: 5,487 lines / 199,838 bytes
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-r1.md`
+
+The bounded review checked all 18 requested finding groups, value leakage,
+root isolation, runtime role propagation, preflight ordering, MarketStack
+remnants, operator documentation, and Task 12/Plan 3 scope. No open code
+finding remains at this implementation gate.
+
+## Round-1 residual limits
+
+- The sole full-suite artifact has seven pre-correction legacy-test failures;
+  final-tree proof is the exact eight-test correction, complete 228-test
+  affected set, 1,575-test trust/affected matrix, and static gate—not a second
+  full run.
+- Unsupported or dynamic trust-boundary constructs are deliberately rejected;
+  adding one requires an explicit parser/model extension plus negative and
+  positive fixtures.
+- Provider-side revocation/rotation of the previously exposed integration
+  credential remains external. Composio has no origin, route, toolkit, caller,
+  or tool and stays disabled.
+- Preflight has no daemon-health row. Daemon freshness is a separate
+  post-start observation.
+- This release remains paper-only, human-approved, webhook-free, and provides
+  no profit guarantee or live-mode path.

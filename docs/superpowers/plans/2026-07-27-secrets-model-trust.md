@@ -66,7 +66,7 @@
 - `src/trading_assistant/logging.py` — register loaded values and redact exception paths.
 - `src/trading_assistant/broker/alpaca.py` — exact paper-origin and no-cross-origin redirects.
 - `src/trading_assistant/notifications/telegram.py` — fixed HTTPS endpoint and redirect refusal.
-- `src/trading_assistant/backtest/marketstack.py` and `backtest/coingecko.py` — fixed origins and redirect refusal.
+- `src/trading_assistant/backtest/coingecko.py` — fixed origin and redirect refusal.
 - `src/trading_assistant/analyst/news.py`, `analyst/analyst.py`, and `analyst/planning.py` — structured summaries only.
 - `src/trading_assistant/analyst/store.py` — encrypted analysis/plan payloads.
 - `src/trading_assistant/orders/repository.py`, `orders/reconciliation.py`, and `orders/startup.py` — encrypted reasons/details.
@@ -165,7 +165,6 @@ class ProviderOriginsConfig(_Strict):
     gemini: AnyUrl = "https://generativelanguage.googleapis.com"
     groq: AnyUrl = "https://api.groq.com"
     telegram: AnyUrl = "https://api.telegram.org"
-    marketstack: AnyUrl = "https://api.marketstack.com"
     coingecko: AnyUrl = "https://api.coingecko.com"
 
 
@@ -199,7 +198,6 @@ class RuntimeSecrets(BaseModel):
     gemini_api_key: SecretStr = SecretStr("")
     groq_api_key: SecretStr = SecretStr("")
     openrouter_api_key: SecretStr = SecretStr("")
-    marketstack_api_key: SecretStr = SecretStr("")
     app_api_token: SecretStr = SecretStr("")
     alpaca_api_key: SecretStr = SecretStr("")
     alpaca_secret_key: SecretStr = SecretStr("")
@@ -649,12 +647,13 @@ git commit -m "feat(security): enforce loopback HTTPS perimeter"
 
 ### Task 4: Pin outbound HTTPS origins and reject cross-origin redirects
 
+Historical non-executable decision: MarketStack was removed; Alpaca historical data is authoritative.
+
 **Files:**
 
 - Create: `src/trading_assistant/security/outbound.py`
 - Modify: `src/trading_assistant/broker/alpaca.py`
 - Modify: `src/trading_assistant/notifications/telegram.py`
-- Modify: `src/trading_assistant/backtest/marketstack.py`
 - Modify: `src/trading_assistant/backtest/coingecko.py`
 - Modify: `src/trading_assistant/analyst/news.py`
 - Modify: `src/trading_assistant/llm/anthropic_backend.py`
@@ -728,8 +727,8 @@ symbol input, or request JSON.
 - LLM SDK clients use only their provider origin.
 - Telegram constructs paths under the fixed Telegram origin; bot token stays
   in the path only in memory and is redacted from exceptions.
-- MarketStack and CoinGecko use `httpx.Client(follow_redirects=False)` and
-  validate the final response request URL.
+- CoinGecko uses `httpx.Client(follow_redirects=False)` and validates the final
+  response request URL.
 
 - [ ] **Step 5: Run outbound tests**
 
@@ -742,7 +741,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/trading_assistant/security/outbound.py src/trading_assistant/broker/alpaca.py src/trading_assistant/notifications/telegram.py src/trading_assistant/backtest/marketstack.py src/trading_assistant/backtest/coingecko.py src/trading_assistant/analyst/news.py src/trading_assistant/llm/anthropic_backend.py src/trading_assistant/llm/gemini_backend.py src/trading_assistant/llm/groq_backend.py tests/test_outbound_policy.py tests/test_alpaca_broker.py tests/test_launch.py tests/test_marketdata.py
+git add src/trading_assistant/security/outbound.py src/trading_assistant/broker/alpaca.py src/trading_assistant/notifications/telegram.py src/trading_assistant/backtest/coingecko.py src/trading_assistant/analyst/news.py src/trading_assistant/llm/anthropic_backend.py src/trading_assistant/llm/gemini_backend.py src/trading_assistant/llm/groq_backend.py tests/test_outbound_policy.py tests/test_alpaca_broker.py tests/test_launch.py tests/test_marketdata.py
 git commit -m "feat(security): pin provider origins and redirects"
 ```
 
@@ -1830,8 +1829,9 @@ Normal readiness requires:
 - encryption state complete and key ID available;
 - no webhook/Composio integration;
 - exact outbound HTTPS origins;
-- existing paper-mode, reconciliation, breaker, quote-integrity, and daemon
-  checks unchanged.
+- existing paper-mode, reconciliation, breaker, and quote-integrity checks
+  unchanged. Daemon freshness remains a separate post-start observation; there
+  is no daemon-health preflight row.
 
 Preflight remains read-only and never resets a breaker, starts a daemon, or
 submits/cancels an order.
@@ -1879,6 +1879,38 @@ was not rerun under the explicit one-run constraint.
 git add scripts/check_release_safety.py tests/test_release_static.py src/trading_assistant/preflight.py tests/test_launch.py README.md docs/RUNBOOK.md
 git commit -m "chore(security): gate trust-boundary invariants"
 ```
+
+### Task 11 fix round 1: close final-authority and local-preflight review gaps
+
+- [x] Add exact RED fixtures for canonical-authority rebinding/mutation,
+  branch-union routes, route-list mutation, recursive chat dispatch, sensitive
+  ORM/raw writes, environment mapping access, direct clients, network-option
+  provenance, transport settings, hermetic Git roots, safe output, and broad
+  tracked artifacts.
+- [x] Require one unconditional canonical definition for chat, sensitive,
+  secret, outbound, and integration authorities; unsupported/dynamic
+  construction fails closed.
+- [x] Replace watchdog urllib liveness with an injected proxy-free,
+  no-redirect transport pinned to the canonical loopback HTTPS endpoint and
+  certificate.
+- [x] Enforce the exact outbound manifest at adapter/composition boundaries,
+  including MCP Alpaca data and no preflight LLM role.
+- [x] Require explicit macOS Keychain provider provenance and one provider/load
+  chain; execute all five structural rows independently on provider failure.
+- [x] Keep preflight field-encryption inspection metadata-only and require
+  canonical TLS certificate/key paths.
+- [x] Correct operator docs and remove stale executable retired-provider
+  instructions, retaining only the labeled historical non-executable decision.
+- [x] Focused/static gate:
+  `245` static-fixture tests and `1575` trust/affected tests passed;
+  `release static checks: PASS`.
+- [x] Run exactly one full suite. Actual:
+  `3535 passed, 7 failed, 1 skipped, 1 warning`; the seven stale fake
+  interfaces were corrected, exact failures passed `8/8`, complete affected
+  files passed `228/228`, and the full suite was not rerun.
+- [x] Commit implementation/tests/operator docs as `1f63080`, then package the
+  bounded review diff, brief/report, plan checkboxes, and progress ledger in a
+  separate evidence commit.
 
 ---
 
