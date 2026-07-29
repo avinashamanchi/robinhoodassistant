@@ -36,14 +36,6 @@ _TERMINATE_GRACE_SECONDS = 0.5
 _KILL_GRACE_SECONDS = 0.5
 _COMMAND_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _SHA = re.compile(r"[0-9a-f]{40,64}")
-_TESTS_PASSED = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
-_TESTS_FAILED = re.compile(r"\b\d+\s+(?:failed|error|errors)\b", re.IGNORECASE)
-_TESTS_SKIPPED = re.compile(r"\b\d+\s+skipped\b", re.IGNORECASE)
-_TESTS_DESELECTED = re.compile(r"\b\d+\s+deselected\b", re.IGNORECASE)
-_NO_TESTS = (
-    re.compile(r"\bno tests ran\b", re.IGNORECASE),
-    re.compile(r"\bcollected\s+0\s+items\b", re.IGNORECASE),
-)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(?:api[-_]?key|authorization|credential|password|secret|token)"
     r"\b\s*[:=]\s*[^\s,;]+"
@@ -564,15 +556,11 @@ def _git(
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
-            (str(git_path), *arguments),
+        return SubprocessRunner().run(
+            argv=(str(git_path), *arguments),
             cwd=root,
             env=environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=15.0,
-            check=False,
+            timeout_seconds=15.0,
         )
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(

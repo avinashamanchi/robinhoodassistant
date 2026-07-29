@@ -8,11 +8,14 @@ import ast
 from dataclasses import dataclass, field
 import hashlib
 import importlib.util
+import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,6 +29,11 @@ _SAFE_FINDING_PATH = re.compile(
 )
 _GIT_EXECUTABLE: Path | None = None
 _GIT_RESOLUTION_ATTEMPTED = False
+_STATIC_CAPTURE_BYTES = 192 * 1024 * 1024
+_STATIC_STDERR_BYTES = 1024 * 1024
+_TRACKED_NAMES_BYTES = 32 * 1024 * 1024
+_PROCESS_TERMINATE_SECONDS = 0.5
+_PROCESS_KILL_SECONDS = 0.5
 
 
 def _resolve_git_executable() -> Path | None:
@@ -81,6 +89,123 @@ def _git_executable() -> Path | None:
         _GIT_EXECUTABLE = _resolve_git_executable()
         _GIT_RESOLUTION_ATTEMPTED = True
     return _GIT_EXECUTABLE
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes],
+    sig: signal.Signals,
+) -> None:
+    try:
+        os.killpg(process.pid, sig)
+        return
+    except OSError:
+        pass
+    try:
+        if sig == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+    except OSError:
+        pass
+
+
+def _bounded_stop(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=_PROCESS_TERMINATE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_process_group(process, signal.SIGKILL)
+    try:
+        process.wait(timeout=_PROCESS_KILL_SECONDS)
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _bounded_contents(handle, maximum: int) -> bytes | None:
+    handle.flush()
+    if os.fstat(handle.fileno()).st_size > maximum:
+        return None
+    handle.seek(0)
+    payload = handle.read(maximum + 1)
+    if len(payload) > maximum:
+        return None
+    return payload
+
+
+def _run_bounded_process(
+    *,
+    argv: tuple[str, ...],
+    cwd: Path,
+    env: dict[str, str],
+    input_bytes: bytes | None,
+    timeout: float,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+) -> subprocess.CompletedProcess[bytes] | None:
+    """Run fixed argv with private file-backed, size-bounded evidence."""
+
+    if (
+        not argv
+        or not math.isfinite(timeout)
+        or timeout <= 0
+        or max_stdout_bytes < 0
+        or max_stderr_bytes < 0
+    ):
+        return None
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdin_handle,
+        tempfile.TemporaryFile(mode="w+b") as stdout_handle,
+        tempfile.TemporaryFile(mode="w+b") as stderr_handle,
+    ):
+        for handle in (stdin_handle, stdout_handle, stderr_handle):
+            os.fchmod(handle.fileno(), 0o600)
+        if input_bytes is not None:
+            stdin_handle.write(input_bytes)
+        stdin_handle.seek(0)
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdin=stdin_handle,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+            )
+        except OSError:
+            return None
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _bounded_stop(process)
+            return None
+        except BaseException:
+            _bounded_stop(process)
+            return None
+        stdout = _bounded_contents(stdout_handle, max_stdout_bytes)
+        stderr = _bounded_contents(stderr_handle, max_stderr_bytes)
+        if stdout is None or stderr is None or process.returncode is None:
+            return None
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+def _git_environment() -> dict[str, str]:
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+    }
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -183,20 +308,26 @@ def _git_tracked_names(root: Path) -> tuple[str, ...] | None:
     git = _git_executable()
     if git is None:
         return None
-    try:
-        top = subprocess.run(
-            [str(git), "rev-parse", "--show-toplevel"],
-            cwd=root,
-            check=False,
-            capture_output=True,
-        )
-        tracked = subprocess.run(
-            [str(git), "ls-files", "-z", "--"],
-            cwd=root,
-            check=False,
-            capture_output=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+    environment = _git_environment()
+    top = _run_bounded_process(
+        argv=(str(git), "rev-parse", "--show-toplevel"),
+        cwd=root,
+        env=environment,
+        input_bytes=None,
+        timeout=15.0,
+        max_stdout_bytes=64 * 1024,
+        max_stderr_bytes=_STATIC_STDERR_BYTES,
+    )
+    tracked = _run_bounded_process(
+        argv=(str(git), "ls-files", "-z", "--"),
+        cwd=root,
+        env=environment,
+        input_bytes=None,
+        timeout=30.0,
+        max_stdout_bytes=_TRACKED_NAMES_BYTES,
+        max_stderr_bytes=_STATIC_STDERR_BYTES,
+    )
+    if top is None or tracked is None:
         return None
     if top.returncode != 0 or tracked.returncode != 0:
         return None
@@ -5440,29 +5571,20 @@ def _history_git(
     *,
     input_bytes: bytes | None = None,
     timeout: float = 60.0,
+    max_output_bytes: int = _STATIC_CAPTURE_BYTES,
 ) -> subprocess.CompletedProcess[bytes] | None:
     git = _git_executable()
     if git is None:
         return None
-    environment = {
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PATH": os.environ.get("PATH", os.defpath),
-    }
-    try:
-        return subprocess.run(
-            (str(git), *arguments),
-            cwd=root,
-            env=environment,
-            input=input_bytes,
-            check=False,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    return _run_bounded_process(
+        argv=(str(git), *arguments),
+        cwd=root,
+        env=_git_environment(),
+        input_bytes=input_bytes,
+        timeout=timeout,
+        max_stdout_bytes=max_output_bytes,
+        max_stderr_bytes=_STATIC_STDERR_BYTES,
+    )
 
 
 def _history_commits(root: Path) -> tuple[str, ...] | None:
@@ -5508,6 +5630,7 @@ def _history_message_findings(
         completed = _history_git(
             root,
             ("show", "-s", "--format=%B", commit),
+            max_output_bytes=_MAX_HISTORY_MESSAGE_BYTES + 1,
         )
         if completed is None or completed.returncode != 0:
             return None
@@ -5547,7 +5670,11 @@ def _history_message_findings(
             continue
         if object_type != b"tag":
             return None
-        completed = _history_git(root, ("cat-file", "tag", object_id))
+        completed = _history_git(
+            root,
+            ("cat-file", "tag", object_id),
+            max_output_bytes=_MAX_HISTORY_MESSAGE_BYTES + 1,
+        )
         if completed is None or completed.returncode != 0:
             return None
         if len(completed.stdout) > _MAX_HISTORY_MESSAGE_BYTES:

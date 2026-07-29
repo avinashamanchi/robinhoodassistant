@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import math
 import os
@@ -807,6 +808,44 @@ def test_subprocess_runner_timeout_has_a_finite_cleanup_deadline(
     assert time.monotonic() - started < 1.5
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "scripts/verify_loopback_release.py",
+        "scripts/check_release_safety.py",
+    ),
+)
+def test_verifier_scripts_do_not_use_unbounded_pipe_capture(
+    relative_path: str,
+):
+    tree = ast.parse(Path(relative_path).read_text(encoding="utf-8"))
+    violations: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "communicate"
+            ):
+                violations.append((node.lineno, "communicate"))
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "capture_output"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                ):
+                    violations.append((node.lineno, "capture_output"))
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "subprocess"
+            and node.attr == "PIPE"
+        ):
+            violations.append((node.lineno, "subprocess.PIPE"))
+
+    assert violations == []
+
+
 def test_dirty_tree_blocks_before_any_verification_command(
     clean_repository: Path,
     tmp_path: Path,
@@ -1058,16 +1097,18 @@ def test_ignored_root_credentials_block_before_commands_without_reading_values(
     assert marker not in serialized
 
 
+@pytest.mark.parametrize("blocked_family", ("AF_INET", "AF_INET6"))
 def test_python_network_guard_blocks_inet_but_allows_unix_socket_creation(
     clean_repository: Path,
     tmp_path: Path,
+    blocked_family: str,
 ):
     source = (
         "import socket;"
         "local=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
         "local.close();"
         "print('unix-ok');"
-        "socket.socket(socket.AF_INET,socket.SOCK_STREAM)"
+        f"socket.socket(socket.{blocked_family},socket.SOCK_STREAM)"
     )
     command = Command(
         "python-network-attempt",
@@ -1123,6 +1164,8 @@ def test_python_network_guard_blocks_default_inet_socket_constructor(
     (
         "socket.SocketType(socket.AF_INET,socket.SOCK_STREAM)",
         "__import__('_socket').socket(socket.AF_INET,socket.SOCK_STREAM)",
+        "socket.getnameinfo(('127.0.0.1',80),0)",
+        "__import__('_socket').getnameinfo(('127.0.0.1',80),0)",
     ),
 )
 def test_python_network_guard_blocks_standard_socket_alias_bypasses(

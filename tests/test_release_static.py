@@ -4078,6 +4078,57 @@ def test_static_gate_rejects_mismatched_verified_git_without_path_or_hash_leak(
     assert bad_fingerprint not in completed.stderr
 
 
+def test_static_gate_git_runner_uses_private_bounded_regular_spools(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "release_gate_bounded_process_contract",
+        Path("scripts/check_release_safety.py"),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    inspect_descriptors = (
+        "import os, stat, sys\n"
+        "print('stdout_regular=' + "
+        "str(stat.S_ISREG(os.fstat(1).st_mode)))\n"
+        "print('stdout_mode=' + "
+        "oct(stat.S_IMODE(os.fstat(1).st_mode)))\n"
+        "print('stderr_regular=' + "
+        "str(stat.S_ISREG(os.fstat(2).st_mode)), file=sys.stderr)\n"
+        "print('stderr_mode=' + "
+        "oct(stat.S_IMODE(os.fstat(2).st_mode)), file=sys.stderr)\n"
+    )
+
+    completed = module._run_bounded_process(
+        argv=(sys.executable, "-c", inspect_descriptors),
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+        input_bytes=None,
+        timeout=5.0,
+        max_stdout_bytes=4096,
+        max_stderr_bytes=4096,
+    )
+
+    assert completed is not None
+    assert completed.returncode == 0
+    assert completed.stdout == (
+        b"stdout_regular=True\nstdout_mode=0o600\n"
+    )
+    assert completed.stderr == (
+        b"stderr_regular=True\nstderr_mode=0o600\n"
+    )
+    oversized = module._run_bounded_process(
+        argv=(sys.executable, "-c", "print('x' * 10000)"),
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+        input_bytes=None,
+        timeout=5.0,
+        max_stdout_bytes=128,
+        max_stderr_bytes=128,
+    )
+    assert oversized is None
+
+
 def _ci_workflow() -> tuple[str, dict[str, object]]:
     source = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     parsed = yaml.load(source, Loader=yaml.BaseLoader)

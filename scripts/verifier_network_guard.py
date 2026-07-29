@@ -63,10 +63,15 @@ def install_network_guard() -> None:
     _socket.socket = GuardedRawSocket
     socket.create_connection = _blocked
     socket.getaddrinfo = _blocked
+    socket.getfqdn = _blocked
     socket.gethostbyname = _blocked
     socket.gethostbyname_ex = _blocked
     socket.gethostbyaddr = _blocked
+    socket.getnameinfo = _blocked
     _socket.getaddrinfo = _blocked
     _socket.gethostbyname = _blocked
+    if hasattr(_socket, "gethostbyname_ex"):
+        _socket.gethostbyname_ex = _blocked
     _socket.gethostbyaddr = _blocked
+    _socket.getnameinfo = _blocked
     _INSTALLED = True
