@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -19,11 +20,20 @@ _TRUSTED_ANCESTRY_ANCHORS: dict[Path, str] = {}
 
 
 def test_release_static_gate_passes_for_the_committed_runtime_sources():
+    inherited_output_ceiling = 64 * 1024 * 1024
+
+    def limit_output_files() -> None:
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE,
+            (inherited_output_ceiling, inherited_output_ceiling),
+        )
+
     completed = subprocess.run(
         [sys.executable, "scripts/check_release_safety.py"],
         check=False,
         capture_output=True,
         text=True,
+        preexec_fn=limit_output_files,
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr

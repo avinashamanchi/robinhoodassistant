@@ -197,7 +197,19 @@ def _run_bounded_process(
         if input_bytes is not None:
             stdin_handle.write(input_bytes)
         stdin_handle.seek(0)
-        output_file_limit = max(max_stdout_bytes, max_stderr_bytes, 1)
+        requested_output_file_limit = max(
+            max_stdout_bytes,
+            max_stderr_bytes,
+            1,
+        )
+        _inherited_soft_limit, inherited_hard_limit = resource.getrlimit(
+            resource.RLIMIT_FSIZE
+        )
+        output_file_limit = (
+            requested_output_file_limit
+            if inherited_hard_limit == resource.RLIM_INFINITY
+            else min(requested_output_file_limit, inherited_hard_limit)
+        )
 
         def limit_child_files() -> None:
             resource.setrlimit(
@@ -5569,6 +5581,8 @@ _CREDENTIAL_FINGERPRINTS: tuple[
 )
 _MAX_SCANNED_BLOB_BYTES = 5 * 1024 * 1024
 _MAX_HISTORY_BATCH_BYTES = 128 * 1024 * 1024
+_MAX_HISTORY_PAYLOAD_CHUNK_BYTES = 32 * 1024 * 1024
+_MAX_HISTORY_BATCH_HEADER_BYTES = 128
 _MAX_HISTORY_MESSAGE_BYTES = 1024 * 1024
 
 
@@ -5924,50 +5938,89 @@ def _history_blob_payloads(
     sizes: dict[str, int],
 ) -> dict[str, bytes] | None:
     if not object_ids:
-        return {}
-    input_bytes = b"".join(
-        object_id.encode("ascii") + b"\n"
-        for object_id in object_ids
-    )
-    completed = _history_git(
-        root,
-        ("cat-file", "--batch"),
-        input_bytes=input_bytes,
-        timeout=120.0,
-    )
-    if completed is None or completed.returncode != 0:
+        return {} if not sizes else None
+    if set(sizes) != set(object_ids):
         return None
-    output = completed.stdout
-    cursor = 0
-    payloads: dict[str, bytes] = {}
-    for expected in object_ids:
-        header_end = output.find(b"\n", cursor)
-        if header_end < 0:
-            return None
-        header = output[cursor:header_end].split()
-        if len(header) != 3:
-            return None
-        raw_object, object_type, raw_size = header
-        try:
-            object_id = raw_object.decode("ascii")
-            size = int(raw_size)
-        except (UnicodeDecodeError, ValueError):
-            return None
+    chunks: list[tuple[str, ...]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for object_id in object_ids:
+        size = sizes.get(object_id)
         if (
-            object_id != expected
-            or object_type != b"blob"
-            or size != sizes.get(expected)
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
         ):
             return None
-        start = header_end + 1
-        end = start + size
-        if end >= len(output) or output[end : end + 1] != b"\n":
+        bounded_size = size + _MAX_HISTORY_BATCH_HEADER_BYTES
+        if bounded_size > _MAX_HISTORY_PAYLOAD_CHUNK_BYTES:
             return None
-        payloads[object_id] = output[start:end]
-        cursor = end + 1
-    if cursor != len(output):
-        return None
-    return payloads
+        if (
+            current
+            and current_bytes + bounded_size
+            > _MAX_HISTORY_PAYLOAD_CHUNK_BYTES
+        ):
+            chunks.append(tuple(current))
+            current = []
+            current_bytes = 0
+        current.append(object_id)
+        current_bytes += bounded_size
+    if current:
+        chunks.append(tuple(current))
+
+    payloads: dict[str, bytes] = {}
+    for chunk in chunks:
+        input_bytes = b"".join(
+            object_id.encode("ascii") + b"\n"
+            for object_id in chunk
+        )
+        maximum_output = (
+            sum(
+                sizes[object_id] + _MAX_HISTORY_BATCH_HEADER_BYTES
+                for object_id in chunk
+            )
+            + 1
+        )
+        completed = _history_git(
+            root,
+            ("cat-file", "--batch"),
+            input_bytes=input_bytes,
+            timeout=120.0,
+            max_output_bytes=maximum_output,
+        )
+        if completed is None or completed.returncode != 0:
+            return None
+        output = completed.stdout
+        cursor = 0
+        for expected in chunk:
+            header_end = output.find(b"\n", cursor)
+            if header_end < 0:
+                return None
+            header = output[cursor:header_end].split()
+            if len(header) != 3:
+                return None
+            raw_object, object_type, raw_size = header
+            try:
+                object_id = raw_object.decode("ascii")
+                size = int(raw_size)
+            except (UnicodeDecodeError, ValueError):
+                return None
+            if (
+                object_id != expected
+                or object_type != b"blob"
+                or size != sizes.get(expected)
+                or object_id in payloads
+            ):
+                return None
+            start = header_end + 1
+            end = start + size
+            if end >= len(output) or output[end : end + 1] != b"\n":
+                return None
+            payloads[object_id] = output[start:end]
+            cursor = end + 1
+        if cursor != len(output):
+            return None
+    return payloads if set(payloads) == set(object_ids) else None
 
 
 def _scan_git_history(root: Path) -> list[ReleaseViolation]:
