@@ -133,3 +133,23 @@ suite was run.
   broker-truth checks, and no-profit-guarantee limits are unchanged.
 - No service, real resource, credential, external transport, trading action,
   notification, breaker reset, or push occurred.
+
+## Round 4 supersession
+
+This package remains the historical round-3 record, but three conclusions are
+superseded by round 4:
+
+- The watchdog requirement tuple was database-only, but the generic provider
+  still fetched every Keychain account before projecting that tuple. Round 4
+  moves role projection into provider retrieval and proves exact account
+  access with a fake provider.
+- “Local `SELECT`s” was too literal. The actual invariant is no trading-table
+  DML; SQLite connection setup intentionally retains WAL and secure-sidecar
+  maintenance.
+- The recorded migration-race caveat was a test synchronization defect. Round
+  4 binds the hook to the exact revision 0013 sensitive drop/lock point without
+  changing migration production behavior.
+
+The authoritative follow-up is
+`task-11-review-package-r4.md` with bounded implementation diff
+`review-c12ce6f..2093b80.diff`.

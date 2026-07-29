@@ -1,0 +1,1370 @@
+diff --git a/docs/RUNBOOK.md b/docs/RUNBOOK.md
+index 76a697f..0700985 100644
+--- a/docs/RUNBOOK.md
++++ b/docs/RUNBOOK.md
+@@ -344,10 +344,11 @@ not decrypt rows. The startup guard performs the one full envelope scan. Only
+ after all five pass does preflight run the paper-mode, schema, WAL, breaker,
+ Alpaca-read, quote, and broker/local reconciliation checks. Reconciliation uses
+ a dedicated read-only `preflight` service exposing one snapshot probe. It calls
+-only broker open-order/position reads and local SQL `SELECT`s; it constructs no
+-mutable `TradingService`, clock client, field cipher, LLM provider, agent, app,
+-or notifier. There is no daemon-health preflight row; daemon freshness is
+-observed separately after startup.
++only broker open-order/position reads and performs no trading-table DML. Local
++SQLite setup still establishes WAL and applies sidecar permissions before the
++probe. The probe constructs no mutable `TradingService`, clock client, field
++cipher, LLM provider, agent, app, or notifier. There is no daemon-health
++preflight row; daemon freshness is observed separately after startup.
+ 
+ Preflight never submits a new order, calls an LLM, or sends an external
+ notification, repairs order state, cancels an order, or writes reconciliation
+diff --git a/docs/ops/README.md b/docs/ops/README.md
+index 49a8587..0bbdac3 100644
+--- a/docs/ops/README.md
++++ b/docs/ops/README.md
+@@ -32,8 +32,10 @@ The TLS setup installs the canonical `rootCA.pem`, `localhost.pem`, and
+ `localhost-key.pem` layout; watchdog verification uses the CA file, never the
+ leaf as a trust bundle. After the five structural rows pass, preflight uses a
+ dedicated read-only reconciliation service. That service exposes one snapshot
+-probe, calls only broker open-order/position reads and local SQL `SELECT`s, and
+-cannot repair, cancel, submit, notify, or construct a mutable trading service.
++probe, calls only broker open-order/position reads, and performs no trading-table DML.
++SQLite setup still establishes WAL and applies sidecar
++permissions. The probe cannot repair, cancel, submit, notify, or construct a
++mutable trading service.
+ Rotation requires a reviewed new retained key ID, an interactive
+ `set-encryption-key`, stopped-writer `encrypt_sensitive rotate`, a coordinated
+ active/retained config transition, and a final Keychain audit plus envelope
+diff --git a/scripts/check_release_safety.py b/scripts/check_release_safety.py
+index 3c2d343..49a7284 100644
+--- a/scripts/check_release_safety.py
++++ b/scripts/check_release_safety.py
+@@ -359,6 +359,19 @@ def _canonical_assignment_finding(
+             and _target_root_name(node.func.value) in aliases
+         ):
+             return [_finding(code, relative, node.lineno)]
++        elif (
++            isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr in _AUTHORITY_MUTATORS
++            and any(
++                _contains_loaded_name(expression, aliases)
++                for expression in (
++                    *node.args,
++                    *(keyword.value for keyword in node.keywords),
++                )
++            )
++        ):
++            return [_finding(code, relative, node.lineno)]
+         elif (
+             isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+@@ -3428,6 +3441,19 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+                 (ast.Dict, ast.List, ast.Set, ast.Tuple),
+             ):
+                 indirect_expression = candidate.value
++            elif (
++                isinstance(candidate, ast.Call)
++                and isinstance(candidate.func, ast.Attribute)
++                and candidate.func.attr
++                in {"append", "extend", "insert", "update"}
++            ):
++                indirect_expression = ast.Tuple(
++                    elts=[
++                        *candidate.args,
++                        *(keyword.value for keyword in candidate.keywords),
++                    ],
++                    ctx=ast.Load(),
++                )
+             elif (
+                 isinstance(candidate, ast.Call)
+                 and isinstance(candidate.func, ast.Subscript)
+@@ -4365,16 +4391,32 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+             return expression_path
+ 
+         for candidate in ast.walk(tree):
+-            if not (
++            indirect_expression = None
++            if (
+                 isinstance(candidate, (ast.Assign, ast.AnnAssign))
+                 and isinstance(
+                     candidate.value,
+                     (ast.Dict, ast.List, ast.Set, ast.Tuple),
+                 )
+             ):
++                indirect_expression = candidate.value
++            elif (
++                isinstance(candidate, ast.Call)
++                and isinstance(candidate.func, ast.Attribute)
++                and candidate.func.attr
++                in {"append", "extend", "insert", "update"}
++            ):
++                indirect_expression = ast.Tuple(
++                    elts=[
++                        *candidate.args,
++                        *(keyword.value for keyword in candidate.keywords),
++                    ],
++                    ctx=ast.Load(),
++                )
++            if indirect_expression is None:
+                 continue
+             indirect_network_identity = False
+-            for item in ast.walk(candidate.value):
++            for item in ast.walk(indirect_expression):
+                 if not isinstance(item, (ast.Name, ast.Attribute)):
+                     continue
+                 identity_path = canonical_network_path(item)
+@@ -4603,7 +4645,6 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 or module_client
+                 or module_request
+                 or provider_client_name is not None
+-                or call_name in _OUTBOUND_CLIENT_CONSTRUCTORS
+                 or (
+                     boundary_wrapper
+                     and call_name.lower() in _OUTBOUND_REQUEST_METHODS
+diff --git a/scripts/launchd/README.md b/scripts/launchd/README.md
+index 5429f90..d02b15e 100644
+--- a/scripts/launchd/README.md
++++ b/scripts/launchd/README.md
+@@ -34,9 +34,10 @@ Field preflight is metadata-only; the startup guard owns the full envelope
+ scan. Local TLS requires `rootCA.pem`, `localhost.pem`, and
+ `localhost-key.pem`; the watchdog trusts only the CA file. After structural
+ success, preflight uses a dedicated read-only snapshot service that performs
+-only broker open-order/position reads and local SQL `SELECT`s. It cannot repair
+-or cancel orders and constructs no mutable trading service, LLM provider,
+-agent, app, or notifier. Keychain migration, field
++only broker open-order/position reads and performs no trading-table DML. SQLite
++setup still establishes WAL and applies sidecar permissions. The probe cannot
++repair or cancel orders and constructs no mutable trading service, LLM
++provider, agent, app, or notifier. Keychain migration, field
+ migration/rotation, and encrypted restore procedures are in
+ `docs/RUNBOOK.md`; no secret value belongs on a command line.
+ For rotation, keep every writer stopped, configure and prompt for the reviewed
+diff --git a/src/trading_assistant/ops/preflight_probe.py b/src/trading_assistant/ops/preflight_probe.py
+index 6c4a9fa..41e841e 100644
+--- a/src/trading_assistant/ops/preflight_probe.py
++++ b/src/trading_assistant/ops/preflight_probe.py
+@@ -13,6 +13,7 @@ from ..assets import broker_symbol_matches_local
+ from ..broker.base import BrokerClient
+ from ..broker.models import OrderStatus
+ from ..db.models import (
++    FILL_RECONCILIATION_SUPERSEDED,
+     FILL_RECONCILIATION_TRUSTED,
+     PLAN_CANCEL_INDETERMINATE,
+     PLAN_CANCEL_REQUESTED,
+@@ -86,6 +87,7 @@ class ReadOnlyPreflightService:
+                     Order.status,
+                     Order.broker_order_id,
+                     Order.plan_cancel_state,
++                    Order.qty,
+                 ).where(
+                     Order.status.in_(
+                         _LOCAL_BROKER_OPEN_STATUSES
+@@ -105,60 +107,95 @@ class ReadOnlyPreflightService:
+ 
+         local_by_client: dict[
+             str,
+-            tuple[str, str, str | None, str],
++            tuple[str, str, str, str, Decimal],
+         ] = {}
++        local_broker_ids: set[str] = set()
+         orders_match = True
+-        for client_id, ticker, status, broker_id, cancel_state in local_orders:
++        for (
++            client_id,
++            ticker,
++            status,
++            broker_id,
++            cancel_state,
++            qty,
++        ) in local_orders:
+             if (
+                 not isinstance(client_id, str)
+-                or not client_id
++                or not client_id.strip()
+                 or client_id in local_by_client
+                 or status in _LOCAL_UNCERTAIN_STATUSES
+                 or not isinstance(broker_id, str)
+-                or not broker_id
++                or not broker_id.strip()
++                or broker_id in local_broker_ids
+                 or cancel_state in _UNRESOLVED_CANCEL_STATES
++                or not isinstance(qty, Decimal)
++                or not qty.is_finite()
++                or qty <= 0
+             ):
+                 orders_match = False
+             else:
++                local_broker_ids.add(broker_id)
+                 local_by_client[client_id] = (
+                     ticker,
+                     status,
+                     broker_id,
+                     cancel_state,
++                    qty,
+                 )
+ 
+         remote_by_client: dict[str, object] = {}
++        remote_broker_ids: set[str] = set()
+         for remote in remote_orders:
+             client_id = getattr(remote, "idempotency_key", None)
+             broker_id = getattr(remote, "broker_order_id", None)
+             status = getattr(remote, "status", None)
+             ticker = getattr(remote, "ticker", None)
++            filled_qty = getattr(remote, "filled_qty", None)
+             if (
+                 not isinstance(client_id, str)
+-                or not client_id
++                or not client_id.strip()
+                 or client_id in remote_by_client
+                 or not isinstance(broker_id, str)
+-                or not broker_id
++                or not broker_id.strip()
++                or broker_id in remote_broker_ids
+                 or status not in _REMOTE_OPEN_STATUSES
+                 or not isinstance(ticker, str)
+-                or not ticker
++                or not ticker.strip()
++                or not isinstance(filled_qty, Decimal)
++                or not filled_qty.is_finite()
++                or filled_qty < 0
+             ):
+                 orders_match = False
+                 continue
++            remote_broker_ids.add(broker_id)
+             remote_by_client[client_id] = remote
+ 
+         if set(local_by_client) != set(remote_by_client):
+             orders_match = False
+         for client_id in set(local_by_client).intersection(remote_by_client):
+-            local_ticker, local_status, local_broker_id, _ = local_by_client[
+-                client_id
+-            ]
++            (
++                local_ticker,
++                local_status,
++                local_broker_id,
++                _,
++                local_qty,
++            ) = local_by_client[client_id]
+             remote = remote_by_client[client_id]
+             remote_status = getattr(remote, "status")
+             remote_ticker = getattr(remote, "ticker")
++            remote_filled_qty = getattr(remote, "filled_qty")
+             if (
+                 getattr(remote, "broker_order_id") != local_broker_id
+                 or remote_status.value != local_status
++                or remote_filled_qty > local_qty
++                or (
++                    remote_status is OrderStatus.SUBMITTED
++                    and remote_filled_qty != 0
++                )
++                or (
++                    remote_status is OrderStatus.PARTIALLY_FILLED
++                    and not (0 < remote_filled_qty < local_qty)
++                )
+             ):
+                 orders_match = False
+             try:
+@@ -181,6 +218,8 @@ class ReadOnlyPreflightService:
+             broker_fill_id,
+             reconciliation_state,
+         ) in local_fills:
++            if reconciliation_state == FILL_RECONCILIATION_SUPERSEDED:
++                continue
+             symbol = str(ticker).upper()
+             if (
+                 reconciliation_state != FILL_RECONCILIATION_TRUSTED
+diff --git a/src/trading_assistant/security/secrets.py b/src/trading_assistant/security/secrets.py
+index 26026ca..cdba567 100644
+--- a/src/trading_assistant/security/secrets.py
++++ b/src/trading_assistant/security/secrets.py
+@@ -391,6 +391,30 @@ class MacOSKeychainSecretProvider:
+         )
+         return loaded
+ 
++    def load_for_role(
++        self,
++        *,
++        role: str,
++        config: AppConfig,
++    ) -> RuntimeSecrets:
++        """Read only the Keychain accounts visible to one runtime role."""
++        values = {
++            field_name: self._get(field_name) or ""
++            for field_name in _role_simple_secret_fields(role, config)
++        }
++        field_keys: dict[str, str] = {}
++        if _role_requires_key_material(role):
++            for key_id in _configured_key_ids(config.encryption):
++                account = f"field-encryption/{key_id}"
++                value = self._get(account)
++                if value is None or not value:
++                    raise SecretUnavailable(account, "missing")
++                field_keys[key_id] = value
++        return RuntimeSecrets(
++            **values,
++            field_encryption_keys=field_keys,
++        )
++
+     def read_presence(
+         self,
+         *,
+@@ -552,6 +576,45 @@ def _required_fields(role: str, config: AppConfig) -> tuple[str, ...]:
+     return tuple(fields)
+ 
+ 
++def _role_requires_key_material(role: str) -> bool:
++    """Watchdog is the sole role with no cryptographic write capability."""
++    return role != "watchdog"
++
++
++def _role_simple_secret_fields(
++    role: str,
++    config: AppConfig,
++) -> tuple[str, ...]:
++    fields = list(_required_fields(role, config))
++    if _role_requires_key_material(role):
++        fields.extend(
++            (
++                "candidate_signing_key",
++                "backup_encryption_key",
++            )
++        )
++    return tuple(dict.fromkeys(fields))
++
++
++def _project_role_secrets(
++    role: str,
++    config: AppConfig,
++    loaded: RuntimeSecrets,
++) -> RuntimeSecrets:
++    """Drop every secret outside the selected role's capability set."""
++    return RuntimeSecrets(
++        **{
++            field_name: getattr(loaded, field_name)
++            for field_name in _role_simple_secret_fields(role, config)
++        },
++        field_encryption_keys=(
++            loaded.field_encryption_keys
++            if _role_requires_key_material(role)
++            else {}
++        ),
++    )
++
++
+ def _validate_required_fields(
+     role: str,
+     config: AppConfig,
+@@ -675,13 +738,22 @@ def load_role_secrets(
+             raise UnsafeSecretProvider(
+                 f"production role={role} requires macOS Keychain"
+             )
+-    loaded = selected.load(encryption=config.encryption)
++    loaded = (
++        selected.load_for_role(role=role, config=config)
++        if isinstance(selected, MacOSKeychainSecretProvider)
++        else _project_role_secrets(
++            role,
++            config,
++            selected.load(encryption=config.encryption),
++        )
++    )
+ 
+     from ..logging import register_all_secrets
+ 
+     register_all_secrets(loaded)
+     _validate_required_fields(role, config, loaded)
+-    _validate_key_material(config, loaded)
++    if _role_requires_key_material(role):
++        _validate_key_material(config, loaded)
+     if hasattr(selected, "last_successful_role_load_at"):
+         selected.last_successful_role_load_at = datetime.now(timezone.utc)
+     return loaded
+diff --git a/src/trading_assistant/security/sensitive_write_scan.py b/src/trading_assistant/security/sensitive_write_scan.py
+index 926d36c..08928d5 100644
+--- a/src/trading_assistant/security/sensitive_write_scan.py
++++ b/src/trading_assistant/security/sensitive_write_scan.py
+@@ -568,9 +568,16 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+                 + list(nested.args.args)
+                 + list(nested.args.kwonlyargs)
+             )
++            nested_by_name = {
++                parameter.arg: parameter
++                for parameter in nested_arguments
++            }
+             nested_bindings: dict[str, str] = {}
+             for parameter, argument in zip(
+-                nested_arguments,
++                (
++                    list(nested.args.posonlyargs)
++                    + list(nested.args.args)
++                ),
+                 statement.args,
+             ):
+                 model = (
+@@ -581,6 +588,26 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+                 )
+                 if model is not None:
+                     nested_bindings[parameter.arg] = model
++            for keyword in statement.keywords:
++                if (
++                    keyword.arg is None
++                    or keyword.arg not in nested_by_name
++                ):
++                    if keyword.arg is None:
++                        self._report(
++                            statement,
++                            "unknown_model",
++                            "**helper_flow",
++                        )
++                    continue
++                model = (
++                    local_bindings.get(keyword.value.id)
++                    if isinstance(keyword.value, ast.Name)
++                    else self._object_model(keyword.value)
++                    or self._call_model(keyword.value)
++                )
++                if model is not None:
++                    nested_bindings[keyword.arg] = model
+             if nested_bindings:
+                 self._inspect_local_helper(
+                     nested,
+@@ -709,11 +736,20 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+             isinstance(node.func, ast.Name)
+             and node.func.id in self.mutation_call_models
+         ):
++            values_mapping = self._keyword(node, "values")
+             self._check_mapping(
+                 node,
+                 self.mutation_call_models[node.func.id],
+-                args=node.args,
+-                keywords=node.keywords,
++                args=(
++                    (*node.args, values_mapping)
++                    if values_mapping is not None
++                    else node.args
++                ),
++                keywords=(
++                    keyword
++                    for keyword in node.keywords
++                    if keyword.arg != "values"
++                ),
+             )
+ 
+         call_name = _name(node.func)
+diff --git a/tests/test_migrations.py b/tests/test_migrations.py
+index ff114f8..4f72d18 100644
+--- a/tests/test_migrations.py
++++ b/tests/test_migrations.py
+@@ -1955,19 +1955,31 @@ def test_sensitive_trust_downgrade_lock_closes_checked_after_race(
+     migration_errors: list[BaseException] = []
+     mutation_errors: list[BaseException] = []
+     mutation_committed: list[bool] = []
++    paused_drop_points: list[tuple[str, str | None]] = []
+     original_drop_index = alembic_op.drop_index
+-    first_drop = True
+ 
+-    def pause_after_gate(*args, **kwargs):
+-        nonlocal first_drop
+-        if first_drop:
+-            first_drop = False
++    def pause_at_sensitive_0013_drop(*args, **kwargs):
++        drop_point = (
++            args[0] if args else "",
++            kwargs.get("table_name"),
++        )
++        if drop_point == (
++            "ux_untrusted_ingest_source_content",
++            "untrusted_ingest_events",
++        ):
++            paused_drop_points.append(
++                drop_point
++            )
+             gate_checked.set()
+             if not allow_ddl.wait(timeout=10):
+                 raise RuntimeError("test_downgrade_pause_timeout")
+         return original_drop_index(*args, **kwargs)
+ 
+-    monkeypatch.setattr(alembic_op, "drop_index", pause_after_gate)
++    monkeypatch.setattr(
++        alembic_op,
++        "drop_index",
++        pause_at_sensitive_0013_drop,
++    )
+ 
+     def run_downgrade() -> None:
+         try:
+@@ -1978,6 +1990,12 @@ def test_sensitive_trust_downgrade_lock_closes_checked_after_race(
+     migration_thread = threading.Thread(target=run_downgrade)
+     migration_thread.start()
+     assert gate_checked.wait(timeout=10)
++    assert paused_drop_points == [
++        (
++            "ux_untrusted_ingest_source_content",
++            "untrusted_ingest_events",
++        )
++    ]
+ 
+     concurrent_engine = create_db_engine(_url(database_path))
+ 
+diff --git a/tests/test_release_static.py b/tests/test_release_static.py
+index 8fedec7..c8292c4 100644
+--- a/tests/test_release_static.py
++++ b/tests/test_release_static.py
+@@ -1842,6 +1842,7 @@ def test_composio_must_remain_explicitly_disabled(
+         ),
+         (
+             "src/trading_assistant/proxy.py",
++            "from httpx import Client\n"
+             "client = Client(trust_env=True)\n",
+             "PROXY_HEADERS_TRUSTED",
+         ),
+@@ -3679,3 +3680,131 @@ def test_computed_credential_query_key_is_rejected(tmp_path):
+ 
+     assert completed.returncode == 1
+     assert "QUERY_SECRET" in completed.stderr
++
++
++# ── Task 11 review round 4 regressions ────────────────────────────────
++
++
++def test_final_authority_rejects_mutation_built_collection_alias(tmp_path):
++    root = _trust_fixture(tmp_path)
++    target = root / "src/trading_assistant/security/sensitive_fields.py"
++    target.write_text(
++        target.read_text(encoding="utf-8")
++        + (
++            "\nregistry_box = []\n"
++            "registry_box.append(SENSITIVE_FIELDS)\n"
++            "registry_box[0].clear()\n"
++        ),
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
++
++
++def test_sensitive_bound_update_alias_resolves_keyword_values(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/bound_sensitive_update.py",
++        "from trading_assistant.db.models import AuditEvent\n"
++        "mutate = session.query(AuditEvent).update\n"
++        "mutate(values={'reason': 'round4-fixture'})\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
++    assert "round4-fixture" not in completed.stderr
++
++
++def test_sensitive_nested_keyword_only_helper_propagates_model(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/nested_sensitive_helper.py",
++        "from trading_assistant.db.models import AuditEvent\n"
++        "def nested(*, record):\n"
++        "    record.reason = 'round4-fixture'\n"
++        "def outer(record):\n"
++        "    nested(record=record)\n"
++        "event = session.get(AuditEvent, 1)\n"
++        "outer(event)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "PLAINTEXT_SENSITIVE_WRITE" in completed.stderr
++    assert "round4-fixture" not in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("source", "code"),
++    [
++        (
++            "import starlette.middleware.cors as cors\n"
++            "middlewares = []\n"
++            "middlewares.append(cors.CORSMiddleware)\n"
++            "app.add_middleware(middlewares[0], allow_origins=['*'])\n",
++            "WILDCARD_HOST_ORIGIN",
++        ),
++        (
++            "import http.client as http_client\n"
++            "clients = []\n"
++            "clients.insert(0, http_client.HTTPSConnection)\n"
++            "clients[0]('example.invalid')\n",
++            "OUTBOUND_CLIENT_UNAPPROVED",
++        ),
++        (
++            "cookies = []\n"
++            "cookies.extend([response.set_cookie])\n"
++            "cookies[0]('session', secure=False, httponly=True, "
++            "samesite='strict')\n",
++            "INSECURE_COOKIE",
++        ),
++        (
++            "import ssl as tls\n"
++            "factories = {}\n"
++            "factories.update(factory=tls._create_unverified_context)\n"
++            "factories['factory']()\n",
++            "TLS_DISABLED",
++        ),
++    ],
++    ids=("cors-append", "http-insert", "cookie-extend", "ssl-update"),
++)
++def test_mutation_built_security_identity_collections_fail_closed(
++    tmp_path,
++    source,
++    code,
++):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/mutation_built_security_identity.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert code in completed.stderr
++
++
++def test_local_client_verify_keyword_is_not_network_transport(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/local_client.py",
++        "class Client:\n"
++        "    def __init__(self, *, verify):\n"
++        "        self.verify = verify\n"
++        "client = Client(verify=False)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 0, completed.stdout + completed.stderr
+diff --git a/tests/test_task11_round3.py b/tests/test_task11_round3.py
+index 4989572..bc3857e 100644
+--- a/tests/test_task11_round3.py
++++ b/tests/test_task11_round3.py
+@@ -123,7 +123,7 @@ def test_preflight_builder_constructs_only_narrow_read_only_service(
+     ]
+ 
+ 
+-def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
++def test_read_only_preflight_probe_performs_no_trading_table_dml_or_broker_mutation(
+     make_service,
+ ):
+     from sqlalchemy import event
+@@ -143,7 +143,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
+     broker = ReadOnlyBroker()
+     mutable_service = make_service(broker=broker)
+     engine = mutable_service.session_factory.kw["bind"]
+-    writes: list[str] = []
++    trading_table_dml: list[str] = []
+ 
+     def record_statement(
+         _connection,
+@@ -155,7 +155,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
+     ):
+         verb = statement.lstrip().partition(" ")[0].upper()
+         if verb in {"DELETE", "INSERT", "REPLACE", "UPDATE"}:
+-            writes.append(verb)
++            trading_table_dml.append(verb)
+ 
+     event.listen(engine, "before_cursor_execute", record_statement)
+     try:
+@@ -169,7 +169,7 @@ def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
+ 
+     assert snapshot.orders_match is True
+     assert snapshot.positions_match is True
+-    assert writes == []
++    assert trading_table_dml == []
+     assert {
+         name
+         for name in dir(type(probe))
+diff --git a/tests/test_task11_round4.py b/tests/test_task11_round4.py
+new file mode 100644
+index 0000000..fe6a275
+--- /dev/null
++++ b/tests/test_task11_round4.py
+@@ -0,0 +1,387 @@
++"""Task 11 review round 4 regression probes.
++
++All secret, broker, and database dependencies in this module are injected
++fakes or temporary fixtures.
++"""
++
++from __future__ import annotations
++
++import base64
++from decimal import Decimal
++import hashlib
++from pathlib import Path
++
++import pytest
++
++from trading_assistant.broker.models import (
++    OrderResult,
++    OrderStatus,
++)
++from trading_assistant.db.models import (
++    FILL_RECONCILIATION_QUARANTINED,
++    FILL_RECONCILIATION_SUPERSEDED,
++    Fill,
++    Order,
++)
++from trading_assistant.ops.preflight_probe import ReadOnlyPreflightService
++from trading_assistant.security.secrets import (
++    KEYCHAIN_SERVICE,
++    MacOSKeychainSecretProvider,
++    load_role_secrets,
++    secret_is_set,
++)
++from trading_assistant.security.sensitive_fields import persist_sensitive
++
++
++def _key(label: str) -> str:
++    return base64.b64encode(hashlib.sha256(label.encode()).digest()).decode()
++
++
++class RecordingKeyring:
++    def __init__(self, values: dict[str, str]) -> None:
++        self.values = values
++        self.accounts: list[str] = []
++
++    def get_password(self, service: str, username: str) -> str | None:
++        assert service == KEYCHAIN_SERVICE
++        self.accounts.append(username)
++        return self.values.get(username)
++
++    def set_password(
++        self,
++        service: str,
++        username: str,
++        password: str,
++    ) -> None:
++        raise AssertionError("round 4 secret fixture attempted a write")
++
++    def delete_password(self, service: str, username: str) -> None:
++        raise AssertionError("round 4 secret fixture attempted a delete")
++
++
++def _role_secret_values(app_config) -> dict[str, str]:
++    values = {
++        "anthropic_api_key": "round4-anthropic-fixture",
++        "gemini_api_key": "round4-gemini-fixture",
++        "groq_api_key": "round4-groq-fixture",
++        "openrouter_api_key": "",
++        "app_api_token": "R4!vN3#mQ7$pL2&tX9-zC5_kW4sD6gH8",
++        "alpaca_api_key": "round4-paper-key",
++        "alpaca_secret_key": "round4-paper-secret",
++        "database_url": "sqlite:///round4-role-fixture.db",
++        "telegram_bot_token": "",
++        "telegram_chat_id": "",
++        "candidate_signing_key": _key("round4-candidate"),
++        "backup_encryption_key": _key("round4-backup"),
++        "live_trading_confirm": "",
++    }
++    for key_id in (
++        app_config.encryption.active_key_id,
++        *app_config.encryption.retained_key_ids,
++    ):
++        values[f"field-encryption/{key_id}"] = _key(
++            f"round4-field:{key_id}"
++        )
++    return values
++
++
++def test_watchdog_keychain_load_requests_and_receives_only_database_url(
++    app_config,
++):
++    backend = RecordingKeyring(_role_secret_values(app_config))
++
++    loaded = load_role_secrets(
++        "watchdog",
++        config=app_config,
++        provider=MacOSKeychainSecretProvider(backend=backend),
++    )
++
++    assert backend.accounts == ["database_url"]
++    assert secret_is_set(loaded.database_url)
++    assert loaded.field_encryption_keys == {}
++    assert all(
++        not secret_is_set(getattr(loaded, field))
++        for field in (
++            "anthropic_api_key",
++            "gemini_api_key",
++            "groq_api_key",
++            "openrouter_api_key",
++            "app_api_token",
++            "alpaca_api_key",
++            "alpaca_secret_key",
++            "telegram_bot_token",
++            "telegram_chat_id",
++            "candidate_signing_key",
++            "backup_encryption_key",
++            "live_trading_confirm",
++        )
++    )
++
++
++@pytest.mark.parametrize(
++    "role",
++    [
++        "app",
++        "backup",
++        "daemon",
++        "mcp",
++        "migration",
++        "paper-drill",
++        "preflight",
++        "safety-drill",
++        "validate-analyst",
++    ],
++)
++def test_other_keychain_roles_keep_exact_required_secret_projection(
++    app_config,
++    role,
++):
++    from trading_assistant.security.secrets import _required_fields
++
++    backend = RecordingKeyring(_role_secret_values(app_config))
++
++    loaded = load_role_secrets(
++        role,
++        config=app_config,
++        provider=MacOSKeychainSecretProvider(backend=backend),
++    )
++
++    expected_simple = {
++        *_required_fields(role, app_config),
++        "candidate_signing_key",
++        "backup_encryption_key",
++    }
++    expected_accounts = {
++        *expected_simple,
++        *(
++            f"field-encryption/{key_id}"
++            for key_id in (
++                app_config.encryption.active_key_id,
++                *app_config.encryption.retained_key_ids,
++            )
++        ),
++    }
++    assert set(backend.accounts) == expected_accounts
++    assert len(backend.accounts) == len(expected_accounts)
++    assert all(secret_is_set(getattr(loaded, field)) for field in expected_simple)
++    assert set(loaded.field_encryption_keys) == {
++        app_config.encryption.active_key_id,
++        *app_config.encryption.retained_key_ids,
++    }
++
++
++class SnapshotBroker:
++    def __init__(
++        self,
++        *,
++        orders: list[OrderResult] | None = None,
++        positions: list[object] | None = None,
++    ) -> None:
++        self.orders = list(orders or [])
++        self.positions = list(positions or [])
++
++    def get_open_orders(self) -> list[OrderResult]:
++        return list(self.orders)
++
++    def get_positions(self) -> list[object]:
++        return list(self.positions)
++
++
++def _persist_open_order(
++    session_factory,
++    *,
++    client_id: str,
++    broker_id: str,
++    status: OrderStatus = OrderStatus.SUBMITTED,
++    qty: Decimal | None = Decimal("2"),
++) -> None:
++    with session_factory() as session:
++        persist_sensitive(
++            session,
++            Order(
++                idempotency_key=client_id,
++                ticker="AAPL",
++                side="buy",
++                order_type="market",
++                qty=qty,
++                status=status.value,
++                broker_order_id=broker_id,
++            ),
++            {"approval_reason": "round 4 fixture"},
++        )
++        session.commit()
++
++
++def test_preflight_excludes_superseded_fill_tombstones_from_arithmetic(
++    session_factory,
++):
++    with session_factory() as session:
++        session.add(
++            Fill(
++                ticker="AAPL",
++                side="buy",
++                qty=Decimal("1"),
++                price=Decimal("100"),
++                broker_fill_id=None,
++                reconciliation_state=FILL_RECONCILIATION_SUPERSEDED,
++            )
++        )
++        session.commit()
++
++    snapshot = ReadOnlyPreflightService(
++        SnapshotBroker(),
++        session_factory,
++    ).inspect_reconciliation()
++
++    assert snapshot.positions_match is True
++    assert snapshot.drift_symbols == ()
++
++
++def test_preflight_still_fails_closed_for_quarantined_fill(
++    session_factory,
++):
++    with session_factory() as session:
++        session.add(
++            Fill(
++                ticker="AAPL",
++                side="buy",
++                qty=Decimal("1"),
++                price=Decimal("100"),
++                broker_fill_id=None,
++                reconciliation_state=FILL_RECONCILIATION_QUARANTINED,
++            )
++        )
++        session.commit()
++
++    snapshot = ReadOnlyPreflightService(
++        SnapshotBroker(),
++        session_factory,
++    ).inspect_reconciliation()
++
++    assert snapshot.positions_match is False
++    assert snapshot.drift_symbols == ("AAPL",)
++
++
++def test_preflight_rejects_duplicate_remote_broker_order_ids(session_factory):
++    for client_id in ("round4-client-1", "round4-client-2"):
++        _persist_open_order(
++            session_factory,
++            client_id=client_id,
++            broker_id="round4-duplicate-broker-id",
++        )
++    broker = SnapshotBroker(
++        orders=[
++            OrderResult(
++                client_id,
++                "round4-duplicate-broker-id",
++                OrderStatus.SUBMITTED,
++                filled_qty=Decimal("0"),
++                ticker="AAPL",
++            )
++            for client_id in ("round4-client-1", "round4-client-2")
++        ]
++    )
++
++    snapshot = ReadOnlyPreflightService(
++        broker,
++        session_factory,
++    ).inspect_reconciliation()
++
++    assert snapshot.orders_match is False
++
++
++@pytest.mark.parametrize(
++    ("status", "order_qty", "filled_qty"),
++    [
++        (OrderStatus.SUBMITTED, Decimal("2"), Decimal("NaN")),
++        (OrderStatus.SUBMITTED, Decimal("2"), Decimal("-1")),
++        (OrderStatus.SUBMITTED, Decimal("2"), Decimal("1")),
++        (OrderStatus.PARTIALLY_FILLED, Decimal("2"), Decimal("0")),
++        (OrderStatus.PARTIALLY_FILLED, Decimal("2"), Decimal("2")),
++        (OrderStatus.PARTIALLY_FILLED, Decimal("2"), Decimal("3")),
++        (OrderStatus.SUBMITTED, None, Decimal("0")),
++    ],
++    ids=(
++        "nan",
++        "negative",
++        "submitted-nonzero",
++        "partial-zero",
++        "partial-equals-qty",
++        "partial-exceeds-qty",
++        "missing-local-qty",
++    ),
++)
++def test_preflight_rejects_malformed_remote_filled_quantity_truth(
++    session_factory,
++    status,
++    order_qty,
++    filled_qty,
++):
++    _persist_open_order(
++        session_factory,
++        client_id="round4-client",
++        broker_id="round4-broker",
++        status=status,
++        qty=order_qty,
++    )
++    broker = SnapshotBroker(
++        orders=[
++            OrderResult(
++                "round4-client",
++                "round4-broker",
++                status,
++                filled_qty=filled_qty,
++                ticker="AAPL",
++            )
++        ]
++    )
++
++    snapshot = ReadOnlyPreflightService(
++        broker,
++        session_factory,
++    ).inspect_reconciliation()
++
++    assert snapshot.orders_match is False
++
++
++def test_preflight_already_rejects_empty_remote_broker_id(session_factory):
++    """Retain the hermetic counterexample for the already-closed subclaim."""
++
++    _persist_open_order(
++        session_factory,
++        client_id="round4-client",
++        broker_id="round4-local-broker",
++    )
++    broker = SnapshotBroker(
++        orders=[
++            OrderResult(
++                "round4-client",
++                "",
++                OrderStatus.SUBMITTED,
++                filled_qty=Decimal("0"),
++                ticker="AAPL",
++            )
++        ]
++    )
++
++    snapshot = ReadOnlyPreflightService(
++        broker,
++        session_factory,
++    ).inspect_reconciliation()
++
++    assert snapshot.orders_match is False
++
++
++@pytest.mark.parametrize(
++    "relative",
++    (
++        "docs/RUNBOOK.md",
++        "docs/ops/README.md",
++        "scripts/launchd/README.md",
++    ),
++)
++def test_preflight_docs_describe_no_trading_table_dml(relative):
++    source = Path(relative).read_text(encoding="utf-8")
++
++    assert "local SQL `SELECT`s" not in source
++    assert "no trading-table DML" in source
+diff --git a/tests/test_task6_transaction_directory_hardening.py b/tests/test_task6_transaction_directory_hardening.py
+index 4836902..71b925f 100644
+--- a/tests/test_task6_transaction_directory_hardening.py
++++ b/tests/test_task6_transaction_directory_hardening.py
+@@ -71,12 +71,49 @@ def _create(source: Path, destination: Path, **kwargs):
+ 
+ 
+ def _process_context():
+-    method = (
+-        "fork"
+-        if "fork" in multiprocessing.get_all_start_methods()
+-        else "spawn"
+-    )
+-    return multiprocessing.get_context(method)
++    return multiprocessing.get_context("spawn")
++
++
++def _join_fixture_process(
++    process,
++    *,
++    expected_exitcode: int,
++    timeout: float = 10,
++) -> None:
++    process.join(timeout=timeout)
++    if process.is_alive():
++        process.terminate()
++        process.join(timeout=2)
++        if process.is_alive():
++            process.kill()
++            process.join(timeout=2)
++        pytest.fail("fixture_process_timeout")
++    assert process.exitcode == expected_exitcode
++
++
++def test_crash_fixture_processes_use_fresh_interpreter_context():
++    assert _process_context().get_start_method() == "spawn"
++
++
++def test_timed_out_fixture_process_is_terminated_and_reaped():
++    context = multiprocessing.get_context("spawn")
++    process = context.Process(target=time.sleep, args=(60,))
++    process.start()
++    try:
++        with pytest.raises(
++            pytest.fail.Exception,
++            match="^fixture_process_timeout$",
++        ):
++            _join_fixture_process(
++                process,
++                expected_exitcode=0,
++                timeout=0.01,
++            )
++        assert not process.is_alive()
++    finally:
++        if process.is_alive():
++            process.terminate()
++            process.join(timeout=2)
+ 
+ 
+ def _crash_at_stage(
+@@ -262,9 +299,7 @@ def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
+         args=(source, destination, stage),
+     )
+     process.start()
+-    process.join(timeout=10)
+-
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transactions = _transaction_directories(destination)
+     assert len(transactions) == 1
+     transaction = transactions[0]
+@@ -322,9 +357,7 @@ def test_manifest_is_durable_only_after_all_members_are_precreated(tmp_path):
+         args=(source, destination, "transaction_manifest_durable"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     assert {candidate.name for candidate in transaction.iterdir()} == (
+         _TRANSACTION_MEMBERS
+@@ -352,8 +385,7 @@ def test_recovery_preserves_operator_replacement_at_every_crash_stage(
+         args=(source, destination, stage),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     replacement = transaction / "encrypted.aesgcm"
+     if replacement.exists() or replacement.is_symlink():
+@@ -391,8 +423,7 @@ def test_recovery_preserves_unrecorded_old_sidecar_name(
+         args=(source, destination, stage),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     sidecar = transaction / "snapshot.sqlite3-wal"
+     sidecar.write_bytes(b"operator-owned-sidecar")
+@@ -440,8 +471,7 @@ def test_recovery_converges_when_recorded_members_are_already_absent(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     for name in missing_names:
+         (transaction / name).unlink()
+@@ -479,8 +509,7 @@ def test_partial_recovery_preserves_extra_or_replaced_entries(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     (transaction / "encrypted.aesgcm").unlink()
+     if damage == "extra":
+@@ -537,8 +566,7 @@ def test_aged_partial_active_transaction_is_protected_by_manifest_lock(
+     assert elapsed < 1.5
+     assert _namespace_identities(transaction) == before_recovery
+     release.set()
+-    process.join(timeout=10)
+-    assert process.exitcode == 0
++    _join_fixture_process(process, expected_exitcode=0)
+ 
+     for _attempt in range(2):
+         backup_module._recover_backup_orphans(
+@@ -579,8 +607,7 @@ def test_busy_transaction_manifest_is_bounded_and_preserved(tmp_path):
+     assert elapsed < 1.5
+     assert transaction.exists()
+     release.set()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+ 
+     _age_tree(transaction, recovery_now - 120)
+     backup_module._recover_backup_orphans(
+@@ -610,8 +637,7 @@ def test_recovery_preserves_ambiguous_transaction_directories(
+         args=(source, destination, "snapshot_created"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     if damage == "corrupt_manifest":
+         manifest = transaction / "manifest"
+@@ -648,8 +674,7 @@ def test_manifest_copy_and_symlink_namespace_are_not_adopted(tmp_path):
+         args=(source, destination, "snapshot_created"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     original = _transaction_directories(destination)[0]
+     copied = destination / f"{_TRANSACTION_PREFIX}{'c' * 32}"
+     copied.mkdir(mode=0o700)
+@@ -710,8 +735,7 @@ def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
+         args=(source, destination, "before_artifact_commit"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     assert _transaction_directories(destination) == ()
+     assert list_committed_backups(destination) == ()
+     assert len(tuple(destination.glob(".*.commit-state"))) == 1
+@@ -753,8 +777,7 @@ def test_partial_cleanup_recovery_converges_after_unlink_failure(
+         args=(source, destination, "snapshot_created"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -829,8 +852,7 @@ def test_recovery_preserves_replacement_at_identity_unlink_seam(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -886,8 +908,7 @@ def test_recovery_member_lock_is_bounded_and_preserves_namespace(tmp_path):
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -913,8 +934,7 @@ def test_recovery_member_lock_is_bounded_and_preserves_namespace(tmp_path):
+     assert transaction.exists()
+     assert _namespace_identities(transaction) == before_recovery
+     release.set()
+-    holder.join(timeout=10)
+-    assert holder.exitcode == 0
++    _join_fixture_process(holder, expected_exitcode=0)
+ 
+     for _attempt in range(2):
+         backup_module._recover_backup_orphans(
+@@ -938,8 +958,7 @@ def test_recovery_preserves_external_hardlink_and_transaction(tmp_path):
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     operator_link = destination / "operator-snapshot-link"
+     os.link(transaction / "snapshot.sqlite3", operator_link)
+@@ -978,8 +997,7 @@ def test_post_isolation_ambiguity_restores_original_namespace(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -1057,8 +1075,7 @@ def test_new_original_name_after_isolation_is_never_overwritten(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     original_members = _namespace_identities(transaction)
+     recovery_now = time.time()
+@@ -1125,8 +1142,7 @@ def test_ambiguous_successful_isolation_is_restored_without_cleanup(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -1186,8 +1202,7 @@ def test_isolation_parent_fsync_failure_restores_without_cleanup(
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -1238,8 +1253,7 @@ def test_real_crash_after_quarantine_rename_is_recoverable(tmp_path):
+         args=(source, destination, "quick_check_complete"),
+     )
+     process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
++    _join_fixture_process(process, expected_exitcode=73)
+     transaction = _transaction_directories(destination)[0]
+     recovery_now = time.time()
+     _age_tree(transaction, recovery_now - 120)
+@@ -1248,9 +1262,7 @@ def test_real_crash_after_quarantine_rename_is_recoverable(tmp_path):
+         args=(destination, recovery_now),
+     )
+     recovery.start()
+-    recovery.join(timeout=10)
+-
+-    assert recovery.exitcode == 79
++    _join_fixture_process(recovery, expected_exitcode=79)
+     assert _transaction_directories(destination) == ()
+     quarantines = _quarantine_directories(destination)
+     assert len(quarantines) == 1

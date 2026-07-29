@@ -745,12 +745,14 @@ tests used temporary SQLite only.
 12. **Preflight capability — confirmed.** The old dedicated role still
     returned a full mutable `TradingService`. It now returns only
     `PreflightReconciliationProbe.inspect_reconciliation`, backed by broker
-    reads and local `SELECT`s. No clock, cipher hooks, LLM, notifier, mutable
-    trading method, or writer tenure is constructed.
-13. **Watchdog capability — mixed.** Alpaca and Telegram origins were excess
-    and are removed. The claimed provider-secret excess was not present:
-    `_required_fields("watchdog", config)` was already exactly
-    `("database_url",)` and remains protected by a dedicated counterexample.
+    reads and local database inspection with no trading-table DML. SQLite
+    connection setup may still establish WAL and secure sidecar modes. No
+    clock, cipher hooks, LLM, notifier, mutable trading method, or writer
+    tenure is constructed.
+13. **Watchdog capability — round-3 disposition, later superseded.** Alpaca
+    and Telegram origins were excess and are removed. The requirement tuple
+    was already exactly `("database_url",)`, but round 4 proved the generic
+    provider load still fetched every Keychain account before projection.
 14. **TLS setup runner — confirmed.** The executable setup now uses
     `uv run python`; tests inspect the script but never execute setup.
 
@@ -870,3 +872,225 @@ full-suite caveat.
   is made.
 - No app, daemon, MCP, real Keychain/credential/runtime database, external
   transport, trading action, notification, breaker reset, or push occurred.
+
+# Task 11 Fix Round 4 Addendum
+
+## Review boundary
+
+- Base: `c12ce6f1c5df914f5f40e48d100bdfa0bf3fdb4c`
+- Implementation:
+  `2093b8049dc85e9d02b73fb424d4a648de8f3a1d`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-c12ce6f..2093b80.diff`
+- Diff size: 1,370 lines / 49,857 bytes
+- Scope: Task 11 production, tests, operator documentation, and the bounded
+  Task 6 test-only process-fixture stabilization required to complete the
+  owned full-suite release proof
+- Excluded: Plan 3, push, service startup, ignored runtime database, real
+  Keychain/credentials, broker/provider/notifier/integration/network calls,
+  trading, reconciliation writes, notification, and breaker reset
+
+The implementation commit contains every production, test, and operator-doc
+change. This addendum, review package, bounded diff, brief, plan checkboxes,
+and progress ledger form the separate evidence-only commit.
+
+## Finding disposition
+
+1. **Role-scoped watchdog secrets — confirmed.** The round-3
+   `_required_fields` counterexample proved only post-load projection.
+   `MacOSKeychainSecretProvider.load()` still requested all accounts. Round 4
+   adds provider-level `load_for_role`; the watchdog fake records account
+   access and proves that only `database_url` is requested or returned. Every
+   other runtime role has an exact projection test.
+2. **Superseded fill tombstones — confirmed.** They are valid reconciliation
+   exclusions and no longer count as drift. Quarantined or otherwise
+   untrusted states still fail closed.
+3. **Malformed broker truth — confirmed.** Remote IDs must be present and
+   unique. Filled quantities must be finite, nonnegative, status-consistent,
+   bounded by remote quantity, and consistent with the local snapshot.
+4. **Mutation-built final-authority aliases — confirmed.** Insertion of a
+   security authority into a mutable collection and later subscript use is
+   rejected as unproven.
+5. **Bound `Query.update` alias — confirmed.** Method provenance and keyword
+   `values` survive aliasing, so registered plaintext writes are rejected.
+6. **Nested keyword-only helper flow — confirmed.** Local call propagation
+   now carries keyword-only model provenance; unsupported flows fail closed.
+7. **Mutation-built security call identities — confirmed.** Collection
+   indirection around CORS, HTTP clients, cookies, and SSL factories is
+   rejected while a canonically local non-network `Client(verify=False)`
+   remains a clean decoy.
+8. **Migration test synchronization — confirmed test defect.** The old hook
+   stopped at the first later `drop_index`, which now belongs to revision
+   0014. The test now waits for the exact revision 0013
+   `ux_untrusted_ingest_source_content` drop/lock point. No migration
+   production code changed.
+
+Operator wording now states the actual invariant: preflight performs no
+trading-table DML. SQLite setup may configure WAL and sidecar permissions;
+that maintenance is intentionally retained.
+
+## Exact RED evidence
+
+Before implementation:
+
+```text
+Runtime/provider/preflight/docs bundle:
+22 failed, 2 passed
+
+Exact static alias bundle:
+8 failed
+
+Exact migration synchronization command:
+2 failed
+```
+
+The two runtime passes were already-closed subclaims: quarantined fills were
+already rejected, and an empty remote broker ID was already rejected. The
+first migration failure deterministically reported the revision 0014
+`ix_runtime_tenures_expires_at` drop instead of the required revision 0013
+`ux_untrusted_ingest_source_content` point. The second failure followed the
+first aborted worker and reflected contaminated Alembic authority state; it
+is not represented as a second production finding.
+
+After the first full-suite process failure, two minimal test-infrastructure
+regressions were added before the fix:
+
+```text
+uv run pytest -q \
+  tests/test_task6_transaction_directory_hardening.py::test_crash_fixture_processes_use_fresh_interpreter_context \
+  tests/test_task6_transaction_directory_hardening.py::test_timed_out_fixture_process_is_terminated_and_reaped
+
+2 failed
+```
+
+The failures were exact: the fixture selected `fork`, and
+`_join_fixture_process` did not yet exist.
+
+## Process-hang diagnosis and correction
+
+The first no-argument round-4 suite reported:
+
+```text
+uv run pytest
+1 failed, 3651 passed, 1 skipped, 1 warning in 537.89s
+```
+
+The exact failed boundary was:
+
+```text
+tests/test_task6_transaction_directory_hardening.py::
+test_recovery_preserves_unrecorded_old_sidecar_name[verification_opened]
+```
+
+`ForkProcess-107` (PID `56072`) remained alive after the parent test's
+`process.join(timeout=10)`, leaving `exitcode is None`; the assertion then
+failed without terminating or reaping the child. Pytest later waited during
+multiprocessing shutdown. The stage hook itself was not a deterministic
+production hang: the complete ten-parameter node group passed `10/10`, and
+the pre-fix complete file passed `57/57` when run in isolation.
+
+When asked to stop only parent PID `53460`, child PID `56072`, and resource
+tracker PID `55923`, a read-only process check found that all three had
+already exited. No signal was sent.
+
+The test-only fix uses a fresh `spawn` interpreter and one bounded helper for
+every process wait. On timeout the helper terminates, joins, escalates to kill
+only if still alive, joins again, and then fails with stable fixture text.
+Production backup and migration behavior is unchanged.
+
+## Final verification
+
+Initial round-4 gates before the first full run:
+
+```text
+Runtime/docs:
+24 passed
+
+Exact static probes:
+8 passed
+
+Exact migration race:
+2 passed
+
+Complete static fixture file:
+304 passed
+
+Secret provider, watchdog, and round-3:
+187 passed
+
+Sensitive migration subset:
+17 passed
+
+Preflight:
+30 passed
+
+31-file Task 11 matrix:
+2036 passed, 1 warning in 308.48s
+
+Repository static gate:
+release static checks: PASS
+
+Compileall, git diff --check, and shell syntax:
+PASS
+```
+
+Hang-fix focused proof:
+
+```text
+New spawn/reap regressions:
+2 passed
+
+Exact previously failing node:
+1 passed in 0.65s
+
+Complete crash-fixture file:
+59 passed
+
+Combined focused collection:
+841 passed, 1 warning
+```
+
+After the focused fix, the unchanged 31-file Task 11 matrix plus the complete
+crash-fixture file passed:
+
+```text
+2095 passed, 1 warning in 368.08s
+```
+
+The repository static gate again reported
+`release static checks: PASS`; compileall, `git diff --check`, and syntax
+checks for `setup-local-tls.sh`, `start.sh`, `stop.sh`, and both launchd
+scripts exited zero.
+
+The user expressly authorized one replacement no-argument suite after the
+hang root cause was fixed and every focused/matrix/static prerequisite was
+green:
+
+```text
+uv run pytest
+3654 passed, 1 skipped, 1 warning in 615.81s
+```
+
+Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning.
+
+## Residual hard limits
+
+- Provider role projection is now enforced before Keychain retrieval. The
+  watchdog cannot request or receive Alpaca, LLM, signing, encryption,
+  Telegram, or app-token fields.
+- Preflight remains capability-minimal and read-only with respect to trading
+  tables. Superseded tombstones are excluded, while malformed or quarantined
+  broker truth fails closed.
+- Unsupported/dynamic security-boundary Python remains rejected by design.
+- Composio remains disabled pending provider-side revocation/rotation. It has
+  no origin, route, caller, toolkit, MCP surface, or chat tool. No webhook or
+  live-mode path exists.
+- General chat remains read-only. Immutable drafts require an explicit signed
+  queue action and separate human approval. Paper mode, kill switches,
+  broker-truth checks, and the no-profit-guarantee limit are unchanged.
+- Verification used temporary Git roots, fakes, temporary SQLite databases,
+  and hermetic process fixtures only. No app, daemon, MCP, ignored runtime
+  database, real Keychain/credential, network, broker/provider/notifier call,
+  trading action, reconciliation write, notification, breaker reset, or push
+  occurred.

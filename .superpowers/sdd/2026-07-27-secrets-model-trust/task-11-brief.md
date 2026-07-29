@@ -361,9 +361,11 @@ artifact, TLS, direct-networking, and preflight-capability gaps.
   sensitive-write bundle `3 failed`; runtime/TLS/preflight bundle
   `6 failed, 1 passed`; URL-rebinding `.F`; unknown dispatch effect
   `1 failed`; and missing explicit server-auth EKU `1 failed`.
-- [x] Retain the mixed watchdog disposition as a hermetic counterexample:
-  provider egress was a real excess capability and was removed, while the
-  role's required secret set was already exactly `("database_url",)`.
+- [x] Record the round-3 watchdog disposition: provider egress was excess
+  capability and was removed, while the role requirement tuple was already
+  exactly `("database_url",)`. Round 4 supersedes the latter conclusion:
+  generic provider loading still requested every Keychain account before
+  projecting that tuple.
 - [x] Reject dynamic/nested authority access, root and recursively reachable
   chat effects, unproven wrapper control flow, chained mappings, full
   environment unpacking, sensitive helper/execute/query aliases,
@@ -371,9 +373,11 @@ artifact, TLS, direct-networking, and preflight-capability gaps.
   credentials, conventional SQL dumps, and non-network option false
   positives.
 - [x] Replace preflight's mutable `TradingService` with a dedicated one-method
-  read-only probe using only broker open-order/position reads and local SQL
-  `SELECT`s; it constructs no clock, field cipher, LLM, notifier, proposal,
-  approval, cancellation, submission, repair, or writer-tenure capability.
+  read-only probe using only broker open-order/position reads and local
+  database inspection with no trading-table DML. SQLite connection setup may
+  still establish WAL and secure sidecar modes. It constructs no clock, field
+  cipher, LLM, notifier, proposal, approval, cancellation, submission, repair,
+  or writer-tenure capability.
 - [x] Require CA `keyCertSign`, standards chain verification, and an explicit
   leaf `serverAuth` EKU. The standards verifier rejects client-only EKU but
   treats an absent EKU as unconstrained, so the local validator separately
@@ -402,3 +406,74 @@ trust-boundary constructs remain intentionally rejected. Composio remains
 disabled pending provider-side rotation; no webhook, live mode, autonomous
 execution, profit guarantee, service start, real resource access, or push was
 introduced.
+
+## Fix round 4 completion
+
+Round 4 supersedes the round-3 watchdog-secret counterexample and the
+round-3 full-suite migration-race caveat. It also records the separately
+diagnosed pytest process-fixture hang found during the first round-4 full run.
+
+- [x] Verify all eight bounded round-4 findings against base
+  `c12ce6f1c5df914f5f40e48d100bdfa0bf3fdb4c`.
+- [x] Record exact pre-implementation RED:
+  `22 failed, 2 passed` for runtime/provider/preflight/docs;
+  `8 failed` for static alias fixtures; and `2 failed` for the migration
+  synchronization command. The first migration failure proved that the old
+  hook stopped in revision 0014 instead of revision 0013; the second was
+  follow-on Alembic contamination after the first worker aborted, not an
+  independent production defect.
+- [x] Load Keychain fields by exact runtime role before retrieval. A watchdog
+  fake proves it requests and receives only `database_url`; app, daemon, MCP,
+  preflight, migration, drill, and other roles retain their exact required
+  projections.
+- [x] Exclude legitimate superseded fill tombstones from reconciliation
+  arithmetic while retaining fail-closed quarantine handling. Reject empty or
+  duplicate remote broker IDs and non-finite, negative, status-inconsistent,
+  quantity-inconsistent, or locally inconsistent fill truth.
+- [x] Fail closed on mutation-built collections carrying final authorities or
+  security call identities; preserve bound ORM update provenance and nested
+  keyword-only model provenance; keep canonically local
+  `Client(verify=False)` calls clean.
+- [x] Stabilize the sensitive-downgrade race test at the exact revision 0013
+  drop/lock point without changing migration production behavior.
+- [x] Correct operator wording to “no trading-table DML”; SQLite WAL and
+  sidecar setup remain intentional.
+- [x] Initial round-4 focused gates: runtime/docs `24 passed`; exact static
+  `8 passed`; exact migration race `2 passed`; full static fixtures
+  `304 passed`; secret/watchdog/round-3 `187 passed`; sensitive migration
+  `17 passed`; preflight `30 passed`.
+- [x] Initial 31-file Task 11 affected matrix:
+  `2036 passed, 1 warning in 308.48s`.
+- [x] Initial repository gate: `release static checks: PASS`; compileall,
+  diff, and shell syntax checks passed.
+- [x] Preserve the first full-run result:
+  `3651 passed, 1 failed, 1 skipped, 1 warning in 537.89s`. The failed
+  `verification_opened` crash-fixture process remained alive after
+  `join(timeout=10)`, which left pytest waiting during interpreter shutdown.
+- [x] Record hang-fix RED before changing the fixture:
+  `2 failed`—the context was `fork`, and no bounded terminate/reap helper
+  existed.
+- [x] Use a fresh `spawn` interpreter for crash fixtures and route every
+  process wait in that file through a bounded terminate/kill/reap helper.
+  Production backup and migration behavior is unchanged.
+- [x] Hang-focused proof: new regression tests `2 passed`; exact prior node
+  `1 passed in 0.65s`; complete crash-fixture file `59 passed`; combined
+  focused collection `841 passed, 1 warning`.
+- [x] Final 32-file Task 11 plus crash-fixture matrix:
+  `2095 passed, 1 warning in 368.08s`.
+- [x] Final repository gate: `release static checks: PASS`; compileall,
+  `git diff --check`, and all five shell syntax checks exited zero.
+- [x] Run the one replacement no-argument full suite expressly authorized
+  after the hang fix:
+  `3654 passed, 1 skipped, 1 warning in 615.81s`; pytest exited normally.
+- [x] Commit implementation/tests/operator docs as
+  `2093b8049dc85e9d02b73fb424d4a648de8f3a1d`; package bounded diff
+  `review-c12ce6f..2093b80.diff` and round-4 evidence separately.
+
+At the stop request, PIDs `53460`, `56072`, and `55923` no longer existed, so
+no signal was sent and no unrelated process was touched. The hang was at the
+test fixture's parent/child join boundary, not in production backup logic.
+Unsupported dynamic trust-boundary constructs remain intentionally rejected.
+Composio remains disabled pending provider-side rotation; no webhook, live
+mode, autonomous execution, profit guarantee, service start, real resource
+access, or push was introduced.

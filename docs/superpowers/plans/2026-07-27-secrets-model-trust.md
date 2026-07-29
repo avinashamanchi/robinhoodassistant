@@ -1840,8 +1840,10 @@ Normal readiness requires:
 Preflight never resets a breaker, starts a daemon, submits a new order, calls
 an LLM, sends a notification, repairs order state, cancels an order, or writes
 reconciliation results. Its dedicated service exposes only broker
-open-order/position reads and local SQL `SELECT`s. Any mismatch remains an
-explicit operator-controlled runtime repair outside preflight.
+open-order/position reads and local database inspection with no trading-table
+DML. SQLite connection setup may still establish WAL and secure sidecar
+modes. Any mismatch remains an explicit operator-controlled runtime repair
+outside preflight.
 
 - [x] **Step 5: Document operator commands and hard limits**
 
@@ -1979,7 +1981,9 @@ the follow-up commit contains evidence only.
   leaf `serverAuth`; use repository-declared `uv run python` for TLS setup.
 - [x] Replace mutable preflight service composition with a one-method
   read-only broker/local snapshot protocol and remove watchdog provider
-  origins. Retain the exact watchdog database-only secret-role counterexample.
+  origins. Round 4 later supersedes the watchdog database-only
+  counterexample: the requirement tuple was narrow, but generic loading still
+  fetched every provider account before projection.
 - [x] Final focused set:
   `432 passed in 101.29s`.
 - [x] Final 30-file affected trust matrix:
@@ -1993,6 +1997,64 @@ the follow-up commit contains evidence only.
   `1/1 in 3.51s`. No second full suite or migration change was made.
 - [x] Package bounded diff `8de8bd9..b51e8ee`, coherent brief/report/progress,
   supersession notice, and round-3 review in a separate evidence-only commit.
+
+### Task 11 fix round 4: role projection, broker truth, static aliases, and deterministic release proof
+
+The round-3 watchdog-secret counterexample and full-suite migration caveat are
+superseded. All production, test, and operator-doc changes are in
+implementation commit `2093b8049dc85e9d02b73fb424d4a648de8f3a1d`;
+the follow-up commit contains evidence only.
+
+- [x] Verify all eight bounded findings against base
+  `c12ce6f1c5df914f5f40e48d100bdfa0bf3fdb4c`.
+- [x] Record exact RED first: runtime/provider/preflight/docs
+  `22 failed, 2 passed`; static aliases `8 failed`; migration synchronization
+  `2 failed`. Record the first migration failure as the deterministic
+  revision-0014-versus-0013 proof and the second as follow-on Alembic
+  contamination after the aborted worker.
+- [x] Project exact role fields before Keychain retrieval. Prove watchdog
+  account access is exactly `database_url` and preserve exact requirements for
+  every other role.
+- [x] Exclude superseded fill tombstones from arithmetic; keep quarantine
+  fail-closed; reject missing/duplicate broker IDs and non-finite, negative,
+  status-inconsistent, quantity-inconsistent, or local-snapshot-inconsistent
+  remote fill truth.
+- [x] Reject mutation-built collections containing final authorities or
+  security identities; preserve bound ORM update and nested keyword-only
+  helper provenance; retain the canonical local-client `verify=False` decoy.
+- [x] Synchronize the dependent-insert test on the exact sensitive revision
+  0013 drop/lock point without changing migration production behavior.
+- [x] Document the real preflight boundary as no trading-table DML while
+  retaining intentional SQLite WAL and secure-sidecar setup.
+- [x] Initial focused gates: `24`, `8`, `2`, `304`, `187`, `17`, and `30`
+  passed in their respective runtime/docs, exact-static, migration,
+  full-static, secret/watchdog, sensitive-migration, and preflight sets.
+- [x] Initial 31-file affected matrix:
+  `2036 passed, 1 warning in 308.48s`; repository static, compileall, diff,
+  and shell syntax gates passed.
+- [x] Preserve the first no-argument result:
+  `3651 passed, 1 failed, 1 skipped, 1 warning in 537.89s`, followed by a
+  pytest shutdown wait caused by an unreaped failed crash-fixture child at
+  `verification_opened`.
+- [x] Apply systematic debugging and TDD to that exact test boundary:
+  pre-fix isolated parameter group `10 passed`; pre-fix full file `57 passed`;
+  new spawn/reap regressions `2 failed`; post-fix regressions `2 passed`;
+  exact prior node `1 passed in 0.65s`; complete file `59 passed`.
+- [x] Use a fresh `spawn` interpreter and bounded terminate/kill/reap helper
+  for every crash-fixture process wait. Do not change production backup or
+  migration behavior.
+- [x] Final combined focused collection:
+  `841 passed, 1 warning`.
+- [x] Final 32-file Task 11 plus crash-fixture matrix:
+  `2095 passed, 1 warning in 368.08s`.
+- [x] Final repository gate: `release static checks: PASS`; compileall,
+  `git diff --check`, and all five shell syntax checks passed.
+- [x] Run the one replacement no-argument suite expressly authorized after
+  the hang fix:
+  `3654 passed, 1 skipped, 1 warning in 615.81s`; pytest exited normally.
+- [x] Package bounded diff `c12ce6f..2093b80`, coherent brief/report/progress,
+  round-3 supersession, and round-4 review package in a separate evidence-only
+  commit.
 
 ---
 
