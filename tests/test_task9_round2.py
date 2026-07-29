@@ -425,8 +425,6 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
         session_factory=session_factory,
     )
     broker = object()
-    clock = object()
-    cipher = object()
     service = object()
     observed: list[tuple[str, object]] = []
 
@@ -450,15 +448,15 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
     monkeypatch.setattr(
         bootstrap,
         "build_sensitive_data_cipher",
-        lambda encryption, supplied: (
-            observed.append(("cipher", supplied)) or cipher
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only preflight must not construct a field cipher"
         ),
     )
     monkeypatch.setattr(
         bootstrap,
         "bind_sensitive_cipher",
-        lambda factory, supplied_cipher: observed.append(
-            ("bind_cipher", (factory, supplied_cipher))
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only preflight must not install write/decrypt hooks"
         ),
     )
     monkeypatch.setattr(
@@ -478,15 +476,25 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
     monkeypatch.setattr(
         bootstrap,
         "build_clock",
-        lambda config, supplied, *, runtime_role: (
-            observed.append(("clock_role", runtime_role)) or clock
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only reconciliation must not construct a clock client"
         ),
     )
     monkeypatch.setattr(
         bootstrap,
         "TradingService",
-        lambda supplied_broker, factory, config, supplied_clock, **kwargs: (
-            observed.append(("service", kwargs)) or service
+        lambda *_args, **_kwargs: pytest.fail(
+            "preflight must not expose mutable TradingService"
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "ReadOnlyPreflightService",
+        lambda supplied_broker, factory: (
+            observed.append(
+                ("read_only_service", (supplied_broker, factory))
+            )
+            or service
         ),
     )
     monkeypatch.setattr(
@@ -504,8 +512,10 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
     assert ("origins", "preflight") in observed
     assert ("database_role", "preflight") in observed
     assert ("broker_role", "preflight") in observed
-    assert ("clock_role", "preflight") in observed
-    assert ("service", {"external_source": None}) in observed
+    assert (
+        "read_only_service",
+        (broker, session_factory),
+    ) in observed
 
 
 def test_watchdog_database_runtime_reuses_explicit_secrets_and_role(

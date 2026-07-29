@@ -1543,13 +1543,22 @@ def test_preflight_reconciliation_reports_position_drift(make_service):
     from trading_assistant.broker.mock import MockBroker
     from trading_assistant.broker.models import Position
     from trading_assistant import preflight
+    from trading_assistant.ops.preflight_probe import (
+        ReadOnlyPreflightService,
+    )
 
     broker = MockBroker(
         positions=[
             Position("AAPL", Decimal("2"), Decimal("100"), Decimal("100"))
         ]
     )
-    result = preflight._reconciliation(make_service(broker=broker))
+    mutable_service = make_service(broker=broker)
+    result = preflight._reconciliation(
+        ReadOnlyPreflightService(
+            broker,
+            mutable_service.session_factory,
+        )
+    )
 
     assert result.status == "FAIL"
     assert "AAPL" in result.detail
@@ -1559,7 +1568,7 @@ def test_preflight_reconciliation_sanitizes_provider_exception_text():
     from trading_assistant import preflight
 
     class ExplodingService:
-        def sync_open_orders(self, **context):
+        def inspect_reconciliation(self):
             raise RuntimeError("provider-secret-preflight-detail")
 
     result = preflight._reconciliation(ExplodingService())

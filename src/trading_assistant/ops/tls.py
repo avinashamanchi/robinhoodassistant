@@ -19,6 +19,13 @@ from cryptography.hazmat.primitives.asymmetric import (
     rsa,
 )
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.x509.oid import ExtendedKeyUsageOID
+from cryptography.x509.verification import (
+    DNSName,
+    PolicyBuilder,
+    Store,
+    VerificationError,
+)
 
 from ..config import load_config
 
@@ -138,11 +145,15 @@ def validate_tls_material(server) -> TLSMaterialStatus:
         ca_constraints = ca_certificate.extensions.get_extension_for_class(
             x509.BasicConstraints
         ).value
+        ca_key_usage = ca_certificate.extensions.get_extension_for_class(
+            x509.KeyUsage
+        ).value
     except Exception:
         raise TLSMaterialError("tls_ca_invalid") from None
     now = datetime.now(timezone.utc)
     if (
         not ca_constraints.ca
+        or not ca_key_usage.key_cert_sign
         or ca_certificate.subject != ca_certificate.issuer
         or not (
             ca_certificate.not_valid_before_utc
@@ -174,6 +185,24 @@ def validate_tls_material(server) -> TLSMaterialStatus:
         or not _signature_is_valid(certificate, ca_certificate)
     ):
         raise TLSMaterialError("tls_ca_chain_invalid")
+    try:
+        extended_key_usage = certificate.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage
+        ).value
+    except x509.ExtensionNotFound:
+        raise TLSMaterialError("tls_ca_chain_invalid") from None
+    if ExtendedKeyUsageOID.SERVER_AUTH not in extended_key_usage:
+        raise TLSMaterialError("tls_ca_chain_invalid")
+    try:
+        (
+            PolicyBuilder()
+            .store(Store([ca_certificate]))
+            .time(now)
+            .build_server_verifier(DNSName("localhost"))
+            .verify(certificate, [])
+        )
+    except VerificationError:
+        raise TLSMaterialError("tls_ca_chain_invalid") from None
     names = extension.value
     dns_names = {value.lower() for value in names.get_values_for_type(x509.DNSName)}
     ip_names = {

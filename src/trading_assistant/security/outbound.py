@@ -60,7 +60,6 @@ OUTBOUND_ORIGIN_MANIFEST = (
                 "paper-drill",
                 "preflight",
                 "safety-drill",
-                "watchdog",
             }
         ),
     ),
@@ -112,7 +111,7 @@ OUTBOUND_ORIGIN_MANIFEST = (
         "telegram",
         "notifier.telegram",
         "https://api.telegram.org",
-        frozenset({"app", "daemon", "preflight", "watchdog"}),
+        frozenset({"app", "daemon", "preflight"}),
         "features.telegram_notifications",
     ),
     OutboundOriginRule(

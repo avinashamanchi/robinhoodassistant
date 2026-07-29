@@ -101,6 +101,21 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         self.execute_aliases: set[str] = set()
         self.structured_statements: set[str] = set()
         self.string_constants: dict[str, str] = {}
+        self.local_functions: dict[
+            str,
+            ast.FunctionDef | ast.AsyncFunctionDef,
+        ] = {}
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self.local_functions = {
+            statement.name: statement
+            for statement in node.body
+            if isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+        }
+        self.generic_visit(node)
 
     def _report(
         self,
@@ -452,6 +467,128 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             return None
         return self.class_aliases.get(candidate)
 
+    @staticmethod
+    def _keyword(
+        node: ast.Call,
+        name: str,
+    ) -> ast.AST | None:
+        return next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == name
+            ),
+            None,
+        )
+
+    def _inspect_local_helper(
+        self,
+        helper: ast.FunctionDef | ast.AsyncFunctionDef,
+        bindings: dict[str, str],
+        *,
+        active: set[str],
+    ) -> None:
+        if helper.name in active:
+            self._report(helper, "unknown_model", "**helper_flow")
+            return
+        active.add(helper.name)
+        local_bindings = dict(bindings)
+        changed = True
+        while changed:
+            changed = False
+            for statement in ast.walk(helper):
+                if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = statement.value
+                source_model = (
+                    local_bindings.get(value.id)
+                    if isinstance(value, ast.Name)
+                    else self._call_model(value)
+                )
+                if source_model is None:
+                    continue
+                for target in (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                ):
+                    if (
+                        isinstance(target, ast.Name)
+                        and local_bindings.get(target.id) != source_model
+                    ):
+                        local_bindings[target.id] = source_model
+                        changed = True
+        for statement in ast.walk(helper):
+            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                    ):
+                        continue
+                    model = local_bindings.get(target.value.id)
+                    if (
+                        model is not None
+                        and target.attr in self.model_fields[model][1]
+                    ):
+                        self._report(target, model, target.attr)
+            if not isinstance(statement, ast.Call):
+                continue
+            if _name(statement.func) == "setattr" and len(statement.args) >= 2:
+                receiver = statement.args[0]
+                model = (
+                    local_bindings.get(receiver.id)
+                    if isinstance(receiver, ast.Name)
+                    else None
+                )
+                field = (
+                    statement.args[1].value
+                    if isinstance(statement.args[1], ast.Constant)
+                    and isinstance(statement.args[1].value, str)
+                    else None
+                )
+                if model is not None and field in self.model_fields[model][1]:
+                    self._report(statement, model, field)
+                elif model is not None and field is None:
+                    self._report(statement, model, "**field")
+            nested = (
+                self.local_functions.get(statement.func.id)
+                if isinstance(statement.func, ast.Name)
+                else None
+            )
+            if nested is None:
+                continue
+            nested_arguments = (
+                list(nested.args.posonlyargs)
+                + list(nested.args.args)
+                + list(nested.args.kwonlyargs)
+            )
+            nested_bindings: dict[str, str] = {}
+            for parameter, argument in zip(
+                nested_arguments,
+                statement.args,
+            ):
+                model = (
+                    local_bindings.get(argument.id)
+                    if isinstance(argument, ast.Name)
+                    else self._object_model(argument)
+                    or self._call_model(argument)
+                )
+                if model is not None:
+                    nested_bindings[parameter.arg] = model
+            if nested_bindings:
+                self._inspect_local_helper(
+                    nested,
+                    nested_bindings,
+                    active=active,
+                )
+        active.remove(helper.name)
+
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
             if isinstance(target, ast.Attribute):
@@ -553,11 +690,20 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
         ):
             query_model = self._query_model(node.func.value)
             if query_model is not None:
+                values_mapping = self._keyword(node, "values")
                 self._check_mapping(
                     node,
                     query_model,
-                    args=node.args,
-                    keywords=node.keywords,
+                    args=(
+                        (*node.args, values_mapping)
+                        if values_mapping is not None
+                        else node.args
+                    ),
+                    keywords=(
+                        keyword
+                        for keyword in node.keywords
+                        if keyword.arg != "values"
+                    ),
                 )
         if (
             isinstance(node.func, ast.Name)
@@ -646,29 +792,78 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
             elif field in self.unique_fields:
                 self._report(node, "*", field)
 
-        if (
+        execution_call = (
             isinstance(node.func, ast.Attribute)
             and node.func.attr in {"execute", "exec_driver_sql"}
-            and node.args
         ) or (
             isinstance(node.func, ast.Name)
             and node.func.id in self.execute_aliases
-            and node.args
-        ):
-            execute_model = self._mutation_model(node.args[0])
+        )
+        statement = (
+            node.args[0]
+            if node.args
+            else self._keyword(node, "statement")
+            if execution_call
+            else None
+        )
+        if execution_call and statement is not None:
+            execute_model = self._mutation_model(statement)
             if (
                 execute_model is not None
-                and self._mutation_kind(node.args[0]) == "delete"
+                and self._mutation_kind(statement) == "delete"
             ):
                 self._report(node, execute_model, "**row")
-            if execute_model is not None and len(node.args) > 1:
+            parameter_mappings = list(node.args[1:])
+            for parameter_name in ("params", "parameters"):
+                parameter = self._keyword(node, parameter_name)
+                if parameter is not None:
+                    parameter_mappings.append(parameter)
+            if execute_model is not None and parameter_mappings:
                 self._check_mapping(
                     node,
                     execute_model,
-                    args=node.args[1:],
-                    keywords=node.keywords,
+                    args=parameter_mappings,
+                    keywords=(
+                        keyword
+                        for keyword in node.keywords
+                        if keyword.arg
+                        not in {"statement", "params", "parameters"}
+                    ),
                 )
-            self._check_raw_sql(node, node.args[0])
+            self._check_raw_sql(node, statement)
+
+        local_helper = (
+            self.local_functions.get(node.func.id)
+            if isinstance(node.func, ast.Name)
+            else None
+        )
+        if local_helper is not None:
+            parameters = (
+                list(local_helper.args.posonlyargs)
+                + list(local_helper.args.args)
+                + list(local_helper.args.kwonlyargs)
+            )
+            bindings: dict[str, str] = {}
+            for parameter, argument in zip(parameters, node.args):
+                model = self._object_model(argument) or self._call_model(
+                    argument
+                )
+                if model is not None:
+                    bindings[parameter.arg] = model
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    continue
+                model = self._object_model(keyword.value) or self._call_model(
+                    keyword.value
+                )
+                if model is not None:
+                    bindings[keyword.arg] = model
+            if bindings:
+                self._inspect_local_helper(
+                    local_helper,
+                    bindings,
+                    active=set(),
+                )
 
         if (
             isinstance(node.func, ast.Attribute)

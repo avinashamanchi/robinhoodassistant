@@ -345,3 +345,45 @@ def test_runtime_boundary_blocks_core_delete_from_sensitive_table(
 
     with session_factory() as session:
         assert session.get(AuditEvent, event_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("source", "marker"),
+    [
+        (
+            """
+from sqlalchemy import text
+run = session.execute
+run(statement=text(
+    "UPDATE audit_events SET reason = :reason WHERE id = :id"
+))
+""",
+            "audit_events.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+session.query(AuditEvent).update(values={"reason": "plain"})
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+def mutate(item):
+    item.reason = "plain"
+row = session.get(AuditEvent, 1)
+mutate(row)
+""",
+            "AuditEvent.reason",
+        ),
+    ],
+    ids=("execute-statement-keyword", "query-update-values", "helper-parameter"),
+)
+def test_round3_sensitive_write_alias_and_helper_bypasses(
+    tmp_path,
+    source,
+    marker,
+):
+    offenders = _scan_fixture(tmp_path, source)
+    assert any(marker in offender for offender in offenders), offenders

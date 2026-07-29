@@ -336,22 +336,25 @@ or loading fails, and constructs no broker, outbound provider, or notifier if
 any structural check fails. `LOCAL_TLS` requires the exact
 `.local/tls/rootCA.pem`, `.local/tls/localhost.pem`, and
 `.local/tls/localhost-key.pem` paths. The CA and leaf must be current, the CA
-must sign the leaf, and the leaf must match the private key and exact loopback
-SANs. The watchdog trusts `rootCA.pem`, not the leaf as a CA file.
+must be authorized for certificate signing, and the leaf must have server
+authentication usage, match the private key, chain under the CA, and carry the
+exact loopback SANs. The watchdog trusts `rootCA.pem`, not the leaf as a CA file.
 `FIELD_ENCRYPTION` reads migration metadata and key availability only; it does
 not decrypt rows. The startup guard performs the one full envelope scan. Only
-after all five pass does preflight run the unchanged paper-mode, schema, WAL,
-breaker, Alpaca-read, quote, and broker/local reconciliation checks through a
-dedicated `preflight` composition. That composition constructs no LLM provider,
-agent, app, or notifier. There is no daemon-health preflight row; daemon
-freshness is observed separately after startup.
+after all five pass does preflight run the paper-mode, schema, WAL, breaker,
+Alpaca-read, quote, and broker/local reconciliation checks. Reconciliation uses
+a dedicated read-only `preflight` service exposing one snapshot probe. It calls
+only broker open-order/position reads and local SQL `SELECT`s; it constructs no
+mutable `TradingService`, clock client, field cipher, LLM provider, agent, app,
+or notifier. There is no daemon-health preflight row; daemon freshness is
+observed separately after startup.
 
 Preflight never submits a new order, calls an LLM, or sends an external
-notification. Its existing broker-truth reconciliation can perform the
-fail-closed repair or cancellation actions required to resolve already-known
-paper-order state, so run it only as the explicit operator-controlled readiness
-step. Both `FAIL` and `NEEDS-ME` print `NOT READY` and return nonzero; missing
-required credentials can never produce `READY`.
+notification, repairs order state, cancels an order, or writes reconciliation
+results. Any mismatch prints `NOT READY`; repair remains a separate
+operator-controlled runtime action under the normal writer-tenure and audit
+boundaries. Both `FAIL` and `NEEDS-ME` return nonzero, and missing required
+credentials can never produce `READY`.
 
 Open `https://localhost:8020`, log in without displaying or storing the
 operator secret, and verify liveness and daemon freshness. Every non-liveness

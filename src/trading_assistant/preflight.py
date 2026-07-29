@@ -13,7 +13,6 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 import re
-from uuid import uuid4
 
 from .config import BrokerKind, TradingMode, load_config
 from .db.schema import SchemaOutOfDate
@@ -565,35 +564,30 @@ def _db(
 
 
 def _reconciliation(service) -> Result:
-    """Repair stale order statuses, then require local positions to match Alpaca."""
+    """Require one read-only broker/local snapshot to match exactly."""
     try:
-        request_id = uuid4().hex
-        order_sync = service.sync_open_orders(
-            actor="preflight:startup",
-            reason="preflight broker order reconciliation",
-            request_id=request_id,
-        )
-        positions = service.reconcile_positions(
-            actor="preflight:startup",
-            reason="preflight position reconciliation",
-            request_id=request_id,
-        )
-        if order_sync.get("failed", 0):
+        snapshot = service.inspect_reconciliation()
+        if snapshot.orders_match is not True:
             return Result(
                 "broker/local reconciliation",
                 FAIL,
-                f"order status sync failures: {order_sync}",
+                "order snapshot mismatch",
             )
-        if not positions["reconciled"]:
+        if snapshot.positions_match is not True:
+            symbols = tuple(snapshot.drift_symbols)
             return Result(
                 "broker/local reconciliation",
                 FAIL,
-                f"drift={positions['drift']} order_sync={order_sync}",
+                (
+                    "position drift=" + ",".join(symbols)
+                    if symbols
+                    else "position snapshot mismatch"
+                ),
             )
         return Result(
             "broker/local reconciliation",
             PASS,
-            f"positions match; order_sync={order_sync}",
+            "orders and positions match",
         )
     except Exception as e:
         return Result(

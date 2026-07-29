@@ -56,6 +56,10 @@ from .ops.tenure import (
     TenureUncertain,
     install_runtime_mutation_barrier,
 )
+from .ops.preflight_probe import (
+    PreflightReconciliationProbe,
+    ReadOnlyPreflightService,
+)
 from .risk.breakers import BreakerService
 from .rules.worker import RuleWorker
 from .preflight import SensitiveEncryptionStateInspector
@@ -122,7 +126,7 @@ class ApplicationContainer:
 class PreflightServiceContainer:
     """Minimal preflight owner with no app, agent, notifier, or LLM surface."""
 
-    service: TradingService
+    service: PreflightReconciliationProbe
     runtime_tenure_guard: None = None
 
 
@@ -360,7 +364,7 @@ def build_preflight_service(
     config: AppConfig,
     secrets: RuntimeSecrets,
 ) -> PreflightServiceContainer:
-    """Compose only paper broker reconciliation for the preflight role."""
+    """Compose only the read-only paper reconciliation preflight capability."""
 
     require_configured_role_origins(config, "preflight")
     _guard_runtime(config, secrets)
@@ -368,33 +372,15 @@ def build_preflight_service(
         secrets,
         runtime_role="preflight",
     )
-    try:
-        sensitive_cipher = build_sensitive_data_cipher(
-            config.encryption,
-            secrets,
-        )
-    except Exception:
-        raise StartupEncryptionBlocked(
-            "sensitive_key_unavailable"
-        ) from None
-    bind_sensitive_cipher(runtime.session_factory, sensitive_cipher)
     broker = build_broker(
         config,
         secrets,
         runtime_role="preflight",
     )
     _arm_production_paper_broker(broker)
-    clock = build_clock(
-        config,
-        secrets,
-        runtime_role="preflight",
-    )
-    service = TradingService(
+    service = ReadOnlyPreflightService(
         broker,
         runtime.session_factory,
-        config,
-        clock,
-        external_source=None,
     )
     return PreflightServiceContainer(service=service)
 

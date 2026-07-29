@@ -111,8 +111,9 @@ envelope verification and retention review.
 ## Running
 
 ```bash
-# Local structural checks plus paper broker/reconciliation readiness. Do not
-# continue on FAIL or NEEDS-ME:
+# Local structural checks plus paper broker/read-only reconciliation
+# readiness. This probe never repairs or cancels. Do not continue on FAIL or
+# NEEDS-ME:
 uv run python -m trading_assistant.preflight
 
 # Loopback HTTPS app only:

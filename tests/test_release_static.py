@@ -1009,7 +1009,7 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
         "OUTBOUND_ORIGIN_MANIFEST = (\n"
         "    OutboundOriginRule('alpaca_trading', 'alpaca.trading', "
         "'https://paper-api.alpaca.markets', frozenset({'app', 'daemon', "
-        "'mcp', 'paper-drill', 'preflight', 'safety-drill', 'watchdog'})),\n"
+        "'mcp', 'paper-drill', 'preflight', 'safety-drill'})),\n"
         "    OutboundOriginRule('alpaca_data', 'alpaca.historical', "
         "'https://data.alpaca.markets', frozenset({'app', 'daemon', "
         "'mcp', 'paper-drill', 'preflight', 'safety-drill', "
@@ -1029,7 +1029,7 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
         "'validate-analyst'}), 'llm.provider=groq'),\n"
         "    OutboundOriginRule('telegram', 'notifier.telegram', "
         "'https://api.telegram.org', frozenset({'app', 'daemon', "
-        "'preflight', 'watchdog'}), 'features.telegram_notifications'),\n"
+        "'preflight'}), 'features.telegram_notifications'),\n"
         "    OutboundOriginRule('coingecko', 'marketdata.coingecko', "
         "'https://api.coingecko.com', frozenset({'app', 'daemon'}), "
         "'crypto_risk'),\n"
@@ -1909,12 +1909,14 @@ def test_composio_must_remain_explicitly_disabled(
         ),
         (
             "src/trading_assistant/proxy.py",
-            "server = Config(forwarded_allow_ips='*')\n",
+            "import uvicorn\n"
+            "uvicorn.run(app, proxy_headers=False, "
+            "forwarded_allow_ips='*')\n",
             "PROXY_HEADERS_TRUSTED",
         ),
         (
             "src/trading_assistant/tls.py",
-            "server = Config(ssl_certfile=None)\n",
+            "import httpx\nclient = httpx.Client(verify=False)\n",
             "TLS_DISABLED",
         ),
     ],
@@ -1949,12 +1951,13 @@ def test_dynamic_outbound_manifest_fails_closed(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("source", "code"),
-    [
-        (
-            "client = make_client(follow_redirects=True)\n",
-            "CROSS_ORIGIN_REDIRECT_ENABLED",
-        ),
+        ("source", "code"),
+        [
+            (
+                "import httpx\n"
+                "client = httpx.Client(follow_redirects=True)\n",
+                "CROSS_ORIGIN_REDIRECT_ENABLED",
+            ),
         (
             "options['trust_env'] = configured_proxy_trust\n",
             "PROXY_HEADERS_TRUSTED",
@@ -3297,3 +3300,382 @@ def test_plaintext_format_document_is_not_a_decrypted_backup(tmp_path):
     completed = _run_trust_gate(root)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+# ── Task 11 review round 3 regressions ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "\nlocals()['SENSITIVE_FIELDS'] = {}\n",
+        "\nexec('SENSITIVE_FIELDS = {}')\n",
+        (
+            "\nregistry_box = [SENSITIVE_FIELDS]\n"
+            "registry_alias = registry_box[0]\n"
+            "registry_alias.clear()\n"
+        ),
+    ],
+    ids=("locals-rebind", "exec-rebind", "nested-container-alias"),
+)
+def test_final_sensitive_authority_rejects_dynamic_and_nested_access(
+    tmp_path,
+    mutation,
+):
+    root = _trust_fixture(tmp_path)
+    target = root / "src/trading_assistant/security/sensitive_fields.py"
+    target.write_text(
+        target.read_text(encoding="utf-8") + mutation,
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative", "authority", "code"),
+    [
+        (
+            "src/trading_assistant/app/agent.py",
+            "READ_ONLY_TOOL_SPECS",
+            "CHAT_TOOL_REGISTRY_UNPROVEN",
+        ),
+        (
+            "src/trading_assistant/security/sensitive_fields.py",
+            "SENSITIVE_FIELDS",
+            "SENSITIVE_REGISTRY_INVALID",
+        ),
+        (
+            "src/trading_assistant/security/secrets.py",
+            "_SIMPLE_SECRET_FIELDS",
+            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
+        ),
+        (
+            "src/trading_assistant/security/outbound.py",
+            "OUTBOUND_ORIGIN_MANIFEST",
+            "OUTBOUND_ORIGIN_UNAPPROVED",
+        ),
+    ],
+)
+def test_every_final_authority_rejects_dynamic_locals_rebinding(
+    tmp_path,
+    relative,
+    authority,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    target = root / relative
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + f"\nlocals()[{authority!r}] = {authority}\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            "        s = self.service\n",
+            "        s = self.service\n        self.dispatch_state = {}\n",
+        ),
+        (
+            "        s = self.service\n",
+            "        s = self.service\n        del self.service\n",
+        ),
+    ],
+    ids=("root-assignment", "root-delete"),
+)
+def test_chat_dispatch_root_rejects_state_mutation(
+    tmp_path,
+    needle,
+    replacement,
+):
+    root = _trust_fixture(tmp_path)
+    source = _agent_fixture_source()
+    assert needle in source
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/agent.py",
+        source.replace(needle, replacement, 1),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "MUTABLE_CHAT_TOOL" in completed.stderr
+
+
+def test_chat_dispatch_root_rejects_direct_mutating_effect(tmp_path):
+    root = _trust_fixture(tmp_path)
+    source = _agent_fixture_source()
+    needle = "        s = self.service\n"
+    assert needle in source
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/agent.py",
+        source.replace(
+            needle,
+            needle + "        self.service.cancel_order('order-id')\n",
+            1,
+        ),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "MUTABLE_CHAT_TOOL" in completed.stderr
+
+
+def test_chat_dispatch_root_rejects_unknown_direct_effect(tmp_path):
+    root = _trust_fixture(tmp_path)
+    source = _agent_fixture_source()
+    needle = "        s = self.service\n"
+    assert needle in source
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/app/agent.py",
+        source.replace(
+            needle,
+            needle + "        self.service.unmodeled_effect()\n",
+            1,
+        ),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "CHAT_TOOL_REGISTRY_UNPROVEN" in completed.stderr
+
+
+def test_outbound_dynamic_policy_guard_must_dominate_transport(tmp_path):
+    root = _trust_fixture(tmp_path)
+    target = root / "src/trading_assistant/security/outbound.py"
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + (
+            "\nclass NoRedirectSession:\n"
+            "    def request(self, method, url, params=None):\n"
+            "        response = super().request(\n"
+            "            method, url,\n"
+            "            params=_validated_query_params(params),\n"
+            "        )\n"
+            "        self._policy.assert_url(url)\n"
+            "        return response\n"
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
+def test_outbound_dynamic_policy_guard_rejects_url_rebinding_before_transport(
+    tmp_path,
+):
+    root = _trust_fixture(tmp_path)
+    target = root / "src/trading_assistant/security/outbound.py"
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + (
+            "\nclass NoRedirectSession:\n"
+            "    def request(self, method, url, params=None):\n"
+            "        self._policy.assert_url(url)\n"
+            "        url = configured_url\n"
+            "        return super().request(\n"
+            "            method, url,\n"
+            "            params=_validated_query_params(params),\n"
+            "        )\n"
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
+def test_chained_query_mapping_targets_share_mutation_provenance(tmp_path):
+    root = _trust_fixture(tmp_path)
+    target = root / "src/trading_assistant/security/outbound.py"
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + (
+            "\nclass NoRedirectSession:\n"
+            "    def request(self, method, url):\n"
+            "        params = alias = {'symbol': 'AAPL'}\n"
+            "        alias.setdefault('access_key', credential)\n"
+            "        self._policy.assert_url(url)\n"
+            "        return super().request(method, url, params=params)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "QUERY_SECRET" in completed.stderr
+
+
+def test_chained_provider_options_share_mutation_provenance(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/llm/anthropic_backend.py",
+        "from anthropic import Anthropic\n"
+        "options = alias = {'api_key': credential}\n"
+        "alias['base_url'] = 'https://unapproved.invalid'\n"
+        "client = Anthropic(**options)\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_ORIGIN_UNAPPROVED" in completed.stderr
+
+
+def test_environment_mapping_unpack_is_rejected(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/environment_unpack.py",
+        "import os\n"
+        "copied_environment = {**os.environ}\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "ENVIRONMENT_SECRETS_IN_PRODUCTION" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        (
+            "import starlette.middleware.cors as cors\n"
+            "middlewares = [cors.CORSMiddleware]\n"
+            "app.add_middleware(middlewares[0], allow_origins=['*'])\n",
+            "WILDCARD_HOST_ORIGIN",
+        ),
+        (
+            "import http.client as http_client\n"
+            "clients = [http_client.HTTPSConnection]\n"
+            "clients[0]('example.invalid')\n",
+            "OUTBOUND_CLIENT_UNAPPROVED",
+        ),
+        (
+            "cookies = [response.set_cookie]\n"
+            "cookies[0]('session', secure=False, httponly=True, "
+            "samesite='strict')\n",
+            "INSECURE_COOKIE",
+        ),
+        (
+            "import ssl as tls\n"
+            "factories = [tls._create_unverified_context]\n"
+            "factories[0]()\n",
+            "TLS_DISABLED",
+        ),
+    ],
+    ids=("cors", "http-client", "cookie", "ssl-factory"),
+)
+def test_security_call_collection_indirection_fails_closed(
+    tmp_path,
+    source,
+    code,
+):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/security_indirection.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert code in completed.stderr
+
+
+def test_tracked_root_production_sql_is_rejected(tmp_path):
+    root = _trust_fixture(tmp_path)
+    relative = "production.sql"
+    _write_fixture_file(root, relative, "fixture backup marker\n")
+    subprocess.run(["git", "add", "--", relative], cwd=root, check=True)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "TRACKED_DECRYPTED_BACKUP" in completed.stderr
+    assert "fixture backup marker" not in completed.stderr
+
+
+def test_non_network_get_verify_keyword_is_a_decoy(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/local_store.py",
+        "result = local_store.get('record', verify=False)\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import urllib.request\n"
+            "urllib.request.build_opener().open("
+            "'https://example.invalid/data')\n"
+        ),
+        (
+            "import socket\n"
+            "socket.socket().connect(('example.invalid', 443))\n"
+        ),
+    ],
+    ids=("urllib-opener", "socket-instance"),
+)
+def test_chained_stdlib_network_clients_are_rejected(tmp_path, source):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/stdlib_chain.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
+def test_computed_credential_query_key_is_rejected(tmp_path):
+    root = _trust_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/computed_query.py",
+        "import urllib.request\n"
+        "credential_key = 'api_' + 'key'\n"
+        "target = ('https://example.invalid/data?' + credential_key "
+        "+ '=fixture')\n"
+        "urllib.request.urlopen(target)\n",
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "QUERY_SECRET" in completed.stderr

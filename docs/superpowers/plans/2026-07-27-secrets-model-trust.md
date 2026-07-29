@@ -567,11 +567,13 @@ Remove `CORSMiddleware`; no cross-origin route is supported.
    `.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` for
    `localhost`, `127.0.0.1`, and `::1`;
 5. sets directory mode `0700`, certificate `0644`, private key `0600`;
-6. runs `python -m trading_assistant.ops.tls inspect`.
+6. runs `uv run python -m trading_assistant.ops.tls inspect`.
 
-`inspect` parses the certificate, verifies SANs, validity dates, private-key
-mode, public-key match, and path containment under the repository `.local/tls`
-directory. It prints no private-key bytes.
+`inspect` parses the certificate, verifies SANs, validity dates, CA
+certificate-signing authorization, leaf server-authentication usage,
+private-key mode, standards-complete chain validation, public-key match, and
+path containment under the repository `.local/tls` directory. It prints no
+private-key bytes.
 
 - [ ] **Step 5: Replace shell Uvicorn arguments with a strict launcher**
 
@@ -1831,15 +1833,15 @@ Normal readiness requires:
 - encryption state complete and key ID available;
 - no webhook/Composio integration;
 - exact outbound HTTPS origins;
-- existing paper-mode, reconciliation, breaker, and quote-integrity checks
-  unchanged. Daemon freshness remains a separate post-start observation; there
-  is no daemon-health preflight row.
+- existing paper-mode, breaker, and quote-integrity checks plus a read-only
+  broker/local reconciliation snapshot. Daemon freshness remains a separate
+  post-start observation; there is no daemon-health preflight row.
 
 Preflight never resets a breaker, starts a daemon, submits a new order, calls
-an LLM, or sends a notification. Its existing broker-truth reconciliation may
-perform the fail-closed repair or cancellation actions required for
-already-known paper-order state, so it remains an explicit operator-controlled
-readiness step.
+an LLM, sends a notification, repairs order state, cancels an order, or writes
+reconciliation results. Its dedicated service exposes only broker
+open-order/position reads and local SQL `SELECT`s. Any mismatch remains an
+explicit operator-controlled runtime repair outside preflight.
 
 - [x] **Step 5: Document operator commands and hard limits**
 
@@ -1920,8 +1922,8 @@ git commit -m "chore(security): gate trust-boundary invariants"
 ### Task 11 fix round 2: close static/runtime trust review gaps
 
 The round-1 “no open code finding” and evidence-only provenance conclusions
-are superseded. Its evidence commit also changed executable MarketStack plan
-instructions. Round-2 executable, runtime, test, setup, and operator-document
+are superseded. Its evidence commit also changed executable retired-provider
+plan instructions. Round-2 executable, runtime, test, setup, and operator-document
 changes are isolated in implementation commit
 `d7c9576146ec205f454a8fd7b8db1425a2ce91d0`; this section records completion
 evidence only.

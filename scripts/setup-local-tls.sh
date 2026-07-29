@@ -21,4 +21,4 @@ mkcert -cert-file .local/tls/localhost.pem \
 chmod 0644 .local/tls/localhost.pem
 chmod 0644 .local/tls/rootCA.pem
 chmod 0600 .local/tls/localhost-key.pem
-python -m trading_assistant.ops.tls inspect
+uv run python -m trading_assistant.ops.tls inspect

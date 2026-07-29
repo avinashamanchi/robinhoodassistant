@@ -13,6 +13,13 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID
+from cryptography.x509.verification import (
+    DNSName,
+    PolicyBuilder,
+    Store,
+    VerificationError,
+)
 from fastapi.testclient import TestClient
 
 from trading_assistant.app.main import create_app
@@ -765,6 +772,8 @@ def _write_tls_pair(
     dns_names: tuple[str, ...] = ("localhost",),
     ip_names: tuple[str, ...] = ("127.0.0.1", "::1"),
     key_matches_certificate: bool = True,
+    ca_key_cert_sign: bool = True,
+    leaf_server_auth: bool | None = True,
 ) -> SimpleNamespace:
     tls_directory = tmp_path / ".local" / "tls"
     tls_directory.mkdir(parents=True)
@@ -788,6 +797,26 @@ def _write_tls_pair(
             x509.BasicConstraints(ca=True, path_length=0),
             critical=True,
         )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=ca_key_cert_sign,
+                crl_sign=ca_key_cert_sign,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(
+                root_key.public_key()
+            ),
+            critical=False,
+        )
         .sign(root_key, hashes.SHA256())
     )
     certificate_key = rsa.generate_private_key(
@@ -799,7 +828,7 @@ def _write_tls_pair(
         if key_matches_certificate
         else rsa.generate_private_key(public_exponent=65537, key_size=2048)
     )
-    certificate = (
+    certificate_builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]))
         .issuer_name(root_name)
@@ -820,6 +849,46 @@ def _write_tls_pair(
         .add_extension(
             x509.BasicConstraints(ca=False, path_length=None),
             critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+    )
+    if leaf_server_auth is not None:
+        certificate_builder = certificate_builder.add_extension(
+            x509.ExtendedKeyUsage(
+                [
+                    ExtendedKeyUsageOID.SERVER_AUTH
+                    if leaf_server_auth
+                    else ExtendedKeyUsageOID.CLIENT_AUTH
+                ]
+            ),
+            critical=False,
+        )
+    certificate = (
+        certificate_builder
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(
+                certificate_key.public_key()
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                root_key.public_key()
+            ),
+            critical=False,
         )
         .sign(root_key, hashes.SHA256())
     )
@@ -1039,6 +1108,60 @@ def test_tls_inspection_rejects_missing_loopback_sans_and_key_mismatch(
         validate_tls_material(mismatch)
     assert exc_info.value.code == "tls_certificate_key_mismatch"
     assert "PRIVATE KEY" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("fixture_options", "expected_code"),
+    [
+        ({"ca_key_cert_sign": False}, "tls_ca_invalid"),
+        ({"leaf_server_auth": False}, "tls_ca_chain_invalid"),
+    ],
+    ids=("ca-without-key-cert-sign", "leaf-without-server-auth"),
+)
+def test_tls_inspection_matches_standards_verifier_constraints(
+    tmp_path,
+    monkeypatch,
+    fixture_options,
+    expected_code,
+):
+    """The local validator must reject every chain the standards verifier rejects."""
+    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
+
+    server = _write_tls_pair(tmp_path, **fixture_options)
+    ca = x509.load_pem_x509_certificate(
+        (tmp_path / ".local/tls/rootCA.pem").read_bytes()
+    )
+    leaf = x509.load_pem_x509_certificate(
+        (tmp_path / ".local/tls/localhost.pem").read_bytes()
+    )
+    verifier = (
+        PolicyBuilder()
+        .store(Store([ca]))
+        .build_server_verifier(DNSName("localhost"))
+    )
+    with pytest.raises(VerificationError):
+        verifier.verify(leaf, [])
+
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(TLSMaterialError) as exc_info:
+        validate_tls_material(server)
+
+    assert exc_info.value.code == expected_code
+
+
+def test_tls_inspection_requires_explicit_server_auth_eku(
+    tmp_path,
+    monkeypatch,
+):
+    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
+
+    server = _write_tls_pair(tmp_path, leaf_server_auth=None)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(TLSMaterialError) as exc_info:
+        validate_tls_material(server)
+
+    assert exc_info.value.code == "tls_ca_chain_invalid"
 
 
 def test_production_encryption_inspector_fails_closed_without_singleton(
