@@ -126,3 +126,15 @@ second no-argument full suite ran.
   fake brokers, and local fixtures only. It did not start services, access
   real resources, make external calls, push, trade, reconcile, notify, or
   reset a breaker.
+
+## Supersession
+
+The final construction-boundary review against base `a830889` found that this
+package's production/test factory conclusion was incomplete. Public
+`build_container` still exposed an unguarded app construction path,
+`create_test_app` accepted arbitrary explicit production-capable components,
+and pre-build failures were outside the app startup lifecycle. Those points
+are superseded by implementation `5b28a24` and
+`task-11-review-package-plan2-construction-boundary.md`. This package's
+role-identity, excess-news-authority, paper-only, and live-rejection findings
+remain valid.

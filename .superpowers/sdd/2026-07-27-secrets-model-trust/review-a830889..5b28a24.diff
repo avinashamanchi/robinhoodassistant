@@ -1,0 +1,2047 @@
+diff --git a/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md b/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
+index 03d834f..6b06bd8 100644
+--- a/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
++++ b/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
+@@ -14,7 +14,9 @@
+    graded-call linkage to `AnalysisReport`s. `MarketFeatures` and `playbook.md` are still
+    built now (strategies consume `MarketFeatures`; the playbook ships as a doc).
+ 2. **Crypto is a real asset class in the paper runtime** (not backtest-only),
+-   but it is not a live-trading asset class. This modifies Phase 1–3 code (§1).
++   but it is not a live-trading asset class. This modifies the shared runtime
++   architecture only for backtesting and paper operation (§1); this release
++   rejects live mode.
+    **Hard condition:** the entire existing Phase 1 risk + kill-switch
+    suite must pass unchanged, plus new tests proving equity/crypto trip independently and
+    the crypto clock is always-open while the equity clock is unaffected.
+@@ -145,8 +147,10 @@ asset class with the most turnover.
+ ## 8. Guardrails (permanent)
+ 
+ 1. **Holdout is sacred** — `HoldoutGuard` blocks sweeps on it and logs access.
+-2. Backtest results **never auto-enable** anything; promotion stays a manual config change and
+-   the Phase 6 "50 graded calls" gate still applies on top (when Phase 6 exists).
++2. Backtest results **never auto-enable** anything. Promotion is an evaluation
++   label only: it cannot enable live mode and is not a live configuration path.
++   The Phase 6 "50 graded calls" gate remains a paper-evaluation requirement
++   (when Phase 6 exists).
+ 3. Every simulated result in the UI carries: **"Simulated — past performance does not predict
+    future results."**
+ 4. **No lookahead** — the `DataView` test (single name + SPY context) runs in CI forever.
+@@ -159,7 +163,8 @@ stamped Simulated.
+ 
+ ## 10. Build order & review checkpoints
+ 
+-`assets` + config + **§1 asset-class live-path change (existing suite must stay green)** →
++`assets` + config + **§1 shared runtime/paper change (live mode remains rejected;
++existing suite must stay green)** →
+ `signals` → `strategies` → `data` (synthetic for tests) → **`sim_broker` + `engine` +
+ no-lookahead `DataView` test** ⏸️ **STOP for review** → `evaluate` + **first walk-forward
+ baseline report** ⏸️ **STOP for review (before any LLM run)** → `situations` → `stress/` → UI.
+diff --git a/src/trading_assistant/app/main.py b/src/trading_assistant/app/main.py
+index 0f42e52..1ba1d18 100644
+--- a/src/trading_assistant/app/main.py
++++ b/src/trading_assistant/app/main.py
+@@ -10,8 +10,6 @@ from __future__ import annotations
+ 
+ from copy import deepcopy
+ from datetime import date, timedelta
+-from functools import wraps
+-import inspect
+ import json
+ from pathlib import Path
+ import threading
+@@ -316,7 +314,7 @@ def build_default_container(
+         or startup_guard_receipt is None
+     ):
+         raise RuntimeError("production_startup_guard_required")
+-    return bootstrap._build_guarded_container(
++    return bootstrap.build_container(
+         config,
+         secrets,
+         runtime_role="app",
+@@ -355,8 +353,17 @@ def _build_agent(container) -> Agent:
+     return agent
+ 
+ 
+-def build_default_stack() -> tuple[TradingService, Agent]:
+-    container = build_default_container()
++def build_default_stack(
++    *,
++    config,
++    secrets: RuntimeSecrets,
++    startup_guard_receipt,
++) -> tuple[TradingService, Agent]:
++    container = build_default_container(
++        config=config,
++        secrets=secrets,
++        startup_guard_receipt=startup_guard_receipt,
++    )
+     return container.service, _build_agent(container)
+ 
+ 
+@@ -1470,26 +1477,24 @@ def _create_guarded_app(
+     )
+ 
+ 
+-@wraps(_create_app)
+ def create_test_app(*args, **kwargs) -> FastAPI:
+-    """Build an explicitly injected local test app with no ambient authority."""
+-    if "_guarded_app_composition" in kwargs:
++    """Build only from the opaque fake-only container issued to tests."""
++    if args or "_guarded_app_composition" in kwargs:
+         raise TypeError(
+-            "guarded app composition requires private launcher entrypoint"
++            "test app requires an explicit test-only container"
+         )
+-    bound = inspect.signature(_create_app).bind_partial(
+-        *args,
+-        **kwargs,
+-    )
+-    bound.apply_defaults()
+-    automatic = (
+-        bound.arguments["container"] is None
+-        and bound.arguments["service"] is None
+-        and bound.arguments["agent"] is None
+-    )
+-    if automatic:
+-        raise RuntimeError("explicit_test_stack_required")
+-    return _create_app(*args, **kwargs)
++    if "service" in kwargs or "runtime_secrets" in kwargs:
++        raise RuntimeError("test_container_required")
++    from .. import bootstrap
++
++    container = kwargs.get("container")
++    if not bootstrap._is_test_application_container(container):
++        raise RuntimeError("test_container_required")
++    agent = getattr(container, "_test_agent", None)
++    if agent is None:
++        raise RuntimeError("test_agent_required")
++    kwargs["agent"] = agent
++    return _create_app(**kwargs)
+ 
+ 
+ def create_app(*args, **kwargs) -> FastAPI:
+@@ -1501,23 +1506,32 @@ def create_app(*args, **kwargs) -> FastAPI:
+     }
+     if args or set(kwargs).difference(allowed):
+         raise RuntimeError("explicit_stack_requires_test_factory")
+-    container = build_default_container(
+-        config=kwargs.get("config"),
+-        secrets=kwargs.get("secrets"),
+-        startup_guard_receipt=kwargs.get(
+-            "startup_guard_receipt"
+-        ),
+-    )
+-
+-    try:
+-        return _create_guarded_app(container=container)
+-    except BaseException:
+-        guard = getattr(container, "runtime_tenure_guard", None)
+-        if guard is not None and not guard.close():
+-            raise RuntimeError(
+-                "runtime_tenure_cleanup_uncertain"
+-            ) from None
+-        raise
++    secrets = kwargs.get("secrets")
++    if secrets is None:
++        raise RuntimeError("production_startup_guard_required")
++    from ..logging import runtime_startup
++
++    with runtime_startup("app", secrets):
++        container = build_default_container(
++            config=kwargs.get("config"),
++            secrets=secrets,
++            startup_guard_receipt=kwargs.get(
++                "startup_guard_receipt"
++            ),
++        )
++        try:
++            return _create_guarded_app(container=container)
++        except BaseException:
++            guard = getattr(
++                container,
++                "runtime_tenure_guard",
++                None,
++            )
++            if guard is not None and not guard.close():
++                raise RuntimeError(
++                    "runtime_tenure_cleanup_uncertain"
++                ) from None
++            raise
+ 
+ 
+ # ── backtest DB helpers ────────────────────────────────────────
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 093736d..4bcbd07 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from datetime import timedelta
+ from uuid import uuid4
+ 
+@@ -22,7 +22,6 @@ from .config import (
+     AppConfig,
+     BrokerKind,
+     TradingMode,
+-    load_config,
+ )
+ from .db.schema import require_current_schema
+ from .db.session import create_db_engine, make_session_factory
+@@ -122,6 +121,24 @@ class ApplicationContainer:
+     startup_evidence: StartupPostureEvidence | None = None
+ 
+ 
++_TEST_CONTAINER_SEAL = object()
++
++
++@dataclass(frozen=True)
++class _TestApplicationContainer:
++    """Opaque test-only wrapper issued only after fake-capability checks."""
++
++    _source: object = field(repr=False)
++    _test_agent: object = field(repr=False)
++    _test_composition: object = field(
++        default=_TEST_CONTAINER_SEAL,
++        repr=False,
++    )
++
++    def __getattr__(self, name: str):
++        return getattr(self._source, name)
++
++
+ @dataclass(frozen=True)
+ class PreflightServiceContainer:
+     """Minimal preflight owner with no app, agent, notifier, or LLM surface."""
+@@ -346,20 +363,31 @@ def build_quarantine_summarizer(
+ 
+ 
+ def build_container(
+-    config: AppConfig | None = None,
+-    secrets: RuntimeSecrets | None = None,
++    config: AppConfig,
++    secrets: RuntimeSecrets,
+     *,
+-    runtime_role: str | None = None,
++    runtime_role: str,
++    startup_guard_receipt: StartupGuardReceipt | None = None,
+     process_identity: ProcessIdentity | None = None,
+     process_inspector=None,
+     tenure_clock=None,
+     tenure_owner_factory=None,
+ ) -> ApplicationContainer:
+-    config = config or load_config()
+-    if secrets is None:
+-        raise RuntimeError(
+-            "build_container requires explicit RuntimeSecrets"
++    if runtime_role == "app":
++        if startup_guard_receipt is None:
++            raise RuntimeError("app_startup_guard_required")
++        return _build_guarded_container(
++            config,
++            secrets,
++            runtime_role=runtime_role,
++            startup_guard_receipt=startup_guard_receipt,
++            process_identity=process_identity,
++            process_inspector=process_inspector,
++            tenure_clock=tenure_clock,
++            tenure_owner_factory=tenure_owner_factory,
+         )
++    if startup_guard_receipt is not None:
++        raise RuntimeError("startup_guard_receipt_role_invalid")
+     return _build_container(
+         config,
+         secrets,
+@@ -408,19 +436,112 @@ def build_test_container(
+     *,
+     broker: BrokerClient,
+     clock,
++    service: TradingService | None = None,
++    agent: object | None = None,
++    source_container: object | None = None,
+     runtime_role: str = "app",
+-) -> ApplicationContainer:
++) -> ApplicationContainer | _TestApplicationContainer:
+     """Compose with explicit fakes while retaining production-safe config."""
+-    return _build_container(
+-        config,
+-        secrets,
+-        broker=broker,
+-        clock=clock,
+-        runtime_role=runtime_role,
+-        enforce_runtime_tenure=False,
++    if agent is not None:
++        _require_test_only_capabilities(broker, clock)
++    if service is None:
++        if source_container is not None:
++            raise RuntimeError("test_container_source_invalid")
++        source = _build_container(
++            config,
++            secrets,
++            broker=broker,
++            clock=clock,
++            runtime_role=runtime_role,
++            enforce_runtime_tenure=False,
++        )
++    else:
++        if service.config is not config:
++            raise RuntimeError("test_service_config_mismatch")
++        if service.broker is not broker or service.clock is not clock:
++            raise RuntimeError("test_service_capability_mismatch")
++        clocks = getattr(service, "_clocks", None)
++        if type(clocks) is not dict:
++            raise RuntimeError("production_test_capability_forbidden")
++        if agent is not None:
++            for configured_clock in clocks.values():
++                _require_test_only_capabilities(
++                    broker,
++                    configured_clock,
++                )
++        if (
++            source_container is None
++            or getattr(source_container, "config", None) is not config
++            or getattr(source_container, "secrets", None) is not secrets
++            or getattr(source_container, "service", None) is not service
++        ):
++            raise RuntimeError("test_container_source_invalid")
++        if (
++            getattr(source_container, "runtime_tenure_guard", None)
++            is not None
++            or getattr(source_container, "startup_evidence", None)
++            is not None
++        ):
++            raise RuntimeError("production_test_capability_forbidden")
++        source = source_container
++    if agent is None:
++        return source
++    return _TestApplicationContainer(
++        _source=source,
++        _test_agent=agent,
+     )
+ 
+ 
++def _require_test_only_capabilities(
++    broker: object,
++    clock: object,
++) -> None:
++    from .broker.mock import MockBroker
++    from .risk.clock import CryptoClock, FakeClock
++
++    if not isinstance(broker, MockBroker):
++        raise RuntimeError("production_test_capability_forbidden")
++    if not isinstance(clock, (CryptoClock, FakeClock)):
++        raise RuntimeError("production_test_capability_forbidden")
++
++
++def _is_test_application_container(container: object) -> bool:
++    try:
++        if (
++            type(container) is not _TestApplicationContainer
++            or container._test_composition is not _TEST_CONTAINER_SEAL
++            or container._test_agent is None
++        ):
++            return False
++        source = container._source
++        service = source.service
++        if (
++            source.config is not service.config
++            or getattr(source, "runtime_tenure_guard", None)
++            is not None
++            or getattr(source, "startup_evidence", None)
++            is not None
++            or getattr(source.operations, "service", None)
++            is not service
++        ):
++            return False
++        _require_test_only_capabilities(
++            service.broker,
++            service.clock,
++        )
++        clocks = getattr(service, "_clocks", None)
++        if type(clocks) is not dict:
++            return False
++        for configured_clock in clocks.values():
++            _require_test_only_capabilities(
++                service.broker,
++                configured_clock,
++            )
++    except Exception:
++        return False
++    return True
++
++
+ def build_preflight_service(
+     config: AppConfig,
+     secrets: RuntimeSecrets,
+diff --git a/src/trading_assistant/ops/serve.py b/src/trading_assistant/ops/serve.py
+index 886e0b8..55d135e 100644
+--- a/src/trading_assistant/ops/serve.py
++++ b/src/trading_assistant/ops/serve.py
+@@ -20,6 +20,7 @@ from ..bootstrap import _build_guarded_container
+ from ..config import load_config
+ from ..db.schema import require_current_schema
+ from ..db.session import create_db_engine
++from ..logging import runtime_startup
+ from ..preflight import (
+     SensitiveEncryptionStateInspector,
+     StructuralCheck,
+@@ -194,71 +195,76 @@ def main(argv: list[str] | None = None) -> int:
+         secrets=secrets,
+         secret_loaded_at=secret_loaded_at,
+     )
+-    control = start_app_control(Path.cwd())
+-    app = None
+-    try:
+-        container = _build_guarded_container(
+-            config,
+-            secrets,
+-            runtime_role="app",
+-            startup_guard_receipt=startup_guard_receipt,
+-        )
+-        app = _create_guarded_app(
+-            container=container,
+-        )
+-        server = uvicorn.Server(
+-            uvicorn.Config(
+-                app,
+-                host=config.server.bind_host,
+-                port=config.server.port,
+-                ssl_certfile=str(config.server.tls_cert_path),
+-                ssl_keyfile=str(config.server.tls_key_path),
+-                proxy_headers=False,
+-                forwarded_allow_ips="",
+-                access_log=False,
+-            )
+-        )
+-        install_shutdown = getattr(
+-            app.state,
+-            "install_controlled_shutdown",
+-            None,
+-        )
+-        if not callable(install_shutdown):
+-            raise RuntimeError("runtime_tenure_shutdown_owner_missing")
+-        install_shutdown(lambda: setattr(server, "should_exit", True))
+-        server.run()
+-    finally:
++    with runtime_startup("app", secrets):
++        control = start_app_control(Path.cwd())
++        app = None
+         try:
+-            if app is not None:
+-                guard = getattr(
+-                    app.state,
+-                    "runtime_tenure_guard",
+-                    None,
++            container = _build_guarded_container(
++                config,
++                secrets,
++                runtime_role="app",
++                startup_guard_receipt=startup_guard_receipt,
++            )
++            app = _create_guarded_app(
++                container=container,
++            )
++            server = uvicorn.Server(
++                uvicorn.Config(
++                    app,
++                    host=config.server.bind_host,
++                    port=config.server.port,
++                    ssl_certfile=str(config.server.tls_cert_path),
++                    ssl_keyfile=str(config.server.tls_key_path),
++                    proxy_headers=False,
++                    forwarded_allow_ips="",
++                    access_log=False,
+                 )
+-                if guard is not None:
+-                    if (
+-                        not getattr(guard, "closed", False)
+-                        and not guard.close()
+-                    ):
+-                        raise RuntimeError(
+-                            "runtime_tenure_cleanup_uncertain"
+-                        )
+-                    close_result = getattr(
+-                        guard,
+-                        "close_result",
++            )
++            install_shutdown = getattr(
++                app.state,
++                "install_controlled_shutdown",
++                None,
++            )
++            if not callable(install_shutdown):
++                raise RuntimeError(
++                    "runtime_tenure_shutdown_owner_missing"
++                )
++            install_shutdown(
++                lambda: setattr(server, "should_exit", True)
++            )
++            server.run()
++        finally:
++            try:
++                if app is not None:
++                    guard = getattr(
++                        app.state,
++                        "runtime_tenure_guard",
+                         None,
+                     )
+-                    close_value = getattr(
+-                        close_result,
+-                        "value",
+-                        close_result,
+-                    )
+-                    if close_value == "uncertain":
+-                        raise RuntimeError(
+-                            "runtime_tenure_cleanup_uncertain"
++                    if guard is not None:
++                        if (
++                            not getattr(guard, "closed", False)
++                            and not guard.close()
++                        ):
++                            raise RuntimeError(
++                                "runtime_tenure_cleanup_uncertain"
++                            )
++                        close_result = getattr(
++                            guard,
++                            "close_result",
++                            None,
+                         )
+-        finally:
+-            control.close()
++                        close_value = getattr(
++                            close_result,
++                            "value",
++                            close_result,
++                        )
++                        if close_value == "uncertain":
++                            raise RuntimeError(
++                                "runtime_tenure_cleanup_uncertain"
++                            )
++            finally:
++                control.close()
+     return 0
+ 
+ 
+diff --git a/tests/app_factory.py b/tests/app_factory.py
+new file mode 100644
+index 0000000..163afa9
+--- /dev/null
++++ b/tests/app_factory.py
+@@ -0,0 +1,164 @@
++"""Compatibility helper that turns explicit local fakes into a sealed test stack."""
++
++from __future__ import annotations
++
++from datetime import timedelta
++from types import SimpleNamespace
++
++from trading_assistant.config import Secrets
++from trading_assistant.security.secrets import secret_is_set
++
++_UNSET = object()
++
++
++def build_test_app_container(
++    service,
++    agent,
++    *,
++    secrets,
++    source_container=None,
++):
++    """Issue one marked app container from explicit fake capabilities."""
++    from trading_assistant import bootstrap
++    from trading_assistant.app.auth import SessionAuth
++    from trading_assistant.app.limits import (
++        ConcurrencyLeaseService,
++        DurableRateLimiter,
++        PolicyStoreMaintenance,
++    )
++    from trading_assistant.operations import (
++        AuditRecorder,
++        OperationsService,
++    )
++
++    if source_container is None:
++        rate_limiter = DurableRateLimiter(service.session_factory)
++        leases = ConcurrencyLeaseService(service.session_factory)
++        policy_store = PolicyStoreMaintenance(
++            rate_limiter,
++            leases,
++        )
++        provider_budget = bootstrap.build_provider_budget_service(
++            service.config,
++            service.session_factory,
++        )
++        audit = AuditRecorder(service.session_factory)
++        source_container = SimpleNamespace(
++            config=service.config,
++            secrets=secrets,
++            engine=service.session_factory.kw.get("bind"),
++            session_factory=service.session_factory,
++            rate_limiter=rate_limiter,
++            leases=leases,
++            policy_store_maintenance=policy_store,
++            provider_budget=provider_budget,
++            broker=service.broker,
++            service=service,
++            snapshot_service=service.snapshot_service,
++            order_application=service.order_application,
++            order_submission=service.order_submission,
++            reconciliation=service.reconciliation,
++            breakers=service.breakers,
++            rule_worker=None,
++            session_auth=SessionAuth(
++                service.session_factory,
++                application_secret=secrets.app_api_token,
++                ttl=timedelta(
++                    hours=service.config.security.session_hours
++                ),
++                reauthentication_window=timedelta(
++                    minutes=(
++                        service.config.security
++                        .reauthentication_minutes
++                    )
++                ),
++                cookie_secure=service.config.server.secure_cookies,
++            ),
++            audit=audit,
++            operations=OperationsService(
++                service,
++                audit,
++                rate_limiter=rate_limiter,
++                leases=leases,
++                policy_store_maintenance=policy_store,
++                provider_budget=provider_budget,
++            ),
++            runtime_tenure_guard=None,
++            startup_evidence=None,
++        )
++    return bootstrap.build_test_container(
++        service.config,
++        secrets,
++        broker=service.broker,
++        clock=service.clock,
++        service=service,
++        agent=agent,
++        source_container=source_container,
++    )
++
++
++def create_app(
++    service=None,
++    agent=None,
++    *,
++    container=None,
++    planning=_UNSET,
++    runtime_secrets=None,
++    api_token=None,
++    **kwargs,
++):
++    """Build route-test apps through the production test-container issuer."""
++    from trading_assistant import bootstrap
++    from trading_assistant.app.main import create_test_app
++
++    if bootstrap._is_test_application_container(container):
++        if agent is None:
++            call = {"container": container, **kwargs}
++            if planning is not _UNSET:
++                call["planning"] = planning
++            if api_token is not None:
++                call["api_token"] = api_token
++            return create_test_app(**call)
++
++    source_container = container
++    if source_container is not None:
++        if service is not None and service is not source_container.service:
++            raise RuntimeError("container and service do not match")
++        service = source_container.service
++        if runtime_secrets is None:
++            runtime_secrets = source_container.secrets
++
++    if (service is None) != (agent is None):
++        raise RuntimeError("service and agent must be injected together")
++    if service is None:
++        raise RuntimeError("explicit_test_stack_required")
++    if planning is _UNSET and source_container is None:
++        if not secret_is_set(api_token):
++            raise RuntimeError("APP_API_TOKEN is required")
++        raise RuntimeError(
++            "automatic planning requires a shared ApplicationContainer"
++        )
++    if (
++        source_container is not None
++        and runtime_secrets is not None
++        and runtime_secrets is not source_container.secrets
++    ):
++        raise RuntimeError(
++            "container and runtime Secrets do not match"
++        )
++
++    secrets = runtime_secrets
++    if secrets is None:
++        secrets = Secrets(app_api_token=api_token or "")
++    marked = build_test_app_container(
++        service,
++        agent,
++        secrets=secrets,
++        source_container=source_container,
++    )
++    call = {"container": marked, **kwargs}
++    if planning is not _UNSET:
++        call["planning"] = planning
++    if api_token is not None:
++        call["api_token"] = api_token
++    return create_test_app(**call)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 2351a29..c9dd3c2 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -306,7 +306,7 @@ def authenticate_client(operator_token):
+ def authenticated_client(make_service, operator_token, authenticate_client):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_test_app as create_app
++    from tests.app_factory import create_app
+ 
+     class _StubAgent:
+         def chat(self, message, **context):
+diff --git a/tests/test_api.py b/tests/test_api.py
+index 0a22d82..af20b98 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -13,10 +13,9 @@ import pytest
+ from fastapi.testclient import TestClient
+ from sqlalchemy import event, inspect as sa_inspect
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.app.limits import DurableRateLimiter
+ from trading_assistant.config import BrokerKind, TradingMode
+-from trading_assistant.broker.alpaca import AlpacaClock
+ from trading_assistant.broker.base import BrokerDataIntegrityError
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.broker.models import (
+@@ -42,7 +41,7 @@ from trading_assistant.db.models import (
+ )
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.risk.breakers import BreakerScope
+-from trading_assistant.risk.clock import FakeClock
++from trading_assistant.risk.clock import FakeClock, MarketClockObservation
+ from trading_assistant.security.crypto import (
+     SensitiveDataCipher,
+     SensitiveFieldRef,
+@@ -101,52 +100,73 @@ def _install_equity_clock(service, clock) -> None:
+ 
+ 
+ def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
+-    state = {"open": raw_session_open}
+-    client = SimpleNamespace(
+-        provider_marker=marker,
+-        get_clock=lambda: SimpleNamespace(is_open=True),
+-        get_calendar=lambda _request: [
+-            SimpleNamespace(
+-                date=CLOCK_NOW.date(),
+-                open=state["open"],
+-                close=datetime(2026, 7, 24, 16),
++    state = {"open": raw_session_open, "provider_marker": marker}
++
++    class MalformedCalendarFake(FakeClock):
++        def observe(self, at):
++            if not isinstance(state["open"], datetime):
++                raise BrokerDataIntegrityError(
++                    "invalid Alpaca market calendar"
++                )
++            return MarketClockObservation(
++                is_open=True,
++                most_recent_open=datetime(
++                    2026,
++                    7,
++                    24,
++                    13,
++                    30,
++                    tzinfo=timezone.utc,
++                ),
+             )
+-        ],
+-    )
+-    return AlpacaClock(client), state
++
++    return MalformedCalendarFake(is_open=True), state
+ 
+ 
+ def _race_alpaca_clock(later_current_state: bool):
+     calls = {"clock": 0, "calendar": 0}
+ 
+-    def get_clock():
+-        calls["clock"] += 1
+-        return SimpleNamespace(is_open=later_current_state)
+-
+-    def get_calendar(_request):
+-        calls["calendar"] += 1
+-        return [
+-            SimpleNamespace(
+-                date=datetime(2026, 7, 23).date(),
+-                open=datetime(2026, 7, 23, 9, 30),
+-                close=datetime(2026, 7, 23, 16),
+-            ),
+-            SimpleNamespace(
+-                date=datetime(2026, 7, 24).date(),
+-                open=datetime(2026, 7, 24, 9, 30),
+-                close=datetime(2026, 7, 24, 16),
+-            ),
+-        ]
+-
+-    return (
+-        AlpacaClock(
+-            SimpleNamespace(
+-                get_clock=get_clock,
+-                get_calendar=get_calendar,
++    class RaceCalendarFake(FakeClock):
++        def is_open(self, at=None):
++            if at is None:
++                calls["clock"] += 1
++                return later_current_state
++            return self.observe(at).is_open
++
++        def observe(self, at):
++            calls["calendar"] += 1
++            session_open = datetime(
++                2026,
++                7,
++                24,
++                13,
++                30,
++                tzinfo=timezone.utc,
+             )
+-        ),
+-        calls,
+-    )
++            session_close = datetime(
++                2026,
++                7,
++                24,
++                20,
++                0,
++                tzinfo=timezone.utc,
++            )
++            previous_open = datetime(
++                2026,
++                7,
++                23,
++                13,
++                30,
++                tzinfo=timezone.utc,
++            )
++            return MarketClockObservation(
++                is_open=session_open <= at < session_close,
++                most_recent_open=(
++                    session_open if at >= session_open else previous_open
++                ),
++            )
++
++    return RaceCalendarFake(is_open=later_current_state), calls
+ 
+ 
+ class StubAgent:
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 3c1bd8b..c9e9aeb 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -14,7 +14,7 @@ from trading_assistant.app.auth import (
+     SessionAuth,
+     SessionExpired,
+ )
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.db.models import AuthSession
+ from trading_assistant.risk.breakers import BreakerScope
+diff --git a/tests/test_backtests_api.py b/tests/test_backtests_api.py
+index 4e21c1d..3af195b 100644
+--- a/tests/test_backtests_api.py
++++ b/tests/test_backtests_api.py
+@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
+ 
+ import trading_assistant.backtest.runner as runner
+ from trading_assistant.app.limits import ConcurrencyLeaseService
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.db.models import (
+     AuditEvent,
+     BacktestRun,
+diff --git a/tests/test_bootstrap.py b/tests/test_bootstrap.py
+index 3c1a6ad..73e1ff4 100644
+--- a/tests/test_bootstrap.py
++++ b/tests/test_bootstrap.py
+@@ -21,7 +21,7 @@ from trading_assistant.app.limits import (
+     LimitSpec,
+     LimitStoreUnavailable,
+ )
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.broker.alpaca import AlpacaBroker
+ from trading_assistant.broker.base import BrokerSubmissionRejected
+ from trading_assistant.broker.mock import MockBroker
+@@ -232,11 +232,15 @@ def test_production_container_arms_exact_dynamic_alpaca_paper_guard(
+         "build_clock",
+         lambda *_args, **_kwargs: FakeClock(is_open=True),
+     )
++    config = _alpaca_config(app_config)
++    secrets = _migrated_secrets(tmp_path)
+ 
+     with _closed_runtime_container(
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
+-            _migrated_secrets(tmp_path),
++            config,
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+         )
+     ) as container:
+         with container.session_factory() as session:
+@@ -307,10 +311,14 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
+         "build_broker",
+         lambda *_args, **_kwargs: MockBroker(),
+     )
++    config = _alpaca_config(app_config)
++    secrets = _migrated_secrets(tmp_path)
+     with pytest.raises(RuntimeError, match="exact AlpacaBroker"):
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
+-            _migrated_secrets(tmp_path),
++            config,
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+         )
+ 
+     broker, trading = _paper_alpaca_broker()
+@@ -325,9 +333,13 @@ def test_production_container_rejects_non_alpaca_or_unsafe_target(
+         BrokerSubmissionRejected,
+         match="not official Alpaca paper",
+     ):
++        config = _alpaca_config(app_config)
++        secrets = _migrated_secrets(tmp_path)
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
+-            _migrated_secrets(tmp_path),
++            config,
++            secrets,
++            runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+         )
+ 
+ 
+@@ -405,12 +417,15 @@ def test_app_container_serves_console_with_failed_startup_reconciliation(
+         "build_clock",
+         lambda *_args, **_kwargs: FakeClock(is_open=True),
+     )
++    config = _alpaca_config(app_config)
++    secrets = _migrated_secrets(tmp_path)
+ 
+     with _closed_runtime_container(
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
+-            _migrated_secrets(tmp_path),
++            config,
++            secrets,
+             runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+         )
+     ) as container:
+         with container.session_factory() as session:
+@@ -470,7 +485,7 @@ def test_daemon_container_remains_fail_closed_on_startup_reconciliation_failure(
+     assert trading.cancel_calls == 0
+ 
+ 
+-def test_create_app_builds_missing_agent_from_exact_injected_container(
++def test_create_test_app_uses_exact_injected_fake_stack(
+     make_service,
+     monkeypatch,
+ ):
+@@ -483,28 +498,22 @@ def test_create_app_builds_missing_agent_from_exact_injected_container(
+     )
+     container = _injected_container(service, secrets)
+     agent = _StubAgent()
+-    seen = []
+ 
+     monkeypatch.setattr(
+         app_main,
+         "_build_agent",
+-        lambda supplied: seen.append(supplied) or agent,
+-    )
+-    monkeypatch.setattr(
+-        app_main,
+-        "build_default_stack",
+-        lambda: (_ for _ in ()).throw(
+-            AssertionError("injected container must not build a second stack")
++        lambda _supplied: (_ for _ in ()).throw(
++            AssertionError("test app must use its injected fake agent")
+         ),
+     )
+ 
+     app = create_app(
+         container=container,
++        agent=agent,
+         planning=None,
+     )
+ 
+-    assert seen == [container]
+-    assert app.state.container is container
++    assert app.state.container.service is container.service
+     assert app.state.trading_service is container.service
+     assert app.state.agent is agent
+     assert app.state.runtime_secrets is container.secrets
+@@ -663,6 +672,17 @@ def _issue_guard_receipt(posture, config, secrets, *, runtime_role="app"):
+     )
+ 
+ 
++def _app_receipt(config, secrets):
++    from trading_assistant.operations import security_posture as posture
++
++    return _issue_guard_receipt(
++        posture,
++        config,
++        secrets,
++        runtime_role="app",
++    )
++
++
+ def test_startup_guard_receipt_is_role_bound_and_wrong_role_does_not_consume(
+     make_service,
+     monkeypatch,
+@@ -911,7 +931,7 @@ def test_canonical_startup_receipt_is_identity_bound_and_private_app_accepts_it(
+     )
+     with pytest.raises(
+         RuntimeError,
+-        match="guarded container requires guarded app composition",
++        match="^production_test_capability_forbidden$",
+     ):
+         create_app(
+             container=container,
+@@ -2297,7 +2317,11 @@ def test_bootstrap_rejects_every_dangerous_runtime_switch(
+     unsafe = safe.model_copy(update=config_update(safe))
+ 
+     with pytest.raises(RuntimeError, match=message):
+-        build_container(unsafe, _migrated_secrets(tmp_path))
++        build_container(
++            unsafe,
++            _migrated_secrets(tmp_path),
++            runtime_role="daemon",
++        )
+ 
+ 
+ def test_bootstrap_rejects_outdated_schema_before_provider_construction(
+@@ -2325,6 +2349,7 @@ def test_bootstrap_rejects_outdated_schema_before_provider_construction(
+                 database_url=database_url,
+                 app_api_token="operator-secret-for-bootstrap-tests",
+             ),
++            runtime_role="daemon",
+         )
+ 
+     assert broker_built is False
+@@ -2383,12 +2408,14 @@ def test_active_maintenance_blocks_bootstrap_before_broker_construction(
+         raise AssertionError("broker construction must follow runtime tenure")
+ 
+     monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
++    config = _alpaca_config(app_config)
+ 
+     with pytest.raises(TenureUnavailable) as exc:
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
++            config,
+             secrets,
+             runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+             process_identity=ProcessIdentity(5102, "app-start"),
+             process_inspector=inspector,
+         )
+@@ -2428,12 +2455,14 @@ def test_plaintext_sensitive_field_blocks_before_broker_construction(
+         raise AssertionError("broker must follow full crypto scan")
+ 
+     monkeypatch.setattr(bootstrap, "build_broker", forbidden_broker)
++    config = _alpaca_config(app_config)
+ 
+     with pytest.raises(bootstrap.StartupEncryptionBlocked) as exc:
+         bootstrap.build_container(
+-            _alpaca_config(app_config),
++            config,
+             secrets,
+             runtime_role="app",
++            startup_guard_receipt=_app_receipt(config, secrets),
+             process_identity=ProcessIdentity(5110, "app-start"),
+             process_inspector=_UnknownProcessInspector(),
+         )
+@@ -2581,6 +2610,9 @@ def test_runtime_guard_setup_failure_closes_acquired_tenure(
+ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
+     make_service,
+ ):
++    from trading_assistant.app import main as app_main
++    from trading_assistant.operations import security_posture as posture
++
+     service = make_service()
+     secrets = Secrets(
+         database_url=str(service.session_factory.kw["bind"].url),
+@@ -2604,8 +2636,30 @@ def test_app_wires_runtime_renewal_loss_to_controlled_shutdown(
+     )
+     guard.start()
+     container.runtime_tenure_guard = guard
++    receipt = _app_receipt(service.config, secrets)
++    consumed = posture._consume_startup_guard_receipt(
++        receipt,
++        config=service.config,
++        secrets=secrets,
++        runtime_role="app",
++    )
++    container.startup_evidence = posture._validate_consumed_startup_guard(
++        consumed,
++        config=service.config,
++        secrets=secrets,
++        runtime_role="app",
++    )
++    container.operations = OperationsService(
++        service,
++        container.audit,
++        rate_limiter=container.rate_limiter,
++        provider_budget=container.provider_budget,
++        _consumed_startup_guard=consumed,
++        _startup_secrets=secrets,
++        _startup_runtime_role="app",
++    )
+     with _closed_runtime_container(container):
+-        app = create_app(
++        app = app_main._create_guarded_app(
+             container=container,
+             agent=_StubAgent(),
+             planning=None,
+diff --git a/tests/test_candidate_boundary.py b/tests/test_candidate_boundary.py
+index db757a7..1d3c9ab 100644
+--- a/tests/test_candidate_boundary.py
++++ b/tests/test_candidate_boundary.py
+@@ -17,7 +17,7 @@ from sqlalchemy import event, func, select
+ from sqlalchemy.exc import IntegrityError
+ 
+ from trading_assistant.assets import AssetClass
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.app.limits import InterlockDecision
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.db.models import (
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index d14c3cf..221946a 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -15,7 +15,7 @@ import pytest
+ from fastapi.testclient import TestClient
+ from sqlalchemy import event, func, select, text
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.app.errors import ApiError
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.broker.models import Account, Position
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+index 0187f0c..c2594a1 100644
+--- a/tests/test_ops.py
++++ b/tests/test_ops.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.config import BrokerKind, TradingMode
+ from trading_assistant.db.migrate import upgrade
+ from trading_assistant.db.models import PanicReceipt, utcnow
+diff --git a/tests/test_plan2_integration_correction.py b/tests/test_plan2_integration_correction.py
+index cc7dbb6..aa9ad1b 100644
+--- a/tests/test_plan2_integration_correction.py
++++ b/tests/test_plan2_integration_correction.py
+@@ -2,7 +2,9 @@
+ 
+ from __future__ import annotations
+ 
++from contextlib import nullcontext
+ from datetime import datetime, timedelta, timezone
++import logging
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -38,6 +40,457 @@ def _issue_app_receipt(config, secrets):
+     )
+ 
+ 
++def test_public_build_container_has_no_ambient_app_default():
++    from trading_assistant import bootstrap
++
++    with pytest.raises(TypeError):
++        bootstrap.build_container()
++
++
++def test_public_build_container_requires_receipt_for_explicit_app(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_container",
++        lambda *_args, **_kwargs: pytest.fail(
++            "unguarded app authority was constructed"
++        ),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^app_startup_guard_required$",
++    ):
++        bootstrap.build_container(
++            app_config,
++            Secrets(app_api_token="plan2-app-boundary-token"),
++            runtime_role="app",
++        )
++
++
++def test_create_test_app_rejects_ordinary_build_container_result(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.app import main as app_main
++
++    ordinary = SimpleNamespace()
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_container",
++        lambda *_args, **_kwargs: ordinary,
++    )
++    container = bootstrap.build_container(
++        app_config,
++        Secrets(app_api_token="plan2-ordinary-container-token"),
++        runtime_role="daemon",
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^test_container_required$",
++    ):
++        app_main.create_test_app(
++            container=container,
++            planning=None,
++        )
++
++
++def test_create_test_app_accepts_only_marked_fake_container(
++    app_config,
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++    from tests.app_factory import build_test_app_container
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    service = make_service()
++    agent = Agent()
++    secrets = Secrets(
++        app_api_token="plan2-marked-test-container-token"
++    )
++    container = build_test_app_container(
++        service,
++        agent,
++        secrets=secrets,
++    )
++
++    app = app_main.create_test_app(
++        container=container,
++        planning=None,
++    )
++
++    assert app.state.container is container
++    assert app.state.trading_service is service
++    assert app.state.agent is agent
++
++
++def test_test_container_builder_rejects_production_broker_capability(
++    app_config,
++    session_factory,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from trading_assistant.risk.clock import FakeClock
++    from trading_assistant.service import TradingService
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    broker = AlpacaBroker(SimpleNamespace(), SimpleNamespace())
++    clock = FakeClock(is_open=True)
++    service = TradingService(
++        broker,
++        session_factory,
++        app_config,
++        clock,
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        bootstrap.build_test_container(
++            app_config,
++            Secrets(
++                app_api_token="plan2-production-capability-token"
++            ),
++            broker=broker,
++            clock=clock,
++            service=service,
++            agent=Agent(),
++        )
++
++
++def test_test_container_builder_rejects_nested_production_clock_capability(
++    app_config,
++    make_service,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.assets import AssetClass
++    from trading_assistant.broker.alpaca import AlpacaClock
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    service = make_service()
++    service._clocks[AssetClass.CRYPTO] = AlpacaClock(
++        SimpleNamespace()
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        bootstrap.build_test_container(
++            app_config,
++            Secrets(
++                app_api_token="plan2-nested-capability-token"
++            ),
++            broker=service.broker,
++            clock=service.clock,
++            service=service,
++            agent=Agent(),
++        )
++
++
++def test_test_container_builder_rejects_wrapped_production_broker(
++    app_config,
++    session_factory,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from trading_assistant.ops.safety_drill import (
++        _CrashAfterAcceptanceOnceBroker,
++    )
++    from trading_assistant.risk.clock import FakeClock
++    from trading_assistant.service import TradingService
++    from tests.app_factory import build_test_app_container
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    broker = _CrashAfterAcceptanceOnceBroker(
++        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
++    )
++    service = TradingService(
++        broker,
++        session_factory,
++        app_config,
++        FakeClock(is_open=True),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            Agent(),
++            secrets=Secrets(
++                app_api_token="plan2-wrapped-capability-token"
++            ),
++        )
++
++
++def test_non_app_test_composition_is_not_an_app_test_authority(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.broker.mock import MockBroker
++    from trading_assistant.risk.clock import FakeClock
++
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_container",
++        lambda *_args, **_kwargs: SimpleNamespace(
++            runtime_tenure_guard=None,
++        ),
++    )
++
++    container = bootstrap.build_test_container(
++        app_config,
++        Secrets(app_api_token="plan2-non-app-test-token"),
++        broker=MockBroker(),
++        clock=FakeClock(is_open=True),
++    )
++
++    assert bootstrap._is_test_application_container(container) is False
++
++
++def test_marked_test_container_revalidates_fake_capabilities_at_use(
++    app_config,
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    service = make_service()
++    container = build_test_app_container(
++        service,
++        Agent(),
++        secrets=Secrets(
++            app_api_token="plan2-revalidate-test-token"
++        ),
++    )
++    service.broker = AlpacaBroker(
++        SimpleNamespace(),
++        SimpleNamespace(),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^test_container_required$",
++    ):
++        app_main.create_test_app(
++            container=container,
++            planning=None,
++        )
++
++
++def test_app_prebuild_failure_logs_stable_marker_and_preserves_exception(
++    app_config,
++    caplog,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant import logging as runtime_logging
++    from trading_assistant.app import main as app_main
++
++    secret = "plan2-prebuild-sensitive-token"
++    secrets = Secrets(app_api_token=secret)
++    receipt = _issue_app_receipt(app_config, secrets)
++    failure = RuntimeError(f"prebuild failed with {secret}")
++
++    monkeypatch.setattr(
++        runtime_logging,
++        "configure_runtime_logging",
++        lambda role, loaded: None,
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_container",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
++    )
++
++    with caplog.at_level(
++        logging.ERROR,
++        logger="trading_assistant.startup",
++    ):
++        with pytest.raises(RuntimeError) as raised:
++            app_main.create_app(
++                config=app_config,
++                secrets=secrets,
++                startup_guard_receipt=receipt,
++            )
++
++    assert raised.value is failure
++    messages = [
++        record.getMessage()
++        for record in caplog.records
++        if record.name == "trading_assistant.startup"
++    ]
++    assert messages == ["startup_failed role=app"]
++    assert secret not in caplog.text
++
++
++def test_app_postbuild_failure_logs_and_closes_once_without_replacement(
++    app_config,
++    caplog,
++    monkeypatch,
++):
++    from trading_assistant import logging as runtime_logging
++    from trading_assistant.app import main as app_main
++
++    class Guard:
++        close_calls = 0
++
++        def close(self):
++            self.close_calls += 1
++            return True
++
++    secret = "plan2-postbuild-sensitive-token"
++    secrets = Secrets(app_api_token=secret)
++    receipt = _issue_app_receipt(app_config, secrets)
++    guard = Guard()
++    container = SimpleNamespace(runtime_tenure_guard=guard)
++    failure = RuntimeError(f"app failed with {secret}")
++
++    monkeypatch.setattr(
++        runtime_logging,
++        "configure_runtime_logging",
++        lambda role, loaded: None,
++    )
++    monkeypatch.setattr(
++        app_main,
++        "build_default_container",
++        lambda **_kwargs: container,
++    )
++    monkeypatch.setattr(
++        app_main,
++        "_create_guarded_app",
++        lambda **_kwargs: (_ for _ in ()).throw(failure),
++    )
++
++    with caplog.at_level(
++        logging.ERROR,
++        logger="trading_assistant.startup",
++    ):
++        with pytest.raises(RuntimeError) as raised:
++            app_main.create_app(
++                config=app_config,
++                secrets=secrets,
++                startup_guard_receipt=receipt,
++            )
++
++    assert raised.value is failure
++    assert guard.close_calls == 1
++    messages = [
++        record.getMessage()
++        for record in caplog.records
++        if record.name == "trading_assistant.startup"
++    ]
++    assert messages == ["startup_failed role=app"]
++    assert secret not in caplog.text
++
++
++def test_canonical_launcher_prebuild_failure_logs_and_preserves_cleanup(
++    app_config,
++    caplog,
++    monkeypatch,
++):
++    from trading_assistant import logging as runtime_logging
++    from trading_assistant.ops import serve
++
++    class Control:
++        close_calls = 0
++
++        def close(self):
++            self.close_calls += 1
++
++    secret = "plan2-launcher-prebuild-sensitive-token"
++    secrets = Secrets(app_api_token=secret)
++    provider = SimpleNamespace(
++        last_successful_role_load_at=datetime.now(timezone.utc)
++    )
++    control = Control()
++    failure = RuntimeError(f"launcher failed with {secret}")
++
++    monkeypatch.setattr(serve, "load_config", lambda: app_config)
++    monkeypatch.setattr(
++        serve,
++        "MacOSKeychainSecretProvider",
++        lambda: provider,
++    )
++    monkeypatch.setattr(
++        serve,
++        "load_role_secrets",
++        lambda *_args, **_kwargs: secrets,
++    )
++    monkeypatch.setattr(
++        serve,
++        "run_startup_guard",
++        lambda **_kwargs: object(),
++    )
++    monkeypatch.setattr(
++        serve,
++        "start_app_control",
++        lambda _path: control,
++    )
++    monkeypatch.setattr(
++        serve,
++        "_build_guarded_container",
++        lambda *_args, **_kwargs: (
++            (_ for _ in ()).throw(failure)
++        ),
++    )
++    monkeypatch.setattr(
++        serve.uvicorn,
++        "Server",
++        lambda *_args, **_kwargs: pytest.fail(
++            "uvicorn must follow guarded composition"
++        ),
++    )
++    monkeypatch.setattr(
++        runtime_logging,
++        "configure_runtime_logging",
++        lambda role, loaded: None,
++    )
++
++    with caplog.at_level(
++        logging.ERROR,
++        logger="trading_assistant.startup",
++    ):
++        with pytest.raises(RuntimeError) as raised:
++            serve.main()
++
++    assert raised.value is failure
++    assert control.close_calls == 1
++    messages = [
++        record.getMessage()
++        for record in caplog.records
++        if record.name == "trading_assistant.startup"
++    ]
++    assert messages == ["startup_failed role=app"]
++    assert secret not in caplog.text
++
++
+ def test_public_automatic_app_factory_refuses_before_ambient_or_authority_build(
+     monkeypatch,
+ ):
+@@ -128,6 +581,7 @@ def test_public_production_factory_consumes_receipt_before_app_creation(
+     monkeypatch,
+ ):
+     from trading_assistant import bootstrap
++    from trading_assistant import logging as runtime_logging
+     from trading_assistant.app import main as app_main
+ 
+     secrets = Secrets(app_api_token="plan2-public-factory-token")
+@@ -145,6 +599,11 @@ def test_public_production_factory_consumes_receipt_before_app_creation(
+         "_create_guarded_app",
+         lambda *, container: created.append(container) or "app",
+     )
++    monkeypatch.setattr(
++        runtime_logging,
++        "runtime_startup",
++        lambda *_args, **_kwargs: nullcontext(),
++    )
+ 
+     assert (
+         app_main.create_app(
+@@ -171,6 +630,7 @@ def test_explicit_unguarded_stack_requires_named_test_factory(
+     make_service,
+ ):
+     from trading_assistant.app import main as app_main
++    from tests.app_factory import create_app as create_fake_app
+ 
+     class Agent:
+         def chat(self, message, **context):
+@@ -188,7 +648,17 @@ def test_explicit_unguarded_stack_requires_named_test_factory(
+             planning=None,
+         )
+ 
+-    test_app = app_main.create_test_app(
++    with pytest.raises(
++        RuntimeError,
++        match="^test_container_required$",
++    ):
++        app_main.create_test_app(
++            service=service,
++            agent=Agent(),
++            api_token="plan2-explicit-test-token",
++            planning=None,
++        )
++    test_app = create_fake_app(
+         service=service,
+         agent=Agent(),
+         api_token="plan2-explicit-test-token",
+diff --git a/tests/test_plans_api.py b/tests/test_plans_api.py
+index f687368..3911697 100644
+--- a/tests/test_plans_api.py
++++ b/tests/test_plans_api.py
+@@ -6,8 +6,6 @@ import json
+ from pathlib import Path
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+-from types import SimpleNamespace
+-
+ import pytest
+ from fastapi.testclient import TestClient
+ from sqlalchemy import event
+@@ -16,11 +14,11 @@ from trading_assistant.analyst.models import (
+     EntryPlan, ExitPlan, ExitTarget, Invalidation, PlanAction, Scenario, TradePlan, Tranche,
+ )
+ from trading_assistant.analyst.planning import PlanningService
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import build_test_app_container, create_app
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.backtest.data import DataSource
+ from trading_assistant.backtest.synthetic import make_bars
+-from trading_assistant.broker.alpaca import AlpacaClock
++from trading_assistant.broker.base import BrokerDataIntegrityError
+ from trading_assistant.config import Secrets
+ from trading_assistant.db.models import (
+     AuditEvent,
+@@ -31,7 +29,7 @@ from trading_assistant.db.models import (
+     TradePlanRow,
+ )
+ from trading_assistant.dependencies import RequiredDependencyUnavailable
+-from trading_assistant.risk.clock import FakeClock
++from trading_assistant.risk.clock import FakeClock, MarketClockObservation
+ from trading_assistant.security.sensitive_fields import sensitive_store
+ from trading_assistant.signals.models import MarketFeatures, Regime
+ from tests.conftest import decrypt_test_sensitive
+@@ -75,51 +73,61 @@ def _install_equity_clock(service, clock) -> None:
+ 
+ 
+ def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
+-    client = SimpleNamespace(
+-        provider_marker=marker,
+-        get_clock=lambda: SimpleNamespace(is_open=True),
+-        get_calendar=lambda _request: [
+-            SimpleNamespace(
+-                date=CLOCK_NOW.date(),
+-                open=raw_session_open,
+-                close=datetime(2026, 7, 24, 16),
++    class MalformedCalendarFake(FakeClock):
++        provider_marker = marker
++
++        def observe(self, at):
++            raise BrokerDataIntegrityError(
++                "invalid Alpaca market calendar"
+             )
+-        ],
+-    )
+-    return AlpacaClock(client)
++
++    return MalformedCalendarFake(is_open=True)
+ 
+ 
+ def _race_alpaca_clock(later_current_state: bool):
+     calls = {"clock": 0, "calendar": 0}
+ 
+-    def get_clock():
+-        calls["clock"] += 1
+-        return SimpleNamespace(is_open=later_current_state)
+-
+-    def get_calendar(_request):
+-        calls["calendar"] += 1
+-        return [
+-            SimpleNamespace(
+-                date=datetime(2026, 7, 23).date(),
+-                open=datetime(2026, 7, 23, 9, 30),
+-                close=datetime(2026, 7, 23, 16),
+-            ),
+-            SimpleNamespace(
+-                date=datetime(2026, 7, 24).date(),
+-                open=datetime(2026, 7, 24, 9, 30),
+-                close=datetime(2026, 7, 24, 16),
+-            ),
+-        ]
+-
+-    return (
+-        AlpacaClock(
+-            SimpleNamespace(
+-                get_clock=get_clock,
+-                get_calendar=get_calendar,
++    class RaceCalendarFake(FakeClock):
++        def is_open(self, at=None):
++            if at is None:
++                calls["clock"] += 1
++                return later_current_state
++            return self.observe(at).is_open
++
++        def observe(self, at):
++            calls["calendar"] += 1
++            session_open = datetime(
++                2026,
++                7,
++                24,
++                13,
++                30,
++                tzinfo=timezone.utc,
++            )
++            session_close = datetime(
++                2026,
++                7,
++                24,
++                20,
++                0,
++                tzinfo=timezone.utc,
++            )
++            previous_open = datetime(
++                2026,
++                7,
++                23,
++                13,
++                30,
++                tzinfo=timezone.utc,
++            )
++            return MarketClockObservation(
++                is_open=session_open <= at < session_close,
++                most_recent_open=(
++                    session_open if at >= session_open else previous_open
++                ),
+             )
+-        ),
+-        calls,
+-    )
++
++    return RaceCalendarFake(is_open=later_current_state), calls
+ 
+ 
+ def _plan():
+@@ -158,10 +166,6 @@ def test_planning_startup_internal_failure_is_not_hidden(
+     monkeypatch,
+ ):
+     from trading_assistant.llm import factory as llm_factory
+-    from trading_assistant.llm.budget import (
+-        BudgetLimits,
+-        ProviderBudgetService,
+-    )
+ 
+     marker = "internal-planning-startup-secret"
+ 
+@@ -176,30 +180,14 @@ def test_planning_startup_internal_failure_is_not_hidden(
+     )
+     service = make_service()
+     secrets = Secrets(app_api_token=TOKEN)
+-    configured = service.config.security.provider_budget
+-    container = SimpleNamespace(
+-        config=service.config,
++    container = build_test_app_container(
++        service,
++        _StubAgent(),
+         secrets=secrets,
+-        service=service,
+-        provider_budget=ProviderBudgetService(
+-            service.session_factory,
+-            BudgetLimits(
+-                calls=configured.daily_calls,
+-                input_tokens=configured.daily_input_tokens,
+-                output_tokens=configured.daily_output_tokens,
+-                reservation_ttl_seconds=(
+-                    configured.reservation_ttl_seconds
+-                ),
+-            ),
+-            prices=configured.prices,
+-        ),
+     )
+ 
+     with pytest.raises(RuntimeError, match=marker):
+-        create_app(
+-            container=container,
+-            agent=_StubAgent(),
+-        )
++        create_app(container=container)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_reconciliation_service.py b/tests/test_reconciliation_service.py
+index a0d5981..f7d770a 100644
+--- a/tests/test_reconciliation_service.py
++++ b/tests/test_reconciliation_service.py
+@@ -316,7 +316,7 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_test_app as create_app
++    from tests.app_factory import create_app
+ 
+     service = make_service()
+     active = service.create_conditional_rule(
+@@ -418,7 +418,7 @@ def test_panic_local_enumeration_marks_partial_query_failure_unknown(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_test_app as create_app
++    from tests.app_factory import create_app
+ 
+     service = make_service()
+ 
+diff --git a/tests/test_route_policy.py b/tests/test_route_policy.py
+index 5184a69..c8f8a0c 100644
+--- a/tests/test_route_policy.py
++++ b/tests/test_route_policy.py
+@@ -18,7 +18,7 @@ from sqlalchemy import func, select
+ from sqlalchemy.orm import sessionmaker
+ 
+ import trading_assistant.app.limits as limits_module
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ import trading_assistant.app.policy as policy_module
+ from trading_assistant.app.policy import (
+     AuthLevel,
+diff --git a/tests/test_runtime_tenure.py b/tests/test_runtime_tenure.py
+index d95a28d..03cc6f0 100644
+--- a/tests/test_runtime_tenure.py
++++ b/tests/test_runtime_tenure.py
+@@ -531,7 +531,7 @@ def test_app_rejects_mutations_immediately_after_tenure_loss(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_test_app as create_app
++    from tests.app_factory import create_app
+ 
+     class StubAgent:
+         def chat(self, _message, **_context):
+diff --git a/tests/test_security.py b/tests/test_security.py
+index 6768b6f..9810c4f 100644
+--- a/tests/test_security.py
++++ b/tests/test_security.py
+@@ -18,7 +18,7 @@ import httpx
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.broker.models import Quote
+ 
+diff --git a/tests/test_security_headers.py b/tests/test_security_headers.py
+index 8bb8cbc..b8e6d7c 100644
+--- a/tests/test_security_headers.py
++++ b/tests/test_security_headers.py
+@@ -7,7 +7,7 @@ from pathlib import Path
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ 
+ TOKEN = "task-7-operator-secret"
+ 
+diff --git a/tests/test_security_posture.py b/tests/test_security_posture.py
+index 12d6d14..57375c4 100644
+--- a/tests/test_security_posture.py
++++ b/tests/test_security_posture.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from concurrent.futures import ThreadPoolExecutor
++from contextlib import nullcontext
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+ import importlib
+@@ -652,6 +653,11 @@ def test_launcher_preserves_one_keychain_startup_evidence_chain(
+     monkeypatch.setattr(serve, "run_startup_guard", guard_once)
+     monkeypatch.setattr(serve, "_build_guarded_container", build_once)
+     monkeypatch.setattr(serve, "_create_guarded_app", create_once)
++    monkeypatch.setattr(
++        serve,
++        "runtime_startup",
++        lambda *_args, **_kwargs: nullcontext(),
++    )
+     monkeypatch.setattr(
+         serve,
+         "start_app_control",
+diff --git a/tests/test_submission_barrier.py b/tests/test_submission_barrier.py
+index 7d61884..d9338e5 100644
+--- a/tests/test_submission_barrier.py
++++ b/tests/test_submission_barrier.py
+@@ -706,9 +706,7 @@ def _position_reconciliation_process(
+         if entrypoint == "http":
+             from fastapi.testclient import TestClient
+ 
+-            from trading_assistant.app.main import (
+-                create_test_app as create_app,
+-            )
++            from tests.app_factory import create_app
+ 
+             client = TestClient(
+                 create_app(
+diff --git a/tests/test_task9_round2.py b/tests/test_task9_round2.py
+index df2e23f..ba70fbb 100644
+--- a/tests/test_task9_round2.py
++++ b/tests/test_task9_round2.py
+@@ -13,7 +13,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.config import BrokerKind, Secrets
+ from trading_assistant.db.migrate import upgrade
+@@ -88,10 +88,17 @@ def test_create_app_complete_explicit_injection_never_reads_ambient_secrets(
+         bind_host="127.0.0.1",
+     )
+ 
+-    assert app.state.container is None
++    from trading_assistant import bootstrap
++
++    assert bootstrap._is_test_application_container(
++        app.state.container
++    )
+     assert app.state.trading_service is service
+     assert app.state.agent is agent
+-    assert app.state.runtime_secrets is None
++    assert (
++        app.state.runtime_secrets.app_api_token.get_secret_value()
++        == "complete-explicit-token"
++    )
+ 
+ 
+ def test_create_app_outside_container_requires_shared_container_for_auto_planning(
+@@ -977,6 +984,7 @@ def test_public_production_container_rejects_non_alpaca_broker(
+         build_container(
+             app_config,
+             _migrated_secrets(tmp_path),
++            runtime_role="daemon",
+         )
+ 
+ 
+diff --git a/tests/test_transport_boundary.py b/tests/test_transport_boundary.py
+index 5696eec..a341874 100644
+--- a/tests/test_transport_boundary.py
++++ b/tests/test_transport_boundary.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from contextlib import nullcontext
+ import ipaddress
+ import os
+ from datetime import datetime, timedelta, timezone
+@@ -22,7 +23,7 @@ from cryptography.x509.verification import (
+ )
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_test_app as create_app
++from tests.app_factory import create_app
+ from trading_assistant.db.models import (
+     AuditEvent,
+     AuthSession,
+@@ -92,6 +93,11 @@ def _patch_fake_launcher_composition(monkeypatch, serve, app) -> None:
+         "load_role_secrets",
+         lambda *_args, **_kwargs: secrets,
+     )
++    monkeypatch.setattr(
++        serve,
++        "runtime_startup",
++        lambda *_args, **_kwargs: nullcontext(),
++    )
+ 
+     def run_guard(*, config, secrets: object, secret_loaded_at, **_kwargs):
+         return posture._issue_startup_guard_receipt(

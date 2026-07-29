@@ -570,3 +570,50 @@ and Composio-disabled pending provider-side rotation. Verification used only
 temporary databases, fake providers, and local fixtures; it did not start a
 service, access real credentials or the ignored runtime database, make an
 external call, push, trade, reconcile, notify, or reset a breaker.
+
+## Final Plan 2 construction-boundary correction
+
+This correction supersedes the integration package's incomplete claim that
+the public production and explicit test construction boundaries were fully
+closed. The production factory required a receipt, but public
+`build_container` still exposed an unguarded app path and `create_test_app`
+still accepted arbitrary explicitly injected production-capable components.
+
+- [x] Record exact initial RED:
+  `6 failed in 4.79s`.
+- [x] Record conservative follow-up RED for production broker, nested
+  production clock, canonical launcher lifecycle, unmarked composition,
+  wrapped production broker, and post-issuance capability mutation:
+  six separate `1 failed` results.
+- [x] Remove ambient/default public container construction. Require explicit
+  config, secrets, and role; require and consume the canonical one-shot
+  receipt for role `app`.
+- [x] Restrict `create_test_app` to the opaque composition issued by
+  `build_test_container` after fake broker/clock validation, and revalidate
+  nested capabilities at use.
+- [x] Wrap automatic and canonical launcher app construction in
+  `runtime_startup("app", ...)`; prove stable redacted failure markers,
+  original exception identity, and exact cleanup.
+- [x] Correct Phase 7: promotion is evaluation-only, shared changes apply to
+  backtest/paper runtime, and this release rejects live mode.
+- [x] Final focused construction/lifecycle proof:
+  `34 passed, 1 warning in 1.86s`.
+- [x] Static-fixture proof:
+  `304 passed in 92.68s`; safety-drill proof:
+  `81 passed, 1 warning in 19.33s`.
+- [x] Preserve the affected-matrix fixture correction:
+  initial `1 failed, 1228 passed, 1 warning in 209.83s`; exact corrected node
+  `1 passed in 1.01s`; final matrix
+  `1229 passed, 1 warning in 209.66s`.
+- [x] Repository static gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3712 passed, 1 skipped, 1 warning in 608.07s`; pytest exited normally.
+- [x] Commit implementation/tests/spec as
+  `5b28a24d57b3b38b5cbc5bba0f153db7774b98f9`; package bounded diff
+  `review-a830889..5b28a24.diff` and coherent closure evidence separately.
+
+No production service, real Keychain/credential, ignored runtime database,
+network, broker/provider/notifier/integration call, trading action,
+reconciliation write, notification, breaker reset, Plan 3 work, or push
+occurred.

@@ -2141,6 +2141,45 @@ the capability is removed rather than authorized under another role.
   `b1e2016..5d34837`, coherent brief/report/progress/plan evidence, prior
   supersession notice, and review package in a separate evidence-only commit.
 
+### Final Plan 2 construction-boundary correction
+
+This correction supersedes the integration package's incomplete conclusion
+that public and test-only app construction were fully sealed.
+
+- [x] Verify all three findings against base
+  `a8308895799ff8393832b0ee4fe2027887325667`.
+- [x] Record exact initial RED:
+  `6 failed in 4.79s`, followed by six stricter one-node probes that each
+  reported `1 failed`.
+- [x] Remove ambient/default `build_container` construction. Require explicit
+  config, secrets, and runtime role; require and consume the canonical
+  one-shot receipt before app authority construction.
+- [x] Make HTTP test construction accept only the opaque fake composition
+  issued by `build_test_container`. Reject ordinary production containers,
+  production/wrapped brokers, provider clocks, nested provider clocks, and
+  post-issuance capability replacement.
+- [x] Restore `runtime_startup("app", ...)` around automatic and canonical
+  launcher construction. Prove stable redacted pre-/post-build failure
+  markers, original exception identity, and exact cleanup.
+- [x] Correct Phase 7 wording: promotion is evaluation-only, changes apply to
+  backtesting/paper runtime, and this release rejects live mode.
+- [x] Final focused construction/lifecycle proof:
+  `34 passed, 1 warning in 1.86s`; static-fixture proof:
+  `304 passed in 92.68s`; safety-drill proof:
+  `81 passed, 1 warning in 19.33s`.
+- [x] Preserve the affected-matrix fixture correction:
+  initial `1 failed, 1228 passed, 1 warning in 209.83s`; exact node
+  `1 passed in 1.01s`; final matrix
+  `1229 passed, 1 warning in 209.66s`.
+- [x] Repository static gate:
+  `release static checks: PASS`; compileall and `git diff --check` passed.
+- [x] Run exactly one no-argument full suite:
+  `3712 passed, 1 skipped, 1 warning in 608.07s`; pytest exited normally.
+- [x] Commit implementation/tests/spec as
+  `5b28a24d57b3b38b5cbc5bba0f153db7774b98f9`; package bounded diff
+  `a830889..5b28a24`, coherent brief/report/progress/plan evidence, and review
+  supersession in a separate evidence-only commit.
+
 ---
 
 ## Plan 2 completion checkpoint

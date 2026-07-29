@@ -1313,3 +1313,127 @@ brokers, and hermetic local fixtures only. It did not start app/daemon/MCP,
 access the ignored runtime database or real credentials/Keychain, make a
 network/broker/provider/notifier/integration call, trade, reconcile, notify,
 reset a breaker, or push.
+
+# Final Plan 2 Construction-Boundary Closure
+
+## Supersession and verified findings
+
+This closure supersedes only the Whole-Plan-2 integration package's
+construction-boundary conclusion. Its role-identity, excess-news-authority,
+paper-only, and live-rejection conclusions remain valid.
+
+The follow-up review was correct:
+
+1. The public `build_container` API still defaulted configuration and role,
+   allowing app authority to be composed without the canonical receipt.
+2. `create_test_app` distinguished ambient from explicit injection but did
+   not distinguish fake-only components from production-capable broker,
+   service, clock, or ordinary container objects.
+3. App pre-build failures were outside `runtime_startup("app", ...)`, so the
+   canonical value-free `startup_failed` lifecycle marker was absent.
+4. Phase 7 still described promotion as a manual configuration change and
+   used live-path wording inconsistent with this release's unconditional live
+   rejection.
+
+## Implemented boundary
+
+`build_container` now requires explicit config, explicit role-scoped secrets,
+and an explicit runtime role. Role `app` additionally requires the canonical
+config-, secrets-, role-, and launch-bound receipt and consumes it through the
+guarded path before authority construction. A missing receipt fails with a
+stable code; a receipt passed to a non-app role is rejected; receipt reuse
+retains the existing one-shot failure.
+
+`build_test_container` is the sole issuer for the opaque HTTP test
+composition. Issuance requires an explicit fake agent and validates the
+broker, primary clock, and every nested asset clock. `create_test_app`
+accepts only that marked composition and revalidates it at use, so an ordinary
+production container, provider-capable broker or clock, wrapper around a
+production broker, or post-issuance replacement fails before route
+construction. Existing non-HTTP maintenance/drill test composition remains
+unmarked and cannot be passed to the HTTP test factory.
+
+Both the public automatic app factory and `ops.serve` now wrap guarded app
+construction in `runtime_startup("app", secrets)`. Pre-build and post-build
+failures emit only `startup_failed role=app`; exception identity is retained,
+and runtime-tenure/control cleanup remains exact.
+
+Phase 7 now states that crypto changes apply only to shared
+backtest/paper-runtime architecture, promotion is an evaluation label rather
+than a live configuration path, and this release rejects live mode.
+
+## TDD and verification evidence
+
+The exact initial RED selection reported:
+
+```text
+6 failed in 4.79s
+```
+
+Six stricter follow-up probes each reported `1 failed`: production broker
+capability, nested provider clock, canonical launcher pre-build marker,
+unmarked no-agent composition, wrapped production broker, and post-issuance
+capability mutation.
+
+Final focused evidence:
+
+```text
+Construction/lifecycle file:
+34 passed, 1 warning in 1.86s
+
+Static fixture file:
+304 passed in 92.68s
+
+Safety-drill file:
+81 passed, 1 warning in 19.33s
+```
+
+The first complete affected matrix surfaced one legacy
+planning-startup-exception test that passed an unmarked `SimpleNamespace` and
+was therefore blocked before its intended injected failure:
+
+```text
+1 failed, 1228 passed, 1 warning in 209.83s
+```
+
+The test now obtains its fake stack through the canonical issuer. Its exact
+rerun passed `1 passed in 1.01s`, and the final matrix passed:
+
+```text
+1229 passed, 1 warning in 209.66s
+```
+
+Release verification:
+
+```text
+release static checks: PASS
+compileall: PASS
+git diff --check: PASS
+uv run pytest:
+3712 passed, 1 skipped, 1 warning in 608.07s
+```
+
+The no-argument suite was the only full-suite run for this correction and
+started only after all focused, affected, static, compile, and diff gates were
+green. Pytest exited normally. The warning is the existing third-party
+`websockets.legacy` deprecation warning.
+
+## Review package and hard limits
+
+- Base: `a8308895799ff8393832b0ee4fe2027887325667`
+- Implementation:
+  `5b28a24d57b3b38b5cbc5bba0f153db7774b98f9`
+- Bounded diff:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/review-a830889..5b28a24.diff`
+- Review package:
+  `.superpowers/sdd/2026-07-27-secrets-model-trust/task-11-review-package-plan2-construction-boundary.md`
+
+The release remains paper-only and manually approved. General chat remains
+read-only; immutable drafts require an explicit signed queue action and
+separate human approval. Composio remains disabled pending provider-side
+rotation, no webhook exists, and no profit guarantee is made.
+
+Verification used temporary databases, explicit fake brokers/clocks/agents,
+and local fixtures only. It did not start app/daemon/MCP, access the ignored
+runtime database or real Keychain/credentials, make external calls, push,
+trade, reconcile, notify, or reset a breaker.
