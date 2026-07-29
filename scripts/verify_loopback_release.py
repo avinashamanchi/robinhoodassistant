@@ -32,6 +32,7 @@ NETWORK_GUARD_PATH = Path(__file__).resolve().with_name(
 )
 EXPECTED_MIGRATION_HEAD = "20260729_0017"
 TRUSTED_ANCESTRY_ANCHOR = "4807cc0dc9dd20f21cf174e81034fea656162e3d"
+CI_VERIFIER_BIN = Path("/opt/trading-assistant-verifier/bin")
 _MAX_CAPTURE_CHARS = 32_768
 _MAX_CAPTURE_BYTES = 32_768
 _MAX_OUTPUT_FILE_BYTES = 64 * 1024 * 1024
@@ -610,6 +611,7 @@ def _tool_path_is_trusted(name: str, path: Path) -> bool:
             Path("/opt/homebrew/Cellar/node"),
             Path("/home/linuxbrew/.linuxbrew/Cellar/node"),
             Path("/opt/hostedtoolcache/node"),
+            CI_VERIFIER_BIN,
         )
     elif name == "uv":
         roots = (
@@ -620,6 +622,7 @@ def _tool_path_is_trusted(name: str, path: Path) -> bool:
             Path("/opt/hostedtoolcache/uv"),
             account_home / ".local" / "bin",
             account_home / ".local" / "share" / "uv",
+            CI_VERIFIER_BIN,
         )
     else:
         return False

@@ -4413,34 +4413,40 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
                 '--no-project --no-config --resolve-links 3.11.15)"'
             ),
             (
+                "sudo install -d -o root -g root -m 0555 "
+                "/opt/trading-assistant-verifier/bin"
+            ),
+            (
                 "sudo install -o root -g root -m 0555 "
                 '"$uv_source" '
-                "/usr/local/bin/.trading-assistant-uv-stage"
+                "/opt/trading-assistant-verifier/bin/uv"
             ),
             (
                 "sudo install -o root -g root -m 0555 "
                 '"$node_source" '
-                "/usr/local/bin/.trading-assistant-node-stage"
+                "/opt/trading-assistant-verifier/bin/node"
             ),
+            'test ! -L /opt/trading-assistant-verifier/bin/uv',
+            'test ! -L /opt/trading-assistant-verifier/bin/node',
             (
-                "sudo mv -f -- /usr/local/bin/.trading-assistant-uv-stage "
-                "/usr/local/bin/uv"
-            ),
-            (
-                "sudo mv -f -- /usr/local/bin/.trading-assistant-node-stage "
-                "/usr/local/bin/node"
-            ),
-            'test ! -L /usr/local/bin/uv',
-            'test ! -L /usr/local/bin/node',
-            (
-                'test "$(stat -c \'%u:%g:%a\' /usr/local/bin/uv)" '
+                'test "$(stat -c \'%u:%g:%a\' '
+                '/opt/trading-assistant-verifier/bin)" '
                 '= "0:0:555"'
             ),
             (
-                'test "$(stat -c \'%u:%g:%a\' /usr/local/bin/node)" '
+                'test "$(stat -c \'%u:%g:%a\' '
+                '/opt/trading-assistant-verifier/bin/uv)" '
                 '= "0:0:555"'
             ),
-            'export PATH="/usr/local/bin:/usr/bin:/bin"',
+            (
+                'test "$(stat -c \'%u:%g:%a\' '
+                '/opt/trading-assistant-verifier/bin/node)" '
+                '= "0:0:555"'
+            ),
+            (
+                'export PATH="/opt/trading-assistant-verifier/bin:'
+                '/usr/bin:/bin"'
+            ),
             '"$verifier_python" -I -S scripts/verify_loopback_release.py',
         )
     )

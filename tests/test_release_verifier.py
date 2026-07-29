@@ -387,6 +387,9 @@ def test_repository_preflight_requires_the_pinned_anchor_to_be_an_ancestor(
 def test_release_verifier_has_only_the_exact_offline_commands():
     commands = ReleaseVerifier.default_commands()
 
+    assert verifier_module.CI_VERIFIER_BIN == Path(
+        "/opt/trading-assistant-verifier/bin"
+    )
     assert tuple((command.name, command.argv) for command in commands) == (
         (
             "compile",
