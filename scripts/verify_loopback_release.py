@@ -1647,7 +1647,11 @@ class ReleaseVerifier:
             "uv": str(toolchain.uv.path),
             "python": str(toolchain.python.path),
         }
-        return tuple(replacements.get(part, part) for part in command.argv)
+        executable, *arguments = command.argv
+        return (
+            replacements.get(executable, executable),
+            *arguments,
+        )
 
     def _candidate_state_error(
         self,

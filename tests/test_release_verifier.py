@@ -604,7 +604,7 @@ def test_injected_trusted_tools_are_recorded_before_ambient_path_changes(
     assert result.passed is True
     assert result.commit == expected_commit
     assert Path(runner.calls[0]["argv"][0]).is_absolute()
-    assert Path(runner.calls[0]["argv"][2]).is_absolute()
+    assert runner.calls[0]["argv"][2] == "python"
     payload = json.loads(
         (output_dir / "release-results.json").read_text(encoding="utf-8")
     )
