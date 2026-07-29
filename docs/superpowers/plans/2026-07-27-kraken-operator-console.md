@@ -475,33 +475,39 @@ git commit -m "feat(ui): render bounded security and candidate state"
 **Interfaces:**
 
 - Keeps existing screener/analyze/propose/approval/cancel API behavior.
-- Adds visible model-budget, untrusted-source, regime, earnings, correlation,
-  and evidence-boundary states.
+- Consumes the additive list/detail contract from `ac80f66`: list responses are
+  summary-only; detail responses contain raw persisted plan, deterministic
+  sizing, and explicit `evidence_availability`.
+- Uses `/security/posture` only to govern paid analyze/propose calls. Saved-plan
+  review/cancel and the deterministic screener remain available.
 
-- [ ] **Step 1: Add failing plans-page contract tests**
+- [x] **Step 1: Add failing plans-page contract tests**
 
 Require:
 
 - explicit `Research / paper-only` badge;
 - provider budget summary;
 - screener and analysis controls with reason labels;
-- selected plan detail with thesis, bull/bear, catalysts, risks,
-  uncertainties, regime, market context, relative strength, earnings, sizing,
-  invalidation, and source references;
-- separate `Proposed`, `Approved`, `Armed`, `Canceled`, and `Blocked` state copy;
+- summary rows limited to symbol, action, confidence, as-of/freshness, actual
+  persisted status, and paper-only state;
+- selected detail with persisted thesis, scenarios, cited concepts, opaque
+  source references, regime/earnings/correlation notes, entry/exit/invalidation,
+  deterministic sizing, and explicit unavailable-evidence labels;
+- actual server lifecycle status only; no synthesized `Armed` or `Blocked`
+  states;
 - plan approval dialog stating that it arms paper rules and does not prove
   profitability;
-- no “AI pick”, “winner”, “guaranteed”, or “live” copy.
+- no “AI pick”, “winner”, “guaranteed”, or ambiguous live copy.
 
-- [ ] **Step 2: Run and verify missing evidence hierarchy**
+- [x] **Step 2: Run and verify missing evidence hierarchy**
 
 ```bash
-uv run pytest tests/test_frontend_ui.py -k plans -v
+uv run pytest tests/test_frontend_ui.py tests/test_security.py -k "plans_page or plans_approval or plans_css or plan_budget or saved_plan_queue or plan_detail_renders" -v
 ```
 
-Expected: FAIL.
+Observed: 7 failed, 137 deselected.
 
-- [ ] **Step 3: Build the three-pane research layout**
+- [x] **Step 3: Build the three-pane research layout**
 
 Desktop:
 
@@ -517,34 +523,35 @@ plan queue
 selected evidence
 ```
 
-Rows show symbol, action, confidence, regime, freshness, status, and paper
-badge. Confidence is never color-coded green as a correctness claim.
+Rows show symbol, action, confidence, as-of/freshness, actual status, and paper
+badge. Regime context is named as detail-only; no regime enum is synthesized.
+Confidence is never color-coded green as a correctness claim.
 
-- [ ] **Step 4: Render structured evidence safely**
+- [x] **Step 4: Render structured evidence safely**
 
-Use definition lists and text nodes for all analyst content. Show
-`UntrustedSummary.injection_flags` as caution metadata. If sources are absent or
-the summary failed, render `External context unavailable`; do not retain a
-previous plan's sources.
+Use definition lists and text nodes for all analyst content. Availability
+markers render `Not recorded`; `references_only` renders opaque identifiers
+under `References only` without converting them into links or facts. A
+selection/fetch failure clears all prior detail and references.
 
 Provider budget denial disables paid analysis/proposal generation but keeps
 saved-plan review and cancellation available.
 
-- [ ] **Step 5: Preserve approval/cancellation safety**
+- [x] **Step 5: Preserve approval/cancellation safety**
 
 Approval keeps exact plan ID, symbol, action, operator reason, recent auth,
 idempotency, and server response. Cancellation remains separate. No card click
 may approve or cancel.
 
-- [ ] **Step 6: Run plans/security suites**
+- [x] **Step 6: Run plans/security suites**
 
 ```bash
-uv run pytest tests/test_frontend_ui.py tests/test_security.py tests/test_plans_api.py -k "plans or plan" -v
+uv run pytest tests/test_frontend_ui.py tests/test_security.py tests/test_security_headers.py tests/test_plans_api.py -v
 ```
 
-Expected: PASS.
+Observed: 193 passed.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/trading_assistant/app/static/plans.html src/trading_assistant/app/static/js/plans.js src/trading_assistant/app/static/css/console.css tests/test_frontend_ui.py tests/test_security.py
