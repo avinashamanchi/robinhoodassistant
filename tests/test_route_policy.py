@@ -201,6 +201,41 @@ def test_every_api_route_has_exact_policy(make_service):
     assert approval.mutation_operation == "order_approve"
 
 
+def test_rule_route_policies_use_guarded_target_scope(make_service):
+    app = create_app(
+        service=make_service(),
+        agent=_StubAgent(),
+        api_token="rule-route-policy-secret",
+        planning=None,
+    )
+    registry = app.state.route_policy_registry
+    rule_reads = [
+        policy
+        for policy in policy_module.ROUTE_POLICIES
+        if (policy.method, policy.path) == ("GET", "/rules")
+    ]
+    rule_cancels = [
+        policy
+        for policy in policy_module.ROUTE_POLICIES
+        if (policy.method, policy.path) == (
+            "POST",
+            "/rules/{rule_id}/cancel",
+        )
+    ]
+
+    assert len(rule_reads) == 1
+    assert len(rule_cancels) == 1
+    assert registry.get("GET", "/rules").auth is AuthLevel.SESSION
+    cancel = registry.get("POST", "/rules/{rule_id}/cancel")
+    assert cancel.auth is AuthLevel.CSRF
+    assert cancel.limit_name == "mutation"
+    assert cancel.requires_idempotency is True
+    assert cancel.audit_mutation is True
+    assert cancel.concurrency_scope == "target"
+    assert cancel.target_param == "rule_id"
+    assert cancel.mutation_operation == "rule_cancel"
+
+
 def test_candidate_queue_is_not_a_generic_mutation_interlock_operation(
     make_service,
 ):

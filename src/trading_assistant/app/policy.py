@@ -238,6 +238,7 @@ ROUTE_POLICIES = (
         lease_free_bounded_read=True,
     ),
     RoutePolicy("GET", "/pending", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/rules", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
         "GET",
         "/pending/{order_id}/confirmation",
@@ -302,6 +303,17 @@ ROUTE_POLICIES = (
         concurrency_scope="target",
         target_param="order_id",
         mutation_operation="order_cancel",
+    ),
+    RoutePolicy(
+        "POST",
+        "/rules/{rule_id}/cancel",
+        AuthLevel.CSRF,
+        "mutation",
+        requires_idempotency=True,
+        audit_mutation=True,
+        concurrency_scope="target",
+        target_param="rule_id",
+        mutation_operation="rule_cancel",
     ),
     RoutePolicy(
         "POST",
@@ -710,6 +722,8 @@ def _resource_material(
         "/orders/{order_id}/cancel",
     }:
         return f"order:{resolved.path_params.get('order_id', '')}"
+    if path == "/rules/{rule_id}/cancel":
+        return f"rule:{resolved.path_params.get('rule_id', '')}"
     if path in {
         "/plans/{plan_id}/approve",
         "/plans/{plan_id}/cancel",

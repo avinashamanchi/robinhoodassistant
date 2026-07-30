@@ -37,6 +37,7 @@ from trading_assistant.db.models import (
     RiskEvent,
     Rule,
     RuleGroup,
+    TradePlanRow,
     utcnow,
 )
 from trading_assistant.assets import AssetClass
@@ -254,6 +255,33 @@ def _propose(svc, notional="100"):
         reason="API test proposal setup",
         request_id="api-test-proposal",
     )["order_id"]
+
+
+def _create_rule(svc, *, plan_id: int | None = None):
+    if plan_id is not None:
+        with svc.session_factory() as session:
+            persist_sensitive(
+                session,
+                TradePlanRow(
+                    id=plan_id,
+                    symbol="AAPL",
+                    action="buy",
+                    status="approved",
+                    paper_only=True,
+                ),
+                {"plan_json": "{}", "sized_json": "{}"},
+            )
+            session.commit()
+    return svc.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:api-rule-setup",
+        reason="prepare API rule cancellation",
+        request_id=f"api-rule-setup-{plan_id or 'standalone'}",
+        group_key=(f"api-plan-rule-{plan_id}" if plan_id is not None else None),
+        plan_id=plan_id,
+    )
 
 
 def _unsafe_local_state(
@@ -661,6 +689,83 @@ def test_live_order_cancel_requires_reason_and_audits_identity(client):
     assert sync_audit.actor == audit.actor
     assert _plaintext(sync_audit, "reason") == _plaintext(audit, "reason")
     assert sync_audit.request_id == audit.request_id
+
+
+def test_rule_route_lists_authenticated_rules(client):
+    c, svc, _ = client
+    created = _create_rule(svc)
+
+    response = c.get("/rules")
+
+    assert response.status_code == 200
+    assert response.json() == {"rules": [created]}
+
+
+def test_rule_cancel_is_idempotent_and_never_submits_to_broker(client):
+    c, svc, _ = client
+    standalone = _create_rule(svc)
+    headers = {"Idempotency-Key": "rule-cancel-standalone"}
+
+    first = c.post(
+        f"/rules/{standalone['rule_id']}/cancel",
+        json={"reason": "operator canceled standing rule"},
+        headers=headers,
+    )
+    replay = c.post(
+        f"/rules/{standalone['rule_id']}/cancel",
+        json={"reason": "operator canceled standing rule"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert svc.broker.submit_calls == 0
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="rule.cancel", target_id=str(standalone["rule_id"]))
+            .one()
+        )
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "operator canceled standing rule"
+    assert audit.request_id == first.headers["X-Request-ID"]
+
+    terminal = c.post(
+        f"/rules/{standalone['rule_id']}/cancel",
+        json={"reason": "repeat terminal cancellation"},
+        headers={"Idempotency-Key": "rule-cancel-terminal"},
+    )
+    assert terminal.status_code == 409
+    assert terminal.json()["error"]["code"] == "rule_conflict"
+
+
+def test_rule_cancel_rejects_plan_owned_missing_and_blank_rules(client):
+    c, svc, _ = client
+    plan_owned = _create_rule(svc, plan_id=901)
+
+    blank = c.post(
+        f"/rules/{plan_owned['rule_id']}/cancel",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "rule-cancel-blank"},
+    )
+    plan_conflict = c.post(
+        f"/rules/{plan_owned['rule_id']}/cancel",
+        json={"reason": "plan rules require plan cancellation"},
+        headers={"Idempotency-Key": "rule-cancel-plan-owned"},
+    )
+    missing = c.post(
+        "/rules/999/cancel",
+        json={"reason": "reviewed missing rule"},
+        headers={"Idempotency-Key": "rule-cancel-missing"},
+    )
+
+    assert blank.status_code == 422
+    assert plan_conflict.status_code == 409
+    assert plan_conflict.json()["error"]["code"] == "rule_conflict"
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "rule_not_found"
+    assert svc.broker.submit_calls == 0
 
 
 @pytest.mark.parametrize(

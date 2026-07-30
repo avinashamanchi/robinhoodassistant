@@ -34,6 +34,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..broker.models import OrderStatus
+from ..db.models import AuditEvent
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
@@ -866,6 +867,12 @@ def _create_app(
     ):
         return {"pending": service.get_pending()}
 
+    @app.get("/rules")
+    def list_rules(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return {"rules": service.list_rules()}
+
     @app.get("/pending/{order_id}/confirmation")
     def pending_confirmation(
         order_id: int,
@@ -1050,6 +1057,53 @@ def _create_app(
                 "order_conflict",
                 409,
                 "Order cancellation could not be confirmed",
+            )
+        return result
+
+    @app.post("/rules/{rule_id}/cancel")
+    def cancel_rule(
+        rule_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        with service.session_factory() as session:
+            prior_success = session.scalar(
+                select(AuditEvent.id)
+                .where(
+                    AuditEvent.actor == principal.actor,
+                    AuditEvent.action == "http.rule_cancel",
+                    AuditEvent.target_type == "rule",
+                    AuditEvent.target_id == str(rule_id),
+                    AuditEvent.idempotency_key
+                    == request.state.idempotency_key,
+                    AuditEvent.result_code == "http_200",
+                )
+                .limit(1)
+            )
+        if prior_success is not None:
+            return {"rule_id": rule_id, "canceled": True}
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.rule_cancel",
+            "rule",
+            rule_id,
+        )
+        result = service.cancel_rule(
+            rule_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
+        )
+        if result.get("error") == "not found":
+            raise ApiError("rule_not_found", 404, "Rule not found")
+        if "error" in result:
+            raise ApiError(
+                "rule_conflict",
+                409,
+                "Rule cancellation is no longer current",
             )
         return result
 
