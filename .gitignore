@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+.local/
 
 # Python
 __pycache__/
@@ -24,6 +25,8 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+*.db.*.pre-migration.bak
+*.db.submission.lock*
 *.sqlite
 *.sqlite3
 
@@ -38,3 +41,8 @@ htmlcov/
 
 # Runtime logs
 logs/
+runtime/
+
+# Local brainstorming mockups and browser-session state
+.superpowers/
+.worktrees/

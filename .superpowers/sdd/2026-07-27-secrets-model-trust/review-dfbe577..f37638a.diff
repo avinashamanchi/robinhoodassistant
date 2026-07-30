@@ -1,0 +1,2426 @@
+diff --git a/src/trading_assistant/ops/backup.py b/src/trading_assistant/ops/backup.py
+index ca61727eb5056dcdb0e4bc372412a14e3389d097..7e934f164104781a5b4e2a4950c762b0ee3409d7 100644
+--- a/src/trading_assistant/ops/backup.py
++++ b/src/trading_assistant/ops/backup.py
+@@ -19 +18,0 @@ import struct
+-import tempfile
+@@ -36,0 +36,26 @@ from ..security.secrets import (
++from .backup_transaction import (
++    BACKUP_CHUNK_BYTES as _CHUNK_BYTES,
++    ENCRYPTED_NAME as _ENCRYPTED_NAME,
++    SNAPSHOT_NAME as _SNAPSHOT_NAME,
++    TRANSACTION_DIRECTORY as _TRANSACTION_DIRECTORY,
++    VERIFICATION_NAME as _VERIFICATION_NAME,
++    BackupTransaction as _BackupTransaction,
++    EncryptedBackupError,
++    acquire_bounded_lock as _acquire_bounded_lock,
++    close_backup_transaction as _close_backup_transaction,
++    create_backup_transaction as _create_backup_transaction,
++    create_transaction_member as _create_transaction_member,
++    decode_checksummed_record as _decode_checksummed_record,
++    encode_checksummed_record as _encode_checksummed_record,
++    fsync_and_hash_transaction_artifact as _fsync_and_hash_transaction_artifact,
++    hash_artifact_descriptor as _hash_artifact_descriptor,
++    hash_transaction_member as _hash_transaction_member,
++    open_transaction_member as _open_transaction_member,
++    positive_record_integer as _positive_record_integer,
++    pread_exact as _pread_exact,
++    pwrite_all as _pwrite_all,
++    recover_backup_transaction as _recover_backup_transaction,
++    retry_flock as _retry_flock,
++    retry_fsync as _retry_fsync,
++    validate_backup_transaction as _validate_backup_transaction,
++)
+@@ -49 +73,0 @@ _TAG_BYTES = 16
+-_CHUNK_BYTES = 1_048_576
+@@ -60 +83,0 @@ _COMMIT_STATE_BYTES = 1024
+-_COMMIT_STATE_DIGEST_BYTES = hashlib.sha256().digest_size
+@@ -68,2 +90,0 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+-_STATE_LOCK_TIMEOUT_SECONDS = 0.25
+-_STATE_LOCK_RETRY_SECONDS = 0.005
+@@ -77,8 +97,0 @@ _ORPHAN_RECOVERY_TTL_SECONDS = 86_400
+-class EncryptedBackupError(RuntimeError):
+-    """Stable, content-free failure from encrypted backup handling."""
+-
+-    def __init__(self, stable_code: str) -> None:
+-        self.stable_code = stable_code
+-        super().__init__(stable_code)
+-
+-
+@@ -192,8 +204,0 @@ def _fsync_directory(path: Path) -> None:
+-def _unlink_private_temp(path: Path | None) -> None:
+-    if path is None:
+-        return
+-    path.unlink(missing_ok=True)
+-    path.with_name(f"{path.name}-wal").unlink(missing_ok=True)
+-    path.with_name(f"{path.name}-shm").unlink(missing_ok=True)
+-
+-
+@@ -225,18 +230,5 @@ def _encode_commit_state(state: _ArtifactCommitState) -> bytes:
+-    payload = _canonical_json(_state_payload(state))
+-    body_size = _COMMIT_STATE_BYTES - _COMMIT_STATE_DIGEST_BYTES
+-    prefix = (
+-        _COMMIT_STATE_MAGIC
+-        + struct.pack(">I", len(payload))
+-        + payload
+-    )
+-    if len(prefix) > body_size:
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    body = prefix + (b"\x00" * (body_size - len(prefix)))
+-    return body + hashlib.sha256(body).digest()
+-
+-
+-def _positive_record_integer(value: object) -> bool:
+-    return (
+-        isinstance(value, int)
+-        and not isinstance(value, bool)
+-        and value > 0
++    return _encode_checksummed_record(
++        _COMMIT_STATE_MAGIC,
++        _state_payload(state),
++        record_bytes=_COMMIT_STATE_BYTES,
++        invalid_code="encrypted_backup_state_invalid",
+@@ -247,28 +239,6 @@ def _decode_commit_state(encoded: bytes) -> _ArtifactCommitState:
+-    if len(encoded) != _COMMIT_STATE_BYTES:
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    body = encoded[:-_COMMIT_STATE_DIGEST_BYTES]
+-    digest = encoded[-_COMMIT_STATE_DIGEST_BYTES:]
+-    if not hmac.compare_digest(hashlib.sha256(body).digest(), digest):
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    if not body.startswith(_COMMIT_STATE_MAGIC):
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    length_start = len(_COMMIT_STATE_MAGIC)
+-    length_end = length_start + 4
+-    payload_length = struct.unpack(
+-        ">I",
+-        body[length_start:length_end],
+-    )[0]
+-    payload_end = length_end + payload_length
+-    if (
+-        payload_length <= 0
+-        or payload_end > len(body)
+-        or any(body[payload_end:])
+-    ):
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    encoded_payload = body[length_end:payload_end]
+-    try:
+-        payload = json.loads(encoded_payload.decode("utf-8"))
+-    except (UnicodeDecodeError, json.JSONDecodeError):
+-        raise EncryptedBackupError(
+-            "encrypted_backup_state_invalid"
+-        ) from None
++    payload = _decode_checksummed_record(
++        encoded,
++        _COMMIT_STATE_MAGIC,
++        record_bytes=_COMMIT_STATE_BYTES,
++        invalid_code="encrypted_backup_state_invalid",
++    )
+@@ -276,3 +246 @@ def _decode_commit_state(encoded: bytes) -> _ArtifactCommitState:
+-        not isinstance(payload, dict)
+-        or _canonical_json(payload) != encoded_payload
+-        or set(payload)
++        set(payload)
+@@ -336,2 +303,0 @@ def _decode_commit_state(encoded: bytes) -> _ArtifactCommitState:
+-
+-
+@@ -350,89 +315,0 @@ def _state_open_flags(*, writable: bool) -> int:
+-def _retry_flock(descriptor: int, operation: int) -> None:
+-    while True:
+-        try:
+-            fcntl.flock(descriptor, operation)
+-            return
+-        except InterruptedError:
+-            continue
+-
+-
+-def _acquire_state_lock(
+-    descriptor: int,
+-    operation: int,
+-    *,
+-    timeout_seconds: float = _STATE_LOCK_TIMEOUT_SECONDS,
+-) -> None:
+-    deadline = time.monotonic() + timeout_seconds
+-    while True:
+-        try:
+-            fcntl.flock(
+-                descriptor,
+-                operation | fcntl.LOCK_NB,
+-            )
+-            return
+-        except InterruptedError:
+-            continue
+-        except BlockingIOError:
+-            remaining = deadline - time.monotonic()
+-            if remaining <= 0:
+-                raise EncryptedBackupError(
+-                    "encrypted_backup_state_busy"
+-                ) from None
+-            time.sleep(min(_STATE_LOCK_RETRY_SECONDS, remaining))
+-        except OSError:
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_unavailable"
+-            ) from None
+-
+-
+-def _retry_fsync(descriptor: int) -> None:
+-    while True:
+-        try:
+-            os.fsync(descriptor)
+-            return
+-        except InterruptedError:
+-            continue
+-
+-
+-def _pread_retry(descriptor: int, length: int, offset: int) -> bytes:
+-    while True:
+-        try:
+-            return os.pread(descriptor, length, offset)
+-        except InterruptedError:
+-            continue
+-
+-
+-def _pread_exact(descriptor: int, length: int, offset: int) -> bytes:
+-    result = bytearray()
+-    while len(result) < length:
+-        chunk = _pread_retry(
+-            descriptor,
+-            length - len(result),
+-            offset + len(result),
+-        )
+-        if not chunk:
+-            break
+-        result.extend(chunk)
+-    return bytes(result)
+-
+-
+-def _pwrite_all(descriptor: int, encoded: bytes) -> None:
+-    offset = 0
+-    while offset < len(encoded):
+-        while True:
+-            try:
+-                written = os.pwrite(
+-                    descriptor,
+-                    encoded[offset:],
+-                    offset,
+-                )
+-                break
+-            except InterruptedError:
+-                continue
+-        if written <= 0:
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_write_failed"
+-            )
+-        offset += written
+-
+-
+@@ -506 +383 @@ def _locked_state_descriptor(
+-        _acquire_state_lock(descriptor, fcntl.LOCK_SH)
++        _acquire_bounded_lock(descriptor, fcntl.LOCK_SH)
+@@ -605,37 +481,0 @@ def _matching_artifact_stat(
+-def _hash_artifact_descriptor(
+-    descriptor: int,
+-    *,
+-    expected_size: int,
+-) -> str:
+-    initial_stat = os.fstat(descriptor)
+-    if not (
+-        stat.S_ISREG(initial_stat.st_mode)
+-        and initial_stat.st_size == expected_size
+-    ):
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    digest = hashlib.sha256()
+-    offset = 0
+-    while offset < expected_size:
+-        chunk = _pread_retry(
+-            descriptor,
+-            min(_CHUNK_BYTES, expected_size - offset),
+-            offset,
+-        )
+-        if not chunk:
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_invalid"
+-            )
+-        digest.update(chunk)
+-        offset += len(chunk)
+-    final_stat = os.fstat(descriptor)
+-    if not (
+-        initial_stat.st_dev == final_stat.st_dev
+-        and initial_stat.st_ino == final_stat.st_ino
+-        and initial_stat.st_size == final_stat.st_size
+-        and initial_stat.st_mtime_ns == final_stat.st_mtime_ns
+-        and initial_stat.st_ctime_ns == final_stat.st_ctime_ns
+-    ):
+-        raise EncryptedBackupError("encrypted_backup_state_invalid")
+-    return digest.hexdigest()
+-
+-
+@@ -828 +668 @@ def _create_pending_commit_state(
+-    anchor_stat: os.stat_result,
++    artifact_stat: os.stat_result,
+@@ -843 +683 @@ def _create_pending_commit_state(
+-        _acquire_state_lock(descriptor, fcntl.LOCK_EX)
++        _acquire_bounded_lock(descriptor, fcntl.LOCK_EX)
+@@ -848 +688 @@ def _create_pending_commit_state(
+-            stat.S_ISREG(anchor_stat.st_mode)
++            stat.S_ISREG(artifact_stat.st_mode)
+@@ -862,3 +702,3 @@ def _create_pending_commit_state(
+-            artifact_device=anchor_stat.st_dev,
+-            artifact_inode=anchor_stat.st_ino,
+-            artifact_size=anchor_stat.st_size,
++            artifact_device=artifact_stat.st_dev,
++            artifact_inode=artifact_stat.st_ino,
++            artifact_size=artifact_stat.st_size,
+@@ -953 +793 @@ def _transition_commit_state(
+-        _acquire_state_lock(state_descriptor, fcntl.LOCK_EX)
++        _acquire_bounded_lock(state_descriptor, fcntl.LOCK_EX)
+@@ -964 +803,0 @@ def _transition_commit_state(
+-        artifact_descriptor = _open_matching_artifact(target, current)
+@@ -968,0 +808,3 @@ def _transition_commit_state(
++        # This is the last artifact operation. The fixed-state write, fsync,
++        # and same-descriptor readback below are the irrevocable commit point.
++        artifact_descriptor = _open_matching_artifact(target, current)
+@@ -971,6 +812,0 @@ def _transition_commit_state(
+-            _verify_matching_artifact(
+-                target,
+-                transitioned,
+-                artifact_descriptor,
+-            )
+-            prove_state(transitioned)
+@@ -980,6 +815,0 @@ def _transition_commit_state(
+-                _verify_matching_artifact(
+-                    target,
+-                    expected,
+-                    artifact_descriptor,
+-                )
+-                prove_state(expected)
+@@ -998 +827,0 @@ def _transition_commit_state(
+-                    prove_state(fail_closed)
+@@ -1025,0 +855,3 @@ def _transition_commit_state(
++    # A proven transition is final. Unlock/close still release kernel
++    # resources even when their wrappers report an error, so descriptor
++    # cleanup cannot reverse or obscure the durable result.
+@@ -1064,71 +895,0 @@ def _unlink_matching_regular_file(
+-def _private_temp(directory: Path, prefix: str) -> Path:
+-    descriptor, name = tempfile.mkstemp(prefix=prefix, dir=directory)
+-    try:
+-        os.fchmod(descriptor, 0o600)
+-    finally:
+-        os.close(descriptor)
+-    return Path(name)
+-
+-
+-def _hash_file(
+-    path: Path,
+-    *,
+-    ensure_maintenance: Callable[[], None] | None = None,
+-) -> str:
+-    digest = hashlib.sha256()
+-    with path.open("rb", buffering=0) as handle:
+-        while True:
+-            if ensure_maintenance is not None:
+-                ensure_maintenance()
+-            chunk = handle.read(_CHUNK_BYTES)
+-            if not chunk:
+-                break
+-            digest.update(chunk)
+-    return digest.hexdigest()
+-
+-
+-def _fsync_and_hash_anchor(
+-    anchor: Path,
+-) -> tuple[os.stat_result, str]:
+-    descriptor = os.open(
+-        anchor,
+-        os.O_RDONLY
+-        | getattr(os, "O_NOFOLLOW", 0)
+-        | getattr(os, "O_NONBLOCK", 0),
+-    )
+-    try:
+-        descriptor_stat = os.fstat(descriptor)
+-        path_stat = anchor.lstat()
+-        if not (
+-            stat.S_ISREG(descriptor_stat.st_mode)
+-            and stat.S_ISREG(path_stat.st_mode)
+-            and descriptor_stat.st_dev == path_stat.st_dev
+-            and descriptor_stat.st_ino == path_stat.st_ino
+-        ):
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_invalid"
+-            )
+-        _retry_fsync(descriptor)
+-        artifact_sha256 = _hash_artifact_descriptor(
+-            descriptor,
+-            expected_size=descriptor_stat.st_size,
+-        )
+-        final_stat = os.fstat(descriptor)
+-        final_path_stat = anchor.lstat()
+-        if not (
+-            descriptor_stat.st_dev == final_stat.st_dev
+-            and descriptor_stat.st_ino == final_stat.st_ino
+-            and descriptor_stat.st_size == final_stat.st_size
+-            and descriptor_stat.st_mtime_ns == final_stat.st_mtime_ns
+-            and descriptor_stat.st_ctime_ns == final_stat.st_ctime_ns
+-            and final_stat.st_dev == final_path_stat.st_dev
+-            and final_stat.st_ino == final_path_stat.st_ino
+-        ):
+-            raise EncryptedBackupError(
+-                "encrypted_backup_state_invalid"
+-            )
+-        return final_stat, artifact_sha256
+-    finally:
+-        os.close(descriptor)
+-
+-
+@@ -1273,3 +1034,3 @@ def create_encrypted_database_backup(
+-    snapshot: Path | None = None
+-    encrypted_temp: Path | None = None
+-    verification: Path | None = None
++
++    transaction: _BackupTransaction | None = None
++    directory: Path | None = None
+@@ -1277,2 +1037,0 @@ def create_encrypted_database_backup(
+-    anchor: Path | None = None
+-    anchor_identity: tuple[int, int] | None = None
+@@ -1279,0 +1039 @@ def create_encrypted_database_backup(
++    receipt: EncryptedBackupReceipt | None = None
+@@ -1292,0 +1053,4 @@ def create_encrypted_database_backup(
++        # The checksummed, inode-bound manifest is durable and exclusively
++        # locked before the first plaintext member can exist.
++        transaction = _create_backup_transaction(directory)
++        hook("transaction_manifest_durable")
+@@ -1294 +1058,4 @@ def create_encrypted_database_backup(
+-        snapshot = _private_temp(directory, ".sensitive-snapshot-")
++        snapshot = _create_transaction_member(
++            transaction,
++            _SNAPSHOT_NAME,
++        )
+@@ -1310 +1077,7 @@ def create_encrypted_database_backup(
+-        os.chmod(snapshot, 0o600)
++        _validate_backup_transaction(transaction)
++        snapshot_descriptor = _open_transaction_member(
++            transaction,
++            _SNAPSHOT_NAME,
++            os.O_RDONLY,
++        )
++        os.close(snapshot_descriptor)
+@@ -1315,2 +1088,3 @@ def create_encrypted_database_backup(
+-        source_sha256 = _hash_file(
+-            snapshot,
++        source_sha256 = _hash_transaction_member(
++            transaction,
++            _SNAPSHOT_NAME,
+@@ -1334 +1108 @@ def create_encrypted_database_backup(
+-        encrypted_temp = _private_temp(directory, ".sensitive-encrypted-")
++        _create_transaction_member(transaction, _ENCRYPTED_NAME)
+@@ -1341,2 +1115,18 @@ def create_encrypted_database_backup(
+-            snapshot.open("rb", buffering=0) as plaintext,
+-            encrypted_temp.open("r+b", buffering=0) as ciphertext,
++            os.fdopen(
++                _open_transaction_member(
++                    transaction,
++                    _SNAPSHOT_NAME,
++                    os.O_RDONLY,
++                ),
++                "rb",
++                buffering=0,
++            ) as plaintext,
++            os.fdopen(
++                _open_transaction_member(
++                    transaction,
++                    _ENCRYPTED_NAME,
++                    os.O_RDWR,
++                ),
++                "r+b",
++                buffering=0,
++            ) as ciphertext,
+@@ -1357,0 +1148 @@ def create_encrypted_database_backup(
++        _validate_backup_transaction(transaction)
+@@ -1361 +1152,4 @@ def create_encrypted_database_backup(
+-        verification = _private_temp(directory, ".sensitive-verify-")
++        verification = _create_transaction_member(
++            transaction,
++            _VERIFICATION_NAME,
++        )
+@@ -1364,2 +1158,18 @@ def create_encrypted_database_backup(
+-            encrypted_temp.open("rb", buffering=0) as ciphertext,
+-            verification.open("r+b", buffering=0) as plaintext,
++            os.fdopen(
++                _open_transaction_member(
++                    transaction,
++                    _ENCRYPTED_NAME,
++                    os.O_RDONLY,
++                ),
++                "rb",
++                buffering=0,
++            ) as ciphertext,
++            os.fdopen(
++                _open_transaction_member(
++                    transaction,
++                    _VERIFICATION_NAME,
++                    os.O_RDWR,
++                ),
++                "r+b",
++                buffering=0,
++            ) as plaintext,
+@@ -1412,0 +1223 @@ def create_encrypted_database_backup(
++        _validate_backup_transaction(transaction)
+@@ -1448,0 +1260 @@ def create_encrypted_database_backup(
++        _validate_backup_transaction(transaction)
+@@ -1457,6 +1269,3 @@ def create_encrypted_database_backup(
+-            target.exists()
+-            or target.is_symlink()
+-            or anchor.exists()
+-            or anchor.is_symlink()
+-            or state_path.exists()
+-            or state_path.is_symlink()
++            _path_entry_exists(target)
++            or _path_entry_exists(anchor)
++            or _path_entry_exists(state_path)
+@@ -1466,20 +1275,3 @@ def create_encrypted_database_backup(
+-        # Plaintext cleanup and every maintenance callback complete before the
+-        # publication transaction. The hidden anchor and fixed-size state file
+-        # are made durable while the state is PENDING. A public target can then
+-        # be safely orphaned after an ambiguous link because official readers
+-        # require a valid, inode-bound COMMITTED state record.
+-        _unlink_private_temp(snapshot)
+-        snapshot = None
+-        _unlink_private_temp(verification)
+-        verification = None
+-        try:
+-            os.link(encrypted_temp, anchor, follow_symlinks=False)
+-        except FileExistsError:
+-            raise EncryptedBackupError("encrypted_backup_exists") from None
+-        anchor_stat, artifact_sha256 = _fsync_and_hash_anchor(anchor)
+-        anchor_identity = (anchor_stat.st_dev, anchor_stat.st_ino)
+-        _unlink_private_temp(encrypted_temp)
+-        encrypted_temp = None
+-        _fsync_directory(directory)
+-
+-        transaction_id = os.urandom(16).hex()
++        artifact_stat, artifact_sha256 = (
++            _fsync_and_hash_transaction_artifact(transaction)
++        )
+@@ -1489 +1281 @@ def create_encrypted_database_backup(
+-                anchor_stat,
++                artifact_stat,
+@@ -1491 +1283 @@ def create_encrypted_database_backup(
+-                transaction_id,
++                transaction.manifest.transaction_id,
+@@ -1495 +1287 @@ def create_encrypted_database_backup(
+-        _fsync_directory(directory)
++        _retry_fsync(transaction.destination_descriptor)
+@@ -1497,0 +1290,38 @@ def create_encrypted_database_backup(
++        try:
++            os.link(
++                _ENCRYPTED_NAME,
++                anchor.name,
++                src_dir_fd=transaction.directory_descriptor,
++                dst_dir_fd=transaction.destination_descriptor,
++                follow_symlinks=False,
++            )
++        except FileExistsError:
++            raise EncryptedBackupError("encrypted_backup_exists") from None
++        _retry_fsync(transaction.destination_descriptor)
++        hook("anchor_linked_pending")
++
++        try:
++            os.link(
++                anchor.name,
++                target.name,
++                src_dir_fd=transaction.destination_descriptor,
++                dst_dir_fd=transaction.destination_descriptor,
++                follow_symlinks=False,
++            )
++        except FileExistsError:
++            raise EncryptedBackupError("encrypted_backup_exists") from None
++        hook("target_linked_pending")
++        _retry_fsync(transaction.destination_descriptor)
++        hook("target_directory_fsynced")
++
++        observed_pending = _authoritative_state(target, "PENDING")
++        if observed_pending != pending_state:
++            raise EncryptedBackupError(
++                "encrypted_backup_state_invalid"
++            )
++
++        # All plaintext/ciphertext operation members and their manifest are
++        # removed and both directories fsynced before commit can begin.
++        _close_backup_transaction(transaction, remove=True)
++        transaction = None
++
+@@ -1513,13 +1342,0 @@ def create_encrypted_database_backup(
+-        try:
+-            os.link(anchor, target, follow_symlinks=False)
+-        except FileExistsError:
+-            raise EncryptedBackupError("encrypted_backup_exists") from None
+-        hook("target_linked_pending")
+-        _fsync_directory(directory)
+-        hook("target_directory_fsynced")
+-        _transition_commit_state(
+-            target,
+-            pending_state,
+-            "COMMITTED",
+-        )
+-        return receipt
+@@ -1528,5 +1345 @@ def create_encrypted_database_backup(
+-        for private_path in (
+-            snapshot,
+-            encrypted_temp,
+-            verification,
+-        ):
++        if transaction is not None:
+@@ -1534 +1347 @@ def create_encrypted_database_backup(
+-                _unlink_private_temp(private_path)
++                _close_backup_transaction(transaction, remove=True)
+@@ -1536,2 +1349 @@ def create_encrypted_database_backup(
+-                if cleanup_failure is None:
+-                    cleanup_failure = cleanup_exc
++                cleanup_failure = cleanup_exc
+@@ -1565,10 +1377,6 @@ def create_encrypted_database_backup(
+-        elif anchor is not None and anchor_identity is not None:
+-            try:
+-                _unlink_matching_regular_file(
+-                    anchor,
+-                    device=anchor_identity[0],
+-                    inode=anchor_identity[1],
+-                )
+-            except BaseException as cleanup_exc:
+-                if cleanup_failure is None:
+-                    cleanup_failure = cleanup_exc
++            if directory is not None:
++                try:
++                    _fsync_directory(directory)
++                except BaseException as cleanup_exc:
++                    if cleanup_failure is None:
++                        cleanup_failure = cleanup_exc
+@@ -1589,0 +1398,22 @@ def create_encrypted_database_backup(
++    if target is None or pending_state is None or receipt is None:
++        raise EncryptedBackupError("encrypted_backup_failed")
++    # No exception cleanup scope surrounds this final transition. All hooks,
++    # maintenance checks, receipt construction, artifact verification, and
++    # operation-directory cleanup have already completed.
++    try:
++        _transition_commit_state(
++            target,
++            pending_state,
++            "COMMITTED",
++        )
++    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
++        raise
++    except EncryptedBackupError:
++        raise
++    except BaseException:
++        # The transition proves any ambiguous durable COMMITTED write before
++        # returning or raising. This wrapper normalizes only a proven
++        # non-commit failure and deliberately performs no cleanup.
++        raise EncryptedBackupError("encrypted_backup_failed") from None
++    return receipt
++
+@@ -1617,10 +1446,0 @@ def _artifact_for_state_path(state_path: Path) -> Path | None:
+-def _artifact_for_anchor_path(anchor: Path) -> Path | None:
+-    name = anchor.name
+-    if not (name.startswith(".") and name.endswith(".pending")):
+-        return None
+-    artifact_name = name[1 : -len(".pending")]
+-    if _COMMITTED_NAME.fullmatch(artifact_name) is None:
+-        return None
+-    return anchor.with_name(artifact_name)
+-
+-
+@@ -1726 +1546 @@ def _recover_state_backed_orphan(
+-        _acquire_state_lock(state_descriptor, fcntl.LOCK_EX)
++        _acquire_bounded_lock(state_descriptor, fcntl.LOCK_EX)
+@@ -1813,62 +1632,0 @@ def _recover_state_backed_orphan(
+-def _recover_anchor_only_orphan(
+-    anchor: Path,
+-    *,
+-    cutoff: float,
+-    durable_directory: Path,
+-) -> None:
+-    artifact = _artifact_for_anchor_path(anchor)
+-    if artifact is None:
+-        return
+-    if _path_entry_exists(artifact) or _path_entry_exists(
+-        _commit_state_path(artifact)
+-    ):
+-        return
+-    descriptor: int | None = None
+-    try:
+-        descriptor = os.open(
+-            anchor,
+-            os.O_RDONLY
+-            | getattr(os, "O_NOFOLLOW", 0)
+-            | getattr(os, "O_NONBLOCK", 0),
+-        )
+-        descriptor_stat = os.fstat(descriptor)
+-        path_stat = anchor.lstat()
+-        if not (
+-            stat.S_ISREG(descriptor_stat.st_mode)
+-            and stat.S_ISREG(path_stat.st_mode)
+-            and descriptor_stat.st_dev == path_stat.st_dev
+-            and descriptor_stat.st_ino == path_stat.st_ino
+-            and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
+-            and descriptor_stat.st_mtime < cutoff
+-        ):
+-            return
+-        with os.fdopen(os.dup(descriptor), "rb") as handle:
+-            _parse_header_stream(handle)
+-        final_stat = os.fstat(descriptor)
+-        final_path_stat = anchor.lstat()
+-        if not (
+-            descriptor_stat.st_dev == final_stat.st_dev
+-            and descriptor_stat.st_ino == final_stat.st_ino
+-            and descriptor_stat.st_size == final_stat.st_size
+-            and descriptor_stat.st_mtime_ns == final_stat.st_mtime_ns
+-            and descriptor_stat.st_ctime_ns == final_stat.st_ctime_ns
+-            and final_stat.st_dev == final_path_stat.st_dev
+-            and final_stat.st_ino == final_path_stat.st_ino
+-        ):
+-            return
+-        _unlink_matching_regular_file(
+-            anchor,
+-            device=descriptor_stat.st_dev,
+-            inode=descriptor_stat.st_ino,
+-        )
+-        _fsync_directory(durable_directory)
+-    except (EncryptedBackupError, OSError):
+-        return
+-    finally:
+-        if descriptor is not None:
+-            try:
+-                os.close(descriptor)
+-            except OSError:
+-                pass
+-
+-
+@@ -1896,0 +1655,7 @@ def _recover_backup_orphans(
++    for candidate in candidates:
++        if _TRANSACTION_DIRECTORY.fullmatch(candidate.name) is not None:
++            _recover_backup_transaction(
++                durable_directory,
++                candidate.name,
++                cutoff=cutoff,
++            )
+@@ -1904,7 +1668,0 @@ def _recover_backup_orphans(
+-    for anchor in candidates:
+-        if _artifact_for_anchor_path(anchor) is not None:
+-            _recover_anchor_only_orphan(
+-                anchor,
+-                cutoff=cutoff,
+-                durable_directory=durable_directory,
+-            )
+diff --git a/src/trading_assistant/ops/backup_transaction.py b/src/trading_assistant/ops/backup_transaction.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d16d9b2e637874d4f433de9b9ac455e6881a5be
+--- /dev/null
++++ b/src/trading_assistant/ops/backup_transaction.py
+@@ -0,0 +1,914 @@
++"""Private crash-safe filesystem transaction support for encrypted backups."""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from dataclasses import dataclass
++import fcntl
++import hashlib
++import hmac
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import struct
++import time
++
++
++BACKUP_CHUNK_BYTES = 1_048_576
++TRANSACTION_PREFIX = ".backup-txn-"
++TRANSACTION_DIRECTORY = re.compile(
++    rf"{re.escape(TRANSACTION_PREFIX)}([0-9a-f]{{32}})"
++)
++TRANSACTION_MANIFEST_MAGIC = b"TA-BACKUP-TRANSACTION\x00"
++TRANSACTION_MANIFEST_VERSION = 1
++TRANSACTION_MANIFEST_BYTES = 512
++TRANSACTION_MANIFEST_NAME = "manifest"
++SNAPSHOT_NAME = "snapshot.sqlite3"
++VERIFICATION_NAME = "verification.sqlite3"
++ENCRYPTED_NAME = "encrypted.aesgcm"
++TRANSACTION_MEMBER_NAMES = frozenset(
++    {
++        TRANSACTION_MANIFEST_NAME,
++        SNAPSHOT_NAME,
++        f"{SNAPSHOT_NAME}-journal",
++        f"{SNAPSHOT_NAME}-shm",
++        f"{SNAPSHOT_NAME}-wal",
++        VERIFICATION_NAME,
++        f"{VERIFICATION_NAME}-journal",
++        f"{VERIFICATION_NAME}-shm",
++        f"{VERIFICATION_NAME}-wal",
++        ENCRYPTED_NAME,
++    }
++)
++_RECORD_DIGEST_BYTES = hashlib.sha256().digest_size
++_TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
++_LOCK_TIMEOUT_SECONDS = 0.25
++_LOCK_RETRY_SECONDS = 0.005
++
++
++class EncryptedBackupError(RuntimeError):
++    """Stable, content-free failure from encrypted backup handling."""
++
++    def __init__(self, stable_code: str) -> None:
++        self.stable_code = stable_code
++        super().__init__(stable_code)
++
++
++@dataclass(frozen=True)
++class _BackupTransactionManifest:
++    transaction_id: str
++    directory_name: str
++    directory_device: int
++    directory_inode: int
++
++
++@dataclass
++class BackupTransaction:
++    destination: Path
++    destination_descriptor: int
++    directory: Path
++    directory_descriptor: int
++    manifest_descriptor: int
++    manifest: _BackupTransactionManifest
++    manifest_locked: bool = True
++
++
++def _canonical_json(value: dict[str, object]) -> bytes:
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        separators=(",", ":"),
++        sort_keys=True,
++    ).encode("utf-8")
++
++
++def encode_checksummed_record(
++    magic: bytes,
++    payload: dict[str, object],
++    *,
++    record_bytes: int,
++    invalid_code: str,
++) -> bytes:
++    encoded_payload = _canonical_json(payload)
++    body_size = record_bytes - _RECORD_DIGEST_BYTES
++    prefix = magic + struct.pack(">I", len(encoded_payload)) + encoded_payload
++    if len(prefix) > body_size:
++        raise EncryptedBackupError(invalid_code)
++    body = prefix + (b"\x00" * (body_size - len(prefix)))
++    return body + hashlib.sha256(body).digest()
++
++
++def decode_checksummed_record(
++    encoded: bytes,
++    magic: bytes,
++    *,
++    record_bytes: int,
++    invalid_code: str,
++) -> dict[str, object]:
++    if len(encoded) != record_bytes:
++        raise EncryptedBackupError(invalid_code)
++    body = encoded[:-_RECORD_DIGEST_BYTES]
++    digest = encoded[-_RECORD_DIGEST_BYTES:]
++    if not hmac.compare_digest(hashlib.sha256(body).digest(), digest):
++        raise EncryptedBackupError(invalid_code)
++    if not body.startswith(magic):
++        raise EncryptedBackupError(invalid_code)
++    length_start = len(magic)
++    length_end = length_start + 4
++    payload_length = struct.unpack(
++        ">I",
++        body[length_start:length_end],
++    )[0]
++    payload_end = length_end + payload_length
++    if (
++        payload_length <= 0
++        or payload_end > len(body)
++        or any(body[payload_end:])
++    ):
++        raise EncryptedBackupError(invalid_code)
++    encoded_payload = body[length_end:payload_end]
++    try:
++        payload = json.loads(encoded_payload.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise EncryptedBackupError(invalid_code) from None
++    if (
++        not isinstance(payload, dict)
++        or _canonical_json(payload) != encoded_payload
++    ):
++        raise EncryptedBackupError(invalid_code)
++    return payload
++
++
++def positive_record_integer(value: object) -> bool:
++    return (
++        isinstance(value, int)
++        and not isinstance(value, bool)
++        and value > 0
++    )
++
++
++def retry_flock(descriptor: int, operation: int) -> None:
++    while True:
++        try:
++            fcntl.flock(descriptor, operation)
++            return
++        except InterruptedError:
++            continue
++
++
++def acquire_bounded_lock(
++    descriptor: int,
++    operation: int,
++    *,
++    timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
++) -> None:
++    deadline = time.monotonic() + timeout_seconds
++    while True:
++        try:
++            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
++            return
++        except InterruptedError:
++            continue
++        except BlockingIOError:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise EncryptedBackupError(
++                    "encrypted_backup_state_busy"
++                ) from None
++            time.sleep(min(_LOCK_RETRY_SECONDS, remaining))
++        except OSError:
++            raise EncryptedBackupError(
++                "encrypted_backup_state_unavailable"
++            ) from None
++
++
++def retry_fsync(descriptor: int) -> None:
++    while True:
++        try:
++            os.fsync(descriptor)
++            return
++        except InterruptedError:
++            continue
++
++
++def pread_retry(descriptor: int, length: int, offset: int) -> bytes:
++    while True:
++        try:
++            return os.pread(descriptor, length, offset)
++        except InterruptedError:
++            continue
++
++
++def pread_exact(descriptor: int, length: int, offset: int) -> bytes:
++    result = bytearray()
++    while len(result) < length:
++        chunk = pread_retry(
++            descriptor,
++            length - len(result),
++            offset + len(result),
++        )
++        if not chunk:
++            break
++        result.extend(chunk)
++    return bytes(result)
++
++
++def pwrite_all(descriptor: int, encoded: bytes) -> None:
++    offset = 0
++    while offset < len(encoded):
++        while True:
++            try:
++                written = os.pwrite(
++                    descriptor,
++                    encoded[offset:],
++                    offset,
++                )
++                break
++            except InterruptedError:
++                continue
++        if written <= 0:
++            raise EncryptedBackupError(
++                "encrypted_backup_state_write_failed"
++            )
++        offset += written
++
++
++def hash_artifact_descriptor(
++    descriptor: int,
++    *,
++    expected_size: int,
++) -> str:
++    initial_stat = os.fstat(descriptor)
++    if not (
++        stat.S_ISREG(initial_stat.st_mode)
++        and initial_stat.st_size == expected_size
++    ):
++        raise EncryptedBackupError("encrypted_backup_state_invalid")
++    digest = hashlib.sha256()
++    offset = 0
++    while offset < expected_size:
++        chunk = pread_retry(
++            descriptor,
++            min(BACKUP_CHUNK_BYTES, expected_size - offset),
++            offset,
++        )
++        if not chunk:
++            raise EncryptedBackupError(
++                "encrypted_backup_state_invalid"
++            )
++        digest.update(chunk)
++        offset += len(chunk)
++    final_stat = os.fstat(descriptor)
++    if not (
++        initial_stat.st_dev == final_stat.st_dev
++        and initial_stat.st_ino == final_stat.st_ino
++        and initial_stat.st_size == final_stat.st_size
++        and initial_stat.st_mtime_ns == final_stat.st_mtime_ns
++        and initial_stat.st_ctime_ns == final_stat.st_ctime_ns
++    ):
++        raise EncryptedBackupError("encrypted_backup_state_invalid")
++    return digest.hexdigest()
++
++
++def _manifest_payload(
++    manifest: _BackupTransactionManifest,
++) -> dict[str, object]:
++    return {
++        "directory_device": manifest.directory_device,
++        "directory_inode": manifest.directory_inode,
++        "directory_name": manifest.directory_name,
++        "transaction_id": manifest.transaction_id,
++        "version": TRANSACTION_MANIFEST_VERSION,
++    }
++
++
++def _encode_manifest(manifest: _BackupTransactionManifest) -> bytes:
++    return encode_checksummed_record(
++        TRANSACTION_MANIFEST_MAGIC,
++        _manifest_payload(manifest),
++        record_bytes=TRANSACTION_MANIFEST_BYTES,
++        invalid_code="encrypted_backup_transaction_invalid",
++    )
++
++
++def _decode_manifest(encoded: bytes) -> _BackupTransactionManifest:
++    payload = decode_checksummed_record(
++        encoded,
++        TRANSACTION_MANIFEST_MAGIC,
++        record_bytes=TRANSACTION_MANIFEST_BYTES,
++        invalid_code="encrypted_backup_transaction_invalid",
++    )
++    if (
++        set(payload)
++        != {
++            "directory_device",
++            "directory_inode",
++            "directory_name",
++            "transaction_id",
++            "version",
++        }
++        or type(payload.get("version")) is not int
++        or payload.get("version") != TRANSACTION_MANIFEST_VERSION
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    transaction_id = payload.get("transaction_id")
++    directory_name = payload.get("directory_name")
++    if (
++        not isinstance(transaction_id, str)
++        or _TRANSACTION_ID.fullmatch(transaction_id) is None
++        or not isinstance(directory_name, str)
++        or TRANSACTION_DIRECTORY.fullmatch(directory_name) is None
++        or directory_name != f"{TRANSACTION_PREFIX}{transaction_id}"
++        or not positive_record_integer(payload.get("directory_device"))
++        or not positive_record_integer(payload.get("directory_inode"))
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return _BackupTransactionManifest(
++        transaction_id=transaction_id,
++        directory_name=directory_name,
++        directory_device=payload["directory_device"],
++        directory_inode=payload["directory_inode"],
++    )
++
++
++def directory_open_flags() -> int:
++    return (
++        os.O_RDONLY
++        | getattr(os, "O_DIRECTORY", 0)
++        | getattr(os, "O_NOFOLLOW", 0)
++        | getattr(os, "O_NONBLOCK", 0)
++    )
++
++
++def _destination_identity(
++    destination: Path,
++    descriptor: int,
++) -> os.stat_result:
++    descriptor_stat = os.fstat(descriptor)
++    path_stat = destination.lstat()
++    if not (
++        stat.S_ISDIR(descriptor_stat.st_mode)
++        and stat.S_ISDIR(path_stat.st_mode)
++        and descriptor_stat.st_dev == path_stat.st_dev
++        and descriptor_stat.st_ino == path_stat.st_ino
++        and stat.S_IMODE(descriptor_stat.st_mode) == 0o700
++    ):
++        raise EncryptedBackupError("backup_directory_invalid")
++    return descriptor_stat
++
++
++def _directory_identity(
++    transaction: BackupTransaction,
++) -> os.stat_result:
++    _destination_identity(
++        transaction.destination,
++        transaction.destination_descriptor,
++    )
++    descriptor_stat = os.fstat(transaction.directory_descriptor)
++    path_stat = os.stat(
++        transaction.manifest.directory_name,
++        dir_fd=transaction.destination_descriptor,
++        follow_symlinks=False,
++    )
++    if not (
++        stat.S_ISDIR(descriptor_stat.st_mode)
++        and stat.S_ISDIR(path_stat.st_mode)
++        and descriptor_stat.st_dev == path_stat.st_dev
++        and descriptor_stat.st_ino == path_stat.st_ino
++        and descriptor_stat.st_dev
++        == transaction.manifest.directory_device
++        and descriptor_stat.st_ino
++        == transaction.manifest.directory_inode
++        and stat.S_IMODE(descriptor_stat.st_mode) == 0o700
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return descriptor_stat
++
++
++def _manifest_identity(
++    transaction: BackupTransaction,
++) -> os.stat_result:
++    descriptor_stat = os.fstat(transaction.manifest_descriptor)
++    path_stat = os.stat(
++        TRANSACTION_MANIFEST_NAME,
++        dir_fd=transaction.directory_descriptor,
++        follow_symlinks=False,
++    )
++    if not (
++        stat.S_ISREG(descriptor_stat.st_mode)
++        and stat.S_ISREG(path_stat.st_mode)
++        and descriptor_stat.st_dev == path_stat.st_dev
++        and descriptor_stat.st_ino == path_stat.st_ino
++        and descriptor_stat.st_size == TRANSACTION_MANIFEST_BYTES
++        and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return descriptor_stat
++
++
++def _read_manifest(
++    transaction: BackupTransaction,
++) -> _BackupTransactionManifest:
++    _directory_identity(transaction)
++    before = _manifest_identity(transaction)
++    manifest = _decode_manifest(
++        pread_exact(
++            transaction.manifest_descriptor,
++            TRANSACTION_MANIFEST_BYTES,
++            0,
++        )
++    )
++    after = _manifest_identity(transaction)
++    if not (
++        manifest == transaction.manifest
++        and before.st_dev == after.st_dev
++        and before.st_ino == after.st_ino
++        and before.st_mtime_ns == after.st_mtime_ns
++        and before.st_ctime_ns == after.st_ctime_ns
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return manifest
++
++
++def validate_backup_transaction(
++    transaction: BackupTransaction,
++) -> set[str]:
++    _read_manifest(transaction)
++    members = set(os.listdir(transaction.directory_descriptor))
++    if (
++        TRANSACTION_MANIFEST_NAME not in members
++        or not members <= TRANSACTION_MEMBER_NAMES
++    ):
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    return members
++
++
++def create_backup_transaction(destination: Path) -> BackupTransaction:
++    destination_descriptor = os.open(destination, directory_open_flags())
++    directory_descriptor: int | None = None
++    manifest_descriptor: int | None = None
++    manifest_locked = False
++    directory_name: str | None = None
++    try:
++        _destination_identity(destination, destination_descriptor)
++        transaction_id = os.urandom(16).hex()
++        directory_name = f"{TRANSACTION_PREFIX}{transaction_id}"
++        os.mkdir(
++            directory_name,
++            mode=0o700,
++            dir_fd=destination_descriptor,
++        )
++        directory_descriptor = os.open(
++            directory_name,
++            directory_open_flags(),
++            dir_fd=destination_descriptor,
++        )
++        os.fchmod(directory_descriptor, 0o700)
++        directory_stat = os.fstat(directory_descriptor)
++        directory_path_stat = os.stat(
++            directory_name,
++            dir_fd=destination_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISDIR(directory_stat.st_mode)
++            and stat.S_ISDIR(directory_path_stat.st_mode)
++            and directory_stat.st_dev == directory_path_stat.st_dev
++            and directory_stat.st_ino == directory_path_stat.st_ino
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        manifest = _BackupTransactionManifest(
++            transaction_id=transaction_id,
++            directory_name=directory_name,
++            directory_device=directory_stat.st_dev,
++            directory_inode=directory_stat.st_ino,
++        )
++        manifest_descriptor = os.open(
++            TRANSACTION_MANIFEST_NAME,
++            os.O_RDWR
++            | os.O_CREAT
++            | os.O_EXCL
++            | getattr(os, "O_NOFOLLOW", 0)
++            | getattr(os, "O_NONBLOCK", 0)
++            | getattr(os, "O_DSYNC", os.O_SYNC),
++            0o600,
++            dir_fd=directory_descriptor,
++        )
++        os.fchmod(manifest_descriptor, 0o600)
++        acquire_bounded_lock(manifest_descriptor, fcntl.LOCK_EX)
++        manifest_locked = True
++        transaction = BackupTransaction(
++            destination=destination,
++            destination_descriptor=destination_descriptor,
++            directory=destination / directory_name,
++            directory_descriptor=directory_descriptor,
++            manifest_descriptor=manifest_descriptor,
++            manifest=manifest,
++        )
++        pwrite_all(manifest_descriptor, _encode_manifest(manifest))
++        retry_fsync(manifest_descriptor)
++        _read_manifest(transaction)
++        retry_fsync(directory_descriptor)
++        retry_fsync(destination_descriptor)
++        return transaction
++    except BaseException:
++        if manifest_descriptor is not None and manifest_locked:
++            try:
++                retry_flock(manifest_descriptor, fcntl.LOCK_UN)
++            except OSError:
++                pass
++        if manifest_descriptor is not None:
++            try:
++                os.close(manifest_descriptor)
++            except OSError:
++                pass
++        if directory_descriptor is not None:
++            try:
++                os.unlink(
++                    TRANSACTION_MANIFEST_NAME,
++                    dir_fd=directory_descriptor,
++                )
++            except OSError:
++                pass
++            try:
++                os.close(directory_descriptor)
++            except OSError:
++                pass
++        if directory_name is not None:
++            try:
++                os.rmdir(
++                    directory_name,
++                    dir_fd=destination_descriptor,
++                )
++                retry_fsync(destination_descriptor)
++            except OSError:
++                pass
++        os.close(destination_descriptor)
++        raise
++
++
++def create_transaction_member(
++    transaction: BackupTransaction,
++    name: str,
++) -> Path:
++    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    validate_backup_transaction(transaction)
++    descriptor = os.open(
++        name,
++        os.O_RDWR
++        | os.O_CREAT
++        | os.O_EXCL
++        | getattr(os, "O_NOFOLLOW", 0)
++        | getattr(os, "O_NONBLOCK", 0),
++        0o600,
++        dir_fd=transaction.directory_descriptor,
++    )
++    try:
++        os.fchmod(descriptor, 0o600)
++        retry_fsync(descriptor)
++    finally:
++        os.close(descriptor)
++    retry_fsync(transaction.directory_descriptor)
++    validate_backup_transaction(transaction)
++    return transaction.directory / name
++
++
++def open_transaction_member(
++    transaction: BackupTransaction,
++    name: str,
++    flags: int,
++) -> int:
++    if name == TRANSACTION_MANIFEST_NAME or name not in TRANSACTION_MEMBER_NAMES:
++        raise EncryptedBackupError(
++            "encrypted_backup_transaction_invalid"
++        )
++    validate_backup_transaction(transaction)
++    descriptor = os.open(
++        name,
++        flags
++        | getattr(os, "O_NOFOLLOW", 0)
++        | getattr(os, "O_NONBLOCK", 0),
++        dir_fd=transaction.directory_descriptor,
++    )
++    try:
++        descriptor_stat = os.fstat(descriptor)
++        path_stat = os.stat(
++            name,
++            dir_fd=transaction.directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISREG(descriptor_stat.st_mode)
++            and stat.S_ISREG(path_stat.st_mode)
++            and descriptor_stat.st_dev == path_stat.st_dev
++            and descriptor_stat.st_ino == path_stat.st_ino
++            and stat.S_IMODE(descriptor_stat.st_mode) == 0o600
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        return descriptor
++    except BaseException:
++        os.close(descriptor)
++        raise
++
++
++def hash_transaction_member(
++    transaction: BackupTransaction,
++    name: str,
++    *,
++    ensure_maintenance: Callable[[], None] | None = None,
++) -> str:
++    digest = hashlib.sha256()
++    descriptor = open_transaction_member(
++        transaction,
++        name,
++        os.O_RDONLY,
++    )
++    with os.fdopen(descriptor, "rb", buffering=0) as handle:
++        while True:
++            if ensure_maintenance is not None:
++                ensure_maintenance()
++            chunk = handle.read(BACKUP_CHUNK_BYTES)
++            if not chunk:
++                break
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def fsync_and_hash_transaction_artifact(
++    transaction: BackupTransaction,
++) -> tuple[os.stat_result, str]:
++    descriptor = open_transaction_member(
++        transaction,
++        ENCRYPTED_NAME,
++        os.O_RDONLY,
++    )
++    try:
++        descriptor_stat = os.fstat(descriptor)
++        path_stat = os.stat(
++            ENCRYPTED_NAME,
++            dir_fd=transaction.directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISREG(descriptor_stat.st_mode)
++            and stat.S_ISREG(path_stat.st_mode)
++            and descriptor_stat.st_dev == path_stat.st_dev
++            and descriptor_stat.st_ino == path_stat.st_ino
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_state_invalid"
++            )
++        retry_fsync(descriptor)
++        artifact_sha256 = hash_artifact_descriptor(
++            descriptor,
++            expected_size=descriptor_stat.st_size,
++        )
++        final_stat = os.fstat(descriptor)
++        final_path_stat = os.stat(
++            ENCRYPTED_NAME,
++            dir_fd=transaction.directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            descriptor_stat.st_dev == final_stat.st_dev
++            and descriptor_stat.st_ino == final_stat.st_ino
++            and descriptor_stat.st_size == final_stat.st_size
++            and descriptor_stat.st_mtime_ns == final_stat.st_mtime_ns
++            and descriptor_stat.st_ctime_ns == final_stat.st_ctime_ns
++            and final_stat.st_dev == final_path_stat.st_dev
++            and final_stat.st_ino == final_path_stat.st_ino
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_state_invalid"
++            )
++        validate_backup_transaction(transaction)
++        return final_stat, artifact_sha256
++    finally:
++        os.close(descriptor)
++
++
++def _remove_backup_transaction(transaction: BackupTransaction) -> None:
++    members = validate_backup_transaction(transaction)
++    for name in sorted(members - {TRANSACTION_MANIFEST_NAME}):
++        member_stat = os.stat(
++            name,
++            dir_fd=transaction.directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISREG(member_stat.st_mode)
++            and stat.S_IMODE(member_stat.st_mode) == 0o600
++        ):
++            raise EncryptedBackupError(
++                "encrypted_backup_transaction_invalid"
++            )
++        os.unlink(name, dir_fd=transaction.directory_descriptor)
++    retry_fsync(transaction.directory_descriptor)
++    _read_manifest(transaction)
++    _directory_identity(transaction)
++    os.unlink(
++        TRANSACTION_MANIFEST_NAME,
++        dir_fd=transaction.directory_descriptor,
++    )
++    retry_fsync(transaction.directory_descriptor)
++    os.rmdir(
++        transaction.manifest.directory_name,
++        dir_fd=transaction.destination_descriptor,
++    )
++    retry_fsync(transaction.destination_descriptor)
++
++
++def close_backup_transaction(
++    transaction: BackupTransaction,
++    *,
++    remove: bool,
++) -> None:
++    failure: BaseException | None = None
++    if remove:
++        try:
++            _remove_backup_transaction(transaction)
++        except BaseException as exc:
++            failure = exc
++    if transaction.manifest_locked:
++        try:
++            retry_flock(
++                transaction.manifest_descriptor,
++                fcntl.LOCK_UN,
++            )
++        except BaseException as exc:
++            if failure is None:
++                failure = exc
++        transaction.manifest_locked = False
++    for descriptor in (
++        transaction.manifest_descriptor,
++        transaction.directory_descriptor,
++        transaction.destination_descriptor,
++    ):
++        try:
++            os.close(descriptor)
++        except BaseException as exc:
++            if failure is None:
++                failure = exc
++    if failure is not None:
++        raise failure
++
++
++def recover_backup_transaction(
++    destination: Path,
++    directory_name: str,
++    *,
++    cutoff: float,
++) -> None:
++    if TRANSACTION_DIRECTORY.fullmatch(directory_name) is None:
++        return
++    destination_descriptor: int | None = None
++    directory_descriptor: int | None = None
++    manifest_descriptor: int | None = None
++    manifest_locked = False
++    transaction: BackupTransaction | None = None
++    try:
++        destination_descriptor = os.open(
++            destination,
++            directory_open_flags(),
++        )
++        _destination_identity(destination, destination_descriptor)
++        directory_descriptor = os.open(
++            directory_name,
++            directory_open_flags(),
++            dir_fd=destination_descriptor,
++        )
++        directory_stat = os.fstat(directory_descriptor)
++        directory_path_stat = os.stat(
++            directory_name,
++            dir_fd=destination_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISDIR(directory_stat.st_mode)
++            and stat.S_ISDIR(directory_path_stat.st_mode)
++            and directory_stat.st_dev == directory_path_stat.st_dev
++            and directory_stat.st_ino == directory_path_stat.st_ino
++            and stat.S_IMODE(directory_stat.st_mode) == 0o700
++            and directory_stat.st_mtime < cutoff
++        ):
++            return
++        manifest_descriptor = os.open(
++            TRANSACTION_MANIFEST_NAME,
++            os.O_RDONLY
++            | getattr(os, "O_NOFOLLOW", 0)
++            | getattr(os, "O_NONBLOCK", 0),
++            dir_fd=directory_descriptor,
++        )
++        manifest_stat = os.fstat(manifest_descriptor)
++        manifest_path_stat = os.stat(
++            TRANSACTION_MANIFEST_NAME,
++            dir_fd=directory_descriptor,
++            follow_symlinks=False,
++        )
++        if not (
++            stat.S_ISREG(manifest_stat.st_mode)
++            and stat.S_ISREG(manifest_path_stat.st_mode)
++            and manifest_stat.st_dev == manifest_path_stat.st_dev
++            and manifest_stat.st_ino == manifest_path_stat.st_ino
++            and manifest_stat.st_size == TRANSACTION_MANIFEST_BYTES
++            and stat.S_IMODE(manifest_stat.st_mode) == 0o600
++            and manifest_stat.st_mtime < cutoff
++        ):
++            return
++        acquire_bounded_lock(manifest_descriptor, fcntl.LOCK_EX)
++        manifest_locked = True
++        manifest = _decode_manifest(
++            pread_exact(
++                manifest_descriptor,
++                TRANSACTION_MANIFEST_BYTES,
++                0,
++            )
++        )
++        if not (
++            manifest.directory_name == directory_name
++            and manifest.directory_device == directory_stat.st_dev
++            and manifest.directory_inode == directory_stat.st_ino
++        ):
++            return
++        transaction = BackupTransaction(
++            destination=destination,
++            destination_descriptor=destination_descriptor,
++            directory=destination / directory_name,
++            directory_descriptor=directory_descriptor,
++            manifest_descriptor=manifest_descriptor,
++            manifest=manifest,
++        )
++        members = validate_backup_transaction(transaction)
++        if any(
++            os.stat(
++                member,
++                dir_fd=directory_descriptor,
++                follow_symlinks=False,
++            ).st_mtime
++            >= cutoff
++            for member in members
++        ):
++            return
++        final_directory_stat = _directory_identity(transaction)
++        if not (
++            directory_stat.st_mtime_ns
++            == final_directory_stat.st_mtime_ns
++            and directory_stat.st_ctime_ns
++            == final_directory_stat.st_ctime_ns
++            and final_directory_stat.st_mtime < cutoff
++        ):
++            return
++        close_backup_transaction(transaction, remove=True)
++        transaction = None
++        destination_descriptor = None
++        directory_descriptor = None
++        manifest_descriptor = None
++        manifest_locked = False
++    except (EncryptedBackupError, FileNotFoundError, OSError):
++        return
++    finally:
++        if transaction is not None:
++            try:
++                close_backup_transaction(transaction, remove=False)
++            except OSError:
++                pass
++        else:
++            if manifest_descriptor is not None and manifest_locked:
++                try:
++                    retry_flock(
++                        manifest_descriptor,
++                        fcntl.LOCK_UN,
++                    )
++                except OSError:
++                    pass
++            for descriptor in (
++                manifest_descriptor,
++                directory_descriptor,
++                destination_descriptor,
++            ):
++                if descriptor is not None:
++                    try:
++                        os.close(descriptor)
++                    except OSError:
++                        pass
+diff --git a/tests/test_sensitive_migration.py b/tests/test_sensitive_migration.py
+index aa1cdfda2d8e0340c195905a581657fa5d838977..6d6b52d91bb23390feff2110bd801d10de135b43 100644
+--- a/tests/test_sensitive_migration.py
++++ b/tests/test_sensitive_migration.py
+@@ -643 +643,2 @@ def test_backup_temps_are_mode_0600_while_failure_hook_inspects_directory(
+-    observed_modes: list[int] = []
++    observed_directory_modes: list[int] = []
++    observed_member_modes: list[int] = []
+@@ -647,2 +648,2 @@ def test_backup_temps_are_mode_0600_while_failure_hook_inspects_directory(
+-            observed_modes.extend(
+-                stat.S_IMODE(candidate.stat().st_mode)
++            transactions = tuple(
++                candidate
+@@ -650 +651,10 @@ def test_backup_temps_are_mode_0600_while_failure_hook_inspects_directory(
+-                if candidate.name.startswith(".")
++                if candidate.name.startswith(".backup-txn-")
++            )
++            assert len(transactions) == 1
++            transaction = transactions[0]
++            observed_directory_modes.append(
++                stat.S_IMODE(transaction.stat().st_mode)
++            )
++            observed_member_modes.extend(
++                stat.S_IMODE(candidate.stat().st_mode)
++                for candidate in transaction.iterdir()
+@@ -655,2 +665,4 @@ def test_backup_temps_are_mode_0600_while_failure_hook_inspects_directory(
+-    assert observed_modes
+-    assert set(observed_modes) == {0o600}
++    assert observed_directory_modes
++    assert observed_member_modes
++    assert set(observed_directory_modes) == {0o700}
++    assert set(observed_member_modes) == {0o600}
+diff --git a/tests/test_task6_exceptional_hardening.py b/tests/test_task6_exceptional_hardening.py
+index 1516024feadb5dffeb271455277e83e6866fe7ba..2497e7774aa1d74975fe3c590da5506af95db697 100644
+--- a/tests/test_task6_exceptional_hardening.py
++++ b/tests/test_task6_exceptional_hardening.py
+@@ -172,0 +173,11 @@ def _age_protocol_files(destination: Path, timestamp: float) -> None:
++            if candidate.is_dir():
++                for descendant in sorted(
++                    candidate.rglob("*"),
++                    key=lambda path: len(path.parts),
++                    reverse=True,
++                ):
++                    os.utime(
++                        descendant,
++                        (timestamp, timestamp),
++                        follow_symlinks=False,
++                    )
+@@ -556,65 +566,0 @@ def test_torn_commit_is_durably_restored_to_pending_before_failure(
+-def test_failed_postcommit_verification_uses_durable_retired_fallback(
+-    tmp_path,
+-    monkeypatch,
+-):
+-    source = tmp_path / "retired-fallback.db"
+-    destination = tmp_path / "retired-fallback-backups"
+-    _seed_source(source)
+-    original_pwrite = os.pwrite
+-    original_verify = backup_module._verify_matching_artifact
+-    original_unlink = Path.unlink
+-    commit_written = False
+-    verification_failed = False
+-    pending_restore_failed = False
+-
+-    def fail_pending_restore(descriptor, data, offset):
+-        nonlocal commit_written
+-        nonlocal pending_restore_failed
+-        if b'"phase":"COMMITTED"' in data:
+-            commit_written = True
+-        elif (
+-            commit_written
+-            and b'"phase":"PENDING"' in data
+-            and not pending_restore_failed
+-        ):
+-            pending_restore_failed = True
+-            raise OSError("injected pending restore failure")
+-        return original_pwrite(descriptor, data, offset)
+-
+-    def fail_postcommit_verification(path, state, descriptor):
+-        nonlocal verification_failed
+-        if (
+-            commit_written
+-            and state.phase == "COMMITTED"
+-            and not verification_failed
+-        ):
+-            verification_failed = True
+-            raise OSError("injected postcommit artifact verification failure")
+-        return original_verify(path, state, descriptor)
+-
+-    def preserve_failed_image(path: Path, *args, **kwargs):
+-        if commit_written and path.parent == destination:
+-            raise OSError("injected cleanup refusal")
+-        return original_unlink(path, *args, **kwargs)
+-
+-    monkeypatch.setattr(os, "pwrite", fail_pending_restore)
+-    monkeypatch.setattr(
+-        backup_module,
+-        "_verify_matching_artifact",
+-        fail_postcommit_verification,
+-    )
+-    monkeypatch.setattr(Path, "unlink", preserve_failed_image)
+-
+-    with pytest.raises(EncryptedBackupError):
+-        _create(source, destination)
+-
+-    target = next(destination.glob("*.sqlite3.aesgcm"))
+-    assert verification_failed is True
+-    assert pending_restore_failed is True
+-    assert list_committed_backups(destination) == ()
+-    assert (
+-        backup_module._authoritative_state(target, "RETIRED")
+-        is not None
+-    )
+-
+-
+@@ -922,3 +867,0 @@ def test_backup_entrypoint_fails_bounded_on_busy_retention_state(tmp_path):
+-        ("pending_state_durable", "pending_without_target"),
+-        ("target_directory_fsynced", "pending_with_target"),
+-        ("pending_state_durable", "anchor_only"),
+@@ -925,0 +869 @@ def test_backup_entrypoint_fails_bounded_on_busy_retention_state(tmp_path):
++        ("target_directory_fsynced", "pending_with_target"),
+@@ -948,4 +892,6 @@ def test_crash_images_recover_only_after_ttl_and_are_idempotent(
+-    if survivor_shape == "anchor_only":
+-        state.unlink()
+-    elif survivor_shape == "state_only":
+-        anchor.unlink()
++    if survivor_shape == "state_only":
++        assert not artifact.exists()
++        assert not anchor.exists()
++    else:
++        assert artifact.exists()
++        assert anchor.exists()
+@@ -1129,37 +1074,0 @@ def test_recovery_preserves_corrupt_busy_and_operator_owned_images(
+-@pytest.mark.parametrize("blocking_name", ["target", "state"])
+-def test_anchor_recovery_preserves_broken_symlink_namespace(
+-    tmp_path,
+-    blocking_name,
+-):
+-    source = tmp_path / f"symlink-{blocking_name}.db"
+-    destination = tmp_path / f"symlink-{blocking_name}-backups"
+-    _seed_source(source)
+-    context = _process_context()
+-    process = context.Process(
+-        target=_crash_backup_at_stage,
+-        args=(source, destination, "pending_state_durable"),
+-    )
+-    process.start()
+-    process.join(timeout=10)
+-    assert process.exitcode == 73
+-    state = next(destination.glob(".*.commit-state"))
+-    artifact = _artifact_from_state_path_for_test(state)
+-    anchor = _anchor_path(artifact)
+-    state.unlink()
+-    blocking_path = (
+-        artifact if blocking_name == "target" else _state_path(artifact)
+-    )
+-    blocking_path.symlink_to(destination / "missing-operator-target")
+-    recovery_now = time.time()
+-    _age_protocol_files(destination, recovery_now - 120)
+-
+-    backup_module._recover_backup_orphans(
+-        destination,
+-        orphan_ttl_seconds=60,
+-        now=lambda: recovery_now,
+-    )
+-
+-    assert anchor.exists()
+-    assert blocking_path.is_symlink()
+-
+-
+diff --git a/tests/test_task6_round4.py b/tests/test_task6_round4.py
+index a3edc96405bc5d82dce4bb8ba75853ccab000c91..904212f9ad32b1d6017736fb10fe9fa241a4a1d6 100644
+--- a/tests/test_task6_round4.py
++++ b/tests/test_task6_round4.py
+@@ -6,0 +7 @@ from datetime import datetime, timezone
++import os
+@@ -599,0 +601,13 @@ def test_directory_fsync_failure_occurs_before_committed_name_is_visible(
++    original_fsync = os.fsync
++
++    def fail_fsync(descriptor: int) -> None:
++        original_fsync(descriptor)
++        if (
++            destination.exists()
++            and os.fstat(descriptor).st_dev == destination.stat().st_dev
++            and os.fstat(descriptor).st_ino == destination.stat().st_ino
++        ):
++            visible_during_fsync.append(
++                tuple(path.name for path in destination.glob("*.aesgcm"))
++            )
++            raise OSError("injected directory fsync failure")
+@@ -601,7 +615 @@ def test_directory_fsync_failure_occurs_before_committed_name_is_visible(
+-    def fail_fsync(_directory: Path) -> None:
+-        visible_during_fsync.append(
+-            tuple(path.name for path in destination.glob("*.aesgcm"))
+-        )
+-        raise OSError("injected directory fsync failure")
+-
+-    monkeypatch.setattr(backup_module, "_fsync_directory", fail_fsync)
++    monkeypatch.setattr(os, "fsync", fail_fsync)
+@@ -613 +621,2 @@ def test_directory_fsync_failure_occurs_before_committed_name_is_visible(
+-    assert visible_during_fsync == [()]
++    assert visible_during_fsync
++    assert set(visible_during_fsync) == {()}
+diff --git a/tests/test_task6_round5.py b/tests/test_task6_round5.py
+index 3a65c8358311476bd650c3b9dab4041139dfe244..32cbfde6abf6f4367ac037407cd2941357237660 100644
+--- a/tests/test_task6_round5.py
++++ b/tests/test_task6_round5.py
+@@ -128 +128,2 @@ def test_link_success_then_cancel_and_cleanup_failure_remains_uncommitted(
+-        candidate = Path(dst)
++        destination_descriptor = kwargs.get("dst_dir_fd")
++        candidate = destination / str(dst)
+@@ -130 +131,5 @@ def test_link_success_then_cancel_and_cleanup_failure_remains_uncommitted(
+-            candidate.parent == destination
++            destination_descriptor is not None
++            and os.fstat(destination_descriptor).st_dev
++            == destination.stat().st_dev
++            and os.fstat(destination_descriptor).st_ino
++            == destination.stat().st_ino
+@@ -172 +177 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
+-    original_fsync_directory = backup_module._fsync_directory
++    original_fsync = os.fsync
+@@ -175 +180 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
+-    def fail_after_target_link(directory: Path) -> None:
++    def fail_after_target_link(descriptor: int) -> None:
+@@ -176,0 +182 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
++        original_fsync(descriptor)
+@@ -178 +184,5 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
+-        if public_targets:
++        if (
++            public_targets
++            and os.fstat(descriptor).st_dev == destination.stat().st_dev
++            and os.fstat(descriptor).st_ino == destination.stat().st_ino
++        ):
+@@ -182 +191,0 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
+-        original_fsync_directory(directory)
+@@ -184,5 +193 @@ def test_target_directory_fsync_failure_never_commits_visible_target(
+-    monkeypatch.setattr(
+-        backup_module,
+-        "_fsync_directory",
+-        fail_after_target_link,
+-    )
++    monkeypatch.setattr(os, "fsync", fail_after_target_link)
+@@ -507 +511,0 @@ def test_success_receipt_follows_target_and_commit_state_durability(
+-    original_fsync_directory = backup_module._fsync_directory
+@@ -512,6 +516 @@ def test_success_receipt_follows_target_and_commit_state_durability(
+-
+-    def observe_directory_fsync(directory: Path) -> None:
+-        original_fsync_directory(directory)
+-        if tuple(destination.glob("*.sqlite3.aesgcm")):
+-            events.append("target-directory-durable")
+-            assert list_committed_backups(destination) == ()
++    target_directory_durable = False
+@@ -528 +527 @@ def test_success_receipt_follows_target_and_commit_state_durability(
+-        nonlocal commit_write_seen
++        nonlocal commit_write_seen, target_directory_durable
+@@ -529,0 +529,9 @@ def test_success_receipt_follows_target_and_commit_state_durability(
++        if (
++            not target_directory_durable
++            and tuple(destination.glob("*.sqlite3.aesgcm"))
++            and os.fstat(descriptor).st_dev == destination.stat().st_dev
++            and os.fstat(descriptor).st_ino == destination.stat().st_ino
++        ):
++            target_directory_durable = True
++            events.append("target-directory-durable")
++            assert list_committed_backups(destination) == ()
+@@ -535,5 +542,0 @@ def test_success_receipt_follows_target_and_commit_state_durability(
+-    monkeypatch.setattr(
+-        backup_module,
+-        "_fsync_directory",
+-        observe_directory_fsync,
+-    )
+diff --git a/tests/test_task6_transaction_directory_hardening.py b/tests/test_task6_transaction_directory_hardening.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f20f607a26673807d2fb3bcc5802305ed90df384
+--- /dev/null
++++ b/tests/test_task6_transaction_directory_hardening.py
+@@ -0,0 +1,519 @@
++"""Crash-safe transaction-directory and final-commit regressions."""
++
++from __future__ import annotations
++
++import fcntl
++import multiprocessing
++import os
++from pathlib import Path
++import shutil
++import sqlite3
++import stat
++import time
++
++import pytest
++
++from trading_assistant.ops import backup as backup_module
++from trading_assistant.ops.backup import (
++    create_encrypted_database_backup,
++    list_committed_backups,
++)
++
++
++BACKUP_KEY = b"T" * 32
++BACKUP_KEY_ID = "transaction-directory-key"
++SCHEMA_HEAD = "20260727_0015"
++_TRANSACTION_PREFIX = ".backup-txn-"
++_TRANSACTION_MEMBERS = {
++    "manifest",
++    "snapshot.sqlite3",
++    "snapshot.sqlite3-journal",
++    "snapshot.sqlite3-shm",
++    "snapshot.sqlite3-wal",
++    "verification.sqlite3",
++    "verification.sqlite3-journal",
++    "verification.sqlite3-shm",
++    "verification.sqlite3-wal",
++    "encrypted.aesgcm",
++}
++
++
++def _seed_source(path: Path) -> None:
++    with sqlite3.connect(path) as connection:
++        connection.execute(
++            "CREATE TABLE sample (id INTEGER PRIMARY KEY, narrative TEXT)"
++        )
++        connection.execute(
++            "INSERT INTO sample(narrative) VALUES (?)",
++            ("plaintext-crash-marker-" + ("x" * 131_072),),
++        )
++        connection.commit()
++
++
++def _create(source: Path, destination: Path, **kwargs):
++    return create_encrypted_database_backup(
++        source,
++        destination,
++        backup_key=BACKUP_KEY,
++        backup_key_id=BACKUP_KEY_ID,
++        schema_head=SCHEMA_HEAD,
++        **kwargs,
++    )
++
++
++def _process_context():
++    method = (
++        "fork"
++        if "fork" in multiprocessing.get_all_start_methods()
++        else "spawn"
++    )
++    return multiprocessing.get_context(method)
++
++
++def _crash_at_stage(
++    source: Path,
++    destination: Path,
++    stage: str,
++) -> None:
++    def crash(current: str) -> None:
++        if current == stage:
++            os._exit(73)
++
++    _create(source, destination, stage_hook=crash)
++    os._exit(74)
++
++
++def _pause_then_crash(
++    source: Path,
++    destination: Path,
++    ready,
++    release,
++) -> None:
++    def pause(current: str) -> None:
++        if current == "snapshot_created":
++            ready.set()
++            release.wait(10)
++            os._exit(73)
++
++    _create(source, destination, stage_hook=pause)
++    os._exit(74)
++
++
++def _transaction_directories(destination: Path) -> tuple[Path, ...]:
++    return tuple(
++        candidate
++        for candidate in destination.iterdir()
++        if candidate.name.startswith(_TRANSACTION_PREFIX)
++        and candidate.is_dir()
++    )
++
++
++def _age_tree(root: Path, timestamp: float) -> None:
++    descendants = sorted(
++        root.rglob("*"),
++        key=lambda candidate: len(candidate.parts),
++        reverse=True,
++    )
++    for candidate in descendants:
++        os.utime(
++            candidate,
++            (timestamp, timestamp),
++            follow_symlinks=False,
++        )
++    os.utime(root, (timestamp, timestamp), follow_symlinks=False)
++
++
++def _hold_manifest_lock(manifest: Path, ready, release) -> None:
++    descriptor = os.open(
++        manifest,
++        os.O_RDONLY
++        | getattr(os, "O_NOFOLLOW", 0)
++        | getattr(os, "O_NONBLOCK", 0),
++    )
++    try:
++        fcntl.flock(descriptor, fcntl.LOCK_EX)
++        ready.set()
++        release.wait(10)
++    finally:
++        fcntl.flock(descriptor, fcntl.LOCK_UN)
++        os.close(descriptor)
++
++
++@pytest.mark.parametrize(
++    "stage",
++    [
++        "transaction_manifest_durable",
++        "snapshot_created",
++        "snapshot_hashed",
++        "header_written",
++        "encrypt_chunk",
++        "ciphertext_fsynced",
++        "verification_opened",
++        "decrypt_chunk",
++        "verification_hashed",
++        "quick_check_complete",
++    ],
++)
++def test_real_crash_files_are_manifest_owned_and_ttl_recoverable(
++    tmp_path,
++    stage,
++):
++    """Removing manifest-first creation or exact recovery leaks crash plaintext."""
++
++    source = tmp_path / f"{stage}.db"
++    destination = tmp_path / f"{stage}-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, stage),
++    )
++    process.start()
++    process.join(timeout=10)
++
++    assert process.exitcode == 73
++    transactions = _transaction_directories(destination)
++    assert len(transactions) == 1
++    transaction = transactions[0]
++    assert stat.S_IMODE(transaction.stat().st_mode) == 0o700
++    members = {candidate.name for candidate in transaction.iterdir()}
++    assert "manifest" in members
++    assert members <= _TRANSACTION_MEMBERS
++    manifest = transaction / "manifest"
++    assert stat.S_IMODE(manifest.stat().st_mode) == 0o600
++    assert manifest.read_bytes().startswith(b"TA-BACKUP-TRANSACTION\x00")
++
++    root_plaintext = [
++        candidate
++        for candidate in destination.iterdir()
++        if candidate.is_file()
++        and candidate.read_bytes()[:16] == b"SQLite format 3\x00"
++    ]
++    assert root_plaintext == []
++
++    operator_owned = destination / "operator-owned"
++    operator_owned.write_bytes(b"preserve")
++    recovery_now = time.time()
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    assert transaction.exists()
++
++    _age_tree(transaction, recovery_now - 120)
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert not transaction.exists()
++    assert operator_owned.read_bytes() == b"preserve"
++    assert list_committed_backups(destination) == ()
++
++
++def test_busy_transaction_manifest_is_bounded_and_preserved(tmp_path):
++    """Replacing bounded manifest ownership with blocking locks hangs recovery."""
++
++    source = tmp_path / "busy.db"
++    destination = tmp_path / "busy-backups"
++    _seed_source(source)
++    context = _process_context()
++    ready = context.Event()
++    release = context.Event()
++    process = context.Process(
++        target=_pause_then_crash,
++        args=(source, destination, ready, release),
++    )
++    process.start()
++    assert ready.wait(timeout=5)
++    transaction = _transaction_directories(destination)[0]
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++
++    started = time.monotonic()
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    elapsed = time.monotonic() - started
++
++    assert elapsed < 1.5
++    assert transaction.exists()
++    release.set()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++
++    _age_tree(transaction, recovery_now - 120)
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    assert not transaction.exists()
++
++
++@pytest.mark.parametrize(
++    "damage",
++    ["corrupt_manifest", "extra_member", "symlink_member"],
++)
++def test_recovery_preserves_ambiguous_transaction_directories(
++    tmp_path,
++    damage,
++):
++    """Broad directory deletion must not consume malformed/operator content."""
++
++    source = tmp_path / f"{damage}.db"
++    destination = tmp_path / f"{damage}-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "snapshot_created"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    if damage == "corrupt_manifest":
++        manifest = transaction / "manifest"
++        encoded = bytearray(manifest.read_bytes())
++        encoded[-1] ^= 0x01
++        manifest.write_bytes(encoded)
++    elif damage == "extra_member":
++        (transaction / "operator.txt").write_bytes(b"preserve")
++    else:
++        (transaction / "encrypted.aesgcm").symlink_to(source)
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert transaction.exists()
++
++
++def test_manifest_copy_and_symlink_namespace_are_not_adopted(tmp_path):
++    """Removing inode/name binding lets copied manifests authorize deletion."""
++
++    source = tmp_path / "copied-manifest.db"
++    destination = tmp_path / "copied-manifest-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "snapshot_created"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    original = _transaction_directories(destination)[0]
++    copied = destination / f"{_TRANSACTION_PREFIX}{'c' * 32}"
++    copied.mkdir(mode=0o700)
++    shutil.copyfile(original / "manifest", copied / "manifest")
++    os.chmod(copied / "manifest", 0o600)
++    symlink = destination / f"{_TRANSACTION_PREFIX}{'d' * 32}"
++    symlink.symlink_to(original, target_is_directory=True)
++    recovery_now = time.time()
++    _age_tree(original, recovery_now - 120)
++    _age_tree(copied, recovery_now - 120)
++
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert not original.exists()
++    assert copied.exists()
++    assert symlink.is_symlink()
++
++
++def test_success_leaves_no_operation_transaction_or_root_plaintext(tmp_path):
++    """Skipping precommit transaction cleanup leaves sensitive operation state."""
++
++    source = tmp_path / "success.db"
++    destination = tmp_path / "success-backups"
++    _seed_source(source)
++
++    observed_precommit = False
++
++    def inspect(stage: str) -> None:
++        nonlocal observed_precommit
++        if stage == "before_artifact_commit":
++            observed_precommit = True
++            assert _transaction_directories(destination) == ()
++            assert list_committed_backups(destination) == ()
++
++    receipt = _create(source, destination, stage_hook=inspect)
++
++    assert observed_precommit is True
++    assert _transaction_directories(destination) == ()
++    assert not tuple(destination.glob(".sensitive-*"))
++    assert list_committed_backups(destination) == (receipt.path,)
++
++
++def test_real_crash_after_transaction_cleanup_recovers_pending_publication(
++    tmp_path,
++):
++    """Moving transaction cleanup after commit can strand plaintext on crash."""
++
++    source = tmp_path / "precommit-crash.db"
++    destination = tmp_path / "precommit-crash-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "before_artifact_commit"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    assert _transaction_directories(destination) == ()
++    assert list_committed_backups(destination) == ()
++    assert len(tuple(destination.glob(".*.commit-state"))) == 1
++    assert len(tuple(destination.glob("*.sqlite3.aesgcm"))) == 1
++
++    recovery_now = time.time()
++    for candidate in destination.iterdir():
++        os.utime(
++            candidate,
++            (recovery_now - 120, recovery_now - 120),
++            follow_symlinks=False,
++        )
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++
++    assert tuple(destination.iterdir()) == ()
++
++
++def test_partial_transaction_cleanup_is_retryable(tmp_path, monkeypatch):
++    """Deleting by broad glob or removing manifest first breaks retry safety."""
++
++    source = tmp_path / "partial-cleanup.db"
++    destination = tmp_path / "partial-cleanup-backups"
++    _seed_source(source)
++    context = _process_context()
++    process = context.Process(
++        target=_crash_at_stage,
++        args=(source, destination, "snapshot_created"),
++    )
++    process.start()
++    process.join(timeout=10)
++    assert process.exitcode == 73
++    transaction = _transaction_directories(destination)[0]
++    recovery_now = time.time()
++    _age_tree(transaction, recovery_now - 120)
++    original_unlink = os.unlink
++    failed_once = False
++
++    def fail_one_member(path, *args, **kwargs):
++        nonlocal failed_once
++        if path == "snapshot.sqlite3" and not failed_once:
++            failed_once = True
++            raise OSError("injected partial cleanup failure")
++        return original_unlink(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "unlink", fail_one_member)
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    assert failed_once is True
++    assert transaction.exists()
++    assert (transaction / "manifest").exists()
++
++    monkeypatch.setattr(os, "unlink", original_unlink)
++    backup_module._recover_backup_orphans(
++        destination,
++        orphan_ttl_seconds=60,
++        now=lambda: recovery_now,
++    )
++    assert not transaction.exists()
++
++
++def test_committed_transition_has_no_fallible_postcommit_work(
++    tmp_path,
++    monkeypatch,
++):
++    """A post-COMMITTED verification/restoration chain can raise yet list."""
++
++    source = tmp_path / "final-commit.db"
++    destination = tmp_path / "final-commit-backups"
++    _seed_source(source)
++    original_pwrite = os.pwrite
++    original_verify = backup_module._verify_matching_artifact
++    original_unlink = Path.unlink
++    committed_written = False
++    postcommit_verifications = 0
++    restoration_writes = 0
++    cleanup_attempts = 0
++
++    def chained_state_write(descriptor, data, offset):
++        nonlocal committed_written, restoration_writes
++        if b'"phase":"COMMITTED"' in data:
++            written = original_pwrite(descriptor, data, offset)
++            committed_written = True
++            return written
++        if committed_written and (
++            b'"phase":"PENDING"' in data or b'"phase":"RETIRED"' in data
++        ):
++            restoration_writes += 1
++            raise OSError("injected restoration failure")
++        return original_pwrite(descriptor, data, offset)
++
++    def reject_postcommit_verification(path, state, descriptor):
++        nonlocal postcommit_verifications
++        if committed_written:
++            postcommit_verifications += 1
++            raise OSError("injected postcommit verification failure")
++        return original_verify(path, state, descriptor)
++
++    def reject_postcommit_cleanup(path: Path, *args, **kwargs):
++        nonlocal cleanup_attempts
++        if committed_written:
++            cleanup_attempts += 1
++            raise OSError("injected postcommit cleanup failure")
++        return original_unlink(path, *args, **kwargs)
++
++    monkeypatch.setattr(os, "pwrite", chained_state_write)
++    monkeypatch.setattr(
++        backup_module,
++        "_verify_matching_artifact",
++        reject_postcommit_verification,
++    )
++    monkeypatch.setattr(Path, "unlink", reject_postcommit_cleanup)
++
++    receipt = _create(source, destination)
++
++    assert committed_written is True
++    assert postcommit_verifications == 0
++    assert restoration_writes == 0
++    assert cleanup_attempts == 0
++    monkeypatch.setattr(os, "pwrite", original_pwrite)
++    monkeypatch.setattr(
++        backup_module,
++        "_verify_matching_artifact",
++        original_verify,
++    )
++    monkeypatch.setattr(Path, "unlink", original_unlink)
++    assert list_committed_backups(destination) == (receipt.path,)

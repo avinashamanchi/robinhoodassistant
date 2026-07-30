@@ -6,34 +6,85 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
 
-from ..broker.factory import build_broker, build_clock
-from ..config import Secrets, load_config
-from ..db.models import create_all
-from ..db.session import create_db_engine, make_session_factory
-from ..logging import configure_logging
+from ..app.limits import LimitStoreUnavailable
+from ..config import load_config
 from ..notifications.base import build_notifier
-from ..service import TradingService
+from ..security.secrets import RuntimeSecrets, load_role_secrets
+from .backoff import (
+    ScheduledMarketDataDenied,
+    scheduled_market_data_read,
+    trip_scheduled_market_data_breaker,
+)
 from .monitor import Monitor
 
 
 def build_monitor() -> Monitor:
-    from ..external_accounts.factory import build_external_source
-    from ..logging import register_all_secrets
+    from ..logging import runtime_startup
 
     config = load_config()
-    secrets = Secrets()
-    register_all_secrets(secrets)
-    engine = create_db_engine(secrets.database_url)
-    create_all(engine)
-    session_factory = make_session_factory(engine)
-    service = TradingService(
-        build_broker(config, secrets),
-        session_factory,
+    secrets = load_role_secrets("daemon", config=config)
+    with runtime_startup("daemon", secrets):
+        return _build_monitor(config, secrets)
+
+
+def _build_monitor(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    historical_alpaca_client_factory=None,
+    historical_coingecko_http=None,
+    historical_cache_dir=".cache/bars",
+) -> Monitor:
+    from .. import bootstrap
+
+    container = bootstrap.build_container(
         config,
-        build_clock(config, secrets),
-        external_source=build_external_source(config, secrets),
+        secrets,
+        runtime_role="daemon",
     )
+    try:
+        return _finish_monitor(
+            config,
+            secrets,
+            container=container,
+            historical_alpaca_client_factory=(
+                historical_alpaca_client_factory
+            ),
+            historical_coingecko_http=historical_coingecko_http,
+            historical_cache_dir=historical_cache_dir,
+        )
+    except BaseException:
+        guard = getattr(container, "runtime_tenure_guard", None)
+        if guard is not None and not guard.close():
+            raise RuntimeError(
+                "runtime_tenure_cleanup_uncertain"
+            ) from None
+        raise
+
+
+def _finish_monitor(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    container,
+    historical_alpaca_client_factory,
+    historical_coingecko_http,
+    historical_cache_dir,
+) -> Monitor:
+    service = container.service
+    runtime_tenure_guard = getattr(
+        container,
+        "runtime_tenure_guard",
+        None,
+    )
+    notifier = build_notifier(
+        config,
+        secrets,
+        runtime_role="daemon",
+    )
+    container.rule_worker.notifier = notifier
     shadow = None
     screen_source = None
     if config.features.shadow_mode:
@@ -45,15 +96,70 @@ def build_monitor() -> Monitor:
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
 
-        analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
-                       suppress_ranging=config.analyst.suppress_ranging)
-        planning = PlanningService(service, analyst, build_live_feature_provider(config, secrets), secrets)
+        analyst = Analyst(
+            build_llm_backend(
+                config,
+                secrets,
+                provider_budget=container.provider_budget,
+                category="analysis",
+                runtime_role="daemon",
+            ),
+            max_tokens=config.llm.max_tokens,
+            suppress_ranging=config.analyst.suppress_ranging,
+            max_attempts=(
+                config.security.provider_budget.max_structured_attempts
+            ),
+        )
+        historical_kwargs = {
+            "scheduled_service": service,
+            "rate_limiter": container.rate_limiter,
+            "alpaca_client_factory": (
+                historical_alpaca_client_factory
+            ),
+            "coingecko_http": historical_coingecko_http,
+            "cache_dir": historical_cache_dir,
+        }
+        planning = PlanningService(
+            service,
+            analyst,
+            build_live_feature_provider(
+                config,
+                secrets,
+                runtime_role="daemon",
+                **historical_kwargs,
+            ),
+            secrets,
+        )
         universe = config.screener.universe or config.risk.ticker_allowlist
-        screen_source = build_screen_source([s.upper() for s in universe], secrets)
+        screen_source = build_screen_source(
+            [s.upper() for s in universe],
+            secrets,
+            config=config,
+            runtime_role="daemon",
+            **historical_kwargs,
+        )
 
         def _price(sym: str):
             try:
-                return Decimal(str(service.broker.get_quote(sym).last))
+                quote = scheduled_market_data_read(
+                    lambda: service.broker.get_quote(sym),
+                    rate_limiter=container.rate_limiter,
+                    limit_config=(
+                        config.security.rate_limits.provider_read
+                    ),
+                )
+                return Decimal(str(quote.last))
+            except (ScheduledMarketDataDenied, LimitStoreUnavailable):
+                trip_scheduled_market_data_breaker(
+                    service,
+                    sym,
+                    actor="daemon:shadow",
+                    request_id=f"shadow-price:{uuid4().hex}",
+                    audit_reason=(
+                        "daemon scheduled shadow market data read"
+                    ),
+                )
+                return None
             except Exception:
                 return None
 
@@ -61,18 +167,35 @@ def build_monitor() -> Monitor:
 
     return Monitor(
         service,
-        build_notifier(config, secrets),
+        notifier,
         auto_execute=config.features.auto_execute_preapproved_rules,
         poll_interval_seconds=config.daemon.poll_interval_seconds,
         max_quote_age_seconds=config.daemon.max_quote_age_seconds,
+        cycle_timeout_seconds=config.daemon.cycle_timeout_seconds,
+        daily_task_timeout_seconds=config.daemon.daily_task_timeout_seconds,
         shadow=shadow,
         digest_source=screen_source,
+        rule_worker=container.rule_worker,
+        rate_limiter=container.rate_limiter,
+        leases=container.leases,
+        provider_budget=container.provider_budget,
+        policy_store_maintenance=getattr(
+            container,
+            "policy_store_maintenance",
+            None,
+        ),
+        runtime_tenure_guard=runtime_tenure_guard,
     )
 
 
 def main() -> None:
-    configure_logging()
-    asyncio.run(build_monitor().run())
+    from ..logging import runtime_startup
+
+    config = load_config()
+    secrets = load_role_secrets("daemon", config=config)
+    with runtime_startup("daemon", secrets):
+        monitor = _build_monitor(config, secrets)
+        asyncio.run(monitor.run())
 
 
 if __name__ == "__main__":

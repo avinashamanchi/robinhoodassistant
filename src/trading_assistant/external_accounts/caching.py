@@ -39,8 +39,11 @@ class CachingExternalSource:
             self._pos_cache = (time.monotonic(), positions)
             self.stale = False
             return positions
-        except Exception as exc:
-            log.warning("external positions fetch failed (%s); serving cache", type(exc).__name__)
+        except Exception:
+            log.warning(
+                "external positions fetch failed "
+                "code=external_read_failed; serving cache"
+            )
             self.stale = True
             return self._pos_cache[1] if self._pos_cache else []
 
@@ -52,8 +55,11 @@ class CachingExternalSource:
             self._sum_cache = (time.monotonic(), summary)
             self.stale = False
             return summary
-        except Exception as exc:
-            log.warning("external summary fetch failed (%s); serving cache", type(exc).__name__)
+        except Exception:
+            log.warning(
+                "external summary fetch failed "
+                "code=external_read_failed; serving cache"
+            )
             self.stale = True
             if self._sum_cache:
                 return replace(self._sum_cache[1], stale=True)
@@ -62,13 +68,18 @@ class CachingExternalSource:
     def get_order_history(self, days: int = 30) -> list[dict]:
         try:
             return self._inner.get_order_history(days)
-        except Exception as exc:
-            log.warning("external order history failed (%s)", type(exc).__name__)
+        except Exception:
+            log.warning(
+                "external order history failed "
+                "code=external_read_failed"
+            )
             return []
 
     def get_dividends(self, days: int = 90) -> list[dict]:
         try:
             return self._inner.get_dividends(days)
-        except Exception as exc:
-            log.warning("external dividends failed (%s)", type(exc).__name__)
+        except Exception:
+            log.warning(
+                "external dividends failed code=external_read_failed"
+            )
             return []

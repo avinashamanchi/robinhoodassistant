@@ -8,6 +8,9 @@ key twice returns the first order rather than creating a second.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -29,15 +32,23 @@ def _deterministic_price(ticker: str) -> Decimal:
 
 
 class MockBroker(BrokerClient):
+    reconciliation_key = "mock"
+
     def __init__(
         self,
         prices: Optional[dict[str, Decimal]] = None,
         positions: Optional[list[Position]] = None,
         buying_power: Decimal = Decimal(100_000),
+        *,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._prices = {k.upper(): v for k, v in (prices or {}).items()}
         self._positions = {p.ticker.upper(): p for p in (positions or [])}
+        self._session_open_prices = {
+            p.ticker.upper(): p.current_price for p in (positions or [])
+        }
         self._buying_power = buying_power
+        self._now = now
         # idempotency_key -> OrderResult (the authoritative record)
         self._orders_by_key: dict[str, OrderResult] = {}
         self._orders_by_id: dict[str, OrderResult] = {}
@@ -51,28 +62,58 @@ class MockBroker(BrokerClient):
     def set_price(self, ticker: str, price: Decimal) -> None:
         self._prices[ticker.upper()] = price
 
+    def set_session_open_price(self, ticker: str, price: Decimal) -> None:
+        self._session_open_prices[ticker.upper()] = price
+
     def get_quote(self, ticker: str) -> Quote:
         last = self.price_of(ticker)
         spread = (last * Decimal("0.001")).quantize(Decimal("0.01"))
+        source_time = self._now()
+        if source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=timezone.utc)
+        else:
+            source_time = source_time.astimezone(timezone.utc)
         return Quote(
             ticker=ticker.upper(),
             bid=last - spread,
             ask=last + spread,
             last=last,
             prev_close=last,  # flat prev close keeps day_change deterministic (0%)
+            as_of=source_time,
+            book_as_of=source_time,
+            trade_as_of=source_time,
         )
 
     # ── account / positions ────────────────────────────────────
     def get_account(self) -> Account:
         equity = self._buying_power + sum(
-            (p.market_value for p in self._positions.values()), Decimal(0)
+            (
+                position.qty * self.price_of(symbol)
+                for symbol, position in self._positions.items()
+            ),
+            Decimal(0),
         )
         return Account(
             buying_power=self._buying_power, equity=equity, cash=self._buying_power
         )
 
     def get_positions(self) -> list[Position]:
-        return list(self._positions.values())
+        return [
+            replace(
+                position,
+                current_price=self.price_of(symbol),
+                unrealized_intraday_pnl=(
+                    position.qty
+                    * (
+                        self.price_of(symbol)
+                        - self._session_open_prices.get(
+                            symbol, position.current_price
+                        )
+                    )
+                ),
+            )
+            for symbol, position in self._positions.items()
+        ]
 
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:
@@ -86,10 +127,24 @@ class MockBroker(BrokerClient):
             idempotency_key=order.idempotency_key,
             broker_order_id=broker_id,
             status=OrderStatus.SUBMITTED,
+            ticker=order.ticker,
         )
         self._orders_by_key[order.idempotency_key] = result
         self._orders_by_id[broker_id] = result
         return result
+
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
+        return self._orders_by_key.get(client_order_id)
+
+    def get_open_orders(self) -> list[OrderResult]:
+        return [
+            order
+            for order in self._orders_by_id.values()
+            if order.status in {
+                OrderStatus.SUBMITTED,
+                OrderStatus.PARTIALLY_FILLED,
+            }
+        ]
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         result = self.submit_order(order)
@@ -112,6 +167,7 @@ class MockBroker(BrokerClient):
             status=OrderStatus.CANCELED,
             filled_qty=result.filled_qty,
             avg_fill_price=result.avg_fill_price,
+            ticker=result.ticker,
         )
         self._orders_by_id[order_id] = canceled
         self._orders_by_key[result.idempotency_key] = canceled

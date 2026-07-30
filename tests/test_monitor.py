@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
+from threading import Event
+from types import SimpleNamespace
 
+import pytest
+from sqlalchemy import select
+
+from trading_assistant.app.limits import (
+    DurableRateLimiter,
+    LimitStoreUnavailable,
+)
+from trading_assistant.assets import AssetClass
+from trading_assistant.config import Secrets
 from trading_assistant.daemon.monitor import Monitor
+from trading_assistant.db.models import AuditEvent
 from trading_assistant.notifications.base import NullNotifier, RecordingNotifier
+from trading_assistant.ops.tenure import TenureLost, TenureUncertain
+from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.security.sensitive_fields import sensitive_store
 
 
 def _rule(svc, cond, action=None):
     action = action or {"side": "buy", "notional": "100"}
-    return svc.create_conditional_rule("AAPL", cond, action)
+    return svc.create_conditional_rule(
+        "AAPL",
+        cond,
+        action,
+        actor="operator:test",
+        reason="monitor test rule setup",
+        request_id="monitor-test-rule",
+    )
 
 
 def test_trigger_creates_proposal_and_notifies(make_service):
@@ -26,6 +49,46 @@ def test_trigger_creates_proposal_and_notifies(make_service):
     assert svc.broker.submit_calls == 0          # proposed, NOT executed
     assert len(notifier.sent) == 1
     assert len(svc.get_pending()) == 1
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="order.propose",
+            target_id=str(acted[0]["proposal"]["order_id"]),
+        ).one()
+        audit_reason = sensitive_store(session).read(audit, "reason")
+    assert audit.actor == "daemon:rules"
+    assert audit_reason == "daemon conditional rule evaluation"
+    assert audit.request_id
+
+
+def test_rule_risk_fault_persists_scoped_breaker_atomically(
+    make_service,
+):
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.risk.breakers import BreakerScope
+    from trading_assistant.risk.engine import (
+        BreakerTripIntent,
+        RiskResult,
+    )
+
+    svc = make_service()
+    _rule(svc, {"price_below": 175})
+    scope = BreakerScope.data(AssetClass.EQUITY)
+    svc._risk_for(AssetClass.EQUITY).check = (
+        lambda *_args, **_kwargs: RiskResult(
+            approved=False,
+            reasons=["quote is stale"],
+            breaker_trips=(
+                BreakerTripIntent(scope, "quote is stale"),
+            ),
+        )
+    )
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "rejected"
+    assert svc.breakers.is_tripped(scope)
+    assert svc.broker.submit_calls == 0
 
 
 def test_rule_is_one_shot(make_service):
@@ -36,30 +99,812 @@ def test_rule_is_one_shot(make_service):
     assert mon.tick() == []                       # already triggered; no re-fire
 
 
+def test_monitor_tick_delegates_only_to_rule_worker(make_service):
+    svc = make_service()
+    sentinel = [{"delegated": True}]
+
+    class StubWorker:
+        calls = 0
+
+        def tick(self, **context):
+            self.calls += 1
+            return sentinel
+
+    worker = StubWorker()
+    svc.propose_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("monitor must not propose directly")
+    )
+    svc.approve_order = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("monitor must not approve or submit")
+    )
+
+    monitor = Monitor(
+        svc, NullNotifier(), auto_execute=True, rule_worker=worker
+    )
+
+    assert monitor.tick() is sentinel
+    assert worker.calls == 1
+    assert svc.broker.submit_calls == 0
+
+
+def test_rule_lease_survives_when_application_crashes_before_transaction(
+    make_service,
+    caplog,
+):
+    from trading_assistant.db.models import Rule
+
+    svc = make_service()
+    rule_id = _rule(svc, {"price_below": 175})["rule_id"]
+
+    def fail_before(phase):
+        if phase == "before_transaction":
+            raise ConnectionError("database temporarily unavailable")
+
+    svc.rule_application.crash_hook = fail_before
+    result = Monitor(svc, NullNotifier()).tick()
+
+    assert result[0]["error"] == "rule_evaluation_failed"
+    assert "database temporarily unavailable" not in caplog.text
+    assert "ConnectionError" not in caplog.text
+    with svc.session_factory() as session:
+        assert session.get(Rule, rule_id).state == "active"
+
+
+def test_monitor_never_submits_even_when_auto_execute_argument_is_true(make_service):
+    svc = make_service()
+    _rule(svc, {"price_below": 175})
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert acted[0]["executed"] is None
+    assert svc.broker.submit_calls == 0
+
+
 def test_no_trigger_when_condition_unmet(make_service):
     svc = make_service()
     _rule(svc, {"price_below": 50})               # 100 is not below 50
     assert Monitor(svc, NullNotifier()).tick() == []
 
 
-def test_auto_execute_requires_preapproved(make_service):
+def test_tick_fetches_one_quote_per_ticker_even_with_many_rules(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    _rule(svc, {"price_below": 175})
+    _rule(svc, {"price_above": 150})
+    broker.quote_calls = 0
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert broker.quote_calls == 1
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["budget-denied", "store-unavailable"],
+)
+def test_scheduled_market_data_denial_makes_zero_broker_calls(
+    make_service,
+    store_unavailable,
+):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+            self.submit_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+        def submit_order(self, order):
+            self.submit_calls += 1
+            return super().submit_order(order)
+
+    class DenyingLimiter:
+        calls: list[tuple[object, str]]
+
+        def __init__(self):
+            self.calls = []
+
+        def consume_pair(self, spec, *, principal):
+            self.calls.append((spec, principal))
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "scheduled limiter unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    _rule(service, {"price_below": 175})
+    broker.quote_calls = 0
+    limiter = DenyingLimiter()
+
+    outcomes = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=limiter,
+    ).tick()
+
+    assert broker.quote_calls == 0
+    assert len(limiter.calls) == 1
+    spec, principal = limiter.calls[0]
+    assert spec.name == "provider_read"
+    assert principal == "provider:alpaca:market-data"
+    assert outcomes[0]["error"] == "rule_evaluation_failed"
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+    assert service.broker.submit_calls == 0
+
+
+def test_scheduled_market_data_gate_survives_limiter_reconstruction(
+    make_service,
+):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.config import WindowLimitConfig
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+            self.submit_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+        def submit_order(self, order):
+            self.submit_calls += 1
+            return super().submit_order(order)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    current = service.config.security.rate_limits.provider_read
+    provider_read = WindowLimitConfig(
+        requests=1,
+        global_requests=current.global_requests,
+        window_seconds=current.window_seconds,
+        concurrency=current.concurrency,
+        daily_requests=current.daily_requests,
+        global_daily_requests=current.global_daily_requests,
+    )
+    rate_limits = service.config.security.rate_limits.model_copy(
+        update={"provider_read": provider_read}
+    )
+    security = service.config.security.model_copy(
+        update={"rate_limits": rate_limits}
+    )
+    service.config = service.config.model_copy(
+        update={"security": security}
+    )
+    _rule(service, {"price_below": 50})
+    broker.quote_calls = 0
+
+    first = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=DurableRateLimiter(service.session_factory),
+    ).tick()
+    second = Monitor(
+        service,
+        NullNotifier(),
+        rate_limiter=DurableRateLimiter(service.session_factory),
+    ).tick()
+
+    assert first == []
+    assert second[0]["error"] == "rule_evaluation_failed"
+    assert broker.quote_calls == 1
+    assert service.broker.submit_calls == 0
+
+
+def test_each_scheduled_retry_requires_a_fresh_durable_allowance():
+    from trading_assistant.daemon.backoff import (
+        RetryPolicy,
+        ScheduledMarketDataDenied,
+        scheduled_market_data_read,
+    )
+    from trading_assistant.config import WindowLimitConfig
+
+    class AllowThenDeny:
+        calls = 0
+
+        def consume_pair(self, spec, *, principal):
+            self.calls += 1
+            return SimpleNamespace(allowed=self.calls == 1)
+
+    provider_calls = 0
+
+    def unavailable_provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        raise ConnectionError("scheduled provider unavailable")
+
+    limiter = AllowThenDeny()
+    delays: list[float] = []
+    limit = WindowLimitConfig(
+        requests=1,
+        global_requests=1,
+        window_seconds=60,
+        concurrency=1,
+    )
+
+    with pytest.raises(ScheduledMarketDataDenied):
+        scheduled_market_data_read(
+            unavailable_provider,
+            rate_limiter=limiter,
+            limit_config=limit,
+            retry_policy=RetryPolicy(
+                attempts=3,
+                base_seconds=0,
+                cap_seconds=0,
+                jitter_fraction=0,
+            ),
+            sleep=delays.append,
+        )
+
+    assert limiter.calls == 2
+    assert provider_calls == 1
+    assert delays == [0]
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["budget-denied", "store-unavailable"],
+)
+def test_daemon_shadow_quote_denial_uses_durable_data_breaker(
+    app_config,
+    make_service,
+    monkeypatch,
+    store_unavailable,
+):
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import live_features
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.llm import factory as llm_factory
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    class DenyingLimiter:
+        calls = 0
+
+        def consume_pair(self, spec, *, principal):
+            self.calls += 1
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "shadow scheduled limiter unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    service = make_service(broker=broker)
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            )
+        }
+    )
+    service.config = config
+    limiter = DenyingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args, **_kwargs: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+    monkeypatch.setattr(
+        live_features,
+        "build_live_feature_provider",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        live_features,
+        "build_screen_source",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    monitor = daemon_main._build_monitor(
+        config,
+        Secrets(app_api_token="shadow-read-test-secret"),
+    )
+    price = monitor.shadow.price_lookup("AAPL")
+
+    assert price is None
+    assert limiter.calls == 1
+    assert broker.quote_calls == 0
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+
+
+def test_production_daemon_builders_gate_every_historical_network_attempt(
+    app_config,
+    make_service,
+    monkeypatch,
+    tmp_path,
+):
+    import pandas as pd
+    import json
+    from contextlib import nullcontext
+
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import live_features
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.llm import factory as llm_factory
+
+    frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1_000.0],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-07-24T00:00:00Z"],
+            name="ts",
+        ),
+    )
+
+    class RecordingLimiter:
+        def __init__(self):
+            self.principals: list[str] = []
+
+        def consume_pair(self, _spec, *, principal):
+            self.principals.append(principal)
+            return SimpleNamespace(allowed=True)
+
+    class FakeAlpacaHistory:
+        def __init__(self):
+            self.calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            return SimpleNamespace(df=frame.copy())
+
+    class FakeResponse:
+        def __init__(self, payload, url):
+            self.payload = payload
+            self.headers = {}
+            self.request = SimpleNamespace(url=url)
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+        def iter_bytes(self):
+            yield json.dumps(self.payload).encode()
+
+    class FakeCoinGeckoHTTP:
+        def __init__(self):
+            self.calls = 0
+
+        def stream(self, method, url, *, params):
+            self.calls += 1
+            assert method == "GET"
+            if url.endswith("/ohlc"):
+                return nullcontext(
+                    FakeResponse(
+                        [[1672790400000, 100, 101, 99, 100.5]],
+                        url,
+                    )
+                )
+            return nullcontext(
+                FakeResponse({"total_volumes": [[1672790400000, 5000]]}, url)
+            )
+
+    captured = {}
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(
+            self,
+            _service,
+            _analyst,
+            feature_provider,
+            _secrets,
+        ):
+            captured["feature_provider"] = feature_provider
+
+    service = make_service()
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            ),
+            "screener": app_config.screener.model_copy(
+                update={"universe": ["AAPL", "BTC/USD"]}
+            ),
+        }
+    )
+    service.config = config
+    limiter = RecordingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    alpaca = FakeAlpacaHistory()
+    coingecko = FakeCoinGeckoHTTP()
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args, **_kwargs: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+    monkeypatch.setattr(
+        live_features,
+        "build_features",
+        lambda *_args, **_kwargs: SimpleNamespace(source="fake"),
+    )
+
+    monitor = daemon_main._build_monitor(
+        config,
+        Secrets(app_api_token="historical-builder-secret"),
+        historical_alpaca_client_factory=lambda *_args: alpaca,
+        historical_coingecko_http=coingecko,
+        historical_cache_dir=tmp_path,
+    )
+    captured["feature_provider"]("MSFT")
+    captured["feature_provider"]("ETH/USD")
+
+    assert monitor.shadow is not None
+    assert alpaca.calls == 3
+    assert coingecko.calls == 4
+    assert limiter.principals.count(
+        "provider:alpaca:market-data"
+    ) == 3
+    assert limiter.principals.count(
+        "provider:coingecko:market-data"
+    ) == 4
+    assert service.broker.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "store_unavailable",
+    [False, True],
+    ids=["denied", "store-unavailable"],
+)
+def test_production_daemon_historical_denial_trips_breakers_without_calls(
+    app_config,
+    make_service,
+    monkeypatch,
+    tmp_path,
+    store_unavailable,
+):
+    import trading_assistant.daemon.main as daemon_main
+    from trading_assistant import bootstrap
+    from trading_assistant.analyst import analyst as analyst_module
+    from trading_assistant.analyst import planning as planning_module
+    from trading_assistant.dependencies import RequiredDependencyUnavailable
+    from trading_assistant.llm import factory as llm_factory
+
+    class DenyingLimiter:
+        def __init__(self):
+            self.principals: list[str] = []
+
+        def consume_pair(self, _spec, *, principal):
+            self.principals.append(principal)
+            if store_unavailable:
+                raise LimitStoreUnavailable(
+                    "historical limiter store unavailable"
+                )
+            return SimpleNamespace(allowed=False)
+
+    class FakeAlpacaHistory:
+        calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            raise AssertionError("denied Alpaca history call")
+
+    class FakeCoinGeckoHTTP:
+        calls = 0
+
+        def get(self, _url, _params):
+            self.calls += 1
+            raise AssertionError("denied CoinGecko history call")
+
+    class StubAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class StubPlanning:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    service = make_service()
+    config = app_config.model_copy(
+        update={
+            "features": app_config.features.model_copy(
+                update={"shadow_mode": True}
+            ),
+            "screener": app_config.screener.model_copy(
+                update={"universe": ["AAPL", "BTC/USD"]}
+            ),
+        }
+    )
+    service.config = config
+    limiter = DenyingLimiter()
+    container = SimpleNamespace(
+        service=service,
+        rule_worker=SimpleNamespace(notifier=None),
+        rate_limiter=limiter,
+        leases=object(),
+        provider_budget=object(),
+    )
+    alpaca = FakeAlpacaHistory()
+    coingecko = FakeCoinGeckoHTTP()
+    monkeypatch.setattr(
+        bootstrap,
+        "build_container",
+        lambda *_args, **_kwargs: container,
+    )
+    monkeypatch.setattr(
+        daemon_main,
+        "build_notifier",
+        lambda *_args, **_kwargs: NullNotifier(),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "build_llm_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(analyst_module, "Analyst", StubAnalyst)
+    monkeypatch.setattr(planning_module, "PlanningService", StubPlanning)
+
+    with pytest.raises(RequiredDependencyUnavailable):
+        daemon_main._build_monitor(
+            config,
+            Secrets(app_api_token="historical-denial-secret"),
+            historical_alpaca_client_factory=lambda *_args: alpaca,
+            historical_coingecko_http=coingecko,
+            historical_cache_dir=tmp_path,
+        )
+
+    assert alpaca.calls == 0
+    assert coingecko.calls == 0
+    assert "provider:alpaca:market-data" in limiter.principals
+    assert "provider:coingecko:market-data" in limiter.principals
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.EQUITY)
+    )
+    assert service.breakers.is_tripped(
+        BreakerScope.data(AssetClass.CRYPTO)
+    )
+    assert service.broker.submit_calls == 0
+
+
+def test_tick_quote_cache_covers_two_ticker_risk_snapshot(make_service):
+    from collections import Counter
+
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__(
+                positions=[
+                    Position(
+                        "MSFT",
+                        Decimal("1"),
+                        Decimal("100"),
+                        Decimal("100"),
+                    )
+                ]
+            )
+            self.quote_calls = Counter()
+
+        def get_quote(self, ticker):
+            self.quote_calls[ticker.upper()] += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("MSFT", Decimal("100"))
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    svc.create_conditional_rule(
+        "MSFT",
+        {"price_above": 150},
+        {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor multi-symbol rule setup",
+        request_id="monitor-msft-rule",
+    )
+    _rule(svc, {"price_below": 175})
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert broker.quote_calls == {"MSFT": 1, "AAPL": 1}
+
+
+def test_snapshot_expansion_flows_back_to_tick_quote_cache(make_service):
+    from collections import Counter
+
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__(
+                positions=[
+                    Position(
+                        "MSFT",
+                        Decimal("1"),
+                        Decimal("100"),
+                        Decimal("100"),
+                    )
+                ]
+            )
+            self.quote_calls = Counter()
+
+        def get_quote(self, ticker):
+            self.quote_calls[ticker.upper()] += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    broker.set_price("MSFT", Decimal("100"))
+    svc = make_service(broker=broker)
+    _rule(svc, {"price_below": 175})
+    svc.create_conditional_rule(
+        "MSFT",
+        {"price_above": 150},
+        {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor grouped rule setup",
+        request_id="monitor-grouped-rule",
+    )
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert broker.quote_calls == {"AAPL": 1, "MSFT": 1}
+
+
+def test_tick_does_not_poll_equity_quotes_while_market_is_closed(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker, market_open=False)
+    _rule(svc, {"price_below": 175})
+    broker.quote_calls = 0
+
+    assert Monitor(svc, NullNotifier()).tick() == []
+    assert broker.quote_calls == 0
+
+
+def test_closed_equity_clock_does_not_stop_crypto_monitoring(make_service):
+    from trading_assistant.broker.mock import MockBroker
+
+    class CountingBroker(MockBroker):
+        quote_calls = 0
+
+        def get_quote(self, ticker):
+            self.quote_calls += 1
+            return super().get_quote(ticker)
+
+    broker = CountingBroker()
+    broker.set_price("BTC/USD", Decimal("50000"))
+    svc = make_service(broker=broker, market_open=False)
+    svc.create_conditional_rule(
+        "BTC/USD",
+        {"price_below": 60000},
+        {"side": "buy", "notional": "100"},
+        actor="operator:test",
+        reason="monitor crypto rule setup",
+        request_id="monitor-crypto-rule",
+    )
+    broker.quote_calls = 0
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["proposal"]["status"] == "proposed"
+    assert broker.quote_calls > 0
+
+
+def test_preapproved_database_row_is_rejected_instead_of_autoexecuted(make_service):
     from trading_assistant.db.models import Rule
 
     svc = make_service()
-    created = _rule(svc, {"price_below": 175})
-    # Ad-hoc rule (not pre-approved): flag on, but it must NOT auto-execute.
-    assert Monitor(svc, NullNotifier(), auto_execute=True).tick()[0]["executed"] is None
-    assert svc.broker.submit_calls == 0
-
-    # Mark it pre-approved (as plan approval would) -> now it auto-executes.
-    svc2 = make_service()
-    rid = _rule(svc2, {"price_below": 175})["rule_id"]
-    with svc2.session_factory() as s:
+    rid = _rule(svc, {"price_below": 175})["rule_id"]
+    with svc.session_factory() as s:
         s.get(Rule, rid).pre_approved = True
         s.commit()
-    acted = Monitor(svc2, NullNotifier(), auto_execute=True).tick()
-    assert acted[0]["executed"]["executed"] is True
-    assert svc2.broker.submit_calls == 1
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert acted[0]["proposal"] is None
+    assert acted[0]["error"] == "rule_load_failed"
+    assert svc.broker.submit_calls == 0
 
 
 def test_crash_safe_rules_persist(make_service):
@@ -72,13 +917,465 @@ def test_crash_safe_rules_persist(make_service):
     assert len(mon2.tick()) == 1
 
 
+def test_startup_no_longer_recovers_legacy_per_rule_processing_claims(make_service):
+    svc = make_service()
+
+    summary = Monitor(svc, NullNotifier()).reconcile()
+
+    assert summary["claims_recovered"] == 0
+    assert not hasattr(Monitor, "_claim_rule")
+
+
+def test_startup_reconcile_syncs_terminal_broker_order_before_positions(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import (
+        BrokerFill,
+        OrderResult,
+        OrderStatus,
+        Position,
+    )
+    from trading_assistant.db.models import Order, utcnow
+
+    class ActivityBroker(MockBroker):
+        activities = []
+
+        def get_fill_activities(self, after=None):
+            return list(self.activities)
+
+    broker = ActivityBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    oid = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        qty="4",
+        actor="operator:test",
+        reason="monitor reconciliation proposal",
+        request_id="monitor-reconciliation-proposal",
+    )["order_id"]
+    svc.approve_order(
+        oid,
+        actor="operator:test",
+        reason="monitor reconciliation test",
+        request_id="monitor-reconciliation-approval",
+    )
+
+    with svc.session_factory() as s:
+        local = s.get(Order, oid)
+        broker_id = local.broker_order_id
+        client_id = local.idempotency_key
+        assert local.status == "submitted"
+
+    # Simulate Alpaca having filled while the daemon was offline.
+    filled = OrderResult(
+        client_id,
+        broker_id,
+        OrderStatus.FILLED,
+        filled_qty=Decimal("4"),
+        avg_fill_price=Decimal("100"),
+    )
+    broker._orders_by_id[broker_id] = filled
+    broker._orders_by_key[client_id] = filled
+    broker.activities = [
+        BrokerFill(
+            broker_fill_id="startup-fill-1",
+            broker_order_id=broker_id,
+            ticker="AAPL",
+            side="buy",
+            qty=Decimal("4"),
+            price=Decimal("100"),
+            filled_at=utcnow(),
+        )
+    ]
+    broker._positions["AAPL"] = Position(
+        "AAPL", Decimal("4"), Decimal("100"), Decimal("100")
+    )
+
+    summary = Monitor(svc, NullNotifier()).reconcile()
+
+    assert summary["order_sync"]["newly_filled"] == 1
+    assert summary["position_reconciliation"]["reconciled"] is True
+    with svc.session_factory() as s:
+        assert s.get(Order, oid).status == "filled"
+
+
+def test_startup_monitor_delegates_to_reconciliation_service(make_service):
+    from trading_assistant.orders.reconciliation import ReconciliationReport
+
+    svc = make_service()
+    report = ReconciliationReport(1, (), 2, 3, ())
+    observed_context = {}
+
+    def sync_with_context(**context):
+        observed_context.update(context)
+        return svc.serialize_reconciliation_report(report)
+
+    svc.sync_open_orders = sync_with_context
+
+    summary = Monitor(svc, NullNotifier()).reconcile()
+
+    assert summary["order_sync"]["resolved_unknown"] == 1
+    assert summary["order_sync"]["synced_orders"] == 2
+    assert summary["order_sync"]["inserted_fills"] == 3
+    assert observed_context["actor"] == "daemon:startup"
+    assert (
+        observed_context["reason"]
+        == "daemon startup broker order reconciliation"
+    )
+    assert observed_context["request_id"]
+
+
 def test_daemon_loop_body_runs_clean(make_service):
     # One full loop body: fill sync + daily-loss enforcement + rule tick + daily tasks.
     svc = make_service()
     mon = Monitor(svc, NullNotifier())
-    svc.sync_open_orders()
-    svc.enforce_daily_loss_limits()
+    svc.sync_open_orders(
+        actor="operator:test",
+        reason="monitor loop body setup",
+        request_id="monitor-loop-body-sync",
+    )
+    svc.enforce_daily_loss_limits(
+        actor="daemon:test",
+        reason="monitor loop daily loss check",
+        request_id="monitor-loop-daily-loss",
+    )
     mon.tick()
     mon.run_daily_tasks()
     svc.write_heartbeat("daemon")
     assert svc.health()["db_ok"] is True and svc.health()["daemon_alive"] is True
+
+
+def test_daily_tasks_run_bounded_policy_store_pruning_once_and_report_posture(
+    make_service,
+):
+    from datetime import date
+
+    calls = []
+
+    class Posture:
+        def as_dict(self):
+            return {
+                "status": "degraded",
+                "source": "daily",
+                "limit": 500,
+                "rate_windows_deleted": 0,
+                "leases_deleted": 4,
+                "failed_stores": ["rate_windows"],
+            }
+
+    class Maintenance:
+        def prune_once(self, *, source, limit):
+            calls.append((source, limit))
+            return Posture()
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        policy_store_maintenance=Maintenance(),
+    )
+    today = date(2026, 7, 27)
+
+    first = monitor.run_daily_tasks(today=today)
+    second = monitor.run_daily_tasks(today=today)
+
+    assert calls == [("daily", 500)]
+    assert first["policy_store_pruning"] == Posture().as_dict()
+    assert second == {"ran": False}
+
+
+def test_slow_daily_analysis_does_not_block_heartbeat_cycles(make_service):
+    daily_started = Event()
+    daily_release = Event()
+    daily_finished = Event()
+
+    class SlowShadow:
+        def grade_due(self):
+            daily_started.set()
+            try:
+                daily_release.wait()
+                return 0
+            finally:
+                daily_finished.set()
+
+        def run_once(self):
+            return []
+
+    svc = make_service()
+    heartbeat_count = 0
+    original_write = svc.write_heartbeat
+
+    def count_heartbeat(source="daemon"):
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        return original_write(source)
+
+    svc.write_heartbeat = count_heartbeat
+    monitor = Monitor(
+        svc,
+        NullNotifier(),
+        poll_interval_seconds=0.01,
+        cycle_timeout_seconds=1.0,
+        daily_task_timeout_seconds=0.02,
+        shadow=SlowShadow(),
+    )
+
+    async def scenario():
+        async def wait_until(condition, description):
+            async def poll():
+                while not condition():
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(poll(), timeout=5)
+            except TimeoutError:
+                pytest.fail(f"timed out waiting for {description}")
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(monitor.run(stop))
+        try:
+            await wait_until(daily_started.is_set, "daily analysis to start")
+            blocked_heartbeat_count = heartbeat_count
+            await wait_until(
+                lambda: heartbeat_count >= blocked_heartbeat_count + 3,
+                "three heartbeats during daily analysis",
+            )
+            assert daily_release.is_set() is False
+            assert daily_finished.is_set() is False
+        finally:
+            daily_release.set()
+            try:
+                if daily_started.is_set():
+                    await wait_until(
+                        daily_finished.is_set,
+                        "daily analysis to finish",
+                    )
+            finally:
+                stop.set()
+                await asyncio.wait_for(task, timeout=5)
+                if monitor._daily_task is not None:
+                    await asyncio.wait_for(monitor._daily_task, timeout=5)
+
+    asyncio.run(scenario())
+
+    assert heartbeat_count >= 3
+
+
+def test_core_cycle_can_recover_after_a_transient_failure(make_service):
+    monitor = Monitor(make_service(), NullNotifier(), cycle_timeout_seconds=0.2)
+    calls = 0
+
+    def flaky_cycle():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("temporary broker disconnect")
+
+    monitor._core_cycle = flaky_cycle
+
+    async def scenario():
+        with pytest.raises(ConnectionError):
+            await monitor._bounded_core_cycle()
+        await monitor._bounded_core_cycle()
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+def test_read_retry_is_bounded_and_does_not_wrap_mutations():
+    from trading_assistant.daemon.backoff import RetryPolicy, retry_read
+
+    calls = 0
+    delays: list[float] = []
+
+    def flaky_read():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise ConnectionError("temporary read outage")
+        return "quote"
+
+    result = retry_read(
+        flaky_read,
+        RetryPolicy(
+            attempts=3,
+            base_seconds=1,
+            cap_seconds=2,
+            jitter_fraction=0,
+        ),
+        sleep=delays.append,
+    )
+
+    assert result == "quote"
+    assert calls == 3
+    assert delays == [1, 2]
+
+
+def test_daemon_does_not_retry_a_failed_mutating_cycle(
+    make_service,
+):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()
+    monitor = Monitor(
+        service,
+        NullNotifier(),
+        cycle_timeout_seconds=0.2,
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    stop = asyncio.Event()
+    calls = 0
+
+    def failed_cycle():
+        nonlocal calls
+        calls += 1
+        stop.set()
+        raise ConnectionError("one failed mutating cycle")
+
+    monitor._core_cycle = failed_cycle
+    with pytest.raises(ConnectionError, match="failed mutating cycle"):
+        asyncio.run(monitor.run(stop))
+
+    assert calls == 1
+    breaker = service.breakers.get(BreakerScope.operator_global())
+    assert breaker is not None and breaker.tripped is True
+
+
+def test_runtime_reconciliation_failure_trips_switches_before_rules(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    svc = make_service()
+    monitor = Monitor(svc, NullNotifier())
+    svc.sync_open_orders = lambda **context: {
+        "synced": 0,
+        "newly_filled": 0,
+        "failed": 1,
+        "fills_repaired": 0,
+    }
+    rules_evaluated = False
+
+    def unsafe_tick():
+        nonlocal rules_evaluated
+        rules_evaluated = True
+
+    monitor.tick = unsafe_tick
+
+    with pytest.raises(RuntimeError, match="order reconciliation"):
+        monitor._core_cycle()
+
+    assert rules_evaluated is False
+    state = svc.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.actor == "daemon:monitor"
+
+
+def test_runtime_reconciliation_failure_trips_global_breaker_once(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()
+    monitor = Monitor(
+        service,
+        NullNotifier(),
+        cycle_timeout_seconds=0.2,
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    service.sync_open_orders = lambda **context: {
+        "synced": 0,
+        "newly_filled": 0,
+        "failed": 1,
+        "fills_repaired": 0,
+    }
+
+    with pytest.raises(RuntimeError, match="order reconciliation"):
+        asyncio.run(monitor.run(asyncio.Event()))
+
+    state = service.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.generation == 1
+
+
+def test_startup_reconciliation_failure_trips_switches_and_stops(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    svc = make_service()
+    monitor = Monitor(svc, NullNotifier(), cycle_timeout_seconds=0.2)
+    monitor.reconcile = lambda: {
+        "active": 1,
+        "triggered": 0,
+        "order_sync": {"synced": 0, "newly_filled": 0, "failed": 1},
+        "position_reconciliation": {"reconciled": True, "drift": {}},
+    }
+
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        asyncio.run(monitor.run(asyncio.Event()))
+
+    state = svc.breakers.get(BreakerScope.operator_global())
+    assert state is not None and state.tripped is True
+    assert state.actor == "daemon:startup"
+
+
+def test_daemon_tenure_loss_exits_before_startup_reconciliation(
+    make_service,
+):
+    calls: list[str] = []
+
+    class LostGuard:
+        def start(self):
+            calls.append("start")
+
+        def ensure_owned(self):
+            calls.append("ensure")
+            raise TenureLost()
+
+        def close(self):
+            calls.append("close")
+            return False
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        runtime_tenure_guard=LostGuard(),
+    )
+    monitor.reconcile = lambda: calls.append("reconcile")
+
+    with pytest.raises(TenureLost):
+        asyncio.run(monitor.run(asyncio.Event()))
+
+    assert calls == ["ensure", "close"]
+
+
+def test_daemon_normal_exit_fails_closed_when_release_is_uncertain(
+    make_service,
+):
+    calls: list[str] = []
+
+    class UncertainReleaseGuard:
+        def ensure_owned(self):
+            calls.append("ensure")
+
+        def close(self):
+            calls.append("close")
+            return False
+
+    monitor = Monitor(
+        make_service(),
+        NullNotifier(),
+        runtime_tenure_guard=UncertainReleaseGuard(),
+    )
+    monitor.reconcile = lambda: {
+        "order_sync": {"failed": 0},
+        "position_reconciliation": {"reconciled": True},
+    }
+    stop = asyncio.Event()
+    stop.set()
+
+    with pytest.raises(TenureUncertain):
+        asyncio.run(monitor.run(stop))
+
+    assert calls == ["ensure", "close"]

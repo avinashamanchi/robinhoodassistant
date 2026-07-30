@@ -45,7 +45,14 @@ def test_flash_crash_trips_killswitch_and_no_duplicate_stop(session_factory, moc
     assert loss == Decimal("-2500")
 
     with session_factory() as s:
-        tripped = KillSwitch.evaluate_daily_loss(s, loss, Decimal("500"), EQ)
+        tripped = KillSwitch.evaluate_daily_loss(
+            s,
+            loss,
+            Decimal("500"),
+            EQ,
+            actor="test:stress",
+            request_id="stress-equity-daily-loss",
+        )
         s.commit()
         assert tripped is True
         assert KillSwitch.is_tripped(s, EQ) is True
@@ -84,7 +91,7 @@ def test_whipsaw_ladder_respects_position_limit(risk_config, make_snapshot):
             positions=[Position("AAPL", held, Decimal("100"), Decimal("100"))],
         )
         order = OrderRequest("AAPL", OrderSide.BUY, OrderType.MARKET, f"k{_}", notional=Decimal("500"))
-        result = engine.check(order, snap, killswitch_tripped=False, market_open=True)
+        result = engine.check(order, snap)
         if result.approved:
             held += Decimal("5")  # 5 shares filled
             approvals += 1
@@ -98,6 +105,23 @@ def test_stale_quote_blocked():
     fresh = NOW
     assert is_stale(fresh - timedelta(seconds=120), now=fresh, max_age_seconds=60) is True
     assert is_stale(fresh - timedelta(seconds=5), now=fresh, max_age_seconds=60) is False
+    assert (
+        is_stale(
+            fresh + timedelta(seconds=6),
+            now=fresh,
+            max_age_seconds=60,
+        )
+        is True
+    )
+    assert (
+        is_stale(
+            fresh + timedelta(seconds=5),
+            now=fresh,
+            max_age_seconds=60,
+        )
+        is False
+    )
+    assert is_stale(None, now=fresh, max_age_seconds=60) is True
 
 
 # ── 5. Crypto weekend dump: crypto trips, equity untouched ──────
@@ -105,14 +129,29 @@ def test_crypto_dump_isolates_equity(make_service):
     svc = make_service(market_open=False)  # equity market closed (weekend)
     svc.broker.set_price("BTC/USD", Decimal("100"))
     with svc.session_factory() as s:
-        KillSwitch.evaluate_daily_loss(s, Decimal("-3000"), Decimal("500"), CR)
+        KillSwitch.evaluate_daily_loss(
+            s,
+            Decimal("-3000"),
+            Decimal("500"),
+            CR,
+            actor="test:stress",
+            request_id="stress-crypto-daily-loss",
+        )
         s.commit()
         assert KillSwitch.is_tripped(s, CR) is True
         assert KillSwitch.is_tripped(s, EQ) is False  # equity independent
 
-    crypto = svc.propose_order("BTC/USD", "buy", "market", notional="100")
+    crypto = svc.propose_order(
+        "BTC/USD",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:stress-test",
+        reason="stress crypto proposal",
+        request_id="stress-crypto-proposal",
+    )
     assert crypto["status"] == "rejected"
-    assert any("kill switch" in r for r in crypto["risk_reasons"])
+    assert any("circuit breaker" in r for r in crypto["risk_reasons"])
 
 
 # ── 6. Stale-approval replay: price moves before execution ──────
@@ -120,12 +159,25 @@ def test_stale_approval_rejected_on_price_move(make_service):
     svc = make_service()
     svc.broker.set_price("AAPL", Decimal("100"))
     svc.broker._positions["AAPL"] = Position("AAPL", Decimal("15"), Decimal("100"), Decimal("100"))
-    order_id = svc.propose_order("AAPL", "buy", "market", notional="500")["order_id"]
+    order_id = svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="500",
+        actor="operator:stress-test",
+        reason="stress stale approval proposal",
+        request_id="stress-stale-proposal",
+    )["order_id"]
     assert svc.get_order_status(order_id)["status"] == "proposed"
 
     # Price jumps 10% between proposal and approval -> execution re-check refuses.
     svc.broker.set_price("AAPL", Decimal("110"))
-    result = svc.approve_order(order_id)
+    result = svc.approve_order(
+        order_id,
+        actor="operator:stress-test",
+        reason="stale approval drill",
+        request_id="stress-stale-approval",
+    )
     assert result["executed"] is False
     assert result["status"] == "rejected"
     assert svc.broker.submit_calls == 0

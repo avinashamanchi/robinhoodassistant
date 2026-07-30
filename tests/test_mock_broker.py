@@ -9,6 +9,7 @@ from trading_assistant.broker.models import (
     OrderSide,
     OrderStatus,
     OrderType,
+    Position,
 )
 
 
@@ -44,9 +45,42 @@ def test_idempotent_submit_does_not_double_order(mock_broker):
     assert third.broker_order_id != first.broker_order_id
 
 
+def test_get_order_by_client_id_returns_none_or_prior_order_without_submitting(mock_broker):
+    assert mock_broker.get_order_by_client_id("missing") is None
+
+    submitted = mock_broker.submit_order(_order("key-lookup"))
+
+    assert mock_broker.get_order_by_client_id("key-lookup") == submitted
+
+
 def test_status_and_cancel(mock_broker):
     result = mock_broker.submit_order(_order("key-x"))
     fetched = mock_broker.get_order_status(result.broker_order_id)
     assert fetched.broker_order_id == result.broker_order_id
     canceled = mock_broker.cancel_order(result.broker_order_id)
     assert canceled.status is OrderStatus.CANCELED
+
+
+def test_get_open_orders_only_returns_live_broker_orders(mock_broker):
+    first = mock_broker.submit_order(_order("open"))
+    second = mock_broker.submit_order(_order("cancel"))
+    mock_broker.cancel_order(second.broker_order_id)
+
+    assert mock_broker.get_open_orders() == [first]
+
+
+def test_positions_compute_intraday_pnl_from_controlled_session_open():
+    from trading_assistant.broker.mock import MockBroker
+
+    broker = MockBroker(
+        positions=[
+            Position("AAPL", Decimal("2"), Decimal("90"), Decimal("100"))
+        ]
+    )
+    broker.set_session_open_price("AAPL", Decimal("95"))
+    broker.set_price("AAPL", Decimal("105"))
+
+    (position,) = broker.get_positions()
+
+    assert position.current_price == Decimal("105")
+    assert position.unrealized_intraday_pnl == Decimal("20")

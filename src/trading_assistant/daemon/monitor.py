@@ -1,10 +1,8 @@
 """Monitoring daemon.
 
-Polls quotes for tickers with active conditional rules; when a rule triggers it
-creates a PENDING proposal (routed through the risk engine like any order) and
-sends a notification. It never bypasses the human gate unless
-``features.auto_execute_preapproved_rules`` is explicitly on — and even then
-execution re-runs the risk engine.
+Delegates conditional-rule evaluation to :class:`RuleWorker`. A firing creates
+a PENDING proposal routed through the risk engine and sends a notification.
+This phase never auto-approves and never submits a broker order.
 
 Crash-safe: rules live in the DB, so a restarted daemon resumes from persisted
 state. Rules are one-shot (active -> triggered) to avoid re-firing every tick.
@@ -13,20 +11,25 @@ state. Rules are one-shot (active -> triggered) to avoid re-firing every tick.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any, Optional
+from uuid import uuid4
 
 from sqlalchemy import select
 
+from ..app.limits import PolicyStoreMaintenance
 from ..db.models import Rule
 from ..notifications.base import Notifier, NullNotifier
-from ..risk.staleness import is_stale
+from ..operations import MutationContext
+from ..ops.tenure import TenureUncertain
+from ..rules.worker import RuleWorker
 from ..service import TradingService
-from . import rules_engine
-from .backoff import next_delay
 
 log = logging.getLogger(__name__)
+
+
+class _KillSwitchesAlreadyTripped(RuntimeError):
+    """Signal that the current failure already durably latched safety."""
 
 
 class Monitor:
@@ -38,123 +41,68 @@ class Monitor:
         auto_execute: bool = False,
         poll_interval_seconds: float = 15.0,
         max_quote_age_seconds: float = 60.0,
+        cycle_timeout_seconds: float = 90.0,
+        daily_task_timeout_seconds: float = 120.0,
         shadow=None,
         digest_source=None,
+        rule_worker=None,
+        rate_limiter=None,
+        leases=None,
+        provider_budget=None,
+        policy_store_maintenance=None,
+        runtime_tenure_guard=None,
     ) -> None:
         self.service = service
         self.notifier = notifier or NullNotifier()
-        self.auto_execute = auto_execute
+        # Retained as a compatibility argument only. RuleWorker has no approval
+        # or submission dependency, so even a stale true setting cannot trade.
+        self.auto_execute = False
         self.poll_interval = poll_interval_seconds
         self.max_quote_age_seconds = max_quote_age_seconds
+        self.cycle_timeout = cycle_timeout_seconds
+        self.daily_task_timeout = daily_task_timeout_seconds
         self.shadow = shadow                 # ShadowRunner or None (D1)
         self.digest_source = digest_source   # screen source for the digest (D2)
         self._last_daily = None              # date of last daily-tasks run
+        self._core_task: Optional[asyncio.Task[Any]] = None
+        self._daily_task: Optional[asyncio.Task[Any]] = None
+        self.rate_limiter = rate_limiter
+        self.leases = leases
+        self.provider_budget = provider_budget
+        self.policy_store_maintenance = policy_store_maintenance
+        self.runtime_tenure_guard = runtime_tenure_guard
+        if (
+            self.policy_store_maintenance is None
+            and rate_limiter is not None
+            and leases is not None
+        ):
+            self.policy_store_maintenance = PolicyStoreMaintenance(
+                rate_limiter,
+                leases,
+            )
+        self.rule_worker = rule_worker or RuleWorker(
+            service,
+            service.rule_repository,
+            service.rule_application,
+            self.notifier,
+            max_quote_age_seconds=max_quote_age_seconds,
+            rate_limiter=rate_limiter,
+            leases=leases,
+            provider_budget=provider_budget,
+        )
 
     # ── one evaluation pass (synchronous, testable) ────────────
-    def _active_rules(self) -> list[dict[str, Any]]:
-        with self.service.session_factory() as s:
-            rules = s.execute(select(Rule).where(Rule.state == "active")).scalars().all()
-            return [
-                {
-                    "id": r.id, "ticker": r.ticker, "kind": r.kind,
-                    "condition": json.loads(r.condition_json),
-                    "action": json.loads(r.action_json),
-                    "hwm": r.hwm, "deadline": r.deadline,
-                    "pre_approved": r.pre_approved, "plan_id": r.plan_id,
-                }
-                for r in rules
-            ]
-
-    def _mark_triggered(self, rule_id: int) -> bool:
-        """Atomically flip active -> triggered. Returns False if already handled."""
-        with self.service.session_factory() as s:
-            rule = s.get(Rule, rule_id)
-            if rule is None or rule.state != "active":
-                return False
-            rule.state = "triggered"
-            s.commit()
-            return True
-
-    def _persist_hwm(self, rule_id: int, hwm) -> None:
-        with self.service.session_factory() as s:
-            rule = s.get(Rule, rule_id)
-            if rule is not None:
-                rule.hwm = hwm
-                s.commit()
-
-    def _cancel_siblings(self, plan_id: int, except_id: int) -> int:
-        """OCO: atomically cancel all other active rules in the plan group."""
-        if plan_id is None:
-            return 0
-        with self.service.session_factory() as s:
-            sibs = s.execute(
-                select(Rule).where(
-                    Rule.plan_id == plan_id,
-                    Rule.state == "active",
-                    Rule.id != except_id,
-                )
-            ).scalars().all()
-            for r in sibs:
-                r.state = "canceled"
-            s.commit()
-            return len(sibs)
-
-    def _fires(self, rule: dict, quote) -> bool:
-        # Staleness gate (A4): never fire on a quote older than the threshold.
-        if is_stale(quote.as_of, max_age_seconds=self.max_quote_age_seconds):
-            log.warning("rule %s skipped: quote stale (> %ss)", rule["id"], self.max_quote_age_seconds)
-            return False
-        kind = rule["kind"]
-        if kind == "trailing":
-            pct = rule["condition"].get("trailing_stop_pct")
-            fires, new_hwm = rules_engine.update_trailing_stop(rule["hwm"], quote.last, pct)
-            self._persist_hwm(rule["id"], new_hwm)  # persist HWM every tick
-            return fires
-        if kind == "time":
-            return rules_engine.time_stop_fires(rule["deadline"])
-        return rules_engine.evaluate(rule["condition"], quote)
-
-    def tick(self) -> list[dict[str, Any]]:
-        actions: list[dict[str, Any]] = []
-        for rule in self._active_rules():
-            rule_id, ticker, action = rule["id"], rule["ticker"], rule["action"]
-            quote = self.service.broker.get_quote(ticker)
-            if not self._fires(rule, quote):
-                continue
-            # Claim the rule first so a concurrent tick can't double-fire it.
-            if not self._mark_triggered(rule_id):
-                continue
-
-            proposal = self.service.propose_order(
-                ticker=ticker,
-                side=action["side"],
-                order_type=action.get("order_type", "market"),
-                qty=action.get("qty"),
-                notional=action.get("notional"),
-                limit_price=action.get("limit_price"),
-            )
-            self.notifier.send(
-                f"Rule {rule_id} ({rule['kind']}) triggered on {ticker}: "
-                f"proposal #{proposal['order_id']} [{proposal['status']}]"
-            )
-
-            executed = None
-            # Only PRE-APPROVED plan rules auto-exec, and only when the flag is on;
-            # ad-hoc rules always await human approval. Execution still passes the
-            # full risk engine.
-            if self.auto_execute and rule["pre_approved"] and proposal["status"] == "proposed":
-                executed = self.service.approve_order(proposal["order_id"])
-
-            # OCO: a full-exit rule (stop/trailing/time) cancels the plan's siblings.
-            canceled = 0
-            if rule["kind"] in ("stop", "trailing", "time") and rule["plan_id"] is not None:
-                canceled = self._cancel_siblings(rule["plan_id"], rule_id)
-
-            actions.append(
-                {"rule_id": rule_id, "proposal": proposal, "executed": executed,
-                 "oco_canceled": canceled}
-            )
-        return actions
+    def tick(self):
+        context = MutationContext(
+            actor="daemon:rules",
+            reason="daemon conditional rule evaluation",
+            request_id=uuid4().hex,
+        )
+        return self.rule_worker.tick(
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
+        )
 
     def run_daily_tasks(self, today=None) -> dict[str, Any]:
         """Once per day: grade matured shadow calls, run a fresh shadow batch, and
@@ -166,12 +114,20 @@ class Monitor:
             return {"ran": False}
         self._last_daily = today
         result: dict[str, Any] = {"ran": True}
+        if self.policy_store_maintenance is not None:
+            pruning = self.policy_store_maintenance.prune_once(
+                source="daily",
+                limit=500,
+            )
+            result["policy_store_pruning"] = pruning.as_dict()
         if self.shadow is not None:
             try:
                 result["shadow_graded"] = self.shadow.grade_due()
                 result["shadow_new"] = len(self.shadow.run_once())
             except Exception:
-                log.exception("shadow tasks failed")
+                log.error(
+                    "shadow tasks failed code=shadow_tasks_failed"
+                )
         try:
             from ..analyst.digest import compose_digest
 
@@ -179,12 +135,27 @@ class Monitor:
                                               screen_source=self.digest_source))
             result["digest_sent"] = True
         except Exception:
-            log.exception("digest failed")
+            log.error("digest failed code=digest_failed")
         return result
 
     # ── reconciliation on restart ──────────────────────────────
-    def reconcile(self) -> dict[str, int]:
-        """Rules persist in the DB; report the resumable state on startup."""
+    def reconcile(self) -> dict[str, Any]:
+        """Synchronize broker truth before resuming persisted rules on startup."""
+        context = MutationContext(
+            actor="daemon:startup",
+            reason="daemon startup reconciliation",
+            request_id=uuid4().hex,
+        )
+        order_sync = self.service.sync_open_orders(
+            actor=context.actor,
+            reason="daemon startup broker order reconciliation",
+            request_id=context.request_id,
+        )
+        position_reconciliation = self.service.reconcile_positions(
+            actor=context.actor,
+            reason="daemon startup position reconciliation",
+            request_id=context.request_id,
+        )
         with self.service.session_factory() as s:
             active = s.execute(
                 select(Rule).where(Rule.state == "active")
@@ -192,32 +163,158 @@ class Monitor:
             triggered = s.execute(
                 select(Rule).where(Rule.state == "triggered")
             ).scalars().all()
-        summary = {"active": len(active), "triggered": len(triggered)}
+        summary = {
+            "active": len(active),
+            "triggered": len(triggered),
+            "claims_recovered": 0,
+            "order_sync": order_sync,
+            "position_reconciliation": position_reconciliation,
+        }
         log.info("daemon reconcile: %s", summary)
         return summary
 
+    def _core_cycle(self) -> None:
+        context = MutationContext(
+            actor="daemon:monitor",
+            reason="daemon runtime safety cycle",
+            request_id=uuid4().hex,
+        )
+        order_sync = self.service.sync_open_orders(
+            actor=context.actor,
+            reason="daemon runtime broker order reconciliation",
+            request_id=context.request_id,
+        )
+        if order_sync.get("failed", 0):
+            self.service.trip_all_killswitches(
+                actor=context.actor,
+                reason="runtime broker order reconciliation failed",
+                request_id=context.request_id,
+            )
+            raise _KillSwitchesAlreadyTripped(
+                "runtime broker order reconciliation failed; kill switches tripped"
+            )
+        self.service.enforce_daily_loss_limits(
+            actor=context.actor,
+            reason="daemon scheduled daily loss enforcement",
+            request_id=context.request_id,
+        )
+        self.rule_worker.tick(
+            actor=context.actor,
+            reason="daemon conditional rule evaluation",
+            request_id=context.request_id,
+        )
+
+    async def _bounded_core_cycle(self) -> None:
+        """Run one safety cycle without ever blocking the asyncio event loop.
+
+        ``wait_for`` cannot kill a Python worker thread, so a timed-out task is
+        retained and no replacement cycle is started until it exits. This avoids
+        accumulating workers or racing multiple rule evaluators while the
+        external launchd watchdog restarts a genuinely wedged process.
+        """
+        if self._core_task is not None:
+            if not self._core_task.done():
+                raise TimeoutError("previous daemon core cycle is still running")
+            completed = self._core_task
+            self._core_task = None
+            completed.result()
+
+        self._core_task = asyncio.create_task(asyncio.to_thread(self._core_cycle))
+        current = self._core_task
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(current), timeout=self.cycle_timeout
+            )
+        except BaseException:
+            if current.done():
+                self._core_task = None
+            raise
+        self._core_task = None
+
+    async def _bounded_daily_tasks(self) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self.run_daily_tasks),
+                timeout=self.daily_task_timeout,
+            )
+        except TimeoutError:
+            log.error(
+                "daily analysis exceeded %.1fs; safety heartbeat loop continues",
+                self.daily_task_timeout,
+            )
+        except Exception:
+            log.error(
+                "daily analysis task failed "
+                "code=daily_analysis_failed"
+            )
+
+    def _schedule_daily_tasks(self) -> None:
+        if self._daily_task is not None and not self._daily_task.done():
+            return
+        if self._daily_task is not None:
+            self._daily_task.result()
+        self._daily_task = asyncio.create_task(self._bounded_daily_tasks())
+
     # ── async loop with exponential backoff (A4) ───────────────
     async def run(self, stop_event: Optional[asyncio.Event] = None) -> None:
-        self.reconcile()
-        attempt = 0
-        while not (stop_event and stop_event.is_set()):
-            try:
-                self.service.sync_open_orders()         # reconcile fills from broker
-                self.service.enforce_daily_loss_limits()  # trip kill switch on breach
-                self.tick()
-                # Heartbeat BEFORE the slow once-a-day shadow run so liveness is
-                # immediate and a watchdog never false-alarms during the daily batch.
-                self.service.write_heartbeat("daemon")  # liveness for /health (D3)
-                self.run_daily_tasks()                  # shadow + digest, once/day (D1/D2)
-                if attempt:  # recovered — feed is healthy again
-                    log.info("monitor recovered after %d failed attempt(s)", attempt)
-                attempt = 0
-                await asyncio.sleep(self.poll_interval)
-            except Exception:  # a bad tick must not kill the daemon
-                attempt += 1
-                delay = next_delay(attempt)
-                log.exception(
-                    "monitor tick failed; reconnecting with backoff %.1fs (attempt %d)",
-                    delay, attempt,
+        guard = self.runtime_tenure_guard
+        primary_failure = False
+        try:
+            if guard is not None:
+                guard.ensure_owned()
+            startup = await asyncio.wait_for(
+                asyncio.to_thread(self.reconcile),
+                timeout=self.cycle_timeout,
+            )
+            if (
+                startup["order_sync"].get("failed", 0)
+                or not startup["position_reconciliation"].get(
+                    "reconciled",
+                    False,
                 )
-                await asyncio.sleep(delay)
+            ):
+                self.service.trip_all_killswitches(
+                    actor="daemon:startup",
+                    reason="startup reconciliation failed",
+                    request_id=uuid4().hex,
+                )
+                raise RuntimeError(
+                    "startup reconciliation failed; kill switches tripped"
+                )
+            while not (stop_event and stop_event.is_set()):
+                if guard is not None:
+                    guard.ensure_owned()
+                try:
+                    await self._bounded_core_cycle()
+                    self.service.write_heartbeat("daemon")
+                    # Daily analysis is isolated from safety heartbeats.
+                    self._schedule_daily_tasks()
+                    await asyncio.sleep(self.poll_interval)
+                except Exception as exc:
+                    if not isinstance(
+                        exc,
+                        _KillSwitchesAlreadyTripped,
+                    ):
+                        self.service.trip_all_killswitches(
+                            actor="daemon:monitor",
+                            reason="daemon mutating cycle failed",
+                            request_id=uuid4().hex,
+                        )
+                    log.error(
+                        "monitor tick failed code=monitor_cycle_failed "
+                        "result=process_exit",
+                    )
+                    raise
+        except BaseException:
+            primary_failure = True
+            raise
+        finally:
+            if guard is not None:
+                try:
+                    released = guard.close()
+                except BaseException:
+                    if not primary_failure:
+                        raise TenureUncertain() from None
+                else:
+                    if not released and not primary_failure:
+                        raise TenureUncertain()

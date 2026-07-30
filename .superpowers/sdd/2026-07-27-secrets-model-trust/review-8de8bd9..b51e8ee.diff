@@ -1,0 +1,2479 @@
+diff --git a/README.md b/README.md
+index 4b28298..9d47962 100644
+--- a/README.md
++++ b/README.md
+@@ -111,8 +111,9 @@ envelope verification and retention review.
+ ## Running
+ 
+ ```bash
+-# Local structural checks plus paper broker/reconciliation readiness. Do not
+-# continue on FAIL or NEEDS-ME:
++# Local structural checks plus paper broker/read-only reconciliation
++# readiness. This probe never repairs or cancels. Do not continue on FAIL or
++# NEEDS-ME:
+ uv run python -m trading_assistant.preflight
+ 
+ # Loopback HTTPS app only:
+diff --git a/docs/RUNBOOK.md b/docs/RUNBOOK.md
+index e9f459f..76a697f 100644
+--- a/docs/RUNBOOK.md
++++ b/docs/RUNBOOK.md
+@@ -336,22 +336,25 @@ or loading fails, and constructs no broker, outbound provider, or notifier if
+ any structural check fails. `LOCAL_TLS` requires the exact
+ `.local/tls/rootCA.pem`, `.local/tls/localhost.pem`, and
+ `.local/tls/localhost-key.pem` paths. The CA and leaf must be current, the CA
+-must sign the leaf, and the leaf must match the private key and exact loopback
+-SANs. The watchdog trusts `rootCA.pem`, not the leaf as a CA file.
++must be authorized for certificate signing, and the leaf must have server
++authentication usage, match the private key, chain under the CA, and carry the
++exact loopback SANs. The watchdog trusts `rootCA.pem`, not the leaf as a CA file.
+ `FIELD_ENCRYPTION` reads migration metadata and key availability only; it does
+ not decrypt rows. The startup guard performs the one full envelope scan. Only
+-after all five pass does preflight run the unchanged paper-mode, schema, WAL,
+-breaker, Alpaca-read, quote, and broker/local reconciliation checks through a
+-dedicated `preflight` composition. That composition constructs no LLM provider,
+-agent, app, or notifier. There is no daemon-health preflight row; daemon
+-freshness is observed separately after startup.
++after all five pass does preflight run the paper-mode, schema, WAL, breaker,
++Alpaca-read, quote, and broker/local reconciliation checks. Reconciliation uses
++a dedicated read-only `preflight` service exposing one snapshot probe. It calls
++only broker open-order/position reads and local SQL `SELECT`s; it constructs no
++mutable `TradingService`, clock client, field cipher, LLM provider, agent, app,
++or notifier. There is no daemon-health preflight row; daemon freshness is
++observed separately after startup.
+ 
+ Preflight never submits a new order, calls an LLM, or sends an external
+-notification. Its existing broker-truth reconciliation can perform the
+-fail-closed repair or cancellation actions required to resolve already-known
+-paper-order state, so run it only as the explicit operator-controlled readiness
+-step. Both `FAIL` and `NEEDS-ME` print `NOT READY` and return nonzero; missing
+-required credentials can never produce `READY`.
++notification, repairs order state, cancels an order, or writes reconciliation
++results. Any mismatch prints `NOT READY`; repair remains a separate
++operator-controlled runtime action under the normal writer-tenure and audit
++boundaries. Both `FAIL` and `NEEDS-ME` return nonzero, and missing required
++credentials can never produce `READY`.
+ 
+ Open `https://localhost:8020`, log in without displaying or storing the
+ operator secret, and verify liveness and daemon freshness. Every non-liveness
+diff --git a/docs/ops/README.md b/docs/ops/README.md
+index 6882343..49a8587 100644
+--- a/docs/ops/README.md
++++ b/docs/ops/README.md
+@@ -31,7 +31,9 @@ in these commands.
+ The TLS setup installs the canonical `rootCA.pem`, `localhost.pem`, and
+ `localhost-key.pem` layout; watchdog verification uses the CA file, never the
+ leaf as a trust bundle. After the five structural rows pass, preflight uses a
+-dedicated non-LLM reconciliation composition.
++dedicated read-only reconciliation service. That service exposes one snapshot
++probe, calls only broker open-order/position reads and local SQL `SELECT`s, and
++cannot repair, cancel, submit, notify, or construct a mutable trading service.
+ Rotation requires a reviewed new retained key ID, an interactive
+ `set-encryption-key`, stopped-writer `encrypt_sensitive rotate`, a coordinated
+ active/retained config transition, and a final Keychain audit plus envelope
+diff --git a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+index 928d5d2..0432557 100644
+--- a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
++++ b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+@@ -567,11 +567,13 @@ Remove `CORSMiddleware`; no cross-origin route is supported.
+    `.local/tls/localhost.pem` and `.local/tls/localhost-key.pem` for
+    `localhost`, `127.0.0.1`, and `::1`;
+ 5. sets directory mode `0700`, certificate `0644`, private key `0600`;
+-6. runs `python -m trading_assistant.ops.tls inspect`.
++6. runs `uv run python -m trading_assistant.ops.tls inspect`.
+ 
+-`inspect` parses the certificate, verifies SANs, validity dates, private-key
+-mode, public-key match, and path containment under the repository `.local/tls`
+-directory. It prints no private-key bytes.
++`inspect` parses the certificate, verifies SANs, validity dates, CA
++certificate-signing authorization, leaf server-authentication usage,
++private-key mode, standards-complete chain validation, public-key match, and
++path containment under the repository `.local/tls` directory. It prints no
++private-key bytes.
+ 
+ - [ ] **Step 5: Replace shell Uvicorn arguments with a strict launcher**
+ 
+@@ -1831,15 +1833,15 @@ Normal readiness requires:
+ - encryption state complete and key ID available;
+ - no webhook/Composio integration;
+ - exact outbound HTTPS origins;
+-- existing paper-mode, reconciliation, breaker, and quote-integrity checks
+-  unchanged. Daemon freshness remains a separate post-start observation; there
+-  is no daemon-health preflight row.
++- existing paper-mode, breaker, and quote-integrity checks plus a read-only
++  broker/local reconciliation snapshot. Daemon freshness remains a separate
++  post-start observation; there is no daemon-health preflight row.
+ 
+ Preflight never resets a breaker, starts a daemon, submits a new order, calls
+-an LLM, or sends a notification. Its existing broker-truth reconciliation may
+-perform the fail-closed repair or cancellation actions required for
+-already-known paper-order state, so it remains an explicit operator-controlled
+-readiness step.
++an LLM, sends a notification, repairs order state, cancels an order, or writes
++reconciliation results. Its dedicated service exposes only broker
++open-order/position reads and local SQL `SELECT`s. Any mismatch remains an
++explicit operator-controlled runtime repair outside preflight.
+ 
+ - [x] **Step 5: Document operator commands and hard limits**
+ 
+@@ -1920,8 +1922,8 @@ git commit -m "chore(security): gate trust-boundary invariants"
+ ### Task 11 fix round 2: close static/runtime trust review gaps
+ 
+ The round-1 “no open code finding” and evidence-only provenance conclusions
+-are superseded. Its evidence commit also changed executable MarketStack plan
+-instructions. Round-2 executable, runtime, test, setup, and operator-document
++are superseded. Its evidence commit also changed executable retired-provider
++plan instructions. Round-2 executable, runtime, test, setup, and operator-document
+ changes are isolated in implementation commit
+ `d7c9576146ec205f454a8fd7b8db1425a2ce91d0`; this section records completion
+ evidence only.
+diff --git a/scripts/check_release_safety.py b/scripts/check_release_safety.py
+index f520578..3c2d343 100644
+--- a/scripts/check_release_safety.py
++++ b/scripts/check_release_safety.py
+@@ -226,6 +226,15 @@ def _target_root_name(node: ast.AST | None) -> str | None:
+     return current.id if isinstance(current, ast.Name) else None
+ 
+ 
++def _contains_loaded_name(node: ast.AST | None, names: set[str]) -> bool:
++    return node is not None and any(
++        isinstance(candidate, ast.Name)
++        and isinstance(candidate.ctx, ast.Load)
++        and candidate.id in names
++        for candidate in ast.walk(node)
++    )
++
++
+ def _canonical_assignment_finding(
+     tree: ast.Module,
+     *,
+@@ -308,13 +317,24 @@ def _canonical_assignment_finding(
+         if (
+             isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+-            and node.func.id in {"globals", "vars"}
++            and node.func.id
++            in {"eval", "exec", "globals", "locals", "vars"}
+         ):
+             return [_finding(code, relative, node.lineno)]
+         if isinstance(node, ast.AugAssign):
+             if _target_root_name(node.target) in aliases:
+                 return [_finding(code, relative, node.lineno)]
+         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
++            value = node.value
++            nested_authority = (
++                isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple))
++                and _contains_loaded_name(value, aliases)
++            ) or (
++                isinstance(value, (ast.Attribute, ast.Subscript))
++                and _target_root_name(value) in aliases
++            )
++            if nested_authority:
++                return [_finding(code, relative, node.lineno)]
+             for target in _assignment_targets(node):
+                 root_name = _target_root_name(target)
+                 if (
+@@ -769,6 +789,9 @@ def _check_no_raw_broker_escape(root: Path) -> None:
+     runtime = root / "src" / "trading_assistant"
+     allowed = {
+         "src/trading_assistant/broker/alpaca.py",
++        # This owner exposes only get_open_orders/get_positions through the
++        # dedicated read-only preflight protocol.
++        "src/trading_assistant/ops/preflight_probe.py",
+         "src/trading_assistant/ops/tenure.py",
+         "src/trading_assistant/ops/safety_drill.py",
+     }
+@@ -2638,7 +2661,6 @@ _APPROVED_OUTBOUND_RULES = {
+                 "paper-drill",
+                 "preflight",
+                 "safety-drill",
+-                "watchdog",
+             }
+         ),
+         None,
+@@ -2680,7 +2702,7 @@ _APPROVED_OUTBOUND_RULES = {
+     ),
+     "telegram": (
+         "notifier.telegram",
+-        frozenset({"app", "daemon", "preflight", "watchdog"}),
++        frozenset({"app", "daemon", "preflight"}),
+         "features.telegram_notifications",
+     ),
+     "coingecko": (
+@@ -2745,6 +2767,8 @@ _OUTBOUND_CLIENT_CONSTRUCTORS = frozenset(
+         "Session",
+         "HTTPConnection",
+         "HTTPSConnection",
++        "build_opener",
++        "socket",
+     }
+ )
+ _OUTBOUND_REQUEST_METHODS = frozenset(
+@@ -2824,6 +2848,11 @@ def _literal_string(
+         return node.value
+     if isinstance(node, ast.Name) and constants is not None:
+         return constants.get(node.id)
++    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++        left = _literal_string(node.left, constants)
++        right = _literal_string(node.right, constants)
++        if left is not None and right is not None:
++            return left + right
+     return None
+ 
+ 
+@@ -3369,6 +3398,48 @@ def _scan_transport_and_integrations(root: Path) -> list[ReleaseViolation]:
+                     uvicorn_run_names.update(targets)
+                     changed = changed or len(uvicorn_run_names) != before
+ 
++        def security_indirection_codes(
++            expression: ast.AST,
++        ) -> set[str]:
++            codes: set[str] = set()
++            for item in ast.walk(expression):
++                identity = (
++                    item.id
++                    if isinstance(item, ast.Name)
++                    else item.attr
++                    if isinstance(item, ast.Attribute)
++                    else None
++                )
++                if identity in cors_middleware_names or identity == "CORSMiddleware":
++                    codes.add("WILDCARD_HOST_ORIGIN")
++                if identity in cookie_callables or identity == "set_cookie":
++                    codes.add("INSECURE_COOKIE")
++                if (
++                    identity in ssl_unverified_factories
++                    or identity == "_create_unverified_context"
++                ):
++                    codes.add("TLS_DISABLED")
++            return codes
++
++        for candidate in ast.walk(tree):
++            indirect_expression = None
++            if isinstance(candidate, (ast.Assign, ast.AnnAssign)) and isinstance(
++                candidate.value,
++                (ast.Dict, ast.List, ast.Set, ast.Tuple),
++            ):
++                indirect_expression = candidate.value
++            elif (
++                isinstance(candidate, ast.Call)
++                and isinstance(candidate.func, ast.Subscript)
++            ):
++                indirect_expression = candidate.func.value
++            if indirect_expression is None:
++                continue
++            for code in security_indirection_codes(indirect_expression):
++                findings.append(
++                    _finding(code, relative, candidate.lineno)
++                )
++
+         for candidate in ast.walk(tree):
+             if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                 value = candidate.value
+@@ -3901,6 +3972,9 @@ def _mapping_alias_entries(
+             for target in targets
+             if isinstance(target, ast.Name)
+         ]
++        if names:
++            for alias in names[1:]:
++                union(names[0], alias)
+         if isinstance(node.value, ast.Dict):
+             for name in names:
+                 add(name)
+@@ -4271,6 +4345,61 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                         imported_request_names.update(names)
+                         changed = changed or len(imported_request_names) != before
+ 
++        def canonical_network_path(
++            expression: ast.AST,
++        ) -> tuple[str, ...]:
++            expression_path = _attribute_path(expression)
++            if (
++                expression_path
++                and expression_path[0] in network_alias_paths
++            ):
++                return (
++                    *network_alias_paths[expression_path[0]],
++                    *expression_path[1:],
++                )
++            if (
++                isinstance(expression, ast.Name)
++                and expression.id in network_alias_paths
++            ):
++                return network_alias_paths[expression.id]
++            return expression_path
++
++        for candidate in ast.walk(tree):
++            if not (
++                isinstance(candidate, (ast.Assign, ast.AnnAssign))
++                and isinstance(
++                    candidate.value,
++                    (ast.Dict, ast.List, ast.Set, ast.Tuple),
++                )
++            ):
++                continue
++            indirect_network_identity = False
++            for item in ast.walk(candidate.value):
++                if not isinstance(item, (ast.Name, ast.Attribute)):
++                    continue
++                identity_path = canonical_network_path(item)
++                if (
++                    identity_path
++                    and identity_path[0] in network_modules
++                    and (
++                        identity_path[-1] in _OUTBOUND_CLIENT_CONSTRUCTORS
++                        or identity_path[-1].lower()
++                        in _OUTBOUND_REQUEST_METHODS
++                        or identity_path[-1]
++                        in {"connect", "create_connection"}
++                    )
++                ):
++                    indirect_network_identity = True
++                    break
++            if indirect_network_identity:
++                findings.append(
++                    _finding(
++                        "OUTBOUND_CLIENT_UNAPPROVED",
++                        relative,
++                        candidate.lineno,
++                    )
++                )
++
+         for node in ast.walk(tree):
+             if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                 targets = (
+@@ -4411,6 +4540,16 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 or _literal_string(node.args[0]).split(".", 1)[0]
+                 in network_modules
+             )
++            approved_local_unix_socket = (
++                relative == "src/trading_assistant/ops/control.py"
++                and canonical_call_path == ("socket", "socket")
++                and len(node.args) >= 2
++                and canonical_network_path(node.args[0])
++                == ("socket", "AF_UNIX")
++                and canonical_network_path(node.args[1])
++                == ("socket", "SOCK_STREAM")
++                and not node.keywords
++            )
+             if (
+                 (
+                     direct_client
+@@ -4421,6 +4560,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     )
+                 )
+                 and not boundary_wrapper
++                and not approved_local_unix_socket
+                 or direct_request
+                 or module_request
+                 or (
+@@ -4457,14 +4597,61 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 if isinstance(node.func, ast.Name)
+                 else ""
+             )
+-            network_option_call = (
++            proven_network_call = (
+                 direct_client
+                 or direct_request
+                 or module_client
+                 or module_request
+                 or provider_client_name is not None
+                 or call_name in _OUTBOUND_CLIENT_CONSTRUCTORS
+-                or call_name.lower() in _OUTBOUND_REQUEST_METHODS
++                or (
++                    boundary_wrapper
++                    and call_name.lower() in _OUTBOUND_REQUEST_METHODS
++                )
++                or (
++                    relative in _APPROVED_ORIGINS_BY_ADAPTER_PATH
++                    and call_name.lower() in _OUTBOUND_REQUEST_METHODS
++                )
++            )
++            option_names = {
++                keyword.arg.lower()
++                for keyword in node.keywords
++                if keyword.arg is not None
++            }
++            literal_url_shape = any(
++                (
++                    value := _literal_string(argument, constants)
++                ) is not None
++                and value.lower().startswith(
++                    ("http://", "https://", "ws://", "wss://")
++                )
++                for argument in node.args
++            )
++            network_shaped_call = (
++                call_name.lower() in _OUTBOUND_REQUEST_METHODS
++                and (
++                    literal_url_shape
++                    or bool(
++                        option_names.intersection(
++                            {
++                                "allow_redirects",
++                                "base_url",
++                                "follow_redirects",
++                                "forwarded_allow_ips",
++                                "params",
++                                "proxies",
++                                "proxy",
++                                "proxy_headers",
++                                "trust_env",
++                                "url",
++                                "url_override",
++                            }
++                        )
++                    )
++                )
++            )
++            network_option_call = (
++                proven_network_call or network_shaped_call
+             )
+             if (
+                 boundary_wrapper
+@@ -4492,6 +4679,44 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     constants,
+                 )
+                 function, class_node = enclosing_context(node)
++                transport_statement_index = None
++                transport_statement = None
++                if function is not None:
++                    for index, statement in enumerate(function.body):
++                        if any(candidate is node for candidate in ast.walk(statement)):
++                            transport_statement_index = index
++                            transport_statement = statement
++                            break
++                direct_prior_url_guards: list[tuple[int, ast.Call]] = []
++                if function is not None:
++                    for index, statement in enumerate(function.body):
++                        if not (
++                            isinstance(statement, ast.Expr)
++                            and isinstance(statement.value, ast.Call)
++                            and _attribute_path(statement.value.func)
++                            == ("self", "_policy", "assert_url")
++                        ):
++                            continue
++                        direct_prior_url_guards.append(
++                            (index, statement.value)
++                        )
++                params_keyword = next(
++                    (
++                        keyword.value
++                        for keyword in node.keywords
++                        if keyword.arg == "params"
++                    ),
++                    None,
++                )
++                query_is_validated = (
++                    isinstance(params_keyword, ast.Call)
++                    and _attribute_path(params_keyword.func)
++                    == ("_validated_query_params",)
++                    and len(params_keyword.args) == 1
++                    and not params_keyword.keywords
++                    and isinstance(params_keyword.args[0], ast.Name)
++                    and params_keyword.args[0].id == "params"
++                )
+                 approved_dynamic_request = (
+                     request_url is None
+                     and function is not None
+@@ -4503,16 +4728,23 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     and isinstance(node.func.value, ast.Call)
+                     and isinstance(node.func.value.func, ast.Name)
+                     and node.func.value.func.id == "super"
+-                    and any(
+-                        isinstance(guard, ast.Call)
+-                        and _attribute_path(guard.func)
+-                        == ("self", "_policy", "assert_url")
+-                        and guard.args
+-                        and isinstance(request_url_node, ast.Name)
+-                        and isinstance(guard.args[0], ast.Name)
+-                        and guard.args[0].id == request_url_node.id
+-                        for guard in ast.walk(function)
++                    and isinstance(transport_statement, ast.Return)
++                    and transport_statement.value is node
++                    and transport_statement_index is not None
++                    and query_is_validated
++                    and len(function.body) == 2
++                    and len(direct_prior_url_guards) == 1
++                    and direct_prior_url_guards[0][0] == 0
++                    and transport_statement_index == 1
++                    and len(direct_prior_url_guards[0][1].args) == 1
++                    and not direct_prior_url_guards[0][1].keywords
++                    and isinstance(request_url_node, ast.Name)
++                    and isinstance(
++                        direct_prior_url_guards[0][1].args[0],
++                        ast.Name,
+                     )
++                    and direct_prior_url_guards[0][1].args[0].id
++                    == request_url_node.id
+                 )
+                 if request_url is None and not approved_dynamic_request:
+                     findings.append(
+@@ -4704,7 +4936,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 if (
+                     keyword_name
+                     in {"follow_redirects", "allow_redirects"}
+-                    and (network_option_call or boundary_wrapper)
++                    and network_option_call
+                     and (
+                         not isinstance(keyword.value, ast.Constant)
+                         or keyword.value.value is not False
+@@ -4719,7 +4951,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     )
+                 if (
+                     keyword_name == "verify"
+-                    and (network_option_call or boundary_wrapper)
++                    and proven_network_call
+                     and (
+                     not isinstance(keyword.value, ast.Constant)
+                     or keyword.value.value is not True
+@@ -4736,7 +4968,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 if keyword_name in {
+                     "trust_env",
+                     "proxy_headers",
+-                } and (
++                } and network_option_call and (
+                     not isinstance(keyword.value, ast.Constant)
+                     or keyword.value.value is not False
+                 ):
+@@ -4749,6 +4981,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     )
+                 if (
+                     keyword_name == "forwarded_allow_ips"
++                    and network_option_call
+                     and (
+                     not isinstance(keyword.value, ast.Constant)
+                     or keyword.value.value != ""
+@@ -4763,6 +4996,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     )
+                 if (
+                     keyword_name in {"proxy", "proxies"}
++                    and network_option_call
+                     and (
+                     not isinstance(keyword.value, ast.Constant)
+                     or keyword.value.value not in {None, False}
+@@ -4783,7 +5017,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                     "ssl",
+                     "tls",
+                     "use_ssl",
+-                } and (
++                } and network_option_call and (
+                     not isinstance(keyword.value, ast.Constant)
+                     or keyword.value.value is not True
+                 ) and not (
+@@ -4798,7 +5032,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
+                 if keyword_name in {
+                     "ssl_certfile",
+                     "ssl_keyfile",
+-                } and (
++                } and network_option_call and (
+                     isinstance(keyword.value, ast.Constant)
+                     and keyword.value.value in {None, False, ""}
+                 ):
+@@ -4907,10 +5141,20 @@ def _tracked_artifact_code(name: str) -> str | None:
+     plaintext_marker = (
+         "decrypted" in lowered or "plaintext" in lowered
+     )
++    conventional_database_backup = (
++        basename.endswith((".sql", ".dump"))
++        and re.search(
++            r"(?:^|[._-])(?:backup|database|db|dump|prod|production|"
++            r"snapshot)(?:[._-]|$)",
++            basename,
++        )
++        is not None
++    )
+     if (
+         (
+             backup_directory
+             and backup_payload
++            or conventional_database_backup
+             or plaintext_marker
+             and backup_payload
+             and not (
+@@ -5291,7 +5535,29 @@ def _scan_environment_secret_sources(root: Path) -> list[ReleaseViolation]:
+         for node in ast.walk(tree):
+             if not hasattr(node, "lineno") or node.lineno in allowed_lines:
+                 continue
+-            if isinstance(node, ast.Call):
++            if isinstance(node, ast.Dict):
++                unpacks_environment = any(
++                    key is None
++                    and (
++                        _is_os_environ(value, os_module_names)
++                        or isinstance(value, ast.Name)
++                        and value.id in environ_names
++                    )
++                    for key, value in zip(
++                        node.keys,
++                        node.values,
++                        strict=True,
++                    )
++                )
++                if unpacks_environment:
++                    findings.append(
++                        _finding(
++                            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
++                            relative,
++                            node.lineno,
++                        )
++                    )
++            elif isinstance(node, ast.Call):
+                 name = _call_name(node)
+                 if name in provider_names:
+                     findings.append(
+@@ -5854,6 +6120,68 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
+             _finding("CHAT_TOOL_REGISTRY_UNPROVEN", relative, 1)
+         )
+     else:
++        def inspect_root_mutations(
++            function: ast.FunctionDef | ast.AsyncFunctionDef,
++            *,
++            allowed_local_assignments: frozenset[str],
++        ) -> None:
++            for mutation in ast.walk(function):
++                if not isinstance(
++                    mutation,
++                    (
++                        ast.Assign,
++                        ast.AnnAssign,
++                        ast.AugAssign,
++                        ast.Delete,
++                        ast.NamedExpr,
++                    ),
++                ):
++                    continue
++                targets = (
++                    mutation.targets
++                    if isinstance(mutation, (ast.Assign, ast.Delete))
++                    else [mutation.target]
++                )
++                state_target = any(
++                    isinstance(target, (ast.Attribute, ast.Subscript))
++                    for target in targets
++                )
++                simple_names = {
++                    target.id
++                    for target in targets
++                    if isinstance(target, ast.Name)
++                }
++                allowed_simple_assignment = (
++                    isinstance(mutation, (ast.Assign, ast.AnnAssign))
++                    and not state_target
++                    and simple_names
++                    and simple_names <= allowed_local_assignments
++                    and len(simple_names) == len(targets)
++                )
++                if allowed_simple_assignment:
++                    continue
++                findings.append(
++                    _finding(
++                        "MUTABLE_CHAT_TOOL"
++                        if state_target
++                        or isinstance(
++                            mutation,
++                            (ast.AugAssign, ast.Delete),
++                        )
++                        else "CHAT_TOOL_REGISTRY_UNPROVEN",
++                        relative,
++                        mutation.lineno,
++                    )
++                )
++
++        inspect_root_mutations(
++            dispatch,
++            allowed_local_assignments=frozenset({"s", "table"}),
++        )
++        inspect_root_mutations(
++            draft,
++            allowed_local_assignments=frozenset({"envelope"}),
++        )
+         table_assignment = next(
+             (
+                 node
+@@ -6018,6 +6346,41 @@ def _scan_chat_tool_boundary(root: Path) -> list[ReleaseViolation]:
+                     )
+                 )
+ 
++        dispatch_table_nodes = (
++            set(ast.walk(table_assignment.value))
++            if table_assignment is not None
++            and isinstance(table_assignment.value, ast.Dict)
++            else set()
++        )
++        for call in (
++            node
++            for node in ast.walk(dispatch)
++            if isinstance(node, ast.Call)
++            and node not in dispatch_table_nodes
++        ):
++            call_path = _attribute_path(call.func)
++            exact_table_dispatch = (
++                isinstance(call.func, ast.Subscript)
++                and isinstance(call.func.value, ast.Name)
++                and call.func.value.id == "table"
++                and isinstance(call.func.slice, ast.Name)
++                and call.func.slice.id == "name"
++                and not call.args
++                and not call.keywords
++            )
++            if exact_table_dispatch or call_path == ("log", "error"):
++                continue
++            called = call_path[-1] if call_path else None
++            findings.append(
++                _finding(
++                    "MUTABLE_CHAT_TOOL"
++                    if called is not None and _mutable_tool_name(called)
++                    else "CHAT_TOOL_REGISTRY_UNPROVEN",
++                    relative,
++                    call.lineno,
++                )
++            )
++
+         for function in (dispatch, draft):
+             for node in ast.walk(function):
+                 if (
+diff --git a/scripts/launchd/README.md b/scripts/launchd/README.md
+index 0dfd401..5429f90 100644
+--- a/scripts/launchd/README.md
++++ b/scripts/launchd/README.md
+@@ -33,8 +33,10 @@ failure and stop before any broker, provider, or notifier is constructed.
+ Field preflight is metadata-only; the startup guard owns the full envelope
+ scan. Local TLS requires `rootCA.pem`, `localhost.pem`, and
+ `localhost-key.pem`; the watchdog trusts only the CA file. After structural
+-success, preflight uses a dedicated composition that constructs no LLM
+-provider, agent, app, or notifier. Keychain migration, field
++success, preflight uses a dedicated read-only snapshot service that performs
++only broker open-order/position reads and local SQL `SELECT`s. It cannot repair
++or cancel orders and constructs no mutable trading service, LLM provider,
++agent, app, or notifier. Keychain migration, field
+ migration/rotation, and encrypted restore procedures are in
+ `docs/RUNBOOK.md`; no secret value belongs on a command line.
+ For rotation, keep every writer stopped, configure and prompt for the reviewed
+diff --git a/scripts/setup-local-tls.sh b/scripts/setup-local-tls.sh
+index 5028bf4..2464896 100755
+--- a/scripts/setup-local-tls.sh
++++ b/scripts/setup-local-tls.sh
+@@ -21,4 +21,4 @@ mkcert -cert-file .local/tls/localhost.pem \
+ chmod 0644 .local/tls/localhost.pem
+ chmod 0644 .local/tls/rootCA.pem
+ chmod 0600 .local/tls/localhost-key.pem
+-python -m trading_assistant.ops.tls inspect
++uv run python -m trading_assistant.ops.tls inspect
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 172ef33..4030b9c 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -56,6 +56,10 @@ from .ops.tenure import (
+     TenureUncertain,
+     install_runtime_mutation_barrier,
+ )
++from .ops.preflight_probe import (
++    PreflightReconciliationProbe,
++    ReadOnlyPreflightService,
++)
+ from .risk.breakers import BreakerService
+ from .rules.worker import RuleWorker
+ from .preflight import SensitiveEncryptionStateInspector
+@@ -122,7 +126,7 @@ class ApplicationContainer:
+ class PreflightServiceContainer:
+     """Minimal preflight owner with no app, agent, notifier, or LLM surface."""
+ 
+-    service: TradingService
++    service: PreflightReconciliationProbe
+     runtime_tenure_guard: None = None
+ 
+ 
+@@ -360,7 +364,7 @@ def build_preflight_service(
+     config: AppConfig,
+     secrets: RuntimeSecrets,
+ ) -> PreflightServiceContainer:
+-    """Compose only paper broker reconciliation for the preflight role."""
++    """Compose only the read-only paper reconciliation preflight capability."""
+ 
+     require_configured_role_origins(config, "preflight")
+     _guard_runtime(config, secrets)
+@@ -368,33 +372,15 @@ def build_preflight_service(
+         secrets,
+         runtime_role="preflight",
+     )
+-    try:
+-        sensitive_cipher = build_sensitive_data_cipher(
+-            config.encryption,
+-            secrets,
+-        )
+-    except Exception:
+-        raise StartupEncryptionBlocked(
+-            "sensitive_key_unavailable"
+-        ) from None
+-    bind_sensitive_cipher(runtime.session_factory, sensitive_cipher)
+     broker = build_broker(
+         config,
+         secrets,
+         runtime_role="preflight",
+     )
+     _arm_production_paper_broker(broker)
+-    clock = build_clock(
+-        config,
+-        secrets,
+-        runtime_role="preflight",
+-    )
+-    service = TradingService(
++    service = ReadOnlyPreflightService(
+         broker,
+         runtime.session_factory,
+-        config,
+-        clock,
+-        external_source=None,
+     )
+     return PreflightServiceContainer(service=service)
+ 
+diff --git a/src/trading_assistant/ops/preflight_probe.py b/src/trading_assistant/ops/preflight_probe.py
+new file mode 100644
+index 0000000..6c4a9fa
+--- /dev/null
++++ b/src/trading_assistant/ops/preflight_probe.py
+@@ -0,0 +1,233 @@
++"""Capability-minimal, read-only broker/local preflight reconciliation."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from decimal import Decimal
++from typing import Protocol
++
++from sqlalchemy import select
++from sqlalchemy.orm import sessionmaker
++
++from ..assets import broker_symbol_matches_local
++from ..broker.base import BrokerClient
++from ..broker.models import OrderStatus
++from ..db.models import (
++    FILL_RECONCILIATION_TRUSTED,
++    PLAN_CANCEL_INDETERMINATE,
++    PLAN_CANCEL_REQUESTED,
++    Fill,
++    Order,
++)
++
++
++_LOCAL_BROKER_OPEN_STATUSES = frozenset(
++    {
++        OrderStatus.SUBMITTED.value,
++        OrderStatus.PARTIALLY_FILLED.value,
++    }
++)
++_LOCAL_UNCERTAIN_STATUSES = frozenset(
++    {
++        OrderStatus.SUBMITTING.value,
++        OrderStatus.ACCEPTANCE_UNKNOWN.value,
++    }
++)
++_REMOTE_OPEN_STATUSES = frozenset(
++    {
++        OrderStatus.SUBMITTED,
++        OrderStatus.PARTIALLY_FILLED,
++    }
++)
++_UNRESOLVED_CANCEL_STATES = frozenset(
++    {PLAN_CANCEL_REQUESTED, PLAN_CANCEL_INDETERMINATE}
++)
++
++
++@dataclass(frozen=True, slots=True)
++class ReadOnlyReconciliationSnapshot:
++    """Value-only proof returned by the preflight reconciliation capability."""
++
++    orders_match: bool
++    positions_match: bool
++    broker_open_order_count: int
++    local_open_order_count: int
++    drift_symbols: tuple[str, ...]
++
++
++class PreflightReconciliationProbe(Protocol):
++    """The complete service capability visible to morning preflight."""
++
++    def inspect_reconciliation(self) -> ReadOnlyReconciliationSnapshot: ...
++
++
++class ReadOnlyPreflightService:
++    """Observe broker and local state without writes, decrypts, or mutations."""
++
++    __slots__ = ("_broker", "_session_factory")
++
++    def __init__(
++        self,
++        broker: BrokerClient,
++        session_factory: sessionmaker,
++    ) -> None:
++        self._broker = broker
++        self._session_factory = session_factory
++
++    def inspect_reconciliation(self) -> ReadOnlyReconciliationSnapshot:
++        remote_orders = self._broker.get_open_orders()
++        remote_positions = self._broker.get_positions()
++
++        with self._session_factory() as session:
++            local_orders = session.execute(
++                select(
++                    Order.idempotency_key,
++                    Order.ticker,
++                    Order.status,
++                    Order.broker_order_id,
++                    Order.plan_cancel_state,
++                ).where(
++                    Order.status.in_(
++                        _LOCAL_BROKER_OPEN_STATUSES
++                        | _LOCAL_UNCERTAIN_STATUSES
++                    )
++                )
++            ).all()
++            local_fills = session.execute(
++                select(
++                    Fill.ticker,
++                    Fill.side,
++                    Fill.qty,
++                    Fill.broker_fill_id,
++                    Fill.reconciliation_state,
++                )
++            ).all()
++
++        local_by_client: dict[
++            str,
++            tuple[str, str, str | None, str],
++        ] = {}
++        orders_match = True
++        for client_id, ticker, status, broker_id, cancel_state in local_orders:
++            if (
++                not isinstance(client_id, str)
++                or not client_id
++                or client_id in local_by_client
++                or status in _LOCAL_UNCERTAIN_STATUSES
++                or not isinstance(broker_id, str)
++                or not broker_id
++                or cancel_state in _UNRESOLVED_CANCEL_STATES
++            ):
++                orders_match = False
++            else:
++                local_by_client[client_id] = (
++                    ticker,
++                    status,
++                    broker_id,
++                    cancel_state,
++                )
++
++        remote_by_client: dict[str, object] = {}
++        for remote in remote_orders:
++            client_id = getattr(remote, "idempotency_key", None)
++            broker_id = getattr(remote, "broker_order_id", None)
++            status = getattr(remote, "status", None)
++            ticker = getattr(remote, "ticker", None)
++            if (
++                not isinstance(client_id, str)
++                or not client_id
++                or client_id in remote_by_client
++                or not isinstance(broker_id, str)
++                or not broker_id
++                or status not in _REMOTE_OPEN_STATUSES
++                or not isinstance(ticker, str)
++                or not ticker
++            ):
++                orders_match = False
++                continue
++            remote_by_client[client_id] = remote
++
++        if set(local_by_client) != set(remote_by_client):
++            orders_match = False
++        for client_id in set(local_by_client).intersection(remote_by_client):
++            local_ticker, local_status, local_broker_id, _ = local_by_client[
++                client_id
++            ]
++            remote = remote_by_client[client_id]
++            remote_status = getattr(remote, "status")
++            remote_ticker = getattr(remote, "ticker")
++            if (
++                getattr(remote, "broker_order_id") != local_broker_id
++                or remote_status.value != local_status
++            ):
++                orders_match = False
++            try:
++                ticker_matches = broker_symbol_matches_local(
++                    remote_ticker,
++                    local_ticker,
++                )
++            except ValueError:
++                ticker_matches = False
++            if not ticker_matches:
++                orders_match = False
++
++        local_position: dict[str, Decimal] = {}
++        positions_match = True
++        drift_symbols: set[str] = set()
++        for (
++            ticker,
++            side,
++            qty,
++            broker_fill_id,
++            reconciliation_state,
++        ) in local_fills:
++            symbol = str(ticker).upper()
++            if (
++                reconciliation_state != FILL_RECONCILIATION_TRUSTED
++                or not isinstance(broker_fill_id, str)
++                or not broker_fill_id.strip()
++                or not isinstance(qty, Decimal)
++                or not qty.is_finite()
++                or qty <= 0
++                or side not in {"buy", "sell"}
++            ):
++                positions_match = False
++                drift_symbols.add(symbol)
++                continue
++            delta = qty if side == "buy" else -qty
++            local_position[symbol] = (
++                local_position.get(symbol, Decimal(0)) + delta
++            )
++
++        broker_position: dict[str, Decimal] = {}
++        for position in remote_positions:
++            symbol = str(getattr(position, "ticker", "")).upper()
++            qty = getattr(position, "qty", None)
++            if (
++                not symbol
++                or symbol in broker_position
++                or not isinstance(qty, Decimal)
++                or not qty.is_finite()
++                or qty == 0
++            ):
++                positions_match = False
++                if symbol:
++                    drift_symbols.add(symbol)
++                continue
++            broker_position[symbol] = qty
++
++        for symbol in set(local_position).union(broker_position):
++            if local_position.get(symbol, Decimal(0)) != broker_position.get(
++                symbol,
++                Decimal(0),
++            ):
++                positions_match = False
++                drift_symbols.add(symbol)
++
++        return ReadOnlyReconciliationSnapshot(
++            orders_match=orders_match,
++            positions_match=positions_match,
++            broker_open_order_count=len(remote_orders),
++            local_open_order_count=len(local_orders),
++            drift_symbols=tuple(sorted(drift_symbols)),
++        )
+diff --git a/src/trading_assistant/ops/tls.py b/src/trading_assistant/ops/tls.py
+index d7baafa..32422dd 100644
+--- a/src/trading_assistant/ops/tls.py
++++ b/src/trading_assistant/ops/tls.py
+@@ -19,6 +19,13 @@ from cryptography.hazmat.primitives.asymmetric import (
+     rsa,
+ )
+ from cryptography.hazmat.primitives.serialization import load_pem_private_key
++from cryptography.x509.oid import ExtendedKeyUsageOID
++from cryptography.x509.verification import (
++    DNSName,
++    PolicyBuilder,
++    Store,
++    VerificationError,
++)
+ 
+ from ..config import load_config
+ 
+@@ -138,11 +145,15 @@ def validate_tls_material(server) -> TLSMaterialStatus:
+         ca_constraints = ca_certificate.extensions.get_extension_for_class(
+             x509.BasicConstraints
+         ).value
++        ca_key_usage = ca_certificate.extensions.get_extension_for_class(
++            x509.KeyUsage
++        ).value
+     except Exception:
+         raise TLSMaterialError("tls_ca_invalid") from None
+     now = datetime.now(timezone.utc)
+     if (
+         not ca_constraints.ca
++        or not ca_key_usage.key_cert_sign
+         or ca_certificate.subject != ca_certificate.issuer
+         or not (
+             ca_certificate.not_valid_before_utc
+@@ -174,6 +185,24 @@ def validate_tls_material(server) -> TLSMaterialStatus:
+         or not _signature_is_valid(certificate, ca_certificate)
+     ):
+         raise TLSMaterialError("tls_ca_chain_invalid")
++    try:
++        extended_key_usage = certificate.extensions.get_extension_for_class(
++            x509.ExtendedKeyUsage
++        ).value
++    except x509.ExtensionNotFound:
++        raise TLSMaterialError("tls_ca_chain_invalid") from None
++    if ExtendedKeyUsageOID.SERVER_AUTH not in extended_key_usage:
++        raise TLSMaterialError("tls_ca_chain_invalid")
++    try:
++        (
++            PolicyBuilder()
++            .store(Store([ca_certificate]))
++            .time(now)
++            .build_server_verifier(DNSName("localhost"))
++            .verify(certificate, [])
++        )
++    except VerificationError:
++        raise TLSMaterialError("tls_ca_chain_invalid") from None
+     names = extension.value
+     dns_names = {value.lower() for value in names.get_values_for_type(x509.DNSName)}
+     ip_names = {
+diff --git a/src/trading_assistant/preflight.py b/src/trading_assistant/preflight.py
+index 35c4a01..a61801f 100644
+--- a/src/trading_assistant/preflight.py
++++ b/src/trading_assistant/preflight.py
+@@ -13,7 +13,6 @@ import sys
+ from dataclasses import dataclass
+ from datetime import datetime
+ import re
+-from uuid import uuid4
+ 
+ from .config import BrokerKind, TradingMode, load_config
+ from .db.schema import SchemaOutOfDate
+@@ -565,35 +564,30 @@ def _db(
+ 
+ 
+ def _reconciliation(service) -> Result:
+-    """Repair stale order statuses, then require local positions to match Alpaca."""
++    """Require one read-only broker/local snapshot to match exactly."""
+     try:
+-        request_id = uuid4().hex
+-        order_sync = service.sync_open_orders(
+-            actor="preflight:startup",
+-            reason="preflight broker order reconciliation",
+-            request_id=request_id,
+-        )
+-        positions = service.reconcile_positions(
+-            actor="preflight:startup",
+-            reason="preflight position reconciliation",
+-            request_id=request_id,
+-        )
+-        if order_sync.get("failed", 0):
++        snapshot = service.inspect_reconciliation()
++        if snapshot.orders_match is not True:
+             return Result(
+                 "broker/local reconciliation",
+                 FAIL,
+-                f"order status sync failures: {order_sync}",
++                "order snapshot mismatch",
+             )
+-        if not positions["reconciled"]:
++        if snapshot.positions_match is not True:
++            symbols = tuple(snapshot.drift_symbols)
+             return Result(
+                 "broker/local reconciliation",
+                 FAIL,
+-                f"drift={positions['drift']} order_sync={order_sync}",
++                (
++                    "position drift=" + ",".join(symbols)
++                    if symbols
++                    else "position snapshot mismatch"
++                ),
+             )
+         return Result(
+             "broker/local reconciliation",
+             PASS,
+-            f"positions match; order_sync={order_sync}",
++            "orders and positions match",
+         )
+     except Exception as e:
+         return Result(
+diff --git a/src/trading_assistant/security/outbound.py b/src/trading_assistant/security/outbound.py
+index 9dd2f89..47f972b 100644
+--- a/src/trading_assistant/security/outbound.py
++++ b/src/trading_assistant/security/outbound.py
+@@ -60,7 +60,6 @@ OUTBOUND_ORIGIN_MANIFEST = (
+                 "paper-drill",
+                 "preflight",
+                 "safety-drill",
+-                "watchdog",
+             }
+         ),
+     ),
+@@ -112,7 +111,7 @@ OUTBOUND_ORIGIN_MANIFEST = (
+         "telegram",
+         "notifier.telegram",
+         "https://api.telegram.org",
+-        frozenset({"app", "daemon", "preflight", "watchdog"}),
++        frozenset({"app", "daemon", "preflight"}),
+         "features.telegram_notifications",
+     ),
+     OutboundOriginRule(
+diff --git a/src/trading_assistant/security/sensitive_write_scan.py b/src/trading_assistant/security/sensitive_write_scan.py
+index 384a7a3..926d36c 100644
+--- a/src/trading_assistant/security/sensitive_write_scan.py
++++ b/src/trading_assistant/security/sensitive_write_scan.py
+@@ -101,6 +101,21 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+         self.execute_aliases: set[str] = set()
+         self.structured_statements: set[str] = set()
+         self.string_constants: dict[str, str] = {}
++        self.local_functions: dict[
++            str,
++            ast.FunctionDef | ast.AsyncFunctionDef,
++        ] = {}
++
++    def visit_Module(self, node: ast.Module) -> None:
++        self.local_functions = {
++            statement.name: statement
++            for statement in node.body
++            if isinstance(
++                statement,
++                (ast.FunctionDef, ast.AsyncFunctionDef),
++            )
++        }
++        self.generic_visit(node)
+ 
+     def _report(
+         self,
+@@ -452,6 +467,128 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+             return None
+         return self.class_aliases.get(candidate)
+ 
++    @staticmethod
++    def _keyword(
++        node: ast.Call,
++        name: str,
++    ) -> ast.AST | None:
++        return next(
++            (
++                keyword.value
++                for keyword in node.keywords
++                if keyword.arg == name
++            ),
++            None,
++        )
++
++    def _inspect_local_helper(
++        self,
++        helper: ast.FunctionDef | ast.AsyncFunctionDef,
++        bindings: dict[str, str],
++        *,
++        active: set[str],
++    ) -> None:
++        if helper.name in active:
++            self._report(helper, "unknown_model", "**helper_flow")
++            return
++        active.add(helper.name)
++        local_bindings = dict(bindings)
++        changed = True
++        while changed:
++            changed = False
++            for statement in ast.walk(helper):
++                if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
++                    continue
++                value = statement.value
++                source_model = (
++                    local_bindings.get(value.id)
++                    if isinstance(value, ast.Name)
++                    else self._call_model(value)
++                )
++                if source_model is None:
++                    continue
++                for target in (
++                    statement.targets
++                    if isinstance(statement, ast.Assign)
++                    else [statement.target]
++                ):
++                    if (
++                        isinstance(target, ast.Name)
++                        and local_bindings.get(target.id) != source_model
++                    ):
++                        local_bindings[target.id] = source_model
++                        changed = True
++        for statement in ast.walk(helper):
++            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
++                targets = (
++                    statement.targets
++                    if isinstance(statement, ast.Assign)
++                    else [statement.target]
++                )
++                for target in targets:
++                    if not (
++                        isinstance(target, ast.Attribute)
++                        and isinstance(target.value, ast.Name)
++                    ):
++                        continue
++                    model = local_bindings.get(target.value.id)
++                    if (
++                        model is not None
++                        and target.attr in self.model_fields[model][1]
++                    ):
++                        self._report(target, model, target.attr)
++            if not isinstance(statement, ast.Call):
++                continue
++            if _name(statement.func) == "setattr" and len(statement.args) >= 2:
++                receiver = statement.args[0]
++                model = (
++                    local_bindings.get(receiver.id)
++                    if isinstance(receiver, ast.Name)
++                    else None
++                )
++                field = (
++                    statement.args[1].value
++                    if isinstance(statement.args[1], ast.Constant)
++                    and isinstance(statement.args[1].value, str)
++                    else None
++                )
++                if model is not None and field in self.model_fields[model][1]:
++                    self._report(statement, model, field)
++                elif model is not None and field is None:
++                    self._report(statement, model, "**field")
++            nested = (
++                self.local_functions.get(statement.func.id)
++                if isinstance(statement.func, ast.Name)
++                else None
++            )
++            if nested is None:
++                continue
++            nested_arguments = (
++                list(nested.args.posonlyargs)
++                + list(nested.args.args)
++                + list(nested.args.kwonlyargs)
++            )
++            nested_bindings: dict[str, str] = {}
++            for parameter, argument in zip(
++                nested_arguments,
++                statement.args,
++            ):
++                model = (
++                    local_bindings.get(argument.id)
++                    if isinstance(argument, ast.Name)
++                    else self._object_model(argument)
++                    or self._call_model(argument)
++                )
++                if model is not None:
++                    nested_bindings[parameter.arg] = model
++            if nested_bindings:
++                self._inspect_local_helper(
++                    nested,
++                    nested_bindings,
++                    active=active,
++                )
++        active.remove(helper.name)
++
+     def visit_Assign(self, node: ast.Assign) -> None:
+         for target in node.targets:
+             if isinstance(target, ast.Attribute):
+@@ -553,11 +690,20 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+         ):
+             query_model = self._query_model(node.func.value)
+             if query_model is not None:
++                values_mapping = self._keyword(node, "values")
+                 self._check_mapping(
+                     node,
+                     query_model,
+-                    args=node.args,
+-                    keywords=node.keywords,
++                    args=(
++                        (*node.args, values_mapping)
++                        if values_mapping is not None
++                        else node.args
++                    ),
++                    keywords=(
++                        keyword
++                        for keyword in node.keywords
++                        if keyword.arg != "values"
++                    ),
+                 )
+         if (
+             isinstance(node.func, ast.Name)
+@@ -646,29 +792,78 @@ class _SensitiveWriteVisitor(ast.NodeVisitor):
+             elif field in self.unique_fields:
+                 self._report(node, "*", field)
+ 
+-        if (
++        execution_call = (
+             isinstance(node.func, ast.Attribute)
+             and node.func.attr in {"execute", "exec_driver_sql"}
+-            and node.args
+         ) or (
+             isinstance(node.func, ast.Name)
+             and node.func.id in self.execute_aliases
+-            and node.args
+-        ):
+-            execute_model = self._mutation_model(node.args[0])
++        )
++        statement = (
++            node.args[0]
++            if node.args
++            else self._keyword(node, "statement")
++            if execution_call
++            else None
++        )
++        if execution_call and statement is not None:
++            execute_model = self._mutation_model(statement)
+             if (
+                 execute_model is not None
+-                and self._mutation_kind(node.args[0]) == "delete"
++                and self._mutation_kind(statement) == "delete"
+             ):
+                 self._report(node, execute_model, "**row")
+-            if execute_model is not None and len(node.args) > 1:
++            parameter_mappings = list(node.args[1:])
++            for parameter_name in ("params", "parameters"):
++                parameter = self._keyword(node, parameter_name)
++                if parameter is not None:
++                    parameter_mappings.append(parameter)
++            if execute_model is not None and parameter_mappings:
+                 self._check_mapping(
+                     node,
+                     execute_model,
+-                    args=node.args[1:],
+-                    keywords=node.keywords,
++                    args=parameter_mappings,
++                    keywords=(
++                        keyword
++                        for keyword in node.keywords
++                        if keyword.arg
++                        not in {"statement", "params", "parameters"}
++                    ),
++                )
++            self._check_raw_sql(node, statement)
++
++        local_helper = (
++            self.local_functions.get(node.func.id)
++            if isinstance(node.func, ast.Name)
++            else None
++        )
++        if local_helper is not None:
++            parameters = (
++                list(local_helper.args.posonlyargs)
++                + list(local_helper.args.args)
++                + list(local_helper.args.kwonlyargs)
++            )
++            bindings: dict[str, str] = {}
++            for parameter, argument in zip(parameters, node.args):
++                model = self._object_model(argument) or self._call_model(
++                    argument
++                )
++                if model is not None:
++                    bindings[parameter.arg] = model
++            for keyword in node.keywords:
++                if keyword.arg is None:
++                    continue
++                model = self._object_model(keyword.value) or self._call_model(
++                    keyword.value
++                )
++                if model is not None:
++                    bindings[keyword.arg] = model
++            if bindings:
++                self._inspect_local_helper(
++                    local_helper,
++                    bindings,
++                    active=set(),
+                 )
+-            self._check_raw_sql(node, node.args[0])
+ 
+         if (
+             isinstance(node.func, ast.Attribute)
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index a4814e6..1f7d8c2 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -1543,13 +1543,22 @@ def test_preflight_reconciliation_reports_position_drift(make_service):
+     from trading_assistant.broker.mock import MockBroker
+     from trading_assistant.broker.models import Position
+     from trading_assistant import preflight
++    from trading_assistant.ops.preflight_probe import (
++        ReadOnlyPreflightService,
++    )
+ 
+     broker = MockBroker(
+         positions=[
+             Position("AAPL", Decimal("2"), Decimal("100"), Decimal("100"))
+         ]
+     )
+-    result = preflight._reconciliation(make_service(broker=broker))
++    mutable_service = make_service(broker=broker)
++    result = preflight._reconciliation(
++        ReadOnlyPreflightService(
++            broker,
++            mutable_service.session_factory,
++        )
++    )
+ 
+     assert result.status == "FAIL"
+     assert "AAPL" in result.detail
+@@ -1559,7 +1568,7 @@ def test_preflight_reconciliation_sanitizes_provider_exception_text():
+     from trading_assistant import preflight
+ 
+     class ExplodingService:
+-        def sync_open_orders(self, **context):
++        def inspect_reconciliation(self):
+             raise RuntimeError("provider-secret-preflight-detail")
+ 
+     result = preflight._reconciliation(ExplodingService())
+diff --git a/tests/test_release_static.py b/tests/test_release_static.py
+index b49cd2e..8fedec7 100644
+--- a/tests/test_release_static.py
++++ b/tests/test_release_static.py
+@@ -1009,7 +1009,7 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
+         "OUTBOUND_ORIGIN_MANIFEST = (\n"
+         "    OutboundOriginRule('alpaca_trading', 'alpaca.trading', "
+         "'https://paper-api.alpaca.markets', frozenset({'app', 'daemon', "
+-        "'mcp', 'paper-drill', 'preflight', 'safety-drill', 'watchdog'})),\n"
++        "'mcp', 'paper-drill', 'preflight', 'safety-drill'})),\n"
+         "    OutboundOriginRule('alpaca_data', 'alpaca.historical', "
+         "'https://data.alpaca.markets', frozenset({'app', 'daemon', "
+         "'mcp', 'paper-drill', 'preflight', 'safety-drill', "
+@@ -1029,7 +1029,7 @@ def _trust_fixture(tmp_path: Path, *, git: bool = True) -> Path:
+         "'validate-analyst'}), 'llm.provider=groq'),\n"
+         "    OutboundOriginRule('telegram', 'notifier.telegram', "
+         "'https://api.telegram.org', frozenset({'app', 'daemon', "
+-        "'preflight', 'watchdog'}), 'features.telegram_notifications'),\n"
++        "'preflight'}), 'features.telegram_notifications'),\n"
+         "    OutboundOriginRule('coingecko', 'marketdata.coingecko', "
+         "'https://api.coingecko.com', frozenset({'app', 'daemon'}), "
+         "'crypto_risk'),\n"
+@@ -1909,12 +1909,14 @@ def test_composio_must_remain_explicitly_disabled(
+         ),
+         (
+             "src/trading_assistant/proxy.py",
+-            "server = Config(forwarded_allow_ips='*')\n",
++            "import uvicorn\n"
++            "uvicorn.run(app, proxy_headers=False, "
++            "forwarded_allow_ips='*')\n",
+             "PROXY_HEADERS_TRUSTED",
+         ),
+         (
+             "src/trading_assistant/tls.py",
+-            "server = Config(ssl_certfile=None)\n",
++            "import httpx\nclient = httpx.Client(verify=False)\n",
+             "TLS_DISABLED",
+         ),
+     ],
+@@ -1949,12 +1951,13 @@ def test_dynamic_outbound_manifest_fails_closed(tmp_path):
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("source", "code"),
+-    [
+-        (
+-            "client = make_client(follow_redirects=True)\n",
+-            "CROSS_ORIGIN_REDIRECT_ENABLED",
+-        ),
++        ("source", "code"),
++        [
++            (
++                "import httpx\n"
++                "client = httpx.Client(follow_redirects=True)\n",
++                "CROSS_ORIGIN_REDIRECT_ENABLED",
++            ),
+         (
+             "options['trust_env'] = configured_proxy_trust\n",
+             "PROXY_HEADERS_TRUSTED",
+@@ -3297,3 +3300,382 @@ def test_plaintext_format_document_is_not_a_decrypted_backup(tmp_path):
+     completed = _run_trust_gate(root)
+ 
+     assert completed.returncode == 0, completed.stdout + completed.stderr
++
++
++# ── Task 11 review round 3 regressions ────────────────────────────────
++
++
++@pytest.mark.parametrize(
++    "mutation",
++    [
++        "\nlocals()['SENSITIVE_FIELDS'] = {}\n",
++        "\nexec('SENSITIVE_FIELDS = {}')\n",
++        (
++            "\nregistry_box = [SENSITIVE_FIELDS]\n"
++            "registry_alias = registry_box[0]\n"
++            "registry_alias.clear()\n"
++        ),
++    ],
++    ids=("locals-rebind", "exec-rebind", "nested-container-alias"),
++)
++def test_final_sensitive_authority_rejects_dynamic_and_nested_access(
++    tmp_path,
++    mutation,
++):
++    root = _trust_fixture(tmp_path)
++    target = root / "src/trading_assistant/security/sensitive_fields.py"
++    target.write_text(
++        target.read_text(encoding="utf-8") + mutation,
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "SENSITIVE_REGISTRY_INVALID" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("relative", "authority", "code"),
++    [
++        (
++            "src/trading_assistant/app/agent.py",
++            "READ_ONLY_TOOL_SPECS",
++            "CHAT_TOOL_REGISTRY_UNPROVEN",
++        ),
++        (
++            "src/trading_assistant/security/sensitive_fields.py",
++            "SENSITIVE_FIELDS",
++            "SENSITIVE_REGISTRY_INVALID",
++        ),
++        (
++            "src/trading_assistant/security/secrets.py",
++            "_SIMPLE_SECRET_FIELDS",
++            "ENVIRONMENT_SECRETS_IN_PRODUCTION",
++        ),
++        (
++            "src/trading_assistant/security/outbound.py",
++            "OUTBOUND_ORIGIN_MANIFEST",
++            "OUTBOUND_ORIGIN_UNAPPROVED",
++        ),
++    ],
++)
++def test_every_final_authority_rejects_dynamic_locals_rebinding(
++    tmp_path,
++    relative,
++    authority,
++    code,
++):
++    root = _trust_fixture(tmp_path)
++    target = root / relative
++    target.write_text(
++        target.read_text(encoding="utf-8")
++        + f"\nlocals()[{authority!r}] = {authority}\n",
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert code in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("needle", "replacement"),
++    [
++        (
++            "        s = self.service\n",
++            "        s = self.service\n        self.dispatch_state = {}\n",
++        ),
++        (
++            "        s = self.service\n",
++            "        s = self.service\n        del self.service\n",
++        ),
++    ],
++    ids=("root-assignment", "root-delete"),
++)
++def test_chat_dispatch_root_rejects_state_mutation(
++    tmp_path,
++    needle,
++    replacement,
++):
++    root = _trust_fixture(tmp_path)
++    source = _agent_fixture_source()
++    assert needle in source
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/app/agent.py",
++        source.replace(needle, replacement, 1),
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "MUTABLE_CHAT_TOOL" in completed.stderr
++
++
++def test_chat_dispatch_root_rejects_direct_mutating_effect(tmp_path):
++    root = _trust_fixture(tmp_path)
++    source = _agent_fixture_source()
++    needle = "        s = self.service\n"
++    assert needle in source
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/app/agent.py",
++        source.replace(
++            needle,
++            needle + "        self.service.cancel_order('order-id')\n",
++            1,
++        ),
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "MUTABLE_CHAT_TOOL" in completed.stderr
++
++
++def test_chat_dispatch_root_rejects_unknown_direct_effect(tmp_path):
++    root = _trust_fixture(tmp_path)
++    source = _agent_fixture_source()
++    needle = "        s = self.service\n"
++    assert needle in source
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/app/agent.py",
++        source.replace(
++            needle,
++            needle + "        self.service.unmodeled_effect()\n",
++            1,
++        ),
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "CHAT_TOOL_REGISTRY_UNPROVEN" in completed.stderr
++
++
++def test_outbound_dynamic_policy_guard_must_dominate_transport(tmp_path):
++    root = _trust_fixture(tmp_path)
++    target = root / "src/trading_assistant/security/outbound.py"
++    target.write_text(
++        target.read_text(encoding="utf-8")
++        + (
++            "\nclass NoRedirectSession:\n"
++            "    def request(self, method, url, params=None):\n"
++            "        response = super().request(\n"
++            "            method, url,\n"
++            "            params=_validated_query_params(params),\n"
++            "        )\n"
++            "        self._policy.assert_url(url)\n"
++            "        return response\n"
++        ),
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
++
++
++def test_outbound_dynamic_policy_guard_rejects_url_rebinding_before_transport(
++    tmp_path,
++):
++    root = _trust_fixture(tmp_path)
++    target = root / "src/trading_assistant/security/outbound.py"
++    target.write_text(
++        target.read_text(encoding="utf-8")
++        + (
++            "\nclass NoRedirectSession:\n"
++            "    def request(self, method, url, params=None):\n"
++            "        self._policy.assert_url(url)\n"
++            "        url = configured_url\n"
++            "        return super().request(\n"
++            "            method, url,\n"
++            "            params=_validated_query_params(params),\n"
++            "        )\n"
++        ),
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
++
++
++def test_chained_query_mapping_targets_share_mutation_provenance(tmp_path):
++    root = _trust_fixture(tmp_path)
++    target = root / "src/trading_assistant/security/outbound.py"
++    target.write_text(
++        target.read_text(encoding="utf-8")
++        + (
++            "\nclass NoRedirectSession:\n"
++            "    def request(self, method, url):\n"
++            "        params = alias = {'symbol': 'AAPL'}\n"
++            "        alias.setdefault('access_key', credential)\n"
++            "        self._policy.assert_url(url)\n"
++            "        return super().request(method, url, params=params)\n"
++        ),
++        encoding="utf-8",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "QUERY_SECRET" in completed.stderr
++
++
++def test_chained_provider_options_share_mutation_provenance(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/llm/anthropic_backend.py",
++        "from anthropic import Anthropic\n"
++        "options = alias = {'api_key': credential}\n"
++        "alias['base_url'] = 'https://unapproved.invalid'\n"
++        "client = Anthropic(**options)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_ORIGIN_UNAPPROVED" in completed.stderr
++
++
++def test_environment_mapping_unpack_is_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/environment_unpack.py",
++        "import os\n"
++        "copied_environment = {**os.environ}\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "ENVIRONMENT_SECRETS_IN_PRODUCTION" in completed.stderr
++
++
++@pytest.mark.parametrize(
++    ("source", "code"),
++    [
++        (
++            "import starlette.middleware.cors as cors\n"
++            "middlewares = [cors.CORSMiddleware]\n"
++            "app.add_middleware(middlewares[0], allow_origins=['*'])\n",
++            "WILDCARD_HOST_ORIGIN",
++        ),
++        (
++            "import http.client as http_client\n"
++            "clients = [http_client.HTTPSConnection]\n"
++            "clients[0]('example.invalid')\n",
++            "OUTBOUND_CLIENT_UNAPPROVED",
++        ),
++        (
++            "cookies = [response.set_cookie]\n"
++            "cookies[0]('session', secure=False, httponly=True, "
++            "samesite='strict')\n",
++            "INSECURE_COOKIE",
++        ),
++        (
++            "import ssl as tls\n"
++            "factories = [tls._create_unverified_context]\n"
++            "factories[0]()\n",
++            "TLS_DISABLED",
++        ),
++    ],
++    ids=("cors", "http-client", "cookie", "ssl-factory"),
++)
++def test_security_call_collection_indirection_fails_closed(
++    tmp_path,
++    source,
++    code,
++):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/security_indirection.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert code in completed.stderr
++
++
++def test_tracked_root_production_sql_is_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    relative = "production.sql"
++    _write_fixture_file(root, relative, "fixture backup marker\n")
++    subprocess.run(["git", "add", "--", relative], cwd=root, check=True)
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "TRACKED_DECRYPTED_BACKUP" in completed.stderr
++    assert "fixture backup marker" not in completed.stderr
++
++
++def test_non_network_get_verify_keyword_is_a_decoy(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/local_store.py",
++        "result = local_store.get('record', verify=False)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 0, completed.stdout + completed.stderr
++
++
++@pytest.mark.parametrize(
++    "source",
++    [
++        (
++            "import urllib.request\n"
++            "urllib.request.build_opener().open("
++            "'https://example.invalid/data')\n"
++        ),
++        (
++            "import socket\n"
++            "socket.socket().connect(('example.invalid', 443))\n"
++        ),
++    ],
++    ids=("urllib-opener", "socket-instance"),
++)
++def test_chained_stdlib_network_clients_are_rejected(tmp_path, source):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/stdlib_chain.py",
++        source,
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
++
++
++def test_computed_credential_query_key_is_rejected(tmp_path):
++    root = _trust_fixture(tmp_path)
++    _write_fixture_file(
++        root,
++        "src/trading_assistant/computed_query.py",
++        "import urllib.request\n"
++        "credential_key = 'api_' + 'key'\n"
++        "target = ('https://example.invalid/data?' + credential_key "
++        "+ '=fixture')\n"
++        "urllib.request.urlopen(target)\n",
++    )
++
++    completed = _run_trust_gate(root)
++
++    assert completed.returncode == 1
++    assert "QUERY_SECRET" in completed.stderr
+diff --git a/tests/test_sensitive_write_sites.py b/tests/test_sensitive_write_sites.py
+index b500193..fba2955 100644
+--- a/tests/test_sensitive_write_sites.py
++++ b/tests/test_sensitive_write_sites.py
+@@ -345,3 +345,45 @@ def test_runtime_boundary_blocks_core_delete_from_sensitive_table(
+ 
+     with session_factory() as session:
+         assert session.get(AuditEvent, event_id) is not None
++
++
++@pytest.mark.parametrize(
++    ("source", "marker"),
++    [
++        (
++            """
++from sqlalchemy import text
++run = session.execute
++run(statement=text(
++    "UPDATE audit_events SET reason = :reason WHERE id = :id"
++))
++""",
++            "audit_events.reason",
++        ),
++        (
++            """
++from trading_assistant.db.models import AuditEvent
++session.query(AuditEvent).update(values={"reason": "plain"})
++""",
++            "AuditEvent.reason",
++        ),
++        (
++            """
++from trading_assistant.db.models import AuditEvent
++def mutate(item):
++    item.reason = "plain"
++row = session.get(AuditEvent, 1)
++mutate(row)
++""",
++            "AuditEvent.reason",
++        ),
++    ],
++    ids=("execute-statement-keyword", "query-update-values", "helper-parameter"),
++)
++def test_round3_sensitive_write_alias_and_helper_bypasses(
++    tmp_path,
++    source,
++    marker,
++):
++    offenders = _scan_fixture(tmp_path, source)
++    assert any(marker in offender for offender in offenders), offenders
+diff --git a/tests/test_task11_round3.py b/tests/test_task11_round3.py
+new file mode 100644
+index 0000000..4989572
+--- /dev/null
++++ b/tests/test_task11_round3.py
+@@ -0,0 +1,221 @@
++"""Task 11 review round 3 regression probes.
++
++Every transport, broker, and certificate interaction in this module is a fake
++or a hermetic local fixture.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++def test_preflight_reconciliation_uses_one_read_only_probe():
++    from trading_assistant import preflight
++
++    calls: list[str] = []
++
++    class ReadOnlyProbe:
++        def inspect_reconciliation(self):
++            calls.append("inspect")
++            return SimpleNamespace(
++                orders_match=True,
++                positions_match=True,
++                broker_open_order_count=0,
++                local_open_order_count=0,
++                drift_symbols=(),
++            )
++
++        def __getattr__(self, name):
++            raise AssertionError(f"unexpected mutable capability: {name}")
++
++    result = preflight._reconciliation(ReadOnlyProbe())
++
++    assert result.status == preflight.PASS
++    assert result.detail == "orders and positions match"
++    assert calls == ["inspect"]
++
++
++def test_preflight_builder_constructs_only_narrow_read_only_service(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.security.secrets import RuntimeSecrets
++
++    secrets = RuntimeSecrets(
++        app_api_token="round3-preflight-token",
++        alpaca_api_key="round3-alpaca-key",
++        alpaca_secret_key="round3-alpaca-secret",
++        database_url="sqlite:///round3-unused.db",
++    )
++    session_factory = object()
++    runtime = SimpleNamespace(
++        engine=object(),
++        session_factory=session_factory,
++    )
++    broker = object()
++    service = object()
++    observed: list[tuple[str, object]] = []
++
++    monkeypatch.setattr(
++        bootstrap,
++        "require_configured_role_origins",
++        lambda _config, role: observed.append(("origins", role)),
++    )
++    monkeypatch.setattr(bootstrap, "_guard_runtime", lambda *_args: None)
++    monkeypatch.setattr(
++        bootstrap,
++        "prepare_database_runtime",
++        lambda _secrets, *, runtime_role: (
++            observed.append(("database", runtime_role)) or runtime
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_broker",
++        lambda _config, _secrets, *, runtime_role: (
++            observed.append(("broker", runtime_role)) or broker
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "_arm_production_paper_broker",
++        lambda selected: observed.append(("paper", selected)),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "ReadOnlyPreflightService",
++        lambda selected_broker, factory: (
++            observed.append(
++                ("read_only_service", (selected_broker, factory))
++            )
++            or service
++        ),
++        raising=False,
++    )
++    for forbidden in (
++        "TradingService",
++        "build_clock",
++        "build_sensitive_data_cipher",
++        "bind_sensitive_cipher",
++        "build_quarantine_summarizer",
++    ):
++        monkeypatch.setattr(
++            bootstrap,
++            forbidden,
++            lambda *_args, _name=forbidden, **_kwargs: pytest.fail(
++                f"preflight constructed forbidden capability: {_name}"
++            ),
++        )
++
++    container = bootstrap.build_preflight_service(app_config, secrets)
++
++    assert container.service is service
++    assert observed == [
++        ("origins", "preflight"),
++        ("database", "preflight"),
++        ("broker", "preflight"),
++        ("paper", broker),
++        ("read_only_service", (broker, session_factory)),
++    ]
++
++
++def test_read_only_preflight_probe_performs_no_database_or_broker_mutation(
++    make_service,
++):
++    from sqlalchemy import event
++
++    from trading_assistant.broker.mock import MockBroker
++    from trading_assistant.ops.preflight_probe import (
++        ReadOnlyPreflightService,
++    )
++
++    class ReadOnlyBroker(MockBroker):
++        def submit_order(self, _order):
++            raise AssertionError("preflight submitted an order")
++
++        def cancel_order(self, _order_id):
++            raise AssertionError("preflight canceled an order")
++
++    broker = ReadOnlyBroker()
++    mutable_service = make_service(broker=broker)
++    engine = mutable_service.session_factory.kw["bind"]
++    writes: list[str] = []
++
++    def record_statement(
++        _connection,
++        _cursor,
++        statement,
++        _parameters,
++        _context,
++        _executemany,
++    ):
++        verb = statement.lstrip().partition(" ")[0].upper()
++        if verb in {"DELETE", "INSERT", "REPLACE", "UPDATE"}:
++            writes.append(verb)
++
++    event.listen(engine, "before_cursor_execute", record_statement)
++    try:
++        probe = ReadOnlyPreflightService(
++            broker,
++            mutable_service.session_factory,
++        )
++        snapshot = probe.inspect_reconciliation()
++    finally:
++        event.remove(engine, "before_cursor_execute", record_statement)
++
++    assert snapshot.orders_match is True
++    assert snapshot.positions_match is True
++    assert writes == []
++    assert {
++        name
++        for name in dir(type(probe))
++        if not name.startswith("_")
++    } == {"inspect_reconciliation"}
++
++
++def test_watchdog_has_no_provider_egress(app_config):
++    from trading_assistant.security.outbound import (
++        OUTBOUND_ORIGIN_MANIFEST,
++        origins_for_role,
++    )
++
++    assert origins_for_role(app_config, "watchdog") == frozenset()
++    assert all(
++        "watchdog" not in rule.roles
++        for rule in OUTBOUND_ORIGIN_MANIFEST
++    )
++
++
++def test_watchdog_secret_role_was_already_database_only(app_config):
++    from trading_assistant.security.secrets import _required_fields
++
++    # Counterexample to the review's secret-capability claim: this was already
++    # narrow before round 3 and must stay that way.
++    assert _required_fields("watchdog", app_config) == ("database_url",)
++
++
++def test_setup_local_tls_uses_repository_declared_python_runner():
++    source = Path("scripts/setup-local-tls.sh").read_text(encoding="utf-8")
++
++    assert "\nuv run python -m trading_assistant.ops.tls inspect\n" in source
++    assert "\npython -m trading_assistant.ops.tls inspect\n" not in source
++
++
++def test_computed_query_keys_are_rejected_before_guarded_transport():
++    from trading_assistant.security.outbound import (
++        OutboundOriginDenied,
++        OutboundPolicy,
++        _validated_query_params,
++    )
++
++    key = "api_" + "key"
++    with pytest.raises(OutboundOriginDenied):
++        _validated_query_params({key: "fixture"})
++    with pytest.raises(OutboundOriginDenied):
++        OutboundPolicy("https://api.example.test").assert_url(
++            "https://api.example.test/path?" + key + "=fixture"
++        )
+diff --git a/tests/test_task9_round2.py b/tests/test_task9_round2.py
+index f131b25..1508c76 100644
+--- a/tests/test_task9_round2.py
++++ b/tests/test_task9_round2.py
+@@ -425,8 +425,6 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
+         session_factory=session_factory,
+     )
+     broker = object()
+-    clock = object()
+-    cipher = object()
+     service = object()
+     observed: list[tuple[str, object]] = []
+ 
+@@ -450,15 +448,15 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
+     monkeypatch.setattr(
+         bootstrap,
+         "build_sensitive_data_cipher",
+-        lambda encryption, supplied: (
+-            observed.append(("cipher", supplied)) or cipher
++        lambda *_args, **_kwargs: pytest.fail(
++            "read-only preflight must not construct a field cipher"
+         ),
+     )
+     monkeypatch.setattr(
+         bootstrap,
+         "bind_sensitive_cipher",
+-        lambda factory, supplied_cipher: observed.append(
+-            ("bind_cipher", (factory, supplied_cipher))
++        lambda *_args, **_kwargs: pytest.fail(
++            "read-only preflight must not install write/decrypt hooks"
+         ),
+     )
+     monkeypatch.setattr(
+@@ -478,15 +476,25 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
+     monkeypatch.setattr(
+         bootstrap,
+         "build_clock",
+-        lambda config, supplied, *, runtime_role: (
+-            observed.append(("clock_role", runtime_role)) or clock
++        lambda *_args, **_kwargs: pytest.fail(
++            "read-only reconciliation must not construct a clock client"
+         ),
+     )
+     monkeypatch.setattr(
+         bootstrap,
+         "TradingService",
+-        lambda supplied_broker, factory, config, supplied_clock, **kwargs: (
+-            observed.append(("service", kwargs)) or service
++        lambda *_args, **_kwargs: pytest.fail(
++            "preflight must not expose mutable TradingService"
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "ReadOnlyPreflightService",
++        lambda supplied_broker, factory: (
++            observed.append(
++                ("read_only_service", (supplied_broker, factory))
++            )
++            or service
+         ),
+     )
+     monkeypatch.setattr(
+@@ -504,8 +512,10 @@ def test_dedicated_preflight_builder_constructs_no_llm_capability(
+     assert ("origins", "preflight") in observed
+     assert ("database_role", "preflight") in observed
+     assert ("broker_role", "preflight") in observed
+-    assert ("clock_role", "preflight") in observed
+-    assert ("service", {"external_source": None}) in observed
++    assert (
++        "read_only_service",
++        (broker, session_factory),
++    ) in observed
+ 
+ 
+ def test_watchdog_database_runtime_reuses_explicit_secrets_and_role(
+diff --git a/tests/test_transport_boundary.py b/tests/test_transport_boundary.py
+index 1c03b86..c4dd80e 100644
+--- a/tests/test_transport_boundary.py
++++ b/tests/test_transport_boundary.py
+@@ -13,6 +13,13 @@ import pytest
+ from cryptography import x509
+ from cryptography.hazmat.primitives import hashes, serialization
+ from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.x509.oid import ExtendedKeyUsageOID
++from cryptography.x509.verification import (
++    DNSName,
++    PolicyBuilder,
++    Store,
++    VerificationError,
++)
+ from fastapi.testclient import TestClient
+ 
+ from trading_assistant.app.main import create_app
+@@ -765,6 +772,8 @@ def _write_tls_pair(
+     dns_names: tuple[str, ...] = ("localhost",),
+     ip_names: tuple[str, ...] = ("127.0.0.1", "::1"),
+     key_matches_certificate: bool = True,
++    ca_key_cert_sign: bool = True,
++    leaf_server_auth: bool | None = True,
+ ) -> SimpleNamespace:
+     tls_directory = tmp_path / ".local" / "tls"
+     tls_directory.mkdir(parents=True)
+@@ -788,6 +797,26 @@ def _write_tls_pair(
+             x509.BasicConstraints(ca=True, path_length=0),
+             critical=True,
+         )
++        .add_extension(
++            x509.KeyUsage(
++                digital_signature=False,
++                content_commitment=False,
++                key_encipherment=False,
++                data_encipherment=False,
++                key_agreement=False,
++                key_cert_sign=ca_key_cert_sign,
++                crl_sign=ca_key_cert_sign,
++                encipher_only=None,
++                decipher_only=None,
++            ),
++            critical=True,
++        )
++        .add_extension(
++            x509.SubjectKeyIdentifier.from_public_key(
++                root_key.public_key()
++            ),
++            critical=False,
++        )
+         .sign(root_key, hashes.SHA256())
+     )
+     certificate_key = rsa.generate_private_key(
+@@ -799,7 +828,7 @@ def _write_tls_pair(
+         if key_matches_certificate
+         else rsa.generate_private_key(public_exponent=65537, key_size=2048)
+     )
+-    certificate = (
++    certificate_builder = (
+         x509.CertificateBuilder()
+         .subject_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")]))
+         .issuer_name(root_name)
+@@ -821,6 +850,46 @@ def _write_tls_pair(
+             x509.BasicConstraints(ca=False, path_length=None),
+             critical=True,
+         )
++        .add_extension(
++            x509.KeyUsage(
++                digital_signature=True,
++                content_commitment=False,
++                key_encipherment=True,
++                data_encipherment=False,
++                key_agreement=False,
++                key_cert_sign=False,
++                crl_sign=False,
++                encipher_only=None,
++                decipher_only=None,
++            ),
++            critical=True,
++        )
++    )
++    if leaf_server_auth is not None:
++        certificate_builder = certificate_builder.add_extension(
++            x509.ExtendedKeyUsage(
++                [
++                    ExtendedKeyUsageOID.SERVER_AUTH
++                    if leaf_server_auth
++                    else ExtendedKeyUsageOID.CLIENT_AUTH
++                ]
++            ),
++            critical=False,
++        )
++    certificate = (
++        certificate_builder
++        .add_extension(
++            x509.SubjectKeyIdentifier.from_public_key(
++                certificate_key.public_key()
++            ),
++            critical=False,
++        )
++        .add_extension(
++            x509.AuthorityKeyIdentifier.from_issuer_public_key(
++                root_key.public_key()
++            ),
++            critical=False,
++        )
+         .sign(root_key, hashes.SHA256())
+     )
+     ca_path = tls_directory / "rootCA.pem"
+@@ -1041,6 +1110,60 @@ def test_tls_inspection_rejects_missing_loopback_sans_and_key_mismatch(
+     assert "PRIVATE KEY" not in str(exc_info.value)
+ 
+ 
++@pytest.mark.parametrize(
++    ("fixture_options", "expected_code"),
++    [
++        ({"ca_key_cert_sign": False}, "tls_ca_invalid"),
++        ({"leaf_server_auth": False}, "tls_ca_chain_invalid"),
++    ],
++    ids=("ca-without-key-cert-sign", "leaf-without-server-auth"),
++)
++def test_tls_inspection_matches_standards_verifier_constraints(
++    tmp_path,
++    monkeypatch,
++    fixture_options,
++    expected_code,
++):
++    """The local validator must reject every chain the standards verifier rejects."""
++    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
++
++    server = _write_tls_pair(tmp_path, **fixture_options)
++    ca = x509.load_pem_x509_certificate(
++        (tmp_path / ".local/tls/rootCA.pem").read_bytes()
++    )
++    leaf = x509.load_pem_x509_certificate(
++        (tmp_path / ".local/tls/localhost.pem").read_bytes()
++    )
++    verifier = (
++        PolicyBuilder()
++        .store(Store([ca]))
++        .build_server_verifier(DNSName("localhost"))
++    )
++    with pytest.raises(VerificationError):
++        verifier.verify(leaf, [])
++
++    monkeypatch.chdir(tmp_path)
++    with pytest.raises(TLSMaterialError) as exc_info:
++        validate_tls_material(server)
++
++    assert exc_info.value.code == expected_code
++
++
++def test_tls_inspection_requires_explicit_server_auth_eku(
++    tmp_path,
++    monkeypatch,
++):
++    from trading_assistant.ops.tls import TLSMaterialError, validate_tls_material
++
++    server = _write_tls_pair(tmp_path, leaf_server_auth=None)
++    monkeypatch.chdir(tmp_path)
++
++    with pytest.raises(TLSMaterialError) as exc_info:
++        validate_tls_material(server)
++
++    assert exc_info.value.code == "tls_ca_chain_invalid"
++
++
+ def test_production_encryption_inspector_fails_closed_without_singleton(
+     tmp_path,
+ ):

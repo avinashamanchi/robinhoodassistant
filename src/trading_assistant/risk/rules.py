@@ -10,20 +10,37 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from ..broker.models import OrderRequest, OrderSide, OrderType, PortfolioSnapshot
+from ..broker.models import (
+    OrderRequest,
+    OrderSide,
+    OrderType,
+    PortfolioSnapshot,
+    Quote,
+)
 from ..config import RiskConfig
 
 
-def _reference_price(order: OrderRequest, snapshot: PortfolioSnapshot) -> Optional[Decimal]:
-    quote = snapshot.quotes.get(order.ticker.upper())
-    return quote.last if quote else None
+def _reference_quote(
+    order: OrderRequest, snapshot: PortfolioSnapshot
+) -> Optional[Quote]:
+    return snapshot.quotes.get(order.ticker.upper())
 
 
-def _order_qty_shares(order: OrderRequest, price: Decimal) -> Decimal:
-    if order.qty is not None:
-        return order.qty
-    assert order.notional is not None
-    return order.notional / price
+def _ticker_values(
+    order: OrderRequest,
+    snapshot: PortfolioSnapshot,
+    quote: Quote,
+) -> tuple[Decimal, Decimal] | None:
+    current_value = snapshot.effective_signed_value(
+        order.ticker.upper()
+    )
+    if current_value is None:
+        return None
+    order_value = order.risk_notional(quote)
+    signed_order_value = (
+        order_value if order.side is OrderSide.BUY else -order_value
+    )
+    return abs(current_value), abs(current_value + signed_order_value)
 
 
 def check_allowlist(order: OrderRequest, config: RiskConfig) -> Optional[str]:
@@ -32,13 +49,19 @@ def check_allowlist(order: OrderRequest, config: RiskConfig) -> Optional[str]:
     return None
 
 
+def check_pending_exposure_known(snapshot: PortfolioSnapshot) -> Optional[str]:
+    if not snapshot.pending_exposure_complete:
+        return "outstanding order exposure is unknown; new orders are blocked"
+    return None
+
+
 def check_max_notional(
     order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
 ) -> Optional[str]:
-    price = _reference_price(order, snapshot)
-    if price is None:
+    quote = _reference_quote(order, snapshot)
+    if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot size order"
-    notional = order.estimated_notional(price)
+    notional = order.risk_notional(quote)
     limit = Decimal(str(config.max_notional_per_order))
     if notional > limit:
         return f"order notional ${notional:.2f} exceeds max ${limit:.2f} per order"
@@ -48,14 +71,15 @@ def check_max_notional(
 def check_max_position(
     order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
 ) -> Optional[str]:
-    price = _reference_price(order, snapshot)
-    if price is None:
+    quote = _reference_quote(order, snapshot)
+    if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot size position"
-    qty = _order_qty_shares(order, price)
-    signed = qty if order.side is OrderSide.BUY else -qty
-    current = snapshot.positions.get(order.ticker.upper())
-    current_qty = current.qty if current else Decimal(0)
-    projected_value = abs(current_qty + signed) * price
+    values = _ticker_values(
+        order, snapshot, quote
+    )
+    if values is None:
+        return "position exposure snapshot is incomplete"
+    _current_value, projected_value = values
     limit = Decimal(str(config.max_position_per_ticker))
     if projected_value > limit:
         return (
@@ -68,17 +92,20 @@ def check_max_position(
 def check_portfolio_exposure(
     order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
 ) -> Optional[str]:
-    price = _reference_price(order, snapshot)
-    if price is None:
+    quote = _reference_quote(order, snapshot)
+    if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot size exposure"
-    qty = _order_qty_shares(order, price)
-    signed = qty if order.side is OrderSide.BUY else -qty
-    current = snapshot.positions.get(order.ticker.upper())
-    current_qty = current.qty if current else Decimal(0)
-    current_ticker_value = abs(current_qty) * price
-    projected_ticker_value = abs(current_qty + signed) * price
+    values = _ticker_values(
+        order, snapshot, quote
+    )
+    gross_exposure = snapshot.gross_exposure_with_pending()
+    if values is None or gross_exposure is None:
+        return "portfolio exposure snapshot is incomplete"
+    current_ticker_value, projected_ticker_value = values
     projected_gross = (
-        snapshot.gross_exposure() - current_ticker_value + projected_ticker_value
+        gross_exposure
+        - current_ticker_value
+        + projected_ticker_value
     )
     limit = Decimal(str(config.max_portfolio_exposure))
     if projected_gross > limit:
@@ -94,9 +121,10 @@ def check_price_sanity(
 ) -> Optional[str]:
     if order.order_type is not OrderType.LIMIT or order.limit_price is None:
         return None
-    price = _reference_price(order, snapshot)
-    if price is None:
+    quote = _reference_quote(order, snapshot)
+    if quote is None:
         return f"no quote available for {order.ticker.upper()}; cannot sanity-check price"
+    price = quote.last
     if price == 0:
         return f"reference price for {order.ticker.upper()} is zero"
     deviation_pct = abs(order.limit_price - price) / price * Decimal(100)
@@ -123,14 +151,15 @@ def check_cross_broker_concentration(
     """WARNING (never a rejection): combined Alpaca + external exposure in this
     ticker would exceed max_position_per_ticker. External holdings aren't ours to
     manage, so this only informs — the human may intend the concentration."""
-    price = _reference_price(order, snapshot)
-    if price is None:
+    quote = _reference_quote(order, snapshot)
+    if quote is None:
         return None
-    qty = _order_qty_shares(order, price)
-    signed = qty if order.side is OrderSide.BUY else -qty
-    current = snapshot.positions.get(order.ticker.upper())
-    current_qty = current.qty if current else Decimal(0)
-    projected_alpaca = abs(current_qty + signed) * price
+    values = _ticker_values(
+        order, snapshot, quote
+    )
+    if values is None:
+        return None
+    _current_value, projected_alpaca = values
     external = snapshot.external_position_value(order.ticker.upper())
     combined = projected_alpaca + external
     limit = Decimal(str(config.max_position_per_ticker))

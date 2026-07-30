@@ -1,0 +1,844 @@
+# Review package: 9c77c2816734625a77b4d99bfc59cf5031c0b654..0fa8b58
+
+## Commits
+0fa8b58 fix(security): close Task 8 compact and expiry races
+
+## Files changed
+ .../plans/2026-07-27-secrets-model-trust.md        |  20 ++
+ src/trading_assistant/analyst/untrusted.py         | 131 +++++++++++-
+ src/trading_assistant/llm/budget.py                |  67 ++++--
+ tests/test_llm_budget.py                           | 236 +++++++++++++++++++++
+ tests/test_task8_model_trust.py                    | 112 +++++++++-
+ 5 files changed, 547 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+index 25daec9..23fc2a3 100644
+--- a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
++++ b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+@@ -1210,20 +1210,40 @@ git commit -m "feat(analyst): quarantine external text"
+ - A reconciliation failure can leave a charged reservation `started`, but
+   reserve, status, and explicit maintenance atomically transition it to
+   `unknown` only after `expires_at`. The provider day is latched with
+   `provider_started_usage_unknown`; no call/token capacity is released and all
+   new calls remain blocked pending operator/provider reconciliation.
+ - One shared source-citation validator runs inside `Analyst`, before
+   `save_report`, immediately after any planning analyst returns, and again at
+   the trade-plan store boundary. Alternate analyst implementations and direct
+   store callers cannot bypass summary/reference validation.
+ 
++**Fix round 2 hardening:**
++
++- In addition to 3–5-token lexical fingerprints, copy-through validation
++  computes bounded NFKC/casefolded forms containing only Unicode alphanumerics.
++  An output of at least 12 compact characters is rejected when it appears in a
++  source, and fixed-width compact source windows reject copied material hidden
++  inside output prefixes or suffixes. Source/output characters, comparisons,
++  and windows all have explicit ceilings. This deliberately conservative
++  boundary may reject a legitimate shared phrase or long proper noun; short
++  tickers and ordinary short numbers remain allowed because preventing raw
++  instruction copy-through takes priority over recall.
++- `mark_unknown(now=...)` and stale-started maintenance use the same helper
++  under their existing `BEGIN IMMEDIATE` transaction. Whether failure marking
++  or reaping acquires the lock first, an unknown reservation at or after
++  `expires_at` atomically latches its provider day with
++  `provider_started_usage_unknown`, retains all call/token charges, and denies
++  new reservations until reconciliation. Repeated calls are idempotent,
++  unexpired started calls are not reaped, and settled reservations remain
++  final.
++
+ - [ ] **Step 1: Write no-tools and no-raw-forwarding tests**
+ 
+ ```python
+ def test_quarantine_model_receives_no_tools(quarantine_gateway):
+     gateway, backend = quarantine_gateway
+     summary = gateway.summarize([malicious_content()], request_id="req-1")
+     assert backend.calls[0]["tools"] == []
+     assert summary.injection_flags
+ 
+ 
+diff --git a/src/trading_assistant/analyst/untrusted.py b/src/trading_assistant/analyst/untrusted.py
+index c9c4aeb..bf972a1 100644
+--- a/src/trading_assistant/analyst/untrusted.py
++++ b/src/trading_assistant/analyst/untrusted.py
+@@ -49,20 +49,32 @@ _COPY_LONG_TOKEN_MIN_CHARACTERS = 12
+ _COPY_NGRAM_MIN_TOKENS = 3
+ _COPY_NGRAM_MAX_TOKENS = 5
+ _COPY_MAX_TOKENS_PER_SOURCE = (MAX_NORMALIZED_CHARACTERS + 1) // 2
+ _COPY_MAX_TOTAL_TOKENS = (
+     MAX_ITEMS_PER_REQUEST * _COPY_MAX_TOKENS_PER_SOURCE
+ )
+ _COPY_MAX_FINGERPRINT_OPERATIONS = (
+     _COPY_MAX_TOTAL_TOKENS
+     * (1 + _COPY_NGRAM_MAX_TOKENS - _COPY_NGRAM_MIN_TOKENS + 1)
+ )
++_COMPACT_COPY_MIN_CHARACTERS = 12
++_COMPACT_MAX_CHARACTERS_PER_SOURCE = MAX_NORMALIZED_CHARACTERS
++_COMPACT_MAX_TOTAL_SOURCE_CHARACTERS = (
++    MAX_ITEMS_PER_REQUEST * _COMPACT_MAX_CHARACTERS_PER_SOURCE
++)
++_COMPACT_MAX_OUTPUT_VALUES = 30
++_COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS = 50_000
++_COMPACT_MAX_SOURCE_COMPARISONS = (
++    MAX_ITEMS_PER_REQUEST * _COMPACT_MAX_OUTPUT_VALUES
++)
++_COMPACT_MAX_SOURCE_WINDOWS = _COMPACT_MAX_TOTAL_SOURCE_CHARACTERS
++_COMPACT_MAX_OUTPUT_WINDOWS = _COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS
+ 
+ SourceKind = Literal["alpaca_news", "filing", "search", "pasted"]
+ FindingSeverity = Literal["low", "medium", "high"]
+ 
+ _BIDI_CONTROLS = frozenset(
+     {
+         "\u061c",
+         "\u200e",
+         "\u200f",
+         "\u202a",
+@@ -695,20 +707,74 @@ def _copy_tokens(value: str) -> tuple[str, ...]:
+     )
+ 
+ 
+ def _copy_fingerprint(parts: Sequence[str]) -> bytes:
+     return hashlib.blake2s(
+         "\x1f".join(parts).encode("utf-8"),
+         digest_size=16,
+     ).digest()
+ 
+ 
++def _compact_alphanumeric(value: str) -> str:
++    normalized = unicodedata.normalize(
++        "NFKC",
++        unicodedata.normalize("NFKC", value).casefold(),
++    )
++    return "".join(
++        character
++        for character in normalized
++        if character.isalnum()
++    )
++
++
++def _source_compact_fingerprints(
++    source_texts: Sequence[str],
++) -> tuple[tuple[str, ...], frozenset[bytes]]:
++    """Return bounded compact forms and fixed-width source windows.
++
++    Fixed-width hashes make reverse substring checks linear in the bounded
++    source/output sizes. A collision can only conservatively reject output.
++    """
++    compact_sources: list[str] = []
++    source_windows: set[bytes] = set()
++    total_characters = 0
++    window_operations = 0
++    for source_text in source_texts:
++        compact = _compact_alphanumeric(source_text)
++        if len(compact) > _COMPACT_MAX_CHARACTERS_PER_SOURCE:
++            raise ValueError("untrusted summary source is too complex")
++        total_characters += len(compact)
++        if total_characters > _COMPACT_MAX_TOTAL_SOURCE_CHARACTERS:
++            raise ValueError("untrusted summary sources are too complex")
++        compact_sources.append(compact)
++        for start in range(
++            0,
++            max(0, len(compact) - _COMPACT_COPY_MIN_CHARACTERS + 1),
++        ):
++            window_operations += 1
++            if window_operations > _COMPACT_MAX_SOURCE_WINDOWS:
++                raise ValueError(
++                    "untrusted summary sources are too complex"
++                )
++            source_windows.add(
++                _copy_fingerprint(
++                    (
++                        compact[
++                            start : start
++                            + _COMPACT_COPY_MIN_CHARACTERS
++                        ],
++                    )
++                )
++            )
++    return tuple(compact_sources), frozenset(source_windows)
++
++
+ def _source_lexical_fingerprints(
+     source_texts: Sequence[str],
+ ) -> tuple[frozenset[bytes], frozenset[bytes]]:
+     """Build bounded lexical copy-through evidence.
+ 
+     This deliberately prefers false-positive rejection over raw-text
+     copy-through. Standalone short identifiers and pure numeric tokens are not
+     single-token fingerprints, but copied 3–5 token phrases still reject.
+     Hashes bound retained memory without weakening the conservative boundary:
+     a digest collision can only reject an otherwise safe summary.
+@@ -745,20 +811,54 @@ def _source_lexical_fingerprints(
+             for start in range(0, max(0, len(tokens) - width + 1)):
+                 operations += 1
+                 ngrams.add(
+                     _copy_fingerprint(tokens[start : start + width])
+                 )
+         if operations > _COPY_MAX_FINGERPRINT_OPERATIONS:
+             raise ValueError("untrusted summary sources are too complex")
+     return frozenset(long_tokens), frozenset(ngrams)
+ 
+ 
++def _reject_source_compact_copy(
++    compact_value: str,
++    *,
++    compact_sources: tuple[str, ...],
++    source_windows: frozenset[bytes],
++) -> tuple[int, int]:
++    if len(compact_value) < _COMPACT_COPY_MIN_CHARACTERS:
++        return 0, 0
++    comparisons = len(compact_sources)
++    if any(
++        compact_value in compact_source
++        for compact_source in compact_sources
++    ):
++        raise ValueError("untrusted summary copied raw content")
++    output_windows = 0
++    for start in range(
++        0,
++        len(compact_value) - _COMPACT_COPY_MIN_CHARACTERS + 1,
++    ):
++        output_windows += 1
++        if (
++            _copy_fingerprint(
++                (
++                    compact_value[
++                        start : start + _COMPACT_COPY_MIN_CHARACTERS
++                    ],
++                )
++            )
++            in source_windows
++        ):
++            raise ValueError("untrusted summary copied raw content")
++    return comparisons, output_windows
++
++
+ def _reject_source_lexical_copy(
+     value: str,
+     *,
+     long_tokens: frozenset[bytes],
+     ngrams: frozenset[bytes],
+ ) -> None:
+     tokens = _copy_tokens(value)
+     if any(
+         len(token) >= _COPY_LONG_TOKEN_MIN_CHARACTERS
+         and not token.isnumeric()
+@@ -802,30 +902,59 @@ def validate_summary_for_privileged_use(
+         raise ValueError("untrusted summary injection flag is invalid")
+ 
+     marker_tokens = {
+         match.group(0).casefold()
+         for source_text in source_texts
+         for match in _RAW_MARKER_TOKEN_RE.finditer(source_text)
+     }
+     long_tokens, source_ngrams = _source_lexical_fingerprints(
+         source_texts
+     )
+-    for value in _summary_strings(summary):
++    compact_sources, source_compact_windows = (
++        _source_compact_fingerprints(source_texts)
++    )
++    summary_values = _summary_strings(summary)
++    if len(summary_values) > _COMPACT_MAX_OUTPUT_VALUES:
++        raise ValueError("untrusted summary output is too complex")
++    compact_output_characters = 0
++    compact_source_comparisons = 0
++    compact_output_windows = 0
++    for value in summary_values:
+         try:
+             normalized, findings = _sanitize(value)
+         except UntrustedContentError:
+             raise ValueError("untrusted summary text is unsafe") from None
+         if normalized != value or findings:
+             raise ValueError("untrusted summary text is unsafe")
+         folded_value = value.casefold()
+         if any(token in folded_value for token in marker_tokens):
+             raise ValueError("untrusted summary copied raw marker")
++        compact_value = _compact_alphanumeric(value)
++        compact_output_characters += len(compact_value)
++        if (
++            compact_output_characters
++            > _COMPACT_MAX_TOTAL_OUTPUT_CHARACTERS
++        ):
++            raise ValueError("untrusted summary output is too complex")
++        comparisons, output_windows = _reject_source_compact_copy(
++            compact_value,
++            compact_sources=compact_sources,
++            source_windows=source_compact_windows,
++        )
++        compact_source_comparisons += comparisons
++        compact_output_windows += output_windows
++        if (
++            compact_source_comparisons
++            > _COMPACT_MAX_SOURCE_COMPARISONS
++            or compact_output_windows > _COMPACT_MAX_OUTPUT_WINDOWS
++        ):
++            raise ValueError("untrusted summary output is too complex")
+         _reject_source_lexical_copy(
+             value,
+             long_tokens=long_tokens,
+             ngrams=source_ngrams,
+         )
+         if any(
+             source_text
+             and len(source_text) >= 12
+             and source_text.casefold() in folded_value
+             for source_text in source_texts
+diff --git a/src/trading_assistant/llm/budget.py b/src/trading_assistant/llm/budget.py
+index b58ce40..b7d48e2 100644
+--- a/src/trading_assistant/llm/budget.py
++++ b/src/trading_assistant/llm/budget.py
+@@ -467,47 +467,61 @@ class ProviderBudgetService:
+             session.flush()
+             self._validate_provider_aggregates(
+                 session,
+                 reservation.provider,
+             )
+             session.commit()
+ 
+     def mark_unknown(
+         self,
+         reservation_id: str,
++        *,
++        now: datetime | None = None,
+     ) -> None:
+         _require_text("reservation_id", reservation_id)
++        current = _as_utc(now or self._clock())
+         with _budget_store_session(self._session_factory) as session:
+             session.execute(text("BEGIN IMMEDIATE"))
+             reservation = session.get(
+                 ProviderReservation,
+                 reservation_id,
+             )
+             if reservation is None:
+                 session.rollback()
+                 raise ProviderBudgetUnavailable(
+                     "provider reservation cannot be marked unknown"
+                 )
+             self._validate_reservation(reservation)
+             self._validate_provider_aggregates(
+                 session,
+                 reservation.provider,
+             )
+-            if reservation.state in {"unknown", "settled"}:
++            if reservation.state == "settled":
+                 session.commit()
+                 return
+-            if reservation.state != "started":
++            if reservation.state not in {"started", "unknown"}:
+                 session.rollback()
+                 raise ProviderBudgetUnavailable(
+                     "provider reservation cannot be marked unknown"
+                 )
+-            reservation.state = "unknown"
++            if current < _as_utc(reservation.started_at):
++                session.rollback()
++                raise ProviderBudgetUnavailable(
++                    "provider reservation cannot be marked unknown"
++                )
++            if reservation.state == "started":
++                reservation.state = "unknown"
++            self._latch_expired_unknown_reconciliation(
++                session,
++                reservation,
++                current,
++            )
+             session.flush()
+             self._validate_provider_aggregates(
+                 session,
+                 reservation.provider,
+             )
+             session.commit()
+ 
+     def release_expired_unstarted(self, now: datetime) -> int:
+         current = _as_utc(now)
+         with _budget_store_session(self._session_factory) as session:
+@@ -600,43 +614,64 @@ class ProviderBudgetService:
+             ProviderReservation.expires_at <= current,
+         )
+         if provider is not None:
+             statement = statement.where(
+                 ProviderReservation.provider == provider
+             )
+         reservations = session.scalars(statement).all()
+         affected_providers: set[str] = set()
+         for reservation in reservations:
+             cls._validate_reservation(reservation)
+-            day = session.get(
+-                ProviderBudgetDay,
+-                (reservation.provider, reservation.budget_day),
+-            )
+-            if day is None:
+-                raise ProviderBudgetUnavailable(
+-                    "provider budget day is unavailable"
+-                )
+-            cls._validate_day(day)
+             reservation.state = "unknown"
+-            if not day.reconciliation_required:
+-                day.reconciliation_required = True
+-                day.reconciliation_code = _STALE_STARTED_CODE
+-            day.updated_at = current
++            cls._latch_expired_unknown_reconciliation(
++                session,
++                reservation,
++                current,
++            )
+             affected_providers.add(reservation.provider)
+         session.flush()
+         for affected_provider in affected_providers:
+             cls._validate_provider_aggregates(
+                 session,
+                 affected_provider,
+             )
+         return len(reservations)
+ 
++    @classmethod
++    def _latch_expired_unknown_reconciliation(
++        cls,
++        session: Session,
++        reservation: ProviderReservation,
++        current: datetime,
++    ) -> None:
++        """Atomically fail closed once unknown provider usage reaches expiry."""
++
++        cls._validate_reservation(reservation)
++        if (
++            reservation.state != "unknown"
++            or _as_utc(reservation.expires_at) > current
++        ):
++            return
++        day = session.get(
++            ProviderBudgetDay,
++            (reservation.provider, reservation.budget_day),
++        )
++        if day is None:
++            raise ProviderBudgetUnavailable(
++                "provider budget day is unavailable"
++            )
++        cls._validate_day(day)
++        if not day.reconciliation_required:
++            day.reconciliation_required = True
++            day.reconciliation_code = _STALE_STARTED_CODE
++        day.updated_at = current
++
+     def status(
+         self,
+         provider: str,
+         *,
+         model: str | None = None,
+         now: datetime | None = None,
+     ) -> BudgetStatus:
+         _require_text("provider", provider)
+         if model is not None:
+             _require_text("model", model)
+diff --git a/tests/test_llm_budget.py b/tests/test_llm_budget.py
+index cf7b953..4108ef5 100644
+--- a/tests/test_llm_budget.py
++++ b/tests/test_llm_budget.py
+@@ -1034,20 +1034,256 @@ def test_concurrent_expired_started_reapers_transition_exactly_once(
+     assert status.calls_used == 1
+     assert status.input_tokens_used == 10
+     assert status.output_tokens_used == 10
+     assert status.reconciliation_required is True
+     assert _reservation_state(
+         session_factory,
+         reservation.reservation_id,
+     ) == "unknown"
+ 
+ 
++@pytest.mark.parametrize(
++    "ordering",
++    ["mark-unknown-first", "reaper-first"],
++)
++def test_mark_unknown_and_expired_reaper_converge_to_one_latched_state(
++    ordering,
++    session_factory,
++):
++    limits = BudgetLimits(
++        calls=10,
++        input_tokens=100,
++        output_tokens=100,
++        reservation_ttl_seconds=5,
++    )
++    service = _service(session_factory, limits)
++    reservation = service.reserve(
++        provider="test",
++        category="chat",
++        request_id=f"request-expiry-race-{ordering}",
++        input_tokens=10,
++        output_tokens=10,
++        now=NOW,
++    )
++    service.mark_started(reservation.reservation_id, now=NOW)
++    expired_at = NOW + timedelta(seconds=5)
++    at_expiry = _service(
++        session_factory,
++        limits,
++        now=expired_at,
++    )
++
++    if ordering == "mark-unknown-first":
++        at_expiry.mark_unknown(reservation.reservation_id)
++        assert at_expiry.reconcile_expired_started(expired_at) == 0
++    else:
++        assert at_expiry.reconcile_expired_started(expired_at) == 1
++        at_expiry.mark_unknown(reservation.reservation_id)
++
++    status = at_expiry.status("test")
++    assert status.reconciliation_required is True
++    assert (
++        status.reconciliation_code
++        == "provider_started_usage_unknown"
++    )
++    assert (
++        status.calls_used,
++        status.input_tokens_used,
++        status.output_tokens_used,
++    ) == (1, 10, 10)
++    assert _reservation_state(
++        session_factory,
++        reservation.reservation_id,
++    ) == "unknown"
++    with pytest.raises(
++        ProviderBudgetExceeded,
++        match="reconciliation",
++    ):
++        at_expiry.reserve(
++            provider="test",
++            category="chat",
++            request_id=f"request-blocked-{ordering}",
++            input_tokens=1,
++            output_tokens=1,
++        )
++
++
++def test_idempotent_mark_unknown_latches_when_clock_crosses_expiry(
++    session_factory,
++):
++    limits = BudgetLimits(
++        calls=10,
++        input_tokens=100,
++        output_tokens=100,
++        reservation_ttl_seconds=5,
++    )
++    service = _service(session_factory, limits)
++    reservation = service.reserve(
++        provider="test",
++        category="chat",
++        request_id="request-unknown-crosses-expiry",
++        input_tokens=10,
++        output_tokens=10,
++        now=NOW,
++    )
++    service.mark_started(reservation.reservation_id, now=NOW)
++
++    service.mark_unknown(
++        reservation.reservation_id,
++        now=NOW + timedelta(seconds=4),
++    )
++    active_status = service.status(
++        "test",
++        now=NOW + timedelta(seconds=4),
++    )
++    assert active_status.reconciliation_required is False
++
++    service.mark_unknown(
++        reservation.reservation_id,
++        now=NOW + timedelta(seconds=5),
++    )
++    expired_status = service.status(
++        "test",
++        now=NOW + timedelta(seconds=5),
++    )
++
++    assert expired_status.reconciliation_required is True
++    assert (
++        expired_status.reconciliation_code
++        == "provider_started_usage_unknown"
++    )
++    assert (
++        expired_status.calls_used,
++        expired_status.input_tokens_used,
++        expired_status.output_tokens_used,
++    ) == (1, 10, 10)
++
++
++def test_simultaneous_mark_unknown_and_reaper_converge_without_double_mutation(
++    session_factory,
++):
++    limits = BudgetLimits(
++        calls=10,
++        input_tokens=100,
++        output_tokens=100,
++        reservation_ttl_seconds=5,
++    )
++    service = _service(session_factory, limits)
++    reservation = service.reserve(
++        provider="test",
++        category="chat",
++        request_id="request-simultaneous-expiry-race",
++        input_tokens=10,
++        output_tokens=10,
++        now=NOW,
++    )
++    service.mark_started(reservation.reservation_id, now=NOW)
++    expired_at = NOW + timedelta(seconds=5)
++    barrier = threading.Barrier(2)
++
++    def mark_unknown() -> str:
++        worker = _service(
++            session_factory,
++            limits,
++            now=expired_at,
++        )
++        barrier.wait()
++        worker.mark_unknown(
++            reservation.reservation_id,
++            now=expired_at,
++        )
++        return "unknown"
++
++    def reap() -> int:
++        worker = _service(
++            session_factory,
++            limits,
++            now=expired_at,
++        )
++        barrier.wait()
++        return worker.reconcile_expired_started(expired_at)
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        unknown_future = pool.submit(mark_unknown)
++        reap_future = pool.submit(reap)
++        assert unknown_future.result() == "unknown"
++        assert reap_future.result() in {0, 1}
++
++    status = service.status("test", now=expired_at)
++    assert status.reconciliation_required is True
++    assert (
++        status.reconciliation_code
++        == "provider_started_usage_unknown"
++    )
++    assert (
++        status.calls_used,
++        status.input_tokens_used,
++        status.output_tokens_used,
++    ) == (1, 10, 10)
++    with session_factory() as session:
++        assert session.scalar(
++            select(func.count()).select_from(ProviderReservation)
++        ) == 1
++        persisted = session.get(
++            ProviderReservation,
++            reservation.reservation_id,
++        )
++    assert persisted.state == "unknown"
++
++
++def test_expired_mark_unknown_keeps_settled_reservation_final(
++    session_factory,
++):
++    limits = BudgetLimits(
++        calls=10,
++        input_tokens=100,
++        output_tokens=100,
++        reservation_ttl_seconds=5,
++    )
++    service = _service(session_factory, limits)
++    reservation = service.reserve(
++        provider="test",
++        category="chat",
++        request_id="request-settled-before-expiry",
++        input_tokens=10,
++        output_tokens=10,
++        now=NOW,
++    )
++    service.mark_started(reservation.reservation_id, now=NOW)
++    service.settle(
++        reservation.reservation_id,
++        input_tokens=4,
++        output_tokens=3,
++        now=NOW + timedelta(seconds=1),
++    )
++
++    service.mark_unknown(
++        reservation.reservation_id,
++        now=NOW + timedelta(seconds=5),
++    )
++    status = service.status(
++        "test",
++        now=NOW + timedelta(seconds=5),
++    )
++
++    assert _reservation_state(
++        session_factory,
++        reservation.reservation_id,
++    ) == "settled"
++    assert status.reconciliation_required is False
++    assert (
++        status.calls_used,
++        status.input_tokens_used,
++        status.output_tokens_used,
++    ) == (1, 4, 3)
++
++
+ def test_provider_reservation_cannot_start_at_or_after_expiry(
+     session_factory,
+ ):
+     limits = BudgetLimits(
+         calls=10,
+         input_tokens=100,
+         output_tokens=100,
+         reservation_ttl_seconds=5,
+     )
+     service = _service(session_factory, limits)
+diff --git a/tests/test_task8_model_trust.py b/tests/test_task8_model_trust.py
+index 6ba64a0..eeb17fe 100644
+--- a/tests/test_task8_model_trust.py
++++ b/tests/test_task8_model_trust.py
+@@ -402,34 +402,142 @@ def test_quarantine_rejects_source_phrase_copied_into_uncertainty(
+             ),
+         ),
+         request_id="quarantine-uncertainty-copy-through",
+     )
+ 
+     assert summary is not None
+     assert copied_uncertainty not in summary.uncertainties
+     assert len(delegate.calls) == 2
+ 
+ 
++@pytest.mark.parametrize(
++    ("source_text", "copied_fact"),
++    [
++        (
++            "Revenue rose. COPYTHROUGHMARKER",
++            "copy-through-marker",
++        ),
++        (
++            "Revenue rose. prefixCOPYTHROUGHMARKERsuffix",
++            "copy-through-marker",
++        ),
++        (
++            "hyperdimensionalmarketmarker",
++            "hyperdimensional",
++        ),
++        (
++            "COPYTHROUGHMARKER",
++            "prefix-copy-through-marker-suffix",
++        ),
++        (
++            "ＭＡＲＫＥＴ—ＳＩＧＮＡＬ",
++            "marketsignal",
++        ),
++    ],
++    ids=[
++        "punctuation-compaction",
++        "output-substring-of-source",
++        "long-source-prefix-substring",
++        "source-window-inside-prefixed-output",
++        "nfkc-compatibility-compaction",
++    ],
++)
++def test_quarantine_repairs_compact_source_copy_before_privileged_use(
++    session_factory,
++    source_text,
++    copied_fact,
++):
++    summarizer, delegate = _summarizer(
++        session_factory,
++        _text_response(_summary_json(fact=copied_fact)),
++        _text_response(_summary_json()),
++    )
++
++    summary = summarizer.summarize(
++        (_content(text=source_text),),
++        request_id="quarantine-compact-copy-through",
++    )
++
++    assert summary is not None
++    assert summary.facts[0].text == "Revenue increased according to the source."
++    assert len(delegate.calls) == 2
++    privileged = AnalystBackend("submit_analysis", ANALYSIS_INPUT)
++    Analyst(privileged, max_attempts=1).analyze(
++        _features(),
++        untrusted_summary=summary,
++        request_id="analysis-after-compact-copy-repair",
++    )
++    privileged_payload = json.dumps(
++        privileged.calls,
++        ensure_ascii=False,
++        default=str,
++    ).casefold()
++    assert copied_fact.casefold() not in privileged_payload
++    assert "copythroughmarker" not in privileged_payload
++    assert "hyperdimensional" not in privileged_payload
++
++
++def test_quarantine_repairs_compact_copy_in_uncertainty(
++    session_factory,
++):
++    copied_uncertainty = "hyperdimensional"
++    summarizer, delegate = _summarizer(
++        session_factory,
++        _text_response(
++            _summary_json(uncertainty=copied_uncertainty)
++        ),
++        _text_response(_summary_json()),
++    )
++
++    summary = summarizer.summarize(
++        (_content(text="hyperdimensionalmarketmarker"),),
++        request_id="quarantine-compact-uncertainty-copy",
++    )
++
++    assert summary is not None
++    assert copied_uncertainty not in summary.uncertainties
++    assert len(delegate.calls) == 2
++
++
++def test_quarantine_allows_rewritten_short_ticker_and_number_fact(
++    session_factory,
++):
++    fact = "AAPL rose 12%."
++    summarizer, delegate = _summarizer(
++        session_factory,
++        _text_response(_summary_json(fact=fact)),
++    )
++
++    summary = summarizer.summarize(
++        (_content(text="AAPL gained 12 percent."),),
++        request_id="quarantine-short-ticker-number-control",
++    )
++
++    assert summary is not None
++    assert summary.facts[0].text == fact
++    assert len(delegate.calls) == 1
++
++
+ def test_quarantine_allows_standalone_short_ticker_company_name_and_number(
+     session_factory,
+ ):
+-    fact = "AAPL and Apple Inc disclosed 123456789012345."
++    fact = "AAPL and Apple Inc disclosed 12345."
+     summarizer, delegate = _summarizer(
+         session_factory,
+         _text_response(_summary_json(fact=fact)),
+     )
+ 
+     summary = summarizer.summarize(
+         (
+             _content(
+                 text=(
+-                    "AAPL Apple Inc reported 123456789012345 in "
++                    "AAPL Apple Inc reported 12345 in "
+                     "notional volume."
+                 )
+             ),
+         ),
+         request_id="quarantine-allowed-identifiers",
+     )
+ 
+     assert summary is not None
+     assert summary.facts[0].text == fact
+     assert len(delegate.calls) == 1

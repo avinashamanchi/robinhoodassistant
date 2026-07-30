@@ -7,9 +7,17 @@ import logging
 import re
 from typing import Any, Optional
 
-from .base import LLMResponse, ToolUseBlock, from_openai, to_openai
+from ..security.outbound import (
+    OutboundPolicy,
+    new_httpx_client,
+    require_origin,
+)
+from .base import LLMResponse, ToolUseBlock, from_openai
+from .payloads import build_groq_payload
 
 log = logging.getLogger(__name__)
+_GROQ_ORIGIN = "https://api.groq.com"
+_GROQ_POLICY = OutboundPolicy(_GROQ_ORIGIN)
 
 
 def _failed_generation(err: Exception) -> str:
@@ -19,7 +27,7 @@ def _failed_generation(err: Exception) -> str:
         e = body.get("error")
         if isinstance(e, dict) and e.get("failed_generation"):
             return str(e["failed_generation"])
-    return str(err)
+    return ""
 
 
 def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
@@ -45,44 +53,72 @@ def _recover_tool_use_failed(err: Exception) -> Optional[LLMResponse]:
         args = next((a for a in args if isinstance(a, dict)), None)
     if not isinstance(args, dict):
         return None
-    log.warning("recovered Groq tool_use_failed into %s(%s)", name, args)
+    log.warning(
+        "recovered Groq tool call "
+        "code=tool_call_recovered tool=%s",
+        name,
+    )
     return LLMResponse(
         content=[ToolUseBlock(id="groq-recovered", name=name, input=args)],
         stop_reason="tool_use",
+        usage=None,
     )
 
 
 class GroqBackend:
     def __init__(
-        self, api_key: str, model: str, max_tokens: int = 1024, client: Any = None
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = 1024,
+        client: Any = None,
+        timeout_seconds: float = 45.0,
+        runtime_role: str = "app",
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
+        self._timeout_seconds = timeout_seconds
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from groq import Groq
 
-            self._client = Groq(api_key=self._api_key)
+            require_origin(
+                self._runtime_role,
+                "llm.groq",
+                _GROQ_ORIGIN,
+            )
+            self._client = Groq(
+                api_key=self._api_key,
+                base_url=_GROQ_ORIGIN,
+                timeout=self._timeout_seconds,
+                max_retries=0,
+                http_client=new_httpx_client(
+                    _GROQ_POLICY,
+                    read_timeout=self._timeout_seconds,
+                ),
+            )
         return self._client
 
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str = "",
     ) -> LLMResponse:
-        oai_messages, oai_tools = to_openai(system, messages, tools)
+        payload = build_groq_payload(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": oai_messages,
             "max_tokens": self.max_tokens,
+            **payload,
         }
-        if oai_tools:
-            kwargs["tools"] = oai_tools
-            # "any" -> the model MUST emit a tool call (used for structured
-            # analyst output); default "auto" lets chat reply in plain text.
-            kwargs["tool_choice"] = "required" if tool_choice == "any" else "auto"
         try:
             resp = self._get_client().chat.completions.create(**kwargs)
         except Exception as err:  # noqa: BLE001 — inspect for a recoverable tool_use_failed

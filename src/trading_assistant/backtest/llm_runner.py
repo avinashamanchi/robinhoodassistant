@@ -4,8 +4,8 @@ Running the analyst on every bar of a multi-year backtest would cost a fortune, 
 
 * **trigger_mode** — the analyst is invoked ONLY on bars where signal events fire
   (golden cross, breakout, …); deterministic HOLD otherwise.
-* **response cache** — keyed on (symbol, date, features hash); identical features
-  never pay twice.
+* **response cache** — keyed on stable decision identity plus features hash;
+  identical features in the same run never pay twice.
 * **hard budget** — ``max_llm_calls`` aborts the run if exceeded; a pre-run
   ``estimate_llm_calls`` prints the expected count/cost for confirmation.
 * **cheap model + spot-check** — run on a cheap model, optionally re-run every Nth
@@ -19,15 +19,19 @@ buy-and-hold on the holdout?
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from ..analyst.analyst import Analyst
 from ..analyst.models import AnalysisReport, AnalystAction
 from ..analyst.scorecard import Scorecard, build_scorecard, grade
 from ..config import BacktestConfig
+from ..identity import canonical_symbol, canonical_utc_timestamp
 from ..signals.models import EventType, MarketFeatures
 from ..strategies.base import Signal, SignalAction, Strategy, hold
 from .data import DataSource
@@ -59,28 +63,90 @@ def _triggered(features: MarketFeatures, config: LLMRunConfig) -> bool:
 
 
 def _features_hash(features: MarketFeatures) -> str:
-    parts = (
-        features.symbol,
-        features.as_of.date().isoformat(),
-        round(features.last_close or 0, 2),
-        round(features.rsi_14 or 0, 1),
-        round(features.sma_50 or 0, 2),
-        round(features.sma_200 or 0, 2),
-        features.regime.value if features.regime else "none",
-        tuple(sorted(e.type.value for e in features.events)),
+    payload = features.model_dump(
+        mode="json",
+        exclude={"recent_bars"},
     )
-    return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+    try:
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except ValueError:
+        raise ValueError(
+            "MarketFeatures prompt payload must contain finite JSON"
+        ) from None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalized_text(field: str, value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be non-empty")
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized:
+        raise ValueError(f"{field} must be non-empty")
+    return normalized
+
+
+def _require_run_id(run_id: str) -> str:
+    return _normalized_text("run_id", run_id)
+
+
+def _normalized_symbol(symbol: str) -> str:
+    return canonical_symbol(symbol)
+
+
+def _decision_request_id(run_id: str, features: MarketFeatures) -> str:
+    material = json.dumps(
+        {
+            "run_id": _require_run_id(run_id),
+            "symbol": _normalized_symbol(features.symbol),
+            "timestamp": canonical_utc_timestamp(
+                features.as_of,
+                field="features.as_of",
+            ),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = base64.urlsafe_b64encode(
+        hashlib.sha256(material.encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    return f"backtest:{digest}"
 
 
 class ResponseCache:
     def __init__(self) -> None:
-        self._store: dict[str, AnalysisReport] = {}
+        self._store: dict[tuple[str, str], AnalysisReport] = {}
 
-    def get(self, features: MarketFeatures) -> Optional[AnalysisReport]:
-        return self._store.get(_features_hash(features))
+    @staticmethod
+    def _key(
+        decision_id: str,
+        features: MarketFeatures,
+    ) -> tuple[str, str]:
+        return (
+            _normalized_text("decision_id", decision_id),
+            _features_hash(features),
+        )
 
-    def put(self, features: MarketFeatures, report: AnalysisReport) -> None:
-        self._store[_features_hash(features)] = report
+    def get(
+        self,
+        decision_id: str,
+        features: MarketFeatures,
+    ) -> Optional[AnalysisReport]:
+        return self._store.get(self._key(decision_id, features))
+
+    def put(
+        self,
+        decision_id: str,
+        features: MarketFeatures,
+        report: AnalysisReport,
+    ) -> None:
+        self._store[self._key(decision_id, features)] = report
 
 
 class AnalystStrategy(Strategy):
@@ -94,10 +160,15 @@ class AnalystStrategy(Strategy):
         config: LLMRunConfig,
         cache: Optional[ResponseCache] = None,
         full_analyst: Optional[Analyst] = None,
+        *,
+        run_id: str,
+        cancel_check: Callable[[], None] | None = None,
     ) -> None:
         self.analyst = analyst
         self.full_analyst = full_analyst
         self.config = config
+        self.run_id = _require_run_id(run_id)
+        self.cancel_check = cancel_check
         self.cache = cache or ResponseCache()
         self.calls = 0
         self.spot_checks = 0
@@ -108,7 +179,8 @@ class AnalystStrategy(Strategy):
         if not _triggered(features, self.config):
             return hold("no trigger event")
 
-        cached = self.cache.get(features)
+        request_id = _decision_request_id(self.run_id, features)
+        cached = self.cache.get(request_id, features)
         if cached is not None:
             return self._to_signal(cached)
 
@@ -116,27 +188,42 @@ class AnalystStrategy(Strategy):
             raise BudgetExceeded(
                 f"exceeded max_llm_calls={self.config.max_llm_calls}"
             )
+        if self.cancel_check is not None:
+            self.cancel_check()
         # Count the ATTEMPT against the budget before making it — a failed call
         # still hits the provider, so the cap must be fail-closed (security).
         self.calls += 1
         try:
-            report = self.analyst.analyze(features)
+            report = self.analyst.analyze(
+                features,
+                request_id=request_id,
+            )
         except Exception:  # a malformed LLM response must not abort the whole run
             return hold("analyst error; skipped")
-        self.cache.put(features, report)
+        self.cache.put(request_id, features, report)
         self.reports.append((features, report))
-        self._maybe_spot_check(features, report)
+        self._maybe_spot_check(features, report, request_id)
         return self._to_signal(report)
 
-    def _maybe_spot_check(self, features: MarketFeatures, cheap: AnalysisReport) -> None:
+    def _maybe_spot_check(
+        self,
+        features: MarketFeatures,
+        cheap: AnalysisReport,
+        request_id: str,
+    ) -> None:
         if (
             self.full_analyst is None
             or self.config.spot_check_every <= 0
             or self.calls % self.config.spot_check_every != 0
         ):
             return
+        if self.cancel_check is not None:
+            self.cancel_check()
         self.spot_checks += 1
-        full = self.full_analyst.analyze(features)
+        full = self.full_analyst.analyze(
+            features,
+            request_id=request_id,
+        )
         if full.action is not cheap.action:
             self.spot_check_disagreements += 1
 
@@ -237,14 +324,22 @@ def run_llm_backtest(
     source: DataSource,
     symbol: str,
     *,
+    run_id: str,
     run_config: LLMRunConfig,
     backtest_config: Optional[BacktestConfig] = None,
     spy_symbol: Optional[str] = None,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     full_analyst: Optional[Analyst] = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> LLMBacktestResult:
-    strategy = AnalystStrategy(analyst, run_config, full_analyst=full_analyst)
+    strategy = AnalystStrategy(
+        analyst,
+        run_config,
+        full_analyst=full_analyst,
+        run_id=run_id,
+        cancel_check=cancel_check,
+    )
     engine_result = run_backtest(
         strategy,
         source,
@@ -253,6 +348,7 @@ def run_llm_backtest(
         spy_symbol=spy_symbol,
         start=start,
         end=end,
+        cancel_check=cancel_check,
     )
     scorecard = _grade_reports(source, symbol, strategy.reports, run_config.horizon_bars)
     return LLMBacktestResult(

@@ -8,28 +8,61 @@ track record on live data in parallel with manual paper trading — nothing trad
 
 from __future__ import annotations
 
-from datetime import timedelta
+import base64
+import hashlib
+import json
+import logging
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Callable, Optional
 
 from sqlalchemy import select
 
+from ..identity import canonical_analyst_version, canonical_symbol
+from ..security.sensitive_fields import sensitive_store
 from . import screener
 from .models import AnalysisReport, AnalystAction, TradePlan
 from .store import grade_report, save_report
 
+log = logging.getLogger(__name__)
 
-def _base_report(plan: TradePlan) -> AnalysisReport:
+
+def _base_report(plan: TradePlan, *, symbol: str | None = None) -> AnalysisReport:
     """Project a TradePlan onto the base report the scorecard grades (NO_TRADE->hold)."""
     action = plan.action.value if plan.action.value in ("buy", "sell", "hold") else "hold"
     return AnalysisReport(
-        symbol=plan.symbol, as_of=plan.as_of, action=AnalystAction(action),
+        symbol=symbol or plan.symbol,
+        as_of=plan.as_of,
+        action=AnalystAction(action),
         confidence=plan.confidence, thesis=plan.thesis,
-        cited_concepts=plan.cited_concepts, regime_note=plan.regime_note,
+        cited_concepts=plan.cited_concepts,
+        cited_source_refs=plan.cited_source_refs,
+        regime_note=plan.regime_note,
         earnings_note=plan.earnings_note, correlation_note=plan.correlation_note,
     )
 
 DEFAULT_HORIZON_DAYS = 5
+
+
+def _request_id_for_daily_call(
+    scheduled_date: date,
+    analyst_version: str,
+    symbol: str,
+) -> str:
+    material = json.dumps(
+        {
+            "analyst_version": analyst_version,
+            "scheduled_date": scheduled_date.isoformat(),
+            "symbol": symbol,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = base64.urlsafe_b64encode(
+        hashlib.sha256(material.encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    return f"shadow:{digest}"
 
 
 class ShadowRunner:
@@ -58,31 +91,85 @@ class ShadowRunner:
 
     def run_once(self) -> list[int]:
         """Screen + analyze the top candidates into shadow plans. No orders."""
-        from ..db.models import ShadowCall, TradePlanRow, utcnow
+        from ..db.models import AnalysisReportRow, ShadowCall, TradePlanRow, utcnow
 
-        universe = self.service.config.screener.universe or self.service.config.risk.ticker_allowlist
-        candidates = screener.screen_source(
-            self.screen_source, [s.upper() for s in universe],
-            spy_symbol=self.spy_symbol, top_n=self.top_n,
+        universe = (
+            self.service.config.screener.universe
+            or self.service.config.risk.ticker_allowlist
         )
+        canonical_universe = [
+            canonical_symbol(symbol) for symbol in universe
+        ]
+        version = canonical_analyst_version(
+            self.service.config.analyst.version
+        )
+        candidates = screener.screen_source(
+            self.screen_source,
+            canonical_universe,
+            spy_symbol=canonical_symbol(self.spy_symbol),
+            top_n=self.top_n,
+        )
+        now = utcnow()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        with self.service.session_factory() as s:
+            completed_symbols = set(
+                s.execute(
+                    select(ShadowCall.symbol)
+                    .join(
+                        AnalysisReportRow,
+                        AnalysisReportRow.id == ShadowCall.report_id,
+                    )
+                    .where(
+                        ShadowCall.created_at >= day_start,
+                        AnalysisReportRow.analyst_version == version,
+                    )
+                ).scalars()
+            )
         plan_ids: list[int] = []
         for c in candidates:
-            out = self.planning.analyze(c["symbol"])   # stores a proposed plan, no orders
+            symbol = canonical_symbol(c["symbol"])
+            if symbol in completed_symbols:
+                continue
+            request_id = _request_id_for_daily_call(
+                day_start.date(),
+                version,
+                symbol,
+            )
+            try:
+                # Stores a shadow plan only; it never creates or executes an order.
+                out = self.planning.analyze(
+                    symbol,
+                    actor="daemon:shadow",
+                    reason="scheduled shadow plan analysis",
+                    request_id=request_id,
+                )
+            except Exception:
+                log.error(
+                    "shadow analysis failed code=analysis_failed "
+                    "symbol=%s; continuing batch",
+                    symbol,
+                )
+                continue
             plan_id = out["plan_id"]
             with self.service.session_factory() as s:
                 row = s.get(TradePlanRow, plan_id)
                 row.shadow = True
-                plan = TradePlan.model_validate_json(row.plan_json)
+                plan = TradePlan.model_validate_json(
+                    sensitive_store(s).read(row, "plan_json")
+                )
                 report_id = save_report(
-                    s, _base_report(plan), version=self.service.config.analyst.version
+                    s,
+                    _base_report(plan, symbol=symbol),
+                    version=version,
                 )
                 s.add(ShadowCall(
-                    report_id=report_id, symbol=plan.symbol,
+                    report_id=report_id, symbol=symbol,
                     reference_price=plan.reference_price,
                     grade_after=utcnow() + timedelta(days=self._base_horizon(plan)),
                 ))
                 s.commit()
             plan_ids.append(plan_id)
+            completed_symbols.add(symbol)
         return plan_ids
 
     def grade_due(self, now=None) -> int:

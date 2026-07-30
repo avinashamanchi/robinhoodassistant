@@ -44,6 +44,10 @@ class AnalysisReport(_Model):
     confidence: float = Field(ge=0.0, le=1.0)
     thesis: str
     cited_concepts: list[str] = Field(min_length=1)
+    cited_source_refs: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+    )
     regime_note: str = Field(min_length=1)
     earnings_note: Optional[str] = None       # required when earnings are in-horizon
     correlation_note: Optional[str] = None

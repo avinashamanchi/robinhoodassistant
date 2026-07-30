@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-from trading_assistant.llm.base import to_gemini_contents, to_openai
-from trading_assistant.llm.factory import FallbackBackend
+from trading_assistant.llm.base import from_openai, to_gemini_contents, to_openai
+from trading_assistant.llm.anthropic_backend import AnthropicBackend
+from trading_assistant.llm.budget import BudgetLimits, ProviderBudgetService
+from trading_assistant.llm.gemini_backend import GeminiBackend
 from trading_assistant.llm.gemini_backend import from_gemini, _sanitize_schema
 from trading_assistant.llm.groq_backend import GroqBackend
 
@@ -100,6 +103,7 @@ def test_groq_recovers_malformed_tool_call():
     assert out.stop_reason == "tool_use"
     assert out.content[0].name == "propose_order"
     assert out.content[0].input == {"order_type": "market", "qty": "1", "side": "buy", "ticker": "AAPL"}
+    assert out.usage is None
 
 
 def test_groq_unrecoverable_error_propagates():
@@ -117,6 +121,26 @@ def test_groq_text_normalized():
     out = _groq(resp).create(system="s", messages=[{"role": "user", "content": "hi"}], tools=[])
     assert out.stop_reason == "end_turn"
     assert out.content[0].type == "text" and out.content[0].text == "hello"
+
+
+def test_groq_accepts_request_id_without_sending_it_to_sdk():
+    resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content="hello", tool_calls=None,
+        ))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        model="llama",
+    )
+    backend = _groq(resp)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-groq",
+    )
+
+    assert "request_id" not in backend._client.chat.completions.last
 
 
 # ── Gemini translation ──────────────────────────────────────────
@@ -141,6 +165,22 @@ def test_from_gemini_text():
     )
     out = from_gemini(resp)
     assert out.stop_reason == "end_turn" and out.content[0].text == "hi there"
+    assert out.usage is None
+
+
+def test_from_openai_preserves_missing_usage():
+    resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content="hello",
+            tool_calls=None,
+        ))],
+        usage=None,
+        model="llama",
+    )
+
+    out = from_openai(resp)
+
+    assert out.usage is None
 
 
 def test_to_gemini_contents_maps_tool_result_name():
@@ -165,37 +205,301 @@ def test_sanitize_schema_collapses_union():
     assert out["properties"]["note"]["type"] == "string"
 
 
-# ── fallback ────────────────────────────────────────────────────
-def test_fallback_used_on_primary_error():
-    class Boom:
-        def create(self, **kw):
-            raise RuntimeError("primary down")
+def test_gemini_accepts_request_id_without_sending_it_to_sdk():
+    class Models:
+        def __init__(self):
+            self.last = None
 
-    class OK:
-        def create(self, **kw):
-            return "fallback-result"
+        def generate_content(self, **kwargs):
+            self.last = kwargs
+            return SimpleNamespace(
+                candidates=[],
+                usage_metadata=None,
+                model_version="gemini",
+            )
 
-    fb = FallbackBackend(Boom(), OK())
-    assert fb.create(system="", messages=[], tools=[]) == "fallback-result"
+    client = SimpleNamespace(models=Models())
+    backend = GeminiBackend("key", "model", client=client)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-gemini",
+    )
+
+    assert "request_id" not in client.models.last
 
 
-def test_fallback_when_primary_returns_no_tool_call_but_one_required():
-    """Gemini can answer a 200 in prose even with tools; if a tool was REQUIRED,
-    the fallback provider must take over (this was 'analyst did not submit a plan')."""
-    from trading_assistant.llm.base import LLMResponse, TextBlock, ToolUseBlock
+def test_anthropic_accepts_request_id_without_sending_it_to_sdk(monkeypatch):
+    import anthropic
 
-    class ProseOnly:  # primary: no tool_use block
-        def create(self, **kw):
-            return LLMResponse(content=[TextBlock(text="here is my prose answer")])
+    class Messages:
+        def __init__(self):
+            self.last = None
 
-    class ToolOK:  # fallback: emits the required tool call
-        def create(self, **kw):
-            return LLMResponse(content=[ToolUseBlock(id="x", name="submit_plan", input={"a": 1})])
+        def create(self, **kwargs):
+            self.last = kwargs
+            return SimpleNamespace(content=[], usage=None)
 
-    fb = FallbackBackend(ProseOnly(), ToolOK())
-    # No forcing -> prose is fine, primary result kept.
-    r_auto = fb.create(system="", messages=[], tools=[{"name": "t"}])
-    assert r_auto.content[0].type == "text"
-    # Forced -> primary's prose is unacceptable, fall back to the tool-calling provider.
-    r_forced = fb.create(system="", messages=[], tools=[{"name": "t"}], tool_choice="any")
-    assert r_forced.content[0].type == "tool_use"
+    client = SimpleNamespace(messages=Messages())
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    backend = AnthropicBackend("key", "model", 100)
+
+    backend.create(
+        system="s",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        request_id="request-anthropic",
+    )
+
+    assert "request_id" not in client.messages.last
+
+
+# ── explicit provider selection ────────────────────────────────
+def test_configured_cross_provider_fallback_is_rejected_without_construction(
+    app_config,
+    session_factory,
+    patch_selected_llm_backend,
+):
+    from trading_assistant.config import Secrets
+    from trading_assistant.llm import factory
+
+    configured = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"fallback_provider": "groq"}
+            )
+        }
+    )
+    providers: list[str] = []
+    patch_selected_llm_backend(
+        configured,
+        lambda *_args, **_kwargs: (
+            providers.append(configured.llm.provider) or object()
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="cross-provider"):
+        factory.build_llm_backend(
+            configured,
+            Secrets(),
+            provider_budget=ProviderBudgetService(
+                session_factory,
+                BudgetLimits(
+                    calls=10,
+                    input_tokens=100_000,
+                    output_tokens=10_000,
+                ),
+            ),
+            category="chat",
+        )
+
+    assert providers == []
+
+
+def test_primary_provider_failure_is_not_sent_to_a_second_vendor(
+    app_config,
+    session_factory,
+    patch_selected_llm_backend,
+):
+    from trading_assistant.config import Secrets
+    from trading_assistant.llm import factory
+
+    class Primary:
+        def create(self, **_kwargs):
+            raise RuntimeError("primary unavailable")
+
+    configured = app_config.model_copy(
+        update={
+            "llm": app_config.llm.model_copy(
+                update={"fallback_provider": None}
+            )
+        }
+    )
+    providers: list[str] = []
+    patch_selected_llm_backend(
+        configured,
+        lambda *_args, **_kwargs: (
+            providers.append(configured.llm.provider) or Primary()
+        ),
+    )
+    backend = factory.build_llm_backend(
+        configured,
+        Secrets(),
+        provider_budget=ProviderBudgetService(
+            session_factory,
+            BudgetLimits(
+                calls=10,
+                input_tokens=100_000,
+                output_tokens=10_000,
+            ),
+        ),
+        category="chat",
+    )
+
+    with pytest.raises(RuntimeError, match="primary unavailable"):
+        backend.create(
+            system="system",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            request_id="primary-failure",
+        )
+
+    assert providers == [configured.llm.provider]
+
+
+def test_groq_client_uses_configured_timeout(monkeypatch):
+    import groq
+
+    seen = {}
+    monkeypatch.setattr(groq, "Groq", lambda **kwargs: seen.update(kwargs) or object())
+    backend = GroqBackend("key", "model", timeout_seconds=17)
+    backend._get_client()
+    assert seen["timeout"] == 17
+    assert seen["base_url"] == "https://api.groq.com"
+    assert seen["http_client"].follow_redirects is False
+    assert seen["http_client"].timeout.connect == 5.0
+    assert seen["http_client"].timeout.read == 17
+    assert seen["max_retries"] == 0
+
+
+def test_anthropic_client_uses_configured_timeout(monkeypatch):
+    import anthropic
+    from trading_assistant.llm.anthropic_backend import AnthropicBackend
+
+    seen = {}
+    monkeypatch.setattr(
+        anthropic, "Anthropic", lambda **kwargs: seen.update(kwargs) or object()
+    )
+    AnthropicBackend(
+        "key",
+        "model",
+        100,
+        timeout_seconds=19,
+    )._get_client()
+    assert seen["timeout"] == 19
+    assert seen["base_url"] == "https://api.anthropic.com"
+    assert seen["http_client"].follow_redirects is False
+    assert seen["http_client"].timeout.connect == 5.0
+    assert seen["http_client"].timeout.read == 19
+    assert seen["max_retries"] == 0
+
+
+def test_gemini_client_uses_configured_timeout(monkeypatch):
+    from google import genai
+    from trading_assistant.llm.gemini_backend import GeminiBackend
+
+    seen = {}
+    monkeypatch.setattr(
+        genai, "Client", lambda **kwargs: seen.update(kwargs) or object()
+    )
+    GeminiBackend("key", "model", timeout_seconds=23)._get_client()
+    assert seen["http_options"].timeout == 23_000
+    assert seen["http_options"].base_url == "https://generativelanguage.googleapis.com"
+    assert seen["http_options"].httpx_client.follow_redirects is False
+    assert seen["http_options"].httpx_client.timeout.connect == 5.0
+    assert seen["http_options"].httpx_client.timeout.read == 23
+    assert seen["http_options"].httpx_async_client.follow_redirects is False
+    assert seen["http_options"].httpx_async_client.timeout.connect == 5.0
+    assert seen["http_options"].httpx_async_client.timeout.read == 23
+    assert seen["http_options"].retry_options.attempts == 1
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "groq"])
+def test_provider_boundary_failure_makes_one_transport_attempt(monkeypatch, provider):
+    """A redirect boundary error must not be retried by either SDK."""
+    import httpx
+
+    from trading_assistant.security import outbound
+
+    if provider == "anthropic":
+        import trading_assistant.llm.anthropic_backend as module
+
+        backend = AnthropicBackend("key", "model", 100)
+        policy = module._ANTHROPIC_POLICY
+    else:
+        import trading_assistant.llm.groq_backend as module
+
+        backend = GroqBackend("key", "model")
+        policy = module._GROQ_POLICY
+
+    attempts = []
+
+    def transport(request):
+        attempts.append(request.url.host)
+        return httpx.Response(
+            302,
+            headers={"Location": "https://evil.test/provider-secret"},
+            request=request,
+        )
+
+    client = outbound.new_httpx_client(
+        policy,
+        transport=httpx.MockTransport(transport),
+    )
+    monkeypatch.setattr(module, "new_httpx_client", lambda *_args, **_kwargs: client)
+
+    try:
+        with pytest.raises(Exception) as raised:
+            backend.create(
+                system="s",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+            )
+    finally:
+        client.close()
+
+    assert attempts == [next(iter(policy.origins)).hostname]
+    assert backend._client.max_retries == 0
+    assert isinstance(raised.value.__cause__, outbound.OutboundRedirectDenied)
+    assert "provider-secret" not in str(raised.value)
+
+
+def test_gemini_retains_pinned_sync_and_async_httpx_clients(monkeypatch):
+    """The installed Gemini client retains both pinned HTTPX seams without I/O."""
+    import httpx
+
+    from trading_assistant.llm import gemini_backend as module
+    from trading_assistant.security import outbound
+
+    calls = []
+
+    def transport(request):
+        calls.append(request.url.host)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    sync_client = outbound.new_httpx_client(
+        module._GEMINI_POLICY,
+        read_timeout=23,
+        transport=httpx.MockTransport(transport),
+    )
+    async_client = outbound.new_async_httpx_client(
+        module._GEMINI_POLICY,
+        read_timeout=23,
+        transport=httpx.MockTransport(transport),
+    )
+    monkeypatch.setattr(module, "new_httpx_client", lambda *_args, **_kwargs: sync_client)
+    monkeypatch.setattr(
+        module,
+        "new_async_httpx_client",
+        lambda *_args, **_kwargs: async_client,
+        raising=False,
+    )
+
+    try:
+        client = GeminiBackend("key", "model", timeout_seconds=23)._get_client()
+        options = client._api_client._http_options
+        assert options.httpx_client is sync_client
+        assert options.httpx_async_client is async_client
+        assert sync_client._trust_env is False
+        assert async_client._trust_env is False
+        sync_client.get("https://generativelanguage.googleapis.com/v1/models")
+        asyncio.run(
+            async_client.get("https://generativelanguage.googleapis.com/v1/models")
+        )
+    finally:
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+    assert calls == ["generativelanguage.googleapis.com"] * 2

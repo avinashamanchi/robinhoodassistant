@@ -1,0 +1,1454 @@
+diff --git a/migrations/env.py b/migrations/env.py
+index 25e748a..601d4fe 100644
+--- a/migrations/env.py
++++ b/migrations/env.py
+@@ -4 +3,0 @@ from alembic import context
+-from sqlalchemy import engine_from_config, pool
+@@ -6,0 +6,4 @@ from trading_assistant.db.models import Base
++from trading_assistant.db.migration_authority import (
++    activate_migration_authority,
++    retire_migration_authority,
++)
+@@ -18,10 +21 @@ def run_migrations_offline() -> None:
+-    url = config.get_main_option("sqlalchemy.url")
+-    context.configure(
+-        url=url,
+-        target_metadata=target_metadata,
+-        literal_binds=True,
+-        dialect_opts={"paramstyle": "named"},
+-    )
+-
+-    with context.begin_transaction():
+-        context.run_migrations()
++    raise RuntimeError("schema_migration_offline_refused")
+@@ -32 +26,5 @@ def run_migrations_online() -> None:
+-    if supplied_connection is not None:
++    authority = config.attributes.get("migration_authority")
++    if supplied_connection is None or authority is None:
++        raise RuntimeError("schema_migration_authority_required")
++    activate_migration_authority(authority, supplied_connection)
++    try:
+@@ -39,13 +37,2 @@ def run_migrations_online() -> None:
+-        return
+-
+-    connectable = engine_from_config(
+-        config.get_section(config.config_ini_section, {}),
+-        prefix="sqlalchemy.",
+-        poolclass=pool.NullPool,
+-    )
+-
+-    with connectable.connect() as connection:
+-        context.configure(connection=connection, target_metadata=target_metadata)
+-
+-        with context.begin_transaction():
+-            context.run_migrations()
++    finally:
++        retire_migration_authority(authority)
+diff --git a/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py b/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
+index 8ab060f..90dd755 100644
+--- a/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
++++ b/migrations/versions/20260727_0015_plan_authority_and_validation_tenure.py
+@@ -10,0 +11,3 @@ import sqlalchemy as sa
++from trading_assistant.db.migration_authority import (
++    assert_migration_authority,
++)
+@@ -66,0 +70,23 @@ def upgrade() -> None:
++    connection = op.get_bind()
++    attributes = op.get_context().config.attributes
++    authority = attributes.get("migration_authority")
++    mode = assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"bootstrap", "maintenance"}),
++    )
++    schema_capability = attributes.get(
++        "runtime_tenure_fence_schema"
++    )
++    assert_owned = attributes.get(
++        "runtime_tenure_assert_owned"
++    )
++    if mode == "maintenance" and (
++        not isinstance(schema_capability, tuple)
++        or len(schema_capability) != 2
++        or not callable(assert_owned)
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++    if mode == "maintenance":
++        assert_owned(connection)
++
+@@ -91,9 +117 @@ def upgrade() -> None:
+-    connection = op.get_bind()
+-    attributes = op.get_context().config.attributes
+-    schema_capability = attributes.get(
+-        "runtime_tenure_fence_schema"
+-    )
+-    assert_owned = attributes.get(
+-        "runtime_tenure_assert_owned"
+-    )
+-    if schema_capability is not None:
++    if mode == "maintenance":
+@@ -135 +153 @@ def upgrade() -> None:
+-        if schema_capability is not None:
++        if mode == "maintenance":
+@@ -137 +155 @@ def upgrade() -> None:
+-    if schema_capability is not None:
++    if mode == "maintenance":
+@@ -142,0 +161,20 @@ def downgrade() -> None:
++    attributes = op.get_context().config.attributes
++    authority = attributes.get("migration_authority")
++    assert_migration_authority(
++        authority,
++        connection,
++        allowed_modes=frozenset({"maintenance"}),
++    )
++    schema_capability = attributes.get(
++        "runtime_tenure_fence_schema"
++    )
++    assert_owned = attributes.get(
++        "runtime_tenure_assert_owned"
++    )
++    if (
++        not isinstance(schema_capability, tuple)
++        or len(schema_capability) != 2
++        or not callable(assert_owned)
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++    assert_owned(connection)
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index f757872..03871b2 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -45,0 +46 @@ from .ops.tenure import (
++    TenureCloseResult,
+@@ -164,0 +166,9 @@ def acquire_runtime_guard(
++        close_result = getattr(
++            guard,
++            "close_result",
++            TenureCloseResult.NOT_ATTEMPTED,
++        )
++        if close_result is TenureCloseResult.CONFIRMED:
++            raise
++        if close_result is TenureCloseResult.UNCERTAIN:
++            raise TenureUncertain() from None
+diff --git a/src/trading_assistant/db/migrate.py b/src/trading_assistant/db/migrate.py
+index 841bb80..a4c776b 100644
+--- a/src/trading_assistant/db/migrate.py
++++ b/src/trading_assistant/db/migrate.py
+@@ -17,0 +18 @@ from trading_assistant.ops.backup import (
++    BackupMaintenance,
+@@ -19,0 +21 @@ from trading_assistant.ops.backup import (
++    guarded_backup_maintenance,
+@@ -31,0 +34,4 @@ from .schema import SchemaOutOfDate, require_current_schema, schema_status
++from .migration_authority import (
++    issue_bootstrap_authority,
++    issue_maintenance_authority,
++)
+@@ -41,0 +48,10 @@ def _config(engine: Engine) -> Config:
++def _run_bootstrap_upgrade(engine: Engine) -> None:
++    with engine.connect() as connection:
++        cfg = _config(engine)
++        cfg.attributes["connection"] = connection
++        cfg.attributes["migration_authority"] = (
++            issue_bootstrap_authority(connection)
++        )
++        command.upgrade(cfg, "head")
++
++
+@@ -49 +65 @@ def _backup(
+-    ensure_maintenance=None,
++    maintenance: BackupMaintenance,
+@@ -68 +84 @@ def _backup(
+-        ensure_maintenance=ensure_maintenance,
++        maintenance=maintenance,
+@@ -101 +117 @@ def upgrade(
+-        command.upgrade(_config(engine), "head")
++        _run_bootstrap_upgrade(engine)
+@@ -126,11 +142,5 @@ def upgrade(
+-    try:
+-        guard.start()
+-        barrier = install_runtime_mutation_barrier(engine, guard)
+-    except BaseException:
+-        if not guard.closed:
+-            try:
+-                if not guard.close():
+-                    raise TenureUncertain()
+-            except BaseException:
+-                raise TenureUncertain() from None
+-        raise
++    maintenance = guarded_backup_maintenance(
++        guard,
++        ttl_seconds=30,
++    )
++    barrier = None
+@@ -140,4 +149,0 @@ def upgrade(
+-        def renew_maintenance() -> None:
+-            if not guard.renew_once():
+-                raise TenureUncertain()
+-
+@@ -150 +156 @@ def upgrade(
+-            ensure_maintenance=renew_maintenance,
++            maintenance=maintenance,
+@@ -151,0 +158 @@ def upgrade(
++        barrier = install_runtime_mutation_barrier(engine, guard)
+@@ -155,0 +163,3 @@ def upgrade(
++            cfg.attributes["migration_authority"] = (
++                issue_maintenance_authority(connection)
++            )
+@@ -180 +190,2 @@ def upgrade(
+-        barrier.close()
++        if barrier is not None:
++            barrier.close()
+diff --git a/src/trading_assistant/db/migration_authority.py b/src/trading_assistant/db/migration_authority.py
+new file mode 100644
+index 0000000..b826830
+--- /dev/null
++++ b/src/trading_assistant/db/migration_authority.py
+@@ -0,0 +1,104 @@
++"""Opaque, connection-bound authority for one Alembic command."""
++
++from __future__ import annotations
++
++from typing import Literal
++
++from sqlalchemy import inspect
++from sqlalchemy.engine import Connection
++
++
++MigrationAuthorityMode = Literal["bootstrap", "maintenance"]
++_SEAL = object()
++
++
++class MigrationAuthority:
++    """A single-use authority bound to one exact SQLAlchemy connection."""
++
++    __slots__ = (
++        "_activated",
++        "_connection",
++        "_mode",
++        "_retired",
++        "_seal",
++    )
++
++    def __init__(
++        self,
++        seal: object,
++        connection: Connection,
++        mode: MigrationAuthorityMode,
++    ) -> None:
++        if seal is not _SEAL:
++            raise RuntimeError("schema_migration_authority_required")
++        self._seal = seal
++        self._connection = connection
++        self._mode = mode
++        self._activated = False
++        self._retired = False
++
++
++def issue_bootstrap_authority(
++    connection: Connection,
++) -> MigrationAuthority:
++    """Issue once only after proving the supplied database is truly empty."""
++
++    if inspect(connection).get_table_names():
++        raise RuntimeError("schema_bootstrap_authority_refused")
++    if connection.in_transaction():
++        connection.rollback()
++    return MigrationAuthority(_SEAL, connection, "bootstrap")
++
++
++def issue_maintenance_authority(
++    connection: Connection,
++) -> MigrationAuthority:
++    """Issue the wrapper's connection-bound maintenance capability."""
++
++    return MigrationAuthority(_SEAL, connection, "maintenance")
++
++
++def activate_migration_authority(
++    authority: object,
++    connection: Connection,
++) -> MigrationAuthorityMode:
++    """Consume the authority for one Alembic environment invocation."""
++
++    if (
++        not isinstance(authority, MigrationAuthority)
++        or authority._seal is not _SEAL
++        or authority._connection is not connection
++        or authority._activated
++        or authority._retired
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++    authority._activated = True
++    return authority._mode
++
++
++def assert_migration_authority(
++    authority: object,
++    connection: Connection,
++    *,
++    allowed_modes: frozenset[MigrationAuthorityMode],
++) -> MigrationAuthorityMode:
++    """Validate active authority before a revision performs its first write."""
++
++    if (
++        not isinstance(authority, MigrationAuthority)
++        or authority._seal is not _SEAL
++        or authority._connection is not connection
++        or not authority._activated
++        or authority._retired
++        or authority._mode not in allowed_modes
++    ):
++        raise RuntimeError("schema_migration_authority_required")
++    return authority._mode
++
++
++def retire_migration_authority(authority: object) -> None:
++    """Prevent reuse after success or failure."""
++
++    if isinstance(authority, MigrationAuthority):
++        authority._retired = True
++
+diff --git a/src/trading_assistant/ops/backup.py b/src/trading_assistant/ops/backup.py
+index e1bc6f9..73a9338 100644
+--- a/src/trading_assistant/ops/backup.py
++++ b/src/trading_assistant/ops/backup.py
+@@ -73,0 +74,57 @@ class EncryptedBackupReceipt:
++@dataclass(frozen=True)
++class BackupMaintenance:
++    """Three-phase maintenance callbacks for one SQLite source snapshot."""
++
++    check_snapshot: Callable[[], None]
++    complete_snapshot: Callable[[], None]
++    ensure_owned: Callable[[], None]
++
++
++def guarded_backup_maintenance(
++    guard: RuntimeTenureGuard,
++    *,
++    ttl_seconds: int,
++    monotonic: Callable[[], float] = time.monotonic,
++) -> BackupMaintenance:
++    """Delay source-writing renewal until the SQLite snapshot is closed."""
++
++    if (
++        isinstance(ttl_seconds, bool)
++        or not isinstance(ttl_seconds, int)
++        or ttl_seconds <= 1
++    ):
++        raise ValueError("backup_tenure_ttl_invalid")
++    deadline = monotonic() + max(1.0, ttl_seconds - 1.0)
++    snapshot_completed = False
++
++    def check_snapshot() -> None:
++        guard.ensure_owned()
++        if snapshot_completed or monotonic() >= deadline:
++            raise EncryptedBackupError("backup_snapshot_tenure_expired")
++
++    def complete_snapshot() -> None:
++        nonlocal snapshot_completed
++        if snapshot_completed:
++            raise EncryptedBackupError(
++                "backup_snapshot_transition_invalid"
++            )
++        check_snapshot()
++        if not guard.renew_once():
++            raise EncryptedBackupError("backup_tenure_lost")
++        guard.start()
++        snapshot_completed = True
++
++    def ensure_owned() -> None:
++        if not snapshot_completed:
++            raise EncryptedBackupError(
++                "backup_snapshot_transition_invalid"
++            )
++        guard.ensure_owned()
++
++    return BackupMaintenance(
++        check_snapshot=check_snapshot,
++        complete_snapshot=complete_snapshot,
++        ensure_owned=ensure_owned,
++    )
++
++
+@@ -207,0 +265 @@ def create_encrypted_database_backup(
++    maintenance: BackupMaintenance | None = None,
+@@ -227,0 +286,2 @@ def create_encrypted_database_backup(
++    if maintenance is not None and ensure_maintenance is not None:
++        raise EncryptedBackupError("backup_maintenance_invalid")
+@@ -229 +289,15 @@ def create_encrypted_database_backup(
+-    maintain_callback = ensure_maintenance or (lambda: None)
++    maintain_callback = (
++        maintenance.ensure_owned
++        if maintenance is not None
++        else ensure_maintenance or (lambda: None)
++    )
++    snapshot_check_callback = (
++        maintenance.check_snapshot
++        if maintenance is not None
++        else (lambda: None)
++    )
++    snapshot_complete_callback = (
++        maintenance.complete_snapshot
++        if maintenance is not None
++        else (lambda: None)
++    )
+@@ -231 +305 @@ def create_encrypted_database_backup(
+-    def maintain() -> None:
++    def invoke(callback: Callable[[], None]) -> None:
+@@ -233 +307 @@ def create_encrypted_database_backup(
+-            maintain_callback()
++            callback()
+@@ -235,0 +310,9 @@ def create_encrypted_database_backup(
++
++    def maintain() -> None:
++        invoke(maintain_callback)
++
++    def check_snapshot() -> None:
++        invoke(snapshot_check_callback)
++
++    def complete_snapshot() -> None:
++        invoke(snapshot_complete_callback)
+@@ -256 +339 @@ def create_encrypted_database_backup(
+-        maintain()
++        check_snapshot()
+@@ -266 +349,3 @@ def create_encrypted_database_backup(
+-                progress=lambda _status, _remaining, _total: maintain(),
++                progress=lambda _status, _remaining, _total: (
++                    check_snapshot()
++                ),
+@@ -271,0 +357 @@ def create_encrypted_database_backup(
++        complete_snapshot()
+@@ -502 +588,4 @@ def backup_database(
+-    guard.start()
++    maintenance = guarded_backup_maintenance(
++        guard,
++        ttl_seconds=30,
++    )
+@@ -505,4 +593,0 @@ def backup_database(
+-        def maintain() -> None:
+-            if not guard.renew_once():
+-                raise EncryptedBackupError("backup_tenure_lost")
+-
+@@ -516 +601 @@ def backup_database(
+-            ensure_maintenance=maintain,
++            maintenance=maintenance,
+diff --git a/src/trading_assistant/ops/control.py b/src/trading_assistant/ops/control.py
+index e55b281..b13e4ea 100644
+--- a/src/trading_assistant/ops/control.py
++++ b/src/trading_assistant/ops/control.py
+@@ -22,0 +23,6 @@ _SOCKET_NAME = "app-control.sock"
++_PROCESS_START_IDENTITY_PREFIX = "ps-lstart-v1:"
++_PROCESS_INSPECTION_ENV = {
++    "LC_ALL": "C",
++    "LANG": "C",
++    "TZ": "UTC",
++}
+@@ -89 +95 @@ def _process_output(pid: int, field: str) -> str | None:
+-            ["ps", "-ww", "-p", str(pid), "-o", f"{field}="],
++            ["/bin/ps", "-ww", "-p", str(pid), "-o", f"{field}="],
+@@ -93,0 +100 @@ def _process_output(pid: int, field: str) -> str | None:
++            env=dict(_PROCESS_INSPECTION_ENV),
+@@ -100 +107,5 @@ def _process_output(pid: int, field: str) -> str | None:
+-    return value or None
++    if not value:
++        return None
++    if field == "lstart":
++        return f"{_PROCESS_START_IDENTITY_PREFIX}{' '.join(value.split())}"
++    return value
+diff --git a/src/trading_assistant/ops/encrypt_sensitive.py b/src/trading_assistant/ops/encrypt_sensitive.py
+index 775cf04..d9c1593 100644
+--- a/src/trading_assistant/ops/encrypt_sensitive.py
++++ b/src/trading_assistant/ops/encrypt_sensitive.py
+@@ -38 +38,5 @@ from ..security.sensitive_fields import (
+-from .backup import create_encrypted_database_backup
++from .backup import (
++    create_encrypted_database_backup,
++    EncryptedBackupError,
++    guarded_backup_maintenance,
++)
+@@ -810 +813,0 @@ def _acquire_maintenance(
+-        guard.start()
+@@ -898,8 +901,3 @@ def migrate_sensitive_fields(
+-        backup = create_encrypted_database_backup(
+-            source,
+-            backup_directory,
+-            backup_key=backup_key,
+-            backup_key_id=backup_key_id,
+-            schema_head=schema_status(engine).head,
+-            now=now,
+-            ensure_maintenance=lambda: _renew(handle),
++        backup_maintenance = guarded_backup_maintenance(
++            handle,
++            ttl_seconds=_MAINTENANCE_TTL_SECONDS,
+@@ -906,0 +905,19 @@ def migrate_sensitive_fields(
++        try:
++            backup = create_encrypted_database_backup(
++                source,
++                backup_directory,
++                backup_key=backup_key,
++                backup_key_id=backup_key_id,
++                schema_head=schema_status(engine).head,
++                now=now,
++                maintenance=backup_maintenance,
++            )
++        except EncryptedBackupError as exc:
++            if exc.stable_code in {
++                "backup_tenure_lost",
++                "backup_snapshot_tenure_expired",
++            }:
++                raise SensitiveMigrationError(
++                    "sensitive_migration_tenure_lost"
++                ) from None
++            raise
+@@ -1061,8 +1078,3 @@ def rotate_sensitive_fields(
+-        backup = create_encrypted_database_backup(
+-            source,
+-            backup_directory,
+-            backup_key=backup_key,
+-            backup_key_id=backup_key_id,
+-            schema_head=schema_status(engine).head,
+-            now=now,
+-            ensure_maintenance=lambda: _renew(handle),
++        backup_maintenance = guarded_backup_maintenance(
++            handle,
++            ttl_seconds=_MAINTENANCE_TTL_SECONDS,
+@@ -1069,0 +1082,19 @@ def rotate_sensitive_fields(
++        try:
++            backup = create_encrypted_database_backup(
++                source,
++                backup_directory,
++                backup_key=backup_key,
++                backup_key_id=backup_key_id,
++                schema_head=schema_status(engine).head,
++                now=now,
++                maintenance=backup_maintenance,
++            )
++        except EncryptedBackupError as exc:
++            if exc.stable_code in {
++                "backup_tenure_lost",
++                "backup_snapshot_tenure_expired",
++            }:
++                raise SensitiveMigrationError(
++                    "sensitive_migration_tenure_lost"
++                ) from None
++            raise
+diff --git a/src/trading_assistant/ops/tenure.py b/src/trading_assistant/ops/tenure.py
+index ddc0670..f46f0bf 100644
+--- a/src/trading_assistant/ops/tenure.py
++++ b/src/trading_assistant/ops/tenure.py
+@@ -48,0 +49,6 @@ _FENCE_SCHEMA_REBUILD_SQL = (
++_PROCESS_START_IDENTITY_PREFIX = "ps-lstart-v1:"
++_PROCESS_INSPECTION_ENV = {
++    "LC_ALL": "C",
++    "LANG": "C",
++    "TZ": "UTC",
++}
+@@ -148,0 +155 @@ class LocalProcessInspector:
++                env=dict(_PROCESS_INSPECTION_ENV),
+@@ -164 +171,4 @@ class LocalProcessInspector:
+-        return ProcessProof.SAME, value
++        return (
++            ProcessProof.SAME,
++            f"{_PROCESS_START_IDENTITY_PREFIX}{value}",
++        )
+@@ -180,0 +191,4 @@ class LocalProcessInspector:
++        if not identity.start_identity.startswith(
++            _PROCESS_START_IDENTITY_PREFIX
++        ):
++            return ProcessProof.UNKNOWN
+diff --git a/tests/safety_helpers.py b/tests/safety_helpers.py
+new file mode 100644
+index 0000000..df457d4
+--- /dev/null
++++ b/tests/safety_helpers.py
+@@ -0,0 +1,68 @@
++"""Small deterministic helpers for safety-boundary regression tests."""
++
++from __future__ import annotations
++
++from contextlib import contextmanager
++import signal
++
++from alembic import command
++from alembic.config import Config
++from sqlalchemy import create_engine
++from sqlalchemy.pool import NullPool
++
++from trading_assistant.db.migration_authority import (
++    issue_bootstrap_authority,
++)
++
++
++class OperationDeadlineExceeded(RuntimeError):
++    """A local-only operation did not complete inside its safety bound."""
++
++
++@contextmanager
++def operation_deadline(seconds: float):
++    """Interrupt a main-thread local operation without leaving worker threads."""
++
++    if seconds <= 0:
++        raise ValueError("seconds must be positive")
++    previous = signal.getsignal(signal.SIGALRM)
++
++    def expired(_signum, _frame):
++        raise OperationDeadlineExceeded(
++            f"operation exceeded {seconds:.1f} seconds"
++        )
++
++    signal.signal(signal.SIGALRM, expired)
++    signal.setitimer(signal.ITIMER_REAL, seconds)
++    try:
++        yield
++    finally:
++        signal.setitimer(signal.ITIMER_REAL, 0)
++        signal.signal(signal.SIGALRM, previous)
++
++
++def bootstrap_database_to_revision(
++    database_url: str,
++    revision: str,
++) -> None:
++    """Build one empty migration fixture through one-shot bootstrap authority."""
++
++    # Match Alembic's historical test-fixture connection semantics. Production
++    # engines deliberately enable WAL, but closed WAL databases without their
++    # sidecars are invalid inputs to the safety-drill copy boundary.
++    engine = create_engine(
++        database_url,
++        future=True,
++        poolclass=NullPool,
++    )
++    try:
++        with engine.connect() as connection:
++            config = Config("alembic.ini")
++            config.set_main_option("sqlalchemy.url", database_url)
++            config.attributes["connection"] = connection
++            config.attributes["migration_authority"] = (
++                issue_bootstrap_authority(connection)
++            )
++            command.upgrade(config, revision)
++    finally:
++        engine.dispose()
+diff --git a/tests/test_cooperative_control.py b/tests/test_cooperative_control.py
+index f20a038..b1685f2 100644
+--- a/tests/test_cooperative_control.py
++++ b/tests/test_cooperative_control.py
+@@ -6,0 +7 @@ import json
++import os
+@@ -53,0 +55,36 @@ def _snapshot(metadata, **updates):
++def test_process_start_identity_uses_absolute_ps_and_fixed_environment(
++    monkeypatch,
++):
++    from trading_assistant.ops import control
++
++    calls: list[tuple[list[str], dict[str, object]]] = []
++
++    def runner(argv, **kwargs):
++        calls.append((argv, kwargs))
++        return SimpleNamespace(
++            returncode=0,
++            stdout="Sun Jul 27 20:00:00 2026\n",
++            stderr="",
++        )
++
++    monkeypatch.setattr(control.subprocess, "run", runner)
++    monkeypatch.setenv("PATH", "/tmp/attacker-controlled")
++    monkeypatch.setenv("TZ", "America/Los_Angeles")
++    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
++
++    first = control._process_output(4242, "lstart")
++    os.environ["TZ"] = "Asia/Kolkata"
++    os.environ["LC_ALL"] = "en_US.UTF-8"
++    second = control._process_output(4242, "lstart")
++
++    assert first == second == "ps-lstart-v1:Sun Jul 27 20:00:00 2026"
++    assert [call[0] for call in calls] == [
++        ["/bin/ps", "-ww", "-p", "4242", "-o", "lstart="],
++        ["/bin/ps", "-ww", "-p", "4242", "-o", "lstart="],
++    ]
++    assert [call[1]["env"] for call in calls] == [
++        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
++        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
++    ]
++
++
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index a26d1fd..f5a79e7 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -14,2 +13,0 @@ import pytest
+-from alembic import command
+-from alembic.config import Config
+@@ -33,0 +32 @@ from trading_assistant.security.sensitive_fields import (
++from tests.safety_helpers import bootstrap_database_to_revision
+@@ -55,3 +54 @@ def _sensitive_head_database(tmp_path, name: str) -> str:
+-    cfg = Config("alembic.ini")
+-    cfg.set_main_option("sqlalchemy.url", url)
+-    command.upgrade(cfg, "head")
++    bootstrap_database_to_revision(url, "head")
+diff --git a/tests/test_migrations.py b/tests/test_migrations.py
+index d86c83f..f0f430c 100644
+--- a/tests/test_migrations.py
++++ b/tests/test_migrations.py
+@@ -29,0 +30,4 @@ from trading_assistant.db.migrate import adopt_existing, upgrade
++from trading_assistant.db.migration_authority import (
++    issue_bootstrap_authority,
++    issue_maintenance_authority,
++)
+@@ -39,0 +44 @@ from trading_assistant.ops.tenure import (
++    RuntimeTenureGuard,
+@@ -52,0 +58,3 @@ MIGRATION_BACKUP_KEY_ID = "migration-backup-key-2026"
++_RAW_ALEMBIC_UPGRADE = command.upgrade
++_RAW_ALEMBIC_DOWNGRADE = command.downgrade
++_RAW_ALEMBIC_STAMP = command.stamp
+@@ -66,0 +75,71 @@ def _url(path: Path) -> str:
++class _AuthorizedTestAlembic:
++    """Run historical migration fixtures with an explicit test-only capability."""
++
++    @staticmethod
++    def _run(operation, cfg, *args, **kwargs):
++        if (
++            cfg.attributes.get("connection") is not None
++            and cfg.attributes.get("migration_authority") is not None
++        ):
++            return operation(cfg, *args, **kwargs)
++        engine = create_db_engine(
++            cfg.get_main_option("sqlalchemy.url")
++        )
++        original = dict(cfg.attributes)
++        try:
++            with engine.connect() as connection:
++                connection.exec_driver_sql(
++                    "PRAGMA foreign_keys=OFF"
++                )
++                cfg.attributes["connection"] = connection
++                has_tables = bool(
++                    inspect(connection).get_table_names()
++                )
++                if connection.in_transaction():
++                    connection.rollback()
++                if has_tables:
++                    authority = issue_maintenance_authority(connection)
++                else:
++                    authority = issue_bootstrap_authority(connection)
++                cfg.attributes["migration_authority"] = authority
++                cfg.attributes["runtime_tenure_fence_schema"] = (
++                    "_pytest_schema_fence",
++                    object(),
++                )
++                cfg.attributes["runtime_tenure_assert_owned"] = (
++                    lambda _connection: None
++                )
++                return operation(cfg, *args, **kwargs)
++        finally:
++            cfg.attributes.clear()
++            cfg.attributes.update(original)
++            engine.dispose()
++
++    def upgrade(self, cfg, *args, **kwargs):
++        return self._run(
++            _RAW_ALEMBIC_UPGRADE,
++            cfg,
++            *args,
++            **kwargs,
++        )
++
++    def downgrade(self, cfg, *args, **kwargs):
++        return self._run(
++            _RAW_ALEMBIC_DOWNGRADE,
++            cfg,
++            *args,
++            **kwargs,
++        )
++
++    def stamp(self, cfg, *args, **kwargs):
++        return self._run(
++            _RAW_ALEMBIC_STAMP,
++            cfg,
++            *args,
++            **kwargs,
++        )
++
++
++command = _AuthorizedTestAlembic()
++
++
+@@ -67,0 +147 @@ def _legacy_engine(path: Path):
++    engine = create_db_engine(_url(path))
+@@ -70,2 +150,6 @@ def _legacy_engine(path: Path):
+-    command.upgrade(cfg, "20260724_0001")
+-    engine = create_db_engine(_url(path))
++    with engine.connect() as connection:
++        cfg.attributes["connection"] = connection
++        cfg.attributes["migration_authority"] = (
++            issue_bootstrap_authority(connection)
++        )
++        _RAW_ALEMBIC_UPGRADE(cfg, "20260724_0001")
+@@ -77,0 +162 @@ def _engine_at_revision(path: Path, revision: str):
++    engine = create_db_engine(_url(path))
+@@ -80,2 +165,63 @@ def _engine_at_revision(path: Path, revision: str):
+-    command.upgrade(cfg, revision)
+-    return create_db_engine(_url(path)), cfg
++    with engine.connect() as connection:
++        cfg.attributes["connection"] = connection
++        cfg.attributes["migration_authority"] = (
++            issue_bootstrap_authority(connection)
++        )
++        _RAW_ALEMBIC_UPGRADE(cfg, revision)
++    direct_cfg = Config("alembic.ini")
++    direct_cfg.set_main_option("sqlalchemy.url", _url(path))
++    return engine, direct_cfg
++
++
++def _database_fingerprint(engine) -> tuple[object, ...]:
++    with engine.connect() as connection:
++        version = connection.scalar(
++            text("SELECT version_num FROM alembic_version")
++        )
++        schema = tuple(
++            connection.execute(
++                text(
++                    "SELECT type,name,coalesce(sql,'') "
++                    "FROM sqlite_master "
++                    "WHERE name NOT LIKE 'sqlite_%' "
++                    "ORDER BY type,name"
++                )
++            )
++        )
++        tenures = (
++            tuple(
++                connection.execute(
++                    text(
++                        "SELECT resource_key,role,state,owner_id,generation "
++                        "FROM runtime_tenures ORDER BY resource_key"
++                    )
++                )
++            )
++            if "runtime_tenures" in inspect(engine).get_table_names()
++            else ()
++        )
++        plans = (
++            tuple(
++                connection.execute(
++                    text("SELECT * FROM trade_plans ORDER BY id")
++                )
++            )
++            if "trade_plans" in inspect(engine).get_table_names()
++            else ()
++        )
++    return version, schema, tenures, plans
++
++
++def _seed_migration_refusal_row(engine, marker: str) -> None:
++    with engine.begin() as connection:
++        connection.execute(
++            text(
++                "INSERT INTO trade_plans "
++                "(symbol,action,status,paper_only,shadow,plan_json,sized_json,"
++                "entry_filled_qty,exit_filled_qty,residual_generation,"
++                "created_at) VALUES "
++                "('AAPL','hold','proposed',1,0,:marker,:marker,"
++                "0,0,0,CURRENT_TIMESTAMP)"
++            ),
++            {"marker": marker},
++        )
+@@ -307,0 +454,57 @@ def test_schema_upgrade_holds_maintenance_through_backup_and_ddl(
++def test_schema_upgrade_starts_renewal_only_after_snapshot_closes(
++    tmp_path,
++    monkeypatch,
++):
++    from trading_assistant.db import migrate as migrate_module
++
++    engine = create_db_engine(_url(tmp_path / "ordered-upgrade.db"))
++    upgrade(engine)
++    starts: list[str] = []
++    backup_receipt = object()
++
++    monkeypatch.setattr(
++        migrate_module,
++        "schema_status",
++        lambda _engine: SimpleNamespace(
++            versioned=True,
++            ready=False,
++            current="20260727_0014",
++        ),
++    )
++    monkeypatch.setattr(
++        RuntimeTenureGuard,
++        "start",
++        lambda _guard: starts.append("started"),
++    )
++
++    def snapshot_probe(*_args, **kwargs):
++        assert starts == []
++        assert "ensure_maintenance" not in kwargs
++        maintenance = kwargs["maintenance"]
++        maintenance.check_snapshot()
++        assert starts == []
++        maintenance.complete_snapshot()
++        assert starts == ["started"]
++        return backup_receipt
++
++    monkeypatch.setattr(migrate_module, "_backup", snapshot_probe)
++    monkeypatch.setattr(
++        migrate_module.command,
++        "upgrade",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(
++            RuntimeError("stop-after-backup")
++        ),
++    )
++
++    with pytest.raises(RuntimeError, match="stop-after-backup"):
++        upgrade(
++            engine,
++            **_migration_backup_args(tmp_path),
++            process_identity=ProcessIdentity(
++                8015,
++                "schema-ordered-maintenance",
++            ),
++            process_inspector=_AbsentProcessInspector(),
++        )
++
++
+@@ -471,0 +675,145 @@ def test_plan_authority_migration_is_successor_0015():
++@pytest.mark.parametrize(
++    "role",
++    [None, "app", "daemon", "mcp", "maintenance"],
++)
++def test_direct_alembic_upgrade_from_0014_requires_opaque_authority(
++    tmp_path,
++    role,
++):
++    path = tmp_path / f"direct-upgrade-{role or 'none'}.db"
++    engine, cfg = _engine_at_revision(path, "20260727_0014")
++    _seed_migration_refusal_row(engine, f"upgrade-{role or 'none'}")
++    if role is not None:
++        service = RuntimeTenureService(
++            make_session_factory(engine),
++            process_inspector=_AbsentProcessInspector(),
++        )
++        identity = ProcessIdentity(
++            8400 + len(role),
++            f"direct-upgrade-{role}",
++        )
++        if role == "maintenance":
++            service.acquire_maintenance(identity, ttl_seconds=30)
++        else:
++            service.acquire_runtime(role, identity, ttl_seconds=30)
++    before = _database_fingerprint(engine)
++    artifact_directory = tmp_path / "direct-upgrade-artifacts"
++    artifact_directory.mkdir()
++    existing_artifact = artifact_directory / "existing.aesgcm"
++    existing_artifact.write_bytes(b"unchanged")
++    artifacts_before = tuple(
++        (path.name, path.read_bytes())
++        for path in sorted(artifact_directory.iterdir())
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^schema_migration_authority_required$",
++    ):
++        _RAW_ALEMBIC_UPGRADE(cfg, "head")
++
++    assert _database_fingerprint(engine) == before
++    assert tuple(
++        (path.name, path.read_bytes())
++        for path in sorted(artifact_directory.iterdir())
++    ) == artifacts_before
++
++
++@pytest.mark.parametrize(
++    "role",
++    [None, "app", "daemon", "mcp", "validation", "maintenance"],
++)
++def test_direct_alembic_head_upgrade_requires_opaque_authority(
++    tmp_path,
++    role,
++):
++    path = tmp_path / f"direct-head-upgrade-{role or 'none'}.db"
++    engine = create_db_engine(_url(path))
++    assert upgrade(engine) is None
++    _seed_migration_refusal_row(engine, f"head-{role or 'none'}")
++    if role is not None:
++        service = RuntimeTenureService(
++            make_session_factory(engine),
++            process_inspector=_AbsentProcessInspector(),
++        )
++        identity = ProcessIdentity(
++            8500 + len(role),
++            f"direct-head-upgrade-{role}",
++        )
++        if role == "maintenance":
++            service.acquire_maintenance(identity, ttl_seconds=30)
++        else:
++            service.acquire_runtime(role, identity, ttl_seconds=30)
++    before = _database_fingerprint(engine)
++    artifact_directory = tmp_path / "direct-head-upgrade-artifacts"
++    assert not artifact_directory.exists()
++    cfg = Config("alembic.ini")
++    cfg.set_main_option("sqlalchemy.url", _url(path))
++
++    with pytest.raises(
++        RuntimeError,
++        match="^schema_migration_authority_required$",
++    ):
++        _RAW_ALEMBIC_UPGRADE(cfg, "head")
++
++    assert _database_fingerprint(engine) == before
++    assert not artifact_directory.exists()
++
++
++@pytest.mark.parametrize(
++    "role",
++    [None, "app", "daemon", "mcp", "validation", "maintenance"],
++)
++def test_direct_alembic_downgrade_requires_opaque_authority(
++    tmp_path,
++    role,
++):
++    path = tmp_path / f"direct-downgrade-{role or 'none'}.db"
++    engine = create_db_engine(_url(path))
++    assert upgrade(engine) is None
++    _seed_migration_refusal_row(engine, f"downgrade-{role or 'none'}")
++    if role is not None:
++        service = RuntimeTenureService(
++            make_session_factory(engine),
++            process_inspector=_AbsentProcessInspector(),
++        )
++        identity = ProcessIdentity(
++            8600 + len(role),
++            f"direct-downgrade-{role}",
++        )
++        if role == "maintenance":
++            service.acquire_maintenance(identity, ttl_seconds=30)
++        else:
++            service.acquire_runtime(role, identity, ttl_seconds=30)
++    before = _database_fingerprint(engine)
++    artifact_directory = tmp_path / "direct-downgrade-artifacts"
++    assert not artifact_directory.exists()
++    cfg = Config("alembic.ini")
++    cfg.set_main_option("sqlalchemy.url", _url(path))
++
++    with pytest.raises(
++        RuntimeError,
++        match="^schema_migration_authority_required$",
++    ):
++        _RAW_ALEMBIC_DOWNGRADE(cfg, "20260727_0014")
++
++    assert _database_fingerprint(engine) == before
++    assert not artifact_directory.exists()
++
++
++def test_offline_alembic_migration_is_refused_before_sql_generation(
++    tmp_path,
++):
++    path = tmp_path / "offline-refused.db"
++    cfg = Config("alembic.ini")
++    cfg.set_main_option("sqlalchemy.url", _url(path))
++
++    with pytest.raises(
++        RuntimeError,
++        match="^schema_migration_offline_refused$",
++    ):
++        _RAW_ALEMBIC_UPGRADE(cfg, "head", sql=True)
++
++    assert not path.exists()
++
++
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+index 26e4d4a..4930a1b 100644
+--- a/tests/test_ops.py
++++ b/tests/test_ops.py
+@@ -41,0 +42 @@ from trading_assistant.security.secrets import RuntimeSecrets
++from tests.safety_helpers import operation_deadline
+@@ -123,0 +125,40 @@ def test_operational_backup_is_encrypted_for_every_migration_state(
++def test_large_operational_backup_completes_without_source_renewal_livelock(
++    tmp_path,
++):
++    source = _operational_database(tmp_path, "required")
++    with sqlite3.connect(source) as connection:
++        connection.execute("PRAGMA journal_mode=WAL")
++        connection.execute(
++            "CREATE TABLE large_backup_probe (payload BLOB NOT NULL)"
++        )
++        connection.execute(
++            "INSERT INTO large_backup_probe(payload) "
++            "VALUES (zeroblob(2097152))"
++        )
++        connection.commit()
++        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
++    destination = tmp_path / "large-backups"
++
++    started = time.monotonic()
++    with operation_deadline(8.0):
++        receipt = backup_database(
++            source,
++            destination,
++            retention_days=14,
++            backup_key=BACKUP_KEY,
++            backup_key_id=BACKUP_KEY_ID,
++            process_identity=BACKUP_IDENTITY,
++            process_inspector=_OfflineInspector(),
++        )
++    elapsed = time.monotonic() - started
++
++    assert elapsed < 8.0
++    assert receipt.verified is True
++    assert read_encrypted_backup_header(receipt.path)[
++        "source_sha256"
++    ] == receipt.source_sha256
++    wal = source.with_name(f"{source.name}-wal")
++    assert not wal.exists() or wal.stat().st_size < 1_048_576
++    assert not any(path.name.startswith(".") for path in destination.iterdir())
++
++
+diff --git a/tests/test_runtime_tenure.py b/tests/test_runtime_tenure.py
+index b7c419e..0f3e10e 100644
+--- a/tests/test_runtime_tenure.py
++++ b/tests/test_runtime_tenure.py
+@@ -14,0 +15,4 @@ from sqlalchemy.orm import Session
++from trading_assistant.bootstrap import (
++    DatabaseRuntime,
++    acquire_runtime_guard,
++)
+@@ -31,0 +36 @@ _LOCAL_PROCESS_INSPECT = LocalProcessInspector.inspect
++_LOCAL_PROCESS_CURRENT = LocalProcessInspector.current
+@@ -34,0 +40 @@ NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
++CANONICAL_START = "ps-lstart-v1:Sun Jul 27 20:00:00 2026"
+@@ -455,0 +462,44 @@ def test_guard_start_failure_releases_exact_ownership(
++def test_acquire_runtime_guard_preserves_confirmed_thread_start_failure(
++    tmp_path,
++    monkeypatch,
++):
++    import trading_assistant.ops.tenure as tenure_module
++
++    class BrokenThread:
++        def __init__(self, **_kwargs):
++            pass
++
++        def start(self):
++            raise RuntimeError("thread-start-failed")
++
++        def is_alive(self):
++            return False
++
++    engine = create_db_engine(f"sqlite:///{tmp_path}/start-failure.db")
++    Base.metadata.create_all(engine)
++    runtime = DatabaseRuntime(
++        engine=engine,
++        session_factory=make_session_factory(engine),
++    )
++    monkeypatch.setattr(tenure_module, "Thread", BrokenThread)
++
++    with pytest.raises(RuntimeError, match="thread-start-failed"):
++        acquire_runtime_guard(
++            runtime,
++            "app",
++            process_identity=APP,
++            process_inspector=FakeProcessInspector(),
++            tenure_clock=lambda: NOW,
++        )
++
++    with Session(engine) as session:
++        row = session.get(RuntimeTenure, "runtime:app")
++        assert row is not None
++        assert row.state == "released"
++    with engine.begin() as connection:
++        connection.exec_driver_sql(
++            "CREATE TABLE listener_cleanup_probe "
++            "(id INTEGER PRIMARY KEY)"
++        )
++
++
+@@ -858 +908 @@ def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
+-    calls: list[list[str]] = []
++    calls: list[tuple[list[str], dict[str, object]]] = []
+@@ -860,2 +910,2 @@ def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
+-    def runner(argv, **_kwargs):
+-        calls.append(argv)
++    def runner(argv, **kwargs):
++        calls.append((argv, kwargs))
+@@ -864 +914 @@ def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
+-            stdout="Sun Jul 27 12:00:00 2026\n",
++            stdout="Sun Jul 27 20:00:00 2026\n",
+@@ -874,2 +924,57 @@ def test_process_inspector_uses_absolute_ps_even_with_path_hijack(
+-    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
+-    assert calls[0][0] == "/bin/ps"
++    assert (
++        _LOCAL_PROCESS_INSPECT(
++            inspector,
++            ProcessIdentity(APP.pid, CANONICAL_START),
++        )
++        is ProcessProof.SAME
++    )
++    assert calls[0][0][0] == "/bin/ps"
++    assert calls[0][1]["env"] == {
++        "LC_ALL": "C",
++        "LANG": "C",
++        "TZ": "UTC",
++    }
++
++
++def test_process_inspector_is_stable_across_caller_timezone_and_locale(
++    monkeypatch,
++):
++    observed_environments: list[dict[str, str]] = []
++
++    def runner(_argv, **kwargs):
++        observed_environments.append(kwargs["env"])
++        return SimpleNamespace(
++            returncode=0,
++            stdout="Sun Jul 27 20:00:00 2026\n",
++            stderr="",
++        )
++
++    inspector = LocalProcessInspector(
++        runner=runner,
++        process_probe=lambda _pid: None,
++    )
++    monkeypatch.setenv("TZ", "America/Los_Angeles")
++    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
++    first = _LOCAL_PROCESS_CURRENT(inspector)
++    monkeypatch.setenv("TZ", "Asia/Kolkata")
++    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
++
++    assert _LOCAL_PROCESS_INSPECT(inspector, first) is ProcessProof.SAME
++    assert first.start_identity == CANONICAL_START
++    assert observed_environments == [
++        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
++        {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
++    ]
++
++
++def test_process_inspector_treats_legacy_unversioned_identity_as_unknown():
++    inspector = LocalProcessInspector(
++        runner=lambda *_args, **_kwargs: SimpleNamespace(
++            returncode=0,
++            stdout="Sun Jul 27 20:00:00 2026\n",
++            stderr="",
++        ),
++        process_probe=lambda _pid: None,
++    )
++
++    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.UNKNOWN
+@@ -929 +1034,33 @@ def test_process_inspector_detects_pid_reuse_by_start_identity():
+-    assert _LOCAL_PROCESS_INSPECT(inspector, APP) is ProcessProof.NOT_SAME
++    assert (
++        _LOCAL_PROCESS_INSPECT(
++            inspector,
++            ProcessIdentity(APP.pid, CANONICAL_START),
++        )
++        is ProcessProof.NOT_SAME
++    )
++
++
++def test_expired_live_owner_with_canonical_identity_blocks_maintenance(
++    tenure_service,
++):
++    service, clock, _inspector = tenure_service
++    runner = lambda *_args, **_kwargs: SimpleNamespace(
++        returncode=0,
++        stdout="Sun Jul 27 20:00:00 2026\n",
++        stderr="",
++    )
++    local = LocalProcessInspector(
++        runner=runner,
++        process_probe=lambda _pid: None,
++    )
++    service._process_inspector = SimpleNamespace(
++        inspect=lambda identity: _LOCAL_PROCESS_INSPECT(local, identity)
++    )
++    live = ProcessIdentity(pid=APP.pid, start_identity=CANONICAL_START)
++    service.acquire_runtime("app", live, ttl_seconds=10)
++    clock.advance(11)
++
++    with pytest.raises(TenureUnavailable) as captured:
++        service.acquire_maintenance(MAINTENANCE, ttl_seconds=30)
++
++    assert captured.value.stable_code == "runtime_process_live"
+diff --git a/tests/test_safety_drill.py b/tests/test_safety_drill.py
+index 7b497aa..e88201a 100644
+--- a/tests/test_safety_drill.py
++++ b/tests/test_safety_drill.py
+@@ -15,2 +14,0 @@ from alpaca.trading.client import TradingClient
+-from alembic import command
+-from alembic.config import Config
+@@ -58,0 +57 @@ from trading_assistant.service import TradingService
++from tests.safety_helpers import bootstrap_database_to_revision
+@@ -75,3 +74 @@ def _upgrade_database(path) -> None:
+-    config = Config("alembic.ini")
+-    config.set_main_option("sqlalchemy.url", f"sqlite:///{path}")
+-    command.upgrade(config, "head")
++    bootstrap_database_to_revision(f"sqlite:///{path}", "head")
+diff --git a/tests/test_sensitive_migration.py b/tests/test_sensitive_migration.py
+index 80dce8c..325e777 100644
+--- a/tests/test_sensitive_migration.py
++++ b/tests/test_sensitive_migration.py
+@@ -39,0 +40 @@ from trading_assistant.ops.backup import (
++    EncryptedBackupReceipt,
+@@ -41,0 +43 @@ from trading_assistant.ops.backup import (
++    guarded_backup_maintenance,
+@@ -55,0 +58 @@ from trading_assistant.ops.tenure import (
++    RuntimeTenureGuard,
+@@ -309,0 +313,39 @@ def test_backup_streams_more_than_two_mebibytes_in_bounded_chunks(tmp_path):
++def test_large_snapshot_expiry_aborts_before_publication_and_cleans_temps(
++    tmp_path,
++):
++    source = tmp_path / "large-expired.db"
++    destination = tmp_path / "expired-backups"
++    _seed_database(source, payload_bytes=2_500_000)
++    monotonic_values = iter((0.0, 0.0, 30.0))
++
++    class InMemoryGuard:
++        renewals = 0
++        starts = 0
++
++        def ensure_owned(self):
++            return None
++
++        def renew_once(self):
++            self.renewals += 1
++            return True
++
++        def start(self):
++            self.starts += 1
++
++    guard = InMemoryGuard()
++    maintenance = guarded_backup_maintenance(
++        guard,
++        ttl_seconds=30,
++        monotonic=lambda: next(monotonic_values),
++    )
++
++    with pytest.raises(EncryptedBackupError) as captured:
++        _create(source, destination, maintenance=maintenance)
++
++    assert captured.value.stable_code == "backup_snapshot_tenure_expired"
++    assert guard.renewals == 0
++    assert guard.starts == 0
++    assert destination.exists()
++    assert not list(destination.iterdir())
++
++
+@@ -337,0 +380,96 @@ def test_backup_renews_maintenance_within_large_snapshot_hash(tmp_path):
++@pytest.mark.parametrize("operation", ["migrate", "rotate"])
++def test_sensitive_operations_start_renewal_only_after_snapshot_closes(
++    tmp_path,
++    monkeypatch,
++    operation,
++):
++    import trading_assistant.ops.encrypt_sensitive as module
++
++    engine, path = _legacy_engine(tmp_path)
++    starts: list[str] = []
++    original_start = RuntimeTenureGuard.start
++
++    def record_start(_guard):
++        starts.append("started")
++
++    def snapshot_probe(
++        _source,
++        destination,
++        **kwargs,
++    ):
++        assert starts == []
++        assert "ensure_maintenance" not in kwargs
++        maintenance = kwargs["maintenance"]
++        maintenance.check_snapshot()
++        assert starts == []
++        maintenance.complete_snapshot()
++        assert starts == ["started"]
++        return EncryptedBackupReceipt(
++            path=Path(destination) / "probe.sqlite3.aesgcm",
++            path_hash="a" * 64,
++            source_sha256="b" * 64,
++            created_at=NOW.isoformat(),
++            schema_head=SCHEMA_HEAD,
++            backup_key_id=BACKUP_KEY_ID,
++            verified=True,
++        )
++
++    def stop_after_backup(stage):
++        if stage == "backup_verified":
++            raise _Interrupted()
++
++    monkeypatch.setattr(RuntimeTenureGuard, "start", record_start)
++    monkeypatch.setattr(
++        module,
++        "create_encrypted_database_backup",
++        snapshot_probe,
++    )
++    try:
++        with pytest.raises(_Interrupted):
++            if operation == "migrate":
++                migrate_sensitive_fields(
++                    engine,
++                    SensitiveDataCipher(
++                        {OLD_KEY_ID: OLD_KEY},
++                        active_key_id=OLD_KEY_ID,
++                    ),
++                    **_migration_kwargs(
++                        path,
++                        tmp_path / "migrate-backups",
++                        stage_hook=stop_after_backup,
++                    ),
++                )
++            else:
++                monkeypatch.setattr(
++                    module,
++                    "_state",
++                    lambda _engine: SimpleNamespace(
++                        state="complete",
++                        active_key_id=OLD_KEY_ID,
++                    ),
++                )
++                rotate_sensitive_fields(
++                    engine,
++                    old_cipher=SensitiveDataCipher(
++                        {OLD_KEY_ID: OLD_KEY},
++                        active_key_id=OLD_KEY_ID,
++                    ),
++                    new_cipher=SensitiveDataCipher(
++                        {
++                            OLD_KEY_ID: OLD_KEY,
++                            NEW_KEY_ID: NEW_KEY,
++                        },
++                        active_key_id=NEW_KEY_ID,
++                    ),
++                    new_key_id=NEW_KEY_ID,
++                    retained_key_ids=[NEW_KEY_ID],
++                    **_migration_kwargs(
++                        path,
++                        tmp_path / "rotate-backups",
++                        stage_hook=stop_after_backup,
++                    ),
++                )
++    finally:
++        monkeypatch.setattr(RuntimeTenureGuard, "start", original_start)
++
++
+@@ -686,0 +825,3 @@ def test_maintenance_renewal_loss_durably_fails_before_mutation(
++    backup_directory = tmp_path / "renewal-loss-backups"
++    assert backup_directory.exists()
++    assert not list(backup_directory.iterdir())
+diff --git a/tests/test_startup_schema.py b/tests/test_startup_schema.py
+index c7e65aa..d76b882 100644
+--- a/tests/test_startup_schema.py
++++ b/tests/test_startup_schema.py
+@@ -11,2 +10,0 @@ import pytest
+-from alembic import command
+-from alembic.config import Config
+@@ -21,0 +20 @@ from trading_assistant.security.secrets import RuntimeSecrets
++from tests.safety_helpers import bootstrap_database_to_revision
+@@ -34,3 +33 @@ def _revision_0004(tmp_path, name="startup.db"):
+-    cfg = Config("alembic.ini")
+-    cfg.set_main_option("sqlalchemy.url", url)
+-    command.upgrade(cfg, "20260724_0004")
++    bootstrap_database_to_revision(url, "20260724_0004")
+@@ -43,3 +40 @@ def _head_database(tmp_path, name="sensitive-head.db"):
+-    cfg = Config("alembic.ini")
+-    cfg.set_main_option("sqlalchemy.url", url)
+-    command.upgrade(cfg, "head")
++    bootstrap_database_to_revision(url, "head")

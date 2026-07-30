@@ -15,13 +15,24 @@ from trading_assistant.db.models import (
 S = OrderStatus
 
 LEGAL = [
-    (S.PROPOSED, S.APPROVED),
+    (S.PROPOSED, S.APPROVAL_RECORDED),
     (S.PROPOSED, S.REJECTED),
     (S.PROPOSED, S.EXPIRED),
     (S.PROPOSED, S.CANCELED),
-    (S.APPROVED, S.SUBMITTED),
-    (S.APPROVED, S.REJECTED),
-    (S.APPROVED, S.CANCELED),
+    (S.APPROVAL_RECORDED, S.SUBMITTING),
+    (S.APPROVAL_RECORDED, S.EXPIRED),
+    (S.SUBMITTING, S.SUBMITTED),
+    (S.SUBMITTING, S.PARTIALLY_FILLED),
+    (S.SUBMITTING, S.FILLED),
+    (S.SUBMITTING, S.ACCEPTANCE_UNKNOWN),
+    (S.SUBMITTING, S.CANCELED),
+    (S.SUBMITTING, S.REJECTED),
+    (S.SUBMITTING, S.EXPIRED),
+    (S.ACCEPTANCE_UNKNOWN, S.SUBMITTED),
+    (S.ACCEPTANCE_UNKNOWN, S.PARTIALLY_FILLED),
+    (S.ACCEPTANCE_UNKNOWN, S.FILLED),
+    (S.ACCEPTANCE_UNKNOWN, S.REJECTED),
+    (S.ACCEPTANCE_UNKNOWN, S.CANCELED),
     (S.SUBMITTED, S.PARTIALLY_FILLED),
     (S.SUBMITTED, S.FILLED),
     (S.SUBMITTED, S.CANCELED),
@@ -29,12 +40,14 @@ LEGAL = [
     (S.PARTIALLY_FILLED, S.PARTIALLY_FILLED),
     (S.PARTIALLY_FILLED, S.FILLED),
     (S.PARTIALLY_FILLED, S.CANCELED),
+    (S.PARTIALLY_FILLED, S.EXPIRED),
 ]
 
 ILLEGAL = [
     (S.PROPOSED, S.SUBMITTED),      # cannot skip approval
     (S.PROPOSED, S.FILLED),
-    (S.APPROVED, S.FILLED),         # must be submitted first
+    (S.APPROVAL_RECORDED, S.FILLED),  # must claim submission first
+    (S.APPROVED, S.SUBMITTED),  # legacy status is deserialization-only
     (S.FILLED, S.CANCELED),         # terminal
     (S.EXPIRED, S.APPROVED),        # terminal
     (S.REJECTED, S.APPROVED),       # terminal
@@ -70,3 +83,27 @@ def test_illegal_transitions_raise(current, new):
 def test_terminal_states_have_no_exits(terminal):
     for target in OrderStatus:
         assert not OrderStateMachine.can_transition(terminal, target)
+
+
+def test_legacy_approved_has_no_runtime_transitions():
+    for target in OrderStatus:
+        assert not OrderStateMachine.can_transition(OrderStatus.APPROVED, target)
+
+
+def test_reachability_uses_the_legal_transition_graph_transitively():
+    assert OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.FILLED,
+    )
+    assert OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.PROPOSED,
+    )
+    assert not OrderStateMachine.is_reachable(
+        OrderStatus.PROPOSED,
+        OrderStatus.APPROVED,
+    )
+    assert not OrderStateMachine.is_reachable(
+        OrderStatus.REJECTED,
+        OrderStatus.PROPOSED,
+    )

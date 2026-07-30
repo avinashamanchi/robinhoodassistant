@@ -10,8 +10,20 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
+
+from trading_assistant.assets import broker_symbol_matches_local
+
+
+FILL_NUMERIC_PRECISION = 24
+FILL_NUMERIC_SCALE = 9
+FILL_ECONOMIC_QUANTUM = Decimal("0.000000001")
+# SQLite's Numeric adapter round-trips through binary float. Keeping accepted
+# fills below one million and at nine fractional places limits values to at
+# most 15 significant digits, which round-trip exactly at the widened schema
+# scale while covering fractional crypto execution quantities.
+FILL_ECONOMIC_MAX_EXCLUSIVE = Decimal("1000000")
 
 
 def _utcnow() -> datetime:
@@ -28,11 +40,21 @@ class OrderType(str, enum.Enum):
     LIMIT = "limit"
 
 
+class OrderTimeInForce(str, enum.Enum):
+    DAY = "day"
+    GTC = "gtc"
+
+
 class OrderStatus(str, enum.Enum):
     """Lifecycle statuses. Transition rules live in db.models.OrderStateMachine (A4)."""
 
     PROPOSED = "proposed"
+    # Retained only to deserialize databases created before the order-outbox
+    # migration. New runtime transitions use APPROVAL_RECORDED instead.
     APPROVED = "approved"
+    APPROVAL_RECORDED = "approval_recorded"
+    SUBMITTING = "submitting"
+    ACCEPTANCE_UNKNOWN = "acceptance_unknown"
     SUBMITTED = "submitted"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
@@ -41,8 +63,88 @@ class OrderStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class FillQuantityRelation(str, enum.Enum):
+    BEHIND = "behind"
+    EXACT = "exact"
+    AHEAD = "ahead"
+
+
 # Money is handled as Decimal end-to-end to avoid float drift on notionals.
 Money = Decimal
+
+
+def normalize_cumulative_filled_qty(value: object) -> Decimal | None:
+    """Return a nonnegative cumulative quantity at the fill-ledger quantum."""
+    if (
+        not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value < 0
+    ):
+        return None
+    try:
+        normalized = value.quantize(FILL_ECONOMIC_QUANTUM)
+    except InvalidOperation:
+        return None
+    if normalized != value:
+        return None
+    return normalized
+
+
+def valid_cumulative_filled_qty(value: object) -> bool:
+    """Whether broker cumulative execution quantity is canonical and safe."""
+    return normalize_cumulative_filled_qty(value) is not None
+
+
+def fill_quantity_relation(
+    reported: object,
+    authoritative: object,
+) -> FillQuantityRelation | None:
+    """Compare canonical cumulative and ledger quantities without tolerance."""
+    normalized_reported = normalize_cumulative_filled_qty(reported)
+    normalized_authoritative = normalize_cumulative_filled_qty(authoritative)
+    if normalized_reported is None or normalized_authoritative is None:
+        return None
+    if normalized_reported < normalized_authoritative:
+        return FillQuantityRelation.BEHIND
+    if normalized_reported > normalized_authoritative:
+        return FillQuantityRelation.AHEAD
+    return FillQuantityRelation.EXACT
+
+
+def exact_fill_exceeds_order_quantity(
+    requested_qty: object | None,
+    aggregate_exact_qty: object,
+) -> bool:
+    """Whether trusted exact fills exceed a quantity order by any quantum."""
+    if requested_qty is None:
+        return False
+    return (
+        fill_quantity_relation(aggregate_exact_qty, requested_qty)
+        is FillQuantityRelation.AHEAD
+    )
+
+
+def normalize_fill_economic(value: object) -> Decimal | None:
+    """Return the exact persisted fill value, or fail closed if unrepresentable."""
+    if (
+        not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value <= 0
+        or value >= FILL_ECONOMIC_MAX_EXCLUSIVE
+    ):
+        return None
+    try:
+        normalized = value.quantize(FILL_ECONOMIC_QUANTUM)
+    except InvalidOperation:
+        return None
+    if normalized != value:
+        return None
+    return normalized
+
+
+def valid_fill_economic(value: object) -> bool:
+    """Whether an exact fill quantity or price has the canonical representation."""
+    return normalize_fill_economic(value) is not None
 
 
 @dataclass(frozen=True)
@@ -60,8 +162,11 @@ class OrderRequest:
     qty: Optional[Decimal] = None
     notional: Optional[Decimal] = None
     limit_price: Optional[Decimal] = None
+    time_in_force: OrderTimeInForce = OrderTimeInForce.DAY
 
     def __post_init__(self) -> None:
+        if not isinstance(self.time_in_force, OrderTimeInForce):
+            raise ValueError("time_in_force must be an OrderTimeInForce")
         if (self.qty is None) == (self.notional is None):
             raise ValueError("OrderRequest requires exactly one of qty or notional")
         if self.qty is not None and self.qty <= 0:
@@ -84,6 +189,22 @@ class OrderRequest:
         assert self.qty is not None  # guaranteed by __post_init__
         return self.qty * reference_price
 
+    def risk_notional(self, quote: "Quote") -> Decimal:
+        """Current-order value used consistently by every risk limit."""
+        if self.notional is not None:
+            return self.notional
+        assert self.qty is not None
+        price = (
+            conservative_buy_price(
+                self.order_type,
+                self.limit_price,
+                quote,
+            )
+            if self.side is OrderSide.BUY
+            else quote.last
+        )
+        return self.qty * price
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -92,7 +213,27 @@ class Quote:
     ask: Decimal
     last: Decimal
     prev_close: Optional[Decimal] = None
-    as_of: datetime = field(default_factory=_utcnow)
+    # ``as_of`` remains the conservative aggregate timestamp for callers that
+    # consume one time. Execution validates both source-component timestamps.
+    as_of: datetime | None = None
+    book_as_of: datetime | None = None
+    trade_as_of: datetime | None = None
+
+    @property
+    def is_valid(self) -> bool:
+        """Whether sizing and spread arithmetic are safe for this quote."""
+        return (
+            isinstance(self.last, Decimal)
+            and self.last.is_finite()
+            and self.last > 0
+            and isinstance(self.bid, Decimal)
+            and self.bid.is_finite()
+            and self.bid > 0
+            and isinstance(self.ask, Decimal)
+            and self.ask.is_finite()
+            and self.ask > 0
+            and self.bid <= self.ask
+        )
 
     @property
     def day_change_pct(self) -> Optional[Decimal]:
@@ -101,16 +242,46 @@ class Quote:
         return (self.last - self.prev_close) / self.prev_close * Decimal(100)
 
 
+def conservative_buy_price(
+    order_type: OrderType | str,
+    limit_price: Decimal | None,
+    quote: Quote,
+) -> Decimal:
+    """Price used to reserve buying power for a quantity buy."""
+    if OrderType(order_type) is OrderType.LIMIT:
+        if limit_price is None:
+            raise ValueError("quantity limit buy requires a limit price")
+        return limit_price
+    return max(quote.ask, quote.last)
+
+
 @dataclass(frozen=True)
 class Position:
     ticker: str
     qty: Decimal          # signed; negative = short
     avg_entry_price: Decimal
     current_price: Decimal
+    unrealized_intraday_pnl: Decimal | None = None
 
     @property
     def market_value(self) -> Decimal:
         return self.qty * self.current_price
+
+    @property
+    def risk_values_valid(self) -> bool:
+        return (
+            isinstance(self.ticker, str)
+            and bool(self.ticker.strip())
+            and isinstance(self.qty, Decimal)
+            and self.qty.is_finite()
+            and self.qty != 0
+            and isinstance(self.avg_entry_price, Decimal)
+            and self.avg_entry_price.is_finite()
+            and self.avg_entry_price > 0
+            and isinstance(self.current_price, Decimal)
+            and self.current_price.is_finite()
+            and self.current_price > 0
+        )
 
 
 @dataclass(frozen=True)
@@ -118,6 +289,16 @@ class Account:
     buying_power: Decimal
     equity: Decimal
     cash: Decimal
+
+    @property
+    def is_valid(self) -> bool:
+        """Whether every execution-required account value is usable."""
+        return all(
+            isinstance(value, Decimal)
+            and value.is_finite()
+            and value > 0
+            for value in (self.buying_power, self.equity, self.cash)
+        )
 
 
 @dataclass(frozen=True)
@@ -130,6 +311,51 @@ class OrderResult:
     filled_qty: Decimal = Decimal(0)
     avg_fill_price: Optional[Decimal] = None
     submitted_at: datetime = field(default_factory=_utcnow)
+    ticker: Optional[str] = None
+
+
+def order_result_identity_error(
+    result: OrderResult,
+    expected_client_id: str,
+    expected_ticker: str | None = None,
+) -> str | None:
+    """Return why a broker order result cannot identify the requested order."""
+    if (
+        not isinstance(result.broker_order_id, str)
+        or not result.broker_order_id.strip()
+    ):
+        return "missing broker order identity"
+    if (
+        not isinstance(result.idempotency_key, str)
+        or result.idempotency_key != expected_client_id
+    ):
+        return (
+            "broker client identity does not match local idempotency key"
+        )
+    if result.ticker is not None and expected_ticker is not None:
+        try:
+            ticker_matches = broker_symbol_matches_local(
+                result.ticker,
+                expected_ticker,
+            )
+        except ValueError:
+            ticker_matches = False
+        if not ticker_matches:
+            return "broker ticker identity does not match local order"
+    return None
+
+
+@dataclass(frozen=True)
+class BrokerFill:
+    """One immutable execution activity from the broker's authoritative ledger."""
+
+    broker_fill_id: str
+    broker_order_id: str
+    ticker: str
+    side: str
+    qty: Decimal
+    price: Decimal
+    filled_at: datetime
 
 
 @dataclass(frozen=True)
@@ -150,17 +376,87 @@ class PortfolioSnapshot:
     quotes: dict[str, Quote]
     buying_power: Decimal
     realized_pnl_today: Decimal
+    cash: Decimal = Decimal(0)
+    unrealized_pnl_today: Decimal = Decimal(0)
+    daily_pnl_complete: bool = True
+    account_high_water_mark: Decimal = Decimal(0)
+    account_equity: Decimal = Decimal(0)
+    account_complete: bool = True
+    quote_fresh: bool = True
+    market_open: bool = True
+    # False distinguishes an unavailable market schedule from a confirmed close.
+    market_clock_complete: bool = True
+    spread_pct_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    pending_buy_notional_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    reserved_sell_qty_by_ticker: dict[str, Decimal] = field(default_factory=dict)
+    broker_reconciled: bool = True
+    active_breakers: frozenset[str] = frozenset()
     as_of: datetime = field(default_factory=_utcnow)
     external_positions: dict[str, "object"] = field(default_factory=dict)
+    # Reserved buy notional from locally tracked outstanding orders. Pending
+    # sells reserve quantity separately in ``reserved_sell_qty_by_ticker``;
+    # opposite sides are deliberately never netted.
+    pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
+    pending_exposure_complete: bool = True
 
-    def position_value(self, ticker: str) -> Decimal:
-        pos = self.positions.get(ticker)
-        return abs(pos.market_value) if pos else Decimal(0)
+    def _marked_position_value(self, ticker: str) -> Decimal | None:
+        symbol = ticker.upper()
+        position = self.positions.get(symbol)
+        if position is None:
+            return Decimal(0)
+        quote = self.quotes.get(symbol)
+        if (
+            quote is None
+            or not quote.is_valid
+            or not isinstance(position.qty, Decimal)
+            or not position.qty.is_finite()
+        ):
+            return None
+        value = position.qty * quote.last
+        return value if value.is_finite() else None
+
+    def position_value(self, ticker: str) -> Decimal | None:
+        value = self._marked_position_value(ticker)
+        return abs(value) if value is not None else None
 
     def external_position_value(self, ticker: str) -> Decimal:
         ext = self.external_positions.get(ticker.upper())
         return abs(ext.current_value) if ext is not None else Decimal(0)
 
-    def gross_exposure(self) -> Decimal:
-        """Total absolute market value across all positions (USD)."""
-        return sum((abs(p.market_value) for p in self.positions.values()), Decimal(0))
+    def gross_exposure(self) -> Decimal | None:
+        """Quote-marked gross position value, or missing when a mark is unsafe."""
+        values = [
+            self._marked_position_value(symbol)
+            for symbol in self.positions
+        ]
+        if any(value is None for value in values):
+            return None
+        return sum(
+            (abs(value) for value in values if value is not None),
+            Decimal(0),
+        )
+
+    def effective_signed_value(self, ticker: str) -> Decimal | None:
+        symbol = ticker.upper()
+        held = self._marked_position_value(symbol)
+        pending = self.pending_signed_notional.get(symbol, Decimal(0))
+        if (
+            held is None
+            or not isinstance(pending, Decimal)
+            or not pending.is_finite()
+        ):
+            return None
+        value = held + pending
+        return value if value.is_finite() else None
+
+    def gross_exposure_with_pending(self) -> Decimal | None:
+        symbols = set(self.positions) | set(self.pending_signed_notional)
+        values = [
+            self.effective_signed_value(symbol) for symbol in symbols
+        ]
+        if any(value is None for value in values):
+            return None
+        return sum(
+            (abs(value) for value in values if value is not None),
+            Decimal(0),
+        )

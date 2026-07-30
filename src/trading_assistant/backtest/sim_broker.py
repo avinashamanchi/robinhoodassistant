@@ -64,6 +64,8 @@ class _Pos:
 
 
 class SimBroker(BrokerClient):
+    reconciliation_key = "sim"
+
     def __init__(
         self, config: BacktestConfig, starting_cash: float = 100_000.0
     ) -> None:
@@ -75,6 +77,8 @@ class SimBroker(BrokerClient):
         self.fills: list[SimFill] = []
         self._ids = count(1)
         self._orders: dict[str, OrderResult] = {}
+        self._orders_by_key: dict[str, OrderResult] = {}
+        self.brackets: list[dict] = []
 
     # ── cost model ─────────────────────────────────────────────
     def _slippage(self, ac: AssetClass) -> float:
@@ -86,7 +90,16 @@ class SimBroker(BrokerClient):
     # ── BrokerClient interface ─────────────────────────────────
     def get_quote(self, ticker: str) -> Quote:
         last = Decimal(str(self._last.get(ticker.upper(), 0.0)))
-        return Quote(ticker=ticker.upper(), bid=last, ask=last, last=last, prev_close=last)
+        return Quote(
+            ticker=ticker.upper(),
+            bid=last,
+            ask=last,
+            last=last,
+            prev_close=last,
+            as_of=None,
+            book_as_of=None,
+            trade_as_of=None,
+        )
 
     def get_account(self) -> Account:
         equity = Decimal(str(self.equity()))
@@ -110,6 +123,9 @@ class SimBroker(BrokerClient):
         return out
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
+        existing = self._orders_by_key.get(order.idempotency_key)
+        if existing is not None:
+            return existing
         ac = AssetClass.for_symbol(order.ticker)
         self._pending.append(_Pending(order=order, asset_class=ac))
         result = OrderResult(
@@ -118,10 +134,25 @@ class SimBroker(BrokerClient):
             status=OrderStatus.SUBMITTED,
         )
         self._orders[result.broker_order_id] = result
+        self._orders_by_key[order.idempotency_key] = result
         return result
+
+    def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
+        return self._orders_by_key.get(client_order_id)
+
+    def get_open_orders(self) -> list[OrderResult]:
+        pending_keys = {pending.order.idempotency_key for pending in self._pending}
+        return [
+            result
+            for key, result in self._orders_by_key.items()
+            if key in pending_keys
+        ]
 
     def submit_bracket(self, order: OrderRequest, take_profit, stop_loss) -> OrderResult:
         """Record a server-side bracket (entry + OCO take-profit/stop). Test double."""
+        existing = self.get_order_by_client_id(order.idempotency_key)
+        if existing is not None:
+            return existing
         result = self.submit_order(order)
         self.brackets.append(
             {"order": order, "take_profit": take_profit, "stop_loss": stop_loss,

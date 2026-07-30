@@ -1,0 +1,263 @@
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 4bcbd07..96fcf91 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -443,7 +443,7 @@ def build_test_container(
+ ) -> ApplicationContainer | _TestApplicationContainer:
+     """Compose with explicit fakes while retaining production-safe config."""
+     if agent is not None:
+-        _require_test_only_capabilities(broker, clock)
++        _require_test_clock_capability(clock)
+     if service is None:
+         if source_container is not None:
+             raise RuntimeError("test_container_source_invalid")
+@@ -465,10 +465,11 @@ def build_test_container(
+             raise RuntimeError("production_test_capability_forbidden")
+         if agent is not None:
+             for configured_clock in clocks.values():
+-                _require_test_only_capabilities(
+-                    broker,
+-                    configured_clock,
+-                )
++                _require_test_clock_capability(configured_clock)
++            _require_test_broker_identity(
++                service=service,
++                expected_broker=broker,
++            )
+         if (
+             source_container is None
+             or getattr(source_container, "config", None) is not config
+@@ -486,22 +487,78 @@ def build_test_container(
+         source = source_container
+     if agent is None:
+         return source
++    service = source.service
++    clocks = getattr(service, "_clocks", None)
++    if type(clocks) is not dict:
++        raise RuntimeError("production_test_capability_forbidden")
++    for configured_clock in clocks.values():
++        _require_test_clock_capability(configured_clock)
++    _require_test_broker_identity(
++        service=service,
++        expected_broker=broker,
++        source=source,
++    )
+     return _TestApplicationContainer(
+         _source=source,
+         _test_agent=agent,
+     )
+ 
+ 
+-def _require_test_only_capabilities(
+-    broker: object,
+-    clock: object,
++def _require_test_clock_capability(clock: object) -> None:
++    from .risk.clock import CryptoClock, FakeClock
++
++    if not isinstance(clock, (CryptoClock, FakeClock)):
++        raise RuntimeError("production_test_capability_forbidden")
++
++
++def _require_test_broker_identity(
++    *,
++    service: object,
++    expected_broker: object,
++    source: object | None = None,
+ ) -> None:
++    """Require one exact MockBroker throughout the app service graph."""
+     from .broker.mock import MockBroker
+-    from .risk.clock import CryptoClock, FakeClock
+ 
+-    if not isinstance(broker, MockBroker):
++    if type(service) is not TradingService:
+         raise RuntimeError("production_test_capability_forbidden")
+-    if not isinstance(clock, (CryptoClock, FakeClock)):
++    snapshot_service = service.snapshot_service
++    order_submission = service.order_submission
++    reconciliation = service.reconciliation
++    if (
++        not isinstance(expected_broker, MockBroker)
++        or type(snapshot_service) is not PortfolioSnapshotService
++        or type(order_submission) is not OrderSubmissionService
++        or type(reconciliation) is not ReconciliationService
++        or service.broker is not expected_broker
++        or snapshot_service.broker is not expected_broker
++        or order_submission.broker is not expected_broker
++        or reconciliation.broker is not expected_broker
++        or order_submission.snapshot_service is not snapshot_service
++        or reconciliation.broker_key
++        != expected_broker.reconciliation_key
++        or service.startup_reconciliation.broker_key
++        != expected_broker.reconciliation_key
++        or snapshot_service.startup_reconciliation_key
++        not in (None, expected_broker.reconciliation_key)
++    ):
++        raise RuntimeError("production_test_capability_forbidden")
++    if source is not None and (
++        getattr(source, "service", None) is not service
++        or getattr(source, "broker", None) is not expected_broker
++        or getattr(source, "snapshot_service", None)
++        is not snapshot_service
++        or getattr(source, "order_submission", None)
++        is not order_submission
++        or getattr(source, "reconciliation", None)
++        is not reconciliation
++        or getattr(
++            getattr(source, "operations", None),
++            "service",
++            None,
++        )
++        is not service
++    ):
+         raise RuntimeError("production_test_capability_forbidden")
+ 
+ 
+@@ -521,22 +578,19 @@ def _is_test_application_container(container: object) -> bool:
+             is not None
+             or getattr(source, "startup_evidence", None)
+             is not None
+-            or getattr(source.operations, "service", None)
+-            is not service
+         ):
+             return False
+-        _require_test_only_capabilities(
+-            service.broker,
+-            service.clock,
++        _require_test_clock_capability(service.clock)
++        _require_test_broker_identity(
++            service=service,
++            expected_broker=service.broker,
++            source=source,
+         )
+         clocks = getattr(service, "_clocks", None)
+         if type(clocks) is not dict:
+             return False
+         for configured_clock in clocks.values():
+-            _require_test_only_capabilities(
+-                service.broker,
+-                configured_clock,
+-            )
++            _require_test_clock_capability(configured_clock)
+     except Exception:
+         return False
+     return True
+diff --git a/tests/test_bootstrap.py b/tests/test_bootstrap.py
+index 73e1ff4..365fdb3 100644
+--- a/tests/test_bootstrap.py
++++ b/tests/test_bootstrap.py
+@@ -110,7 +110,13 @@ def _injected_container(service, secrets):
+     return SimpleNamespace(
+         config=service.config,
+         secrets=secrets,
++        broker=service.broker,
+         service=service,
++        snapshot_service=service.snapshot_service,
++        order_application=service.order_application,
++        order_submission=service.order_submission,
++        reconciliation=service.reconciliation,
++        breakers=service.breakers,
+         session_factory=service.session_factory,
+         rate_limiter=DurableRateLimiter(service.session_factory),
+         leases=ConcurrencyLeaseService(service.session_factory),
+diff --git a/tests/test_plan2_integration_correction.py b/tests/test_plan2_integration_correction.py
+index aa9ad1b..053246c 100644
+--- a/tests/test_plan2_integration_correction.py
++++ b/tests/test_plan2_integration_correction.py
+@@ -243,6 +243,97 @@ def test_test_container_builder_rejects_wrapped_production_broker(
+         )
+ 
+ 
++def test_test_container_builder_rejects_shallow_mock_broker_replacement(
++    app_config,
++    session_factory,
++):
++    from trading_assistant.app import main as app_main
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from trading_assistant.broker.mock import MockBroker
++    from trading_assistant.risk.clock import FakeClock
++    from trading_assistant.service import TradingService
++    from tests.app_factory import build_test_app_container
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    production_broker = AlpacaBroker(
++        SimpleNamespace(),
++        SimpleNamespace(),
++    )
++    service = TradingService(
++        production_broker,
++        session_factory,
++        app_config,
++        FakeClock(is_open=True),
++    )
++    service.broker = MockBroker()
++
++    assert service.snapshot_service.broker is production_broker
++    assert service.order_submission.broker is production_broker
++    assert service.reconciliation.broker is production_broker
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        container = build_test_app_container(
++            service,
++            Agent(),
++            secrets=Secrets(
++                app_api_token="plan2-shallow-broker-swap-token"
++            ),
++        )
++        app_main.create_test_app(
++            container=container,
++            planning=None,
++        )
++
++
++@pytest.mark.parametrize(
++    "broker_owner",
++    (
++        "snapshot_service",
++        "order_submission",
++        "reconciliation",
++    ),
++)
++def test_create_test_app_rejects_post_issuance_nested_broker_tampering(
++    broker_owner,
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    service = make_service()
++    container = build_test_app_container(
++        service,
++        Agent(),
++        secrets=Secrets(
++            app_api_token="plan2-nested-broker-tamper-token"
++        ),
++    )
++    getattr(service, broker_owner).broker = AlpacaBroker(
++        SimpleNamespace(),
++        SimpleNamespace(),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^test_container_required$",
++    ):
++        app_main.create_test_app(
++            container=container,
++            planning=None,
++        )
++
++
+ def test_non_app_test_composition_is_not_an_app_test_authority(
+     app_config,
+     monkeypatch,

@@ -1,9 +1,8 @@
-"""The promotion gate.
+"""An advisory analyst track-record threshold.
 
-Backtest/track-record results NEVER auto-enable anything (Phase 7 guardrail #2).
-Promoting the analyst toward live is a manual config change by a human — and this
-gate is an ADDITIONAL requirement on top of that: at least 50 graded calls with an
-accuracy bar. It returns advice; it cannot flip any switch itself.
+Backtest and track-record results never enable execution capability. This
+threshold is research advice only; the current release rejects live trading
+regardless of its result.
 """
 
 from __future__ import annotations
@@ -25,5 +24,5 @@ def can_promote(scorecard: Scorecard) -> tuple[bool, str]:
         )
     return True, (
         f"{scorecard.n_calls} graded calls at {scorecard.accuracy:.1%} accuracy — "
-        "eligible for MANUAL promotion (still requires the live double-lock)"
+        "eligible for MANUAL analyst review; live trading remains unavailable"
     )

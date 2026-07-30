@@ -1,11 +1,4 @@
-"""Kill switch — DB-backed so a restart returns tripped (A3).
-
-Phase 7: keyed by asset class. Equity and crypto trip independently. Every method
-defaults ``asset_class=EQUITY`` so all pre-Phase-7 call sites and tests are
-unchanged. When the daily realized loss for a class breaches its limit, that
-class's switch trips and blocks its new orders until a human resets it. Both trip
-and reset write an audit row to ``risk_events``.
-"""
+"""Compatibility facade mapping legacy kill switches to scoped breakers."""
 
 from __future__ import annotations
 
@@ -15,67 +8,101 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..assets import AssetClass
-from ..db.models import KillSwitchState, RiskEvent, utcnow
+from ..db.models import CircuitBreakerState, RiskEvent
+from ..security.sensitive_fields import persist_sensitive
+from .breakers import (
+    BreakerScope,
+    trip_in_session,
+)
+from .submission_barrier import SubmissionBarrier
 
 
-def _ac(asset_class: AssetClass | str) -> str:
-    return asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class)
+def _scope(asset_class: AssetClass | str) -> BreakerScope:
+    if isinstance(asset_class, AssetClass):
+        return BreakerScope.loss(asset_class)
+    if str(asset_class) == "operator_global":
+        return BreakerScope.operator_global()
+    return BreakerScope.loss(AssetClass(str(asset_class)))
 
 
-def _get_or_create_state(session: Session, asset_class: str) -> KillSwitchState:
-    state = session.execute(
-        select(KillSwitchState).where(KillSwitchState.asset_class == asset_class)
-    ).scalar_one_or_none()
-    if state is None:
-        state = KillSwitchState(asset_class=asset_class, tripped=False, reason="")
-        session.add(state)
-        session.flush()
-    return state
+def _require_barrier_before_transaction(session: Session) -> None:
+    if session.in_transaction():
+        raise RuntimeError(
+            "compatibility breaker writes reject an active transaction; "
+            "use a fresh session so the process barrier is acquired first"
+        )
+
+
+class KillSwitchResetUnavailable(RuntimeError):
+    """Legacy reset is disabled because it cannot collect server health."""
 
 
 class KillSwitch:
-    """All methods read/write the ``killswitch_state`` row for one asset class."""
+    """Legacy API over loss and operator-global scopes.
+
+    Compatibility writes require a fresh session and own their commit so the
+    process barrier is acquired before SQLite and remains held until the new
+    breaker state is durable.
+    """
 
     @staticmethod
     def is_tripped(
         session: Session, asset_class: AssetClass | str = AssetClass.EQUITY
     ) -> bool:
-        state = session.execute(
-            select(KillSwitchState).where(
-                KillSwitchState.asset_class == _ac(asset_class)
+        return bool(
+            session.scalar(
+                select(CircuitBreakerState.tripped).where(
+                    CircuitBreakerState.scope_key == _scope(asset_class).key
+                )
             )
-        ).scalar_one_or_none()
-        return bool(state and state.tripped)
+        )
 
     @staticmethod
     def trip(
         session: Session,
         reason: str,
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> None:
-        ac = _ac(asset_class)
-        state = _get_or_create_state(session, ac)
-        if state.tripped:
-            return  # already tripped; keep the original reason/time
-        state.tripped = True
-        state.tripped_at = utcnow()
-        state.reason = reason
-        state.updated_at = utcnow()
-        session.add(RiskEvent(event_type="killswitch_trip", reason=f"[{ac}] {reason}"))
+        scope = _scope(asset_class)
+        _require_barrier_before_transaction(session)
+        with SubmissionBarrier(session).hold_writer():
+            try:
+                _state, changed = trip_in_session(
+                    session,
+                    scope,
+                    reason,
+                    actor,
+                    request_id=request_id,
+                )
+                if changed:
+                    persist_sensitive(
+                        session,
+                        RiskEvent(
+                            event_type="killswitch_trip",
+                        ),
+                        {"reason": f"[{scope.key}] {reason}"},
+                    )
+                session.commit()
+            except BaseException:
+                session.rollback()
+                raise
 
     @staticmethod
     def reset(
         session: Session,
         note: str = "manual reset",
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> None:
-        ac = _ac(asset_class)
-        state = _get_or_create_state(session, ac)
-        state.tripped = False
-        state.tripped_at = None
-        state.reason = ""
-        state.updated_at = utcnow()
-        session.add(RiskEvent(event_type="killswitch_reset", reason=f"[{ac}] {note}"))
+        raise KillSwitchResetUnavailable(
+            "compatibility reset is unavailable; "
+            "use TradingService.reset_killswitch"
+        )
 
     @staticmethod
     def evaluate_daily_loss(
@@ -83,8 +110,10 @@ class KillSwitch:
         realized_pnl_today: Decimal,
         loss_limit: Decimal,
         asset_class: AssetClass | str = AssetClass.EQUITY,
+        *,
+        actor: str,
+        request_id: str,
     ) -> bool:
-        """Trip this class's switch if its realized loss meets/exceeds the limit."""
         if realized_pnl_today <= -abs(loss_limit):
             KillSwitch.trip(
                 session,
@@ -93,5 +122,7 @@ class KillSwitch:
                     f"-{abs(loss_limit)}"
                 ),
                 asset_class=asset_class,
+                actor=actor,
+                request_id=request_id,
             )
         return KillSwitch.is_tripped(session, asset_class)

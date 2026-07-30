@@ -8,26 +8,25 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .base import LLMResponse, TextBlock, ToolUseBlock, Usage, to_gemini_contents
+from ..security.outbound import (
+    OutboundPolicy,
+    new_async_httpx_client,
+    new_httpx_client,
+    require_origin,
+)
+from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
+from .payloads import (
+    build_gemini_payload,
+    sanitize_gemini_schema,
+)
+
+
+_GEMINI_ORIGIN = "https://generativelanguage.googleapis.com"
+_GEMINI_POLICY = OutboundPolicy(_GEMINI_ORIGIN)
 
 
 def _sanitize_schema(schema: Any) -> Any:
-    """Make a JSON schema Gemini-friendly: collapse ["string","null"] unions to a
-    single type and recurse into properties/items."""
-    if not isinstance(schema, dict):
-        return schema
-    out = {}
-    for k, v in schema.items():
-        if k == "type" and isinstance(v, list):
-            non_null = [t for t in v if t != "null"]
-            out[k] = non_null[0] if non_null else "string"
-        elif k == "properties" and isinstance(v, dict):
-            out[k] = {pk: _sanitize_schema(pv) for pk, pv in v.items()}
-        elif k == "items":
-            out[k] = _sanitize_schema(v)
-        else:
-            out[k] = v
-    return out
+    return sanitize_gemini_schema(schema)
 
 
 def from_gemini(resp: Any) -> LLMResponse:
@@ -48,63 +47,123 @@ def from_gemini(resp: Any) -> LLMResponse:
     if not blocks:
         blocks.append(TextBlock(text=""))
     meta = getattr(resp, "usage_metadata", None)
+    usage = None
+    if meta is not None:
+        try:
+            input_tokens = getattr(meta, "prompt_token_count")
+            output_tokens = getattr(meta, "candidates_token_count")
+        except AttributeError:
+            pass
+        else:
+            if (
+                type(input_tokens) is int
+                and input_tokens >= 0
+                and type(output_tokens) is int
+                and output_tokens >= 0
+            ):
+                usage = Usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
     return LLMResponse(
         content=blocks,
         stop_reason=stop,
-        usage=Usage(
-            input_tokens=getattr(meta, "prompt_token_count", 0) or 0,
-            output_tokens=getattr(meta, "candidates_token_count", 0) or 0,
-        ),
+        usage=usage,
         model=getattr(resp, "model_version", ""),
     )
 
 
 class GeminiBackend:
     def __init__(
-        self, api_key: str, model: str, max_tokens: int = 1024, client: Any = None
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = 1024,
+        client: Any = None,
+        timeout_seconds: float = 45.0,
+        runtime_role: str = "app",
     ) -> None:
         self._api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self._client = client
+        self._timeout_seconds = timeout_seconds
+        self._runtime_role = runtime_role
 
     def _get_client(self):
         if self._client is None:
             from google import genai
+            from google.genai import types
 
-            self._client = genai.Client(api_key=self._api_key)
+            require_origin(
+                self._runtime_role,
+                "llm.gemini",
+                _GEMINI_ORIGIN,
+            )
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=types.HttpOptions(
+                    baseUrl=_GEMINI_ORIGIN,
+                    timeout=int(self._timeout_seconds * 1000),
+                    httpxClient=new_httpx_client(
+                        _GEMINI_POLICY,
+                        read_timeout=self._timeout_seconds,
+                    ),
+                    httpxAsyncClient=new_async_httpx_client(
+                        _GEMINI_POLICY,
+                        read_timeout=self._timeout_seconds,
+                    ),
+                    retryOptions=types.HttpRetryOptions(attempts=1),
+                ),
+            )
         return self._client
 
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str = "",
     ) -> LLMResponse:
+        payload = build_gemini_payload(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         from google.genai import types
 
         gem_contents = [
             types.Content(
                 role=c["role"], parts=[self._part(types, p) for p in c["parts"]]
             )
-            for c in to_gemini_contents(messages)
+            for c in payload["contents"]
         ]
         decls = [
             types.FunctionDeclaration(
-                name=t["name"],
-                description=t.get("description", ""),
-                parameters=_sanitize_schema(t["input_schema"]),
+                name=declaration["name"],
+                description=declaration["description"],
+                parameters=declaration["parameters"],
             )
-            for t in tools
+            for declaration in (
+                payload["tools"][0]["function_declarations"]
+                if payload["tools"] is not None
+                else []
+            )
         ]
         cfg_kwargs: dict[str, Any] = dict(
-            system_instruction=system,
+            system_instruction=payload["system_instruction"],
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
         )
-        # "any" forces a function call so a 200 always carries structured output
-        # (Gemini otherwise sometimes replies in prose -> "did not submit a plan").
-        if decls and tool_choice == "any":
+        # Preserve the validated explicit mode. "any" forces a function call
+        # so a 200 always carries structured output.
+        if "tool_config" in payload:
+            mode = payload["tool_config"]["function_calling_config"][
+                "mode"
+            ]
             cfg_kwargs["tool_config"] = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=mode
+                )
             )
         config = types.GenerateContentConfig(**cfg_kwargs)
         resp = self._get_client().models.generate_content(

@@ -6,24 +6,56 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
+from trading_assistant.broker.models import OrderStatus
 from trading_assistant.daemon import rules_engine
 from trading_assistant.daemon.monitor import Monitor
-from trading_assistant.db.models import Rule
+from trading_assistant.db.models import Order, Rule, TradePlanRow
 from trading_assistant.notifications.base import NullNotifier
+from trading_assistant.security.sensitive_fields import persist_sensitive
 
 
 def _add_rule(svc, **kw):
-    kw.setdefault("ticker", "AAPL")
-    kw.setdefault("state", "active")
-    kw.setdefault("action_json", json.dumps({"side": "sell", "qty": "5"}))
-    kw.setdefault("condition_json", "{}")
-    with svc.session_factory() as s:
-        rule = Rule(**kw)
-        s.add(rule)
-        s.commit()
-        return rule.id
+    ticker = kw.pop("ticker", "AAPL")
+    kind = kw.pop("kind", "price")
+    plan_id = kw.pop("plan_id", None)
+    condition = json.loads(kw.pop("condition_json", "{}"))
+    action = json.loads(
+        kw.pop("action_json", json.dumps({"side": "sell", "qty": "5"}))
+    )
+    deadline = kw.pop("deadline", None)
+    assert not kw
+    if plan_id is not None:
+        with svc.session_factory() as session:
+            if session.get(TradePlanRow, plan_id) is None:
+                persist_sensitive(
+                    session,
+                    TradePlanRow(
+                        id=plan_id,
+                        symbol=ticker,
+                        action="buy",
+                        status="approved",
+                        paper_only=True,
+                    ),
+                    {"plan_json": "{}", "sized_json": "{}"},
+                )
+                session.commit()
+    if kind == "time":
+        condition = {"type": "time", "deadline": deadline.isoformat()}
+    result = svc.create_conditional_rule(
+        ticker,
+        condition,
+        action,
+        kind=kind,
+        group_key=f"plan-{plan_id}" if plan_id is not None else None,
+        plan_id=plan_id,
+        actor="operator:test",
+        reason="plan rule test setup",
+        request_id="plan-rule-setup",
+    )
+    return result["rule_id"]
 
 
 # ── pure logic ──────────────────────────────────────────────────
@@ -62,18 +94,212 @@ def test_trailing_hwm_persists_across_restart(make_service):
     assert len(acted) == 1                                 # fired -> HWM survived restart
 
 
-# ── OCO: a stop firing cancels the plan's siblings ──────────────
-def test_oco_cancels_siblings_atomically(make_service):
+def test_unrepresentable_runtime_hwm_cannot_corrupt_restart(make_service):
     svc = make_service()
+    _add_rule(
+        svc,
+        kind="trailing",
+        condition_json=json.dumps({"trailing_stop_pct": 10}),
+    )
+    svc.broker.set_price("AAPL", Decimal("0.0000001"))
+
+    outcome = Monitor(svc, NullNotifier()).tick()
+
+    assert len(outcome) == 1
+    assert outcome[0].error == "rule_evaluation_invalid"
+    with svc.session_factory() as session:
+        rule = session.execute(select(Rule)).scalar_one()
+        assert rule.hwm is None
+        assert rule.state == "active"
+
+    restarted = make_service()
+    restarted.broker.set_price("AAPL", Decimal("0.000001"))
+
+    assert Monitor(restarted, NullNotifier()).tick() == []
+    with restarted.session_factory() as session:
+        assert session.execute(select(Rule)).scalar_one().hwm == Decimal(
+            "0.000001"
+        )
+
+
+# ── Plan exits settle only from broker-confirmed execution ──────
+def test_plan_stop_proposal_preserves_sibling_protection(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
     _add_rule(svc, kind="entry", plan_id=1, condition_json=json.dumps({"price_below": 80}))
     _add_rule(svc, kind="target", plan_id=1, condition_json=json.dumps({"price_above": 200}))
-    _add_rule(svc, kind="stop", plan_id=1, condition_json=json.dumps({"price_below": 90}))
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=1,
+        condition_json=json.dumps({"price_below": 90}),
+    )
 
     svc.broker.set_price("AAPL", Decimal("85"))            # only the stop's condition is true
-    acted = Monitor(svc, NullNotifier()).tick()
-    assert len(acted) == 1 and acted[0]["oco_canceled"] == 2
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+    assert len(acted) == 1 and acted[0]["oco_canceled"] == 0
+    assert acted[0]["executed"] is None
+    assert broker._orders_by_key == {}
 
     with svc.session_factory() as s:
         states = {r.kind: r.state for r in s.execute(select(Rule)).scalars()}
-    assert states["stop"] == "triggered"
-    assert states["entry"] == "canceled" and states["target"] == "canceled"
+    assert states["stop"] == "processing"
+    assert states["entry"] == "active"
+    assert states["target"] == "active"
+
+
+def test_full_exit_is_capped_to_unreserved_live_position(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    class RecordingBroker(MockBroker):
+        submitted = []
+
+        def submit_order(self, order):
+            self.submitted.append(order)
+            return super().submit_order(order)
+
+    broker = RecordingBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=2,
+        action_json=json.dumps({"side": "sell", "qty": "10"}),
+        condition_json=json.dumps({"price_below": 95}),
+    )
+    broker.set_price("AAPL", Decimal("90"))
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert acted[0]["executed"] is None
+    assert broker.submitted == []
+    with svc.session_factory() as session:
+        proposal = session.execute(select(Order)).scalar_one()
+    assert proposal.qty == Decimal("5")
+
+
+def test_computed_rule_qty_is_normalized_before_risk_and_persistence(make_service):
+    from trading_assistant.assets import AssetClass
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("1"), Decimal("3"), Decimal("3"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        action_json=json.dumps({"side": "sell", "notional": "1"}),
+        condition_json=json.dumps({"price_below": 4}),
+    )
+    broker.set_price("AAPL", Decimal("3"))
+    checked_qty = []
+    risk = svc._risk_for(AssetClass.EQUITY)
+    original_check = risk.check
+
+    def record_check(order, *args, **kwargs):
+        checked_qty.append(order.qty)
+        return original_check(order, *args, **kwargs)
+
+    risk.check = record_check
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert checked_qty == [Decimal("0.333333")]
+    with svc.session_factory() as session:
+        assert session.execute(select(Order)).scalar_one().qty == Decimal(
+            "0.333333"
+        )
+
+
+def test_computed_rule_qty_underflow_does_not_persist_zero_order(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[
+            Position("AAPL", Decimal("1"), Decimal("100"), Decimal("100"))
+        ]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        action_json=json.dumps({"side": "sell", "notional": "0.000001"}),
+        condition_json=json.dumps({"price_below": 101}),
+    )
+
+    acted = Monitor(svc, NullNotifier()).tick()
+
+    assert len(acted) == 1
+    assert acted[0].proposal is None
+    assert acted[0].error == "no unreserved position to exit"
+    with svc.session_factory() as session:
+        assert session.execute(select(Order)).scalars().all() == []
+        assert session.execute(select(Rule)).scalar_one().state == "active"
+
+
+@pytest.mark.parametrize(
+    ("status", "reserved_qty", "expected_proposal_qty"),
+    [
+        (OrderStatus.APPROVAL_RECORDED.value, Decimal("3"), Decimal("2")),
+        (OrderStatus.SUBMITTING.value, Decimal("5"), None),
+        (OrderStatus.ACCEPTANCE_UNKNOWN.value, Decimal("5"), None),
+    ],
+)
+def test_full_exit_reserves_all_live_pending_same_side_orders(
+    make_service, status, reserved_qty, expected_proposal_qty
+):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import Position
+
+    broker = MockBroker(
+        positions=[Position("AAPL", Decimal("5"), Decimal("100"), Decimal("100"))]
+    )
+    svc = make_service(broker=broker)
+    _add_rule(
+        svc,
+        kind="stop",
+        plan_id=3,
+        action_json=json.dumps({"side": "sell", "qty": "10"}),
+        condition_json=json.dumps({"price_below": 95}),
+    )
+    with svc.session_factory() as session:
+        persist_sensitive(
+            session,
+            Order(
+                idempotency_key=f"reserved-{status}",
+                ticker="AAPL",
+                side="sell",
+                order_type="market",
+                qty=reserved_qty,
+                status=status,
+            ),
+            {"approval_reason": "test fixture"},
+        )
+        session.commit()
+    broker.set_price("AAPL", Decimal("90"))
+
+    acted = Monitor(svc, NullNotifier(), auto_execute=True).tick()
+
+    assert len(acted) == 1
+    assert acted[0]["executed"] is None
+    assert broker._orders_by_key == {}
+    if expected_proposal_qty is None:
+        assert acted[0]["proposal"] is None
+        assert acted[0]["error"] == "no unreserved position to exit"
+    else:
+        proposal_order_id = acted[0]["proposal"]["order_id"]
+        with svc.session_factory() as session:
+            proposal = session.get(Order, proposal_order_id)
+        assert proposal.qty == expected_proposal_qty

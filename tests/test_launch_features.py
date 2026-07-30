@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
-from sqlalchemy import func, select
+import pytest
+from sqlalchemy import event, func, select
 
 from trading_assistant.analyst.accuracy import analyst_accuracy
 from trading_assistant.analyst.analyst import Analyst
@@ -22,8 +27,18 @@ from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.llm_runner import LLMRunConfig
 from trading_assistant.backtest.synthetic import make_bars
 from trading_assistant.config import Secrets
-from trading_assistant.db.models import Rule, ShadowCall, TradePlanRow, utcnow
+from trading_assistant.db.models import (
+    AnalysisReportRow,
+    AuditEvent,
+    Order,
+    Proposal,
+    Rule,
+    ShadowCall,
+    TradePlanRow,
+    utcnow,
+)
 from trading_assistant.signals.models import MarketFeatures, Regime
+from tests.conftest import decrypt_test_sensitive
 
 TS = datetime(2022, 6, 1, tzinfo=timezone.utc)
 
@@ -50,13 +65,40 @@ class _StubAnalyst:
     def __init__(self, plan):
         self.plan = plan
 
-    def analyze_plan(self, features, held_symbols=None, news=None):
+    def analyze_plan(
+        self,
+        features,
+        held_symbols=None,
+        untrusted_summary=None,
+        request_id=None,
+    ):
         return self.plan
 
 
 def _provider(sym):
     return MarketFeatures(symbol=sym, asset_class=AssetClass.EQUITY, as_of=TS,
                           last_close=100.0, regime=Regime.RANGING)
+
+
+def _propose_and_approve_bracket(
+    service,
+    request,
+    take_profit,
+    stop_loss,
+    **context,
+):
+    proposal = service.propose_bracket_order(
+        request,
+        take_profit,
+        stop_loss,
+        **context,
+    )
+    if proposal["status"] != "proposed":
+        return proposal
+    return service.approve_order(
+        proposal["order_id"],
+        **context,
+    )
 
 
 # ── D1 shadow mode ──────────────────────────────────────────────
@@ -81,6 +123,327 @@ def test_shadow_creates_graded_calls_without_orders(make_service):
         assert build_scorecard_from_db(s).n_calls == len(ids)   # track record built, risk-free
 
 
+def test_shadow_continues_when_one_candidate_plan_is_invalid(
+    make_service,
+    caplog,
+):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    source = DataSource(
+        {
+            symbol: make_bars(300, seed=i)
+            for i, symbol in enumerate(["AAPL", "MSFT", "SPY"])
+        }
+    )
+
+    class FailFirstPlanning:
+        calls = 0
+
+        def analyze(self, symbol, **context):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("provider-secret-shadow-plan")
+            return planning.analyze(symbol, **context)
+
+    flaky = FailFirstPlanning()
+    shadow = ShadowRunner(
+        svc, flaky, source, lambda sym: Decimal("110"), top_n=2
+    )
+
+    ids = shadow.run_once()
+
+    assert flaky.calls == 2
+    assert len(ids) == 1
+    assert svc.broker.submit_calls == 0
+    assert "provider-secret-shadow-plan" not in caplog.text
+
+
+def test_shadow_batch_is_idempotent_across_process_restarts(make_service):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    source = DataSource(
+        {
+            "AAPL": make_bars(300, seed=1),
+            "SPY": make_bars(300, seed=2),
+        }
+    )
+
+    first_process = ShadowRunner(
+        svc, planning, source, lambda sym: Decimal("110"), top_n=1
+    )
+    second_process = ShadowRunner(
+        svc, planning, source, lambda sym: Decimal("110"), top_n=1
+    )
+
+    assert len(first_process.run_once()) == 1
+    assert second_process.run_once() == []
+
+
+def test_shadow_request_identity_is_stable_per_persisted_daily_call(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import db
+
+    current_now = [datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)]
+    monkeypatch.setattr(db.models, "utcnow", lambda: current_now[0])
+    svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": " V2 "}
+            )
+        }
+    )
+    source = DataSource(
+        {
+            symbol: make_bars(300, seed=index)
+            for index, symbol in enumerate(["AAPL", "MSFT", "SPY"])
+        }
+    )
+
+    class CaptureFailurePlanning:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def analyze(self, symbol, **context):
+            self.calls.append((symbol, context["request_id"]))
+            raise RuntimeError("capture only")
+
+    first = CaptureFailurePlanning()
+    second = CaptureFailurePlanning()
+    equivalent = CaptureFailurePlanning()
+    next_day = CaptureFailurePlanning()
+    ShadowRunner(
+        svc,
+        first,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    ShadowRunner(
+        svc,
+        second,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+
+    assert len(first.calls) == 2
+    assert second.calls == first.calls
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": "v2"}
+            )
+        }
+    )
+    ShadowRunner(
+        svc,
+        equivalent,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    assert equivalent.calls == first.calls
+
+    current_now[0] += timedelta(days=1)
+    ShadowRunner(
+        svc,
+        next_day,
+        source,
+        lambda _symbol: Decimal("100"),
+        top_n=2,
+    ).run_once()
+    assert [symbol for symbol, _request_id in next_day.calls] == [
+        symbol for symbol, _request_id in first.calls
+    ]
+    assert {
+        request_id for _symbol, request_id in next_day.calls
+    }.isdisjoint(
+        request_id for _symbol, request_id in first.calls
+    )
+
+    assert len({request_id for _symbol, request_id in first.calls}) == 2
+    for symbol, request_id in first.calls:
+        material = json.dumps(
+            {
+                "analyst_version": "v2",
+                "scheduled_date": "2026-07-27",
+                "symbol": symbol.upper(),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(material.encode("utf-8")).digest()
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
+        assert request_id == f"shadow:{digest}"
+        assert len(request_id) <= 64
+
+
+def test_shadow_canonicalizes_identity_once_across_restart_and_persistence(
+    make_service,
+    monkeypatch,
+):
+    from trading_assistant import db
+    from trading_assistant.analyst import shadow as shadow_module
+
+    fixed_now = datetime(2026, 7, 27, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(db.models, "utcnow", lambda: fixed_now)
+    candidates = [[{"symbol": " aapl "}], [{"symbol": "aApL"}]]
+    monkeypatch.setattr(
+        shadow_module.screener,
+        "screen_source",
+        lambda *_args, **_kwargs: candidates.pop(0),
+    )
+    svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": " V2 "}
+            )
+        }
+    )
+
+    class CaptureAnalyst:
+        def __init__(self):
+            self.request_ids = []
+
+        def analyze_plan(
+            self,
+            features,
+            held_symbols=None,
+            untrusted_summary=None,
+            request_id=None,
+        ):
+            self.request_ids.append(request_id)
+            return _plan().model_copy(
+                update={"symbol": features.symbol, "as_of": features.as_of}
+            )
+
+    first_analyst = CaptureAnalyst()
+    first = ShadowRunner(
+        svc,
+        PlanningService(svc, first_analyst, _provider, Secrets()),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    plan_ids = first.run_once()
+
+    assert len(plan_ids) == 1
+    material = json.dumps(
+        {
+            "analyst_version": "v2",
+            "scheduled_date": "2026-07-27",
+            "symbol": "AAPL",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(material.encode("utf-8")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert first_analyst.request_ids == [f"shadow:{digest}"]
+    with svc.session_factory() as session:
+        plan_row = session.get(TradePlanRow, plan_ids[0])
+        report_row = session.execute(select(AnalysisReportRow)).scalar_one()
+        call = session.execute(select(ShadowCall)).scalar_one()
+        assert plan_row.symbol == "AAPL"
+        assert json.loads(
+            decrypt_test_sensitive(plan_row, "plan_json")
+        )["symbol"] == "AAPL"
+        assert report_row.symbol == "AAPL"
+        assert json.loads(
+            decrypt_test_sensitive(report_row, "report_json")
+        )["symbol"] == "AAPL"
+        assert report_row.analyst_version == "v2"
+        assert call.symbol == "AAPL"
+
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": "v2"}
+            )
+        }
+    )
+    restarted_analyst = CaptureAnalyst()
+    restarted = ShadowRunner(
+        svc,
+        PlanningService(svc, restarted_analyst, _provider, Secrets()),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    assert restarted.run_once() == []
+    assert restarted_analyst.request_ids == []
+
+
+@pytest.mark.parametrize(
+    ("symbol", "version"),
+    [
+        ("AAPL X", "v2"),
+        ("AAPL\nX", "v2"),
+        ("A" * 17, "v2"),
+        ("é", "v2"),
+        ("e\u0301", "v2"),
+        ("AAPL", "version two"),
+        ("AAPL", "v" * 17),
+        ("AAPL", "vérsion"),
+        ("AAPL", "ve\u0301rsion"),
+    ],
+)
+def test_shadow_rejects_invalid_identity_before_planning(
+    make_service,
+    monkeypatch,
+    symbol,
+    version,
+):
+    from trading_assistant.analyst import shadow as shadow_module
+
+    monkeypatch.setattr(
+        shadow_module.screener,
+        "screen_source",
+        lambda *_args, **_kwargs: [{"symbol": symbol}],
+    )
+    svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "analyst": svc.config.analyst.model_copy(
+                update={"version": version}
+            )
+        }
+    )
+
+    class NeverPlanning:
+        def analyze(self, *_args, **_kwargs):
+            raise AssertionError("planning must not run")
+
+    runner = ShadowRunner(
+        svc,
+        NeverPlanning(),
+        object(),
+        lambda _symbol: Decimal("100"),
+        top_n=1,
+    )
+
+    with pytest.raises(ValueError):
+        runner.run_once()
+
+
 # ── D2 digest ───────────────────────────────────────────────────
 def test_digest_has_sections(make_service):
     d = compose_digest(make_service())
@@ -89,28 +452,429 @@ def test_digest_has_sections(make_service):
 
 
 # ── D4 bracket orders ───────────────────────────────────────────
-def test_single_target_plan_uses_bracket(make_service):
+def test_explicit_bracket_preference_still_creates_human_gated_rules(make_service):
     svc = make_service()
+    svc.config = svc.config.model_copy(
+        update={
+            "execution": svc.config.execution.model_copy(
+                update={"prefer_bracket_orders": True}
+            )
+        }
+    )
     planning = PlanningService(svc, _StubAnalyst(_plan(single=True)), _provider, Secrets())
-    pid = planning.analyze("AAPL")["plan_id"]
-    res = planning.approve_plan(pid)
+    review = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="single launch analysis",
+        request_id="single-launch-analysis",
+    )
+    pid = review["plan_id"]
+    res = planning.approve_plan(
+        pid,
+        review_token=review["review_token"],
+        actor="operator:avi",
+        reason="reviewed single-target plan",
+        request_id="launch-feature-plan-approval",
+    )
 
-    assert res["bracket"] is not None and res["bracket"]["bracket"] is True
-    assert len(svc.broker.brackets) == 1                    # server-side OCO submitted
+    assert res["status"] == "approved"
+    assert res["bracket"] is None
+    assert svc.broker.brackets == []
+    assert svc.broker.submit_calls == 0
     with svc.session_factory() as s:
-        kinds = {r.kind for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()}
-    assert not ({"entry", "target", "stop"} & kinds)        # handled by the bracket
+        rules = s.execute(select(Rule).where(Rule.plan_id == pid)).scalars().all()
+        bracket_orders = s.execute(
+            select(Order).where(Order.idempotency_key == f"plan-{pid}-bracket-entry")
+        ).scalars().all()
+    assert {"entry", "target", "stop"} <= {rule.kind for rule in rules}
+    assert {
+        rule.state for rule in rules if rule.kind == "entry"
+    } == {"active"}
+    assert {
+        rule.state for rule in rules if rule.kind != "entry"
+    } == {"pending"}
+    assert all(not rule.pre_approved for rule in rules)
+    assert bracket_orders == []
+
+
+def test_bracket_order_is_persisted_before_broker_response_loss(make_service):
+    from trading_assistant.broker.mock import MockBroker
+    from trading_assistant.broker.models import OrderRequest, OrderSide, OrderType
+    from trading_assistant.db.models import Order
+
+    class ResponseLossBroker(MockBroker):
+        first = True
+
+        def submit_bracket(self, order, take_profit, stop_loss):
+            result = super().submit_bracket(order, take_profit, stop_loss)
+            if self.first:
+                self.first = False
+                raise ConnectionError("response lost after broker acceptance")
+            return result
+
+    broker = ResponseLossBroker()
+    broker.set_price("AAPL", Decimal("100"))
+    svc = make_service(broker=broker)
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="stable-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    first = _propose_and_approve_bracket(
+        svc,
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="response-loss drill",
+        request_id="launch-feature-bracket-first",
+    )
+    assert first["executed"] is False
+    assert first["status"] == "acceptance_unknown"
+    with svc.session_factory() as session:
+        stored = session.execute(
+            select(Order).where(Order.idempotency_key == "stable-plan-bracket")
+        ).scalar_one()
+        assert stored.status == "acceptance_unknown"
+        assert stored.broker_order_id is None
+
+    result = _propose_and_approve_bracket(
+        svc,
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="response-loss drill",
+        request_id="launch-feature-bracket-retry",
+    )
+
+    assert result["executed"] is False
+    assert result["status"] == "acceptance_unknown"
+    assert len(broker._orders_by_key) == 1
+
+
+def test_bracket_public_path_only_proposes_until_normal_human_approval(
+    make_service,
+):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="human-gated-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    proposal = service.propose_bracket_order(
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:test",
+        reason="propose bracket for review",
+        request_id="human-gated-bracket-proposal",
+    )
+
+    assert not hasattr(service, "submit_bracket_order")
+    assert proposal["status"] == "proposed"
+    assert proposal["executed"] is False
+    assert service.broker.submit_calls == 0
+
+    result = service.approve_order(
+        proposal["order_id"],
+        actor="operator:test",
+        reason="explicitly reviewed bracket",
+        request_id="human-gated-bracket-approval",
+    )
+
+    assert result["status"] == "submitted"
+    assert result["executed"] is True
+    assert service.broker.submit_calls == 1
+
+
+def test_bracket_proposal_audit_is_exact_and_idempotent(make_service):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="audited-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+    context = {
+        "actor": "operator:bracket-review",
+        "reason": "approved bracket after human review",
+        "request_id": "bracket-proposal-audit",
+    }
+
+    first = _propose_and_approve_bracket(
+        service,
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        **context,
+    )
+    replay = _propose_and_approve_bracket(
+        service,
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor=context["actor"],
+        reason="retry after confirmed response",
+        request_id="bracket-proposal-retry",
+    )
+
+    assert first["status"] == "submitted"
+    assert replay["status"] == "submitted"
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        order = session.scalar(
+            select(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        )
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.target_id == str(order.id),
+            )
+        ).all()
+        proposals = session.scalars(
+            select(Proposal).where(Proposal.order_id == order.id)
+        ).all()
+    assert len(audits) == 1
+    assert len(proposals) == 1
+    assert (
+        audits[0].actor,
+        decrypt_test_sensitive(audits[0], "reason"),
+        audits[0].request_id,
+        audits[0].result_code,
+    ) == (
+        context["actor"],
+        context["reason"],
+        context["request_id"],
+        "proposed",
+    )
+    assert order.approval_actor == context["actor"]
+
+
+def test_bracket_proposal_audit_failure_rolls_back_and_retry_is_safe(
+    make_service,
+):
+    from trading_assistant.broker.models import (
+        OrderRequest,
+        OrderSide,
+        OrderType,
+    )
+
+    service = make_service()
+    request = OrderRequest(
+        ticker="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        idempotency_key="rollback-plan-bracket",
+        qty=Decimal("1"),
+        limit_price=Decimal("100"),
+    )
+
+    def fail_proposal_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "order.propose"
+            for row in session.new
+        ):
+            raise RuntimeError("injected bracket proposal audit failure")
+
+    session_type = service.session_factory.class_
+    event.listen(session_type, "before_flush", fail_proposal_audit)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected bracket proposal audit failure",
+        ):
+            service.propose_bracket_order(
+                request,
+                Decimal("110"),
+                Decimal("95"),
+                actor="operator:bracket-review",
+                reason="reviewed bracket rollback probe",
+                request_id="bracket-proposal-rollback",
+            )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_proposal_audit,
+        )
+
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(Proposal)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.request_id
+                == "bracket-proposal-rollback",
+            )
+        ) == 0
+    assert service.broker.submit_calls == 0
+    assert service.broker.brackets == []
+
+    result = _propose_and_approve_bracket(
+        service,
+        request,
+        Decimal("110"),
+        Decimal("95"),
+        actor="operator:bracket-review",
+        reason="retry reviewed bracket after audit recovery",
+        request_id="bracket-proposal-retry-after-rollback",
+    )
+
+    assert result["status"] == "submitted"
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(Order).where(
+                Order.idempotency_key == request.idempotency_key
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(Proposal)
+        ) == 1
+        retry_audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "order.propose",
+                AuditEvent.request_id
+                == "bracket-proposal-retry-after-rollback",
+            )
+        ).all()
+    assert len(retry_audits) == 1
 
 
 def test_ladder_plan_still_uses_rules(make_service):
     svc = make_service()
     planning = PlanningService(svc, _StubAnalyst(_plan(single=False)), _provider, Secrets())
-    pid = planning.analyze("AAPL")["plan_id"]
-    planning.approve_plan(pid)
+    review = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="multi-rule launch analysis",
+        request_id="multi-rule-launch-analysis",
+    )
+    pid = review["plan_id"]
+    planning.approve_plan(
+        pid,
+        review_token=review["review_token"],
+        actor="operator:test",
+        reason="reviewed ladder plan",
+        request_id="launch-feature-ladder-approval",
+    )
     assert len(svc.broker.brackets) == 0                    # ladder -> daemon rules, not bracket
     with svc.session_factory() as s:
-        kinds = {r.kind for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()}
+        kinds = {
+            r.kind
+            for r in s.execute(select(Rule).where(Rule.plan_id == pid)).scalars()
+        }
     assert "entry" in kinds and "stop" in kinds
+
+
+def test_concurrent_plan_approval_claims_exactly_once(make_service):
+    svc = make_service()
+    planning = PlanningService(svc, _StubAnalyst(_plan()), _provider, Secrets())
+    analysis = planning.analyze(
+        "AAPL",
+        actor="operator:test",
+        reason="launch feature analysis",
+        request_id="launch-feature-analysis",
+    )
+    plan_id = analysis["plan_id"]
+    with svc.session_factory() as session:
+        stored = session.get(TradePlanRow, plan_id)
+        expected_rule_count = len(
+            planning._decompose(
+                TradePlan.model_validate_json(
+                    decrypt_test_sensitive(stored, "plan_json")
+                ),
+                json.loads(
+                    decrypt_test_sensitive(stored, "sized_json")
+                ),
+                plan_id,
+            )
+        )
+    entered = Event()
+    release = Event()
+    decompose_lock = Lock()
+    decompose_calls = 0
+    original = planning._decompose
+
+    def blocking_decompose(*args, **kwargs):
+        nonlocal decompose_calls
+        with decompose_lock:
+            decompose_calls += 1
+            call_number = decompose_calls
+        if call_number == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+        return original(*args, **kwargs)
+
+    planning._decompose = blocking_decompose
+    first_result = {}
+
+    def approve_first():
+        first_result.update(
+            planning.approve_plan(
+                plan_id,
+                review_token=analysis["review_token"],
+                actor="operator:test",
+                reason="reviewed",
+                request_id="launch-feature-concurrent-first",
+            )
+        )
+
+    thread = Thread(target=approve_first)
+    thread.start()
+    assert entered.wait(timeout=2)
+    second = planning.approve_plan(
+        plan_id,
+        review_token=analysis["review_token"],
+        actor="operator:second",
+        reason="reviewed",
+        request_id="launch-feature-concurrent-second",
+    )
+    release.set()
+    thread.join(timeout=2)
+
+    assert second["status"] == "approved"
+    assert "error" not in second
+    assert first_result["status"] == "approved"
+    assert "error" in first_result
+    with svc.session_factory() as session:
+        rules = session.execute(
+            select(Rule).where(Rule.plan_id == plan_id)
+        ).scalars().all()
+        assert len(rules) == expected_rule_count
 
 
 # ── C4 accuracy report (mock analyst) ───────────────────────────
@@ -120,20 +884,46 @@ def _analyst(action="buy", conf=0.8):
     block = SimpleNamespace(type="tool_use", name="submit_analysis", id="t", input=inp)
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[block])
 
-    return Analyst(B())
+    return Analyst(B(), max_attempts=2)
 
 
 def test_accuracy_report_shape(make_service):
     source = DataSource({"AAPL": make_bars(300, seed=1), "SPY": make_bars(300, seed=2)})
-    rep = analyst_accuracy(source, ["AAPL"], _analyst(), LLMRunConfig(max_llm_calls=100), spy_symbol="SPY")
+    rep = analyst_accuracy(
+        source,
+        ["AAPL"],
+        _analyst(),
+        LLMRunConfig(max_llm_calls=100),
+        run_id="accuracy-shape",
+        spy_symbol="SPY",
+    )
     assert set(rep) >= {"hit_rate", "brier", "calibration", "per_regime",
                         "analyst_avg_return_pct", "buy_hold_avg_return_pct", "shows_edge", "verdict"}
     assert rep["graded_calls"] >= 1
     # A single always-buy 0.8-confidence analyst can't clear the >=50-call edge bar.
     assert rep["shows_edge"] is False
+
+
+def test_accuracy_rejects_blank_run_id_before_replay():
+    with pytest.raises(ValueError, match="run_id"):
+        analyst_accuracy(
+            None,
+            [],
+            None,
+            LLMRunConfig(),
+            run_id=" ",
+        )
 
 
 # ── daemon daily tasks (D1/D2 wiring) ───────────────────────────

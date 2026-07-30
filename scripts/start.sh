@@ -1,35 +1,57 @@
 #!/usr/bin/env bash
-# Start the trading assistant (paper). Runs preflight first and refuses to start
-# if it isn't READY. Starts the app + daemon in the background with logs.
+# Start only the loopback HTTPS operator console. The strict launcher performs
+# local structural checks before it constructs the application.
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 
-echo "== stopping any existing instances =="
-pkill -f "uvicorn trading_assistant.app.main" 2>/dev/null || true
-pkill -f "trading_assistant.daemon.main" 2>/dev/null || true
-sleep 1
+PROJECT="$(pwd -P)"
+PY="$PROJECT/.venv/bin/python"
+PID_FILE="$PROJECT/logs/app.pid"
+RUNTIME_DIR="$PROJECT/runtime"
+CONTROL_SOCKET="$RUNTIME_DIR/app-control.sock"
+EXPECTED_ARGV="$PY -m trading_assistant.ops.serve"
 
-echo "== preflight =="
-if ! .venv/bin/python -m trading_assistant.preflight; then
-  echo ">> Preflight NOT READY — fix the FAIL items above. Not starting." >&2
+if [[ ! -x "$PY" ]]; then
+  echo "venv python not found at $PY (run 'uv sync' first)" >&2
   exit 1
 fi
 
-mkdir -p logs
-echo "== starting app on http://127.0.0.1:8000 =="
-nohup .venv/bin/python -m uvicorn trading_assistant.app.main:create_app \
-  --factory --host 127.0.0.1 --port 8000 > logs/app.log 2>&1 &
-echo $! > logs/app.pid
+if [[ -e "$PID_FILE" || -L "$PID_FILE" ]]; then
+  if "$PY" -m trading_assistant.ops.control validate \
+    --project "$PROJECT" \
+    --pid-file "$PID_FILE" \
+    --expected-argv "$EXPECTED_ARGV"; then
+    echo "app already running (cooperative control metadata is current)"
+    exit 0
+  fi
+  echo "refusing to replace stale or malformed app control metadata" >&2
+  exit 1
+fi
 
-echo "== starting daemon (shadow mode) =="
-nohup .venv/bin/python -m trading_assistant.daemon.main > logs/daemon.log 2>&1 &
-echo $! > logs/daemon.pid
+if [[ -e "$CONTROL_SOCKET" || -L "$CONTROL_SOCKET" ]]; then
+  echo "refusing to replace existing app control socket" >&2
+  exit 1
+fi
 
-sleep 4
-echo "== health =="
-curl -s http://127.0.0.1:8000/health || echo "(app still warming up — check logs/app.log)"
-echo
-echo "Open  : http://127.0.0.1:8000"
-echo "Token : run  grep APP_API_TOKEN .env   and paste the value when the page asks"
-echo "Logs  : logs/app.log   logs/daemon.log"
-echo "Stop  : ./scripts/stop.sh"
+mkdir -p logs runtime
+chmod 700 logs runtime
+instance_id="$($PY -c 'import secrets; print(secrets.token_hex(32))')"
+echo "starting HTTPS app on https://localhost:8020"
+TRADING_APP_INSTANCE_ID="$instance_id" \
+  nohup "$PY" -m trading_assistant.ops.serve > /dev/null 2>&1 &
+for _attempt in {1..50}; do
+  if "$PY" -m trading_assistant.ops.control validate \
+    --project "$PROJECT" \
+    --pid-file "$PID_FILE" \
+    --expected-argv "$EXPECTED_ARGV"; then
+    echo "Open  : https://localhost:8020"
+    echo "Logs  : logs/app.runtime.log"
+    echo "Stop  : ./scripts/stop.sh"
+    exit 0
+  fi
+  sleep 0.1
+done
+
+echo "app control channel was not ready; refusing any PID fallback" >&2
+exit 1

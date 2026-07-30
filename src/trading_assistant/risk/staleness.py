@@ -11,16 +11,29 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 DEFAULT_MAX_AGE_SECONDS = 60.0
+DEFAULT_MAX_FUTURE_SKEW_SECONDS = 5.0
 
 
 def is_stale(
-    quote_as_of: datetime,
+    quote_as_of: datetime | None,
     now: datetime | None = None,
     max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
+    max_future_skew_seconds: float = DEFAULT_MAX_FUTURE_SKEW_SECONDS,
 ) -> bool:
-    """True if the quote is older than ``max_age_seconds`` — do NOT trade on it."""
+    """True when a source time is absent, too old, or implausibly future."""
+    if not isinstance(quote_as_of, datetime):
+        return True
     now = now or datetime.now(timezone.utc)
     if quote_as_of.tzinfo is None:
         quote_as_of = quote_as_of.replace(tzinfo=timezone.utc)
+    else:
+        quote_as_of = quote_as_of.astimezone(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     age = (now - quote_as_of).total_seconds()
-    return age > max_age_seconds
+    return (
+        age > max_age_seconds
+        or age < -max_future_skew_seconds
+    )

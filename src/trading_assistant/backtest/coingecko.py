@@ -11,13 +11,23 @@ injectable so parsing is unit-tested without network.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
+from ..security.outbound import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    OutboundError,
+    OutboundPolicy,
+    OutboundRequestFailed,
+    new_httpx_client,
+    read_bounded_json,
+    require_origin,
+)
 from .data import cache_path, load_parquet
 
 BASE = "https://api.coingecko.com/api/v3"
+_ORIGIN_POLICY = OutboundPolicy("https://api.coingecko.com")
 
 SYMBOL_TO_ID = {
     "BTC/USD": "bitcoin",
@@ -33,21 +43,49 @@ def coin_id(symbol: str) -> str:
 
 
 class CoinGeckoClient:
-    def __init__(self, http: Any = None, cache_dir: str | Path = ".cache/bars") -> None:
+    def __init__(
+        self,
+        http: Any = None,
+        cache_dir: str | Path = ".cache/bars",
+        attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        runtime_role: str = "app",
+    ) -> None:
         self._http = http
         self._cache_dir = cache_dir
+        self._attempt_gate = attempt_gate
+        self._max_response_bytes = max_response_bytes
+        self._runtime_role = runtime_role
 
     def _client(self):
         if self._http is None:
-            import httpx
-
-            self._http = httpx.Client(timeout=30.0)
+            require_origin(
+                self._runtime_role,
+                "marketdata.coingecko",
+                "https://api.coingecko.com",
+            )
+            self._http = new_httpx_client(_ORIGIN_POLICY, read_timeout=30.0)
         return self._http
 
     def _get(self, path: str, params: dict) -> Any:
-        resp = self._client().get(f"{BASE}{path}", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        url = f"{BASE}{path}"
+
+        def operation() -> Any:
+            _ORIGIN_POLICY.assert_url(url)
+            try:
+                with self._client().stream("GET", url, params=params) as resp:
+                    _ORIGIN_POLICY.assert_response(resp)
+                    resp.raise_for_status()
+                    return read_bounded_json(
+                        resp,
+                        max_response_bytes=self._max_response_bytes,
+                    )
+            except OutboundError:
+                raise
+            except Exception:
+                raise OutboundRequestFailed() from None
+
+        return self._attempt_gate(operation) if self._attempt_gate is not None else operation()
 
     def ohlc(self, symbol: str, days: int = 365) -> list:
         return self._get(

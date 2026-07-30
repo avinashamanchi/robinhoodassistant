@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operator sign in — Trading Assistant</title>
+  <link rel="icon" href="/static/img/trading-orbit.svg">
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/login.js"></script>
+</head>
+<body class="app-shell login-page">
+  <a class="skip-link" href="#main-content">Skip to operator sign in</a>
+  <header class="topbar login-topbar">
+    <div class="brand">
+      <img class="brand-orbit" src="/static/img/trading-orbit.svg" alt="" aria-hidden="true">
+      <span class="brand-copy">
+        <strong>Trading Assistant</strong>
+        <span>Protected local access</span>
+      </span>
+    </div>
+    <div class="login-mode">
+      <span class="status-chip is-caution">ALPACA PAPER</span>
+    </div>
+  </header>
+  <div class="environment-strip login-environment" aria-label="Current paper environment">
+    <div class="environment-cell environment-primary">
+      <span>Environment</span>
+      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+    </div>
+    <div class="environment-cell"><span>Breaker</span><strong class="is-unknown">Sign in required</strong></div>
+    <div class="environment-cell"><span>Daemon</span><strong class="is-unknown">Sign in required</strong></div>
+    <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Sign in required</strong></div>
+    <div class="environment-cell"><span>Observed</span><strong class="is-stale">Not authenticated</strong></div>
+  </div>
+  <main
+    class="login-shell"
+    id="main-content"
+    aria-labelledby="login-context-title"
+  >
+    <section class="login-context" aria-labelledby="login-context-title">
+      <div>
+        <p class="brand-mark">Loopback access boundary</p>
+        <h1 id="login-context-title">Local HTTPS operator console</h1>
+        <p>Alpaca paper only. Broker truth, scoped safety state, and operator actions stay visibly separate.</p>
+      </div>
+      <p class="login-proof">Local session · HttpOnly cookie · in-memory request protection</p>
+    </section>
+    <form class="login-form" id="login-form" aria-labelledby="login-form-title">
+      <h2 id="login-form-title">Operator sign in</h2>
+      <p id="login-secret-help">
+        Use the local operator secret. It is cleared from this form before the
+        request begins and is never stored by this page.
+      </p>
+      <div class="field">
+        <label for="login-secret">Operator secret</label>
+        <input
+          id="login-secret"
+          name="secret"
+          type="password"
+          autocomplete="current-password"
+          aria-describedby="login-secret-help login-status"
+          required
+        >
+      </div>
+      <button class="button-primary" type="submit">Sign in</button>
+      <p class="login-status" id="login-status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+</body>
+</html>

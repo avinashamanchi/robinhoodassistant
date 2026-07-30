@@ -1,0 +1,2245 @@
+"""Broker-truth reconciliation and fail-closed operator panic."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from sqlalchemy import event, func, inspect as sa_inspect, or_, select, update
+from sqlalchemy.orm import Session, sessionmaker
+
+from trading_assistant.assets import canonicalize_broker_symbol
+from trading_assistant.broker.base import BrokerClient, BrokerDataIntegrityError
+from trading_assistant.broker.models import (
+    BrokerFill,
+    FillQuantityRelation,
+    OrderResult,
+    OrderStatus,
+    exact_fill_exceeds_order_quantity,
+    fill_quantity_relation,
+    normalize_fill_economic,
+    order_result_identity_error,
+    valid_cumulative_filled_qty,
+    valid_fill_economic,
+)
+from trading_assistant.db.models import (
+    FILL_RECONCILIATION_REQUIRED,
+    FILL_RECONCILIATION_QUARANTINED,
+    FILL_RECONCILIATION_SUPERSEDED,
+    FILL_RECONCILIATION_TRUSTED,
+    AuditEvent,
+    Fill,
+    Order,
+    OrderStateMachine,
+    ReconciliationCursor,
+    Rule,
+    RuleGroup,
+    Proposal,
+    fill_has_trusted_identity,
+    fill_requires_reconciliation,
+)
+from trading_assistant.db.lifecycle_proofs import (
+    augment_lifecycle_detail,
+)
+from trading_assistant.dependencies import RequiredDependencyUnavailable
+from trading_assistant.risk.breakers import (
+    BreakerScope,
+    BreakerService,
+    trip_in_session,
+)
+from trading_assistant.risk.staleness import (
+    DEFAULT_MAX_FUTURE_SKEW_SECONDS,
+)
+from trading_assistant.risk.submission_barrier import SubmissionBarrier
+from trading_assistant.security.sensitive_fields import persist_sensitive
+
+from .repository import OrderRepository
+from .safety_state import (
+    UnsafeLocalState,
+    enumerate_unsafe_local_state,
+)
+
+_LOCAL_LIVE_STATUSES = (
+    OrderStatus.SUBMITTING.value,
+    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+    OrderStatus.SUBMITTED.value,
+    OrderStatus.PARTIALLY_FILLED.value,
+)
+_REMOTE_OPEN_STATUSES = {
+    OrderStatus.SUBMITTED,
+    OrderStatus.PARTIALLY_FILLED,
+}
+_FILL_STATUSES = {
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.FILLED,
+}
+_LOCAL_TERMINAL_STATUSES = {
+    OrderStatus.FILLED.value,
+    OrderStatus.CANCELED.value,
+    OrderStatus.REJECTED.value,
+    OrderStatus.EXPIRED.value,
+}
+
+
+class ReconciliationConflict(RuntimeError):
+    """Reconciliation state changed after the caller's observation."""
+
+
+def _require_context(
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> tuple[str, str, str]:
+    actor = actor.strip()
+    reason = reason.strip()
+    request_id = request_id.strip()
+    if not actor or not reason or not request_id:
+        raise ValueError(
+            "reconciliation actor, reason, and request_id must be non-empty"
+        )
+    return actor, reason, request_id
+
+
+def _normalized_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _audit_reconciliation_mutation(
+    session: Session,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    result_code: str,
+    detail: dict[str, object] | None = None,
+) -> None:
+    try:
+        normalized_target_id: int | str = int(target_id)
+    except (TypeError, ValueError):
+        normalized_target_id = target_id
+    lifecycle_detail = augment_lifecycle_detail(
+        session,
+        target_type=target_type,
+        target_id=normalized_target_id,
+        detail=detail,
+    )
+    persist_sensitive(
+        session,
+        AuditEvent(
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            request_id=request_id,
+            result_code=result_code,
+        ),
+        {
+            "reason": reason,
+            "detail_json": json.dumps(
+                lifecycle_detail,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        },
+    )
+
+
+def _changed_columns(row: object) -> list[str]:
+    return sorted(
+        attribute.key
+        for attribute in sa_inspect(row).attrs
+        if attribute.history.has_changes()
+    )
+
+
+_RECONCILIATION_CONTEXT = "reconciliation_mutation_context"
+_PENDING_RECONCILIATION_AUDITS = "pending_reconciliation_audits"
+_PENDING_PARENT_ORDER_PROOFS = "pending_reconciliation_parent_order_proofs"
+
+
+def _bind_reconciliation_context(
+    session: Session,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> None:
+    session.info[_RECONCILIATION_CONTEXT] = (actor, reason, request_id)
+
+
+def _fill_parent_order_ids(fill: Fill) -> set[int]:
+    """Return every parent whose fill snapshot changes in this flush."""
+    candidates: set[object] = {fill.order_id}
+    history = sa_inspect(fill).attrs.order_id.history
+    candidates.update(history.added)
+    candidates.update(history.deleted)
+    return {
+        candidate
+        for candidate in candidates
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate > 0
+        )
+    }
+
+
+@event.listens_for(Session, "before_flush")
+def _audit_reconciliation_flush(
+    session: Session,
+    flush_context,
+    instances,
+) -> None:
+    """Capture audit evidence without recursively flushing sensitive rows."""
+    context = session.info.get(_RECONCILIATION_CONTEXT)
+    if context is None:
+        return
+    actor, reason, request_id = context
+    pending: list[
+        tuple[object, str, str, str, dict[str, object]]
+    ] = []
+    parent_order_ids: set[int] = set()
+    for row in list(session.new):
+        if isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
+            pending.append(
+                (
+                    row,
+                    "fill.reconcile",
+                    "fill",
+                    "inserted",
+                    {"changed_fields": ["insert"]},
+                )
+            )
+        elif isinstance(row, ReconciliationCursor):
+            pending.append(
+                (
+                    row,
+                    "reconciliation_cursor.advance",
+                    "reconciliation_cursor",
+                    "advanced",
+                    {"changed_fields": ["insert"]},
+                )
+            )
+    for row in list(session.dirty):
+        if not session.is_modified(row, include_collections=False):
+            continue
+        changed_fields = _changed_columns(row)
+        if isinstance(row, Order):
+            pending.append(
+                (
+                    row,
+                    "order.reconcile",
+                    "order",
+                    row.status,
+                    {"changed_fields": changed_fields},
+                )
+            )
+        elif isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
+            pending.append(
+                (
+                    row,
+                    "fill.reconcile",
+                    "fill",
+                    row.reconciliation_state,
+                    {"changed_fields": changed_fields},
+                )
+            )
+        elif isinstance(row, ReconciliationCursor):
+            pending.append(
+                (
+                    row,
+                    "reconciliation_cursor.advance",
+                    "reconciliation_cursor",
+                    "advanced",
+                    {"changed_fields": changed_fields},
+                )
+            )
+    for row in list(session.deleted):
+        if isinstance(row, Fill):
+            parent_order_ids.update(_fill_parent_order_ids(row))
+            pending.append(
+                (
+                    row,
+                    "fill.reconcile",
+                    "fill",
+                    "deleted",
+                    {"changed_fields": ["delete"]},
+                )
+            )
+    audit_queue = session.info.setdefault(
+        _PENDING_RECONCILIATION_AUDITS,
+        [],
+    )
+    audit_queue.extend(pending)
+    proof_queue = session.info.setdefault(
+        _PENDING_PARENT_ORDER_PROOFS,
+        set(),
+    )
+    proof_queue.update(parent_order_ids)
+
+
+def _persist_pending_reconciliation_audits(
+    session: Session,
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> None:
+    pending = session.info.pop(_PENDING_RECONCILIATION_AUDITS, [])
+    parent_order_ids = set(
+        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, set())
+    )
+    directly_audited_order_ids = {
+        row.id
+        for row, _action, target_type, _result_code, _detail in pending
+        if (
+            target_type == "order"
+            and isinstance(row, Order)
+            and isinstance(row.id, int)
+        )
+    }
+    for row, action, target_type, result_code, detail in pending:
+        if isinstance(row, ReconciliationCursor):
+            target_id = f"{row.broker}:{row.stream}"
+        elif isinstance(row, Fill) and row.id is None:
+            target_id = row.broker_fill_id
+        else:
+            target_id = str(row.id)
+        _audit_reconciliation_mutation(
+            session,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            result_code=result_code,
+            detail=detail,
+        )
+    for order_id in sorted(
+        parent_order_ids - directly_audited_order_ids
+    ):
+        _audit_reconciliation_mutation(
+            session,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            action="order.fill_reconcile",
+            target_type="order",
+            target_id=str(order_id),
+            result_code="fills_reconciled",
+            detail={"changed_fields": ["fills"]},
+        )
+
+
+def _commit_reconciliation_mutations(
+    session: Session,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> None:
+    """Commit reconciliation writes under an exact transaction context."""
+    _bind_reconciliation_context(session, actor, reason, request_id)
+    from trading_assistant.rules.repository import (
+        reconcile_plan_lifecycle_in_session,
+    )
+
+    reconcile_plan_lifecycle_in_session(
+        session,
+        now=datetime.now(timezone.utc),
+        actor=actor,
+        reason=reason,
+        request_id=request_id,
+    )
+    try:
+        session.flush()
+        _persist_pending_reconciliation_audits(
+            session,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        session.commit()
+    finally:
+        session.info.pop(_RECONCILIATION_CONTEXT, None)
+        session.info.pop(_PENDING_RECONCILIATION_AUDITS, None)
+        session.info.pop(_PENDING_PARENT_ORDER_PROOFS, None)
+
+
+@dataclass(frozen=True)
+class ReconciliationReport:
+    resolved_unknown: int
+    unresolved_unknown: tuple[int, ...]
+    synced_orders: int
+    inserted_fills: int
+    broker_drift: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PanicReport:
+    safe: bool
+    local_enumeration: str
+    remote_enumeration: str
+    confirmed_canceled: tuple[str, ...]
+    unconfirmed_order_ids: tuple[int, ...]
+    remote_open_order_ids: tuple[str, ...]
+    unsafe_local_state: UnsafeLocalState
+    message: str
+
+
+class ReconciliationService:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        broker: BrokerClient,
+        repository: OrderRepository,
+        breakers: BreakerService | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.broker = broker
+        self.repository = repository
+        self.breakers = breakers or BreakerService(session_factory)
+        self.broker_key = broker.reconciliation_key
+        self.submission_barrier = SubmissionBarrier(session_factory)
+
+    def reconcile_unknown(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, tuple[int, ...]]:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
+        with self.submission_barrier.hold_writer():
+            drift: list[str] = []
+            resolved, unresolved, _ = self._resolve_unknown(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._clear_reconciled_rule_groups(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._trip_reconciliation_faults(
+                drift,
+                unresolved,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            return resolved, unresolved
+
+    def _resolve_unknown(
+        self,
+        drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, tuple[int, ...], tuple[tuple[int, OrderResult], ...]]:
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(
+                    Order.id,
+                    Order.idempotency_key,
+                    Order.ticker,
+                ).where(
+                    Order.status.in_(
+                        (
+                            OrderStatus.SUBMITTING.value,
+                            OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                        )
+                    )
+                )
+            ).all()
+
+        resolved = 0
+        unresolved: list[int] = []
+        resolved_results: list[tuple[int, OrderResult]] = []
+        for order_id, client_order_id, ticker in rows:
+            try:
+                remote = self.broker.get_order_by_client_id(client_order_id)
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    (order_id,),
+                    "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                drift.append(
+                    f"local order {order_id} has invalid broker fill payload"
+                )
+                unresolved.append(order_id)
+                continue
+            except Exception:
+                raise RequiredDependencyUnavailable from None
+            if remote is None:
+                unresolved.append(order_id)
+                continue
+            identity_error = order_result_identity_error(
+                remote,
+                client_order_id,
+                ticker,
+            )
+            if identity_error is not None:
+                self._latch_order_ids(
+                    (order_id,),
+                    "invalid_broker_identity",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                drift.append(
+                    f"local order {order_id} has invalid broker identity: "
+                    f"{identity_error}"
+                )
+                unresolved.append(order_id)
+                continue
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                drift.append(
+                    f"local order {order_id} invalid cumulative filled_qty "
+                    f"{remote.filled_qty}"
+                )
+            if self.repository.resolve_acceptance(
+                order_id,
+                remote.broker_order_id,
+                remote.status,
+                remote.filled_qty,
+                datetime.now(timezone.utc),
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            ):
+                resolved += 1
+                resolved_results.append((order_id, remote))
+            else:
+                unresolved.append(order_id)
+        return (
+            resolved,
+            tuple(sorted(unresolved)),
+            tuple(resolved_results),
+        )
+
+    def reconcile(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> ReconciliationReport:
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
+        with self.submission_barrier.hold_writer():
+            drift: list[str] = []
+            self._quarantine_legacy_fills(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            resolved, unresolved, resolved_results = self._resolve_unknown(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            (
+                inserted_fills,
+                invalid_fill_order_ids,
+                exact_fill_stream_complete,
+            ) = (
+                self._reconcile_fill_activities(
+                    drift,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
+            synced, synthetic_fills = self._reconcile_statuses(
+                drift,
+                prefetched_results=resolved_results,
+                blocked_fill_order_ids=invalid_fill_order_ids,
+                exact_fill_stream_complete=exact_fill_stream_complete,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            inserted_fills += synthetic_fills
+            self._detect_quarantined_fills(drift)
+            self._clear_reconciled_rule_groups(
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._detect_open_order_drift(
+                drift,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            self._trip_reconciliation_faults(
+                drift,
+                unresolved,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            return ReconciliationReport(
+                resolved_unknown=resolved,
+                unresolved_unknown=unresolved,
+                synced_orders=synced,
+                inserted_fills=inserted_fills,
+                broker_drift=tuple(drift),
+            )
+
+    def _clear_reconciled_rule_groups(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
+        """Clear only groups whose linked outbox has no unresolved acceptance.
+
+        This method intentionally lives in ReconciliationService: submission and
+        worker code may set the latch, but cannot clear it.
+        """
+        with self.session_factory() as session:
+            _bind_reconciliation_context(
+                session, actor, reason, request_id
+            )
+            group_ids = session.scalars(
+                select(RuleGroup.id).where(
+                    RuleGroup.reconciliation_required.is_(True)
+                )
+            ).all()
+            for group_id in group_ids:
+                unresolved = session.scalar(
+                    select(Order.id)
+                    .join(Proposal, Proposal.order_id == Order.id)
+                    .where(
+                        Proposal.source_rule_group_id == group_id,
+                        or_(
+                            Order.status.in_(
+                                (
+                                    OrderStatus.SUBMITTING.value,
+                                    OrderStatus.ACCEPTANCE_UNKNOWN.value,
+                                )
+                            ),
+                            Order.acceptance_state
+                            == FILL_RECONCILIATION_REQUIRED,
+                        ),
+                    )
+                    .limit(1)
+                )
+                if unresolved is None:
+                    result = session.execute(
+                        update(RuleGroup)
+                        .where(
+                            RuleGroup.id == group_id,
+                            RuleGroup.reconciliation_required.is_(True),
+                        )
+                        .values(
+                            reconciliation_required=False,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    if result.rowcount:
+                        _audit_reconciliation_mutation(
+                            session,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                            action="rule_group.reconcile",
+                            target_type="rule_group",
+                            target_id=str(group_id),
+                            result_code="cleared",
+                        )
+            _commit_reconciliation_mutations(session, actor, reason, request_id)
+
+    @staticmethod
+    def _latch_order_in_session(order: Order, error_code: str) -> bool:
+        changed = False
+        if order.acceptance_state != FILL_RECONCILIATION_REQUIRED:
+            order.acceptance_state = FILL_RECONCILIATION_REQUIRED
+            changed = True
+        if order.last_error_code != error_code:
+            order.last_error_code = error_code
+            changed = True
+        if changed:
+            order.updated_at = datetime.now(timezone.utc)
+            order.version += 1
+        return changed
+
+    def _latch_order_ids(
+        self,
+        order_ids: tuple[int, ...] | list[int],
+        error_code: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, ...]:
+        unique_ids = tuple(sorted(set(order_ids)))
+        if not unique_ids:
+            return ()
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                _bind_reconciliation_context(
+                    session, actor, reason, request_id
+                )
+                orders = session.scalars(
+                    select(Order).where(Order.id.in_(unique_ids))
+                ).all()
+                latched = tuple(order.id for order in orders)
+                for order in orders:
+                    self._latch_order_in_session(order, error_code)
+                _commit_reconciliation_mutations(session, actor, reason, request_id)
+                return latched
+
+    def _latch_broker_order_id(
+        self,
+        broker_order_id: str | None,
+        error_code: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, ...]:
+        if not broker_order_id:
+            return ()
+        with self.session_factory() as session:
+            order_ids = tuple(
+                session.scalars(
+                    select(Order.id).where(
+                        Order.broker_order_id == broker_order_id
+                    )
+                ).all()
+            )
+        return self._latch_order_ids(
+            list(order_ids),
+            error_code,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+
+    def _quarantine_legacy_fills(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
+        """Make every unidentified direct-path row explicitly untrusted."""
+        with self.session_factory() as session:
+            _bind_reconciliation_context(
+                session, actor, reason, request_id
+            )
+            fills = session.scalars(select(Fill)).all()
+            changed = False
+            for fill in fills:
+                if not fill_requires_reconciliation(fill):
+                    continue
+                if (
+                    fill.reconciliation_state
+                    != FILL_RECONCILIATION_QUARANTINED
+                ):
+                    fill.reconciliation_state = (
+                        FILL_RECONCILIATION_QUARANTINED
+                    )
+                    changed = True
+                if fill.order_id is not None:
+                    order = session.get(Order, fill.order_id)
+                    if order is not None:
+                        changed = (
+                            self._latch_order_in_session(
+                                order,
+                                "legacy_unidentified_fill",
+                            )
+                            or changed
+                        )
+            if changed:
+                _commit_reconciliation_mutations(session, actor, reason, request_id)
+
+    def _detect_quarantined_fills(self, drift: list[str]) -> None:
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(Fill.id, Fill.order_id).where(
+                    Fill.reconciliation_state
+                    == FILL_RECONCILIATION_QUARANTINED
+                )
+            ).all()
+        for fill_id, order_id in rows:
+            drift.append(
+                f"quarantined legacy fill {fill_id} for order "
+                f"{order_id} lacks matched authoritative activity"
+            )
+
+    def _trip_reconciliation_faults(
+        self,
+        drift: list[str],
+        unresolved_order_ids: tuple[int, ...] = (),
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
+        faults = list(drift)
+        if unresolved_order_ids:
+            faults.append(
+                "unresolved acceptance orders "
+                f"{list(sorted(unresolved_order_ids))}"
+            )
+        if not faults:
+            return
+        detail = " | ".join(faults[:3])
+        if len(faults) > 3:
+            detail += f" | {len(faults) - 3} additional fault(s)"
+        self.breakers.trip(
+            BreakerScope.broker_drift(),
+            f"broker reconciliation fault: {detail}",
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
+        )
+
+    def _cursor_snapshot(self) -> tuple[str | None, datetime | None, int | None]:
+        with self.session_factory() as session:
+            cursor = session.get(
+                ReconciliationCursor, (self.broker_key, "fills")
+            )
+            if cursor is None:
+                return None, None, None
+            return (
+                cursor.last_activity_id,
+                cursor.last_activity_at,
+                cursor.version,
+            )
+
+    @staticmethod
+    def _trusted_exact_fill_qty(session: Session, order: Order) -> Decimal:
+        synthetic_prefix = f"{order.broker_order_id}:"
+        fills = session.scalars(
+            select(Fill).where(Fill.order_id == order.id)
+        ).all()
+        return sum(
+            (
+                fill.qty
+                for fill in fills
+                if fill_has_trusted_identity(fill)
+                and not fill.broker_fill_id.startswith(synthetic_prefix)
+            ),
+            Decimal(0),
+        )
+
+    @staticmethod
+    def _quantity_overfill_detail(
+        order: Order,
+        aggregate_exact_qty: Decimal,
+    ) -> str | None:
+        if not exact_fill_exceeds_order_quantity(
+            order.qty,
+            aggregate_exact_qty,
+        ):
+            return None
+        return (
+            f"authoritative fill quantity {aggregate_exact_qty} for order "
+            f"{order.id} exceeds requested quantity {order.qty}"
+        )
+
+    def _latch_quantity_overfill_in_session(
+        self,
+        session: Session,
+        order: Order,
+        aggregate_exact_qty: Decimal,
+        drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> bool:
+        detail = self._quantity_overfill_detail(
+            order,
+            aggregate_exact_qty,
+        )
+        if detail is None:
+            return False
+        drift.append(detail)
+        self._latch_order_in_session(
+            order,
+            "fill_quantity_exceeds_order",
+        )
+        trip_in_session(
+            session,
+            BreakerScope.broker_drift(),
+            detail,
+            actor,
+            request_id=request_id,
+            audit_reason=reason,
+        )
+        return True
+
+    def _reconcile_fill_activities(
+        self,
+        drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, frozenset[int], bool]:
+        activity_reader = getattr(self.broker, "get_fill_activities", None)
+        if not callable(activity_reader):
+            return 0, frozenset(), False
+
+        _last_activity_id, after, expected_version = self._cursor_snapshot()
+        try:
+            activities = list(activity_reader(after=after))
+        except BrokerDataIntegrityError as exc:
+            blocked_order_ids = self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_fill_activity",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            drift.append("broker fill activity identity invalid")
+            return 0, frozenset(blocked_order_ids), False
+        except Exception:
+            raise RequiredDependencyUnavailable from None
+
+        observed_at = datetime.now(timezone.utc)
+        # Activity IDs are opaque, not chronological. The broker query overlaps
+        # the timestamp boundary and the fill table's unique broker ID is the
+        # authority for deduplication, including late-visible equal-time fills.
+        batch = sorted(
+            activities,
+            key=lambda activity: _normalized_utc(activity.filled_at),
+        )
+        if not batch:
+            return 0, frozenset(), True
+
+        inserted = 0
+        inserted_activities: list[BrokerFill] = []
+        blocked_order_ids: set[int] = set()
+        advance_cursor = True
+        with self.session_factory() as session:
+            _bind_reconciliation_context(
+                session, actor, reason, request_id
+            )
+            try:
+                for activity in batch:
+                    orders = session.scalars(
+                        select(Order).where(
+                            Order.broker_order_id == activity.broker_order_id
+                        )
+                    ).all()
+                    if len(orders) != 1:
+                        drift.append(
+                            "fill activity "
+                            f"{activity.broker_fill_id} has unknown or ambiguous "
+                            "broker order "
+                            f"{activity.broker_order_id}"
+                        )
+                        advance_cursor = False
+                        continue
+                    order = orders[0]
+                    activity = replace(
+                        activity,
+                        ticker=canonicalize_broker_symbol(
+                            activity.ticker,
+                            local_symbol=order.ticker,
+                        ),
+                        filled_at=_normalized_utc(activity.filled_at),
+                    )
+                    validation_error = self._fill_activity_validation_error(
+                        activity,
+                        order,
+                        observed_at,
+                    )
+                    if validation_error is None:
+                        normalized_qty = normalize_fill_economic(activity.qty)
+                        normalized_price = normalize_fill_economic(
+                            activity.price
+                        )
+                        assert normalized_qty is not None
+                        assert normalized_price is not None
+                        activity = replace(
+                            activity,
+                            qty=normalized_qty,
+                            price=normalized_price,
+                        )
+                    duplicate = None
+                    if validation_error is None:
+                        duplicate = session.scalar(
+                            select(Fill).where(
+                                Fill.broker_fill_id == activity.broker_fill_id
+                            )
+                        )
+                    if validation_error is None and duplicate is not None:
+                        validation_error = (
+                            self._duplicate_fill_validation_error(
+                                activity,
+                                order,
+                                duplicate,
+                            )
+                        )
+                    if validation_error is not None:
+                        drift.append(
+                            f"invalid fill activity "
+                            f"{activity.broker_fill_id}: {validation_error}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_fill_activity",
+                        )
+                        blocked_order_ids.add(order.id)
+                        advance_cursor = False
+                        continue
+                    if duplicate is not None:
+                        if not fill_has_trusted_identity(duplicate):
+                            self._replace_with_authoritative_activity(
+                                duplicate,
+                                order,
+                                activity,
+                            )
+                            inserted_activities.append(activity)
+                        aggregate_exact_qty = (
+                            self._trusted_exact_fill_qty(session, order)
+                        )
+                        if self._latch_quantity_overfill_in_session(
+                            session,
+                            order,
+                            aggregate_exact_qty,
+                            drift,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                        ):
+                            blocked_order_ids.add(order.id)
+                        continue
+                    self._remove_synthetic_fills(session, order)
+                    self._supersede_matching_quarantined_fill(
+                        session,
+                        order,
+                        activity,
+                    )
+                    projected_exact_qty = (
+                        self._trusted_exact_fill_qty(session, order)
+                        + activity.qty
+                    )
+                    exact_fill_overflow = (
+                        self._quantity_overfill_detail(
+                            order,
+                            projected_exact_qty,
+                        )
+                        is not None
+                    )
+                    session.add(
+                        Fill(
+                            order_id=order.id,
+                            ticker=activity.ticker,
+                            side=activity.side,
+                            qty=activity.qty,
+                            price=activity.price,
+                            broker_fill_id=activity.broker_fill_id,
+                            filled_at=activity.filled_at,
+                        )
+                    )
+                    inserted += 1
+                    inserted_activities.append(activity)
+                    if exact_fill_overflow and (
+                        self._latch_quantity_overfill_in_session(
+                            session,
+                            order,
+                            projected_exact_qty,
+                            drift,
+                            actor=actor,
+                            reason=reason,
+                            request_id=request_id,
+                        )
+                    ):
+                        blocked_order_ids.add(order.id)
+
+                if advance_cursor:
+                    cursor_candidate = None
+                    if after is None:
+                        cursor_candidate = batch[-1]
+                    else:
+                        at_or_after_cursor = [
+                            activity
+                            for activity in inserted_activities
+                            if activity.filled_at >= after
+                        ]
+                        if at_or_after_cursor:
+                            cursor_candidate = at_or_after_cursor[-1]
+                    if cursor_candidate is not None:
+                        self._advance_cursor(
+                            session,
+                            cursor_candidate,
+                            expected_version=expected_version,
+                        )
+                _commit_reconciliation_mutations(session, actor, reason, request_id)
+            except ReconciliationConflict:
+                session.rollback()
+                raise
+            except Exception:
+                session.rollback()
+                raise
+        return (
+            inserted,
+            frozenset(blocked_order_ids),
+            advance_cursor,
+        )
+
+    @staticmethod
+    def _replace_with_authoritative_activity(
+        fill: Fill,
+        order: Order,
+        activity: BrokerFill,
+    ) -> None:
+        """Promote one validated exact activity over its untrusted legacy row."""
+        fill.order_id = order.id
+        fill.ticker = activity.ticker
+        fill.side = activity.side
+        fill.qty = activity.qty
+        fill.price = activity.price
+        fill.broker_fill_id = activity.broker_fill_id
+        fill.filled_at = activity.filled_at
+        fill.reconciliation_state = FILL_RECONCILIATION_TRUSTED
+
+    @staticmethod
+    def _supersede_matching_quarantined_fill(
+        session: Session,
+        order: Order,
+        activity: BrokerFill,
+    ) -> None:
+        legacy = session.scalar(
+            select(Fill)
+            .where(
+                or_(
+                    Fill.order_id == order.id,
+                    Fill.order_id.is_(None),
+                ),
+                Fill.reconciliation_state
+                == FILL_RECONCILIATION_QUARANTINED,
+                Fill.ticker == activity.ticker,
+                Fill.side == activity.side,
+                Fill.qty == activity.qty,
+                Fill.price == activity.price,
+            )
+            .order_by(Fill.order_id.is_(None), Fill.id)
+            .limit(1)
+        )
+        if legacy is not None:
+            legacy.order_id = order.id
+            legacy.reconciliation_state = FILL_RECONCILIATION_SUPERSEDED
+
+    @staticmethod
+    def _fill_activity_validation_error(
+        activity: BrokerFill,
+        order: Order,
+        observed_at: datetime,
+    ) -> str | None:
+        if not isinstance(activity.broker_fill_id, str) or not (
+            activity.broker_fill_id.strip()
+        ):
+            return "missing broker fill identity"
+        if (
+            not isinstance(activity.broker_order_id, str)
+            or activity.broker_order_id != order.broker_order_id
+        ):
+            return "broker order identity does not match local order"
+        if (
+            not isinstance(activity.side, str)
+            or activity.side not in {"buy", "sell"}
+        ):
+            return f"unknown side {activity.side!r}"
+        if activity.side != order.side:
+            return (
+                f"side {activity.side!r} does not match local side "
+                f"{order.side!r}"
+            )
+        if (
+            not isinstance(activity.ticker, str)
+            or activity.ticker.upper() != order.ticker.upper()
+        ):
+            return (
+                f"ticker {activity.ticker!r} does not match local ticker "
+                f"{order.ticker!r}"
+            )
+        if not valid_fill_economic(activity.qty):
+            return (
+                f"quantity {activity.qty!r} is outside canonical fill "
+                "precision or bounds"
+            )
+        if not valid_fill_economic(activity.price):
+            return (
+                f"price {activity.price!r} is outside canonical fill "
+                "precision or bounds"
+            )
+        submission_boundary = (
+            order.submission_started_at or order.created_at
+        )
+        allowed_skew = timedelta(
+            seconds=DEFAULT_MAX_FUTURE_SKEW_SECONDS
+        )
+        if activity.filled_at < (
+            _normalized_utc(submission_boundary) - allowed_skew
+        ):
+            return "fill timestamp predates order submission"
+        if activity.filled_at > (
+            _normalized_utc(observed_at) + allowed_skew
+        ):
+            return "fill timestamp is beyond allowed future skew"
+        return None
+
+    @staticmethod
+    def _duplicate_fill_validation_error(
+        activity: BrokerFill,
+        order: Order,
+        duplicate: Fill,
+    ) -> str | None:
+        if (
+            duplicate.order_id != order.id
+            and (
+                duplicate.order_id is not None
+                or fill_has_trusted_identity(duplicate)
+            )
+        ):
+            return "broker fill identity belongs to a different local order"
+        if duplicate.ticker.upper() != activity.ticker.upper():
+            return "broker fill identity replay changed ticker"
+        if duplicate.side != activity.side:
+            return "broker fill identity replay changed side"
+        if duplicate.qty != activity.qty:
+            return "broker fill identity replay changed quantity"
+        if duplicate.price != activity.price:
+            return "broker fill identity replay changed price"
+        if (
+            fill_has_trusted_identity(duplicate)
+            and _normalized_utc(duplicate.filled_at)
+            != _normalized_utc(activity.filled_at)
+        ):
+            return "broker fill identity replay changed timestamp"
+        return None
+
+    @staticmethod
+    def _remove_synthetic_fills(session: Session, order: Order) -> None:
+        synthetic = session.scalars(
+            select(Fill).where(
+                Fill.order_id == order.id,
+                Fill.broker_fill_id.like(f"{order.broker_order_id}:%"),
+            )
+        ).all()
+        for fill in synthetic:
+            session.delete(fill)
+
+    def _advance_cursor(
+        self,
+        session: Session,
+        activity: BrokerFill,
+        *,
+        expected_version: int | None,
+    ) -> None:
+        cursor = session.get(
+            ReconciliationCursor, (self.broker_key, "fills")
+        )
+        if cursor is None:
+            if expected_version is not None:
+                raise ReconciliationConflict
+            session.add(
+                ReconciliationCursor(
+                    broker=self.broker_key,
+                    stream="fills",
+                    last_activity_id=activity.broker_fill_id,
+                    last_activity_at=activity.filled_at,
+                    version=1,
+                )
+            )
+            return
+        if cursor.version != expected_version:
+            raise ReconciliationConflict
+        cursor.last_activity_id = activity.broker_fill_id
+        cursor.last_activity_at = activity.filled_at
+        cursor.version += 1
+
+    def _reconcile_statuses(
+        self,
+        drift: list[str],
+        *,
+        prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
+        blocked_fill_order_ids: frozenset[int] = frozenset(),
+        exact_fill_stream_complete: bool = False,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[int, int]:
+        needs_status_reconciliation = or_(
+            Order.status.in_(
+                (
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                )
+            ),
+            Order.acceptance_state == FILL_RECONCILIATION_REQUIRED,
+        )
+        with self.session_factory() as session:
+            missing_ids = session.scalars(
+                select(Order.id).where(
+                    needs_status_reconciliation,
+                    Order.broker_order_id.is_(None),
+                )
+            ).all()
+            rows = session.execute(
+                select(Order.id, Order.broker_order_id).where(
+                    needs_status_reconciliation,
+                    Order.broker_order_id.is_not(None),
+                )
+            ).all()
+
+        for order_id in missing_ids:
+            drift.append(f"local open order {order_id} has no broker order id")
+
+        results: list[tuple[int, OrderResult]] = list(prefetched_results)
+        prefetched_order_ids = {
+            order_id for order_id, _remote in prefetched_results
+        }
+        for order_id, broker_order_id in rows:
+            if order_id in prefetched_order_ids:
+                continue
+            try:
+                results.append(
+                    (order_id, self.broker.get_order_status(broker_order_id))
+                )
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    (order_id,),
+                    "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                drift.append(
+                    f"local order {order_id} has invalid broker fill payload"
+                )
+            except Exception:
+                raise RequiredDependencyUnavailable from None
+
+        inserted = 0
+        exact_reader = callable(getattr(self.broker, "get_fill_activities", None))
+        for order_id, remote in results:
+            with self.session_factory() as session:
+                _bind_reconciliation_context(
+                    session, actor, reason, request_id
+                )
+                order = session.get(Order, order_id)
+                if order is None:
+                    continue
+                identity_error = order_result_identity_error(
+                    remote,
+                    order.idempotency_key,
+                    order.ticker,
+                )
+                if (
+                    identity_error is None
+                    and remote.broker_order_id != order.broker_order_id
+                ):
+                    identity_error = (
+                        "broker order identity does not match local order"
+                    )
+                if identity_error is not None:
+                    drift.append(
+                        f"local order {order.id} has invalid broker identity: "
+                        f"{identity_error}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_broker_identity",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                if not valid_cumulative_filled_qty(remote.filled_qty):
+                    drift.append(
+                        f"local order {order.id} invalid cumulative filled_qty "
+                        f"{remote.filled_qty}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                target = remote.status
+                current = OrderStatus(order.status)
+                latch_changed = False
+                all_prior_fills = session.scalars(
+                    select(Fill).where(Fill.order_id == order.id)
+                ).all()
+                prior_fills = [
+                    fill
+                    for fill in all_prior_fills
+                    if fill_has_trusted_identity(fill)
+                ]
+                unmatched_legacy_fills = [
+                    fill
+                    for fill in all_prior_fills
+                    if fill_requires_reconciliation(fill)
+                ]
+                recorded = sum(
+                    (fill.qty for fill in prior_fills), Decimal(0)
+                )
+                synthetic_prefix = f"{order.broker_order_id}:"
+                authoritative_fills = [
+                    fill
+                    for fill in prior_fills
+                    if (
+                        fill.broker_fill_id is not None
+                        and not fill.broker_fill_id.startswith(
+                            synthetic_prefix
+                        )
+                    )
+                ]
+                authoritative_qty = sum(
+                    (fill.qty for fill in authoritative_fills),
+                    Decimal(0),
+                )
+                if self._latch_quantity_overfill_in_session(
+                    session,
+                    order,
+                    authoritative_qty,
+                    drift,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                ):
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                authoritative_relation = fill_quantity_relation(
+                    remote.filled_qty,
+                    authoritative_qty,
+                )
+                if authoritative_relation is None:
+                    drift.append(
+                        f"broker order {order.id} has noncanonical cumulative "
+                        "or authoritative fill quantity"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                remote_exceeds_authoritative = (
+                    authoritative_relation is FillQuantityRelation.AHEAD
+                )
+                remote_below_authoritative = (
+                    authoritative_relation is FillQuantityRelation.BEHIND
+                )
+                if remote_below_authoritative:
+                    drift.append(
+                        f"broker order {order.id} cumulative "
+                        f"{remote.filled_qty} is below authoritative local "
+                        f"quantity {authoritative_qty}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "cumulative_fill_contradiction",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                if target in _FILL_STATUSES or remote_exceeds_authoritative:
+                    if (
+                        target is not current
+                        and OrderStateMachine.can_transition(current, target)
+                    ):
+                        OrderStateMachine.transition(order, target)
+                        latch_changed = True
+                    if (
+                        order.acceptance_state
+                        != FILL_RECONCILIATION_REQUIRED
+                    ):
+                        order.acceptance_state = (
+                            FILL_RECONCILIATION_REQUIRED
+                        )
+                        order.updated_at = datetime.now(timezone.utc)
+                        latch_changed = True
+                fill_reconciliation_required = (
+                    order.acceptance_state
+                    == FILL_RECONCILIATION_REQUIRED
+                )
+                if fill_reconciliation_required:
+                    if unmatched_legacy_fills:
+                        self._latch_order_in_session(
+                            order,
+                            "legacy_unidentified_fill",
+                        )
+                        drift.append(
+                            f"broker order {order.id} still has "
+                            f"{len(unmatched_legacy_fills)} quarantined "
+                            "legacy fill(s)"
+                        )
+                        _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    terminal_zero_fill_resolved = (
+                        order.last_error_code == "indeterminate_cancel"
+                        and target
+                        in {
+                            OrderStatus.CANCELED,
+                            OrderStatus.REJECTED,
+                            OrderStatus.EXPIRED,
+                        }
+                        and remote.filled_qty == Decimal(0)
+                        and authoritative_qty == Decimal(0)
+                        and not prior_fills
+                        and exact_fill_stream_complete
+                    )
+                    if order.id in blocked_fill_order_ids:
+                        if latch_changed:
+                            order.version += 1
+                        _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    if not exact_reader:
+                        drift.append(
+                            f"broker order {order.id} requires authoritative "
+                            "fill activities"
+                        )
+                        if latch_changed:
+                            order.version += 1
+                            _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    if not exact_fill_stream_complete:
+                        drift.append(
+                            f"broker order {order.id} authoritative fill "
+                            "activity stream is incomplete"
+                        )
+                        if latch_changed:
+                            order.version += 1
+                            _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    if (
+                        not remote.filled_qty.is_finite()
+                        or (
+                            remote.filled_qty == Decimal(0)
+                            and not terminal_zero_fill_resolved
+                        )
+                        or len(authoritative_fills) != len(prior_fills)
+                        or authoritative_relation
+                        is not FillQuantityRelation.EXACT
+                    ):
+                        drift.append(
+                            f"broker order {order.id} fill reconciliation "
+                            f"requires {remote.filled_qty} authoritative quantity "
+                            f"but exact activities contain {authoritative_qty}"
+                        )
+                        if latch_changed:
+                            order.version += 1
+                            _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                new_qty = remote.filled_qty - recorded
+                recorded_relation = fill_quantity_relation(
+                    remote.filled_qty,
+                    recorded,
+                )
+                if recorded_relation is None:
+                    drift.append(
+                        f"broker order {order.id} has noncanonical cumulative "
+                        "or recorded fill quantity"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "invalid_cumulative_fill",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                if recorded_relation is FillQuantityRelation.BEHIND:
+                    drift.append(
+                        f"broker order {order.id} cumulative "
+                        f"{remote.filled_qty} is below recorded local "
+                        f"quantity {recorded}"
+                    )
+                    self._latch_order_in_session(
+                        order,
+                        "cumulative_fill_contradiction",
+                    )
+                    _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                if (
+                    exact_reader
+                    and recorded_relation is FillQuantityRelation.AHEAD
+                ):
+                    drift.append(
+                        f"broker order {order.id} reports {remote.filled_qty} filled "
+                        f"but exact activities contain {recorded}"
+                    )
+                    if latch_changed:
+                        order.version += 1
+                        _commit_reconciliation_mutations(session, actor, reason, request_id)
+                    continue
+                if (
+                    not exact_reader
+                    and recorded_relation is FillQuantityRelation.AHEAD
+                ):
+                    if not valid_fill_economic(remote.avg_fill_price):
+                        drift.append(
+                            f"broker order {order.id} has invalid cumulative "
+                            f"average fill price {remote.avg_fill_price}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
+                        )
+                        _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    assert remote.avg_fill_price is not None
+                    recorded_notional = sum(
+                        (fill.qty * fill.price for fill in prior_fills), Decimal(0)
+                    )
+                    cumulative_notional = remote.filled_qty * remote.avg_fill_price
+                    incremental_notional = cumulative_notional - recorded_notional
+                    normalized_new_qty = normalize_fill_economic(new_qty)
+                    normalized_incremental_price = normalize_fill_economic(
+                        incremental_notional / new_qty
+                    )
+                    if (
+                        incremental_notional <= 0
+                        or normalized_new_qty is None
+                        or normalized_incremental_price is None
+                    ):
+                        drift.append(
+                            "broker cumulative fill is outside canonical "
+                            f"precision or moved behind local ledger for order "
+                            f"{order.id}"
+                        )
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
+                        )
+                        if latch_changed:
+                            order.version += 1
+                        _commit_reconciliation_mutations(session, actor, reason, request_id)
+                        continue
+                    session.add(
+                        Fill(
+                            order_id=order.id,
+                            ticker=order.ticker,
+                            side=order.side,
+                            qty=normalized_new_qty,
+                            price=normalized_incremental_price,
+                            broker_fill_id=(
+                                f"{order.broker_order_id}:{remote.filled_qty}"
+                            ),
+                        )
+                    )
+                    inserted += 1
+
+                if fill_reconciliation_required:
+                    order.acceptance_state = "accepted"
+                    order.last_error_code = ""
+                current = OrderStatus(order.status)
+                if (
+                    target is not current
+                    and OrderStateMachine.can_transition(current, target)
+                ):
+                    OrderStateMachine.transition(order, target)
+                order.last_reconciled_at = datetime.now(timezone.utc)
+                order.version += 1
+                _commit_reconciliation_mutations(session, actor, reason, request_id)
+        return len(results), inserted
+
+    def _detect_open_order_drift(
+        self,
+        drift: list[str],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> None:
+        try:
+            remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            drift.append("invalid broker open-order payload")
+            return
+        except Exception:
+            raise RequiredDependencyUnavailable from None
+        for remote in remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                self._latch_broker_order_id(
+                    remote.broker_order_id,
+                    "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                drift.append(
+                    "open order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
+        if any(
+            not isinstance(remote.broker_order_id, str)
+            or not remote.broker_order_id.strip()
+            for remote in remote_open
+        ):
+            drift.append("remote open order is missing broker order id")
+        drift.extend(self._remote_open_order_faults(remote_open))
+
+    def _remote_open_order_faults(
+        self,
+        remote_open: list[OrderResult],
+        *,
+        missing_local_is_fault: bool = True,
+    ) -> tuple[str, ...]:
+        remote_ids = {
+            remote.broker_order_id
+            for remote in remote_open
+            if isinstance(remote.broker_order_id, str)
+            and remote.broker_order_id.strip()
+        }
+        if not remote_ids:
+            return ()
+        with self.session_factory() as session:
+            local_orders = session.scalars(
+                select(Order).where(Order.broker_order_id.in_(remote_ids))
+            ).all()
+        local_by_broker_id: dict[str, list[Order]] = {}
+        for order in local_orders:
+            if order.broker_order_id:
+                local_by_broker_id.setdefault(
+                    order.broker_order_id,
+                    [],
+                ).append(order)
+
+        faults: list[str] = []
+        for remote in remote_open:
+            broker_order_id = remote.broker_order_id
+            if (
+                not isinstance(broker_order_id, str)
+                or not broker_order_id.strip()
+            ):
+                continue
+            matches = local_by_broker_id.get(broker_order_id, [])
+            if not matches:
+                if missing_local_is_fault:
+                    faults.append(
+                        f"remote open order {broker_order_id} has no local order"
+                    )
+                continue
+            if len(matches) != 1:
+                faults.append(
+                    f"remote open order {broker_order_id} matches multiple "
+                    f"local orders {[order.id for order in matches]}"
+                )
+                continue
+            local = matches[0]
+            if local.status in _LOCAL_TERMINAL_STATUSES:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"terminal local order {local.id} status {local.status}"
+                )
+                continue
+            identity_error = order_result_identity_error(
+                remote,
+                local.idempotency_key,
+                local.ticker,
+            )
+            if identity_error is not None:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"local order {local.id}: {identity_error}"
+                )
+                continue
+            if local.status not in _LOCAL_LIVE_STATUSES:
+                faults.append(
+                    f"remote open order {broker_order_id} conflicts with "
+                    f"non-live local order {local.id} status {local.status}"
+                )
+        return tuple(faults)
+
+    def panic(
+        self,
+        actor: str,
+        reason: str,
+        *,
+        request_id: str,
+    ) -> PanicReport:
+        actor = actor.strip()
+        reason = reason.strip()
+        actor, reason, request_id = _require_context(
+            actor, reason, request_id
+        )
+        with self.submission_barrier.hold_writer():
+            return self._panic_under_writer(
+                actor,
+                reason,
+                request_id=request_id,
+            )
+
+    def _panic_under_writer(
+        self,
+        actor: str,
+        reason: str,
+        *,
+        request_id: str,
+    ) -> PanicReport:
+        # The durable global latch is the first side effect. No broker call occurs
+        # until its transaction is closed. The outer process-safe writer interval
+        # remains held through rule cancellation, broker cancellation, final local
+        # enumeration, and the safe decision.
+        self.breakers.trip(
+            BreakerScope.operator_global(),
+            reason=f"panic by {actor}: {reason}",
+            actor=actor,
+            request_id=request_id,
+            audit_reason=reason,
+        )
+
+        with self.session_factory() as session:
+            rule_ids = session.scalars(
+                select(Rule.id)
+                .where(
+                    Rule.state.in_(
+                        ("pending", "active", "processing")
+                    )
+                )
+                .order_by(Rule.id)
+            ).all()
+            group_ids = session.scalars(
+                select(RuleGroup.id)
+                .where(
+                    RuleGroup.state.in_(("pending", "active"))
+                )
+                .order_by(RuleGroup.id)
+            ).all()
+            session.execute(
+                update(Rule)
+                .where(Rule.id.in_(rule_ids))
+                .values(state="canceled")
+            )
+            session.execute(
+                update(RuleGroup)
+                .where(RuleGroup.id.in_(group_ids))
+                .values(
+                    state="canceled",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    version=RuleGroup.version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            for rule_id in rule_ids:
+                _audit_reconciliation_mutation(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="rule.panic_cancel",
+                    target_type="rule",
+                    target_id=str(rule_id),
+                    result_code="canceled",
+                )
+            for group_id in group_ids:
+                _audit_reconciliation_mutation(
+                    session,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    action="rule_group.panic_cancel",
+                    target_type="rule_group",
+                    target_id=str(group_id),
+                    result_code="canceled",
+                )
+            _commit_reconciliation_mutations(session, actor, reason, request_id)
+
+        self.reconcile_unknown(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+
+        with self.session_factory() as session:
+            local_rows = session.execute(
+                select(Order.id, Order.broker_order_id).where(
+                    Order.status.in_(_LOCAL_LIVE_STATUSES)
+                )
+            ).all()
+        local_by_broker_id: dict[str, list[int]] = {}
+        for local_id, broker_order_id in local_rows:
+            if broker_order_id:
+                local_by_broker_id.setdefault(broker_order_id, []).append(local_id)
+
+        enumeration_failed = False
+        panic_drift: list[str] = []
+        try:
+            remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            panic_drift.append(
+                "panic open-order payload is invalid"
+            )
+            remote_open = []
+            enumeration_failed = True
+        except Exception:
+            remote_open = []
+            enumeration_failed = True
+        invalid_remote_ids: set[str] = set()
+        for remote in remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                if remote.broker_order_id is not None:
+                    invalid_remote_ids.add(remote.broker_order_id)
+                    self._latch_broker_order_id(
+                        remote.broker_order_id,
+                        "invalid_cumulative_fill",
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                panic_drift.append(
+                    "panic open-order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
+        panic_drift.extend(
+            self._remote_open_order_faults(
+                remote_open,
+                missing_local_is_fault=False,
+            )
+        )
+        unaddressable_remote_open = any(
+            remote.broker_order_id is None for remote in remote_open
+        ) or bool(invalid_remote_ids)
+        remote_by_id = {
+            remote.broker_order_id: remote
+            for remote in remote_open
+            if remote.broker_order_id is not None
+            and remote.broker_order_id not in invalid_remote_ids
+        }
+        explicit_ids = sorted(
+            set(local_by_broker_id)
+            | {
+                remote.broker_order_id
+                for remote in remote_open
+                if remote.broker_order_id is not None
+            }
+        )
+
+        confirmed_canceled: list[str] = []
+        verified_terminal: set[str] = set()
+        potentially_open: set[str] = set(explicit_ids)
+        for broker_order_id in explicit_ids:
+            try:
+                self.broker.cancel_order(broker_order_id)
+            except Exception:
+                pass
+            try:
+                verified = self.broker.get_order_status(broker_order_id)
+            except BrokerDataIntegrityError as exc:
+                self._latch_order_ids(
+                    local_by_broker_id.get(broker_order_id, []),
+                    "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                panic_drift.append(
+                    f"panic order {broker_order_id} has invalid broker payload"
+                )
+                continue
+            except Exception:
+                continue
+            if not valid_cumulative_filled_qty(verified.filled_qty):
+                self._latch_order_ids(
+                    local_by_broker_id.get(broker_order_id, []),
+                    "invalid_cumulative_fill",
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+                panic_drift.append(
+                    f"panic order {broker_order_id} invalid cumulative "
+                    f"filled_qty {verified.filled_qty}"
+                )
+                continue
+            if verified.status not in _REMOTE_OPEN_STATUSES:
+                verified_terminal.add(broker_order_id)
+                potentially_open.discard(broker_order_id)
+                if verified.status is OrderStatus.CANCELED:
+                    confirmed_canceled.append(broker_order_id)
+                panic_drift.extend(
+                    self._persist_verified_status(
+                        local_by_broker_id.get(broker_order_id, ()),
+                        verified,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                )
+
+        try:
+            final_remote_open = self.broker.get_open_orders()
+        except BrokerDataIntegrityError as exc:
+            self._latch_broker_order_id(
+                exc.broker_order_id,
+                "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            panic_drift.append(
+                "panic final open-order payload is invalid"
+            )
+            enumeration_failed = True
+            final_remote_open = [
+                remote_by_id[broker_order_id]
+                for broker_order_id in explicit_ids
+                if broker_order_id in remote_by_id
+                and broker_order_id not in verified_terminal
+            ]
+        except Exception:
+            enumeration_failed = True
+            final_remote_open = [
+                remote_by_id[broker_order_id]
+                for broker_order_id in explicit_ids
+                if broker_order_id in remote_by_id
+                and broker_order_id not in verified_terminal
+            ]
+        for remote in final_remote_open:
+            if not valid_cumulative_filled_qty(remote.filled_qty):
+                if remote.broker_order_id is not None:
+                    potentially_open.add(remote.broker_order_id)
+                    self._latch_broker_order_id(
+                        remote.broker_order_id,
+                        "invalid_cumulative_fill",
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                panic_drift.append(
+                    "panic final open-order invalid cumulative filled_qty "
+                    f"{remote.filled_qty} for {remote.broker_order_id}"
+                )
+        panic_drift.extend(
+            self._remote_open_order_faults(
+                final_remote_open,
+                missing_local_is_fault=False,
+            )
+        )
+        unaddressable_remote_open = unaddressable_remote_open or any(
+            remote.broker_order_id is None for remote in final_remote_open
+        ) or bool(panic_drift)
+        remote_open_ids = tuple(
+            sorted(
+                {
+                    remote.broker_order_id
+                    for remote in final_remote_open
+                    if remote.broker_order_id is not None
+                    and remote.status in _REMOTE_OPEN_STATUSES
+                }
+                | potentially_open
+            )
+        )
+
+        local_state = enumerate_unsafe_local_state(
+            self.session_factory
+        )
+        local_unconfirmed = local_state.unsafe_order_ids
+
+        safe = (
+            not enumeration_failed
+            and not unaddressable_remote_open
+            and not local_state.has_unsafe_state
+            and not remote_open_ids
+        )
+        self._trip_reconciliation_faults(
+            panic_drift,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+        if safe:
+            message = "panic verified: no local unknown/open or broker open orders remain"
+        else:
+            message = (
+                "panic incomplete: safety could not be confirmed; "
+                f"broker_enumeration={'unconfirmed' if enumeration_failed else 'confirmed'} "
+                f"unaddressable_remote_open={str(unaddressable_remote_open).lower()} "
+                f"local_unconfirmed={list(local_unconfirmed)} "
+                f"remote_open={list(remote_open_ids)}"
+            )
+        return PanicReport(
+            safe=safe,
+            local_enumeration=local_state.enumeration,
+            remote_enumeration=(
+                "unknown" if enumeration_failed else "confirmed"
+            ),
+            confirmed_canceled=tuple(sorted(confirmed_canceled)),
+            unconfirmed_order_ids=local_unconfirmed,
+            remote_open_order_ids=remote_open_ids,
+            unsafe_local_state=local_state,
+            message=message,
+        )
+
+    def _persist_verified_status(
+        self,
+        local_order_ids: tuple[int, ...] | list[int],
+        remote: OrderResult,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> tuple[str, ...]:
+        if not local_order_ids:
+            return ()
+        if not valid_cumulative_filled_qty(remote.filled_qty):
+            self._latch_order_ids(
+                list(local_order_ids),
+                "invalid_cumulative_fill",
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            return (
+                "panic verified status has invalid cumulative filled_qty "
+                f"{remote.filled_qty}",
+            )
+        now = datetime.now(timezone.utc)
+        faults: list[str] = []
+        with self.submission_barrier.hold_writer():
+            with self.session_factory() as session:
+                _bind_reconciliation_context(
+                    session, actor, reason, request_id
+                )
+                orders = session.scalars(
+                    select(Order).where(Order.id.in_(local_order_ids))
+                ).all()
+                for order in orders:
+                    identity_error = order_result_identity_error(
+                        remote,
+                        order.idempotency_key,
+                        order.ticker,
+                    )
+                    if (
+                        identity_error is None
+                        and remote.broker_order_id
+                        != order.broker_order_id
+                    ):
+                        identity_error = (
+                            "broker order identity does not match local order"
+                        )
+                    if identity_error is not None:
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_broker_identity",
+                        )
+                        faults.append(
+                            f"panic order {order.id} has invalid broker "
+                            f"identity: {identity_error}"
+                        )
+                        continue
+                    synthetic_prefix = f"{order.broker_order_id}:"
+                    local_fills = session.scalars(
+                        select(Fill).where(Fill.order_id == order.id)
+                    ).all()
+                    trusted_fills = [
+                        fill
+                        for fill in local_fills
+                        if fill_has_trusted_identity(fill)
+                    ]
+                    authoritative_fills = [
+                        fill
+                        for fill in trusted_fills
+                        if not fill.broker_fill_id.startswith(
+                            synthetic_prefix
+                        )
+                    ]
+                    authoritative_qty = sum(
+                        (fill.qty for fill in authoritative_fills),
+                        Decimal(0),
+                    )
+                    if self._latch_quantity_overfill_in_session(
+                        session,
+                        order,
+                        authoritative_qty,
+                        faults,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    ):
+                        continue
+                    fill_truth_complete = (
+                        not any(
+                            fill_requires_reconciliation(fill)
+                            for fill in local_fills
+                        )
+                        and len(authoritative_fills) == len(trusted_fills)
+                    )
+                    relation = fill_quantity_relation(
+                        remote.filled_qty,
+                        authoritative_qty,
+                    )
+                    if relation is None:
+                        self._latch_order_in_session(
+                            order,
+                            "invalid_cumulative_fill",
+                        )
+                        faults.append(
+                            f"panic order {order.id} has noncanonical "
+                            "cumulative or authoritative fill quantity"
+                        )
+                        continue
+                    if relation is FillQuantityRelation.BEHIND:
+                        self._latch_order_in_session(
+                            order,
+                            "cumulative_fill_contradiction",
+                        )
+                        faults.append(
+                            f"panic order {order.id} cumulative "
+                            f"{remote.filled_qty} is below authoritative local "
+                            f"quantity {authoritative_qty}"
+                        )
+                        continue
+                    order.status = remote.status.value
+                    order.last_reconciled_at = now
+                    order.updated_at = now
+                    order.version += 1
+                    if (
+                        relation is FillQuantityRelation.EXACT
+                        and authoritative_qty > Decimal(0)
+                        and fill_truth_complete
+                    ):
+                        order.acceptance_state = "accepted"
+                        order.last_error_code = ""
+                    elif (
+                        remote.status in _FILL_STATUSES
+                        or relation is FillQuantityRelation.AHEAD
+                    ):
+                        order.acceptance_state = (
+                            FILL_RECONCILIATION_REQUIRED
+                        )
+                _commit_reconciliation_mutations(session, actor, reason, request_id)
+        return tuple(faults)

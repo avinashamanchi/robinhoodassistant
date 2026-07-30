@@ -12,15 +12,21 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from ..dependencies import RequiredDependencyUnavailable
+from ..identity import canonical_request_id
 from ..signals.models import MarketFeatures
+from .citations import validate_source_citations
 from .models import AnalysisReport
+from .untrusted import (
+    UntrustedSummary,
+    validate_summary_for_privileged_use,
+)
 
 _PLAYBOOK = (Path(__file__).resolve().parent.parent / "signals" / "playbook.md").read_text(
     encoding="utf-8"
 )
 
 EARNINGS_HORIZON_DAYS = 21
-
 SYSTEM_PREAMBLE = (
     "You are a disciplined trading analyst. You are given deterministic, "
     "pre-computed market features — you INTERPRET them, you never recompute or "
@@ -42,11 +48,23 @@ SUBMIT_TOOL: dict[str, Any] = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "thesis": {"type": "string"},
             "cited_concepts": {"type": "array", "items": {"type": "string"}},
+            "cited_source_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
             "regime_note": {"type": "string"},
             "earnings_note": {"type": ["string", "null"]},
             "correlation_note": {"type": ["string", "null"]},
         },
-        "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note"],
+        "required": [
+            "action",
+            "confidence",
+            "thesis",
+            "cited_concepts",
+            "cited_source_refs",
+            "regime_note",
+        ],
     },
 }
 
@@ -75,6 +93,11 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "thesis": {"type": "string"},
             "cited_concepts": {"type": "array", "items": {"type": "string"}},
+            "cited_source_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
             "regime_note": {"type": "string"},
             "earnings_note": {"type": ["string", "null"]},
             "correlation_note": {"type": ["string", "null"]},
@@ -128,8 +151,18 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
                 "required": ["targets", "stop"],
             },
         },
-        "required": ["action", "confidence", "thesis", "cited_concepts", "regime_note",
-                     "scenarios", "invalidation", "entry_plan", "exit_plan"],
+        "required": [
+            "action",
+            "confidence",
+            "thesis",
+            "cited_concepts",
+            "cited_source_refs",
+            "regime_note",
+            "scenarios",
+            "invalidation",
+            "entry_plan",
+            "exit_plan",
+        ],
     },
 }
 
@@ -138,6 +171,7 @@ class LLMBackend(Protocol):
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
         tool_choice: Optional[str] = None,
+        request_id: str,
     ) -> Any: ...
 
 
@@ -145,7 +179,17 @@ class Analyst:
     def __init__(
         self, backend: LLMBackend, model: str = "", max_tokens: int = 1024,
         suppress_ranging: bool = False,
+        *,
+        max_attempts: int,
     ) -> None:
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts <= 0
+        ):
+            raise ValueError(
+                "max_attempts must be a positive integer"
+            )
         self.backend = backend
         self.model = model
         self.max_tokens = max_tokens
@@ -153,27 +197,72 @@ class Analyst:
         # directional trades in directionless markets. Deterministic, not a number
         # we curve-fit: HOLD/NO_TRADE when the regime is RANGING.
         self.suppress_ranging = suppress_ranging
+        self.max_attempts = max_attempts
 
-    def _prompt(self, features: MarketFeatures, held_symbols: list[str]) -> str:
+    def _prompt(
+        self,
+        features: MarketFeatures,
+        held_symbols: list[str],
+        untrusted_summary: UntrustedSummary | None,
+    ) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
         # the analyst reasons over.
         payload = features.model_dump(mode="json", exclude={"recent_bars"})
-        return (
+        prompt = (
             "Analyze these features and submit_analysis.\n"
             f"Currently held (for correlation): {held_symbols or 'none'}\n"
             f"FEATURES:\n{json.dumps(payload, indent=2, default=str)}"
         )
+        if untrusted_summary is not None:
+            prompt += (
+                "\nUNTRUSTED_SUMMARY:\n"
+                + json.dumps(
+                    untrusted_summary.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        return prompt
+
+    def _create(self, **kwargs):
+        try:
+            return self.backend.create(**kwargs)
+        except RequiredDependencyUnavailable:
+            raise
+        except Exception:
+            raise RequiredDependencyUnavailable from None
 
     def analyze(
-        self, features: MarketFeatures, held_symbols: Optional[list[str]] = None
+        self,
+        features: MarketFeatures,
+        held_symbols: Optional[list[str]] = None,
+        untrusted_summary: UntrustedSummary | None = None,
+        *,
+        request_id: str,
     ) -> AnalysisReport:
-        resp = self.backend.create(
+        budget_request_id = canonical_request_id(request_id)
+        if untrusted_summary is not None:
+            validate_summary_for_privileged_use(untrusted_summary)
+        resp = self._create(
             system=SYSTEM_PREAMBLE,
-            messages=[{"role": "user", "content": self._prompt(features, held_symbols or [])}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": self._prompt(
+                        features,
+                        held_symbols or [],
+                        untrusted_summary,
+                    ),
+                }
+            ],
             tools=[SUBMIT_TOOL],
             tool_choice="any",   # structured output is mandatory for the analyst
+            request_id=budget_request_id,
         )
         report = self._parse(resp, features)
+        validate_source_citations(report, untrusted_summary)
         self._enforce_quality(report, features)
         return self._apply_regime_filter(report, features)
 
@@ -191,37 +280,72 @@ class Analyst:
         self,
         features: MarketFeatures,
         held_symbols: Optional[list[str]] = None,
-        news: Optional[list[str]] = None,
+        untrusted_summary: UntrustedSummary | None = None,
+        *,
+        request_id: str,
     ):
         """Produce a full TradePlan (scenarios, invalidation, entry ladder, exits)."""
         from decimal import Decimal
 
         from .models import TradePlan
 
+        if untrusted_summary is not None:
+            validate_summary_for_privileged_use(untrusted_summary)
         system = PLAN_PREAMBLE
-        user = self._prompt(features, held_symbols or [])
-        if news:
-            from .news import NEWS_GUARD, format_news_context
-
-            system = NEWS_GUARD + "\n\n" + PLAN_PREAMBLE
-            user = user + "\n\n" + format_news_context(news)
-
-        resp = self.backend.create(
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            tools=[SUBMIT_PLAN_TOOL],
-            tool_choice="any",   # the plan tool call is mandatory
+        user = self._prompt(
+            features,
+            held_symbols or [],
+            untrusted_summary,
         )
-        for block in getattr(resp, "content", []):
-            if getattr(block, "type", None) == "tool_use" and block.name == "submit_plan":
+
+        validation_error: ValueError | None = None
+        budget_request_id = canonical_request_id(request_id)
+        for _ in range(self.max_attempts):
+            prompt = user
+            if validation_error is not None:
+                summary = str(validation_error)[:1200]
+                prompt += (
+                    "\n\nYour previous submit_plan failed deterministic validation:\n"
+                    f"{summary}\n"
+                    "Return one complete corrected submit_plan. Preserve the thesis "
+                    "where possible, but satisfy every trade-plan rule exactly."
+                )
+            resp = self._create(
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[SUBMIT_PLAN_TOOL],
+                tool_choice="any",   # the plan tool call is mandatory
+                request_id=budget_request_id,
+            )
+            try:
+                block = next(
+                    block
+                    for block in getattr(resp, "content", [])
+                    if (
+                        getattr(block, "type", None) == "tool_use"
+                        and block.name == "submit_plan"
+                    )
+                )
                 data = dict(block.input)
                 data["symbol"] = features.symbol
                 data["as_of"] = features.as_of
                 data["reference_price"] = Decimal(str(features.last_close or 0))
                 plan = TradePlan(**data)
+                validate_source_citations(
+                    plan,
+                    untrusted_summary,
+                )
                 self._enforce_quality(plan, features)
                 return self._apply_regime_filter(plan, features)
-        raise ValueError("analyst did not submit a plan")
+            except StopIteration:
+                validation_error = ValueError("analyst did not submit a plan")
+            except ValueError as exc:
+                validation_error = exc
+
+        raise ValueError(
+            "analyst plan remained invalid after "
+            f"{self.max_attempts} structured attempts"
+        ) from validation_error
 
     def _apply_regime_filter(self, report, features: MarketFeatures):
         """v2: force HOLD/NO_TRADE in RANGING regimes (deterministic post-filter)."""

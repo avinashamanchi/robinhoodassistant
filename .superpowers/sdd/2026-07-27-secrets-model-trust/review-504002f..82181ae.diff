@@ -1,0 +1,450 @@
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 8fc0d1a..d1adadf 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -5,2 +5,2 @@ from __future__ import annotations
+-from collections import deque
+-from dataclasses import dataclass, field, fields, is_dataclass
++from collections import Counter, deque
++from dataclasses import dataclass, field
+@@ -9 +9,7 @@ from functools import partial
+-from types import FunctionType, MethodType, SimpleNamespace
++from types import (
++    FunctionType,
++    GetSetDescriptorType,
++    MappingProxyType,
++    MemberDescriptorType,
++    MethodType,
++)
+@@ -153,0 +160,12 @@ _TEST_BROKER_REQUIRED_METHODS = frozenset(
++_TEST_BROKER_EXACT_MAPPING_TYPES = frozenset({dict, Counter})
++_TEST_BROKER_EXACT_SEQUENCE_TYPES = frozenset(
++    {list, tuple, set, frozenset, deque}
++)
++_TEST_BROKER_CONTAINER_BASE_TYPES = (
++    dict,
++    list,
++    tuple,
++    set,
++    frozenset,
++    deque,
++)
+@@ -604 +622 @@ def _require_bounded_test_broker_graph(
+-    if not isinstance(root, mock_broker_type):
++    if mock_broker_type not in _static_type_mro(type(root)):
+@@ -606,7 +624,5 @@ def _require_bounded_test_broker_graph(
+-    try:
+-        root_state = vars(root)
+-    except TypeError:
+-        raise RuntimeError(
+-            "production_test_capability_forbidden"
+-        ) from None
+-    if type(root_state) is not dict:
++    root_state = _static_instance_state(
++        root,
++        _static_type_mro(type(root)),
++    )
++    if root_state is None:
+@@ -623,4 +639 @@ def _require_bounded_test_broker_graph(
+-    stack = [
+-        (value, 1)
+-        for value in root_state.values()
+-    ]
++    stack = [(root, 0)]
+@@ -643 +656 @@ def _require_bounded_test_broker_graph(
+-    seen = {id(root)}
++    seen = set()
+@@ -656 +669,4 @@ def _require_bounded_test_broker_graph(
+-        if isinstance(value, BrokerClient):
++        if (
++            value is not root
++            and BrokerClient in _static_type_mro(type(value))
++        ):
+@@ -672,2 +688,2 @@ def _static_broker_attribute(
+-    for owner in type(root).__mro__:
+-        namespace = vars(owner)
++    for owner in _static_type_mro(type(root)):
++        namespace = _static_type_namespace(owner)
+@@ -681,3 +697,9 @@ def _test_broker_owned_children(value: object) -> tuple[object, ...]:
+-    if value_type is dict:
+-        return tuple(value.keys()) + tuple(value.values())
+-    if value_type in {list, tuple, set, frozenset, deque}:
++    value_mro = _static_type_mro(value_type)
++    if type in value_mro:
++        return _static_class_owned_values(
++            _static_type_mro(value),
++            include_all=True,
++        )
++    if value_type in _TEST_BROKER_EXACT_MAPPING_TYPES:
++        return tuple(dict.keys(value)) + tuple(dict.values(value))
++    if value_type in _TEST_BROKER_EXACT_SEQUENCE_TYPES:
+@@ -685,2 +707,5 @@ def _test_broker_owned_children(value: object) -> tuple[object, ...]:
+-    if value_type is SimpleNamespace:
+-        return tuple(vars(value).values())
++    if any(
++        container_type in value_mro
++        for container_type in _TEST_BROKER_CONTAINER_BASE_TYPES
++    ):
++        raise RuntimeError("production_test_capability_forbidden")
+@@ -705,13 +730,101 @@ def _test_broker_owned_children(value: object) -> tuple[object, ...]:
+-    if is_dataclass(value) and not isinstance(value, type):
+-        try:
+-            state = vars(value)
+-        except TypeError:
+-            raise RuntimeError(
+-                "production_test_capability_forbidden"
+-            ) from None
+-        return tuple(
+-            state[data_field.name]
+-            for data_field in fields(value)
+-            if data_field.name in state
+-        )
+-    return ()
++    state = _static_instance_state(value, value_mro)
++    class_values = _static_class_owned_values(
++        value_mro,
++        include_all=state is not None,
++    )
++    if state is None:
++        return class_values
++    return (
++        *tuple(dict.keys(state)),
++        *tuple(dict.values(state)),
++        *class_values,
++    )
++
++
++def _static_type_mro(value_type: type) -> tuple[type, ...]:
++    try:
++        mro = type.__getattribute__(value_type, "__mro__")
++    except BaseException:
++        raise RuntimeError(
++            "production_test_capability_forbidden"
++        ) from None
++    if type(mro) is not tuple:
++        raise RuntimeError("production_test_capability_forbidden")
++    return mro
++
++
++def _static_type_namespace(owner: type) -> MappingProxyType:
++    try:
++        namespace = type.__getattribute__(owner, "__dict__")
++    except BaseException:
++        raise RuntimeError(
++            "production_test_capability_forbidden"
++        ) from None
++    if type(namespace) is not MappingProxyType:
++        raise RuntimeError("production_test_capability_forbidden")
++    return namespace
++
++
++def _static_instance_state(
++    value: object,
++    value_mro: tuple[type, ...],
++) -> dict | None:
++    descriptor = _STATIC_ATTRIBUTE_MISSING
++    for owner in value_mro:
++        namespace = _static_type_namespace(owner)
++        if "__dict__" in namespace:
++            descriptor = namespace["__dict__"]
++            break
++    if descriptor is _STATIC_ATTRIBUTE_MISSING:
++        return None
++    if type(descriptor) not in {
++        GetSetDescriptorType,
++        MemberDescriptorType,
++    }:
++        raise RuntimeError("production_test_capability_forbidden")
++    try:
++        state = object.__getattribute__(value, "__dict__")
++    except BaseException:
++        raise RuntimeError(
++            "production_test_capability_forbidden"
++        ) from None
++    if type(state) is not dict:
++        raise RuntimeError("production_test_capability_forbidden")
++    return state
++
++
++def _static_class_owned_values(
++    value_mro: tuple[type, ...],
++    *,
++    include_all: bool,
++) -> tuple[object, ...]:
++    values = []
++    for owner in value_mro:
++        namespace = _static_type_namespace(owner)
++        declared_slots = "__slots__" in namespace
++        for name in sorted(namespace):
++            if name.startswith("__"):
++                continue
++            raw_value = namespace[name]
++            if type(raw_value) is MemberDescriptorType:
++                if declared_slots:
++                    raise RuntimeError(
++                        "production_test_capability_forbidden"
++                    )
++                continue
++            if include_all or _is_static_class_graph_value(raw_value):
++                values.append(raw_value)
++    return tuple(values)
++
++
++def _is_static_class_graph_value(value: object) -> bool:
++    value_type = type(value)
++    if value_type in (
++        *_TEST_BROKER_EXACT_MAPPING_TYPES,
++        *_TEST_BROKER_EXACT_SEQUENCE_TYPES,
++        FunctionType,
++        MethodType,
++        partial,
++    ):
++        return True
++    return BrokerClient in _static_type_mro(value_type)
+diff --git a/tests/test_plan2_integration_correction.py b/tests/test_plan2_integration_correction.py
+index 28e143f..0af7fb9 100644
+--- a/tests/test_plan2_integration_correction.py
++++ b/tests/test_plan2_integration_correction.py
+@@ -4,0 +5 @@ from __future__ import annotations
++from collections import Counter
+@@ -409,0 +411,234 @@ def test_test_container_rejects_nested_owned_production_delegate(
++def test_test_container_rejects_delegate_in_plain_holder(
++    make_service,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Holder:
++        def __init__(self, delegate):
++            self.delegate = delegate
++
++    service = make_service()
++    service.broker.owned_state = Holder(
++        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++            secrets=Secrets(
++                app_api_token="plan2-plain-holder-token"
++            ),
++        )
++
++
++def test_create_test_app_rejects_plain_holder_delegate_inserted_after_issuance(
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Holder:
++        pass
++
++    service = make_service()
++    holder = Holder()
++    service.broker.owned_state = holder
++    container = build_test_app_container(
++        service,
++        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++        secrets=Secrets(
++            app_api_token="plan2-holder-consumption-token"
++        ),
++    )
++    holder.delegate = AlpacaBroker(
++        SimpleNamespace(),
++        SimpleNamespace(),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^test_container_required$",
++    ):
++        app_main.create_test_app(
++            container=container,
++            planning=None,
++        )
++
++
++def test_test_container_rejects_class_owned_production_delegate(
++    make_service,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Holder:
++        delegate = AlpacaBroker(
++            SimpleNamespace(),
++            SimpleNamespace(),
++        )
++
++    service = make_service()
++    service.broker.owned_state = Holder()
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++            secrets=Secrets(
++                app_api_token="plan2-class-holder-token"
++            ),
++        )
++
++
++def test_test_container_rejects_delegate_owned_by_retained_holder_class(
++    make_service,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Holder:
++        delegate = AlpacaBroker(
++            SimpleNamespace(),
++            SimpleNamespace(),
++        )
++
++    service = make_service()
++    service.broker.owned_state = Holder
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++            secrets=Secrets(
++                app_api_token="plan2-retained-holder-class-token"
++            ),
++        )
++
++
++def test_test_container_rejects_slotted_holder_without_invoking_descriptor(
++    make_service,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    class Holder:
++        __slots__ = ("delegate",)
++
++        def __init__(self, delegate):
++            self.delegate = delegate
++
++    service = make_service()
++    service.broker.owned_state = Holder(
++        AlpacaBroker(SimpleNamespace(), SimpleNamespace())
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++            secrets=Secrets(
++                app_api_token="plan2-slotted-holder-token"
++            ),
++        )
++
++
++def test_test_container_rejects_builtin_container_subclass_without_iteration(
++    make_service,
++):
++    from trading_assistant.broker.alpaca import AlpacaBroker
++    from tests.app_factory import build_test_app_container
++
++    iteration_attempted = []
++
++    class HolderList(list):
++        def __iter__(self):
++            iteration_attempted.append(True)
++            raise AssertionError("custom iteration invoked")
++
++    owned_state = HolderList()
++    list.append(
++        owned_state,
++        AlpacaBroker(SimpleNamespace(), SimpleNamespace()),
++    )
++    service = make_service()
++    service.broker.owned_state = owned_state
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_test_capability_forbidden$",
++    ):
++        build_test_app_container(
++            service,
++            SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++            secrets=Secrets(
++                app_api_token="plan2-container-subclass-token"
++            ),
++        )
++    assert iteration_attempted == []
++
++
++def test_test_container_validation_uses_only_static_holder_state(
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++    from tests.app_factory import build_test_app_container
++
++    instance_lookups = []
++    metaclass_lookups = []
++
++    class ProbeMeta(type):
++        def __getattribute__(cls, name):
++            if name == "__dataclass_fields__":
++                metaclass_lookups.append(name)
++                raise AssertionError("dynamic dataclass lookup")
++            return type.__getattribute__(cls, name)
++
++    class Probe(metaclass=ProbeMeta):
++        def __init__(self):
++            object.__setattr__(self, "marker", "safe")
++
++        def __getattribute__(self, name):
++            instance_lookups.append(name)
++            if name == "__class__":
++                return object.__getattribute__(self, name)
++            raise AssertionError("dynamic instance lookup")
++
++        @property
++        def delegate(self):
++            raise AssertionError("property invoked")
++
++    service = make_service()
++    service.broker.probe = Probe()
++    container = build_test_app_container(
++        service,
++        SimpleNamespace(chat=lambda *_args, **_kwargs: None),
++        secrets=Secrets(
++            app_api_token="plan2-static-holder-token"
++        ),
++    )
++
++    app = app_main.create_test_app(
++        container=container,
++        planning=None,
++    )
++
++    assert app.state.trading_service is service
++    assert instance_lookups == []
++    assert metaclass_lookups == []
++
++
+@@ -511 +746 @@ def test_test_container_accepts_spy_broker_and_cycle_safe_state(
+-    from threading import Event
++    from threading import Event, Lock
+@@ -520,0 +756,2 @@ def test_test_container_accepts_spy_broker_and_cycle_safe_state(
++    service.broker.test_lock = Lock()
++    service.broker.call_counts = Counter({"submit": 1})

@@ -1,181 +1,298 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Trade Plans — Trading Assistant</title>
-  <style>
-    :root { --bg:#0f1216; --panel:#181d24; --line:#2a323c; --fg:#e6e9ee; --muted:#8b96a5;
-            --green:#3fb27f; --red:#e0575b; --amber:#d8a657; --accent:#5aa9e6; }
-    *{box-sizing:border-box;} body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);}
-    header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel);}
-    header h1{font-size:16px;margin:0;font-weight:600;} a{color:var(--accent);}
-    button{font:inherit;border:1px solid var(--line);background:#222a33;color:var(--fg);border-radius:6px;padding:6px 12px;cursor:pointer;}
-    button:hover{border-color:var(--accent);} button.approve{border-color:var(--green);color:var(--green);} button.cancel{border-color:var(--red);color:var(--red);}
-    input{padding:7px 10px;background:#11151a;border:1px solid var(--line);border-radius:6px;color:var(--fg);}
-    main{max-width:1150px;margin:0 auto;padding:16px;display:grid;grid-template-columns:260px 1fr;gap:16px;}
-    .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;}
-    h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:14px 0 8px;}
-    table{width:100%;border-collapse:collapse;} th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line);font-size:13px;}
-    th:first-child,td:first-child{text-align:left;} th{color:var(--muted);font-weight:500;}
-    .item{padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;}
-    .item:hover{border-color:var(--accent);}
-    .banner{background:#2a2417;color:var(--amber);padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;}
-    .bear{color:var(--red);} .bull{color:var(--green);} .base{color:var(--accent);}
-    .muted{color:var(--muted);font-size:12px;} .empty{color:var(--muted);font-style:italic;}
-    #toast{position:fixed;right:16px;bottom:16px;max-width:400px;z-index:50;display:flex;flex-direction:column;gap:8px;}
-    .toast{padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:var(--panel);box-shadow:0 4px 16px rgba(0,0,0,.4);font-size:13px;}
-    .toast.ok{border-color:var(--green);} .toast.err{border-color:var(--red);color:#ffd7d7;}
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plans — Trading Assistant</title>
+  <link rel="icon" href="/static/img/trading-orbit.svg">
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/plans.js"></script>
 </head>
-<body>
-  <header>
-    <h1>Trade Plans &amp; Screener</h1>
-    <div><a href="/" style="margin-right:12px">← Assistant</a>
-    <input id="sym" placeholder="AAPL" size="6"/>
-    <button onclick="analyze()">Analyze</button>
-    <button onclick="runScreen()">Screen</button>
-    <button onclick="propose()" title="Screen the market + analyze the top names into plans you can approve">Generate proposals</button></div>
+<body class="app-shell">
+  <a class="skip-link" href="#main-content">Skip to trade plans</a>
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-orbit" src="/static/img/trading-orbit.svg" alt="" aria-hidden="true">
+      <span class="brand-copy">
+        <strong>Trading Assistant</strong>
+        <span>Research planning</span>
+      </span>
+    </div>
+    <nav class="primary-nav side-nav" aria-label="Primary">
+      <a href="/">Operations</a>
+      <a href="/plans/ui" aria-current="page">Plans</a>
+      <a href="/backtests/ui">Backtests</a>
+    </nav>
+    <div class="session-controls">
+      <span class="session-actor" id="session-actor">Checking session…</span>
+      <button class="button-quiet" id="sign-out" type="button">Sign out</button>
+    </div>
   </header>
-  <main>
-    <section class="panel">
-      <h2 style="margin-top:0">Plans</h2><div id="plans"><div class="empty">none</div></div>
-      <h2>Screener</h2><div id="screen"><div class="empty">click Screen</div></div>
+
+  <div class="environment-strip" aria-label="Current paper environment">
+    <div class="environment-cell environment-primary">
+      <span>Environment</span>
+      <strong class="status-chip is-caution">ALPACA PAPER</strong>
+    </div>
+    <div class="environment-cell"><span>Breaker</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Daemon</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Reconciliation</span><strong class="is-unknown">Unknown</strong></div>
+    <div class="environment-cell"><span>Observed</span><strong class="is-stale">Sign in to verify</strong></div>
+  </div>
+
+  <main class="plans-main" id="main-content" aria-labelledby="plans-page-title">
+    <section class="page-intro plans-intro" aria-labelledby="plans-page-title">
+      <div>
+        <p class="section-label">Analyst evidence workspace</p>
+        <h1 id="plans-page-title">Research stays below the human gate.</h1>
+        <p>Persisted evidence remains paper-only and cannot approve itself.</p>
+      </div>
+      <span class="status-chip is-caution" id="research-paper-badge">Research / paper-only</span>
     </section>
-    <section class="panel">
-      <h2 id="detail-title" style="margin-top:0">Plan detail</h2>
-      <div id="detail"><div class="empty">Analyze a symbol or pick a plan.</div></div>
-    </section>
+
+    <div class="plans-workspace">
+      <aside
+        class="panel plan-actions-pane"
+        id="plan-actions-pane"
+        aria-labelledby="plan-tools-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Actions and filters</p>
+            <h2 id="plan-tools-title">Research controls</h2>
+          </div>
+        </div>
+        <div class="section-body plan-actions-body">
+          <section class="plan-budget" aria-labelledby="plan-budget-title">
+            <div class="plan-subheading">
+              <div>
+                <p class="section-label">Provider boundary</p>
+                <h3 id="plan-budget-title">Model budget</h3>
+              </div>
+              <button class="button-quiet" id="refresh-plan-budget" type="button">Refresh budget</button>
+            </div>
+            <p class="field-hint has-error is-blocked" id="plans-budget-state">
+              Provider call blocked before network I/O
+            </p>
+            <dl class="plan-budget-grid">
+              <div>
+                <dt>Calls remaining</dt>
+                <dd class="is-unknown" id="plans-budget-calls">Unknown</dd>
+              </div>
+              <div>
+                <dt>Input tokens</dt>
+                <dd class="is-unknown" id="plans-budget-input">Unknown</dd>
+              </div>
+              <div>
+                <dt>Output tokens</dt>
+                <dd class="is-unknown" id="plans-budget-output">Unknown</dd>
+              </div>
+              <div>
+                <dt>Reset</dt>
+                <dd class="is-unknown" id="plans-budget-reset">Unknown</dd>
+              </div>
+            </dl>
+          </section>
+
+          <div class="field">
+            <label for="plan-filter">Filter saved plans</label>
+            <input
+              id="plan-filter"
+              type="search"
+              autocomplete="off"
+              placeholder="Symbol, action, or status"
+            >
+          </div>
+
+          <form id="analysis-form">
+            <div class="field">
+              <label for="analysis-symbol">Symbol</label>
+              <input id="analysis-symbol" autocomplete="off" placeholder="AAPL" required>
+            </div>
+            <div class="field">
+              <label for="analysis-reason">Analysis reason</label>
+              <textarea id="analysis-reason" rows="3" required></textarea>
+            </div>
+            <button class="button-primary" id="analysis-submit" type="submit" disabled>
+              Analyze symbol
+            </button>
+          </form>
+
+          <form id="proposal-form">
+            <div class="field">
+              <label for="proposal-reason">Proposal reason</label>
+              <textarea id="proposal-reason" rows="3" required></textarea>
+            </div>
+            <button class="button-primary" id="proposal-submit" type="submit" disabled>
+              Generate proposals
+            </button>
+          </form>
+
+          <section class="plan-screener" aria-labelledby="plan-screener-title">
+            <div class="plan-subheading">
+              <div>
+                <p class="section-label">Deterministic path</p>
+                <h3 id="plan-screener-title">Screener</h3>
+              </div>
+              <button class="button-quiet" id="screen-button" type="button">
+                Refresh screener only
+              </button>
+            </div>
+            <div id="screen-results">
+              <p class="empty-state">Run the screener to inspect candidates.</p>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <section
+        class="panel plan-queue-pane"
+        id="plan-queue-pane"
+        aria-labelledby="plans-list-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Saved research</p>
+            <h2 id="plans-list-title">Plan queue</h2>
+            <p>Regime context is available in selected detail.</p>
+          </div>
+          <button class="button-quiet" id="refresh-plans" type="button">Refresh</button>
+        </div>
+        <div class="section-body plan-queue" id="plans-list">
+          <p class="empty-state">Loading plans…</p>
+        </div>
+      </section>
+
+      <section
+        class="panel plan-evidence-pane"
+        id="plan-evidence-pane"
+        aria-labelledby="plan-detail-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="section-label">Selected persisted evidence</p>
+            <h2 id="plan-detail-title">Plan detail</h2>
+          </div>
+        </div>
+        <div class="section-body plan-evidence" id="plan-detail">
+          <p class="empty-state">Analyze a symbol or choose a saved plan.</p>
+        </div>
+      </section>
+    </div>
   </main>
-  <div id="toast"></div>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    function el(tag, text, cls) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; }
-    function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
-    function apiKey() { let t = localStorage.getItem("api_key"); if (t === null) { t = window.prompt("API token (X-API-Key):") || ""; localStorage.setItem("api_key", t); } return t; }
-    async function api(path, opts = {}) { opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {}); return (await fetch(path, opts)).json(); }
-    const jsonPost = (b) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 
-    function notify(msg, kind) {
-      const t = el("div", msg, "toast " + (kind || ""));
-      $("toast").appendChild(t);
-      setTimeout(() => t.remove(), kind === "err" ? 9000 : 5000);
-    }
-    // Mutating call that surfaces HTTP status AND a body-level {error:...}
-    // (the plan endpoints return 200 with an "error" field for soft failures).
-    async function action(path, opts = {}) {
-      opts.headers = Object.assign({ "X-API-Key": apiKey() }, opts.headers || {});
-      let r, data;
-      try { r = await fetch(path, opts); } catch (e) { notify("Network error: " + e.message, "err"); return { ok: false }; }
-      try { data = await r.json(); } catch (e) { data = {}; }
-      if (r.status === 401) { notify("Rejected: bad/missing API token — re-enter it.", "err"); localStorage.removeItem("api_key"); return { ok: false, data }; }
-      if (!r.ok) { const d = data.detail !== undefined ? data.detail : data; notify("Error " + r.status + ": " + (typeof d === "string" ? d : JSON.stringify(d)), "err"); return { ok: false, data }; }
-      if (data && data.error) { notify(data.error, "err"); return { ok: false, data }; }
-      return { ok: true, data };
-    }
+  <dialog
+    id="plan-approval-dialog"
+    aria-labelledby="plan-approval-title"
+    aria-describedby="plan-approval-description"
+  >
+    <form id="plan-approval-form">
+      <div class="dialog-header">
+        <p class="section-label">Human gate</p>
+        <h2 id="plan-approval-title">Approve exact paper plan</h2>
+        <p id="plan-approval-description">
+          Approving this exact paper plan may create an ALPACA PAPER bracket or arm
+          paper-only rules. It does not prove profitability and remains subject to
+          execution and risk gates. Recent sign-in may be required.
+        </p>
+      </div>
+      <div class="dialog-body">
+        <dl class="proof-grid">
+          <dt>Plan ID</dt>
+          <dd id="plan-approval-target-id">Unknown</dd>
+          <dt>Symbol</dt>
+          <dd id="plan-approval-target-symbol">Unknown</dd>
+          <dt>Action</dt>
+          <dd id="plan-approval-target-action">Unknown</dd>
+        </dl>
+        <div class="field">
+          <label for="plan-approval-reason">Approval reason</label>
+          <textarea
+            id="plan-approval-reason"
+            aria-describedby="plan-approval-description"
+            required
+          ></textarea>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="plan-approval-cancel" type="button">Cancel</button>
+        <button
+          class="button-primary"
+          id="plan-approval-submit"
+          type="submit"
+          disabled
+        >Approve exact plan</button>
+      </div>
+    </form>
+  </dialog>
 
-    async function refresh() {
-      const d = await api("/plans"); const box = $("plans"); clear(box);
-      if (!(d.plans && d.plans.length)) { box.appendChild(el("div", "none", "empty")); return; }
-      d.plans.forEach((p) => {
-        const it = el("div", null, "item");
-        it.appendChild(document.createTextNode("#" + p.plan_id + " " + p.symbol + " · " + p.action + " · "));
-        it.appendChild(el("span", p.status, "muted"));
-        it.addEventListener("click", () => showPlan(p.plan_id));
-        box.appendChild(it);
-      });
-    }
-    async function analyze() {
-      const sym = $("sym").value.trim().toUpperCase(); if (!sym) return;
-      const box = $("detail"); clear(box); box.appendChild(el("div", "Analyzing " + sym + "…", "empty"));
-      const res = await api("/analyze", jsonPost({ symbol: sym }));
-      if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
-      await refresh(); showPlan(res.plan_id);
-    }
-    async function propose() {
-      const box = $("detail"); clear(box);
-      box.appendChild(el("div", "Screening + analyzing top names (analyst v2 is UNPROVEN — review each)…", "empty"));
-      const res = await api("/propose", jsonPost({ n: 3 }));
-      if (res.detail) { clear(box); box.appendChild(el("div", JSON.stringify(res.detail), "banner")); return; }
-      await refresh();
-      clear(box);
-      box.appendChild(el("div", "Proposals generated — pick one on the left to review and approve.", "empty"));
-      (res.proposed || []).forEach((p) => {
-        const line = p.error ? (p.symbol + " — skipped (" + p.error + ")")
-          : ("#" + p.plan_id + " " + p.symbol + " · " + p.action + " · " + p.sized_shares + " sh");
-        box.appendChild(el("div", line, "muted"));
-      });
-    }
-    async function runScreen() {
-      const box = $("screen"); clear(box); box.appendChild(el("div", "screening…", "empty"));
-      const res = await api("/screen", { method: "POST" });
-      clear(box);
-      if (res.detail) { box.appendChild(el("div", JSON.stringify(res.detail), "empty")); return; }
-      (res.candidates || []).forEach((c) => {
-        const it = el("div", null, "item");
-        it.appendChild(document.createTextNode(c.symbol + " "));
-        it.appendChild(el("span", (c.score >= 0 ? "+" : "") + c.score + " · " + (c.regime || ""), "muted"));
-        it.addEventListener("click", () => { $("sym").value = c.symbol; analyze(); });
-        box.appendChild(it);
-      });
-      if (!(res.candidates || []).length) box.appendChild(el("div", "no candidates", "empty"));
-    }
-    function metricTable(headers, rows) {
-      const t = el("table"); const hr = el("tr"); headers.forEach((h) => hr.appendChild(el("th", h))); t.appendChild(hr);
-      rows.forEach((cells) => { const tr = el("tr"); cells.forEach((c, i) => tr.appendChild(el("td", c[0], c[1]))); t.appendChild(tr); });
-      return t;
-    }
-    async function showPlan(id) {
-      const p = await api("/plans/" + id);
-      $("detail-title").textContent = "Plan #" + p.plan_id + " — " + p.symbol + " (" + p.status + ")";
-      const box = $("detail"); clear(box);
-      const pl = p.plan, sz = p.sized;
-      if (p.paper_only) box.appendChild(el("div", "UNPROVEN — analyst under the 50-graded-calls gate: PAPER mode only.", "banner"));
-      box.appendChild(el("p", pl.action.toUpperCase() + " · confidence " + pl.confidence + " · regime: " + pl.regime_note));
-      box.appendChild(el("p", pl.thesis));
-      box.appendChild(el("h2", "Scenarios"));
-      box.appendChild(metricTable(["Case", "Target", "Days", "Prob"],
-        pl.scenarios.map((s) => [[s.name, s.name], [s.price_target], [s.horizon_days], [(s.probability * 100).toFixed(0) + "%"]])));
-      box.appendChild(el("p", "Invalidation @ " + pl.invalidation.price_level + " — " + pl.invalidation.rationale, "muted"));
-      box.appendChild(el("h2", "Entry ladder (sized)"));
-      box.appendChild(metricTable(["Level", "Fraction", "Shares", "Notional"],
-        (sz.tranches || []).map((t) => [[t.price_level], [(t.fraction * 100).toFixed(0) + "%"], [t.shares], ["$" + t.notional]])));
-      box.appendChild(el("p", "Total " + sz.total_shares + " sh · risk budget $" + sz.risk_budget + (sz.zero_reason ? " · " + sz.zero_reason : ""), "muted"));
-      box.appendChild(el("h2", "Exits"));
-      box.appendChild(metricTable(["Target", "Sell"], pl.exit_plan.targets.map((t) => [[t.price_level], [(t.fraction_to_sell * 100).toFixed(0) + "%"]])));
-      box.appendChild(el("p", "Stop " + pl.exit_plan.stop + (pl.exit_plan.trailing_stop_pct ? " · trailing " + pl.exit_plan.trailing_stop_pct + "%" : "") + (pl.exit_plan.time_stop_days ? " · time stop " + pl.exit_plan.time_stop_days + "d" : ""), "muted"));
-      if (p.status === "proposed") {
-        const bar = el("div"); bar.style.marginTop = "10px";
-        const actionable = sz && Number(sz.total_shares) > 0;
-        if (actionable) {
-          const a = el("button", "Approve → arm rules", "approve"); a.addEventListener("click", () => approve(p.plan_id));
-          bar.appendChild(a);
-        } else {
-          // NO_TRADE / HOLD / zero-sized: nothing to arm — say so instead of a dead button.
-          bar.appendChild(el("div",
-            "Advisory only — this " + pl.action.toUpperCase() + " plan has no sized entry, so there are no orders/rules to arm."
-            + (sz && sz.zero_reason ? " (" + sz.zero_reason + ")" : ""), "banner"));
-        }
-        const c = el("button", "Cancel / dismiss", "cancel"); c.style.marginLeft = "8px"; c.addEventListener("click", () => cancelPlan(p.plan_id));
-        bar.appendChild(c); box.appendChild(bar);
-      }
-    }
-    async function approve(id) {
-      const r = await action("/plans/" + id + "/approve", { method: "POST" });
-      if (r.ok) {
-        const d = r.data || {};
-        if (d.bracket) notify("Approved ✓ plan " + id + " — bracket order placed on Alpaca", "ok");
-        else notify("Approved ✓ plan " + id + " — armed " + (d.rules_created || 0) + " rule(s)"
-                    + (d.paper_only ? " (PAPER — analyst unproven)" : ""), "ok");
-      }
-      await refresh(); showPlan(id);
-    }
-    async function cancelPlan(id) {
-      const r = await action("/plans/" + id + "/cancel", { method: "POST" });
-      if (r.ok) notify("Plan " + id + " canceled", "ok");
-      await refresh(); showPlan(id);
-    }
-    refresh();
-  </script>
+  <dialog
+    id="plan-cancel-dialog"
+    aria-labelledby="plan-cancel-title"
+    aria-describedby="plan-cancel-description"
+  >
+    <form id="plan-cancel-form">
+      <div class="dialog-header">
+        <p class="section-label">Human decision</p>
+        <h2 id="plan-cancel-title">Cancel plan</h2>
+        <p id="plan-cancel-description">This cancels only the exact paper plan identified below.</p>
+      </div>
+      <div class="dialog-body">
+        <dl class="proof-grid">
+          <dt>Plan ID</dt>
+          <dd id="plan-cancel-target-id">Unknown</dd>
+          <dt>Symbol</dt>
+          <dd id="plan-cancel-target-symbol">Unknown</dd>
+          <dt>Action</dt>
+          <dd id="plan-cancel-target-action">Unknown</dd>
+        </dl>
+        <div class="field">
+          <label for="plan-cancel-reason">Cancellation reason</label>
+          <textarea
+            id="plan-cancel-reason"
+            aria-describedby="plan-cancel-description"
+            required
+          ></textarea>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="plan-cancel-close" type="button">Keep plan</button>
+        <button class="button-danger" id="plan-cancel-submit" type="submit">Cancel plan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog
+    id="reauth-dialog"
+    aria-labelledby="reauth-title"
+    aria-describedby="reauth-description"
+  >
+    <form id="reauth-form">
+      <div class="dialog-header">
+        <p class="section-label">Recent sign-in required</p>
+        <h2 id="reauth-title">Verify operator secret</h2>
+        <p id="reauth-description">The entered secret is cleared before the verification request.</p>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="reauth-secret">Operator secret</label>
+          <input
+            id="reauth-secret"
+            type="password"
+            autocomplete="current-password"
+            aria-describedby="reauth-description reauth-status"
+            required
+          >
+        </div>
+        <p class="field-error" id="reauth-status" role="status"></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="reauth-cancel" type="button">Cancel</button>
+        <button class="button-primary" type="submit">Verify and retry once</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="status-region" id="status-region" aria-live="polite"></div>
 </body>
 </html>

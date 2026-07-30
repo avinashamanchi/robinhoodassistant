@@ -5,38 +5,84 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from trading_assistant.db.session import create_db_engine, make_session_factory
 from trading_assistant.risk.killswitch import KillSwitch
 from trading_assistant.risk.pnl import FillLike, realized_pnl_today
+from trading_assistant.security.sensitive_fields import bind_sensitive_cipher
 
 
-def test_trip_persists_across_restart(db_url, engine):
+def test_trip_persists_across_restart(db_url, engine, sensitive_cipher):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         assert KillSwitch.is_tripped(s) is False
-        KillSwitch.trip(s, reason="test trip")
+    with factory() as s:
+        KillSwitch.trip(
+            s,
+            reason="test trip",
+            actor="test:killswitch",
+            request_id="killswitch-test-trip",
+        )
         s.commit()
 
     # Simulate a process restart: brand-new engine + session on the same DB file.
     engine2 = create_db_engine(db_url)
     factory2 = make_session_factory(engine2)
+    bind_sensitive_cipher(factory2, sensitive_cipher)
     with factory2() as s:
         assert KillSwitch.is_tripped(s) is True
 
 
-def test_reset_unblocks(engine):
+def test_compatibility_trip_rejects_an_active_caller_transaction(
+    engine,
+    sensitive_cipher,
+):
     factory = make_session_factory(engine)
-    with factory() as s:
-        KillSwitch.trip(s, reason="test")
-        s.commit()
-    with factory() as s:
-        KillSwitch.reset(s)
-        s.commit()
-    with factory() as s:
-        assert KillSwitch.is_tripped(s) is False
+    bind_sensitive_cipher(factory, sensitive_cipher)
+
+    with factory() as session:
+        KillSwitch.is_tripped(session)
+        with pytest.raises(RuntimeError, match="active transaction"):
+            KillSwitch.trip(
+                session,
+                reason="unsafe caller",
+                actor="test:killswitch",
+                request_id="killswitch-unsafe-trip",
+            )
 
 
-def test_daily_loss_from_fills_trips_switch(engine):
+def test_compatibility_reset_is_explicitly_disabled_and_stays_tripped(
+    engine,
+    sensitive_cipher,
+):
+    factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
+    with factory() as s:
+        KillSwitch.trip(
+            s,
+            reason="test",
+            actor="test:killswitch",
+            request_id="killswitch-reset-setup",
+        )
+        s.commit()
+    with factory() as s:
+        with pytest.raises(
+            RuntimeError,
+            match="compatibility reset is unavailable",
+        ) as raised:
+            KillSwitch.reset(
+                s,
+                actor="test:killswitch",
+                request_id="killswitch-reset",
+            )
+        assert type(raised.value).__name__ == "KillSwitchResetUnavailable"
+    with factory() as s:
+        assert KillSwitch.is_tripped(s) is True
+
+
+def test_daily_loss_from_fills_trips_switch(engine, sensitive_cipher):
     """Kill switch trips off a REAL FIFO computation, not a stubbed number (A2)."""
     now = datetime(2026, 7, 8, 18, 0, tzinfo=timezone.utc)
     fills = [
@@ -49,20 +95,30 @@ def test_daily_loss_from_fills_trips_switch(engine):
     assert loss == Decimal("-600")  # (40-100)*10
 
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
-            s, realized_pnl_today=loss, loss_limit=Decimal("500")
+            s,
+            realized_pnl_today=loss,
+            loss_limit=Decimal("500"),
+            actor="test:killswitch",
+            request_id="killswitch-daily-loss",
         )
         s.commit()
         assert tripped is True
         assert KillSwitch.is_tripped(s) is True
 
 
-def test_small_loss_does_not_trip(engine):
+def test_small_loss_does_not_trip(engine, sensitive_cipher):
     factory = make_session_factory(engine)
+    bind_sensitive_cipher(factory, sensitive_cipher)
     with factory() as s:
         tripped = KillSwitch.evaluate_daily_loss(
-            s, realized_pnl_today=Decimal("-100"), loss_limit=Decimal("500")
+            s,
+            realized_pnl_today=Decimal("-100"),
+            loss_limit=Decimal("500"),
+            actor="test:killswitch",
+            request_id="killswitch-daily-loss-clear",
         )
         s.commit()
         assert tripped is False

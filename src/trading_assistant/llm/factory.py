@@ -1,75 +1,134 @@
-"""Select the LLM backend from config, with an optional runtime fallback.
-
-``llm.provider`` picks the primary; ``llm.fallback_provider`` (optional) is tried
-if the primary raises at call time (e.g. Gemini auth/quota fails -> Groq).
-"""
+"""Select exactly one explicitly configured LLM backend."""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
-
 from ..config import AppConfig, Secrets
+from ..security.secrets import secret_value
+from .base import BudgetedLLMBackend
+from .budget import (
+    AnthropicInputEstimator,
+    GeminiInputEstimator,
+    GroqInputEstimator,
+    ProviderBudgetExceeded,
+    ProviderBudgetService,
+    ProviderBudgetUnavailable,
+    ProviderInputEstimator,
+)
 
-log = logging.getLogger(__name__)
+_ALLOWED_CATEGORIES = frozenset(
+    {"chat", "analysis", "untrusted", "backtest"}
+)
 
-
-class FallbackBackend:
-    """Try the primary backend; on any exception, fall back to the secondary."""
-
-    def __init__(self, primary, fallback) -> None:
-        self._primary = primary
-        self._fallback = fallback
-
-    def create(
-        self, *, system: str, messages: list[dict], tools: list[dict],
-        tool_choice: Optional[str] = None,
-    ) -> Any:
-        try:
-            resp = self._primary.create(
-                system=system, messages=messages, tools=tools, tool_choice=tool_choice
-            )
-            # A tool was REQUIRED but the primary answered in prose anyway (Gemini
-            # does this on a 200) — that is a soft failure, so switch providers.
-            if tool_choice == "any" and not _has_tool_use(resp):
-                log.warning("primary returned no tool call though one was required; falling back")
-                return self._fallback.create(
-                    system=system, messages=messages, tools=tools, tool_choice=tool_choice
-                )
-            return resp
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "primary LLM backend failed (%s); falling back", type(exc).__name__
-            )
-            return self._fallback.create(
-                system=system, messages=messages, tools=tools, tool_choice=tool_choice
-            )
+_PROVIDER_INPUT_ESTIMATORS: dict[str, ProviderInputEstimator] = {
+    "anthropic": AnthropicInputEstimator(),
+    "gemini": GeminiInputEstimator(),
+    "groq": GroqInputEstimator(),
+}
 
 
-def _has_tool_use(resp: Any) -> bool:
-    return any(getattr(b, "type", None) == "tool_use" for b in getattr(resp, "content", []))
+def resolve_input_estimator(provider: str) -> ProviderInputEstimator:
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError("provider must be non-empty")
+    estimator = _PROVIDER_INPUT_ESTIMATORS.get(provider)
+    if estimator is None:
+        raise ProviderBudgetUnavailable(
+            f"no provider input estimator registered for {provider!r}"
+        )
+    return estimator
 
 
-def _make_backend(provider: str, config: AppConfig, secrets: Secrets):
+def selected_llm_model(config: AppConfig) -> str:
+    provider = config.llm.provider
+    selected_models = {
+        "anthropic": config.llm.model,
+        "gemini": config.llm.gemini_model,
+        "groq": config.llm.groq_model,
+    }
+    try:
+        return selected_models[provider]
+    except KeyError:
+        raise ValueError(f"unknown LLM provider: {provider}") from None
+
+
+class _DisabledBacktestBackend:
+    def create(self, **_kwargs):
+        raise ProviderBudgetExceeded("LLM backtests are disabled")
+
+
+def _require_category(category: str) -> str:
+    if (
+        not isinstance(category, str)
+        or category not in _ALLOWED_CATEGORIES
+    ):
+        raise ValueError(
+            "category must be one of: analysis, backtest, chat, untrusted"
+        )
+    return category
+
+
+def build_llm_backend(
+    config: AppConfig,
+    secrets: Secrets,
+    *,
+    provider_budget: ProviderBudgetService,
+    category: str,
+    runtime_role: str = "app",
+):
+    category = _require_category(category)
+    if config.llm.fallback_provider is not None:
+        raise RuntimeError(
+            "automatic cross-provider LLM fallback is disabled"
+        )
+    if not isinstance(provider_budget, ProviderBudgetService):
+        raise TypeError(
+            "provider_budget must be a ProviderBudgetService"
+        )
+    if (
+        category == "backtest"
+        and not config.security.provider_budget.backtest_llm_enabled
+    ):
+        return _DisabledBacktestBackend()
+    provider = config.llm.provider
+    estimator = resolve_input_estimator(provider)
     llm = config.llm
+    model = selected_llm_model(config)
     if provider == "anthropic":
         from .anthropic_backend import AnthropicBackend
 
-        return AnthropicBackend(secrets.anthropic_api_key, llm.model, llm.max_tokens)
-    if provider == "gemini":
+        delegate = AnthropicBackend(
+            secret_value(secrets.anthropic_api_key),
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
+        )
+    elif provider == "gemini":
         from .gemini_backend import GeminiBackend
 
-        return GeminiBackend(secrets.gemini_api_key, llm.gemini_model, llm.max_tokens)
-    if provider == "groq":
+        delegate = GeminiBackend(
+            secret_value(secrets.gemini_api_key),
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
+        )
+    elif provider == "groq":
         from .groq_backend import GroqBackend
 
-        return GroqBackend(secrets.groq_api_key, llm.groq_model, llm.max_tokens)
-    raise ValueError(f"unknown LLM provider: {provider}")
-
-
-def build_llm_backend(config: AppConfig, secrets: Secrets):
-    primary = _make_backend(config.llm.provider, config, secrets)
-    if config.llm.fallback_provider:
-        fallback = _make_backend(config.llm.fallback_provider, config, secrets)
-        return FallbackBackend(primary, fallback)
-    return primary
+        delegate = GroqBackend(
+            secret_value(secrets.groq_api_key),
+            model,
+            llm.max_tokens,
+            timeout_seconds=llm.request_timeout_seconds,
+            runtime_role=runtime_role,
+        )
+    else:
+        raise ValueError(f"unknown LLM provider: {provider}")
+    return BudgetedLLMBackend(
+        delegate,
+        provider_budget,
+        provider=provider,
+        category=category,
+        max_output_tokens=config.llm.max_tokens,
+        estimator=estimator,
+    )

@@ -13,9 +13,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
+
+from ..security.outbound import (
+    OutboundPolicy,
+    install_pinned_session,
+    require_origin,
+)
+
+
+_ALPACA_DATA_POLICY = OutboundPolicy("https://data.alpaca.markets")
 
 
 class LookaheadError(Exception):
@@ -105,6 +114,10 @@ def download_alpaca_bars(
     timeframe: str = "1Day",
     years: int = 5,
     cache_dir: str | Path = ".cache/bars",
+    *,
+    runtime_role: str = "app",
+    client_factory: Callable[[str, str], Any] | None = None,
+    attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> pd.DataFrame:
     """Download corporate-action-adjusted bars and cache to parquet.
 
@@ -119,14 +132,34 @@ def download_alpaca_bars(
     if path.exists():
         return load_parquet(path)
 
-    client = StockHistoricalDataClient(api_key, secret_key)
+    production_client = client_factory is None
+    factory = client_factory or StockHistoricalDataClient
+    if production_client:
+        require_origin(
+            runtime_role,
+            "alpaca.historical",
+            "https://data.alpaca.markets",
+        )
+    client = factory(api_key, secret_key)
+    if production_client:
+        install_pinned_session(
+            client,
+            _ALPACA_DATA_POLICY,
+            read_timeout=30.0,
+        )
     start = datetime.now(timezone.utc).replace(microsecond=0)
     start = start.replace(year=start.year - years)
     tf = TimeFrame.Day if timeframe == "1Day" else TimeFrame.Hour
     req = StockBarsRequest(
         symbol_or_symbols=symbol, timeframe=tf, start=start, adjustment="all"
     )
-    bars = client.get_stock_bars(req).df
+    operation = lambda: client.get_stock_bars(req)
+    response = (
+        attempt_gate(operation)
+        if attempt_gate is not None
+        else operation()
+    )
+    bars = response.df
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level="symbol")
     bars = bars.rename_axis("ts")[["open", "high", "low", "close", "volume"]]

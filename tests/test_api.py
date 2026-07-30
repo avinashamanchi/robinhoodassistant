@@ -2,40 +2,309 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event, inspect as sa_inspect
 
-from trading_assistant.app.main import create_app
-from trading_assistant.app.ratelimit import RateLimiter
+from tests.app_factory import create_app
+from trading_assistant.app.limits import DurableRateLimiter
+from trading_assistant.config import BrokerKind, TradingMode
+from trading_assistant.broker.base import BrokerDataIntegrityError
+from trading_assistant.broker.mock import MockBroker
+from trading_assistant.broker.models import (
+    Account,
+    BrokerFill,
+    OrderStatus,
+    Position,
+    Quote,
+)
+from trading_assistant.db.models import (
+    AccountRiskState,
+    AuditEvent,
+    CircuitBreakerState,
+    FILL_RECONCILIATION_REQUIRED,
+    Fill,
+    Heartbeat,
+    Order,
+    Proposal,
+    RiskEvent,
+    Rule,
+    RuleGroup,
+    utcnow,
+)
+from trading_assistant.assets import AssetClass
+from trading_assistant.risk.breakers import BreakerScope
+from trading_assistant.risk.clock import FakeClock, MarketClockObservation
+from trading_assistant.security.crypto import (
+    SensitiveDataCipher,
+    SensitiveFieldRef,
+)
+from trading_assistant.security.sensitive_fields import persist_sensitive
+
+TOKEN = "test-api-operator-secret"
+CLOCK_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+_STATIC = Path("src/trading_assistant/app/static")
+_TEST_CIPHER = SensitiveDataCipher(
+    {"pytest-field-key-2026": b"t" * 32},
+    active_key_id="pytest-field-key-2026",
+)
+
+
+def _plaintext(instance, column: str) -> str:
+    table = instance.__table__.name
+    primary_key = sa_inspect(instance).mapper.primary_key
+    assert len(primary_key) == 1
+    row_id = str(getattr(instance, primary_key[0].key))
+    return _TEST_CIPHER.decrypt(
+        getattr(instance, column),
+        SensitiveFieldRef(table, row_id, column, 1),
+    )
+
+
+def _seed_clock_loss(service) -> None:
+    with service.session_factory() as session:
+        session.add_all(
+            [
+                Fill(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=Decimal("100"),
+                    price=Decimal("100"),
+                    broker_fill_id="api-clock-loss-open",
+                    filled_at=CLOCK_NOW - timedelta(hours=2),
+                ),
+                Fill(
+                    ticker="AAPL",
+                    side="sell",
+                    qty=Decimal("100"),
+                    price=Decimal("50"),
+                    broker_fill_id="api-clock-loss-close",
+                    filled_at=CLOCK_NOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
+
+
+def _install_equity_clock(service, clock) -> None:
+    service.clock = clock
+    service._clocks[AssetClass.EQUITY] = clock
+    service.snapshot_service.now = lambda: CLOCK_NOW
+
+
+def _malformed_alpaca_calendar_clock(raw_session_open, marker: str):
+    state = {"open": raw_session_open, "provider_marker": marker}
+
+    class MalformedCalendarFake(FakeClock):
+        def observe(self, at):
+            if not isinstance(state["open"], datetime):
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca market calendar"
+                )
+            return MarketClockObservation(
+                is_open=True,
+                most_recent_open=datetime(
+                    2026,
+                    7,
+                    24,
+                    13,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+            )
+
+    return MalformedCalendarFake(is_open=True), state
+
+
+def _race_alpaca_clock(later_current_state: bool):
+    calls = {"clock": 0, "calendar": 0}
+
+    class RaceCalendarFake(FakeClock):
+        def is_open(self, at=None):
+            if at is None:
+                calls["clock"] += 1
+                return later_current_state
+            return self.observe(at).is_open
+
+        def observe(self, at):
+            calls["calendar"] += 1
+            session_open = datetime(
+                2026,
+                7,
+                24,
+                13,
+                30,
+                tzinfo=timezone.utc,
+            )
+            session_close = datetime(
+                2026,
+                7,
+                24,
+                20,
+                0,
+                tzinfo=timezone.utc,
+            )
+            previous_open = datetime(
+                2026,
+                7,
+                23,
+                13,
+                30,
+                tzinfo=timezone.utc,
+            )
+            return MarketClockObservation(
+                is_open=session_open <= at < session_close,
+                most_recent_open=(
+                    session_open if at >= session_open else previous_open
+                ),
+            )
+
+    return RaceCalendarFake(is_open=later_current_state), calls
 
 
 class StubAgent:
     def __init__(self):
         self.calls = 0
+        self.last_context = None
 
-    def chat(self, message: str):
+    def chat(self, message: str, **context):
         self.calls += 1
+        self.last_context = context
         return {"reply": f"echo: {message}", "tool_calls": []}
 
 
+class RequestIdentityCaptureBackend:
+    def __init__(self):
+        self.request_ids = []
+
+    def create(self, **kwargs):
+        self.request_ids.append(kwargs["request_id"])
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="captured")],
+            usage=SimpleNamespace(
+                input_tokens=1,
+                output_tokens=1,
+            ),
+        )
+
+
 @pytest.fixture
-def client(make_service):
+def client(make_service, authenticate_client, with_limit):
     svc = make_service()
+    svc.config = with_limit(
+        svc.config,
+        "chat",
+        requests=2,
+        window_seconds=60,
+    )
     agent = StubAgent()
     app = create_app(
         service=svc,
         agent=agent,
-        api_token="",  # auth tested separately in test_security.py
-        chat_rate=RateLimiter(max_requests=2, window_seconds=60),
-        approve_rate=RateLimiter(max_requests=100, window_seconds=60),
+        api_token=TOKEN,
+        planning=None,
     )
-    return TestClient(app), svc, agent
+    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    test_client.headers.update({"X-CSRF-Token": csrf})
+    return test_client, svc, agent
+
+
+def _identity_capture_client(make_service, authenticate_client):
+    from trading_assistant.app.agent import Agent
+
+    service = make_service()
+    backend = RequestIdentityCaptureBackend()
+    agent = Agent(
+        backend,
+        service,
+        service.session_factory,
+        model="capture-only",
+        max_tokens=10,
+        max_turns=2,
+        rate_limiter=DurableRateLimiter(service.session_factory),
+        broker_read_limit=(
+            service.config.security.rate_limits.broker_read
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=agent,
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, csrf = authenticate_client(TestClient(app), TOKEN)
+    return test_client, service, backend, csrf
 
 
 def _propose(svc, notional="100"):
-    return svc.propose_order("AAPL", "buy", "market", notional=notional)["order_id"]
+    return svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional=notional,
+        actor="operator:test-setup",
+        reason="API test proposal setup",
+        request_id="api-test-proposal",
+    )["order_id"]
+
+
+def _unsafe_local_state(
+    *,
+    live_or_unknown_order_ids=(),
+    latched_order_ids=(),
+    unsafe_fill_ids=(),
+    active_rule_ids=(),
+    unsafe_rule_group_ids=(),
+    unknown_categories=(),
+):
+    return {
+        "live_or_unknown_order_ids": list(
+            live_or_unknown_order_ids
+        ),
+        "latched_order_ids": list(latched_order_ids),
+        "unsafe_fill_ids": list(unsafe_fill_ids),
+        "active_rule_ids": list(active_rule_ids),
+        "unsafe_rule_group_ids": list(unsafe_rule_group_ids),
+        "unknown_categories": list(unknown_categories),
+    }
+
+
+def _assert_dependency_unavailable(response):
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "dependency_unavailable",
+            "message": "Required dependency is unavailable",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+
+
+def _assert_internal_error(response):
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
 
 
 def test_index_served(client):
@@ -45,6 +314,14 @@ def test_index_served(client):
     assert "Trading Assistant" in r.text
 
 
+def test_index_mutations_collect_honest_operator_reasons(client):
+    script = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
+
+    assert "rejection-reason" in script
+    assert "panic-reason" in script
+    assert "reason" in script
+
+
 def test_pending_approve_flow(client):
     c, svc, _ = client
     order_id = _propose(svc)
@@ -52,26 +329,365 @@ def test_pending_approve_flow(client):
     pending = c.get("/pending").json()["pending"]
     assert len(pending) == 1 and pending[0]["order_id"] == order_id
 
-    approve = c.post(f"/approve/{order_id}").json()
+    approve_response = c.post(
+        f"/approve/{order_id}",
+        json={"reason": "reviewed in API"},
+        headers={"Idempotency-Key": "pending-approve-flow"},
+    )
+    approve = approve_response.json()
     assert approve["executed"] is True
     assert svc.broker.submit_calls == 1
+    with svc.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(action="order.approve").one()
+        assert audit.actor == "operator:local"
+        assert _plaintext(audit, "reason") == "reviewed in API"
+        assert audit.request_id == approve_response.headers["X-Request-ID"]
 
     # No longer pending.
     assert c.get("/pending").json()["pending"] == []
 
 
+def test_approval_confirmation_is_read_only_exact_server_truth(
+    make_service,
+    authenticate_client,
+):
+    broker = MockBroker(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                ticker="AAPL",
+                qty=Decimal("2"),
+                avg_entry_price=Decimal("90"),
+                current_price=Decimal("100"),
+            )
+        ],
+    )
+    service = make_service(broker=broker)
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "limit",
+        qty="3",
+        limit_price="101",
+        actor="operator:test-setup",
+        reason="approval confirmation setup",
+        request_id="approval-confirmation-setup",
+    )["order_id"]
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+    submit_calls_before = broker._orders_by_key.copy()
+    with service.session_factory() as session:
+        account_state_before = [
+            (
+                row.asset_class,
+                row.high_water_mark,
+                row.last_equity,
+                row.updated_at,
+            )
+            for row in session.query(AccountRiskState).all()
+        ]
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    proof = response.json()
+    assert proof["complete"] is True
+    assert proof["broker"] == "Alpaca"
+    assert proof["mode"] == "paper"
+    assert proof["order"] == {
+        "order_id": order_id,
+        "symbol": "AAPL",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "3.000000",
+        "notional": None,
+        "limit_price": "101.000000",
+    }
+    assert proof["expires_at"]
+    assert proof["exposure"]["currency"] == "USD"
+    assert proof["exposure"]["current_position_quantity"] == "2"
+    assert Decimal(
+        proof["exposure"]["current_signed_notional"]
+    ) == Decimal("200")
+    assert Decimal(
+        proof["exposure"]["resulting_signed_notional"]
+    ) == Decimal("503")
+    assert proof["exposure"]["as_of"]
+    assert broker._orders_by_key == submit_calls_before
+    with service.session_factory() as session:
+        account_state_after = [
+            (
+                row.asset_class,
+                row.high_water_mark,
+                row.last_equity,
+                row.updated_at,
+            )
+            for row in session.query(AccountRiskState).all()
+        ]
+        assert session.get(Order, order_id).status == OrderStatus.PROPOSED.value
+        assert session.query(AuditEvent).filter_by(
+            target_id=str(order_id),
+            action="order.approve",
+        ).count() == 0
+    assert account_state_after == account_state_before
+
+
+@pytest.mark.parametrize(
+    "incomplete_field",
+    ["pending_exposure_complete", "broker_reconciled"],
+)
+def test_approval_confirmation_fails_closed_when_proof_is_incomplete(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    incomplete_field,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service)
+    complete = service.snapshot_service.assemble_for_confirmation(
+        "AAPL",
+        exclude_order_id=order_id,
+    )
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_confirmation",
+        lambda *_args, **_kwargs: replace(
+            complete,
+            **{incomplete_field: False},
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    assert response.json()["complete"] is False
+    assert incomplete_field in response.json()["missing_proof"]
+    assert service.broker.submit_calls == 0
+
+
+def test_approval_confirmation_dependency_failure_is_hardened(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service)
+
+    def fail_positions():
+        raise ConnectionError("provider-secret-approval-confirmation")
+
+    service.broker.get_positions = fail_positions
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    _assert_dependency_unavailable(response)
+    assert "provider-secret-approval-confirmation" not in response.text
+    assert service.broker.submit_calls == 0
+
+
 def test_double_approve_returns_409(client):
     c, svc, _ = client
     order_id = _propose(svc)
-    assert c.post(f"/approve/{order_id}").status_code == 200
-    assert c.post(f"/approve/{order_id}").status_code == 409
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": "first review"},
+        headers={"Idempotency-Key": "double-approve-first"},
+    ).status_code == 200
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": "duplicate review"},
+        headers={"Idempotency-Key": "double-approve-second"},
+    ).status_code == 409
+
+
+def test_expired_approval_returns_stable_409(client):
+    c, svc, _ = client
+    order_id = _propose(svc)
+    with svc.session_factory() as session:
+        proposal = session.query(Proposal).filter_by(order_id=order_id).one()
+        proposal.expires_at = utcnow() - timedelta(seconds=1)
+        session.commit()
+
+    response = c.post(
+        f"/approve/{order_id}",
+        json={"reason": "reviewed after proposal expiry"},
+        headers={"Idempotency-Key": "expired-approval"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "approval_conflict",
+            "message": "Order approval is no longer current",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+
+
+def test_approve_requires_non_empty_reason(client):
+    c, svc, _ = client
+    order_id = _propose(svc)
+    assert c.post(
+        f"/approve/{order_id}",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "approve-blank-reason"},
+    ).status_code == 422
 
 
 def test_reject_endpoint(client):
     c, svc, _ = client
     order_id = _propose(svc)
-    r = c.post(f"/reject/{order_id}").json()
-    assert r["status"] == "rejected"
+    assert (
+        c.post(
+            f"/reject/{order_id}",
+            json={"reason": " "},
+            headers={"Idempotency-Key": "reject-blank-reason"},
+        ).status_code
+        == 422
+    )
+    response = c.post(
+        f"/reject/{order_id}",
+        json={"reason": "thesis invalidated"},
+        headers={"Idempotency-Key": "reject-order"},
+    )
+    assert response.json()["status"] == "rejected"
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="order.reject", target_id=str(order_id))
+            .one()
+        )
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "thesis invalidated"
+    assert audit.request_id == response.headers["X-Request-ID"]
+
+
+def test_live_order_cancel_requires_reason_and_audits_identity(client):
+    c, svc, _ = client
+    order_id = _propose(svc)
+    assert (
+        c.post(
+            f"/approve/{order_id}",
+            json={"reason": "approved before cancel drill"},
+            headers={"Idempotency-Key": "cancel-drill-approve"},
+        ).status_code
+        == 200
+    )
+
+    assert (
+        c.post(
+            f"/orders/{order_id}/cancel",
+            json={"reason": " "},
+            headers={"Idempotency-Key": "cancel-blank-reason"},
+        ).status_code
+        == 422
+    )
+    response = c.post(
+        f"/orders/{order_id}/cancel",
+        json={"reason": "operator canceled stale intent"},
+        headers={"Idempotency-Key": "cancel-live-order"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "canceled"
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="order.cancel", target_id=str(order_id))
+            .one()
+        )
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "operator canceled stale intent"
+    assert audit.request_id == response.headers["X-Request-ID"]
+    with svc.session_factory() as session:
+        sync_audit = (
+            session.query(AuditEvent)
+            .filter_by(action="orders.sync")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert sync_audit is not None
+    assert sync_audit.actor == audit.actor
+    assert _plaintext(sync_audit, "reason") == _plaintext(audit, "reason")
+    assert sync_audit.request_id == audit.request_id
+
+
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        ("/reject/999", "order_not_found"),
+        ("/orders/999/cancel", "order_not_found"),
+    ],
+)
+def test_missing_mutation_target_has_stable_error(client, path, code):
+    c, _, _ = client
+
+    response = c.post(
+        path,
+        json={"reason": "reviewed missing target"},
+        headers={
+            "Idempotency-Key": (
+                f"missing-target-{path.strip('/').replace('/', '-')}"
+            )
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["request_id"] == response.headers[
+        "X-Request-ID"
+    ]
 
 
 def test_positions_and_log(client):
@@ -82,20 +698,2781 @@ def test_positions_and_log(client):
     assert len(log["risk_events"]) >= 1
 
 
+def test_account_returns_authenticated_broker_summary(client):
+    c, _, _ = client
+
+    response = c.get("/account")
+
+    assert response.status_code == 200
+    payload = response.json()
+    observed_at = datetime.fromisoformat(payload.pop("observed_at"))
+    assert observed_at.tzinfo is not None
+    assert payload == {
+        "buying_power": "100000",
+        "equity": "100000",
+        "cash": "100000",
+        "gross_exposure": "0",
+        "positions": [],
+    }
+
+
+def test_account_broker_outage_returns_hardened_503(
+    make_service,
+    authenticate_client,
+):
+    marker = "provider-secret-account-read"
+
+    class AccountReadOutage(MockBroker):
+        def get_account(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=AccountReadOutage())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get("/account")
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+
+
+@pytest.mark.parametrize("invalid_field", ("buying_power", "equity", "cash"))
+def test_account_rejects_invalid_broker_account_values(
+    make_service,
+    authenticate_client,
+    invalid_field,
+):
+    class InvalidAccountBroker(MockBroker):
+        def get_account(self):
+            values = {
+                "buying_power": Decimal("100000"),
+                "equity": Decimal("100000"),
+                "cash": Decimal("100000"),
+            }
+            values[invalid_field] = Decimal("NaN")
+            return Account(**values)
+
+    service = make_service(broker=InvalidAccountBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    _assert_dependency_unavailable(test_client.get("/account"))
+
+
+def test_account_rejects_invalid_broker_position_values(
+    make_service,
+    authenticate_client,
+):
+    class InvalidPositionBroker(MockBroker):
+        def get_positions(self):
+            return [
+                Position(
+                    ticker="AAPL",
+                    qty=Decimal("1"),
+                    avg_entry_price=Decimal("NaN"),
+                    current_price=Decimal("100"),
+                )
+            ]
+
+    service = make_service(broker=InvalidPositionBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    _assert_dependency_unavailable(test_client.get("/account"))
+
+
+def test_account_read_rate_limit_survives_new_app_instance(
+    make_service,
+    authenticate_client,
+    with_limit,
+):
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    service = make_service(broker=broker)
+    service.config = with_limit(
+        service.config,
+        "broker_read",
+        requests=1,
+        window_seconds=60,
+    )
+    first_app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    first_client, csrf = authenticate_client(TestClient(first_app), TOKEN)
+
+    assert first_client.get("/account").status_code == 200
+    session_token = first_client.cookies.get(
+        first_app.state.session_auth.cookie_name()
+    )
+    restarted_app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    restarted_client = TestClient(restarted_app)
+    restarted_client.cookies.set(
+        restarted_app.state.session_auth.cookie_name(),
+        session_token,
+    )
+    limited = restarted_client.get(
+        "/account",
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+
+
+def test_account_reads_use_a_short_bounded_broker_snapshot_cache(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    from trading_assistant.app import main as app_main
+
+    monotonic_now = [100.0]
+    monkeypatch.setattr(
+        app_main.time,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    app = create_app(
+        service=make_service(broker=broker),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    first = test_client.get("/account")
+    second = test_client.get("/account")
+
+    assert first.status_code == second.status_code == 200
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+    assert first.json()["observed_at"] == second.json()["observed_at"]
+
+    monotonic_now[0] += 2.1
+    third = test_client.get("/account")
+
+    assert third.status_code == 200
+    assert broker.account_reads == 2
+    assert broker.position_reads == 2
+
+
+def test_account_and_holdings_share_one_broker_snapshot(
+    make_service,
+    authenticate_client,
+):
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    app = create_app(
+        service=make_service(broker=broker),
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    account = test_client.get("/account")
+    holdings = test_client.get("/holdings")
+
+    assert account.status_code == holdings.status_code == 200
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+    assert (
+        holdings.json()["alpaca_observed_at"]
+        == account.json()["observed_at"]
+    )
+
+
+@pytest.mark.parametrize("second_path", ("/positions", "/holdings"))
+def test_broker_read_rate_limit_cannot_be_bypassed(
+    make_service,
+    authenticate_client,
+    with_limit,
+    second_path,
+):
+    class CountingBroker(MockBroker):
+        def __init__(self):
+            super().__init__()
+            self.account_reads = 0
+            self.position_reads = 0
+
+        def get_account(self):
+            self.account_reads += 1
+            return super().get_account()
+
+        def get_positions(self):
+            self.position_reads += 1
+            return super().get_positions()
+
+    broker = CountingBroker()
+    service = make_service(broker=broker)
+    service.config = with_limit(
+        service.config,
+        "broker_read",
+        requests=1,
+        window_seconds=60,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    test_client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    assert test_client.get("/account").status_code == 200
+    limited = test_client.get(second_path)
+
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert broker.account_reads == 1
+    assert broker.position_reads == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_argument_parts",
+    (
+        ("chat", "rate"),
+        ("approve", "rate"),
+        ("analysis", "rate"),
+        ("backtest", "rate"),
+        ("account", "rate"),
+        ("login", "rate"),
+    ),
+)
+def test_process_local_rate_limiter_overrides_are_rejected(
+    make_service,
+    legacy_argument_parts,
+):
+    legacy_argument = "_".join(legacy_argument_parts)
+    with pytest.raises(TypeError, match=legacy_argument):
+        create_app(
+            service=make_service(),
+            agent=StubAgent(),
+            api_token=TOKEN,
+            planning=None,
+            **{legacy_argument: object()},
+        )
+
+
+def test_health_reports_server_observed_broker_and_mode(client):
+    c, _, _ = client
+
+    health = c.get("/health").json()
+
+    assert health["broker"] == "Mock"
+    assert health["mode"] == "paper"
+
+
+def test_health_observed_at_identifies_one_complete_safety_snapshot(client):
+    c, _, _ = client
+
+    health = c.get("/health").json()
+
+    assert health["db_ok"] is True
+    assert health["safety"]["complete"] is True
+    assert health["observed_at"] == health["safety"]["observed_at"]
+
+
+def test_health_fails_closed_instead_of_reporting_negative_heartbeat_age(
+    client,
+):
+    c, service, _ = client
+    with service.session_factory() as session:
+        session.add(
+            Heartbeat(
+                source="daemon",
+                at=utcnow() + timedelta(days=1),
+            )
+        )
+        session.commit()
+
+    health = c.get("/health").json()
+
+    assert health["db_ok"] is False
+    assert health["daemon_alive"] is False
+    assert health["heartbeat_age_seconds"] is None
+    assert health["safety"]["state"] == "unknown"
+    assert health["safety"]["complete"] is False
+    assert health["safety"]["unknown_categories"] == [
+        "heartbeat"
+    ]
+
+
+def test_health_reports_complete_locally_clear_persisted_safety_truth(client):
+    c, _, _ = client
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    observed_at = safety.pop("observed_at")
+    assert datetime.fromisoformat(observed_at).tzinfo is not None
+    assert safety == {
+        "state": "locally_clear",
+        "complete": True,
+        "local_enumeration": "confirmed",
+        "remote_broker_open_orders": "unverified",
+        "operator_global_breaker": {
+            "tripped": False,
+            "generation": 0,
+        },
+        "active_breakers": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "unknown_categories": [],
+    }
+
+
+def test_health_reports_every_active_breaker_and_global_generation(client):
+    c, service, _ = client
+    global_state = service.breakers.trip(
+        BreakerScope.operator_global(),
+        "operator panic remains latched",
+        "operator:test",
+        request_id="health-global-breaker",
+    )
+    equity_state = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        "equity loss scope remains latched",
+        "operator:test",
+        request_id="health-equity-breaker",
+    )
+    data_state = service.breakers.trip(
+        BreakerScope.data(AssetClass.CRYPTO),
+        "crypto data scope remains latched",
+        "operator:test",
+        request_id="health-data-breaker",
+    )
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    assert safety["state"] == "unsafe"
+    assert safety["complete"] is True
+    assert safety["operator_global_breaker"] == {
+        "tripped": True,
+        "generation": global_state.generation,
+    }
+    assert safety["unknown_categories"] == []
+    assert [
+        (item["scope"], item["generation"])
+        for item in safety["active_breakers"]
+    ] == [
+        (data_state.scope.key, data_state.generation),
+        (equity_state.scope.key, equity_state.generation),
+        (global_state.scope.key, global_state.generation),
+    ]
+
+
+def test_health_marks_malformed_active_breaker_evidence_incomplete(client):
+    c, service, _ = client
+    with service.session_factory() as session:
+        persist_sensitive(
+            session,
+            CircuitBreakerState(
+                scope_key="operator_global",
+                kind="operator_global",
+                target="",
+                tripped=True,
+                actor="operator:test",
+                generation=0,
+            ),
+            {"reason": "malformed persisted generation"},
+        )
+        session.commit()
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    health = response.json()
+    assert health["db_ok"] is False
+    assert health["safety"]["state"] == "unsafe"
+    assert health["safety"]["complete"] is False
+    assert health["safety"]["unknown_categories"] == [
+        "active_breakers"
+    ]
+    assert health["safety"]["operator_global_breaker"] == {
+        "tripped": True,
+        "generation": 0,
+    }
+
+
+def test_health_reports_terminal_latch_and_orphan_fill_after_reload(client):
+    c, service, _ = client
+    with service.session_factory() as session:
+        order = Order(
+            idempotency_key="health-terminal-latch",
+            ticker="AAPL",
+            side="buy",
+            order_type="market",
+            notional=Decimal("100"),
+            status=OrderStatus.CANCELED.value,
+            acceptance_state=FILL_RECONCILIATION_REQUIRED,
+            last_error_code="waiting_for_exact_fill",
+        )
+        persist_sensitive(
+            session,
+            order,
+            {"approval_reason": "health fixture"},
+        )
+        orphan = Fill(
+            order_id=None,
+            ticker="MSFT",
+            side="sell",
+            qty=Decimal("1"),
+            price=Decimal("200"),
+            broker_fill_id="health-orphan-fill",
+        )
+        session.add(orphan)
+        session.commit()
+        order_id = order.id
+        fill_id = orphan.id
+
+    response = c.get("/health")
+
+    assert response.status_code == 200
+    safety = response.json()["safety"]
+    assert safety["state"] == "unsafe"
+    assert safety["complete"] is True
+    assert safety["local_enumeration"] == "confirmed"
+    assert safety["unsafe_local_state"]["latched_order_ids"] == [order_id]
+    assert safety["unsafe_local_state"]["unsafe_fill_ids"] == [fill_id]
+    assert safety["unknown_categories"] == []
+
+
+def test_health_fails_closed_when_persisted_safety_read_is_incomplete(
+    client,
+):
+    c, service, _ = client
+
+    def fail_breaker_read(execute_state):
+        if (
+            execute_state.is_select
+            and "circuit_breaker_state" in str(execute_state.statement)
+        ):
+            raise RuntimeError("database-secret-health-breaker-read")
+
+    session_type = service.session_factory.class_
+    event.listen(session_type, "do_orm_execute", fail_breaker_read)
+    try:
+        response = c.get("/health")
+    finally:
+        event.remove(
+            session_type,
+            "do_orm_execute",
+            fail_breaker_read,
+        )
+
+    assert response.status_code == 200
+    health = response.json()
+    assert health["db_ok"] is False
+    assert health["error"] == "database_unavailable"
+    safety = health["safety"]
+    assert safety.pop("observed_at") == health["observed_at"]
+    assert safety == {
+        "state": "unknown",
+        "complete": False,
+        "local_enumeration": "confirmed",
+        "remote_broker_open_orders": "unverified",
+        "operator_global_breaker": {
+            "tripped": None,
+            "generation": None,
+        },
+        "active_breakers": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "unknown_categories": ["active_breakers"],
+    }
+    assert "database-secret-health-breaker-read" not in response.text
+
+
+@pytest.mark.parametrize("path", ["/positions", "/holdings"])
+def test_required_broker_read_outage_returns_hardened_503(
+    make_service,
+    authenticate_client,
+    path,
+):
+    marker = "provider-secret-required-broker-read"
+
+    class BrokerReadOutage(MockBroker):
+        def get_positions(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=BrokerReadOutage())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(path)
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+
+
+@pytest.mark.parametrize(
+    ("path", "method_name"),
+    [
+        ("/positions", "get_positions"),
+        ("/holdings", "get_combined_holdings"),
+    ],
+)
+def test_required_read_internal_failure_remains_hardened_500(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    path,
+    method_name,
+):
+    service = make_service()
+    marker = f"internal-{method_name}-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(service, method_name, fail_internal)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.get(path)
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+
+
+def test_approval_quote_outage_preserves_outbox_and_retries_safely(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "provider-secret-approval-health"
+    original_get_quote = service.broker.get_quote
+    quote_available = False
+
+    def intermittent_quote(ticker):
+        if not quote_available:
+            raise ConnectionError(marker)
+        return original_get_quote(ticker)
+
+    service.broker.get_quote = intermittent_quote
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    unavailable = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "human reviewed before dependency outage"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-quote-outage",
+        },
+    )
+
+    _assert_dependency_unavailable(unavailable)
+    assert marker not in unavailable.text
+    assert service.broker.submit_calls == 0
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        failure = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=unavailable.headers["X-Request-ID"],
+        ).one()
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert approval_count == 1
+    assert (
+        failure.actor,
+        _plaintext(failure, "reason"),
+        failure.result_code,
+        failure.target_id,
+    ) == (
+        "operator:local",
+        "human reviewed before dependency outage",
+        "dependency_unavailable",
+        str(order_id),
+    )
+    assert marker not in _plaintext(failure, "detail_json")
+    assert "ConnectionError" not in _plaintext(failure, "detail_json")
+
+    quote_available = True
+    retried = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "retry approved outbox after quote recovery"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-quote-retry",
+        },
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == OrderStatus.SUBMITTED.value
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+    assert order.status == OrderStatus.SUBMITTED.value
+    assert approval_count == 1
+
+
+def test_approval_clock_outage_preserves_outbox_audits_exact_context_and_retries(
+    make_service,
+    authenticate_client,
+    caplog,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "provider-secret-approval-market-clock"
+    clock_available = False
+    original_observe = service.clock.observe
+
+    def intermittent_observe(at):
+        if not clock_available:
+            raise ConnectionError(marker)
+        return original_observe(at)
+
+    service.clock.observe = intermittent_observe
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = "human approved before market clock outage"
+
+    unavailable = client.post(
+        f"/approve/{order_id}",
+        json={"reason": reason},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-clock-outage",
+        },
+    )
+
+    _assert_dependency_unavailable(unavailable)
+    assert service.broker.submit_calls == 0
+    request_id = unavailable.headers["X-Request-ID"]
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        failures = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=request_id,
+            result_code="dependency_unavailable",
+        ).all()
+        approval_count = session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count()
+        risk_text = "\n".join(
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            _plaintext(state, "reason")
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert approval_count == 1
+    assert len(failures) == 1
+    failure = failures[0]
+    assert (
+        failure.actor,
+        _plaintext(failure, "reason"),
+        failure.target_type,
+        failure.target_id,
+        _plaintext(failure, "detail_json"),
+    ) == (
+        "operator:local",
+        reason,
+        "order",
+        str(order_id),
+        json.dumps({"stage": "execution_health"}, sort_keys=True),
+    )
+    exposed = "\n".join(
+        (
+            unavailable.text,
+            _plaintext(failure, "detail_json"),
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "ConnectionError" not in exposed
+
+    clock_available = True
+    retried = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "retry approved outbox after clock recovery"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-clock-retry",
+        },
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == OrderStatus.SUBMITTED.value
+    assert service.broker.submit_calls == 1
+    with service.session_factory() as session:
+        assert (
+            session.get(Order, order_id).status
+            == OrderStatus.SUBMITTED.value
+        )
+        assert session.query(AuditEvent).filter_by(
+            action="order.approve",
+            target_id=str(order_id),
+        ).count() == 1
+
+
+def test_approval_internal_failure_is_hardened_500_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    order_id = _propose(service)
+    marker = "internal-order-submission-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        service.order_submission,
+        "submit",
+        fail_internal,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "approval internal failure probe"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "approval-internal-failure",
+        },
+    )
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        order = session.get(Order, order_id)
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="order.submit",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert order.status == OrderStatus.APPROVAL_RECORDED.value
+    assert dependency_audits == 0
+
+
 def test_killswitch_reset_endpoint(client):
     c, svc, _ = client
-    with svc.session_factory() as s:
-        from trading_assistant.risk.killswitch import KillSwitch
+    observed = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="drill",
+        actor="daemon",
+        request_id="api-killswitch-drill",
+    )
+    health_response = c.get("/health").json()
+    assert health_response["killswitch_generation"]["equity"] == (
+        observed.generation
+    )
 
-        KillSwitch.trip(s, reason="drill")
-        s.commit()
-    r = c.post("/killswitch/reset").json()
-    assert r["tripped"] is False
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": "account and broker checks are healthy",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-reset-endpoint"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tripped"] is False
+    assert response.json()["generation"] == observed.generation + 1
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="circuit_breaker.reset")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "account and broker checks are healthy"
+    assert audit.request_id == response.headers["X-Request-ID"]
+    health = json.loads(_plaintext(audit, "detail_json"))["prior_health"]
+    assert set(health) >= {
+        "captured_at",
+        "daily_pnl_complete",
+        "daily_total_pnl",
+        "broker_reconciled",
+        "account_equity",
+        "quote_fresh",
+    }
+    assert "compatibility_facade" not in health
+
+
+def test_breaker_reset_accepts_exact_data_scope_and_health_lists_it(
+    client,
+):
+    c, service, _ = client
+    for symbol in service._reset_symbols(AssetClass.EQUITY):
+        service.broker.set_price(symbol, Decimal("100"))
+    observed = service.breakers.trip(
+        BreakerScope.data(AssetClass.EQUITY),
+        reason="stale equity feed drill",
+        actor="daemon:test",
+        request_id="api-data-breaker-trip",
+    )
+
+    health = c.get("/health").json()
+    assert {
+        item["scope"] for item in health["active_breakers"]
+    } >= {"data:equity"}
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "data:equity",
+            "reason": "all configured equity quotes are fresh",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-data-reset"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["scope"] == "data:equity"
+    assert response.json()["tripped"] is False
+
+
+def test_breaker_reset_rejects_noncanonical_or_legacy_scope_body(
+    client,
+):
+    c, _service, _ = client
+
+    noncanonical = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:aapl",
+            "reason": "invalid lowercase scope",
+            "expected_generation": 1,
+        },
+        headers={"Idempotency-Key": "killswitch-noncanonical-scope"},
+    )
+    legacy = c.post(
+        "/killswitch/reset",
+        json={
+            "asset_class": "equity",
+            "reason": "legacy reset body",
+            "expected_generation": 1,
+        },
+        headers={"Idempotency-Key": "killswitch-legacy-body"},
+    )
+
+    assert noncanonical.status_code == 422
+    assert legacy.status_code == 422
+
+
+def test_liquidity_reset_requires_exact_symbol_spread_recovery(
+    client,
+):
+    c, service, _ = client
+    observed = service.breakers.trip(
+        BreakerScope.liquidity("AAPL"),
+        reason="wide spread drill",
+        actor="daemon:test",
+        request_id="api-liquidity-breaker-trip",
+    )
+    original_quote = service.broker.get_quote
+
+    def wide_quote(ticker):
+        quote = original_quote(ticker)
+        return replace(
+            quote,
+            bid=Decimal("90"),
+            ask=Decimal("110"),
+        )
+
+    service.broker.get_quote = wide_quote
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:AAPL",
+            "reason": "attempt while spread remains wide",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-liquidity-blocked"},
+    )
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(
+        BreakerScope.liquidity("AAPL")
+    )
+
+    service.broker.get_quote = original_quote
+    recovered = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "liquidity:AAPL",
+            "reason": "AAPL spread normalized",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-liquidity-recovered"},
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["scope"] == "liquidity:AAPL"
+
+
+def test_drawdown_reset_requires_recovered_account_equity(client):
+    c, service, _ = client
+    service.snapshot_service.assemble_for_execution("AAPL")
+    service.broker._buying_power = Decimal("80000")
+    observed = service.breakers.trip(
+        BreakerScope.drawdown(AssetClass.EQUITY),
+        reason="drawdown drill",
+        actor="daemon:test",
+        request_id="api-drawdown-breaker-trip",
+    )
+
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "drawdown:equity",
+            "reason": "attempt before equity recovery",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-drawdown-blocked"},
+    )
+
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(
+        BreakerScope.drawdown(AssetClass.EQUITY)
+    )
+
+    service.broker._buying_power = Decimal("100000")
+    recovered = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "drawdown:equity",
+            "reason": "account equity recovered",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-drawdown-recovered"},
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["scope"] == "drawdown:equity"
+
+
+def test_broker_drift_reset_requires_clean_reconciliation(client):
+    c, service, _ = client
+    scope = BreakerScope.broker_drift()
+    observed = service.breakers.trip(
+        scope,
+        reason="broker drift drill",
+        actor="reconciler:test",
+        request_id="api-broker-drift-trip",
+    )
+
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "broker_drift",
+            "reason": "broker and local state reconciled",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-broker-drift"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["scope"] == "broker_drift"
+    assert service.breakers.is_tripped(scope) is False
+
+
+def test_operator_global_reset_refuses_while_other_breaker_is_active(
+    client,
+):
+    c, service, _ = client
+    for symbol in service._reset_symbols(AssetClass.EQUITY):
+        service.broker.set_price(symbol, Decimal("100"))
+    data_scope = BreakerScope.data(AssetClass.EQUITY)
+    data_state = service.breakers.trip(
+        data_scope,
+        reason="data dependency drill",
+        actor="daemon:test",
+        request_id="api-operator-data-trip",
+    )
+    operator_scope = BreakerScope.operator_global()
+    operator_state = service.breakers.trip(
+        operator_scope,
+        reason="operator global drill",
+        actor="operator:test",
+        request_id="api-operator-global-trip",
+    )
+
+    blocked = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "operator_global",
+            "reason": "attempt while another breaker remains active",
+            "expected_generation": operator_state.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-operator-blocked"},
+    )
+    assert blocked.status_code == 503
+    assert service.breakers.is_tripped(operator_scope)
+
+    data_reset = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "data:equity",
+            "reason": "all equity quotes recovered",
+            "expected_generation": data_state.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-operator-data-reset"},
+    )
+    assert data_reset.status_code == 200, data_reset.text
+
+    operator_reset = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "operator_global",
+            "reason": "all other breakers and broker state are clear",
+            "expected_generation": operator_state.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-operator-reset"},
+    )
+    assert operator_reset.status_code == 200, operator_reset.text
+    assert service.breakers.is_tripped(operator_scope) is False
+
+
+def test_killswitch_reset_returns_conflict_for_stale_generation(client):
+    c, svc, _ = client
+    observed = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="initial loss",
+        actor="daemon:first",
+        request_id="api-initial-loss",
+    )
+    retripped = svc.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="new loss evidence",
+        actor="daemon:second",
+        request_id="api-new-loss",
+    )
+
+    response = c.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": "stale operator reset",
+            "expected_generation": observed.generation,
+        },
+        headers={"Idempotency-Key": "killswitch-stale-generation"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "breaker_conflict"
+    assert response.json()["error"]["request_id"] == response.headers[
+        "X-Request-ID"
+    ]
+    assert svc.breakers.is_tripped(
+        BreakerScope.loss(AssetClass.EQUITY)
+    ) is True
+    current = svc.breakers.get(BreakerScope.loss(AssetClass.EQUITY))
+    assert current is not None
+    assert current.generation == retripped.generation
+
+
+@pytest.mark.parametrize("quote_failure", ["unavailable", "stale"])
+def test_killswitch_reset_quote_failure_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+    quote_failure,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="dependency outage setup",
+        actor="daemon:test",
+        request_id="dependency-reset-setup",
+    )
+    marker = "provider-secret-reset-health"
+    original_get_quote = service.broker.get_quote
+
+    def fail_quote(ticker):
+        if quote_failure == "unavailable":
+            raise ConnectionError(marker)
+        current = original_get_quote(ticker)
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        return replace(
+            current,
+            as_of=stale_at,
+            book_as_of=stale_at,
+            trade_as_of=stale_at,
+        )
+
+    service.broker.get_quote = fail_quote
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": "verify dependency health before reset",
+            "expected_generation": observed.generation,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"killswitch-quote-failure-{quote_failure}"
+            ),
+        },
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    assert service.breakers.is_tripped(
+        BreakerScope.loss(AssetClass.EQUITY)
+    ) is True
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        _plaintext(audit, "reason"),
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "verify dependency health before reset",
+        "dependency_unavailable",
+        BreakerScope.loss(AssetClass.EQUITY).key,
+    )
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
+
+
+def test_killswitch_reset_clock_outage_keeps_generation_and_audits_exact_context(
+    make_service,
+    authenticate_client,
+    caplog,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="clock dependency outage setup",
+        actor="daemon:test",
+        request_id="clock-dependency-reset-setup",
+    )
+    marker = "provider-secret-reset-market-calendar"
+
+    def fail_calendar(at):
+        raise ConnectionError(marker)
+
+    service.clock.observe = fail_calendar
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = "verify market clock before breaker reset"
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": reason,
+            "expected_generation": observed.generation,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-clock-outage",
+        },
+    )
+
+    _assert_dependency_unavailable(response)
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        failures = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).all()
+        risk_text = "\n".join(
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            _plaintext(state, "reason")
+            for state in session.query(CircuitBreakerState).all()
+        )
+    assert len(failures) == 1
+    failure = failures[0]
+    assert (
+        failure.actor,
+        _plaintext(failure, "reason"),
+        failure.target_type,
+        failure.target_id,
+        _plaintext(failure, "detail_json"),
+    ) == (
+        "operator:local",
+        reason,
+        "circuit_breaker",
+        BreakerScope.loss(AssetClass.EQUITY).key,
+        json.dumps(
+            {
+                "scope": "loss:equity",
+                "expected_generation": observed.generation,
+                "stage": "health_collection",
+            },
+            sort_keys=True,
+        ),
+    )
+    exposed = "\n".join(
+        (
+            response.text,
+            _plaintext(failure, "detail_json"),
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "ConnectionError" not in exposed
+
+
+@pytest.mark.parametrize("workflow", ["approve", "reset"])
+def test_future_market_boundary_with_large_loss_cannot_approve_or_reset(
+    make_service,
+    authenticate_client,
+    caplog,
+    workflow,
+):
+    service = make_service(quote_now=lambda: CLOCK_NOW)
+    service.snapshot_service.now = lambda: CLOCK_NOW
+    order_id = _propose(service) if workflow == "approve" else None
+    observed = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="future boundary reset setup",
+            actor="daemon:test",
+            request_id="future-boundary-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    _seed_clock_loss(service)
+    future_boundary = CLOCK_NOW + timedelta(microseconds=1)
+    _install_equity_clock(
+        service,
+        FakeClock(
+            is_open=True,
+            most_recent_open=future_boundary,
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = f"reject {workflow} with future market boundary"
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": reason},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-approve",
+            },
+        )
+        action = "order.submit"
+    else:
+        assert observed is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "scope": "loss:equity",
+                "reason": reason,
+                "expected_generation": observed.generation,
+            },
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-reset",
+            },
+        )
+        action = "circuit_breaker.reset"
+
+    _assert_dependency_unavailable(response)
+    with service.session_factory() as session:
+        failure = session.query(AuditEvent).filter_by(
+            action=action,
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+        risk_text = "\n".join(
+            _plaintext(event, "reason") for event in session.query(RiskEvent).all()
+        )
+        breaker_text = "\n".join(
+            _plaintext(state, "reason")
+            for state in session.query(CircuitBreakerState).all()
+        )
+        if order_id is not None:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.APPROVAL_RECORDED.value
+            )
+    assert failure.actor == "operator:local"
+    assert _plaintext(failure, "reason") == reason
+    assert service.broker.submit_calls == 0
+    if observed is not None:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is True
+        assert current.generation == observed.generation
+    exposed = "\n".join(
+        (
+            response.text,
+            _plaintext(failure, "detail_json"),
+            risk_text,
+            breaker_text,
+            caplog.text,
+        )
+    )
+    assert future_boundary.isoformat() not in exposed
+
+    if order_id is not None:
+        _install_equity_clock(
+            service,
+            FakeClock(
+                is_open=True,
+                most_recent_open=CLOCK_NOW - timedelta(hours=3),
+            ),
+        )
+        retry = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "retry against truthful loss boundary"},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "future-boundary-approve-retry",
+            },
+        )
+        assert retry.status_code == 403
+        assert retry.json()["error"]["code"] == "policy_denied"
+        assert service.broker.submit_calls == 0
+        with service.session_factory() as session:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.REJECTED.value
+            )
+            risk = session.query(RiskEvent).filter_by(
+                order_id=order_id,
+                event_type="rejection",
+            ).one()
+        assert "daily total-loss limit reached" in _plaintext(
+            risk,
+            "reason",
+        )
+
+
+@pytest.mark.parametrize("workflow", ["approve", "reset"])
+@pytest.mark.parametrize(
+    "raw_session_open",
+    ["provider-secret-invalid-alpaca-clock", 0, 1, None],
+    ids=["secret-string", "integer-zero", "integer-one", "none"],
+)
+def test_operator_workflows_reject_malformed_alpaca_calendar_and_redact_provider(
+    make_service,
+    authenticate_client,
+    caplog,
+    workflow,
+    raw_session_open,
+):
+    service = make_service(quote_now=lambda: CLOCK_NOW)
+    service.snapshot_service.now = lambda: CLOCK_NOW
+    order_id = _propose(service) if workflow == "approve" else None
+    observed = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="invalid clock reset setup",
+            actor="daemon:test",
+            request_id="invalid-clock-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    marker = "provider-secret-invalid-alpaca-clock"
+    clock, state = _malformed_alpaca_calendar_clock(
+        raw_session_open,
+        marker,
+    )
+    _install_equity_clock(service, clock)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    reason = f"reject invalid clock data during {workflow}"
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": reason},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-approve",
+            },
+        )
+        action = "order.submit"
+    else:
+        assert observed is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "scope": "loss:equity",
+                "reason": reason,
+                "expected_generation": observed.generation,
+            },
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-reset",
+            },
+        )
+        action = "circuit_breaker.reset"
+
+    _assert_dependency_unavailable(response)
+    with service.session_factory() as session:
+        failure = session.query(AuditEvent).filter_by(
+            action=action,
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+        if order_id is not None:
+            assert (
+                session.get(Order, order_id).status
+                == OrderStatus.APPROVAL_RECORDED.value
+            )
+    assert failure.actor == "operator:local"
+    assert _plaintext(failure, "reason") == reason
+    exposed = "\n".join(
+        (
+            response.text,
+            _plaintext(failure, "detail_json"),
+            caplog.text,
+        )
+    )
+    assert marker not in exposed
+    assert "BrokerDataIntegrityError" not in exposed
+    assert "invalid Alpaca market calendar" not in exposed
+    if observed is not None:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is True
+        assert current.generation == observed.generation
+
+    if order_id is not None:
+        state["open"] = datetime(2026, 7, 24, 9, 30)
+        retry = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "retry after valid clock data"},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "invalid-calendar-approve-retry",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["status"] == OrderStatus.SUBMITTED.value
+        assert service.broker.submit_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("workflow", "observed_at", "later_state", "expected_status"),
+    [
+        (
+            "approve",
+            datetime(2026, 7, 24, 13, 29, 59, tzinfo=timezone.utc),
+            True,
+            403,
+        ),
+        (
+            "reset",
+            datetime(2026, 7, 24, 19, 59, 59, tzinfo=timezone.utc),
+            False,
+            200,
+        ),
+    ],
+    ids=["pre-open-post-open", "pre-close-post-close"],
+)
+def test_operator_workflows_use_exact_calendar_observation_across_clock_race(
+    make_service,
+    authenticate_client,
+    workflow,
+    observed_at,
+    later_state,
+    expected_status,
+):
+    service = make_service()
+    order_id = _propose(service) if workflow == "approve" else None
+    observed_breaker = (
+        service.breakers.trip(
+            BreakerScope.loss(AssetClass.EQUITY),
+            reason="calendar race reset setup",
+            actor="daemon:test",
+            request_id="calendar-race-reset-setup",
+        )
+        if workflow == "reset"
+        else None
+    )
+    clock, calls = _race_alpaca_clock(later_state)
+    service.broker._now = lambda: observed_at
+    service.clock = clock
+    service._clocks[AssetClass.EQUITY] = clock
+    service.snapshot_service.now = lambda: observed_at
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    if workflow == "approve":
+        response = client.post(
+            f"/approve/{order_id}",
+            json={"reason": "approve at exact pre-open observation"},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "calendar-race-approve",
+            },
+        )
+    else:
+        assert observed_breaker is not None
+        response = client.post(
+            "/killswitch/reset",
+            json={
+                "scope": "loss:equity",
+                "reason": "reset at exact pre-close observation",
+                "expected_generation": observed_breaker.generation,
+            },
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "calendar-race-reset",
+            },
+        )
+
+    assert response.status_code == expected_status, response.text
+    assert calls == {"clock": 0, "calendar": 1}
+    if workflow == "approve":
+        assert response.json()["error"]["code"] == "policy_denied"
+        assert service.broker.submit_calls == 0
+    else:
+        current = service.breakers.get(
+            BreakerScope.loss(AssetClass.EQUITY)
+        )
+        assert current is not None
+        assert current.tripped is False
+
+
+@pytest.mark.parametrize(
+    "incomplete_field",
+    [
+        "daily_pnl_complete",
+        "broker_reconciled",
+        "account_complete",
+        "pending_exposure_complete",
+        "quote_fresh",
+        "market_clock_complete",
+    ],
+)
+def test_killswitch_reset_rejects_every_incomplete_health_field(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+    incomplete_field,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="incomplete health setup",
+        actor="daemon:test",
+        request_id=f"incomplete-reset-setup-{incomplete_field}",
+    )
+    complete = service.snapshot_service.assemble_for_execution("AAPL")
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_execution",
+        lambda *_args, **_kwargs: replace(
+            complete,
+            **{incomplete_field: False},
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": f"reject incomplete {incomplete_field}",
+            "expected_generation": observed.generation,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": (
+                f"killswitch-incomplete-{incomplete_field}"
+            ),
+        },
+    )
+
+    _assert_dependency_unavailable(response)
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).one()
+    assert _plaintext(audit, "reason") == f"reject incomplete {incomplete_field}"
+
+
+def test_reset_snapshot_internal_failure_is_500_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    observed = service.breakers.trip(
+        BreakerScope.loss(AssetClass.EQUITY),
+        reason="internal reset setup",
+        actor="daemon:test",
+        request_id="internal-reset-setup",
+    )
+    marker = "internal-reset-snapshot-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_execution",
+        fail_internal,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": "reset internal failure probe",
+            "expected_generation": observed.generation,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-snapshot-internal",
+        },
+    )
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+    current = service.breakers.get(
+        BreakerScope.loss(AssetClass.EQUITY)
+    )
+    assert current is not None
+    assert current.tripped is True
+    assert current.generation == observed.generation
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="circuit_breaker.reset",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
+
+def test_unexpected_mutation_exception_remains_hardened_internal_error(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    marker = "unexpected-internal-secret"
+
+    def fail_reset(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(service, "reset_killswitch", fail_reset)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/killswitch/reset",
+        json={
+            "scope": "loss:equity",
+            "reason": "unexpected failure classification probe",
+            "expected_generation": 1,
+        },
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "killswitch-unexpected-failure",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert marker not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_panic_endpoint_supplies_actor_and_requires_reason(client):
+    c, svc, _ = client
+
+    assert c.post(
+        "/panic",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "panic-blank-reason"},
+    ).status_code == 422
+    response = c.post(
+        "/panic",
+        json={"reason": "manual API drill"},
+        headers={"Idempotency-Key": "panic-manual-drill"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["safe"] is True
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="circuit_breaker.trip")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "operator:local"
+    assert audit.request_id == response.headers["X-Request-ID"]
+
+
+def test_unsafe_panic_returns_non_2xx_truthful_receipt(
+    make_service, authenticate_client
+):
+    class UnconfirmedCancelBroker(MockBroker):
+        def cancel_order(self, order_id):
+            raise ConnectionError("provider cancellation detail")
+
+        def get_order_status(self, order_id):
+            raise ConnectionError("provider status detail")
+
+    service = make_service(broker=UnconfirmedCancelBroker())
+    order_id = service.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test-setup",
+        reason="unsafe panic proposal setup",
+        request_id="unsafe-panic-proposal",
+    )["order_id"]
+    approved = service.approve_order(
+        order_id,
+        actor="operator:test-setup",
+        reason="create live order for unsafe panic regression",
+        request_id="unsafe-panic-setup",
+    )
+    broker_order_id = approved["broker_order_id"]
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = c.post(
+        "/panic",
+        json={"reason": "cancel all live orders"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-unsafe-cancel",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "panic_incomplete"
+    assert (
+        response.json()["error"]["request_id"]
+        == response.headers["X-Request-ID"]
+    )
+    receipt = response.json()["receipt"]
+    assert receipt["safe"] is False
+    assert receipt["local_enumeration"] == "confirmed"
+    assert receipt["remote_enumeration"] == "confirmed"
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["unconfirmed_order_ids"] == [order_id]
+    assert receipt["remote_open_order_ids"] == [broker_order_id]
+    assert "provider cancellation detail" not in response.text
+    assert "provider status detail" not in response.text
+
+    reloaded_health = c.get("/health").json()
+    assert reloaded_health["safety"]["state"] == "unsafe"
+    assert reloaded_health["safety"]["operator_global_breaker"][
+        "tripped"
+    ] is True
+    assert order_id in reloaded_health["safety"][
+        "unsafe_local_state"
+    ]["live_or_unknown_order_ids"]
+
+
+def test_panic_dependency_failure_returns_stable_non_2xx_receipt(
+    make_service, authenticate_client
+):
+    class EnumerationFailureBroker(MockBroker):
+        def get_open_orders(self):
+            raise ConnectionError("raw provider outage")
+
+    service = make_service(broker=EnumerationFailureBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = c.post(
+        "/panic",
+        json={"reason": "dependency failure drill"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-dependency-failure",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "panic_incomplete"
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "message": (
+            "panic incomplete: safety could not be confirmed; "
+            "broker_enumeration=unconfirmed "
+            "unaddressable_remote_open=false "
+            "local_unconfirmed=[] remote_open=[]"
+        ),
+    }
+    assert "raw provider outage" not in response.text
+
+
+def test_panic_exception_returns_sanitized_incomplete_receipt_and_headers(
+    make_service, authenticate_client
+):
+    service = make_service()
+
+    def explode(**context):
+        raise RuntimeError("raw provider panic dependency secret")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    c, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = c.post(
+        "/panic",
+        json={"reason": "exception safety drill"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-exception-safety",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "panic_incomplete",
+        "message": "Panic could not confirm a safe state",
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(),
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "raw provider panic dependency secret" not in response.text
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_panic_exception_fallback_enumerates_every_local_live_unknown_order(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    statuses = (
+        OrderStatus.APPROVED,
+        OrderStatus.APPROVAL_RECORDED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.ACCEPTANCE_UNKNOWN,
+        OrderStatus.SUBMITTED,
+        OrderStatus.PARTIALLY_FILLED,
+    )
+    with service.session_factory() as session:
+        rows = [
+            Order(
+                idempotency_key=f"panic-fallback-{status.value}",
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                notional=Decimal("100"),
+                status=status.value,
+            )
+            for status in statuses
+        ]
+        for row in rows:
+            persist_sensitive(
+                session,
+                row,
+                {"approval_reason": "panic fallback fixture"},
+            )
+        session.commit()
+        expected_ids = sorted(row.id for row in rows)
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-fallback")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.post(
+        "/panic",
+        json={"reason": "enumerate local fail-closed truth"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-local-enumeration",
+        },
+    )
+
+    assert response.status_code == 503
+    receipt = response.json()["receipt"]
+    assert receipt == {
+        "safe": False,
+        "local_enumeration": "confirmed",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": expected_ids,
+        "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(
+            live_or_unknown_order_ids=expected_ids,
+        ),
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "provider-secret-panic-fallback" not in response.text
+
+
+def test_panic_exception_fallback_reports_unknown_local_enumeration_on_db_failure(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+
+    def explode(**context):
+        raise RuntimeError("provider-secret-panic-fallback")
+
+    service.panic = explode
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    class BrokenSessionFactory:
+        def __call__(self):
+            raise RuntimeError("database-secret-panic-fallback")
+
+    service.session_factory = BrokenSessionFactory()
+    response = client.post(
+        "/panic",
+        json={"reason": "database enumeration failure drill"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "panic-database-enumeration",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["receipt"] == {
+        "safe": False,
+        "local_enumeration": "unknown",
+        "remote_enumeration": "unknown",
+        "confirmed_canceled": [],
+        "unconfirmed_order_ids": [],
+        "remote_open_order_ids": [],
+        "unsafe_local_state": _unsafe_local_state(
+            unknown_categories=(
+                "live_or_unknown_orders",
+                "latched_orders",
+                "unsafe_fills",
+                "active_rules",
+                "unsafe_rule_groups",
+            ),
+        ),
+        "message": "panic incomplete: safety could not be confirmed",
+    }
+    assert "provider-secret-panic-fallback" not in response.text
+    assert "database-secret-panic-fallback" not in response.text
+
+
+def test_panic_rule_audit_failure_returns_unsafe_receipt_without_false_claim(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    created = service.create_conditional_rule(
+        "AAPL",
+        {"price_below": "90"},
+        {"side": "buy", "notional": "100"},
+        actor="operator:setup",
+        reason="prepare panic audit failure",
+        request_id="panic-audit-failure-setup",
+    )
+    with service.session_factory() as session:
+        rule = session.get(Rule, created["rule_id"])
+        group_id = rule.group_id
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(TestClient(app), TOKEN)
+
+    def fail_rule_panic_audit(session, flush_context, instances):
+        if any(
+            isinstance(row, AuditEvent)
+            and row.action == "rule.panic_cancel"
+            for row in session.new
+        ):
+            raise RuntimeError("injected panic cancellation audit failure")
+
+    session_type = service.session_factory.class_
+    event.listen(
+        session_type,
+        "before_flush",
+        fail_rule_panic_audit,
+    )
+    try:
+        response = client.post(
+            "/panic",
+            json={"reason": "panic audit failure drill"},
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "panic-rule-audit-failure",
+            },
+        )
+    finally:
+        event.remove(
+            session_type,
+            "before_flush",
+            fail_rule_panic_audit,
+        )
+
+    assert response.status_code == 503
+    receipt = response.json()["receipt"]
+    assert receipt["safe"] is False
+    assert receipt["confirmed_canceled"] == []
+    assert receipt["remote_enumeration"] == "unknown"
+    assert service.breakers.is_tripped(
+        BreakerScope.operator_global()
+    ) is True
+    with service.session_factory() as session:
+        assert session.get(Rule, created["rule_id"]).state == "active"
+        assert session.get(RuleGroup, group_id).state == "active"
+
+
+def test_reconcile_requires_reason_and_audits_operator_identity(client):
+    c, svc, _ = client
+
+    assert c.post(
+        "/reconcile",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "reconcile-blank-reason"},
+    ).status_code == 422
+    response = c.post(
+        "/reconcile",
+        json={"reason": "reviewed broker and local positions"},
+        headers={"Idempotency-Key": "reconcile-operator"},
+    )
+
+    assert response.status_code == 200
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="positions.reconcile")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "reviewed broker and local positions"
+    assert audit.request_id == response.headers["X-Request-ID"]
+
+
+def test_reconcile_dependency_outage_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+):
+    marker = "provider-secret-position-reconciliation"
+
+    class PositionOutageBroker(MockBroker):
+        def get_positions(self):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=PositionOutageBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/reconcile",
+        json={"reason": "verify broker positions after outage"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "reconcile-dependency-outage",
+        },
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="positions.reconcile",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        _plaintext(audit, "reason"),
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "verify broker positions after outage",
+        "dependency_unavailable",
+        "all",
+    )
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
+
+
+def test_sync_requires_reason_and_audits_operator_identity(client):
+    c, svc, _ = client
+
+    assert c.post(
+        "/sync",
+        json={"reason": " "},
+        headers={"Idempotency-Key": "sync-blank-reason"},
+    ).status_code == 422
+    response = c.post(
+        "/sync",
+        json={"reason": "manual broker status refresh"},
+        headers={"Idempotency-Key": "sync-operator"},
+    )
+
+    assert response.status_code == 200
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="orders.sync")
+            .order_by(AuditEvent.id.desc())
+            .first()
+        )
+    assert audit is not None
+    assert audit.actor == "operator:local"
+    assert _plaintext(audit, "reason") == "manual broker status refresh"
+    assert audit.request_id == response.headers["X-Request-ID"]
+
+
+def test_sync_dependency_outage_is_audited_hardened_503(
+    make_service,
+    authenticate_client,
+):
+    marker = "provider-secret-order-sync"
+
+    class FillActivityOutageBroker(MockBroker):
+        def get_fill_activities(self, *, after=None):
+            raise ConnectionError(marker)
+
+    service = make_service(broker=FillActivityOutageBroker())
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "manual sync dependency probe"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-dependency-outage",
+        },
+    )
+
+    _assert_dependency_unavailable(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+        ).one()
+    assert (
+        audit.actor,
+        _plaintext(audit, "reason"),
+        audit.result_code,
+        audit.target_id,
+    ) == (
+        "operator:local",
+        "manual sync dependency probe",
+        "dependency_unavailable",
+        "all",
+    )
+    assert marker not in _plaintext(audit, "detail_json")
+    assert "ConnectionError" not in _plaintext(audit, "detail_json")
+
+
+def test_sync_cursor_conflict_is_stable_409_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    class FillActivityBroker(MockBroker):
+        activity = None
+
+        def get_fill_activities(self, *, after=None):
+            return [] if self.activity is None else [self.activity]
+
+    broker = FillActivityBroker()
+    service = make_service(broker=broker)
+    order_id = _propose(service)
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+    approved = client.post(
+        f"/approve/{order_id}",
+        json={"reason": "approve cursor conflict probe"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-cursor-approve",
+        },
+    )
+    assert approved.status_code == 200
+    broker.activity = BrokerFill(
+        broker_fill_id="cursor-conflict-fill",
+        broker_order_id=approved.json()["broker_order_id"],
+        ticker="AAPL",
+        side="buy",
+        qty=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=utcnow(),
+    )
+    monkeypatch.setattr(
+        service.reconciliation,
+        "_cursor_snapshot",
+        lambda: (None, None, 99),
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "cursor conflict probe"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-cursor-conflict",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "reconciliation_conflict",
+            "message": "Reconciliation state changed; retry with fresh state",
+            "request_id": response.headers["X-Request-ID"],
+        }
+    }
+    assert response.headers["Content-Security-Policy"]
+    assert response.headers["Cache-Control"] == "no-store"
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
+
+
+def test_sync_internal_failure_is_hardened_500_without_dependency_audit(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    marker = "internal-reconciliation-invariant"
+
+    def fail_internal(*args, **kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        service.reconciliation,
+        "reconcile",
+        fail_internal,
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, csrf = authenticate_client(
+        TestClient(app, raise_server_exceptions=False),
+        TOKEN,
+    )
+
+    response = client.post(
+        "/sync",
+        json={"reason": "sync internal failure probe"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "sync-internal-failure",
+        },
+    )
+
+    _assert_internal_error(response)
+    assert marker not in response.text
+    with service.session_factory() as session:
+        dependency_audits = session.query(AuditEvent).filter_by(
+            action="orders.sync",
+            request_id=response.headers["X-Request-ID"],
+            result_code="dependency_unavailable",
+        ).count()
+    assert dependency_audits == 0
+
+
+def test_sync_sanitizes_provider_integrity_text_everywhere(
+    client,
+    caplog,
+):
+    c, service, _ = client
+    order_id = _propose(service)
+    approved = c.post(
+        f"/approve/{order_id}",
+        json={"reason": "approve provider sanitization probe"},
+        headers={"Idempotency-Key": "sync-sanitize-approve"},
+    )
+    assert approved.status_code == 200
+    broker_order_id = approved.json()["broker_order_id"]
+    marker = "PROVIDER-SECRET-RECONCILIATION-MARKER"
+
+    def invalid_activities(after=None):
+        raise BrokerDataIntegrityError(
+            marker,
+            broker_order_id=broker_order_id,
+        )
+
+    def invalid_open_orders():
+        raise BrokerDataIntegrityError(
+            marker,
+            broker_order_id=broker_order_id,
+        )
+
+    service.broker.get_fill_activities = invalid_activities
+    service.broker.get_open_orders = invalid_open_orders
+    response = c.post(
+        "/sync",
+        json={"reason": "sanitize provider reconciliation failure"},
+        headers={"Idempotency-Key": "sync-sanitize-provider"},
+    )
+
+    assert response.status_code == 200
+    assert marker not in response.text
+    assert marker not in caplog.text
+    with service.session_factory() as session:
+        audits = session.query(AuditEvent).all()
+        risk_events = session.query(RiskEvent).all()
+        breaker = session.get(
+            CircuitBreakerState,
+            BreakerScope.broker_drift().key,
+        )
+    assert breaker is not None and breaker.tripped is True
+    assert marker not in _plaintext(breaker, "reason")
+    assert all(
+        marker not in _plaintext(audit, "reason")
+        and marker not in _plaintext(audit, "detail_json")
+        and marker not in audit.result_code
+        for audit in audits
+    )
+    assert all(
+        marker not in _plaintext(event_row, "reason")
+        for event_row in risk_events
+    )
 
 
 def test_chat_and_rate_limit(client):
     c, svc, agent = client
-    assert c.post("/chat", json={"message": "hi"}).json()["reply"] == "echo: hi"
+    response = c.post("/chat", json={"message": "hi"})
+    assert response.json()["reply"] == "echo: hi"
+    assert agent.last_context == {
+        "actor": "operator:local",
+        "reason": "hi",
+        "request_id": response.headers["X-Request-ID"],
+        "session_binding": "",
+        "limit_principal": "session:1:operator:local",
+    }
     c.post("/chat", json={"message": "again"})       # 2nd allowed (limit=2)
+    broker_reads = []
+
+    def forbidden_read(*_args, **_kwargs):
+        broker_reads.append("called")
+        raise AssertionError("rate-denied chat must not read the broker")
+
+    svc.broker.get_quote = forbidden_read
+    svc.broker.get_account = forbidden_read
+    svc.broker.get_positions = forbidden_read
+    svc.broker.get_open_orders = forbidden_read
     r = c.post("/chat", json={"message": "third"})   # 3rd blocked
     assert r.status_code == 429
+    assert agent.calls == 2
+    assert broker_reads == []
+
+
+def test_http_request_id_canonicalizes_once_for_response_audit_and_provider(
+    make_service,
+    authenticate_client,
+):
+    test_client, service, backend, csrf = _identity_capture_client(
+        make_service,
+        authenticate_client,
+    )
+    headers = {"X-CSRF-Token": csrf}
+
+    exact = test_client.post(
+        "/chat",
+        json={"message": "exact identity"},
+        headers={
+            **headers,
+            "X-Request-ID": "http.request:one",
+        },
+    )
+    spaced = test_client.post(
+        "/chat",
+        json={"message": "spaced identity"},
+        headers={
+            **headers,
+            "X-Request-ID": "  http.request:one  ",
+        },
+    )
+
+    assert exact.status_code == spaced.status_code == 200
+    assert exact.headers["X-Request-ID"] == "http.request:one"
+    assert spaced.headers["X-Request-ID"] == "http.request:one"
+    assert backend.request_ids == [
+        "http.request:one",
+        "http.request:one",
+    ]
+    with service.session_factory() as session:
+        audits = (
+            session.query(AuditEvent)
+            .filter_by(
+                action="http.chat",
+                request_id="http.request:one",
+            )
+            .all()
+        )
+    assert len(audits) == 2
+
+
+def test_invalid_http_request_id_generates_one_fallback_per_request(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    from trading_assistant.app import security
+    test_client, service, backend, csrf = _identity_capture_client(
+        make_service,
+        authenticate_client,
+    )
+    generated_values = iter(["a" * 32, "b" * 32])
+    generation_calls = []
+
+    def generated_uuid():
+        value = next(generated_values)
+        generation_calls.append(value)
+        return SimpleNamespace(hex=value)
+
+    monkeypatch.setattr(security, "uuid4", generated_uuid)
+    headers = {"X-CSRF-Token": csrf}
+
+    first = test_client.post(
+        "/chat",
+        json={"message": "invalid slash"},
+        headers={
+            **headers,
+            "X-Request-ID": "invalid/request",
+        },
+    )
+    second = test_client.post(
+        "/chat",
+        json={"message": "invalid inner space"},
+        headers={
+            **headers,
+            "X-Request-ID": "invalid request",
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert generation_calls == ["a" * 32, "b" * 32]
+    assert first.headers["X-Request-ID"] == "a" * 32
+    assert second.headers["X-Request-ID"] == "b" * 32
+    assert backend.request_ids == ["a" * 32, "b" * 32]
+    with service.session_factory() as session:
+        audits = (
+            session.query(AuditEvent)
+            .filter(
+                AuditEvent.action == "http.chat",
+                AuditEvent.request_id.in_(["a" * 32, "b" * 32]),
+            )
+            .all()
+        )
+    assert {audit.request_id for audit in audits} == {
+        "a" * 32,
+        "b" * 32,
+    }
+
+
+def test_index_only_reports_panic_success_for_explicit_safe_receipt(client):
+    script = (_STATIC / "js" / "index.js").read_text(encoding="utf-8")
+
+    assert "safe === true" in script
+    assert "local_enumeration" in script
+    assert "remote_enumeration" in script
+    assert "everything halted" not in script.lower()

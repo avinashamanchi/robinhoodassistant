@@ -1,0 +1,1878 @@
+diff --git a/.env.example b/.env.example
+index 1cf65b2..eed2356 100644
+--- a/.env.example
++++ b/.env.example
+@@ -24,5 +24,5 @@ BACKUP_ENCRYPTION_KEY=
+ # values. This field is migration/test-only; do not use it for normal runtime.
+ FIELD_ENCRYPTION_KEYS_JSON=
+ 
+-# Legacy live-mode confirmation. Leave unset for paper-only operation.
++# Legacy diagnostic input only. Any value remains rejected; this release is paper-only.
+ LIVE_TRADING_CONFIRM=
+diff --git a/README.md b/README.md
+index 9d47962..a2c9d80 100644
+--- a/README.md
++++ b/README.md
+@@ -29,8 +29,8 @@ Built in phases (see `docs/superpowers/specs/`):
+   plans/screener UI, optional Alpaca news.
+ - **Phase 6 ✅** — LLM analyst (interprets `MarketFeatures` via the playbook,
+   cited + regime-conditioned, earnings-aware), scorecard grading vs realized
+-  forward returns, and a 50-graded-calls promotion gate (advice only — never
+-  auto-enables; this release rejects live mode at startup).
++  forward returns, and a 50-graded-calls analyst-review threshold (research
++  advice only; this release rejects live mode at startup).
+ - **Phase 7 (harness) ✅** — signal library, baseline strategies, event-driven
+   backtester (no-lookahead), walk-forward + sacred holdout, historical situations,
+   synthetic stress suite, crypto as an independent asset class. LLM-in-the-loop
+diff --git a/config.yaml b/config.yaml
+index ee9963a..7f1ddee 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -35,7 +35,7 @@ integrations:
+   composio_enabled: false
+ 
+ trading:
+-  mode: paper              # paper | live  (live ALSO requires env confirmation)
++  mode: paper              # legacy live parses for diagnostics but is rejected
+   broker: alpaca           # mock | alpaca  — routes orders to Alpaca PAPER
+   request_timeout_seconds: 10
+   reconciliation_max_age_seconds: 300
+diff --git a/docs/RUNBOOK.md b/docs/RUNBOOK.md
+index 0700985..782192a 100644
+--- a/docs/RUNBOOK.md
++++ b/docs/RUNBOOK.md
+@@ -250,9 +250,9 @@ After preliminary idempotency lookup and request preparation, `AlpacaBroker`
+ dynamically rechecks the exact SDK target while holding a broker-owned `RLock`
+ across the actual SDK submit or cancel call, including compensation. The outer
+ drill checks remain defense in depth. Live, uninitialized, subclassed,
+-sandbox-false, or URL-overridden clients are refused. The guard is armed only
+-by this explicit credentialed drill, so it does not globally disable
+-intentionally configured live mode. Offline doubles can exercise mock behavior
++sandbox-false, or URL-overridden clients are refused. This release has no
++intentionally configurable live mode: legacy live fields are parsed only so
++startup can reject them explicitly. Offline doubles can exercise mock behavior
+ only and can never produce `alpaca_paper:passed`.
+ 
+ The gate snapshots pre-existing open-order IDs and exact position quantities,
+diff --git a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+index 3088c90..e9a0bfd 100644
+--- a/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
++++ b/docs/superpowers/plans/2026-07-27-secrets-model-trust.md
+@@ -544,8 +544,11 @@ class TransportPolicy:
+         )
+ ```
+ 
+-Only tests may call `.test()`. The normal `create_app()` factory constructs
+-`.production()`. `TransportBoundaryMiddleware` runs before route code, counts
++Only the explicitly named `create_test_app()` injection boundary may use
++`.test()`. The public `create_app()` factory requires the exact config,
++role-scoped secrets, and one-shot receipt issued by `run_startup_guard()`; an
++ambient ASGI factory invocation fails before container or broker construction.
++`TransportBoundaryMiddleware` runs before route code, counts
+ headers from the ASGI scope, wraps `receive` to enforce the route's byte limit
+ even without `Content-Length`, validates same-origin, and uses
+ an RFC-aware bracketed-IPv6 parser plus `TrustedHostMiddleware` for exact
+@@ -594,22 +597,25 @@ Tests inject pass/fail inspectors. The production default in Task 3 returns
+ Task 5 replaces that default with the database-backed inspector in the same
+ composition root before the program can be released.
+ 
+-After that guard passes, `ops.serve` calls:
++After that guard passes, `ops.serve` consumes the one-shot receipt to build the
++container, creates the guarded app from that exact container, and passes the
++app object to Uvicorn:
+ 
+ ```python
+-uvicorn.run(
+-    "trading_assistant.app.main:create_app",
+-    factory=True,
+-    host=config.server.bind_host,
+-    port=config.server.port,
+-    ssl_certfile=str(config.server.tls_cert_path),
+-    ssl_keyfile=str(config.server.tls_key_path),
+-    proxy_headers=False,
+-    forwarded_allow_ips="",
+-    access_log=False,
++receipt = run_startup_guard(...)
++container = _build_guarded_container(
++    config,
++    secrets,
++    runtime_role="app",
++    startup_guard_receipt=receipt,
+ )
++app = _create_guarded_app(container=container)
++uvicorn.Server(uvicorn.Config(app, ...))
+ ```
+ 
++Direct `uvicorn trading_assistant.app.main:create_app --factory` is not a
++supported launcher and fails with `production_startup_guard_required`.
++
+ `scripts/start.sh` starts only this HTTPS app and does not kill unrelated
+ processes, reset breakers, start the daemon, or display a secret-retrieval
+ command. It uses the PID file only after validating that the recorded process
+diff --git a/docs/superpowers/specs/2026-07-09-agentic-trading-assistant-design.md b/docs/superpowers/specs/2026-07-09-agentic-trading-assistant-design.md
+index ee8a42d..d18ddf2 100644
+--- a/docs/superpowers/specs/2026-07-09-agentic-trading-assistant-design.md
++++ b/docs/superpowers/specs/2026-07-09-agentic-trading-assistant-design.md
+@@ -1,8 +1,8 @@
+ # Agentic Trading Assistant — Design Spec
+ 
+ **Date:** 2026-07-09
+-**Status:** Approved (with amendments 1–8)
+-**Broker:** Alpaca (paper first; live behind double-lock)
++**Status:** Historical design; live-mode portions superseded by Plan 2
++**Broker:** Alpaca paper only in the current release
+ 
+ ---
+ 
+@@ -11,11 +11,12 @@
+ An LLM-driven trading assistant. Claude (Anthropic API, `claude-sonnet-4-6`, native tool
+ use) interprets natural-language commands and decides which tools to call. An MCP server
+ exposes broker tools. A FastAPI host runs the agentic loop and enforces a **human
+-confirmation gate** before any live order. A monitoring daemon watches prices and evaluates
++confirmation gate** before any broker order. A monitoring daemon watches prices and evaluates
+ standing conditional orders.
+ 
+-Everything runs against Alpaca **paper trading** first. Live trading is OFF by default and
+-requires a double-lock (config flag AND an env confirmation string).
++Everything in the current release runs against Alpaca **paper trading**. Legacy
++live fields remain parseable only for explicit rejection and diagnostics; no
++configuration or environment combination enables live trading.
+ 
+ ### The one invariant
+ 
+@@ -140,7 +141,7 @@ project has — a test asserts a typo'd risk key fails to load.
+ 
+ ```yaml
+ trading:
+-  mode: paper              # paper | live
++  mode: paper              # live is legacy syntax and is rejected at startup
+   broker: alpaca           # alpaca | mock
+ 
+ risk:
+@@ -166,13 +167,14 @@ daemon:
+   use_websocket: true
+ ```
+ 
+-`.env` (secrets, gitignored; documented in `.env.example`): `ANTHROPIC_API_KEY`,
+-`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER_BASE_URL`, `LIVE_TRADING_CONFIRM`
+-(must equal `I_UNDERSTAND_LIVE_TRADING` for live), `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`,
+-`TELEGRAM_CHAT_ID`, `APP_HOST`, `APP_PORT`.
++Historical `.env` deployments included `LIVE_TRADING_CONFIRM`. In the current
++release it is retained only as a migration/diagnostic field; setting it never
++enables live trading. Normal production secrets come from the role-scoped
++macOS Keychain provider.
+ 
+-**Guardrail #1:** live mode requires `config.yaml` `mode: live` **AND**
+-`LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`. Missing either → paper.
++**Guardrail #1 (superseded):** the former double-lock contract is removed.
++`trading.mode: live` is rejected by production bootstrap, regardless of any
++legacy confirmation value.
+ 
+ ---
+ 
+@@ -202,7 +204,7 @@ daemon:
+ 
+ ## 9. Non-negotiable guardrails
+ 
+-1. Live trading requires BOTH config flag AND env confirmation string.
++1. Live trading is unavailable; legacy live inputs are rejected.
+ 2. LLM proposes; only human approval (or pre-approved rule) executes.
+ 3. Risk engine is final authority on every order; no bypass path.
+ 4. Default state of everything dangerous is OFF.
+diff --git a/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md b/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
+index 2e935e5..03d834f 100644
+--- a/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
++++ b/docs/superpowers/specs/2026-07-09-phase-7-backtesting-design.md
+@@ -13,14 +13,15 @@
+    exists:** `backtest/llm_runner.py`, wiring `MarketFeatures` into an analyst prompt, and
+    graded-call linkage to `AnalysisReport`s. `MarketFeatures` and `playbook.md` are still
+    built now (strategies consume `MarketFeatures`; the playbook ships as a doc).
+-2. **Crypto is a real asset class in the live path** (not backtest-only). This modifies
+-   Phase 1–3 code (§1). **Hard condition:** the entire existing Phase 1 risk + kill-switch
++2. **Crypto is a real asset class in the paper runtime** (not backtest-only),
++   but it is not a live-trading asset class. This modifies Phase 1–3 code (§1).
++   **Hard condition:** the entire existing Phase 1 risk + kill-switch
+    suite must pass unchanged, plus new tests proving equity/crypto trip independently and
+    the crypto clock is always-open while the equity clock is unaffected.
+ 
+ ---
+ 
+-## 1. Asset-class abstraction (modifies live-path code)
++## 1. Asset-class abstraction (modifies paper-runtime code)
+ 
+ `assets.py`: `class AssetClass(str, Enum): EQUITY="equity"; CRYPTO="crypto"` and
+ `AssetClass.for_symbol(sym)` — a symbol containing "/" (e.g. `BTC/USD`) is CRYPTO, else
+diff --git a/src/trading_assistant/analyst/planning.py b/src/trading_assistant/analyst/planning.py
+index 15a6c05..5ce092a 100644
+--- a/src/trading_assistant/analyst/planning.py
++++ b/src/trading_assistant/analyst/planning.py
+@@ -5,8 +5,8 @@ conditional rules (entry tranches + targets + stop + trailing + time) tagged
+ with the plan id. A firing creates a proposal and still requires a separate,
+ identified human approval.
+ 
+-Promotion gate: while the analyst has <50 graded calls for an asset class, plans
+-for that class may be approved in PAPER mode only.
++Every approved plan remains paper-only. Track-record scoring remains available
++for analyst evaluation but cannot promote execution to live trading.
+ """
+ 
+ from __future__ import annotations
+@@ -21,7 +21,6 @@ from typing import Any, Callable, Optional
+ from sqlalchemy import select, update
+ 
+ from ..assets import AssetClass
+-from ..config import live_trading_enabled
+ from ..db.models import AuditEvent, TradePlanRow, utcnow
+ from ..dependencies import RequiredDependencyUnavailable
+ from ..identity import canonical_request_id
+@@ -30,10 +29,7 @@ from ..security.sensitive_fields import sensitive_store
+ from ..signals.models import MarketFeatures
+ from .citations import validate_source_citations
+ from .models import PlanAction, TradePlan
+-from .promotion import can_promote
+-from .scorecard import build_scorecard
+ from .sizing import SizedTradePlan, size_trade
+-from .store import build_scorecard_from_db
+ from .untrusted import UntrustedSummary
+ 
+ 
+@@ -301,19 +297,10 @@ class PlanningService:
+             if plan.action not in (PlanAction.BUY, PlanAction.SELL) or Decimal(sized["total_shares"]) <= 0:
+                 return {"plan_id": plan_id, "error": "plan has no sized entry to approve"}
+ 
+-            # Promotion gate: <50 graded calls for this class -> paper mode only.
+-            promotable, _ = can_promote(build_scorecard_from_db(s))
+-            live = live_trading_enabled(self.service.config, self.secrets) if self.secrets else False
+-            if live and not promotable:
+-                return {
+-                    "plan_id": plan_id,
+-                    "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
+-                }
+-
+         # Decomposition is pure application work. It happens before the write
+         # transaction so a process stop cannot leave a durable claim behind.
+         rules = self._decompose(plan, sized, plan_id)
+-        paper_only = not (live and promotable)
++        paper_only = True
+         bracket = None
+         with self.service.submission_barrier.hold_writer():
+             with self.service.session_factory() as s:
+diff --git a/src/trading_assistant/analyst/promotion.py b/src/trading_assistant/analyst/promotion.py
+index d688650..0db182b 100644
+--- a/src/trading_assistant/analyst/promotion.py
++++ b/src/trading_assistant/analyst/promotion.py
+@@ -1,9 +1,8 @@
+-"""The promotion gate.
++"""An advisory analyst track-record threshold.
+ 
+-Backtest/track-record results NEVER auto-enable anything (Phase 7 guardrail #2).
+-Promoting the analyst toward live is a manual config change by a human — and this
+-gate is an ADDITIONAL requirement on top of that: at least 50 graded calls with an
+-accuracy bar. It returns advice; it cannot flip any switch itself.
++Backtest and track-record results never enable execution capability. This
++threshold is research advice only; the current release rejects live trading
++regardless of its result.
+ """
+ 
+ from __future__ import annotations
+@@ -25,5 +24,5 @@ def can_promote(scorecard: Scorecard) -> tuple[bool, str]:
+         )
+     return True, (
+         f"{scorecard.n_calls} graded calls at {scorecard.accuracy:.1%} accuracy — "
+-        "eligible for MANUAL promotion (still requires the live double-lock)"
++        "eligible for MANUAL analyst review; live trading remains unavailable"
+     )
+diff --git a/src/trading_assistant/analyst/scorecard.py b/src/trading_assistant/analyst/scorecard.py
+index 203fbf0..9bd3dbc 100644
+--- a/src/trading_assistant/analyst/scorecard.py
++++ b/src/trading_assistant/analyst/scorecard.py
+@@ -1,8 +1,8 @@
+ """Grade analyst calls against realized forward returns, and summarize a track record.
+ 
+ A call is graded once its horizon has elapsed and the realized forward return is
+-known. This is the honest measure of whether the analyst adds anything — and it
+-feeds the promotion gate.
++known. This is the honest measure of whether the analyst adds anything; it does
++not grant execution capability.
+ """
+ 
+ from __future__ import annotations
+diff --git a/src/trading_assistant/app/main.py b/src/trading_assistant/app/main.py
+index f26f608..0f42e52 100644
+--- a/src/trading_assistant/app/main.py
++++ b/src/trading_assistant/app/main.py
+@@ -1,9 +1,9 @@
+ """FastAPI host: chat, pending-approval queue, approve/reject, positions, log.
+ 
+-``create_app`` accepts an injected service + agent (tests use mocks). With none
+-provided it builds the real stack from config/secrets. The approval endpoint is
+-the only path that can execute — and it runs the risk engine one final time
+-inside TradingService.approve_order.
++The public production factory accepts only a startup-guard-bound composition.
++Tests use the explicitly named ``create_test_app`` injection boundary. The
++approval endpoint is the only path that can execute, and it runs the risk
++engine one final time inside ``TradingService.approve_order``.
+ """
+ 
+ from __future__ import annotations
+@@ -34,7 +34,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
+ from starlette.middleware.trustedhost import TrustedHostMiddleware
+ 
+ from ..broker.models import OrderStatus
+-from ..config import load_config
+ from ..dependencies import RequiredDependencyUnavailable
+ from ..orders.reconciliation import ReconciliationConflict
+ from ..orders.safety_state import enumerate_unsafe_local_state
+@@ -47,7 +46,6 @@ from ..operations import (
+ from ..service import TradingService
+ from ..security.secrets import (
+     RuntimeSecrets,
+-    load_role_secrets,
+     secret_is_set,
+     secrets_match,
+ )
+@@ -303,18 +301,27 @@ class KillSwitchResetIn(BaseModel):
+         return value.strip()
+ 
+ 
+-def build_default_container():
++def build_default_container(
++    *,
++    config=None,
++    secrets: RuntimeSecrets | None = None,
++    startup_guard_receipt=None,
++):
++    """Build production authority only from one exact startup receipt."""
+     from .. import bootstrap
+-    from ..logging import runtime_startup
+-
+-    config = load_config()
+-    secrets = load_role_secrets("app", config=config)
+-    with runtime_startup("app", secrets):
+-        return bootstrap.build_container(
+-            config,
+-            secrets,
+-            runtime_role="app",
+-        )
++
++    if (
++        config is None
++        or secrets is None
++        or startup_guard_receipt is None
++    ):
++        raise RuntimeError("production_startup_guard_required")
++    return bootstrap._build_guarded_container(
++        config,
++        secrets,
++        runtime_role="app",
++        startup_guard_receipt=startup_guard_receipt,
++    )
+ 
+ 
+ def _build_agent(container) -> Agent:
+@@ -1214,12 +1221,6 @@ def _create_app(
+             reason=context.reason,
+             request_id=context.request_id,
+         )
+-        if "error" in result and "promotion gate" in result["error"]:
+-            raise ApiError(
+-                "policy_denied",
+-                403,
+-                "Plan approval was denied by safety policy",
+-            )
+         if result.get("error") == "not found":
+             raise ApiError("plan_not_found", 404, "Plan not found")
+         if result.get("error") == "plan_review_stale":
+@@ -1470,8 +1471,8 @@ def _create_guarded_app(
+ 
+ 
+ @wraps(_create_app)
+-def create_app(*args, **kwargs) -> FastAPI:
+-    """Build the automatic production app inside its role log boundary."""
++def create_test_app(*args, **kwargs) -> FastAPI:
++    """Build an explicitly injected local test app with no ambient authority."""
+     if "_guarded_app_composition" in kwargs:
+         raise TypeError(
+             "guarded app composition requires private launcher entrypoint"
+@@ -1486,16 +1487,30 @@ def create_app(*args, **kwargs) -> FastAPI:
+         and bound.arguments["service"] is None
+         and bound.arguments["agent"] is None
+     )
+-    if not automatic:
+-        return _create_app(*args, **kwargs)
++    if automatic:
++        raise RuntimeError("explicit_test_stack_required")
++    return _create_app(*args, **kwargs)
+ 
+-    container = build_default_container()
+-    bound.arguments["container"] = container
+-    from ..logging import runtime_startup
++
++def create_app(*args, **kwargs) -> FastAPI:
++    """Build an automatic production app from one startup receipt only."""
++    allowed = {
++        "config",
++        "secrets",
++        "startup_guard_receipt",
++    }
++    if args or set(kwargs).difference(allowed):
++        raise RuntimeError("explicit_stack_requires_test_factory")
++    container = build_default_container(
++        config=kwargs.get("config"),
++        secrets=kwargs.get("secrets"),
++        startup_guard_receipt=kwargs.get(
++            "startup_guard_receipt"
++        ),
++    )
+ 
+     try:
+-        with runtime_startup("app", container.secrets):
+-            return _create_app(*bound.args, **bound.kwargs)
++        return _create_guarded_app(container=container)
+     except BaseException:
+         guard = getattr(container, "runtime_tenure_guard", None)
+         if guard is not None and not guard.close():
+diff --git a/src/trading_assistant/assets.py b/src/trading_assistant/assets.py
+index 39e78a3..93e5d33 100644
+--- a/src/trading_assistant/assets.py
++++ b/src/trading_assistant/assets.py
+@@ -1,9 +1,9 @@
+ """Asset-class abstraction (Phase 7).
+ 
+-Crypto is a first-class live asset class: it has an independent kill switch, an
+-always-open clock, and a UTC-midnight daily P&L boundary. This enum threads
+-through the risk layer. Everything defaults to EQUITY so all pre-Phase-7
+-behavior is unchanged.
++Crypto is a first-class paper-runtime asset class: it has an independent kill
++switch, an always-open clock, and a UTC-midnight daily P&L boundary. It is not a
++live-trading asset class in this release. This enum threads through the risk
++layer. Everything defaults to EQUITY so all pre-Phase-7 behavior is unchanged.
+ """
+ 
+ from __future__ import annotations
+diff --git a/src/trading_assistant/backtest/engine.py b/src/trading_assistant/backtest/engine.py
+index 18ed1f1..02e7881 100644
+--- a/src/trading_assistant/backtest/engine.py
++++ b/src/trading_assistant/backtest/engine.py
+@@ -3,7 +3,7 @@
+ At simulated time t the strategy sees only a DataView bounded at t. An order
+ decided at t is submitted after the decision and fills at t+1's open (via
+ SimBroker) — so no decision can use information it could not have had. Orders run
+-through the SAME RiskEngine as the live path; only the numeric limits differ
++through the SAME RiskEngine as the paper runtime; only the numeric limits differ
+ (a permissive backtest profile so capital can actually be deployed).
+ """
+ 
+diff --git a/src/trading_assistant/bootstrap.py b/src/trading_assistant/bootstrap.py
+index 4030b9c..093736d 100644
+--- a/src/trading_assistant/bootstrap.py
++++ b/src/trading_assistant/bootstrap.py
+@@ -213,6 +213,62 @@ def acquire_runtime_guard(
+     return guard
+ 
+ 
++def acquire_maintenance_guard(
++    runtime: DatabaseRuntime,
++    *,
++    process_identity: ProcessIdentity | None = None,
++    process_inspector=None,
++    tenure_clock=None,
++    tenure_owner_factory=None,
++) -> RuntimeTenureGuard:
++    """Acquire the mutually exclusive maintenance tenure for a paper drill."""
++    inspector = process_inspector or LocalProcessInspector()
++    identity = process_identity
++    if identity is None:
++        try:
++            identity = inspector.current()
++        except Exception:
++            raise TenureUncertain() from None
++    service_kwargs = {"process_inspector": inspector}
++    if tenure_clock is not None:
++        service_kwargs["clock"] = tenure_clock
++    if tenure_owner_factory is not None:
++        service_kwargs["owner_factory"] = tenure_owner_factory
++    handle = RuntimeTenureService(
++        runtime.session_factory,
++        **service_kwargs,
++    ).acquire_maintenance(
++        identity,
++        ttl_seconds=30,
++    )
++    guard = RuntimeTenureGuard(
++        handle,
++        ttl_seconds=30,
++        renewal_interval_seconds=5,
++    )
++    try:
++        guard.start()
++        install_runtime_mutation_barrier(runtime.engine, guard)
++    except BaseException:
++        close_result = getattr(
++            guard,
++            "close_result",
++            TenureCloseResult.NOT_ATTEMPTED,
++        )
++        if close_result is TenureCloseResult.CONFIRMED:
++            raise
++        if close_result is TenureCloseResult.UNCERTAIN:
++            raise TenureUncertain() from None
++        try:
++            released = guard.close()
++        except BaseException:
++            raise TenureUncertain() from None
++        if not released:
++            raise TenureUncertain() from None
++        raise
++    return guard
++
++
+ def _guard_runtime(config: AppConfig, secrets: RuntimeSecrets) -> None:
+     if not secret_is_set(secrets.app_api_token):
+         raise RuntimeError("APP_API_TOKEN is required")
+@@ -271,7 +327,10 @@ def build_quarantine_summarizer(
+     runtime_role: str = "app",
+ ) -> QuarantineSummarizer | None:
+     """Compose the no-tools reader separately from the privileged analyst."""
+-    if not config.analyst.news_enabled:
++    if (
++        runtime_role not in {"app", "daemon"}
++        or not config.analyst.news_enabled
++    ):
+         return None
+     from .llm.factory import build_llm_backend
+ 
+@@ -349,6 +408,7 @@ def build_test_container(
+     *,
+     broker: BrokerClient,
+     clock,
++    runtime_role: str = "app",
+ ) -> ApplicationContainer:
+     """Compose with explicit fakes while retaining production-safe config."""
+     return _build_container(
+@@ -356,6 +416,7 @@ def build_test_container(
+         secrets,
+         broker=broker,
+         clock=clock,
++        runtime_role=runtime_role,
+         enforce_runtime_tenure=False,
+     )
+ 
+@@ -400,7 +461,15 @@ def _build_container(
+     _consumed_startup_guard: _ConsumedStartupGuard | None = None,
+ ) -> ApplicationContainer:
+     effective_role = runtime_role or "app"
+-    if effective_role not in {"app", "daemon", "mcp"}:
++    if effective_role not in {
++        "app",
++        "daemon",
++        "mcp",
++        "paper-drill",
++        "safety-drill",
++    }:
++        raise ValueError("runtime_role_invalid")
++    if enforce_runtime_tenure and effective_role == "safety-drill":
+         raise ValueError("runtime_role_invalid")
+     require_configured_role_origins(config, effective_role)
+     startup_evidence = None
+@@ -429,14 +498,23 @@ def _build_container(
+     bind_sensitive_cipher(session_factory, sensitive_cipher)
+     runtime_tenure_guard: RuntimeTenureGuard | None = None
+     if enforce_runtime_tenure:
+-        runtime_tenure_guard = acquire_runtime_guard(
+-            runtime,
+-            effective_role,
+-            process_identity=process_identity,
+-            process_inspector=process_inspector,
+-            tenure_clock=tenure_clock,
+-            tenure_owner_factory=tenure_owner_factory,
+-        )
++        if effective_role == "paper-drill":
++            runtime_tenure_guard = acquire_maintenance_guard(
++                runtime,
++                process_identity=process_identity,
++                process_inspector=process_inspector,
++                tenure_clock=tenure_clock,
++                tenure_owner_factory=tenure_owner_factory,
++            )
++        else:
++            runtime_tenure_guard = acquire_runtime_guard(
++                runtime,
++                effective_role,
++                process_identity=process_identity,
++                process_inspector=process_inspector,
++                tenure_clock=tenure_clock,
++                tenure_owner_factory=tenure_owner_factory,
++            )
+     try:
+         return _finish_container(
+             config,
+diff --git a/src/trading_assistant/config.py b/src/trading_assistant/config.py
+index 1343d46..29ae52a 100644
+--- a/src/trading_assistant/config.py
++++ b/src/trading_assistant/config.py
+@@ -9,8 +9,8 @@ Two sources, deliberately separated:
+ * runtime secrets — supplied separately through a typed secret provider.
+ 
+ Legacy live-mode fields remain parseable for configuration compatibility, but
+-the safety-foundation production bootstrap and broker factory reject/ignore
+-them: this release is hard-locked to Alpaca paper trading.
++the safety-foundation production bootstrap rejects them and the broker factory
++is always paper-targeted: this release is hard-locked to Alpaca paper trading.
+ """
+ 
+ from __future__ import annotations
+@@ -33,9 +33,6 @@ from pydantic import (
+ 
+ from .security.secrets import RuntimeSecrets
+ 
+-LIVE_CONFIRM_STRING = "I_UNDERSTAND_LIVE_TRADING"
+-
+-
+ class _Strict(BaseModel):
+     """Base for all YAML config models: unknown keys are a hard error (A8)."""
+ 
+@@ -361,8 +358,6 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
+ 
+ 
+ def live_trading_enabled(config: AppConfig, secrets: RuntimeSecrets) -> bool:
+-    """Guardrail #1: both locks must be set, else we are NOT live."""
+-    return (
+-        config.trading.mode is TradingMode.LIVE
+-        and secrets.live_trading_confirm.get_secret_value() == LIVE_CONFIRM_STRING
+-    )
++    """Compatibility diagnostic: this release never enables live trading."""
++    del config, secrets
++    return False
+diff --git a/src/trading_assistant/ops/paper_drill.py b/src/trading_assistant/ops/paper_drill.py
+index 3c7c57c..ad282aa 100644
+--- a/src/trading_assistant/ops/paper_drill.py
++++ b/src/trading_assistant/ops/paper_drill.py
+@@ -30,7 +30,7 @@ def build_paper_service(
+     container = build_container(
+         config,
+         secrets,
+-        runtime_role="app",
++        runtime_role="paper-drill",
+     )
+     primary_failure = False
+     try:
+diff --git a/src/trading_assistant/ops/safety_drill.py b/src/trading_assistant/ops/safety_drill.py
+index 4b5a8ad..336e43e 100644
+--- a/src/trading_assistant/ops/safety_drill.py
++++ b/src/trading_assistant/ops/safety_drill.py
+@@ -1751,6 +1751,7 @@ def run_safety_drill(
+         drill_secrets,
+         broker=crash_broker,
+         clock=clock or FakeClock(is_open=True),
++        runtime_role="safety-drill",
+     )
+     tag = f"safety-drill-{uuid4().hex}"
+     details: list[str] = [
+@@ -1834,6 +1835,7 @@ def run_safety_drill(
+                 drill_secrets,
+                 broker=crash_broker,
+                 clock=clock or FakeClock(is_open=True),
++                runtime_role="safety-drill",
+             )
+             with restarted.session_factory() as session:
+                 after_restart = session.get(Order, proposal["order_id"])
+@@ -2057,6 +2059,7 @@ def run_safety_drill(
+             drill_secrets,
+             broker=crash_broker,
+             clock=clock or FakeClock(is_open=True),
++            runtime_role="safety-drill",
+         )
+         survived_restart = (
+             restarted.breakers.is_tripped(data_scope)
+diff --git a/src/trading_assistant/security/secrets.py b/src/trading_assistant/security/secrets.py
+index e2c906d..5930c6a 100644
+--- a/src/trading_assistant/security/secrets.py
++++ b/src/trading_assistant/security/secrets.py
+@@ -142,9 +142,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
+             "alpaca_api_key",
+             "alpaca_secret_key",
+             "database_url",
+-            "anthropic_api_key",
+-            "gemini_api_key",
+-            "groq_api_key",
+             "candidate_signing_key",
+             "backup_encryption_key",
+             "field_encryption_keys",
+@@ -160,9 +157,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
+             "alpaca_api_key",
+             "alpaca_secret_key",
+             "database_url",
+-            "anthropic_api_key",
+-            "gemini_api_key",
+-            "groq_api_key",
+             "candidate_signing_key",
+             "backup_encryption_key",
+             "field_encryption_keys",
+@@ -186,9 +180,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
+             "database_url",
+             "alpaca_api_key",
+             "alpaca_secret_key",
+-            "anthropic_api_key",
+-            "gemini_api_key",
+-            "groq_api_key",
+             "candidate_signing_key",
+             "backup_encryption_key",
+             "field_encryption_keys",
+@@ -209,9 +200,6 @@ _ROLE_VISIBLE_FIELDS = MappingProxyType(
+ _LLM_REQUIRED_ROLES = frozenset(
+     {"app", "daemon", "preflight", "validate-analyst"}
+ )
+-_NEWS_LLM_ROLES = frozenset(
+-    {"mcp", "paper-drill", "safety-drill"}
+-)
+ _LLM_SECRET_FIELDS = frozenset(
+     {"anthropic_api_key", "gemini_api_key", "groq_api_key"}
+ )
+@@ -704,13 +692,7 @@ def _role_visible_fields(
+     config: AppConfig,
+ ) -> tuple[str, ...]:
+     allowed_fields = _ROLE_VISIBLE_FIELDS[role]
+-    llm_visible = (
+-        role in _LLM_REQUIRED_ROLES
+-        or (
+-            role in _NEWS_LLM_ROLES
+-            and config.analyst.news_enabled
+-        )
+-    )
++    llm_visible = role in _LLM_REQUIRED_ROLES
+     selected_llm = (
+         _selected_llm_secret_field(config)
+         if llm_visible
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e53dca6..2351a29 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -306,7 +306,7 @@ def authenticate_client(operator_token):
+ def authenticated_client(make_service, operator_token, authenticate_client):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_app
++    from trading_assistant.app.main import create_test_app as create_app
+ 
+     class _StubAgent:
+         def chat(self, message, **context):
+diff --git a/tests/test_api.py b/tests/test_api.py
+index a396557..0a22d82 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -13,7 +13,7 @@ import pytest
+ from fastapi.testclient import TestClient
+ from sqlalchemy import event, inspect as sa_inspect
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.app.limits import DurableRateLimiter
+ from trading_assistant.config import BrokerKind, TradingMode
+ from trading_assistant.broker.alpaca import AlpacaClock
+diff --git a/tests/test_asset_class.py b/tests/test_asset_class.py
+index 94bcab7..2a72609 100644
+--- a/tests/test_asset_class.py
++++ b/tests/test_asset_class.py
+@@ -1,4 +1,4 @@
+-"""Phase 7 §1: equity/crypto are independent in the live path.
++"""Phase 7 §1: equity/crypto are independent in the paper runtime.
+ 
+ Existing equity behavior is covered unchanged by the Phase 1 suite; these tests
+ prove the two asset classes' kill switches, clocks, and P&L boundaries do not
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index d6afdb6..3c1bd8b 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -14,7 +14,7 @@ from trading_assistant.app.auth import (
+     SessionAuth,
+     SessionExpired,
+ )
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.db.models import AuthSession
+ from trading_assistant.risk.breakers import BreakerScope
+diff --git a/tests/test_backtests_api.py b/tests/test_backtests_api.py
+index 93cc364..4e21c1d 100644
+--- a/tests/test_backtests_api.py
++++ b/tests/test_backtests_api.py
+@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
+ 
+ import trading_assistant.backtest.runner as runner
+ from trading_assistant.app.limits import ConcurrencyLeaseService
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.db.models import (
+     AuditEvent,
+     BacktestRun,
+diff --git a/tests/test_bootstrap.py b/tests/test_bootstrap.py
+index 317503c..3c1a6ad 100644
+--- a/tests/test_bootstrap.py
++++ b/tests/test_bootstrap.py
+@@ -21,7 +21,7 @@ from trading_assistant.app.limits import (
+     LimitSpec,
+     LimitStoreUnavailable,
+ )
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.broker.alpaca import AlpacaBroker
+ from trading_assistant.broker.base import BrokerSubmissionRejected
+ from trading_assistant.broker.mock import MockBroker
+@@ -1050,6 +1050,7 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
+     import trading_assistant.daemon.main as daemon_main
+     import trading_assistant.mcp_server.server as mcp_server
+     from trading_assistant import bootstrap
++    from trading_assistant.operations import security_posture as posture
+ 
+     service = make_service()
+     config = app_config.model_copy(
+@@ -1086,8 +1087,7 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
+         return secrets
+ 
+     monkeypatch.setattr(bootstrap, "build_container", capture_container)
+-    monkeypatch.setattr(app_main, "load_config", lambda: config)
+-    monkeypatch.setattr(app_main, "load_role_secrets", one_secrets)
++    monkeypatch.setattr(bootstrap, "_build_container", capture_container)
+     monkeypatch.setattr(daemon_main, "load_config", lambda: config)
+     monkeypatch.setattr(daemon_main, "load_role_secrets", one_secrets)
+     monkeypatch.setattr(
+@@ -1098,10 +1098,18 @@ def test_app_daemon_and_mcp_default_roots_pass_distinct_runtime_roles(
+     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+     monkeypatch.setattr(mcp_server, "load_role_secrets", one_secrets)
+ 
+-    assert app_main.build_default_container() is container
++    receipt = _issue_guard_receipt(posture, config, secrets)
++    assert (
++        app_main.build_default_container(
++            config=config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
++        is container
++    )
+     assert daemon_main.build_monitor().service is service
+     assert mcp_server.build_default_container() is container
+-    assert secret_reads == 3
++    assert secret_reads == 2
+     assert observed == [
+         (config, secrets, "app"),
+         (config, secrets, "daemon"),
+diff --git a/tests/test_candidate_boundary.py b/tests/test_candidate_boundary.py
+index 8f38545..db757a7 100644
+--- a/tests/test_candidate_boundary.py
++++ b/tests/test_candidate_boundary.py
+@@ -17,7 +17,7 @@ from sqlalchemy import event, func, select
+ from sqlalchemy.exc import IntegrityError
+ 
+ from trading_assistant.assets import AssetClass
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.app.limits import InterlockDecision
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.db.models import (
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 762862e..f99f426 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -1,4 +1,4 @@
+-"""A8: config fails fast on unknown/misspelled keys; live double-lock (guardrail #1)."""
++"""A8: config rejects unknown keys and never enables live trading."""
+ 
+ from __future__ import annotations
+ 
+@@ -11,7 +11,6 @@ import yaml
+ from pydantic import AnyUrl, ValidationError
+ 
+ from trading_assistant.config import (
+-    LIVE_CONFIRM_STRING,
+     ProviderOriginsConfig,
+     Secrets,
+     ServerConfig,
+@@ -390,15 +389,32 @@ def test_unknown_daemon_heartbeat_setting_remains_forbidden(tmp_path):
+         load_config(_write(tmp_path, invalid))
+ 
+ 
+-def test_live_double_lock(tmp_path):
+-    cfg = load_config(_write(tmp_path, VALID.replace("mode: paper", "mode: live")))
+-    # Missing confirmation string -> still not live.
+-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm="")) is False
+-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm="wrong")) is False
+-    # Both locks set -> live.
+-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING))
+-
++@pytest.mark.parametrize("mode", ["paper", "live"])
++@pytest.mark.parametrize(
++    "confirmation",
++    [
++        "",
++        "wrong",
++        "I_UNDERSTAND_LIVE_TRADING",
++        "any-other-populated-value",
++    ],
++)
++def test_live_trading_is_never_enabled_by_parsed_legacy_fields(
++    tmp_path,
++    mode,
++    confirmation,
++):
++    cfg = load_config(
++        _write(
++            tmp_path,
++            VALID.replace("mode: paper", f"mode: {mode}"),
++        )
++    )
+ 
+-def test_paper_never_live_even_with_confirm(tmp_path):
+-    cfg = load_config(_write(tmp_path, VALID))  # mode: paper
+-    assert live_trading_enabled(cfg, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING)) is False
++    assert (
++        live_trading_enabled(
++            cfg,
++            Secrets(live_trading_confirm=confirmation),
++        )
++        is False
++    )
+diff --git a/tests/test_factory.py b/tests/test_factory.py
+index 5d56539..27fbdb8 100644
+--- a/tests/test_factory.py
++++ b/tests/test_factory.py
+@@ -1,4 +1,4 @@
+-"""Broker/clock factory selection + live double-lock enforcement."""
++"""Broker/clock factory selection plus paper-only enforcement."""
+ 
+ from __future__ import annotations
+ 
+@@ -8,7 +8,6 @@ from trading_assistant.broker.factory import build_broker, build_clock
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.config import (
+     BrokerKind,
+-    LIVE_CONFIRM_STRING,
+     Secrets,
+     TradingMode,
+     live_trading_enabled,
+@@ -26,17 +25,21 @@ def test_mock_config_builds_fake_clock(app_config):
+     assert isinstance(clock, MarketClock)
+ 
+ 
+-def test_live_lock_requires_both_flags(app_config):
++def test_legacy_live_fields_never_enable_live_trading(app_config):
+     live = app_config.model_copy(
+         update={
+             "trading": app_config.trading.model_copy(update={"mode": TradingMode.LIVE})
+         }
+     )
+-    # Config says live but no env confirmation -> not live (forces paper).
+     assert live_trading_enabled(live, Secrets(live_trading_confirm="")) is False
+     assert (
+-        live_trading_enabled(live, Secrets(live_trading_confirm=LIVE_CONFIRM_STRING))
+-        is True
++        live_trading_enabled(
++            live,
++            Secrets(
++                live_trading_confirm="I_UNDERSTAND_LIVE_TRADING"
++            ),
++        )
++        is False
+     )
+ 
+ 
+@@ -77,7 +80,9 @@ def test_factory_itself_remains_paper_only_even_with_legacy_live_double_lock(
+             )
+         }
+     )
+-    secrets = Secrets(live_trading_confirm=LIVE_CONFIRM_STRING)
++    secrets = Secrets(
++        live_trading_confirm="I_UNDERSTAND_LIVE_TRADING"
++    )
+ 
+     build_broker(legacy_live, secrets)
+     build_clock(legacy_live, secrets)
+diff --git a/tests/test_launch.py b/tests/test_launch.py
+index 1f7d8c2..d14c3cf 100644
+--- a/tests/test_launch.py
++++ b/tests/test_launch.py
+@@ -15,7 +15,7 @@ import pytest
+ from fastapi.testclient import TestClient
+ from sqlalchemy import event, func, select, text
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.app.errors import ApiError
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.broker.models import Account, Position
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+index c9a5c4c..0187f0c 100644
+--- a/tests/test_ops.py
++++ b/tests/test_ops.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.config import BrokerKind, TradingMode
+ from trading_assistant.db.migrate import upgrade
+ from trading_assistant.db.models import PanicReceipt, utcnow
+diff --git a/tests/test_plan2_integration_correction.py b/tests/test_plan2_integration_correction.py
+new file mode 100644
+index 0000000..cc7dbb6
+--- /dev/null
++++ b/tests/test_plan2_integration_correction.py
+@@ -0,0 +1,419 @@
++"""Whole-Plan-2 integration regressions use only local fakes."""
++
++from __future__ import annotations
++
++from datetime import datetime, timedelta, timezone
++from types import SimpleNamespace
++
++import pytest
++
++from trading_assistant.config import Secrets
++
++
++def _issue_app_receipt(config, secrets):
++    from trading_assistant.operations import security_posture as posture
++
++    observed_at = datetime.now(timezone.utc)
++    return posture._issue_startup_guard_receipt(
++        config=config,
++        secrets=secrets,
++        checks=(
++            SimpleNamespace(
++                name="runtime_configuration",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(
++                name="loopback_https",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(name="tls", passed=True, code="ok"),
++            SimpleNamespace(name="database", passed=True, code="ok"),
++            SimpleNamespace(name="encryption", passed=True, code="ok"),
++        ),
++        observed_at=observed_at,
++        secret_loaded_at=observed_at - timedelta(seconds=1),
++        runtime_role="app",
++    )
++
++
++def test_public_automatic_app_factory_refuses_before_ambient_or_authority_build(
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant import config as config_module
++    from trading_assistant.app import main as app_main
++    from trading_assistant.security import secrets as secrets_module
++
++    touched: list[str] = []
++
++    def forbidden(label):
++        def fail(*_args, **_kwargs):
++            touched.append(label)
++            raise AssertionError(label)
++
++        return fail
++
++    monkeypatch.setattr(
++        config_module,
++        "load_config",
++        forbidden("config"),
++    )
++    monkeypatch.setattr(
++        secrets_module,
++        "load_role_secrets",
++        forbidden("keychain"),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_guarded_container",
++        forbidden("container"),
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="^production_startup_guard_required$",
++    ):
++        app_main.create_app()
++
++    assert touched == []
++
++
++def test_public_default_container_consumes_exact_receipt_once(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.app import main as app_main
++
++    secrets = Secrets(app_api_token="plan2-receipt-test-token")
++    receipt = _issue_app_receipt(app_config, secrets)
++    built: list[dict[str, object]] = []
++    sentinel = object()
++
++    def fake_build(config, loaded, **kwargs):
++        assert config is app_config
++        assert loaded is secrets
++        built.append(kwargs)
++        return sentinel
++
++    monkeypatch.setattr(bootstrap, "_build_container", fake_build)
++
++    assert (
++        app_main.build_default_container(
++            config=app_config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
++        is sentinel
++    )
++    with pytest.raises(
++        RuntimeError,
++        match="^startup_guard_receipt_consumed$",
++    ):
++        app_main.build_default_container(
++            config=app_config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
++
++    assert len(built) == 1
++    assert built[0]["runtime_role"] == "app"
++    assert "_consumed_startup_guard" in built[0]
++
++
++def test_public_production_factory_consumes_receipt_before_app_creation(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.app import main as app_main
++
++    secrets = Secrets(app_api_token="plan2-public-factory-token")
++    receipt = _issue_app_receipt(app_config, secrets)
++    container = SimpleNamespace(runtime_tenure_guard=None)
++    created: list[object] = []
++
++    monkeypatch.setattr(
++        bootstrap,
++        "_build_container",
++        lambda *_args, **_kwargs: container,
++    )
++    monkeypatch.setattr(
++        app_main,
++        "_create_guarded_app",
++        lambda *, container: created.append(container) or "app",
++    )
++
++    assert (
++        app_main.create_app(
++            config=app_config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
++        == "app"
++    )
++    with pytest.raises(
++        RuntimeError,
++        match="^startup_guard_receipt_consumed$",
++    ):
++        app_main.create_app(
++            config=app_config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
++
++    assert created == [container]
++
++
++def test_explicit_unguarded_stack_requires_named_test_factory(
++    make_service,
++):
++    from trading_assistant.app import main as app_main
++
++    class Agent:
++        def chat(self, message, **context):
++            return {"reply": message, "context": context}
++
++    service = make_service()
++    with pytest.raises(
++        RuntimeError,
++        match="^explicit_stack_requires_test_factory$",
++    ):
++        app_main.create_app(
++            service=service,
++            agent=Agent(),
++            api_token="plan2-explicit-test-token",
++            planning=None,
++        )
++
++    test_app = app_main.create_test_app(
++        service=service,
++        agent=Agent(),
++        api_token="plan2-explicit-test-token",
++        planning=None,
++    )
++    assert test_app.state.trading_service is service
++    assert test_app.state.startup_evidence is None
++
++
++@pytest.mark.parametrize(
++    "runtime_role",
++    ["mcp", "paper-drill", "safety-drill"],
++)
++@pytest.mark.parametrize(
++    "provider",
++    ["anthropic", "gemini", "groq"],
++)
++def test_unused_news_roots_construct_no_llm_adapter(
++    app_config,
++    monkeypatch,
++    runtime_role,
++    provider,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.llm import factory as llm_factory
++
++    config = app_config.model_copy(
++        update={
++            "analyst": app_config.analyst.model_copy(
++                update={"news_enabled": True}
++            ),
++            "llm": app_config.llm.model_copy(
++                update={"provider": provider}
++            ),
++        }
++    )
++    constructed: list[str] = []
++    monkeypatch.setattr(
++        llm_factory,
++        "build_llm_backend",
++        lambda *_args, **_kwargs: constructed.append(runtime_role)
++        or object(),
++    )
++
++    summarizer = bootstrap.build_quarantine_summarizer(
++        config,
++        Secrets(),
++        object(),
++        runtime_role=runtime_role,
++    )
++
++    assert summarizer is None
++    assert constructed == []
++
++
++@pytest.mark.parametrize("runtime_role", ["app", "daemon"])
++@pytest.mark.parametrize(
++    "provider",
++    ["anthropic", "gemini", "groq"],
++)
++def test_supported_news_adapters_keep_exact_runtime_role(
++    app_config,
++    monkeypatch,
++    runtime_role,
++    provider,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.llm import factory as llm_factory
++
++    config = app_config.model_copy(
++        update={
++            "analyst": app_config.analyst.model_copy(
++                update={"news_enabled": True}
++            ),
++            "llm": app_config.llm.model_copy(
++                update={"provider": provider}
++            ),
++        }
++    )
++    backend = object()
++    observed: list[tuple[str, str]] = []
++
++    monkeypatch.setattr(
++        llm_factory,
++        "build_llm_backend",
++        lambda *_args, **kwargs: (
++            observed.append(
++                (
++                    kwargs["category"],
++                    kwargs["runtime_role"],
++                )
++            )
++            or backend
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "QuarantineSummarizer",
++        lambda supplied: supplied,
++    )
++
++    assert (
++        bootstrap.build_quarantine_summarizer(
++            config,
++            Secrets(),
++            object(),
++            runtime_role=runtime_role,
++        )
++        is backend
++    )
++    assert observed == [("untrusted", runtime_role)]
++
++
++def test_paper_drill_container_never_borrows_app_role(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++    from trading_assistant.ops import paper_drill
++
++    service = object()
++    roles: list[str | None] = []
++
++    def build_container(_config, _secrets, *, runtime_role):
++        roles.append(runtime_role)
++        return SimpleNamespace(
++            service=service,
++            runtime_tenure_guard=None,
++        )
++
++    monkeypatch.setattr(bootstrap, "build_container", build_container)
++
++    with paper_drill.build_paper_service(
++        app_config,
++        Secrets(),
++    ) as built:
++        assert built is service
++
++    assert roles == ["paper-drill"]
++
++
++def test_paper_drill_composition_uses_maintenance_tenure_and_exact_role(
++    app_config,
++    monkeypatch,
++):
++    from trading_assistant import bootstrap
++
++    runtime = SimpleNamespace(
++        engine=object(),
++        session_factory=object(),
++    )
++    guard = object()
++    observed: list[tuple[str, object]] = []
++    sentinel = object()
++
++    monkeypatch.setattr(
++        bootstrap,
++        "require_configured_role_origins",
++        lambda _config, role: observed.append(("origins", role)),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "_guard_runtime",
++        lambda *_args, **_kwargs: None,
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "prepare_database_runtime",
++        lambda _secrets, *, runtime_role: (
++            observed.append(("database", runtime_role)) or runtime
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "build_sensitive_data_cipher",
++        lambda *_args, **_kwargs: object(),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "bind_sensitive_cipher",
++        lambda *_args, **_kwargs: None,
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "acquire_runtime_guard",
++        lambda *_args, **_kwargs: pytest.fail(
++            "paper drill must not borrow runtime tenure"
++        ),
++    )
++    monkeypatch.setattr(
++        bootstrap,
++        "acquire_maintenance_guard",
++        lambda *_args, **_kwargs: guard,
++    )
++
++    def finish(_config, _secrets, **kwargs):
++        observed.append(("finish_role", kwargs["runtime_role"]))
++        assert kwargs["runtime_tenure_guard"] is guard
++        return sentinel
++
++    monkeypatch.setattr(bootstrap, "_finish_container", finish)
++
++    assert (
++        bootstrap._build_container(
++            app_config,
++            Secrets(),
++            runtime_role="paper-drill",
++        )
++        is sentinel
++    )
++    assert observed == [
++        ("origins", "paper-drill"),
++        ("database", "paper-drill"),
++        ("finish_role", "paper-drill"),
++    ]
++
++
++def test_safety_drill_role_is_restricted_to_explicit_test_container(
++    app_config,
++):
++    from trading_assistant import bootstrap
++
++    with pytest.raises(ValueError, match="^runtime_role_invalid$"):
++        bootstrap.build_container(
++            app_config,
++            Secrets(),
++            runtime_role="safety-drill",
++        )
+diff --git a/tests/test_planning.py b/tests/test_planning.py
+index 08a63ae..eddadf0 100644
+--- a/tests/test_planning.py
++++ b/tests/test_planning.py
+@@ -3285,7 +3285,11 @@ def test_worker_and_plan_cancellation_commit_one_coherent_group_state(make_servi
+         assert len(worker_outcomes) == 1
+ 
+ 
+-def test_promotion_gate_blocks_live_without_track_record(make_service, app_config, session_factory):
++def test_legacy_live_fields_still_create_only_paper_plan_rules(
++    make_service,
++    app_config,
++    session_factory,
++):
+     from trading_assistant.broker.mock import MockBroker
+     from trading_assistant.service import TradingService
+ 
+@@ -3298,10 +3302,17 @@ def test_promotion_gate_blocks_live_without_track_record(make_service, app_confi
+     pln = PlanningService(svc_live, _StubAnalyst(_plan()), _provider, sec)
+ 
+     pid = _analyze(pln, "promotion gate")["plan_id"]
+-    res = _approve(pln,
++    res = _approve(
++        pln,
+         pid,
+         actor="operator:test",
+         reason="reviewed plan",
+         request_id="planning-promotion-gate",
+-    )  # 0 graded calls -> gate blocks live approval
+-    assert "promotion gate" in res["error"]
++    )
++
++    assert res["status"] == "approved"
++    assert res["paper_only"] is True
++    with session_factory() as session:
++        stored = session.get(TradePlanRow, pid)
++    assert stored is not None
++    assert stored.paper_only is True
+diff --git a/tests/test_plans_api.py b/tests/test_plans_api.py
+index ca89993..f687368 100644
+--- a/tests/test_plans_api.py
++++ b/tests/test_plans_api.py
+@@ -16,7 +16,7 @@ from trading_assistant.analyst.models import (
+     EntryPlan, ExitPlan, ExitTarget, Invalidation, PlanAction, Scenario, TradePlan, Tranche,
+ )
+ from trading_assistant.analyst.planning import PlanningService
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.assets import AssetClass
+ from trading_assistant.backtest.data import DataSource
+ from trading_assistant.backtest.synthetic import make_bars
+diff --git a/tests/test_reconciliation_service.py b/tests/test_reconciliation_service.py
+index 1cc9a31..a0d5981 100644
+--- a/tests/test_reconciliation_service.py
++++ b/tests/test_reconciliation_service.py
+@@ -316,7 +316,7 @@ def test_panic_exception_fallback_enumerates_active_rules_and_latched_groups(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_app
++    from trading_assistant.app.main import create_test_app as create_app
+ 
+     service = make_service()
+     active = service.create_conditional_rule(
+@@ -418,7 +418,7 @@ def test_panic_local_enumeration_marks_partial_query_failure_unknown(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_app
++    from trading_assistant.app.main import create_test_app as create_app
+ 
+     service = make_service()
+ 
+diff --git a/tests/test_route_policy.py b/tests/test_route_policy.py
+index 6ef44cf..5184a69 100644
+--- a/tests/test_route_policy.py
++++ b/tests/test_route_policy.py
+@@ -18,7 +18,7 @@ from sqlalchemy import func, select
+ from sqlalchemy.orm import sessionmaker
+ 
+ import trading_assistant.app.limits as limits_module
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ import trading_assistant.app.policy as policy_module
+ from trading_assistant.app.policy import (
+     AuthLevel,
+diff --git a/tests/test_runtime_tenure.py b/tests/test_runtime_tenure.py
+index 0f3e10e..d95a28d 100644
+--- a/tests/test_runtime_tenure.py
++++ b/tests/test_runtime_tenure.py
+@@ -531,7 +531,7 @@ def test_app_rejects_mutations_immediately_after_tenure_loss(
+ ):
+     from fastapi.testclient import TestClient
+ 
+-    from trading_assistant.app.main import create_app
++    from trading_assistant.app.main import create_test_app as create_app
+ 
+     class StubAgent:
+         def chat(self, _message, **_context):
+diff --git a/tests/test_safety_drill.py b/tests/test_safety_drill.py
+index e88201a..195afa8 100644
+--- a/tests/test_safety_drill.py
++++ b/tests/test_safety_drill.py
+@@ -94,12 +94,14 @@ def test_drill_copy_secrets_preserve_secretstr_masking(
+     _upgrade_database(primary)
+     original_token = "safety-drill-secretstr-marker"
+     captured = []
++    captured_roles = []
+ 
+     class CapturedDrillSecrets(RuntimeError):
+         pass
+ 
+-    def capture_container(_config, secrets, **_kwargs):
++    def capture_container(_config, secrets, **kwargs):
+         captured.append(secrets)
++        captured_roles.append(kwargs.get("runtime_role"))
+         raise CapturedDrillSecrets
+ 
+     monkeypatch.setattr(
+@@ -127,6 +129,7 @@ def test_drill_copy_secrets_preserve_secretstr_masking(
+     assert dumped["app_api_token"] == "**********"
+     assert original_token not in repr(drill_secrets)
+     assert str(destination) not in repr(drill_secrets)
++    assert captured_roles == ["safety-drill"]
+ 
+ 
+ def _runtime_secrets_from_test_environment(
+diff --git a/tests/test_scorecard.py b/tests/test_scorecard.py
+index 173ddc6..42b424d 100644
+--- a/tests/test_scorecard.py
++++ b/tests/test_scorecard.py
+@@ -1,4 +1,4 @@
+-"""Grading analyst calls, the scorecard, the 50-call promotion gate, persistence."""
++"""Grading analyst calls, the advisory 50-call threshold, and persistence."""
+ 
+ from __future__ import annotations
+ 
+@@ -49,7 +49,7 @@ def test_scorecard_accuracy():
+     assert sc.n_acted == 3
+ 
+ 
+-# ── promotion gate ──────────────────────────────────────────────
++# ── advisory track-record threshold ─────────────────────────────
+ def test_promotion_needs_50_calls():
+     few = build_scorecard([(_report("buy"), grade(_report("buy"), 4.0))] * 10)
+     ok, reason = can_promote(few)
+@@ -59,7 +59,7 @@ def test_promotion_needs_50_calls():
+ def test_promotion_eligible_at_threshold():
+     fifty = build_scorecard([(_report("buy"), grade(_report("buy"), 4.0))] * 50)
+     ok, reason = can_promote(fifty)
+-    assert ok is True and "eligible for MANUAL promotion" in reason
++    assert ok is True and "eligible for MANUAL analyst review" in reason
+ 
+ 
+ # ── persistence ─────────────────────────────────────────────────
+diff --git a/tests/test_security.py b/tests/test_security.py
+index c21a722..6768b6f 100644
+--- a/tests/test_security.py
++++ b/tests/test_security.py
+@@ -18,7 +18,7 @@ import httpx
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.broker.models import Quote
+ 
+diff --git a/tests/test_security_headers.py b/tests/test_security_headers.py
+index 6cec654..8bb8cbc 100644
+--- a/tests/test_security_headers.py
++++ b/tests/test_security_headers.py
+@@ -7,7 +7,7 @@ from pathlib import Path
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ 
+ TOKEN = "task-7-operator-secret"
+ 
+diff --git a/tests/test_startup_schema.py b/tests/test_startup_schema.py
+index d76b882..df3c167 100644
+--- a/tests/test_startup_schema.py
++++ b/tests/test_startup_schema.py
+@@ -94,6 +94,8 @@ def test_api_startup_and_in_place_upgrade_fail_closed_on_pre_tenure_schema(
+     monkeypatch,
+ ):
+     from trading_assistant.app import main as app_main
++    from trading_assistant.config import BrokerKind, load_config
++    from trading_assistant.operations import security_posture as posture
+ 
+     engine, url = _revision_0004(tmp_path, "api-0004.db")
+     with engine.begin() as connection:
+@@ -106,10 +108,50 @@ def test_api_startup_and_in_place_upgrade_fail_closed_on_pre_tenure_schema(
+             )
+         )
+     before = set(inspect(engine).get_table_names())
+-    _patch_common_startup(monkeypatch, app_main, url)
++    config = load_config(
++        Path(__file__).resolve().parent.parent / "config.yaml"
++    )
++    config = config.model_copy(
++        update={
++            "trading": config.trading.model_copy(
++                update={"broker": BrokerKind.ALPACA}
++            )
++        }
++    )
++    secrets = RuntimeSecrets(
++        database_url=url,
++        app_api_token="startup-schema-test-secret",
++    )
++    observed_at = datetime.now(timezone.utc)
++    receipt = posture._issue_startup_guard_receipt(
++        config=config,
++        secrets=secrets,
++        checks=(
++            SimpleNamespace(
++                name="runtime_configuration",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(
++                name="loopback_https",
++                passed=True,
++                code="ok",
++            ),
++            SimpleNamespace(name="tls", passed=True, code="ok"),
++            SimpleNamespace(name="database", passed=True, code="ok"),
++            SimpleNamespace(name="encryption", passed=True, code="ok"),
++        ),
++        observed_at=observed_at,
++        secret_loaded_at=observed_at - timedelta(seconds=1),
++        runtime_role="app",
++    )
+ 
+     with pytest.raises(SchemaOutOfDate, match="current='20260724_0004'"):
+-        app_main.build_default_stack()
++        app_main.build_default_container(
++            config=config,
++            secrets=secrets,
++            startup_guard_receipt=receipt,
++        )
+ 
+     assert set(inspect(engine).get_table_names()) == before
+     assert "circuit_breaker_state" not in before
+diff --git a/tests/test_submission_barrier.py b/tests/test_submission_barrier.py
+index fce61c7..7d61884 100644
+--- a/tests/test_submission_barrier.py
++++ b/tests/test_submission_barrier.py
+@@ -706,7 +706,9 @@ def _position_reconciliation_process(
+         if entrypoint == "http":
+             from fastapi.testclient import TestClient
+ 
+-            from trading_assistant.app.main import create_app
++            from trading_assistant.app.main import (
++                create_test_app as create_app,
++            )
+ 
+             client = TestClient(
+                 create_app(
+diff --git a/tests/test_task11_round4.py b/tests/test_task11_round4.py
+index 60aeff4..45a03a3 100644
+--- a/tests/test_task11_round4.py
++++ b/tests/test_task11_round4.py
+@@ -358,9 +358,14 @@ def test_preflight_live_confirmation_cannot_be_projected_to_all_disabled(
+     "role",
+     ["mcp", "paper-drill", "safety-drill"],
+ )
+-def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
++@pytest.mark.parametrize(
++    "provider",
++    ["anthropic", "gemini", "groq"],
++)
++def test_unused_news_roles_receive_no_llm_secret(
+     app_config,
+     role,
++    provider,
+ ):
+     config = app_config.model_copy(
+         update={
+@@ -368,7 +373,7 @@ def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
+                 update={"news_enabled": True}
+             ),
+             "llm": app_config.llm.model_copy(
+-                update={"provider": "gemini"}
++                update={"provider": provider}
+             ),
+         }
+     )
+@@ -380,10 +385,51 @@ def test_news_branch_roles_receive_only_the_selected_optional_llm_secret(
+         provider=MacOSKeychainSecretProvider(backend=backend),
+     )
+ 
+-    assert backend.accounts.count("gemini_api_key") == 1
+-    assert secret_is_set(loaded.gemini_api_key)
+-    assert "anthropic_api_key" not in backend.accounts
+-    assert "groq_api_key" not in backend.accounts
++    for field in (
++        "anthropic_api_key",
++        "gemini_api_key",
++        "groq_api_key",
++    ):
++        assert field not in backend.accounts
++        assert not secret_is_set(getattr(loaded, field))
++
++
++@pytest.mark.parametrize("role", ["app", "daemon"])
++@pytest.mark.parametrize(
++    "provider",
++    ["anthropic", "gemini", "groq"],
++)
++def test_supported_news_roles_receive_only_selected_llm_secret(
++    app_config,
++    role,
++    provider,
++):
++    config = app_config.model_copy(
++        update={
++            "analyst": app_config.analyst.model_copy(
++                update={"news_enabled": True}
++            ),
++            "llm": app_config.llm.model_copy(
++                update={"provider": provider}
++            ),
++        }
++    )
++    backend = RecordingKeyring(_role_secret_values(config))
++
++    loaded = load_role_secrets(
++        role,
++        config=config,
++        provider=MacOSKeychainSecretProvider(backend=backend),
++    )
++
++    for field in (
++        "anthropic_api_key",
++        "gemini_api_key",
++        "groq_api_key",
++    ):
++        expected = field == f"{provider}_api_key"
++        assert (field in backend.accounts) is expected
++        assert secret_is_set(getattr(loaded, field)) is expected
+ 
+ 
+ class SnapshotBroker:
+diff --git a/tests/test_task9_round2.py b/tests/test_task9_round2.py
+index 1508c76..df2e23f 100644
+--- a/tests/test_task9_round2.py
++++ b/tests/test_task9_round2.py
+@@ -13,7 +13,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.broker.mock import MockBroker
+ from trading_assistant.config import BrokerKind, Secrets
+ from trading_assistant.db.migrate import upgrade
+@@ -131,42 +131,26 @@ def test_explicit_runtime_secrets_cannot_bypass_shared_planning_budget(
+     assert constructed == []
+ 
+ 
+-def test_automatic_app_root_logs_post_container_startup_failure(
+-    tmp_path,
+-    make_service,
++def test_automatic_app_root_refuses_before_container_construction(
+     monkeypatch,
+ ):
+     import trading_assistant.app.main as app_main
++    from trading_assistant import bootstrap
+ 
+-    marker = "post-container-agent-secret"
+-    service = make_service()
+-    secrets = Secrets(app_api_token=marker)
+-    container = SimpleNamespace(
+-        service=service,
+-        secrets=secrets,
+-    )
++    built = []
+     monkeypatch.setattr(
+-        app_main,
+-        "build_default_container",
+-        lambda: container,
+-    )
+-    monkeypatch.setattr(
+-        app_main,
+-        "_build_agent",
+-        lambda _container: (_ for _ in ()).throw(
+-            RuntimeError(marker)
+-        ),
++        bootstrap,
++        "_build_guarded_container",
++        lambda *_args, **_kwargs: built.append(True),
+     )
+-    monkeypatch.chdir(tmp_path)
+ 
+-    with pytest.raises(RuntimeError, match=marker):
+-        create_app()
++    with pytest.raises(
++        RuntimeError,
++        match="^production_startup_guard_required$",
++    ):
++        app_main.create_app()
+ 
+-    content = (
+-        tmp_path / "logs" / "app.runtime.log"
+-    ).read_text(encoding="utf-8")
+-    assert "startup_failed role=app" in content
+-    assert marker not in content
++    assert built == []
+ 
+ 
+ def test_mcp_startup_failure_prevents_transport_run(monkeypatch):
+@@ -333,7 +317,7 @@ def test_every_production_role_has_private_bounded_startup_log(
+ @pytest.mark.parametrize(
+     ("builder_name", "runtime_role"),
+     [
+-        ("paper_drill", "app"),
++        ("paper_drill", "paper-drill"),
+     ],
+ )
+ def test_service_utility_roots_pass_exact_role_and_secrets(
+diff --git a/tests/test_transport_boundary.py b/tests/test_transport_boundary.py
+index c4dd80e..5696eec 100644
+--- a/tests/test_transport_boundary.py
++++ b/tests/test_transport_boundary.py
+@@ -22,7 +22,7 @@ from cryptography.x509.verification import (
+ )
+ from fastapi.testclient import TestClient
+ 
+-from trading_assistant.app.main import create_app
++from trading_assistant.app.main import create_test_app as create_app
+ from trading_assistant.db.models import (
+     AuditEvent,
+     AuthSession,

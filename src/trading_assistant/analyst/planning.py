@@ -1,38 +1,106 @@
 """Plan lifecycle: analyze → size → store → approve (decompose into rules) → cancel.
 
-Approving a plan turns its SizedTradePlan into a group of PRE_APPROVED conditional
-rules (entry tranches + targets + stop + trailing + time) tagged with the plan id.
-With ``auto_execute_preapproved_rules`` on, the daemon runs the whole ladder and
-exit sequence hands-free on Alpaca — every firing still passing the risk engine.
+Approving a plan turns its SizedTradePlan into a human-gated group of typed
+conditional rules (entry tranches + targets + stop + trailing + time) tagged
+with the plan id. A firing creates a proposal and still requires a separate,
+identified human approval.
 
-Promotion gate: while the analyst has <50 graded calls for an asset class, plans
-for that class may be approved in PAPER mode only.
+Every approved plan remains paper-only. Track-record scoring remains available
+for analyst evaluation but cannot promote execution to live trading.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
-import uuid
 from datetime import timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..assets import AssetClass
-from ..broker.models import OrderRequest, OrderSide, OrderType
-from ..config import live_trading_enabled
-from ..db.models import Rule, TradePlanRow, utcnow
+from ..db.models import AuditEvent, TradePlanRow, utcnow
+from ..dependencies import RequiredDependencyUnavailable
+from ..identity import canonical_request_id
+from ..rules.models import RuleCommand
+from ..security.sensitive_fields import sensitive_store
 from ..signals.models import MarketFeatures
+from .citations import validate_source_citations
 from .models import PlanAction, TradePlan
-from .promotion import can_promote
-from .scorecard import build_scorecard
 from .sizing import SizedTradePlan, size_trade
-from .store import build_scorecard_from_db
+from .untrusted import UntrustedSummary
 
 
 def _floor(x: Decimal) -> Decimal:
     return x.to_integral_value(rounding=ROUND_DOWN)
+
+
+_AUTHORITY_VERSION = 1
+
+
+def _canonical_number(value: object) -> str:
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("plan authority number invalid")
+    normalized = format(number.normalize(), "f")
+    return "0" if Decimal(normalized) == 0 else normalized
+
+
+def _authority_payload(plan: TradePlan, sized: dict[str, Any]) -> dict:
+    return {
+        "action": plan.action.value,
+        "entry_type": plan.entry_plan.type,
+        "exit": {
+            "stop": _canonical_number(plan.exit_plan.stop),
+            "targets": [
+                {
+                    "fraction": _canonical_number(
+                        target.fraction_to_sell
+                    ),
+                    "price": _canonical_number(target.price_level),
+                }
+                for target in plan.exit_plan.targets
+            ],
+            "time_stop_days": plan.exit_plan.time_stop_days,
+            "trailing_stop_pct": (
+                _canonical_number(plan.exit_plan.trailing_stop_pct)
+                if plan.exit_plan.trailing_stop_pct is not None
+                else None
+            ),
+        },
+        "sized": {
+            "direction": str(sized.get("direction", "")),
+            "total_shares": _canonical_number(sized["total_shares"]),
+            "tranches": [
+                {
+                    "fraction": _canonical_number(tranche["fraction"]),
+                    "price": _canonical_number(
+                        tranche["price_level"]
+                    ),
+                    "shares": _canonical_number(tranche["shares"]),
+                }
+                for tranche in sized["tranches"]
+            ],
+        },
+        "symbol": plan.symbol,
+        "version": _AUTHORITY_VERSION,
+    }
+
+
+def _authority_digest(plan: TradePlan, sized: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        _authority_payload(plan, sized),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _review_token(plan_id: int, version: int, digest: str) -> str:
+    return f"plan:{plan_id}:authority:v{version}:{digest}"
 
 
 class PlanningService:
@@ -54,36 +122,133 @@ class PlanningService:
         return cfg or self.service.config.risk
 
     # ── analyze → size → store ─────────────────────────────────
-    def analyze(self, symbol: str) -> dict[str, Any]:
+    def analyze(
+        self,
+        symbol: str,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        untrusted_summary: UntrustedSummary | None = None,
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
+            raise ValueError(
+                "plan analysis actor, reason, and request_id must be non-empty"
+            )
         features = self.feature_provider(symbol)
         held = [p["ticker"] for p in self.service.get_external_positions().get("positions", [])]
-        plan = self.analyst.analyze_plan(features, held_symbols=held)
+        plan = self.analyst.analyze_plan(
+            features,
+            held_symbols=held,
+            untrusted_summary=untrusted_summary,
+            request_id=request_id,
+        )
+        validate_source_citations(plan, untrusted_summary)
 
         ac = AssetClass.for_symbol(symbol)
         with self.service.session_factory() as s:
-            snapshot = self.service.assemble_snapshot(s, [symbol], ac)
-        equity = self.service.broker.get_account().equity
+            snapshot = self.service.assemble_snapshot(
+                s,
+                [symbol],
+                ac,
+                required_dependencies=True,
+            )
+        equity = snapshot.account_equity
         sized = size_trade(plan, snapshot, self._risk_cfg(symbol), equity)
 
-        plan_id = self._store(plan, sized)
-        return {"plan_id": plan_id, "plan": json.loads(plan.model_dump_json()),
-                "sized": sized.to_dict()}
+        plan_id, authority_digest = self._store(
+            plan,
+            sized,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            untrusted_summary=untrusted_summary,
+        )
+        return {
+            "plan_id": plan_id,
+            "plan": json.loads(plan.model_dump_json()),
+            "sized": sized.to_dict(),
+            "authority_version": _AUTHORITY_VERSION,
+            "authority_digest": authority_digest,
+            "review_token": _review_token(
+                plan_id,
+                _AUTHORITY_VERSION,
+                authority_digest,
+            ),
+        }
 
-    def _store(self, plan: TradePlan, sized: SizedTradePlan) -> int:
+    def _store(
+        self,
+        plan: TradePlan,
+        sized: SizedTradePlan,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+        untrusted_summary: UntrustedSummary | None = None,
+    ) -> tuple[int, str]:
+        validate_source_citations(plan, untrusted_summary)
+        sized_payload = sized.to_dict()
+        authority_digest = _authority_digest(plan, sized_payload)
         with self.service.session_factory() as s:
             row = TradePlanRow(
                 symbol=plan.symbol,
                 action=plan.action.value,
                 status="proposed",
-                plan_json=plan.model_dump_json(),
-                sized_json=json.dumps(sized.to_dict()),
+                authority_version=_AUTHORITY_VERSION,
+                authority_digest=authority_digest,
             )
-            s.add(row)
+            store = sensitive_store(s, self.service.session_factory)
+            store.write_many(
+                row,
+                {
+                    "plan_json": plan.model_dump_json(),
+                    "sized_json": json.dumps(sized_payload),
+                },
+            )
+            audit = AuditEvent(
+                actor=actor,
+                action="plan.create",
+                target_type="trade_plan",
+                target_id=str(row.id),
+                request_id=request_id,
+                result_code="proposed",
+            )
+            store.write_many(
+                audit,
+                {
+                    "reason": reason,
+                    "detail_json": json.dumps(
+                        {"symbol": plan.symbol},
+                        sort_keys=True,
+                    ),
+                },
+            )
             s.commit()
-            return row.id
+            return row.id, authority_digest
 
     # ── approve (gate + decompose into rules) ──────────────────
-    def approve_plan(self, plan_id: int) -> dict[str, Any]:
+    def approve_plan(
+        self,
+        plan_id: int,
+        *,
+        review_token: str,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
+            raise ValueError(
+                "approval actor, reason, and request_id must be non-empty"
+            )
+        if not isinstance(review_token, str) or not review_token:
+            return {"plan_id": plan_id, "error": "plan_review_stale"}
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
@@ -91,146 +256,474 @@ class PlanningService:
             if row.status != "proposed":
                 return {"plan_id": plan_id, "status": row.status,
                         "error": "only proposed plans can be approved"}
+            if (
+                row.authority_version != _AUTHORITY_VERSION
+                or not isinstance(row.authority_digest, str)
+                or not hmac.compare_digest(
+                    review_token,
+                    _review_token(
+                        row.id,
+                        row.authority_version,
+                        row.authority_digest,
+                    ),
+                )
+            ):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
 
-            plan = TradePlan.model_validate_json(row.plan_json)
-            sized = json.loads(row.sized_json)
+            store = sensitive_store(s, self.service.session_factory)
+            try:
+                plan = TradePlan.model_validate_json(
+                    store.read(row, "plan_json")
+                )
+                sized = json.loads(store.read(row, "sized_json"))
+                observed_digest = _authority_digest(plan, sized)
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
+            if not hmac.compare_digest(
+                observed_digest,
+                row.authority_digest,
+            ):
+                return {
+                    "plan_id": plan_id,
+                    "error": "plan_review_stale",
+                }
+            reviewed_digest = row.authority_digest
             if plan.action not in (PlanAction.BUY, PlanAction.SELL) or Decimal(sized["total_shares"]) <= 0:
                 return {"plan_id": plan_id, "error": "plan has no sized entry to approve"}
 
-            # Promotion gate: <50 graded calls for this class -> paper mode only.
-            promotable, _ = can_promote(build_scorecard_from_db(s))
-            live = live_trading_enabled(self.service.config, self.secrets) if self.secrets else False
-            if live and not promotable:
+        # Decomposition is pure application work. It happens before the write
+        # transaction so a process stop cannot leave a durable claim behind.
+        rules = self._decompose(plan, sized, plan_id)
+        paper_only = True
+        bracket = None
+        with self.service.submission_barrier.hold_writer():
+            with self.service.session_factory() as s:
+                connection = s.connection()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                current = s.get(TradePlanRow, plan_id)
+                if (
+                    current is None
+                    or current.status != "proposed"
+                    or current.authority_version != _AUTHORITY_VERSION
+                    or current.authority_digest != reviewed_digest
+                ):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "status": (
+                            current.status if current else None
+                        ),
+                        "error": "plan_review_stale",
+                    }
+                current_store = sensitive_store(
+                    s,
+                    self.service.session_factory,
+                )
+                try:
+                    current_plan = TradePlan.model_validate_json(
+                        current_store.read(current, "plan_json")
+                    )
+                    current_sized = json.loads(
+                        current_store.read(current, "sized_json")
+                    )
+                    current_digest = _authority_digest(
+                        current_plan,
+                        current_sized,
+                    )
+                except (ArithmeticError, KeyError, TypeError, ValueError):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "error": "plan_review_stale",
+                    }
+                if not hmac.compare_digest(
+                    current_digest,
+                    reviewed_digest,
+                ):
+                    s.rollback()
+                    return {
+                        "plan_id": plan_id,
+                        "error": "plan_review_stale",
+                    }
+                claim = s.execute(
+                    update(TradePlanRow)
+                    .where(
+                        TradePlanRow.id == plan_id,
+                        TradePlanRow.status == "proposed",
+                        TradePlanRow.authority_version
+                        == _AUTHORITY_VERSION,
+                        TradePlanRow.authority_digest
+                        == reviewed_digest,
+                    )
+                    .values(
+                        status="approved",
+                        paper_only=paper_only,
+                    )
+                )
+                if claim.rowcount != 1:
+                    s.rollback()
+                    current = s.get(TradePlanRow, plan_id)
+                    return {
+                        "plan_id": plan_id,
+                        "status": (
+                            current.status if current else None
+                        ),
+                        "error": (
+                            "plan approval is already complete "
+                            "or unavailable"
+                        ),
+                    }
+                self.service.rule_application.persist_commands(
+                    s,
+                    rules,
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                    plan_id=plan_id,
+                )
+                audit = AuditEvent(
+                    actor=actor,
+                    action="plan.approve",
+                    target_type="trade_plan",
+                    target_id=str(plan_id),
+                    request_id=request_id,
+                    result_code="approved",
+                )
+                sensitive_store(
+                    s,
+                    self.service.session_factory,
+                ).write_many(
+                    audit,
+                    {"reason": reason, "detail_json": "{}"},
+                )
+                s.commit()
                 return {
                     "plan_id": plan_id,
-                    "error": "promotion gate: <50 graded calls — approvable in PAPER mode only",
+                    "status": "approved",
+                    "rules_created": len(rules),
+                    "paper_only": paper_only,
+                    "bracket": bracket,
                 }
 
-            # D4: single-tranche + single-target plans go out as a server-side
-            # bracket (survives our downtime); the ladder/trailing/time cases stay
-            # daemon-managed rules.
-            bracket = None
-            eligible = (
-                self.service.config.execution.prefer_bracket_orders
-                and len(plan.entry_plan.tranches) == 1
-                and len(plan.exit_plan.targets) == 1
-                and hasattr(self.service.broker, "submit_bracket")
-                and sized["tranches"] and Decimal(sized["tranches"][0]["shares"]) > 0
-            )
-            if eligible:
-                tr = sized["tranches"][0]
-                is_long = plan.action is PlanAction.BUY
-                order_req = OrderRequest(
-                    ticker=plan.symbol,
-                    side=OrderSide.BUY if is_long else OrderSide.SELL,
-                    order_type=OrderType.LIMIT, idempotency_key=uuid.uuid4().hex,
-                    qty=Decimal(tr["shares"]), limit_price=Decimal(str(tr["price_level"])),
-                )
-                bracket = self.service.submit_bracket_order(
-                    order_req, plan.exit_plan.targets[0].price_level, plan.exit_plan.stop
-                )
-                rules = self._decompose(plan, sized, plan_id, exits_only=True)
-            else:
-                rules = self._decompose(plan, sized, plan_id)
-            for r in rules:
-                s.add(r)
-            row.status = "approved"
-            row.paper_only = not (live and promotable)
-            s.commit()
-            return {"plan_id": plan_id, "status": "approved",
-                    "rules_created": len(rules), "paper_only": row.paper_only,
-                    "bracket": bracket}
-
     def _decompose(
-        self, plan: TradePlan, sized: dict, plan_id: int, exits_only: bool = False
-    ) -> list[Rule]:
+        self, plan: TradePlan, sized: dict, plan_id: int
+    ) -> list[RuleCommand]:
         symbol = plan.symbol
         is_long = plan.action is PlanAction.BUY
         entry_side = "buy" if is_long else "sell"
         exit_side = "sell" if is_long else "buy"
         total = Decimal(sized["total_shares"])
-        rules: list[Rule] = []
+        rules: list[RuleCommand] = []
+        exit_group_key = f"plan-{plan_id}-exits"
 
-        # When a bracket handles entry+target+stop, only trailing/time remain.
-        for t in ([] if exits_only else sized["tranches"]):
+        for index, t in enumerate(sized["tranches"], start=1):
             shares = Decimal(t["shares"])
             if shares <= 0:
                 continue
-            cond = ({"price_below": float(t["price_level"])} if is_long
-                    else {"price_above": float(t["price_level"])})
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="entry", pre_approved=True,
-                fraction=Decimal(str(t["fraction"])),
-                condition_json=json.dumps(cond),
-                action_json=json.dumps({"side": entry_side, "qty": str(shares)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "entry",
+                        "condition": {
+                            "type": "price",
+                            "direction": "below" if is_long else "above",
+                            "price": t["price_level"],
+                        },
+                        "action": {
+                            "side": entry_side,
+                            "order_type": "market",
+                            "qty": shares,
+                        },
+                        "group_key": f"plan-{plan_id}-entry-{index}",
+                        "fraction": t["fraction"],
+                    }
+                )
+            )
 
-        if not exits_only:
-            for tgt in plan.exit_plan.targets:
-                qty = _floor(Decimal(str(tgt.fraction_to_sell)) * total)
-                if qty <= 0:
-                    continue
-                cond = ({"price_above": float(tgt.price_level)} if is_long
-                        else {"price_below": float(tgt.price_level)})
-                rules.append(Rule(
-                    ticker=symbol, plan_id=plan_id, kind="target", pre_approved=True,
-                    condition_json=json.dumps(cond),
-                    action_json=json.dumps({"side": exit_side, "qty": str(qty)}),
-                ))
+        cumulative_fraction = Decimal(0)
+        allocated_target_qty = Decimal(0)
+        for tgt in plan.exit_plan.targets:
+            fraction = Decimal(str(tgt.fraction_to_sell))
+            cumulative_fraction += fraction
+            terminal_on_trigger = cumulative_fraction >= Decimal(1)
+            qty = (
+                total - allocated_target_qty
+                if terminal_on_trigger
+                else _floor(fraction * total)
+            )
+            if qty <= 0:
+                continue
+            allocated_target_qty += qty
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "target",
+                        "condition": {
+                            "type": "price",
+                            "direction": "above" if is_long else "below",
+                            "price": tgt.price_level,
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": qty,
+                        },
+                        "group_key": exit_group_key,
+                        "fraction": fraction,
+                        "activation": "on_entry_fill",
+                        "terminal_on_trigger": terminal_on_trigger,
+                    }
+                )
+            )
 
-            stop_cond = ({"price_below": float(plan.exit_plan.stop)} if is_long
-                         else {"price_above": float(plan.exit_plan.stop)})
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="stop", pre_approved=True,
-                condition_json=json.dumps(stop_cond),
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+        rules.append(
+            RuleCommand.model_validate(
+                {
+                    "ticker": symbol,
+                    "kind": "stop",
+                    "condition": {
+                        "type": "price",
+                        "direction": "below" if is_long else "above",
+                        "price": plan.exit_plan.stop,
+                    },
+                    "action": {
+                        "side": exit_side,
+                        "order_type": "market",
+                        "qty": total,
+                    },
+                    "group_key": exit_group_key,
+                    "fraction": Decimal(1),
+                    "activation": "on_entry_fill",
+                }
+            )
+        )
 
         if plan.exit_plan.trailing_stop_pct:
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="trailing", pre_approved=True,
-                condition_json=json.dumps({"trailing_stop_pct": plan.exit_plan.trailing_stop_pct}),
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "trailing",
+                        "condition": {
+                            "type": "trailing",
+                            "percent": plan.exit_plan.trailing_stop_pct,
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": total,
+                        },
+                        "group_key": exit_group_key,
+                        "fraction": Decimal(1),
+                        "activation": "on_entry_fill",
+                    }
+                )
+            )
 
         if plan.exit_plan.time_stop_days:
-            rules.append(Rule(
-                ticker=symbol, plan_id=plan_id, kind="time", pre_approved=True,
-                deadline=utcnow() + timedelta(days=plan.exit_plan.time_stop_days),
-                condition_json="{}",
-                action_json=json.dumps({"side": exit_side, "qty": str(total)}),
-            ))
+            rules.append(
+                RuleCommand.model_validate(
+                    {
+                        "ticker": symbol,
+                        "kind": "time",
+                        "condition": {
+                            "type": "time",
+                            "deadline": utcnow()
+                            + timedelta(days=plan.exit_plan.time_stop_days),
+                        },
+                        "action": {
+                            "side": exit_side,
+                            "order_type": "market",
+                            "qty": total,
+                        },
+                        "group_key": exit_group_key,
+                        "fraction": Decimal(1),
+                        "activation": "on_entry_fill",
+                    }
+                )
+            )
         return rules
 
     # ── cancel + queries ───────────────────────────────────────
-    def cancel_plan(self, plan_id: int) -> dict[str, Any]:
-        with self.service.session_factory() as s:
-            row = s.get(TradePlanRow, plan_id)
-            if row is None:
-                return {"error": "not found"}
-            sibs = s.execute(
-                select(Rule).where(Rule.plan_id == plan_id, Rule.state == "active")
-            ).scalars().all()
-            for r in sibs:
-                r.state = "canceled"
-            row.status = "canceled"
-            s.commit()
-            return {"plan_id": plan_id, "status": "canceled", "rules_canceled": len(sibs)}
+    def cancel_plan(
+        self,
+        plan_id: int,
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        request_id = canonical_request_id(request_id)
+        if not actor or not reason:
+            raise ValueError(
+                "plan cancellation actor, reason, and request_id "
+                "must be non-empty"
+            )
+        with self.service.submission_barrier.hold_writer():
+            blocker = (
+                self.service.rule_repository.plan_cancellation_blocker(
+                    plan_id,
+                    now=utcnow(),
+                    actor=actor,
+                    reason=reason,
+                    request_id=request_id,
+                )
+            )
+            if (
+                blocker is not None
+                and blocker.error == "reconciliation_required"
+            ):
+                try:
+                    self.service.sync_open_orders(
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                except RequiredDependencyUnavailable:
+                    return {
+                        "plan_id": plan_id,
+                        "status": blocker.status,
+                        "rules_canceled": 0,
+                        "error": "order_cancel_unconfirmed",
+                    }
+                blocker = (
+                    self.service.rule_repository.plan_cancellation_blocker(
+                        plan_id,
+                        now=utcnow(),
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                    )
+                )
+            if blocker is not None:
+                if blocker.error == "not_found":
+                    return {"error": "not found"}
+                return {
+                    "plan_id": plan_id,
+                    "status": blocker.status,
+                    "rules_canceled": 0,
+                    "error": blocker.error,
+                }
+            quiesced = self.service.quiesce_trade_plan_orders(
+                plan_id,
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+            if quiesced["failed"]:
+                with self.service.session_factory() as session:
+                    plan = session.get(TradePlanRow, plan_id)
+                return {
+                    "plan_id": plan_id,
+                    "status": (
+                        plan.status if plan is not None else "unknown"
+                    ),
+                    "rules_canceled": 0,
+                    "error": "order_cancel_unconfirmed",
+                }
+            result = self.service.rule_repository.cancel_plan(
+                plan_id,
+                now=utcnow(),
+                actor=actor,
+                reason=reason,
+                request_id=request_id,
+            )
+        if result.error == "not_found":
+            return {"error": "not found"}
+        response = {
+            "plan_id": plan_id,
+            "status": result.status,
+            "rules_canceled": result.rules_canceled,
+        }
+        if result.error is not None:
+            response["error"] = result.error
+        return response
 
     def get_plans(self) -> list[dict[str, Any]]:
         with self.service.session_factory() as s:
             rows = s.execute(select(TradePlanRow).order_by(TradePlanRow.id.desc())).scalars().all()
-            return [{"plan_id": r.id, "symbol": r.symbol, "action": r.action,
-                     "status": r.status, "paper_only": r.paper_only,
-                     "created_at": r.created_at.isoformat()} for r in rows]
+            store = sensitive_store(s, self.service.session_factory)
+            plans = []
+            for row in rows:
+                plan = TradePlan.model_validate_json(
+                    store.read(row, "plan_json")
+                )
+                plans.append(
+                    {
+                        "plan_id": row.id,
+                        "symbol": row.symbol,
+                        "action": row.action,
+                        "status": row.status,
+                        "paper_only": row.paper_only,
+                        "authority_version": row.authority_version,
+                        "authority_digest": row.authority_digest,
+                        "review_token": (
+                            _review_token(
+                                row.id,
+                                row.authority_version,
+                                row.authority_digest,
+                            )
+                            if row.authority_version
+                            == _AUTHORITY_VERSION
+                            and isinstance(row.authority_digest, str)
+                            else None
+                        ),
+                        "created_at": row.created_at.isoformat(),
+                        "confidence": plan.confidence,
+                        "as_of": plan.as_of.isoformat(),
+                    }
+                )
+            return plans
 
     def get_plan(self, plan_id: int) -> Optional[dict[str, Any]]:
         with self.service.session_factory() as s:
             row = s.get(TradePlanRow, plan_id)
             if row is None:
                 return None
+            store = sensitive_store(s, self.service.session_factory)
+            plan_json = store.read(row, "plan_json")
+            plan = TradePlan.model_validate_json(plan_json)
             return {
                 "plan_id": row.id, "symbol": row.symbol, "status": row.status,
                 "paper_only": row.paper_only,
-                "plan": json.loads(row.plan_json), "sized": json.loads(row.sized_json),
+                "authority_version": row.authority_version,
+                "authority_digest": row.authority_digest,
+                "review_token": (
+                    _review_token(
+                        row.id,
+                        row.authority_version,
+                        row.authority_digest,
+                    )
+                    if row.authority_version == _AUTHORITY_VERSION
+                    and isinstance(row.authority_digest, str)
+                    else None
+                ),
+                "plan": json.loads(plan_json),
+                "sized": json.loads(
+                    store.read(row, "sized_json")
+                ),
+                "evidence_availability": {
+                    "injection_flags": "not_recorded",
+                    "uncertainties": "not_recorded",
+                    "catalysts": "not_recorded",
+                    "risks": "not_recorded",
+                    "market_context": "not_recorded",
+                    "relative_strength_vs_spy": "not_recorded",
+                    "days_to_next_earnings": "not_recorded",
+                    "source_evidence": (
+                        "references_only"
+                        if plan.cited_source_refs
+                        else "not_recorded"
+                    ),
+                },
             }

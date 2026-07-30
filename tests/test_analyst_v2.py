@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
+
+import pytest
 
 from trading_assistant.analyst.analyst import Analyst
 from trading_assistant.analyst.models import AnalysisReport, AnalystAction, PlanAction
@@ -36,7 +39,15 @@ def _backend(tool, inp):
     block = SimpleNamespace(type="tool_use", name=tool, id="t", input=dict(inp))
 
     class B:
-        def create(self, *, system, messages, tools, tool_choice=None):
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
             return SimpleNamespace(content=[block])
 
     return B()
@@ -49,23 +60,134 @@ def _feat(regime):
 
 # ── RANGING suppression ─────────────────────────────────────────
 def test_report_forced_hold_in_ranging():
-    a = Analyst(_backend("submit_analysis", _REPORT_INPUT), suppress_ranging=True)
-    assert a.analyze(_feat(Regime.RANGING)).action is AnalystAction.HOLD
+    a = Analyst(
+        _backend("submit_analysis", _REPORT_INPUT),
+        suppress_ranging=True,
+        max_attempts=2,
+    )
+    assert a.analyze(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-ranging-hold",
+    ).action is AnalystAction.HOLD
 
 
 def test_report_untouched_outside_ranging():
-    a = Analyst(_backend("submit_analysis", _REPORT_INPUT), suppress_ranging=True)
-    assert a.analyze(_feat(Regime.TRENDING_UP)).action is AnalystAction.BUY
+    a = Analyst(
+        _backend("submit_analysis", _REPORT_INPUT),
+        suppress_ranging=True,
+        max_attempts=2,
+    )
+    assert a.analyze(
+        _feat(Regime.TRENDING_UP),
+        request_id="analyst-v2-trending-buy",
+    ).action is AnalystAction.BUY
 
 
 def test_plan_forced_no_trade_in_ranging():
-    a = Analyst(_backend("submit_plan", _PLAN_INPUT), suppress_ranging=True)
-    assert a.analyze_plan(_feat(Regime.RANGING)).action is PlanAction.NO_TRADE
+    a = Analyst(
+        _backend("submit_plan", _PLAN_INPUT),
+        suppress_ranging=True,
+        max_attempts=2,
+    )
+    assert a.analyze_plan(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-ranging-plan",
+    ).action is PlanAction.NO_TRADE
 
 
 def test_suppression_off_leaves_buy():
-    a = Analyst(_backend("submit_analysis", _REPORT_INPUT), suppress_ranging=False)
-    assert a.analyze(_feat(Regime.RANGING)).action is AnalystAction.BUY
+    a = Analyst(
+        _backend("submit_analysis", _REPORT_INPUT),
+        suppress_ranging=False,
+        max_attempts=2,
+    )
+    assert a.analyze(
+        _feat(Regime.RANGING),
+        request_id="analyst-v2-suppression-off",
+    ).action is AnalystAction.BUY
+
+
+def test_plan_validation_failure_gets_one_bounded_repair_attempt():
+    invalid = deepcopy(_PLAN_INPUT)
+    invalid["exit_plan"]["stop"] = 80
+    outputs = [invalid, deepcopy(_PLAN_INPUT)]
+
+    class SequenceBackend:
+        def __init__(self):
+            self.calls = []
+            self.request_ids = []
+
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
+            self.calls.append(messages)
+            self.request_ids.append(request_id)
+            data = outputs[len(self.calls) - 1]
+            block = SimpleNamespace(
+                type="tool_use", name="submit_plan", id="t", input=data
+            )
+            return SimpleNamespace(content=[block])
+
+    backend = SequenceBackend()
+    plan = Analyst(
+        backend,
+        max_attempts=2,
+    ).analyze_plan(
+        _feat(Regime.TRENDING_UP),
+        request_id="structured-repair-request",
+    )
+
+    assert plan.exit_plan.stop == 92
+    assert len(backend.calls) == 2
+    assert backend.request_ids == [
+        "structured-repair-request",
+        "structured-repair-request",
+    ]
+    assert "failed deterministic validation" in backend.calls[1][0]["content"]
+
+
+def test_plan_repair_is_capped_at_one_retry():
+    invalid = deepcopy(_PLAN_INPUT)
+    invalid["exit_plan"]["stop"] = 80
+
+    class AlwaysInvalidBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def create(
+            self,
+            *,
+            system,
+            messages,
+            tools,
+            tool_choice=None,
+            request_id,
+        ):
+            self.calls += 1
+            block = SimpleNamespace(
+                type="tool_use",
+                name="submit_plan",
+                id="t",
+                input=deepcopy(invalid),
+            )
+            return SimpleNamespace(content=[block])
+
+    backend = AlwaysInvalidBackend()
+    with pytest.raises(ValueError, match="after 2 structured attempts"):
+        Analyst(
+            backend,
+            max_attempts=2,
+        ).analyze_plan(
+            _feat(Regime.TRENDING_UP),
+            request_id="analyst-v2-repair-cap",
+        )
+    assert backend.calls == 2
 
 
 # ── confidence neutralized ──────────────────────────────────────

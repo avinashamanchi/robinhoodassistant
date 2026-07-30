@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import select
+
+from trading_assistant.assets import AssetClass
+from trading_assistant.db.models import AuditEvent
+from trading_assistant.db.session import create_db_engine, make_session_factory
+from trading_assistant.risk.breakers import (
+    BreakerKind,
+    BreakerResetConflict,
+    BreakerScope,
+    BreakerService,
+)
+from trading_assistant.security.sensitive_fields import sensitive_store
+
+
+NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+
+
+def test_breaker_scopes_have_stable_targeted_keys():
+    assert BreakerScope.data(AssetClass.EQUITY).key == "data:equity"
+    assert BreakerScope.loss(AssetClass.CRYPTO).key == "loss:crypto"
+    assert BreakerScope.drawdown(AssetClass.EQUITY).key == "drawdown:equity"
+    assert BreakerScope.liquidity("aapl").key == "liquidity:AAPL"
+    assert BreakerScope.broker_drift().key == "broker_drift"
+    assert BreakerScope.operator_global().key == "operator_global"
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        BreakerScope.data(AssetClass.EQUITY),
+        BreakerScope.loss(AssetClass.CRYPTO),
+        BreakerScope.drawdown(AssetClass.EQUITY),
+        BreakerScope.liquidity("AAPL"),
+        BreakerScope.broker_drift(),
+        BreakerScope.operator_global(),
+    ],
+)
+def test_breaker_scope_parser_accepts_only_canonical_keys(scope):
+    assert BreakerScope.parse(scope.key) == scope
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        " loss:equity",
+        "loss:EQUITY",
+        "loss",
+        "loss:aapl",
+        "data:AAPL",
+        "liquidity:aapl",
+        "liquidity:",
+        "broker_drift:any",
+        "unknown:equity",
+    ],
+)
+def test_breaker_scope_parser_rejects_noncanonical_keys(raw):
+    with pytest.raises(ValueError, match="breaker scope"):
+        BreakerScope.parse(raw)
+
+
+def test_scoped_breakers_persist_and_reset_independently(session_factory):
+    service = BreakerService(session_factory)
+    data_scope = BreakerScope.data(AssetClass.EQUITY)
+    drift_scope = BreakerScope.broker_drift()
+
+    data_state = service.trip(
+        data_scope,
+        "feed disagreement",
+        "daemon",
+        request_id="breaker-scope-data",
+        now=NOW,
+    )
+    drift_state = service.trip(
+        drift_scope,
+        "position mismatch",
+        "daemon",
+        request_id="breaker-scope-drift",
+        now=NOW,
+    )
+    reset_state = service.reset(
+        data_scope,
+        actor="operator:avi",
+        reason="feed healthy",
+        prior_health={"provider": "healthy", "age_seconds": 1},
+        expected_generation=data_state.generation,
+        request_id="breaker-scope-reset",
+        now=NOW,
+    )
+
+    assert data_state.scope == data_scope
+    assert data_state.tripped is True
+    assert drift_state.scope == drift_scope
+    assert reset_state.tripped is False
+    assert service.is_tripped(data_scope) is False
+    assert service.is_tripped(drift_scope) is True
+
+
+def test_breaker_trip_survives_restart(db_url, session_factory):
+    scope = BreakerScope.loss(AssetClass.CRYPTO)
+    BreakerService(session_factory).trip(
+        scope,
+        "daily loss",
+        "daemon",
+        request_id="breaker-restart-trip",
+        now=NOW,
+    )
+
+    restarted = BreakerService(
+        make_session_factory(create_db_engine(db_url))
+    )
+
+    assert restarted.is_tripped(scope) is True
+
+
+def test_active_for_symbol_returns_only_relevant_scopes(session_factory):
+    service = BreakerService(session_factory)
+    expected = (
+        BreakerScope.operator_global(),
+        BreakerScope.broker_drift(),
+        BreakerScope.data(AssetClass.EQUITY),
+        BreakerScope.loss(AssetClass.EQUITY),
+        BreakerScope.drawdown(AssetClass.EQUITY),
+        BreakerScope.liquidity("AAPL"),
+    )
+    unrelated = (
+        BreakerScope.data(AssetClass.CRYPTO),
+        BreakerScope.liquidity("MSFT"),
+    )
+    for scope in expected + unrelated:
+        service.trip(
+            scope,
+            f"trip {scope.key}",
+            "daemon",
+            request_id=f"breaker-active-{scope.key}",
+            now=NOW,
+        )
+
+    active = service.active_for_symbol("aapl")
+
+    assert {state.scope for state in active} == set(expected)
+    assert all(state.tripped for state in active)
+
+
+@pytest.mark.parametrize(
+    ("reason", "prior_health"),
+    [
+        ("", {"provider": "healthy"}),
+        ("   ", {"provider": "healthy"}),
+        ("feed healthy", {}),
+    ],
+)
+def test_reset_requires_reason_and_prior_health(
+    session_factory, reason, prior_health
+):
+    service = BreakerService(session_factory)
+    scope = BreakerScope.data(AssetClass.EQUITY)
+    observed = service.trip(
+        scope,
+        "feed disagreement",
+        "daemon",
+        request_id="breaker-reset-validation-trip",
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError):
+        service.reset(
+            scope,
+            actor="operator:avi",
+            reason=reason,
+            prior_health=prior_health,
+            expected_generation=observed.generation,
+            request_id="breaker-reset-validation-reset",
+            now=NOW,
+        )
+
+    assert service.is_tripped(scope) is True
+
+
+def test_each_breaker_mutation_writes_an_audit_event(session_factory):
+    service = BreakerService(session_factory)
+    scope = BreakerScope(BreakerKind.LIQUIDITY, "AAPL")
+    observed = service.trip(
+        scope,
+        "spread too wide",
+        "daemon",
+        request_id="breaker-audit-trip",
+        now=NOW,
+    )
+    service.reset(
+        scope,
+        actor="operator:avi",
+        reason="spread normalized",
+        prior_health={"spread_pct": "0.2"},
+        expected_generation=observed.generation,
+        request_id="breaker-audit-reset",
+        now=NOW,
+    )
+
+    with session_factory() as session:
+        events = session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.target_id == scope.key)
+            .order_by(AuditEvent.id)
+        ).all()
+        store = sensitive_store(session)
+        reset_reason = store.read(events[1], "reason")
+        reset_detail = store.read(events[1], "detail_json")
+
+    assert [event.action for event in events] == [
+        "circuit_breaker.trip",
+        "circuit_breaker.reset",
+    ]
+    assert [event.actor for event in events] == ["daemon", "operator:avi"]
+    assert reset_reason == "spread normalized"
+    assert '"spread_pct": "0.2"' in reset_detail
+
+
+def test_reset_is_bound_to_observed_generation_and_a_retrip_wins(
+    session_factory,
+):
+    service = BreakerService(session_factory)
+    scope = BreakerScope.data(AssetClass.EQUITY)
+    observed = service.trip(
+        scope,
+        "initial feed fault",
+        "daemon:first",
+        request_id="breaker-generation-initial",
+        now=NOW,
+    )
+    retripped = service.trip(
+        scope,
+        "new feed fault",
+        "daemon:second",
+        request_id="breaker-generation-retrip",
+        now=NOW,
+    )
+
+    assert retripped.generation == observed.generation + 1
+    with pytest.raises(BreakerResetConflict) as raised:
+        service.reset(
+            scope,
+            actor="operator:avi",
+            reason="reset based on stale observation",
+            prior_health={"provider": "healthy", "age_seconds": 1},
+            expected_generation=observed.generation,
+            request_id="breaker-generation-stale-reset",
+            now=NOW,
+        )
+
+    assert raised.value.expected_generation == observed.generation
+    assert raised.value.current_state == retripped
+    current = service.get(scope)
+    assert current == retripped
+    assert current is not None and current.tripped is True
+
+    with session_factory() as session:
+        conflict = session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.target_id == scope.key,
+                AuditEvent.action == "circuit_breaker.reset",
+            )
+            .order_by(AuditEvent.id.desc())
+        ).first()
+        conflict_detail = (
+            sensitive_store(session).read(conflict, "detail_json")
+            if conflict is not None
+            else ""
+        )
+
+    assert conflict is not None
+    assert conflict.result_code == "conflict"
+    assert f'"expected_generation": {observed.generation}' in (
+        conflict_detail
+    )
+    assert f'"current_generation": {retripped.generation}' in (
+        conflict_detail
+    )
+
+
+def test_reset_with_current_generation_advances_generation(session_factory):
+    service = BreakerService(session_factory)
+    scope = BreakerScope.liquidity("AAPL")
+    observed = service.trip(
+        scope,
+        "wide spread",
+        "daemon",
+        request_id="breaker-current-generation-trip",
+        now=NOW,
+    )
+
+    reset = service.reset(
+        scope,
+        actor="operator:avi",
+        reason="spread normalized",
+        prior_health={"spread_pct": "0.2"},
+        expected_generation=observed.generation,
+        request_id="breaker-current-generation-reset",
+        now=NOW,
+    )
+
+    assert reset.tripped is False
+    assert reset.generation == observed.generation + 1

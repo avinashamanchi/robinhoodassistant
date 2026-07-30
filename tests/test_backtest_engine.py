@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import date, timezone
 from decimal import Decimal
 
 import pandas as pd
 import pytest
 
+import trading_assistant.backtest.runner as backtest_runner
 from trading_assistant.backtest.data import DataSource, LookaheadError
 from trading_assistant.backtest.engine import run_backtest
 from trading_assistant.backtest.sim_broker import SimBroker
@@ -102,6 +104,26 @@ def test_limit_order_only_fills_when_crossed():
     assert broker.fills[0].price == 95.0
 
 
+def test_sim_broker_deduplicates_simple_and_bracket_client_ids():
+    broker = SimBroker(BacktestConfig(), starting_cash=100_000)
+    simple = _order("AAPL", OrderSide.BUY, notional=1000)
+    first = broker.submit_order(simple)
+    second = broker.submit_order(simple)
+
+    assert second == first
+    assert len(broker._pending) == 1
+    assert len(broker._orders) == 1
+
+    bracket = _order("MSFT", OrderSide.BUY, qty=1, limit=100, otype=OrderType.LIMIT)
+    bracket_first = broker.submit_bracket(bracket, Decimal("110"), Decimal("95"))
+    bracket_second = broker.submit_bracket(bracket, Decimal("110"), Decimal("95"))
+
+    assert bracket_second == bracket_first
+    assert len(broker._pending) == 2
+    assert len(broker._orders) == 2
+    assert len(broker.brackets) == 1
+
+
 # ── end-to-end ──────────────────────────────────────────────────
 def test_buy_and_hold_grows_in_uptrend():
     source = DataSource({"AAPL": make_trend(n_base=5, n_move=200, start=100.0, end=200.0)})
@@ -117,3 +139,182 @@ def test_sma_crossover_trades_and_is_deterministic():
     r2 = run_backtest(SmaCrossover(), source, "AAPL", backtest_config=BacktestConfig())
     assert r1.ending_equity == r2.ending_equity       # deterministic
     assert len(r1.equity_curve) == len(source.timeline(["AAPL"]))
+
+
+def test_replay_checks_cancellation_immediately_before_strategy_call(
+    monkeypatch,
+):
+    class CooperativeStop(RuntimeError):
+        pass
+
+    import trading_assistant.backtest.engine as engine
+
+    stopped = False
+    strategy_calls = 0
+    original_build_features = engine.build_features
+
+    def build_then_stop(*args, **kwargs):
+        nonlocal stopped
+        features = original_build_features(*args, **kwargs)
+        stopped = True
+        return features
+
+    def check():
+        if stopped:
+            raise CooperativeStop
+
+    class ProviderStrategy:
+        name = "provider_strategy"
+
+        def on_bar(self, features):
+            nonlocal strategy_calls
+            strategy_calls += 1
+            raise AssertionError(
+                "strategy/provider call happened after cancellation"
+            )
+
+    source = DataSource({"AAPL": make_bars(1, seed=9)})
+    monkeypatch.setattr(
+        engine,
+        "build_features",
+        build_then_stop,
+    )
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            ProviderStrategy(),
+            source,
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert strategy_calls == 0
+
+
+def test_replay_checks_cancellation_before_every_bar():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    strategy_calls = 0
+    stop = False
+
+    def check():
+        if stop:
+            raise CooperativeStop
+
+    class OneProviderCall:
+        name = "one_provider_call"
+
+        def on_bar(self, features):
+            nonlocal strategy_calls, stop
+            strategy_calls += 1
+            stop = True
+            return type(
+                "Signal",
+                (),
+                {"action": "hold", "size_hint": None},
+            )()
+
+    source = DataSource({"AAPL": make_bars(5, seed=10)})
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            OneProviderCall(),
+            source,
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert strategy_calls == 1
+
+
+def test_replay_checks_cancellation_before_each_data_access():
+    class CooperativeStop(RuntimeError):
+        pass
+
+    stopped = False
+    timeline_calls = 0
+    source = DataSource({"AAPL": make_bars(5, seed=11)})
+
+    class CancelAfterFull:
+        def full(self, symbol):
+            nonlocal stopped
+            result = source.full(symbol)
+            stopped = True
+            return result
+
+        def timeline(self, symbols):
+            nonlocal timeline_calls
+            timeline_calls += 1
+            return source.timeline(symbols)
+
+        def view(self, as_of):
+            return source.view(as_of)
+
+    def check():
+        if stopped:
+            raise CooperativeStop
+
+    with pytest.raises(CooperativeStop):
+        run_backtest(
+            SmaCrossover(),
+            CancelAfterFull(),
+            "AAPL",
+            backtest_config=BacktestConfig(),
+            warmup=0,
+            cancel_check=check,
+        )
+
+    assert timeline_calls == 0
+
+
+def test_synthetic_source_uses_requested_dates_inclusively():
+    source = backtest_runner.build_synthetic_source(
+        ["TREND"],
+        start_date=date(2026, 1, 10),
+        end_date=date(2026, 1, 12),
+    )
+
+    timeline = source.timeline(["TREND"])
+
+    assert len(timeline) == 3
+    assert timeline[0].date() == date(2026, 1, 10)
+    assert timeline[-1].date() == date(2026, 1, 12)
+    assert all(ts.tzinfo == timezone.utc for ts in timeline)
+
+
+def test_replay_date_window_is_inclusive_without_future_bars():
+    source = DataSource({"AAPL": make_bars(5, seed=12)})
+    timeline = source.timeline(["AAPL"])
+    observed = []
+
+    class RecordingStrategy:
+        name = "recording"
+
+        def on_bar(self, features):
+            observed.append(features.as_of)
+            assert (
+                features.as_of
+                <= timeline[3]
+            )
+            return type(
+                "Signal",
+                (),
+                {"action": "hold", "size_hint": None},
+            )()
+
+    run_backtest(
+        RecordingStrategy(),
+        source,
+        "AAPL",
+        backtest_config=BacktestConfig(),
+        warmup=0,
+        start=timeline[1],
+        end=timeline[3],
+    )
+
+    assert observed == timeline[1:4]

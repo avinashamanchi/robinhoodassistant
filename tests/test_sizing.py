@@ -88,7 +88,17 @@ def test_exposure_cap_binds(risk_config, make_snapshot):
 
 def test_existing_position_reduces_headroom(risk_config, make_snapshot):
     cfg = _permissive(risk_config).model_copy(update={"max_position_per_ticker": 2000})
-    snap = make_snapshot(positions=[Position("AAPL", Decimal("15"), Decimal("100"), Decimal("100"))])
+    snap = make_snapshot(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                "AAPL",
+                Decimal("15"),
+                Decimal("100"),
+                Decimal("100"),
+            )
+        ],
+    )
     # 2000/100=20 minus existing 15 -> only 5 more shares allowed.
     sized = size_trade(_plan(), snap, cfg, EQUITY)
     assert sized.total_shares == Decimal("5")

@@ -12,7 +12,12 @@ from typing import Optional
 
 from ..config import BacktestConfig
 from ..backtest.engine import run_backtest
-from ..backtest.llm_runner import AnalystStrategy, BudgetExceeded, LLMRunConfig
+from ..backtest.llm_runner import (
+    AnalystStrategy,
+    BudgetExceeded,
+    LLMRunConfig,
+    _require_run_id,
+)
 from ..backtest.metrics import compute_metrics
 from ..strategies.buy_and_hold import BuyAndHold
 from .scorecard import grade
@@ -20,13 +25,21 @@ from .scorecard import grade
 
 def analyst_accuracy(
     source, symbols, analyst, run_config: LLMRunConfig, *,
-    start=None, end=None, spy_symbol: str = "SPY",
+    run_id: str,
+    start=None,
+    end=None,
+    spy_symbol: str = "SPY",
 ) -> dict:
+    run_id = _require_run_id(run_id)
     graded = []  # (confidence, correct, regime, action)
     analyst_ret, bnh_ret = [], []
     calls = 0
     for sym in symbols:
-        strat = AnalystStrategy(analyst, run_config)
+        strat = AnalystStrategy(
+            analyst,
+            run_config,
+            run_id=run_id,
+        )
         try:
             res = run_backtest(strat, source, sym, backtest_config=BacktestConfig(),
                                spy_symbol=spy_symbol, start=start, end=end)

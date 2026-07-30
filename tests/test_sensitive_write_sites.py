@@ -1,0 +1,389 @@
+"""Static enforcement for registered sensitive ORM write sites."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from sqlalchemy import delete, func, insert, select, text
+
+from trading_assistant.db.models import AuditEvent
+from trading_assistant.security.sensitive_fields import (
+    PlaintextSensitiveField,
+    persist_sensitive,
+)
+from trading_assistant.security.sensitive_write_scan import (
+    scan_sensitive_writes,
+)
+
+
+ROOT = Path("src/trading_assistant")
+ALLOWED = {
+    Path("src/trading_assistant/security/sensitive_fields.py"),
+    Path("src/trading_assistant/ops/encrypt_sensitive.py"),
+}
+
+
+def _scan_fixture(tmp_path: Path, source: str) -> list[str]:
+    path = tmp_path / "fixture.py"
+    path.write_text(source, encoding="utf-8")
+    return scan_sensitive_writes([path])
+
+
+@pytest.mark.parametrize(
+    ("source", "marker"),
+    [
+        (
+            """
+from trading_assistant.db.models import AuditEvent as Event
+row = Event(reason="plain")
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+Event = AuditEvent
+row = Event(**{"reason": "plain"})
+""",
+            "AuditEvent.**mapping",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+row = AuditEvent()
+row.reason = "plain"
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+def mutate(row: AuditEvent):
+    row.reason = "plain"
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+row = session.get(AuditEvent, 1)
+setattr(row, "detail_json", "{}")
+""",
+            "AuditEvent.detail_json",
+        ),
+        (
+            """
+from sqlalchemy import insert
+from trading_assistant.db.models import AuditEvent as Event
+statement = insert(Event).values(reason="plain")
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from sqlalchemy import update
+from trading_assistant.db.models import RiskEvent
+statement = update(RiskEvent).values(**payload)
+""",
+            "RiskEvent.**mapping",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+session.bulk_insert_mappings(
+    AuditEvent,
+    [{"actor": "a", **payload}],
+)
+""",
+            "AuditEvent.**mapping",
+        ),
+        (
+            """
+from sqlalchemy import insert
+from trading_assistant.db.models import AuditEvent
+session.execute(insert(AuditEvent), [{"reason": "plain"}])
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from sqlalchemy import text
+session.execute(
+    text("UPDATE audit_events SET reason = :reason WHERE id = :id")
+)
+""",
+            "audit_events.reason",
+        ),
+        (
+            """
+session.execute(
+    "INSERT INTO proposals (order_id, reasoning) VALUES (1, 'plain')"
+)
+""",
+            "proposals.reasoning",
+        ),
+        (
+            """
+from sqlalchemy import text
+session.execute(text(
+    "WITH chosen AS (SELECT 1) "
+    "UPDATE audit_events SET reason = :reason WHERE id = 1"
+))
+""",
+            "audit_events.reason",
+        ),
+        (
+            """
+table = "audit_events"
+session.execute(f"UPDATE {table} SET reason = :reason")
+""",
+            "dynamic_sql.**expression",
+        ),
+        (
+            """
+table = "audit_events"
+sql = "UPDATE " + table + " SET reason = :reason"
+connection.exec_driver_sql(sql)
+""",
+            "dynamic_sql.**expression",
+        ),
+        (
+            """
+connection.exec_driver_sql(
+    "UPDATE audit_events SET detail_json = :value WHERE id = 1"
+)
+""",
+            "audit_events.detail_json",
+        ),
+        (
+            """
+from sqlalchemy import select
+from trading_assistant.db.models import AuditEvent
+row = session.scalar(select(AuditEvent))
+row.reason = "plain"
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent as Event
+Model = Event
+rows = [{"reason": "plain"}]
+session.bulk_insert_mappings(Model, rows)
+""",
+            "AuditEvent.**mapping",
+        ),
+        (
+            """
+from sqlalchemy import delete
+from trading_assistant.db.models import AuditEvent
+session.execute(delete(AuditEvent))
+""",
+            "AuditEvent.**row",
+        ),
+        (
+            """
+from sqlalchemy import select
+from trading_assistant.db.models import AuditEvent
+row = session.scalar(select(AuditEvent))
+session.delete(row)
+""",
+            "AuditEvent.**row",
+        ),
+        (
+            """
+from sqlalchemy import text
+session.execute(text("DELETE FROM audit_events WHERE id = 1"))
+""",
+            "audit_events.**row",
+        ),
+    ],
+)
+def test_static_gate_rejects_sensitive_write_bypasses(
+    tmp_path: Path,
+    source: str,
+    marker: str,
+):
+    offenders = _scan_fixture(tmp_path, source)
+    assert any(marker in offender for offender in offenders), offenders
+
+
+def test_release_static_gate_scans_all_production_write_sites():
+    paths = [
+        path
+        for path in sorted(ROOT.rglob("*.py"))
+        if path not in ALLOWED
+    ]
+    assert scan_sensitive_writes(paths) == []
+
+
+def test_factory_bound_runtime_guard_blocks_direct_plaintext_commit(
+    session_factory,
+):
+    with session_factory() as session:
+        session.add(
+            AuditEvent(
+                actor="test",
+                action="static.backstop",
+                target_type="test",
+                target_id="1",
+                request_id="runtime-backstop",
+                reason="plain",
+                detail_json="{}",
+            )
+        )
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.commit()
+        session.rollback()
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+
+
+def _valid_audit(session_factory) -> int:
+    with session_factory() as session:
+        event = AuditEvent(
+            actor="test",
+            action="sensitive.boundary",
+            target_type="test",
+            target_id="1",
+            request_id="sensitive-boundary",
+        )
+        persist_sensitive(
+            session,
+            event,
+            {"reason": "valid", "detail_json": "{}"},
+            session_factory=session_factory,
+        )
+        session.commit()
+        return event.id
+
+
+def test_runtime_boundary_blocks_core_insert_into_sensitive_table(
+    session_factory,
+):
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                insert(AuditEvent).values(
+                    actor="raw",
+                    action="sensitive.escape",
+                    target_type="test",
+                    target_id="1",
+                    request_id="raw-sensitive-insert",
+                    reason="plain",
+                    detail_json="{}",
+                )
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent)
+        ) == 0
+
+
+def test_runtime_boundary_blocks_cte_update_of_sensitive_column(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                text(
+                    "WITH chosen AS (SELECT :event_id AS id) "
+                    "UPDATE audit_events SET reason = :reason "
+                    "WHERE id IN (SELECT id FROM chosen)"
+                ),
+                {"event_id": event_id, "reason": "plain"},
+            )
+        session.rollback()
+
+
+def test_runtime_boundary_blocks_exec_driver_sql_sensitive_update(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+    engine = session_factory.kw["bind"]
+
+    with pytest.raises(
+        PlaintextSensitiveField,
+        match="^plaintext_sensitive_field$",
+    ):
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE audit_events SET detail_json = ? WHERE id = ?",
+                ("{}", event_id),
+            )
+
+
+def test_runtime_boundary_blocks_core_delete_from_sensitive_table(
+    session_factory,
+):
+    event_id = _valid_audit(session_factory)
+
+    with session_factory() as session:
+        with pytest.raises(
+            PlaintextSensitiveField,
+            match="^plaintext_sensitive_field$",
+        ):
+            session.execute(
+                delete(AuditEvent).where(AuditEvent.id == event_id)
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        assert session.get(AuditEvent, event_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("source", "marker"),
+    [
+        (
+            """
+from sqlalchemy import text
+run = session.execute
+run(statement=text(
+    "UPDATE audit_events SET reason = :reason WHERE id = :id"
+))
+""",
+            "audit_events.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+session.query(AuditEvent).update(values={"reason": "plain"})
+""",
+            "AuditEvent.reason",
+        ),
+        (
+            """
+from trading_assistant.db.models import AuditEvent
+def mutate(item):
+    item.reason = "plain"
+row = session.get(AuditEvent, 1)
+mutate(row)
+""",
+            "AuditEvent.reason",
+        ),
+    ],
+    ids=("execute-statement-keyword", "query-update-values", "helper-parameter"),
+)
+def test_round3_sensitive_write_alias_and_helper_bypasses(
+    tmp_path,
+    source,
+    marker,
+):
+    offenders = _scan_fixture(tmp_path, source)
+    assert any(marker in offender for offender in offenders), offenders

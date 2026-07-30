@@ -11,6 +11,7 @@ Promotes nothing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 
@@ -19,10 +20,76 @@ from .analyst.analyst import Analyst
 from .backtest.data import DataSource, cache_path, load_parquet
 from .backtest.holdout import HoldoutGuard
 from .backtest.llm_runner import LLMRunConfig, estimate_llm_calls
-from .config import Secrets, load_config
-from .llm.factory import build_llm_backend
+from .config import load_config
+from .identity import (
+    canonical_analyst_version,
+    canonical_symbol,
+    canonical_utc_datetime,
+    canonical_utc_timestamp,
+)
+from .llm.factory import build_llm_backend, selected_llm_model
+from .security.secrets import load_role_secrets
 
 COST_CONFIRM_USD = 5.0
+
+
+def _build_analyst(config, secrets, provider_budget) -> Analyst:
+    return Analyst(
+        build_llm_backend(
+            config,
+            secrets,
+            provider_budget=provider_budget,
+            category="backtest",
+            runtime_role="validate-analyst",
+        ),
+        max_tokens=config.llm.max_tokens,
+        suppress_ranging=config.analyst.suppress_ranging,
+        max_attempts=(
+            config.security.provider_budget.max_structured_attempts
+        ),
+    )
+
+
+def _validation_run_id(
+    *,
+    config,
+    symbols,
+    start,
+    end,
+    run_config: LLMRunConfig,
+    analyst_version: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "analyst_version": analyst_version,
+            "cost_per_call_usd": run_config.cost_per_call_usd,
+            "end": (
+                canonical_utc_timestamp(end, field="validation end")
+                if end is not None
+                else None
+            ),
+            "horizon_bars": run_config.horizon_bars,
+            "max_llm_calls": run_config.max_llm_calls,
+            "model": selected_llm_model(config),
+            "provider": config.llm.provider,
+            "spot_check_every": run_config.spot_check_every,
+            "start": (
+                canonical_utc_timestamp(start, field="validation start")
+                if start is not None
+                else None
+            ),
+            "symbols": symbols,
+            "trigger_events": (
+                sorted(event.value for event in run_config.trigger_events)
+                if run_config.trigger_events is not None
+                else None
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"validation:{digest[:53]}"
 
 
 def run(argv=None) -> int:
@@ -34,8 +101,20 @@ def run(argv=None) -> int:
     args = p.parse_args(argv)
 
     config = load_config("config.yaml")
-    secrets = Secrets()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or config.risk.ticker_allowlist
+    secrets = load_role_secrets(
+        "validate-analyst",
+        config=config,
+    )
+    configured_symbols = (
+        [symbol for symbol in args.symbols.split(",") if symbol.strip()]
+        or config.risk.ticker_allowlist
+    )
+    symbols = sorted(
+        {canonical_symbol(symbol) for symbol in configured_symbols}
+    )
+    analyst_version = canonical_analyst_version(
+        config.analyst.version
+    )
 
     try:
         frames = {s: load_parquet(cache_path(".cache/bars", s, "1Day")) for s in symbols + ["SPY"]}
@@ -46,8 +125,26 @@ def run(argv=None) -> int:
     guard = HoldoutGuard(source.timeline(symbols), holdout_months=12)
     dev, hold = guard.split(source.timeline(symbols))
     start, end = (hold[0], hold[-1]) if hold else (None, None)
+    if start is not None:
+        start = canonical_utc_datetime(
+            start,
+            field="validation start",
+        )
+    if end is not None:
+        end = canonical_utc_datetime(
+            end,
+            field="validation end",
+        )
 
     run_cfg = LLMRunConfig(max_llm_calls=args.max_calls, cost_per_call_usd=args.cost_per_call, horizon_bars=5)
+    run_id = _validation_run_id(
+        config=config,
+        symbols=symbols,
+        start=start,
+        end=end,
+        run_config=run_cfg,
+        analyst_version=analyst_version,
+    )
     est = sum(estimate_llm_calls(source, s, run_cfg, start=start, end=end)["estimated_calls"] for s in symbols)
     est_cost = est * args.cost_per_call
     print(f"Pre-run estimate: ~{est} analyst calls, ~${est_cost:.2f} "
@@ -56,13 +153,56 @@ def run(argv=None) -> int:
         print(f"Estimate exceeds ${COST_CONFIRM_USD}. Re-run with --yes to proceed.")
         return 2
 
-    analyst = Analyst(build_llm_backend(config, secrets), max_tokens=config.llm.max_tokens,
-                       suppress_ranging=config.analyst.suppress_ranging)
-    print("Running analyst over the holdout (this makes real LLM calls)...")
-    report = analyst_accuracy(source, symbols, analyst, run_cfg, start=start, end=end)
-    print(json.dumps(report, indent=2))
-    print("\n" + report["verdict"])
-    return 0
+    from . import bootstrap
+
+    runtime = bootstrap.prepare_database_runtime(
+        secrets,
+        runtime_role="validate-analyst",
+    )
+    tenure = bootstrap.acquire_runtime_guard(runtime, "validation")
+    primary_failure = False
+    try:
+        tenure.ensure_owned()
+        provider_budget = bootstrap.build_provider_budget_service(
+            config,
+            runtime.session_factory,
+        )
+        tenure.ensure_owned()
+        analyst = _build_analyst(config, secrets, provider_budget)
+        tenure.ensure_owned()
+        print(
+            "Running analyst over the holdout "
+            "(this makes real LLM calls)..."
+        )
+        report = analyst_accuracy(
+            source,
+            symbols,
+            analyst,
+            run_cfg,
+            run_id=run_id,
+            start=start,
+            end=end,
+        )
+        tenure.ensure_owned()
+        print(json.dumps(report, indent=2))
+        print("\n" + report["verdict"])
+        return 0
+    except BaseException:
+        primary_failure = True
+        raise
+    finally:
+        try:
+            released = tenure.close()
+        except BaseException:
+            if not primary_failure:
+                raise RuntimeError(
+                    "runtime_tenure_cleanup_uncertain"
+                ) from None
+        else:
+            if not released and not primary_failure:
+                raise RuntimeError(
+                    "runtime_tenure_cleanup_uncertain"
+                )
 
 
 if __name__ == "__main__":

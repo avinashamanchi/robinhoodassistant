@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from ..security.secrets import secret_value
 
 class Notifier(Protocol):
     def send(self, message: str) -> bool: ...
@@ -27,7 +28,12 @@ class RecordingNotifier:
         return True
 
 
-def build_notifier(config, secrets) -> Notifier:
+def build_notifier(
+    config,
+    secrets,
+    *,
+    runtime_role: str = "app",
+) -> Notifier:
     """Build the configured notifier. Telegram only if the flag AND creds are set."""
     if not config.features.telegram_notifications:
         return NullNotifier()
@@ -35,6 +41,7 @@ def build_notifier(config, secrets) -> Notifier:
 
     return TelegramNotifier(
         enabled=True,
-        bot_token=secrets.telegram_bot_token,
-        chat_id=secrets.telegram_chat_id,
+        bot_token=secret_value(secrets.telegram_bot_token),
+        chat_id=secret_value(secrets.telegram_chat_id),
+        runtime_role=runtime_role,
     )

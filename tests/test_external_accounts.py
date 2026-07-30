@@ -54,7 +54,15 @@ def test_cross_broker_warning_fires_but_does_not_block(app_config, session_facto
         positions=[ExternalPosition("NVDA", Decimal("30"), Decimal("90"), Decimal("100"), "rh")]
     )  # external NVDA value = 3000 > max_position_per_ticker (2000)
     svc = _svc(app_config, session_factory, ext)
-    res = svc.propose_order("NVDA", "buy", "market", notional="100")
+    res = svc.propose_order(
+        "NVDA",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="external account proposal",
+        request_id="external-account-proposal",
+    )
     assert res["status"] == "proposed"          # NOT blocked
     assert res["approved_by_risk"] is True
     assert any("cross-broker" in w for w in res["risk_warnings"])
@@ -65,7 +73,15 @@ def test_no_warning_when_external_small(app_config, session_factory):
         positions=[ExternalPosition("NVDA", Decimal("5"), Decimal("90"), Decimal("100"), "rh")]
     )  # external value 500; combined well under the 2000 limit
     svc = _svc(app_config, session_factory, ext)
-    res = svc.propose_order("NVDA", "buy", "market", notional="100")
+    res = svc.propose_order(
+        "NVDA",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="external warning proposal",
+        request_id="external-warning-proposal",
+    )
     assert res["risk_warnings"] == []
 
 
@@ -105,7 +121,15 @@ def test_service_still_trades_when_external_down(app_config, session_factory):
     svc = _svc(app_config, session_factory, ext, price_symbol="AAPL")
     assert svc.get_external_positions()["positions"] == []
     # The trading path is unaffected by the external source being down.
-    assert svc.propose_order("AAPL", "buy", "market", notional="100")["status"] == "proposed"
+    assert svc.propose_order(
+        "AAPL",
+        "buy",
+        "market",
+        notional="100",
+        actor="operator:test",
+        reason="external outage proposal",
+        request_id="external-outage-proposal",
+    )["status"] == "proposed"
 
 
 def test_no_external_source_is_available_false(app_config, session_factory):
@@ -114,16 +138,13 @@ def test_no_external_source_is_available_false(app_config, session_factory):
 
 
 # ── secret redaction ────────────────────────────────────────────
-def test_rh_secrets_are_redacted():
+def test_production_external_factory_is_permanently_disabled(
+    app_config,
+):
     from trading_assistant.config import Secrets
-    from trading_assistant.logging import redact, register_all_secrets
-
-    secrets = Secrets(
-        rh_username="me@example.com", rh_password="SUP3RSECRET", rh_totp_secret="TOTPKEY123"
+    from trading_assistant.external_accounts.factory import (
+        build_external_source,
     )
-    register_all_secrets(secrets)
-    line = "login me@example.com pw=SUP3RSECRET totp=TOTPKEY123"
-    out = redact(line)
-    assert "SUP3RSECRET" not in out
-    assert "TOTPKEY123" not in out
-    assert "me@example.com" not in out
+
+    assert not hasattr(app_config, "external_accounts")
+    assert build_external_source(app_config, Secrets()) is None

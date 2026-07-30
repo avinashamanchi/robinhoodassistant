@@ -9,15 +9,25 @@ from sqlalchemy import select
 
 from trading_assistant.backtest.data import DataSource
 from trading_assistant.backtest.engine import BacktestResult
-from trading_assistant.backtest.evaluate import persist_report, walk_forward
+from trading_assistant.backtest.evaluate import (
+    BacktestArtifactContext,
+    persist_report,
+    walk_forward,
+)
 from trading_assistant.backtest.holdout import HoldoutGuard, HoldoutViolation
 from trading_assistant.backtest.metrics import compute_metrics
 from trading_assistant.backtest.report import SIMULATED_LABEL
 from trading_assistant.backtest.sim_broker import SimFill
 from trading_assistant.backtest.synthetic import make_bars
-from trading_assistant.db.models import BacktestMetricRow, BacktestRun, HoldoutAccessLog
+from trading_assistant.config import BacktestConfig
+from trading_assistant.db.models import (
+    BacktestMetricRow,
+    BacktestRun,
+    HoldoutAccessLog,
+)
 from trading_assistant.signals.models import Regime
 from trading_assistant.strategies.breakout import Breakout
+from trading_assistant.strategies.base import hold
 from trading_assistant.strategies.rsi_reversion import RsiReversion
 from trading_assistant.strategies.sma_crossover import SmaCrossover
 
@@ -82,16 +92,54 @@ def test_walk_forward_reports_vs_buy_and_hold(session_factory):
     assert "development" in windows and "holdout" in windows
     # Every row carries its buy-and-hold benchmark side by side.
     assert all(r.benchmark is not None for r in report.rows)
+    # Persistence must receive the actual replay points, never reconstructed
+    # curves derived from aggregate metrics.
+    assert all(r.equity_curve for r in report.rows)
+    assert all(r.benchmark_equity_curve for r in report.rows)
+    assert all(r.window_start <= r.window_end for r in report.rows)
+    assert all(r.total_fees >= 0 for r in report.rows)
+    assert all(r.benchmark_total_fees >= 0 for r in report.rows)
     # The holdout was accessed (once) and that is on record.
     assert any("holdout" in a.context for a in guard.access_log)
     # Rendered table starts with the mandatory disclaimer.
     assert report.render_table().startswith(SIMULATED_LABEL)
 
 
+def test_walk_forward_honors_requested_window_inclusively():
+    source = DataSource({"AAPL": make_bars(10, seed=13)})
+    timeline = source.timeline(["AAPL"])
+    observed = []
+
+    class RecordingStrategy:
+        name = "recording"
+
+        def on_bar(self, features):
+            observed.append(features.as_of)
+            return hold()
+
+    walk_forward(
+        source,
+        ["AAPL"],
+        [RecordingStrategy],
+        holdout_months=12,
+        start=timeline[3],
+        end=timeline[5],
+    )
+
+    assert observed == timeline[3:6]
+
+
 def test_persist_report_writes_rows_and_audit(session_factory):
     source = DataSource({"AAPL": make_bars(550, seed=4)})
     report, guard = walk_forward(source, ["AAPL"], [SmaCrossover], holdout_months=12)
-    run_id = persist_report(session_factory, report, guard)
+    run_id = persist_report(
+        session_factory,
+        report,
+        guard,
+        actor="test:backtest",
+        reason="persist evaluation report",
+        request_id="backtest-evaluation-persist",
+    )
 
     with session_factory() as s:
         assert s.get(BacktestRun, run_id) is not None
@@ -101,3 +149,42 @@ def test_persist_report_writes_rows_and_audit(session_factory):
         assert len(rows) == len(report.rows)
         access = s.execute(select(HoldoutAccessLog)).scalars().all()
         assert len(access) >= 1
+
+
+def test_artifact_validation_rolls_back_nonfinite_run_atomically(
+    session_factory,
+):
+    source = DataSource({"AAPL": make_bars(5, seed=14)})
+    report, guard = walk_forward(
+        source,
+        ["AAPL"],
+        [SmaCrossover],
+        holdout_months=12,
+    )
+    timestamp, _ = report.rows[0].equity_curve[0]
+    report.rows[0].equity_curve[0] = (timestamp, float("nan"))
+    started = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="must be finite"):
+        persist_report(
+            session_factory,
+            report,
+            guard,
+            actor="test:nonfinite",
+            reason="reject nonfinite evidence",
+            request_id="backtest-nonfinite",
+            artifact_context=BacktestArtifactContext(
+                data_source="synthetic",
+                requested_start=None,
+                requested_end=None,
+                started_at=started,
+                completed_at=started,
+                duration_seconds=0.0,
+                backtest_config=BacktestConfig(),
+                symbols=("AAPL",),
+                strategies=("sma_crossover",),
+            ),
+        )
+
+    with session_factory() as session:
+        assert session.query(BacktestRun).count() == 0
