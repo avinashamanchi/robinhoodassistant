@@ -197,6 +197,33 @@ def test_stop_uses_only_cooperative_control_and_never_targets_a_pid():
     assert "kill " not in identity
 
 
+def test_manual_launchers_check_interpreter_before_using_it_and_delegate_recovery():
+    start = Path("scripts/start.sh").read_text(encoding="utf-8")
+    stop = Path("scripts/stop.sh").read_text(encoding="utf-8")
+
+    for script in (start, stop):
+        assert script.index('if [[ ! -x "$PY" ]]') < script.index(
+            "expected-argv"
+        )
+    assert "refusing to replace stale or malformed app control metadata" not in start
+    assert "refusing to replace existing app control socket" not in start
+    assert "trading_assistant.ops.control validate" in start
+    assert start.count(
+        "trading_assistant.ops.control ready"
+    ) == 2
+    assert start.count("--port 8020") == 2
+    assert "trading_assistant.ops.serve" in start
+    assert "trading_assistant.ops.control begin-start" in start
+    assert start.index("begin-start") < start.index(
+        "trading_assistant.ops.serve"
+    )
+    assert "trading_assistant.ops.control app-absent" in stop
+    assert "$LSOF" not in stop
+    assert "--cacert \"$TLS_CA\"" in start
+    assert "https://localhost:8020/health/live" in start
+    assert "startup, control artifact, listener" in stop
+
+
 class _StubAgent:
     def chat(self, message, **context):
         return {"reply": "ok", "tool_calls": []}

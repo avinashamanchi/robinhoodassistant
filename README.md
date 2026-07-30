@@ -143,6 +143,15 @@ uv run python -m trading_assistant.ops.safety_drill \
 ./scripts/launchd/install.sh
 ```
 
+The manual launcher reports success only after the exact controlled process
+owns the configured TCP listener and the loopback TLS endpoint returns the
+canonical liveness payload. Before spawning, it publishes a private,
+instance-bound startup intent under the same lock used by control publication.
+The app consumes that exact intent only when its cooperative channel is ready.
+The stop script reports `unknown` rather than claiming absence unless one
+atomic check proves there is no pending start, control artifact, or HTTPS
+listener and the system process inspection completed without diagnostics.
+
 Order lifecycle is hardened: partial fills advance PARTIALLY_FILLED → FILLED,
 duplicate broker fill events are idempotent (`broker_fill_id`), `POST
 /orders/{id}/cancel` cancels live orders, `POST /reconcile` compares broker

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import errno
+from threading import Event, Thread
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -363,6 +364,82 @@ def test_renewal_uncertainty_immediately_latches_and_requests_shutdown():
         guard.ensure_owned()
     assert guard.renew_once() is False
     assert shutdowns == ["requested"]
+
+
+def test_exclusive_transaction_renewal_blocks_background_renewal():
+    class RecordingHandle:
+        role = "maintenance"
+
+        def __init__(self):
+            self.renew_calls = 0
+            self.transaction_calls = 0
+
+        def renew(self, *, ttl_seconds):
+            self.renew_calls += 1
+
+        def renew_in_transaction(self, connection, *, ttl_seconds):
+            self.transaction_calls += 1
+
+        def release(self):
+            return True
+
+    handle = RecordingHandle()
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+    attempted = Event()
+    finished = Event()
+
+    def background_renew():
+        attempted.set()
+        guard.renew_once()
+        finished.set()
+
+    with guard.exclusive_transaction_renewal():
+        worker = Thread(target=background_renew)
+        worker.start()
+        assert attempted.wait(timeout=1)
+        assert finished.wait(timeout=0.05) is False
+        guard.renew_in_transaction(object())
+        assert handle.transaction_calls == 1
+        assert handle.renew_calls == 0
+
+    assert finished.wait(timeout=1)
+    worker.join(timeout=1)
+    assert handle.renew_calls == 1
+
+
+def test_real_maintenance_tenure_renews_inside_existing_write_transaction(
+    tenure_service,
+):
+    service, clock, _inspector = tenure_service
+    handle = service.acquire_maintenance(
+        MAINTENANCE,
+        ttl_seconds=30,
+    )
+    guard = RuntimeTenureGuard(
+        handle,
+        ttl_seconds=30,
+        renewal_interval_seconds=5,
+    )
+
+    with guard.exclusive_transaction_renewal():
+        with service._session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            clock.advance(20)
+            guard.renew_in_transaction(session.connection())
+            session.commit()
+
+    with service._session_factory() as session:
+        row = session.get(
+            RuntimeTenure,
+            "sensitive-migration:global",
+        )
+        assert row is not None
+        assert row.expires_at == clock.value + timedelta(seconds=30)
+    assert guard.close() is True
 
 
 def test_late_shutdown_owner_is_notified_if_started_guard_already_lost():

@@ -366,6 +366,86 @@ high-consequence actions require recent reauthentication (five minutes by
 default). The UI prompts again and never stores the operator secret, session, or
 CSRF token in `localStorage`. Logout revokes the server-side session.
 
+### Exceptional flat paper-history adoption
+
+Use this recovery path only when a newly bootstrapped local database is empty
+but the configured Alpaca paper account has closed historical fills that make
+startup reconciliation fail. It is not a general migration, merge, or live
+account import.
+
+1. Prove the Alpaca paper account has no position and no open order.
+2. Stop the app, daemon, MCP, watchdog, and backup writers and prove neither the
+   target nor legacy database has an open file handle.
+3. Create and verify an encrypted backup of the target database.
+4. Run the one-time importer with an absolute legacy database path:
+
+   ```bash
+   uv run python -m trading_assistant.ops.paper_history \
+     --legacy-database /absolute/path/to/legacy-paper.sqlite3
+   ```
+
+The source and existing sidecars must be regular files owned by the current
+operator with mode `0600`. Their parent must also be operator-owned and must not
+be group- or world-writable. The command uses `lsof` before reading and again
+before commit; any open handle or unavailable/ambiguous process evidence is a
+refusal. The checked pathname is URI-encoded before SQLite opens it, and the
+opened `main` database must resolve to the same file identity.
+
+The target must contain no prior application, execution, reconciliation,
+account-risk, rule-group, or lifecycle state. Infrastructure rows created by
+database preparation are allowed. The exact durable `broker_drift` breaker must
+already be tripped; its generation is captured before broker reads and
+revalidated under the target's immediate write transaction. A missing, reset,
+or changed generation refuses the import.
+
+The importer reads no legacy narrative or credential fields. It requires two
+stable reads of the complete Alpaca fill stream, two flat-account checks, and
+exact equality of fill IDs, broker-order IDs, client idempotency keys, symbols,
+sides, quantities, prices, terminal order status, cumulative quantities,
+original broker-requested quantity/notional, order side/type/limit identity,
+and bounded submission/fill timestamps.
+Broker-rounded weighted average fill prices must agree within half of the
+ledger's nine-decimal quantum. Fully filled plus partially filled
+`canceled`/`expired` terminal orders are supported. Order quantities and limit
+prices that cannot round-trip through the current `NUMERIC(20,6)` precision
+and scale are refused before import; fill economics retain nine decimals.
+
+Imported orders are explicitly marked `history_import`, with zero local
+submission attempts, no claimed historical approval actor/time, and a payload
+stating that original approval provenance is unavailable. The historical
+submission boundary is retained only for fill chronology. The current operator
+is recorded as authorizing the import in the encrypted audit event, never as
+the original trade approver.
+
+The importer hashes the durable database and WAL bytes before and after the
+broker reads and once more inside the target transaction; SQLite `-shm` read
+marks may change, so its identity, mode, presence, and size are checked instead
+of its bytes. While that atomic target transaction is open, separate-connection
+tenure renewal is paused and the exact maintenance tenure is renewed through
+the existing writer transaction. A lost or expired tenure rolls the import
+back.
+
+The importer performs no broker mutation and never clears a breaker. Its
+receipt and encrypted audit event contain the breaker generation plus source,
+history, broker-proof, and import digests. Preserve that receipt. Exit status
+`0` with status `imported` means commit and maintenance-tenure release both
+completed. Status `imported_commit_reconciled` means the commit call lost its
+response but the exact encrypted audit event, breaker generation, and persisted
+order/fill facts proved the commit. Exit status `2` with
+`commit_outcome_unknown` means commit was attempted but could not be proved
+either way; do not retry. Exit status `2` with a status beginning `committed_`
+means the history did commit but cleanup or tenure release is uncertain. In
+either exit-2 case, resolve the retained maintenance state from the receipt and
+audit evidence before any retry or runtime startup.
+
+After a successful commit, verify encrypted fields, start the app and daemon,
+require a current startup-reconciliation generation plus a durable fill cursor,
+and only then reset the exact `broker_drift` generation through the
+reauthenticated operator UI. Rerun preflight after the reset and require
+`READY`. Before commit, any non-flat account, incomplete history, changed
+source, mismatched broker fact, non-fresh target, or uncertain writer
+quiescence is a hard refusal.
+
 ## Durable request and provider budgets
 
 Request-limit windows and concurrency state are durable: process restart does

@@ -20,6 +20,7 @@ from trading_assistant.broker.base import (
     BrokerSubmissionRejected,
 )
 from trading_assistant.broker.models import (
+    BrokerOrderType,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -105,6 +106,12 @@ class FakeOrder:
         *,
         symbol=None,
         asset_class=None,
+        side=None,
+        order_type=None,
+        qty=None,
+        notional=None,
+        limit_price=None,
+        submitted_at=None,
     ):
         self.id = id
         self.client_order_id = client_order_id
@@ -117,6 +124,20 @@ class FakeOrder:
             if isinstance(asset_class, str)
             else asset_class
         )
+        self.side = (
+            SimpleNamespace(value=side)
+            if isinstance(side, str)
+            else side
+        )
+        self.type = (
+            SimpleNamespace(value=order_type)
+            if isinstance(order_type, str)
+            else order_type
+        )
+        self.qty = qty
+        self.notional = notional
+        self.limit_price = limit_price
+        self.submitted_at = submitted_at
 
 
 class FakeTrading:
@@ -817,6 +838,79 @@ def test_order_mapping_does_not_stringify_missing_broker_identity():
 
     assert mapped is not None
     assert mapped.broker_order_id is None
+
+
+def test_order_mapping_preserves_execution_identity_fields():
+    submitted_at = datetime(2026, 7, 20, 13, 31, 16, tzinfo=timezone.utc)
+    prior = FakeOrder(
+        "brk-identity",
+        "k1",
+        "filled",
+        filled_qty="1",
+        avg="100",
+        symbol="AAPL",
+        asset_class="us_equity",
+        side="buy",
+        order_type="limit",
+        qty="2",
+        limit_price="101",
+        submitted_at=submitted_at,
+    )
+    broker = AlpacaBroker(FakeTrading(existing=prior), FakeData({}))
+
+    mapped = broker.get_order_by_client_id("k1")
+
+    assert mapped is not None
+    assert mapped.side is OrderSide.BUY
+    assert mapped.order_type is BrokerOrderType.LIMIT
+    assert mapped.requested_qty == Decimal("2")
+    assert mapped.requested_notional is None
+    assert mapped.limit_price == Decimal("101")
+    assert mapped.submitted_at == submitted_at
+
+
+def test_order_mapping_preserves_requested_notional():
+    prior = FakeOrder(
+        "brk-notional",
+        "notional-order",
+        "filled",
+        filled_qty="0.5",
+        avg="200",
+        symbol="AAPL",
+        asset_class="us_equity",
+        side="buy",
+        order_type="market",
+        notional="100",
+        submitted_at=datetime.now(timezone.utc),
+    )
+
+    mapped = AlpacaBroker(
+        FakeTrading(existing=prior),
+        FakeData({}),
+    ).get_order_by_client_id("notional-order")
+
+    assert mapped is not None
+    assert mapped.requested_qty is None
+    assert mapped.requested_notional == Decimal("100")
+
+
+def test_order_mapping_preserves_protective_broker_order_types():
+    prior = FakeOrder(
+        "brk-stop",
+        "protective-stop",
+        "new",
+        symbol="AAPL",
+        asset_class="us_equity",
+        side="sell",
+        order_type="stop",
+        submitted_at=datetime.now(timezone.utc),
+    )
+    broker = AlpacaBroker(FakeTrading(existing=prior), FakeData({}))
+
+    mapped = broker.get_order_by_client_id("protective-stop")
+
+    assert mapped is not None
+    assert mapped.order_type is BrokerOrderType.STOP
 
 
 def test_submit_market_order_builds_request_and_maps_result():

@@ -132,6 +132,10 @@ class SimBroker(BrokerClient):
             idempotency_key=order.idempotency_key,
             broker_order_id=f"sim-{next(self._ids)}",
             status=OrderStatus.SUBMITTED,
+            ticker=order.ticker,
+            side=order.side,
+            requested_qty=order.qty,
+            requested_notional=order.notional,
         )
         self._orders[result.broker_order_id] = result
         self._orders_by_key[order.idempotency_key] = result
