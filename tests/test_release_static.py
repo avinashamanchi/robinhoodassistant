@@ -3834,6 +3834,61 @@ def test_static_gate_rejects_terminal_control_flow_and_dataflow_bypasses(
     assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda source: source.replace(
+            "        if not isinstance(body, bytes):\n",
+            "        if (body := getattr(stream, \"read\")()) and not isinstance(\n"
+            "            body, bytes\n"
+            "        ):\n",
+            1,
+        ),
+        lambda source: source + "\n_NoRedirect = HTTPRedirectHandler\n",
+        lambda source: source.replace(
+            "        self._opener = opener or build_opener(\n",
+            "        setattr(context, \"check_hostname\", False)\n"
+            "        setattr(context, \"verify_mode\", 0)\n"
+            "        self._opener = opener or build_opener(\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "        if (\n            getattr(context,",
+            "        context_alias = context\n"
+            "        if (\n            getattr(context,",
+            1,
+        ).replace(
+            "        self._opener = opener or build_opener(\n",
+            "        setattr(context_alias, \"check_hostname\", False)\n"
+            "        setattr(context_alias, \"verify_mode\", 0)\n"
+            "        self._opener = opener or build_opener(\n",
+            1,
+        ),
+    ],
+    ids=(
+        "indirect-unbounded-read-after-bounded-decoy",
+        "active-no-redirect-module-rebinding",
+        "context-mutation-between-guard-and-opener",
+        "pre-guard-context-alias-post-guard-mutation",
+    ),
+)
+def test_static_gate_rejects_terminal_active_binding_and_mutation_bypasses(
+    tmp_path,
+    mutation,
+):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    mutated = mutation(source)
+    assert mutated != source
+    root = _operator_api_static_fixture(tmp_path, mutated)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
 def test_computed_credential_query_key_is_rejected(tmp_path):
     root = _trust_fixture(tmp_path)
     _write_fixture_file(

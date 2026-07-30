@@ -3130,7 +3130,31 @@ def _operator_api_approved_calls(
     }
     client = classes.get("OperatorApiClient")
     no_redirect = classes.get("_NoRedirect")
-    if client is None or no_redirect is None:
+    if (
+        client is None
+        or no_redirect is None
+        or sum(
+            isinstance(node, ast.ClassDef) and node.name == "_NoRedirect"
+            for node in tree.body
+        )
+        != 1
+        or any(
+            statement is not no_redirect
+            and any(
+                (
+                    isinstance(node, ast.Name)
+                    and node.id == "_NoRedirect"
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                )
+                or (
+                    isinstance(node, ast.alias)
+                    and (node.name == "_NoRedirect" or node.asname == "_NoRedirect")
+                )
+                for node in ast.walk(statement)
+            )
+            for statement in tree.body
+        )
+    ):
         return set()
 
     methods = {
@@ -3311,6 +3335,12 @@ def _operator_api_approved_calls(
             break
     if opener_call is None or opener_index <= guard_index:
         return set()
+    if any(
+        _is_name(node, "context")
+        for statement in initializer.body[guard_index + 1 : opener_index]
+        for node in ast.walk(statement)
+    ):
+        return set()
 
     reads = [
         node
@@ -3328,6 +3358,7 @@ def _operator_api_approved_calls(
         and _is_name(reader.body[0].body[0].targets[0], "body")
         and len(reads) == 1
         and reads[0] is reader.body[0].body[0].value
+        and sum(_is_name(node, "stream") for node in ast.walk(reader)) == 1
         and isinstance(reader.body[-1], ast.Return)
         and _is_name(reader.body[-1].value, "payload")
         and isinstance(reads[0].func, ast.Attribute)
