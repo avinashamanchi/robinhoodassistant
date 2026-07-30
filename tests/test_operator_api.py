@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 import ssl
+from http.client import BadStatusLine
+from http.cookiejar import Cookie
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -50,6 +52,39 @@ class _RecordingOpener:
         if self.failure is not None:
             raise self.failure
         return self.response
+
+
+class _CookieApplyingOpener(_RecordingOpener):
+    def __init__(self, seen):
+        super().__init__(seen, response={"ok": True})
+        self.cookies = None
+
+    def open(self, request, *, timeout):
+        assert self.cookies is not None
+        self.cookies.add_cookie_header(request)
+        return super().open(request, timeout=timeout)
+
+
+def _session_cookie(value="session-cookie"):
+    return Cookie(
+        version=0,
+        name="session",
+        value=value,
+        port=None,
+        port_specified=False,
+        domain="localhost.local",
+        domain_specified=False,
+        domain_initial_dot=False,
+        path="/",
+        path_specified=True,
+        secure=True,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+        rfc2109=False,
+    )
 
 
 def _config_loader(path):
@@ -220,6 +255,45 @@ def test_login_keeps_cookie_and_csrf_in_memory_and_mutation_is_single_shot(tmp_p
     assert cookie not in repr(session)
 
 
+def test_unauthenticated_requests_suppress_existing_session_cookie(tmp_path):
+    from trading_assistant.ops.operator_api import OperatorApiClient
+
+    seen = []
+    opener = _CookieApplyingOpener(seen)
+    client = OperatorApiClient(
+        _project(tmp_path), opener=opener, config_loader=_config_loader
+    )
+    opener.cookies = client._cookies
+    client._cookies.set_cookie(_session_cookie())
+
+    client.get("/health/live", authenticated=False)
+    client.get("/rules", authenticated=True)
+
+    assert seen[0].get_header("Cookie") == ""
+    assert seen[1].unredirected_hdrs["Cookie"] == "session=session-cookie"
+
+
+def test_malformed_login_clears_cookie_and_csrf_before_mutation(tmp_path):
+    from trading_assistant.ops.operator_api import OperatorApiClient, OperatorApiError
+
+    opener = _RecordingOpener([], response={"csrf_token": "new-csrf"})
+    client = OperatorApiClient(
+        _project(tmp_path), opener=opener, config_loader=_config_loader
+    )
+    client._csrf_token = "old-csrf"
+    client._cookies.set_cookie(_session_cookie())
+
+    with pytest.raises(OperatorApiError) as caught:
+        client.login("secret")
+
+    assert caught.value.code == "operator_response_invalid"
+    assert client._csrf_token is None
+    assert list(client._cookies) == []
+    with pytest.raises(OperatorApiError) as mutation:
+        client.mutate("/rules", {}, idempotent=False)
+    assert mutation.value.code == "operator_csrf_missing"
+
+
 def test_mutation_transport_failure_is_not_retried(tmp_path):
     from trading_assistant.ops.operator_api import OperatorApiClient, OperatorApiError
 
@@ -361,6 +435,23 @@ def test_client_bounds_response_and_redacts_transport_failures(
         client.get("/health/live", authenticated=False)
     assert caught.value.code == code
     assert secret not in caplog.text
+    assert secret not in repr(caught.value)
+
+
+def test_protocol_failures_are_redacted_to_stable_operator_error(tmp_path):
+    from trading_assistant.ops.operator_api import OperatorApiClient, OperatorApiError
+
+    secret = "provider-status-secret"
+    opener = _RecordingOpener([], failure=BadStatusLine(secret))
+    client = OperatorApiClient(
+        _project(tmp_path), opener=opener, config_loader=_config_loader
+    )
+
+    with pytest.raises(OperatorApiError) as caught:
+        client.get("/health/live", authenticated=False)
+
+    assert caught.value.code == "operator_request_failed"
+    assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
 
 

@@ -3763,6 +3763,77 @@ def test_static_gate_rejects_terminal_urllib_shape_regressions(
     assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda source: source.replace(
+            "        try:\n"
+            "            body = stream.read(self._max_response_bytes + 1)\n",
+            "        if False:\n"
+            "            stream.read(self._max_response_bytes + 1)\n"
+            "        try:\n"
+            "            body = stream.read()\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "        if (\n            getattr(context,",
+            "        if False and (\n            getattr(context,",
+            1,
+        ),
+        lambda source: source.replace("is not True", "is True", 1),
+        lambda source: source.replace(
+            "        del args, kwargs\n        return None",
+            "        del args, kwargs\n"
+            "        if args:\n"
+            "            return request\n"
+            "        return None",
+            1,
+        ),
+        lambda source: source.replace(
+            "        self._cookies = CookieJar()",
+            "        context = other_context\n"
+            "        self._cookies = CookieJar()",
+            1,
+        ),
+        lambda source: source.replace(
+            "HTTPSHandler(context=context)",
+            "HTTPSHandler(context=other_context)",
+            1,
+        ),
+        lambda source: source.replace(
+            "        self._opener = opener or build_opener(",
+            "        proxy_handler = ProxyHandler({})\n"
+            "        self._opener = opener or build_opener(",
+            1,
+        ).replace("ProxyHandler({}),", "proxy_handler,", 1),
+    ],
+    ids=(
+        "dead-bounded-read-live-unbounded-read",
+        "dead-tls-guard",
+        "inverted-tls-guard",
+        "alternate-redirect-return",
+        "context-rebinding",
+        "handler-context-disconnect",
+        "proxy-alias",
+    ),
+)
+def test_static_gate_rejects_terminal_control_flow_and_dataflow_bypasses(
+    tmp_path,
+    mutation,
+):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    mutated = mutation(source)
+    assert mutated != source
+    root = _operator_api_static_fixture(tmp_path, mutated)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
 def test_computed_credential_query_key_is_rejected(tmp_path):
     root = _trust_fixture(tmp_path)
     _write_fixture_file(

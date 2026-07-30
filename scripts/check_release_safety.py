@@ -3152,54 +3152,115 @@ def _operator_api_approved_calls(
     redirect = redirect_methods.get("redirect_request")
     if (
         redirect is None
-        or not redirect.body
-        or not isinstance(redirect.body[-1], ast.Return)
-        or not isinstance(redirect.body[-1].value, ast.Constant)
-        or redirect.body[-1].value.value is not None
+        or len(redirect.body) != 2
+        or not isinstance(redirect.body[0], ast.Delete)
+        or {
+            target.id
+            for target in redirect.body[0].targets
+            if isinstance(target, ast.Name)
+        }
+        != {"args", "kwargs"}
+        or not isinstance(redirect.body[1], ast.Return)
+        or not isinstance(redirect.body[1].value, ast.Constant)
+        or redirect.body[1].value.value is not None
     ):
         return set()
 
-    context_call = next(
-        (
-            node
+    def direct_assignment(name: str) -> tuple[int, ast.AST] | None:
+        matches: list[tuple[int, ast.AST]] = []
+        for index, statement in enumerate(initializer.body):
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                if _is_name(statement.targets[0], name):
+                    matches.append((index, statement.value))
+            elif isinstance(statement, ast.AnnAssign) and _is_name(statement.target, name):
+                matches.append((index, statement.value))
+        return matches[0] if len(matches) == 1 else None
+
+    def stores_to(name: str) -> int:
+        return sum(
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id == name
             for node in ast.walk(initializer)
-            if isinstance(node, ast.Call)
-            and _attribute_path(node.func) == ("ssl_context_factory",)
-            and not node.args
-            and len(node.keywords) == 1
-            and node.keywords[0].arg == "cafile"
-            and isinstance(node.keywords[0].value, ast.Call)
-            and _attribute_path(node.keywords[0].value.func) == ("str",)
-            and len(node.keywords[0].value.args) == 1
-            and _is_name(node.keywords[0].value.args[0], "ca_path")
-        ),
-        None,
-    )
-    tls_guarded = any(
-        isinstance(node, ast.If)
-        and any(
-            isinstance(candidate, ast.Call)
-            and _attribute_path(candidate.func) == ("getattr",)
-            and len(candidate.args) >= 2
-            and _is_name(candidate.args[0], "context")
-            and isinstance(candidate.args[1], ast.Constant)
-            and candidate.args[1].value == "check_hostname"
-            for candidate in ast.walk(node.test)
         )
-        and any(
-            _attribute_path(candidate) == ("ssl", "CERT_REQUIRED")
-            for candidate in ast.walk(node.test)
+
+    ca_assignment = direct_assignment("ca_path")
+    context_assignment = direct_assignment("context")
+    if (
+        ca_assignment is None
+        or context_assignment is None
+        or stores_to("ca_path") != 1
+        or stores_to("context") != 1
+        or ca_assignment[0] + 1 != context_assignment[0]
+        or not isinstance(ca_assignment[1], ast.Call)
+        or _attribute_path(ca_assignment[1].func) != ("self", "_validated_ca_path")
+        or len(ca_assignment[1].args) != 1
+        or not _is_name(ca_assignment[1].args[0], "config")
+        or ca_assignment[1].keywords
+        or not isinstance(context_assignment[1], ast.Call)
+        or _attribute_path(context_assignment[1].func) != ("ssl_context_factory",)
+        or context_assignment[1].args
+        or len(context_assignment[1].keywords) != 1
+        or context_assignment[1].keywords[0].arg != "cafile"
+        or not isinstance(context_assignment[1].keywords[0].value, ast.Call)
+        or _attribute_path(context_assignment[1].keywords[0].value.func) != ("str",)
+        or len(context_assignment[1].keywords[0].value.args) != 1
+        or not _is_name(context_assignment[1].keywords[0].value.args[0], "ca_path")
+    ):
+        return set()
+
+    def expected_getattr(node: ast.AST, field: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _attribute_path(node.func) == ("getattr",)
+            and len(node.args) == 3
+            and not node.keywords
+            and _is_name(node.args[0], "context")
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == field
+            and isinstance(node.args[2], ast.Constant)
+            and node.args[2].value is None
         )
-        and any(
-            isinstance(candidate, ast.Raise) for candidate in ast.walk(node)
-        )
-        for node in ast.walk(initializer)
-    )
-    if context_call is None or not tls_guarded:
+
+    guard_index = context_assignment[0] + 1
+    if guard_index >= len(initializer.body):
+        return set()
+    guard = initializer.body[guard_index]
+    if not (
+        isinstance(guard, ast.If)
+        and isinstance(guard.test, ast.BoolOp)
+        and isinstance(guard.test.op, ast.Or)
+        and len(guard.test.values) == 2
+        and not guard.orelse
+        and len(guard.body) == 1
+        and isinstance(guard.body[0], ast.Raise)
+        and isinstance(guard.body[0].exc, ast.Call)
+        and _attribute_path(guard.body[0].exc.func) == ("ValueError",)
+        and len(guard.body[0].exc.args) == 1
+        and isinstance(guard.body[0].exc.args[0], ast.Constant)
+        and guard.body[0].exc.args[0].value == "operator_tls_invalid"
+    ):
+        return set()
+    hostname_guard, verify_guard = guard.test.values
+    if not (
+        isinstance(hostname_guard, ast.Compare)
+        and len(hostname_guard.ops) == 1
+        and isinstance(hostname_guard.ops[0], ast.IsNot)
+        and expected_getattr(hostname_guard.left, "check_hostname")
+        and len(hostname_guard.comparators) == 1
+        and isinstance(hostname_guard.comparators[0], ast.Constant)
+        and hostname_guard.comparators[0].value is True
+        and isinstance(verify_guard, ast.Compare)
+        and len(verify_guard.ops) == 1
+        and isinstance(verify_guard.ops[0], ast.NotEq)
+        and expected_getattr(verify_guard.left, "verify_mode")
+        and len(verify_guard.comparators) == 1
+        and _attribute_path(verify_guard.comparators[0]) == ("ssl", "CERT_REQUIRED")
+    ):
         return set()
 
     opener_call = None
-    for statement in initializer.body:
+    for opener_index, statement in enumerate(initializer.body):
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
         targets = (
@@ -3248,22 +3309,36 @@ def _operator_api_approved_calls(
         if approved:
             opener_call = candidate
             break
-    if opener_call is None:
+    if opener_call is None or opener_index <= guard_index:
         return set()
 
-    bounded_read = any(
-        isinstance(node, ast.Call)
+    reads = [
+        node
+        for node in ast.walk(reader)
+        if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "read"
-        and _is_name(node.func.value, "stream")
-        and len(node.args) == 1
-        and not node.keywords
-        and isinstance(node.args[0], ast.BinOp)
-        and isinstance(node.args[0].op, ast.Add)
-        and _is_self_attribute(node.args[0].left, "_max_response_bytes")
-        and isinstance(node.args[0].right, ast.Constant)
-        and node.args[0].right.value == 1
-        for node in ast.walk(reader)
+    ]
+    bounded_read = (
+        len(reader.body) == 6
+        and isinstance(reader.body[0], ast.Try)
+        and len(reader.body[0].body) == 1
+        and isinstance(reader.body[0].body[0], ast.Assign)
+        and len(reader.body[0].body[0].targets) == 1
+        and _is_name(reader.body[0].body[0].targets[0], "body")
+        and len(reads) == 1
+        and reads[0] is reader.body[0].body[0].value
+        and isinstance(reader.body[-1], ast.Return)
+        and _is_name(reader.body[-1].value, "payload")
+        and isinstance(reads[0].func, ast.Attribute)
+        and _is_name(reads[0].func.value, "stream")
+        and len(reads[0].args) == 1
+        and not reads[0].keywords
+        and isinstance(reads[0].args[0], ast.BinOp)
+        and isinstance(reads[0].args[0].op, ast.Add)
+        and _is_self_attribute(reads[0].args[0].left, "_max_response_bytes")
+        and isinstance(reads[0].args[0].right, ast.Constant)
+        and reads[0].args[0].right.value == 1
     )
     request_call = None
     for node in ast.walk(requester):

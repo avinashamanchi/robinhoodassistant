@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.client import HTTPException
 import json
 import math
 from pathlib import Path
@@ -248,10 +249,15 @@ class OperatorApiClient:
         headers: dict[str, str] | None = None,
         authenticated: bool = True,
     ) -> dict[str, object]:
-        del authenticated  # Cookies remain managed solely by the in-memory jar.
         canonical_path = self._path(path)
         body: bytes | None = None
         request_headers = {"Accept": "application/json"}
+        if not authenticated:
+            # CookieJar honors an explicitly supplied Cookie header, so this
+            # prevents a prior authenticated session from crossing this
+            # request boundary while retaining its ability to store login
+            # response cookies.
+            request_headers["Cookie"] = ""
         if headers:
             request_headers.update(headers)
         if payload is not None:
@@ -280,7 +286,7 @@ class OperatorApiClient:
                 code="operator_tls_failed",
                 message=_GENERIC_REQUEST_MESSAGE,
             )
-        except (URLError, TimeoutError, OSError):
+        except (HTTPException, URLError, TimeoutError, OSError):
             failure = OperatorApiError(
                 status=None,
                 code="operator_request_failed",
@@ -335,14 +341,22 @@ class OperatorApiClient:
         )
 
     def login(self, secret: str) -> OperatorSession:
-        payload = self._request(
-            "POST", "/auth/login", {"secret": secret}, authenticated=False
-        )
-        self._csrf_token = _require_text(payload, "csrf_token")
+        try:
+            payload = self._request(
+                "POST", "/auth/login", {"secret": secret}, authenticated=False
+            )
+            csrf_token = _require_text(payload, "csrf_token")
+            actor = _require_text(payload, "actor")
+            expires_at = _optional_text(payload, "expires_at")
+        except OperatorApiError as error:
+            if error.status is not None and 200 <= error.status < 300:
+                self._clear_auth_state()
+            raise
+        self._csrf_token = csrf_token
         return OperatorSession(
-            actor=_require_text(payload, "actor"),
-            csrf_token=self._csrf_token,
-            expires_at=_optional_text(payload, "expires_at"),
+            actor=actor,
+            csrf_token=csrf_token,
+            expires_at=expires_at,
         )
 
     def reauthenticate(self, secret: str) -> OperatorSession:
