@@ -41,6 +41,7 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.assets import AssetClass
+from trading_assistant.ops.operator_terminal import OperatorMenu
 from trading_assistant.risk.breakers import BreakerScope
 from trading_assistant.risk.clock import FakeClock, MarketClockObservation
 from trading_assistant.security.crypto import (
@@ -379,6 +380,8 @@ def test_approval_confirmation_is_read_only_exact_server_truth(
     make_service,
     authenticate_client,
 ):
+    captured_at = datetime.now(timezone.utc)
+    quote_observed_at = captured_at - timedelta(seconds=5)
     broker = MockBroker(
         prices={"AAPL": Decimal("100")},
         positions=[
@@ -389,8 +392,10 @@ def test_approval_confirmation_is_read_only_exact_server_truth(
                 current_price=Decimal("100"),
             )
         ],
+        now=lambda: quote_observed_at,
     )
     service = make_service(broker=broker)
+    service.snapshot_service.now = lambda: captured_at
     service.config = service.config.model_copy(
         update={
             "trading": service.config.trading.model_copy(
@@ -435,6 +440,7 @@ def test_approval_confirmation_is_read_only_exact_server_truth(
     assert response.status_code == 200
     proof = response.json()
     assert proof["complete"] is True
+    assert proof["missing_proof"] == []
     assert proof["broker"] == "Alpaca"
     assert proof["mode"] == "paper"
     assert proof["order"] == {
@@ -447,6 +453,14 @@ def test_approval_confirmation_is_read_only_exact_server_truth(
         "limit_price": "101.000000",
     }
     assert proof["expires_at"]
+    assert proof["breaker_state"] == {
+        "tripped": False,
+        "active_scopes": [],
+    }
+    assert proof["reconciliation"] == {
+        "broker_reconciled": True,
+        "pending_exposure_complete": True,
+    }
     assert proof["exposure"]["currency"] == "USD"
     assert proof["exposure"]["current_position_quantity"] == "2"
     assert Decimal(
@@ -455,7 +469,20 @@ def test_approval_confirmation_is_read_only_exact_server_truth(
     assert Decimal(
         proof["exposure"]["resulting_signed_notional"]
     ) == Decimal("503")
-    assert proof["exposure"]["as_of"]
+    assert Decimal(
+        proof["exposure"]["order_estimated_notional"]
+    ) == Decimal("303")
+    assert (
+        proof["exposure"]["quote_observed_at"]
+        == quote_observed_at.isoformat()
+    )
+    assert proof["exposure"]["quote_observed_at"] != captured_at.isoformat()
+    assert "as_of" not in proof["exposure"]
+    confirmation = OperatorMenu._validate_confirmation(
+        proof,
+        expected_order_id=order_id,
+    )
+    assert confirmation.order_id == order_id
     assert broker._orders_by_key == submit_calls_before
     with service.session_factory() as session:
         account_state_after = [
@@ -520,9 +547,176 @@ def test_approval_confirmation_fails_closed_when_proof_is_incomplete(
     response = client.get(f"/pending/{order_id}/confirmation")
 
     assert response.status_code == 200
-    assert response.json()["complete"] is False
-    assert incomplete_field in response.json()["missing_proof"]
+    proof = response.json()
+    assert proof["complete"] is False
+    assert incomplete_field in proof["missing_proof"]
+    assert proof["reconciliation"][incomplete_field] is False
+    other_field = (
+        "broker_reconciled"
+        if incomplete_field == "pending_exposure_complete"
+        else "pending_exposure_complete"
+    )
+    assert proof["reconciliation"][other_field] is True
     assert service.broker.submit_calls == 0
+
+
+def test_approval_confirmation_fails_closed_for_active_breakers(
+    make_service,
+    authenticate_client,
+    monkeypatch,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service)
+    complete = service.snapshot_service.assemble_for_confirmation(
+        "AAPL",
+        exclude_order_id=order_id,
+    )
+    monkeypatch.setattr(
+        service.snapshot_service,
+        "assemble_for_confirmation",
+        lambda *_args, **_kwargs: replace(
+            complete,
+            active_breakers=frozenset(
+                {"loss:equity", "liquidity:AAPL"}
+            ),
+        ),
+    )
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    proof = response.json()
+    assert proof["complete"] is False
+    assert "active_breakers" in proof["missing_proof"]
+    assert proof["breaker_state"] == {
+        "tripped": True,
+        "active_scopes": [
+            "liquidity:AAPL",
+            "loss:equity",
+        ],
+    }
+    assert service.broker.submit_calls == 0
+
+
+def test_approval_confirmation_supports_notional_only_and_terminal_validation(
+    make_service,
+    authenticate_client,
+):
+    service = make_service()
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = _propose(service, notional="125")
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    proof = response.json()
+    assert proof["order"]["quantity"] is None
+    assert Decimal(proof["order"]["notional"]) == Decimal("125")
+    assert Decimal(
+        proof["exposure"]["order_estimated_notional"]
+    ) == Decimal("125")
+    confirmation = OperatorMenu._validate_confirmation(
+        proof,
+        expected_order_id=order_id,
+    )
+    rendered_order = confirmation.rendered["order"]
+    assert isinstance(rendered_order, dict)
+    assert rendered_order["quantity"] is None
+    assert Decimal(rendered_order["notional"]) == Decimal("125")
+
+
+def test_approval_confirmation_allows_sell_to_flat_zero_resulting_exposure(
+    make_service,
+    authenticate_client,
+):
+    broker = MockBroker(
+        prices={"AAPL": Decimal("100")},
+        positions=[
+            Position(
+                ticker="AAPL",
+                qty=Decimal("2"),
+                avg_entry_price=Decimal("90"),
+                current_price=Decimal("100"),
+            )
+        ],
+    )
+    service = make_service(broker=broker)
+    service.config = service.config.model_copy(
+        update={
+            "trading": service.config.trading.model_copy(
+                update={
+                    "broker": BrokerKind.ALPACA,
+                    "mode": TradingMode.PAPER,
+                }
+            )
+        }
+    )
+    order_id = service.propose_order(
+        "AAPL",
+        "sell",
+        "market",
+        qty="2",
+        actor="operator:test-setup",
+        reason="sell to flat confirmation setup",
+        request_id="sell-to-flat-confirmation-setup",
+    )["order_id"]
+    app = create_app(
+        service=service,
+        agent=StubAgent(),
+        api_token=TOKEN,
+        planning=None,
+    )
+    client, _csrf = authenticate_client(TestClient(app), TOKEN)
+
+    response = client.get(f"/pending/{order_id}/confirmation")
+
+    assert response.status_code == 200
+    proof = response.json()
+    assert proof["complete"] is True
+    assert Decimal(
+        proof["exposure"]["resulting_signed_notional"]
+    ) == Decimal("0")
+    assert Decimal(
+        proof["exposure"]["order_estimated_notional"]
+    ) == Decimal("200")
+    confirmation = OperatorMenu._validate_confirmation(
+        proof,
+        expected_order_id=order_id,
+    )
+    assert confirmation.order_id == order_id
 
 
 def test_approval_confirmation_dependency_failure_is_hardened(

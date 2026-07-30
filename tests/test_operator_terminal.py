@@ -190,22 +190,46 @@ def confirmation_payload(
     *,
     order_type: str = "limit",
     limit_price: object = "101.50",
+    quantity: object = "2",
+    notional: object = None,
+    side: str = "buy",
+    resulting_signed_notional: object = "203.00",
+    order_estimated_notional: object = "203.00",
 ) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     return {
-        "order_id": order_id,
-        "ticker": "AAPL",
-        "side": "buy",
-        "qty": "2",
-        "order_type": order_type,
-        "limit_price": limit_price,
-        "estimated_exposure": "203.00",
-        "quote_observed_at": (now - timedelta(seconds=2)).isoformat(),
-        "expires_at": (now + timedelta(minutes=5)).isoformat(),
-        "breaker_state": {"status": "clear", "tripped": False},
-        "reconciliation": {"status": "current"},
+        "complete": True,
+        "missing_proof": [],
         "broker": "Alpaca",
         "mode": "paper",
+        "order": {
+            "order_id": order_id,
+            "symbol": "AAPL",
+            "side": side,
+            "order_type": order_type,
+            "quantity": quantity,
+            "notional": notional,
+            "limit_price": limit_price,
+        },
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "breaker_state": {
+            "tripped": False,
+            "active_scopes": [],
+        },
+        "reconciliation": {
+            "broker_reconciled": True,
+            "pending_exposure_complete": True,
+        },
+        "exposure": {
+            "currency": "USD",
+            "current_position_quantity": "0",
+            "current_signed_notional": "0",
+            "resulting_signed_notional": resulting_signed_notional,
+            "order_estimated_notional": order_estimated_notional,
+            "quote_observed_at": (
+                now - timedelta(seconds=2)
+            ).isoformat(),
+        },
     }
 
 
@@ -651,26 +675,45 @@ def test_rule_list_and_cancel_use_only_guarded_rule_routes():
 
 
 @pytest.mark.parametrize(
-    "missing_field",
+    ("section", "missing_field"),
     [
-        "order_id",
-        "ticker",
-        "side",
-        "qty",
-        "order_type",
-        "estimated_exposure",
-        "quote_observed_at",
-        "expires_at",
-        "breaker_state",
-        "reconciliation",
+        (None, "complete"),
+        (None, "missing_proof"),
+        (None, "broker"),
+        (None, "mode"),
+        (None, "order"),
+        (None, "expires_at"),
+        (None, "breaker_state"),
+        (None, "reconciliation"),
+        (None, "exposure"),
+        ("order", "order_id"),
+        ("order", "symbol"),
+        ("order", "side"),
+        ("order", "quantity"),
+        ("order", "notional"),
+        ("order", "order_type"),
+        ("order", "limit_price"),
+        ("breaker_state", "tripped"),
+        ("breaker_state", "active_scopes"),
+        ("reconciliation", "broker_reconciled"),
+        ("reconciliation", "pending_exposure_complete"),
+        ("exposure", "currency"),
+        ("exposure", "current_position_quantity"),
+        ("exposure", "current_signed_notional"),
+        ("exposure", "resulting_signed_notional"),
+        ("exposure", "order_estimated_notional"),
+        ("exposure", "quote_observed_at"),
     ],
 )
 def test_order_approval_blocks_when_each_required_confirmation_field_is_missing(
+    section,
     missing_field,
 ):
     api = FakeApi()
     payload = confirmation_payload()
-    payload.pop(missing_field)
+    container = payload if section is None else payload[section]
+    assert isinstance(container, dict)
+    container.pop(missing_field)
     api.queue_get("/pending/9/confirmation", payload)
     menu, output, _input, _secret, _daemon = build_menu(api, [])
 
@@ -682,32 +725,52 @@ def test_order_approval_blocks_when_each_required_confirmation_field_is_missing(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("path", "value"),
     [
-        ("order_id", True),
-        ("ticker", "AAPL\n"),
-        ("side", "hold"),
-        ("qty", "NaN"),
-        ("order_type", "stop"),
-        ("estimated_exposure", "unknown"),
-        ("quote_observed_at", "not-a-time"),
-        ("expires_at", "not-a-time"),
-        ("breaker_state", {"status": "unknown"}),
-        ("breaker_state", {"status": "clear", "unknown": False}),
-        ("reconciliation", {"status": "stale"}),
+        (("complete",), False),
+        (("missing_proof",), ["quote"]),
+        (("broker",), "Mock"),
+        (("mode",), "live"),
+        (("order", "order_id"), True),
+        (("order", "symbol"), "AAPL\n"),
+        (("order", "side"), "hold"),
+        (("order", "quantity"), "NaN"),
+        (("order", "order_type"), "stop"),
+        (("exposure", "current_position_quantity"), "NaN"),
+        (("exposure", "current_signed_notional"), "unknown"),
+        (("exposure", "resulting_signed_notional"), "Infinity"),
+        (("exposure", "order_estimated_notional"), "unknown"),
+        (("exposure", "quote_observed_at"), "not-a-time"),
+        (("expires_at",), "not-a-time"),
         (
-            "reconciliation",
-            {"status": "current", "broker_reconciled": False},
+            ("breaker_state",),
+            {"status": "clear", "tripped": False},
+        ),
+        (
+            ("breaker_state",),
+            {"tripped": False, "active_scopes": ()},
+        ),
+        (
+            ("reconciliation",),
+            {
+                "broker_reconciled": True,
+                "pending_exposure_complete": "true",
+            },
         ),
     ],
 )
 def test_order_approval_blocks_malformed_or_unknown_confirmation_values(
-    field,
+    path,
     value,
 ):
     api = FakeApi()
     payload = confirmation_payload()
-    payload[field] = value
+    container = payload
+    for component in path[:-1]:
+        nested = container[component]
+        assert isinstance(nested, dict)
+        container = nested
+    container[path[-1]] = value
     api.queue_get("/pending/9/confirmation", payload)
     menu, output, _input, _secret, _daemon = build_menu(api, [])
 
@@ -718,18 +781,177 @@ def test_order_approval_blocks_malformed_or_unknown_confirmation_values(
     assert api.mutations == []
 
 
+def test_actual_legacy_route_confirmation_shape_is_rejected():
+    now = datetime.now(timezone.utc)
+    legacy_route_payload = {
+        "complete": True,
+        "missing_proof": [],
+        "broker": "Alpaca",
+        "mode": "paper",
+        "order": {
+            "order_id": 9,
+            "symbol": "AAPL",
+            "side": "buy",
+            "order_type": "limit",
+            "quantity": "2",
+            "notional": None,
+            "limit_price": "101.50",
+        },
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "exposure": {
+            "currency": "USD",
+            "current_position_quantity": "0",
+            "current_signed_notional": "0",
+            "resulting_signed_notional": "203.00",
+            "as_of": (now - timedelta(seconds=2)).isoformat(),
+        },
+    }
+
+    with pytest.raises(
+        InputRejected,
+        match="pending_confirmation_invalid",
+    ):
+        OperatorMenu._validate_confirmation(
+            legacy_route_payload,
+            expected_order_id=9,
+        )
+
+
+@pytest.mark.parametrize(
+    ("breaker_state", "reconciliation"),
+    [
+        (
+            {"tripped": False, "active_scopes": ["liquidity:AAPL"]},
+            {
+                "broker_reconciled": True,
+                "pending_exposure_complete": True,
+            },
+        ),
+        (
+            {"tripped": False, "active_scopes": []},
+            {
+                "broker_reconciled": True,
+                "pending_exposure_complete": False,
+            },
+        ),
+    ],
+)
+def test_order_approval_rejects_contradictory_safety_proof_before_prompt(
+    breaker_state,
+    reconciliation,
+):
+    api = FakeApi()
+    payload = confirmation_payload()
+    payload["breaker_state"] = breaker_state
+    payload["reconciliation"] = reconciliation
+    api.queue_get("/pending/9/confirmation", payload)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.approve_pending_order(9)
+
+    assert output == ["pending_confirmation_invalid"]
+    assert input_fn.prompts == []
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("quantity", "notional", "valid"),
+    [
+        ("2", None, True),
+        (None, "203.00", True),
+        ("2", "203.00", False),
+        (None, None, False),
+    ],
+)
+def test_order_approval_requires_exactly_one_positive_size(
+    quantity,
+    notional,
+    valid,
+):
+    payload = confirmation_payload(
+        quantity=quantity,
+        notional=notional,
+    )
+
+    if valid:
+        confirmation = OperatorMenu._validate_confirmation(
+            payload,
+            expected_order_id=9,
+        )
+        order = confirmation.rendered["order"]
+        assert isinstance(order, dict)
+        assert order["quantity"] == quantity
+        assert order["notional"] == notional
+    else:
+        with pytest.raises(
+            InputRejected,
+            match="pending_confirmation_invalid",
+        ):
+            OperatorMenu._validate_confirmation(
+                payload,
+                expected_order_id=9,
+            )
+
+
+def test_notional_order_is_rendered_as_notional_not_quantity():
+    payload = confirmation_payload(
+        quantity=None,
+        notional="203.00",
+    )
+
+    confirmation = OperatorMenu._validate_confirmation(
+        payload,
+        expected_order_id=9,
+    )
+
+    order = confirmation.rendered["order"]
+    assert isinstance(order, dict)
+    assert order["quantity"] is None
+    assert order["notional"] == "203.00"
+    assert "qty" not in order
+
+
+def test_sell_to_flat_zero_resulting_exposure_is_valid():
+    payload = confirmation_payload(
+        side="sell",
+        resulting_signed_notional="0",
+        order_estimated_notional="200",
+    )
+
+    confirmation = OperatorMenu._validate_confirmation(
+        payload,
+        expected_order_id=9,
+    )
+
+    exposure = confirmation.rendered["exposure"]
+    assert isinstance(exposure, dict)
+    assert exposure["resulting_signed_notional"] == "0"
+
+
 def test_order_approval_blocks_changed_id_stale_quote_and_expired_proposal():
     now = datetime.now(timezone.utc)
     cases = [
-        {"order_id": 10},
-        {"quote_observed_at": (now - timedelta(minutes=10)).isoformat()},
-        {"expires_at": (now - timedelta(seconds=1)).isoformat()},
+        (("order", "order_id"), 10),
+        (
+            ("exposure", "quote_observed_at"),
+            (now - timedelta(minutes=10)).isoformat(),
+        ),
+        (
+            ("expires_at",),
+            (now - timedelta(seconds=1)).isoformat(),
+        ),
     ]
 
-    for changes in cases:
+    for path, value in cases:
         api = FakeApi()
         payload = confirmation_payload()
-        payload.update(changes)
+        container = payload
+        for component in path[:-1]:
+            nested = container[component]
+            assert isinstance(nested, dict)
+            container = nested
+        container[path[-1]] = value
         api.queue_get("/pending/9/confirmation", payload)
         menu, output, _input, _secret, _daemon = build_menu(api, [])
 

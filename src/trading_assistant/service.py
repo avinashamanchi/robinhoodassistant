@@ -2626,10 +2626,17 @@ class TradingService:
             order_request.ticker,
             exclude_order_id=order_id,
         )
-        if snapshot.pending_exposure_complete is not True:
+        pending_exposure_complete = (
+            snapshot.pending_exposure_complete is True
+        )
+        broker_reconciled = snapshot.broker_reconciled is True
+        active_scopes = sorted(snapshot.active_breakers)
+        if not pending_exposure_complete:
             missing_proof.append("pending_exposure_complete")
-        if snapshot.broker_reconciled is not True:
+        if not broker_reconciled:
             missing_proof.append("broker_reconciled")
+        if active_scopes:
+            missing_proof.append("active_breakers")
 
         symbol = order_request.ticker.upper()
         quote = snapshot.quotes.get(symbol)
@@ -2641,6 +2648,8 @@ class TradingService:
         )
         current_signed_notional: Decimal | None = None
         resulting_signed_notional: Decimal | None = None
+        order_estimated_notional: Decimal | None = None
+        quote_observed_at: str | None = None
         if (
             quote is None
             or not quote.is_valid
@@ -2648,23 +2657,38 @@ class TradingService:
         ):
             missing_proof.append("quote")
         else:
+            if (
+                quote.as_of is None
+                or quote.as_of.tzinfo is None
+                or quote.as_of.utcoffset() is None
+            ):
+                missing_proof.append("quote_observed_at")
+            else:
+                quote_observed_at = quote.as_of.isoformat()
             current_signed_notional = current_quantity * quote.last
             risk_base = snapshot.effective_signed_value(symbol)
             if risk_base is not None:
                 order_notional = order_request.risk_notional(quote)
-                signed_order_notional = (
-                    order_notional
-                    if order_request.side is OrderSide.BUY
-                    else -order_notional
-                )
-                resulting_signed_notional = (
-                    risk_base + signed_order_notional
-                )
+                if order_notional.is_finite() and order_notional > 0:
+                    order_estimated_notional = order_notional
+                    signed_order_notional = (
+                        order_notional
+                        if order_request.side is OrderSide.BUY
+                        else -order_notional
+                    )
+                    resulting_signed_notional = (
+                        risk_base + signed_order_notional
+                    )
+                else:
+                    missing_proof.append(
+                        "order_estimated_notional"
+                    )
         if (
             current_signed_notional is None
             or not current_signed_notional.is_finite()
             or resulting_signed_notional is None
             or not resulting_signed_notional.is_finite()
+            or order_estimated_notional is None
         ):
             missing_proof.append("exposure")
 
@@ -2679,6 +2703,16 @@ class TradingService:
             "mode": self.config.trading.mode.value,
             "order": order_payload,
             "expires_at": expires_at,
+            "breaker_state": {
+                "tripped": bool(active_scopes),
+                "active_scopes": active_scopes,
+            },
+            "reconciliation": {
+                "broker_reconciled": broker_reconciled,
+                "pending_exposure_complete": (
+                    pending_exposure_complete
+                ),
+            },
             "exposure": {
                 "currency": "USD",
                 "current_position_quantity": str(current_quantity),
@@ -2692,7 +2726,12 @@ class TradingService:
                     if resulting_signed_notional is None
                     else str(resulting_signed_notional)
                 ),
-                "as_of": snapshot.as_of.isoformat(),
+                "order_estimated_notional": (
+                    None
+                    if order_estimated_notional is None
+                    else str(order_estimated_notional)
+                ),
+                "quote_observed_at": quote_observed_at,
             },
         }
 

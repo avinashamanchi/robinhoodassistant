@@ -33,17 +33,54 @@ SENSITIVE_KEYS = {
     "key",
     "credential",
 }
-ORDER_CONFIRMATION_FIELDS = (
-    "order_id",
-    "ticker",
-    "side",
-    "qty",
-    "order_type",
-    "estimated_exposure",
-    "quote_observed_at",
+_CONFIRMATION_FIELDS = frozenset(
+    {
+        "complete",
+        "missing_proof",
+        "broker",
+        "mode",
+        "order",
+        "expires_at",
+        "breaker_state",
+        "reconciliation",
+        "exposure",
+    }
+)
+_ORDER_FIELDS = frozenset(
+    {
+        "order_id",
+        "symbol",
+        "side",
+        "order_type",
+        "quantity",
+        "notional",
+        "limit_price",
+    }
+)
+_BREAKER_FIELDS = frozenset({"tripped", "active_scopes"})
+_RECONCILIATION_FIELDS = frozenset(
+    {"broker_reconciled", "pending_exposure_complete"}
+)
+_EXPOSURE_FIELDS = frozenset(
+    {
+        "currency",
+        "current_position_quantity",
+        "current_signed_notional",
+        "resulting_signed_notional",
+        "order_estimated_notional",
+        "quote_observed_at",
+    }
+)
+_RENDERED_CONFIRMATION_FIELDS = (
+    "complete",
+    "missing_proof",
+    "broker",
+    "mode",
+    "order",
     "expires_at",
     "breaker_state",
     "reconciliation",
+    "exposure",
 )
 
 MAX_RENDERED_CHARS = 32_768
@@ -60,23 +97,6 @@ _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _TICKER = re.compile(r"^[A-Z0-9][A-Z0-9./-]{0,19}$")
 _SAFE_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _SAFE_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
-_UNSAFE_EVIDENCE_STATES = frozenset(
-    {
-        "blocked",
-        "conflict",
-        "conflicting",
-        "error",
-        "failed",
-        "failure",
-        "missing",
-        "partial",
-        "stale",
-        "tripped",
-        "unconfirmed",
-        "unknown",
-        "unreconciled",
-    }
-)
 
 _TOP_LEVEL_MENU = (
     "1 System status | 2 Alpaca paper account | "
@@ -758,32 +778,48 @@ class OperatorMenu:
         )
 
     @staticmethod
-    def _positive_decimal(value: object) -> Decimal:
-        if isinstance(value, bool) or value is None:
+    def _exact_dict(
+        value: object,
+        fields: frozenset[str],
+    ) -> dict[str, object]:
+        if (
+            not isinstance(value, dict)
+            or frozenset(value) != fields
+        ):
             raise InputRejected("pending_confirmation_invalid")
-        if isinstance(value, str):
-            if (
-                not value
-                or len(value) > 80
-                or _has_control(value)
-            ):
-                raise InputRejected(
-                    "pending_confirmation_invalid"
-                )
-            raw = value
-        elif isinstance(value, (int, float, Decimal)):
-            raw = str(value)
-        else:
+        return value
+
+    @staticmethod
+    def _finite_decimal(
+        value: object,
+        *,
+        positive: bool = False,
+    ) -> Decimal:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 80
+            or not value.isascii()
+            or value != value.strip()
+            or _has_control(value)
+        ):
             raise InputRejected("pending_confirmation_invalid")
         try:
-            parsed = Decimal(raw)
+            parsed = Decimal(value)
         except (InvalidOperation, ValueError):
             raise InputRejected(
                 "pending_confirmation_invalid"
             ) from None
-        if not parsed.is_finite() or parsed <= 0:
+        if (
+            not parsed.is_finite()
+            or (positive and parsed <= 0)
+        ):
             raise InputRejected("pending_confirmation_invalid")
         return parsed
+
+    @classmethod
+    def _positive_decimal(cls, value: object) -> Decimal:
+        return cls._finite_decimal(value, positive=True)
 
     @staticmethod
     def _timestamp(value: object) -> datetime:
@@ -813,230 +849,84 @@ class OperatorMenu:
         return parsed.astimezone(timezone.utc)
 
     @classmethod
-    def _evidence_has_unknown(cls, value: object) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str):
-            normalized = re.sub(
-                r"[^a-z0-9]+",
-                "_",
-                value.lower(),
-            ).strip("_")
-            if normalized in {
-                "clean",
-                "clear",
-                "current",
-                "not_tripped",
-                "ok",
-                "ready",
-                "reconciled",
-            }:
-                return False
-            return (
-                normalized in _UNSAFE_EVIDENCE_STATES
-                or bool(
-                    set(normalized.split("_")).intersection(
-                        _UNSAFE_EVIDENCE_STATES
-                    )
-                )
-            )
-        if isinstance(value, dict):
-            return (
-                not value
-                or any(
-                    (
-                        isinstance(key, str)
-                        and bool(
-                            set(
-                                re.sub(
-                                    r"[^a-z0-9]+",
-                                    "_",
-                                    key.lower(),
-                                )
-                                .strip("_")
-                                .split("_")
-                            ).intersection(
-                                {
-                                    "failed",
-                                    "missing",
-                                    "partial",
-                                    "stale",
-                                    "unconfirmed",
-                                    "unknown",
-                                }
-                            )
-                        )
-                    )
-                    or cls._evidence_has_unknown(item)
-                    for key, item in value.items()
-                )
-            )
-        if isinstance(value, (list, tuple)):
-            return (
-                not value
-                or any(
-                    cls._evidence_has_unknown(item)
-                    for item in value
-                )
-            )
-        return False
-
-    @classmethod
-    def _validate_breaker_state(cls, value: object) -> None:
-        if (
-            not isinstance(value, dict)
-            or not value
-            or cls._evidence_has_unknown(value)
-        ):
-            raise InputRejected("pending_confirmation_invalid")
-        if "tripped" in value and value["tripped"] is not False:
-            raise InputRejected("pending_confirmation_invalid")
-        status = value.get("status")
-        if status is not None and status not in {
-            "clear",
-            "not_tripped",
-            "ok",
-            "ready",
-        }:
-            raise InputRejected("pending_confirmation_invalid")
-        if "tripped" not in value and status is None:
-            raise InputRejected("pending_confirmation_invalid")
-
-    @classmethod
-    def _validate_reconciliation(cls, value: object) -> None:
-        if (
-            not isinstance(value, dict)
-            or not value
-            or cls._evidence_has_unknown(value)
-        ):
-            raise InputRejected("pending_confirmation_invalid")
-        status = value.get("status")
-        if status is not None and status not in {
-            "clean",
-            "current",
-            "ok",
-            "reconciled",
-        }:
-            raise InputRejected("pending_confirmation_invalid")
-        for key, item in value.items():
-            normalized_key = (
-                re.sub(
-                    r"[^a-z0-9]+",
-                    "_",
-                    key.lower(),
-                ).strip("_")
-                if isinstance(key, str)
-                else ""
-            )
-            if (
-                item is False
-                and (
-                    normalized_key
-                    in {
-                        "clean",
-                        "complete",
-                        "current",
-                        "reconciled",
-                    }
-                    or normalized_key.endswith("_reconciled")
-                )
-            ):
-                raise InputRejected(
-                    "pending_confirmation_invalid"
-                )
-        if status is None and not any(
-            item is True
-            or (
-                isinstance(item, str)
-                and item in {"clean", "current", "reconciled"}
-            )
-            for item in value.values()
-        ):
-            raise InputRejected("pending_confirmation_invalid")
-
-    @staticmethod
-    def _flatten_confirmation(
-        payload: dict[str, object],
-    ) -> dict[str, object]:
-        flattened = dict(payload)
-        order = payload.get("order")
-        if isinstance(order, dict):
-            aliases = {
-                "order_id": "order_id",
-                "ticker": "symbol",
-                "side": "side",
-                "qty": "quantity",
-                "order_type": "order_type",
-                "limit_price": "limit_price",
-            }
-            for target, source in aliases.items():
-                if target not in flattened and source in order:
-                    flattened[target] = order[source]
-        exposure = payload.get("exposure")
-        if isinstance(exposure, dict):
-            if (
-                "estimated_exposure" not in flattened
-                and "resulting_signed_notional" in exposure
-            ):
-                flattened["estimated_exposure"] = exposure[
-                    "resulting_signed_notional"
-                ]
-            if (
-                "quote_observed_at" not in flattened
-                and "as_of" in exposure
-            ):
-                flattened["quote_observed_at"] = exposure["as_of"]
-        return flattened
-
-    @classmethod
     def _validate_confirmation(
         cls,
         payload: object,
         *,
         expected_order_id: int,
     ) -> _OrderConfirmation:
-        if not isinstance(payload, dict):
+        confirmation = cls._exact_dict(
+            payload,
+            _CONFIRMATION_FIELDS,
+        )
+        if confirmation["complete"] is not True:
             raise InputRejected("pending_confirmation_invalid")
-        if payload.get("complete", True) is not True:
-            raise InputRejected("pending_confirmation_invalid")
-        missing_proof = payload.get("missing_proof", [])
+        missing_proof = confirmation["missing_proof"]
         if (
             not isinstance(missing_proof, list)
-            or missing_proof
+            or missing_proof != []
         ):
             raise InputRejected("pending_confirmation_invalid")
-        if "broker" in payload and payload["broker"] != "Alpaca":
+        if confirmation["broker"] != "Alpaca":
             raise InputRejected("pending_confirmation_invalid")
-        if "mode" in payload and payload["mode"] != "paper":
+        if confirmation["mode"] != "paper":
             raise InputRejected("pending_confirmation_invalid")
 
-        flattened = cls._flatten_confirmation(payload)
-        if any(
-            field not in flattened or flattened[field] is None
-            for field in ORDER_CONFIRMATION_FIELDS
+        breaker_state = cls._exact_dict(
+            confirmation["breaker_state"],
+            _BREAKER_FIELDS,
+        )
+        active_scopes = breaker_state["active_scopes"]
+        if (
+            breaker_state["tripped"] is not False
+            or not isinstance(active_scopes, list)
+            or active_scopes != []
         ):
             raise InputRejected("pending_confirmation_invalid")
 
-        order_id = flattened["order_id"]
+        reconciliation = cls._exact_dict(
+            confirmation["reconciliation"],
+            _RECONCILIATION_FIELDS,
+        )
+        if (
+            reconciliation["broker_reconciled"] is not True
+            or reconciliation[
+                "pending_exposure_complete"
+            ] is not True
+        ):
+            raise InputRejected("pending_confirmation_invalid")
+
+        order = cls._exact_dict(
+            confirmation["order"],
+            _ORDER_FIELDS,
+        )
+        order_id = order["order_id"]
         if (
             isinstance(order_id, bool)
             or not isinstance(order_id, int)
             or order_id != expected_order_id
         ):
             raise InputRejected("pending_confirmation_invalid")
-        ticker = flattened["ticker"]
+        ticker = order["symbol"]
         if (
             not isinstance(ticker, str)
             or _TICKER.fullmatch(ticker) is None
         ):
             raise InputRejected("pending_confirmation_invalid")
-        if flattened["side"] not in {"buy", "sell"}:
+        if order["side"] not in {"buy", "sell"}:
             raise InputRejected("pending_confirmation_invalid")
-        cls._positive_decimal(flattened["qty"])
-        cls._positive_decimal(flattened["estimated_exposure"])
 
-        order_type = flattened["order_type"]
-        limit_price = flattened.get("limit_price")
+        quantity = order["quantity"]
+        notional = order["notional"]
+        if (quantity is None) == (notional is None):
+            raise InputRejected("pending_confirmation_invalid")
+        if quantity is not None:
+            cls._positive_decimal(quantity)
+        else:
+            parsed_notional = cls._positive_decimal(notional)
+
+        order_type = order["order_type"]
+        limit_price = order["limit_price"]
         if order_type == "market":
             if limit_price is not None:
                 raise InputRejected("pending_confirmation_invalid")
@@ -1045,12 +935,30 @@ class OperatorMenu:
         else:
             raise InputRejected("pending_confirmation_invalid")
 
-        cls._validate_breaker_state(flattened["breaker_state"])
-        cls._validate_reconciliation(flattened["reconciliation"])
-        quote_observed_at = cls._timestamp(
-            flattened["quote_observed_at"]
+        exposure = cls._exact_dict(
+            confirmation["exposure"],
+            _EXPOSURE_FIELDS,
         )
-        expires_at = cls._timestamp(flattened["expires_at"])
+        if exposure["currency"] != "USD":
+            raise InputRejected("pending_confirmation_invalid")
+        cls._finite_decimal(exposure["current_position_quantity"])
+        cls._finite_decimal(exposure["current_signed_notional"])
+        cls._finite_decimal(exposure["resulting_signed_notional"])
+        order_estimated_notional = cls._positive_decimal(
+            exposure["order_estimated_notional"]
+        )
+        if (
+            notional is not None
+            and order_estimated_notional != parsed_notional
+        ):
+            raise InputRejected("pending_confirmation_invalid")
+
+        quote_observed_at = cls._timestamp(
+            exposure["quote_observed_at"]
+        )
+        expires_at = cls._timestamp(
+            confirmation["expires_at"]
+        )
         now = datetime.now(timezone.utc)
         quote_age = (now - quote_observed_at).total_seconds()
         if (
@@ -1061,10 +969,9 @@ class OperatorMenu:
             raise InputRejected("pending_confirmation_invalid")
 
         rendered = {
-            field: flattened[field]
-            for field in ORDER_CONFIRMATION_FIELDS
+            field: confirmation[field]
+            for field in _RENDERED_CONFIRMATION_FIELDS
         }
-        rendered["limit_price"] = limit_price
         return _OrderConfirmation(
             order_id=order_id,
             quote_observed_at=quote_observed_at,
