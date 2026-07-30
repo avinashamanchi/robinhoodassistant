@@ -127,6 +127,7 @@ def _persist_audit(
     request_id: str,
     reason: str,
     result_code: str,
+    idempotency_key: str = "",
     detail_json: str = "{}",
     created_at=None,
     lifecycle_proof: bool = True,
@@ -144,6 +145,7 @@ def _persist_audit(
         target_type=target_type,
         target_id=target_id,
         request_id=request_id,
+        idempotency_key=idempotency_key,
         result_code=result_code,
         created_at=created_at or utcnow(),
     )
@@ -2997,13 +2999,35 @@ class TradingService:
         actor: str,
         reason: str,
         request_id: str,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         actor, reason, request_id = _require_mutation_context(
             actor,
             reason,
             request_id,
         )
+        if (
+            not isinstance(idempotency_key, str)
+            or idempotency_key != idempotency_key.strip()
+            or len(idempotency_key) > 64
+        ):
+            raise ValueError("idempotency_key is invalid")
         with self.session_factory() as s:
+            if idempotency_key:
+                prior_success = s.scalar(
+                    select(AuditEvent.id)
+                    .where(
+                        AuditEvent.actor == actor,
+                        AuditEvent.action == "rule.cancel",
+                        AuditEvent.target_type == "rule",
+                        AuditEvent.target_id == str(rule_id),
+                        AuditEvent.idempotency_key == idempotency_key,
+                        AuditEvent.result_code == "canceled",
+                    )
+                    .limit(1)
+                )
+                if prior_success is not None:
+                    return {"rule_id": rule_id, "canceled": True}
             rule = s.get(Rule, rule_id)
             if rule is None:
                 return {"rule_id": rule_id, "canceled": False, "error": "not found"}
@@ -3107,6 +3131,7 @@ class TradingService:
                     request_id=request_id,
                     reason=reason,
                     result_code="canceled",
+                    idempotency_key=idempotency_key,
             )
             s.commit()
             return {"rule_id": rule_id, "canceled": True}

@@ -936,6 +936,98 @@ def test_rule_cancel_interlock_migration_is_successor_0018():
     )
 
 
+def test_rule_cancel_interlock_downgrade_refuses_durable_state(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "rule-cancel-interlock-downgrade.db",
+        "head",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO mutation_interlocks "
+                "(resource_key,owner,generation,operation,state,outcome_code,"
+                "created_at,updated_at) VALUES "
+                "('route:rule-cancel:1','operator:local',1,'rule_cancel',"
+                "'active','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^rule_cancel_interlock_downgrade_blocked$",
+    ):
+        command.downgrade(cfg, "20260729_0017")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260730_0018"
+        assert connection.scalar(
+            text("SELECT count(*) FROM mutation_interlocks")
+        ) == 1
+
+
+def test_rule_cancel_interlock_clean_downgrade_restores_old_constraint(tmp_path):
+    engine, cfg = _engine_at_revision(
+        tmp_path / "rule-cancel-clean-downgrade.db",
+        "head",
+    )
+
+    command.downgrade(cfg, "20260729_0017")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260729_0017"
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO mutation_interlocks "
+                    "(resource_key,owner,generation,operation,state,outcome_code,"
+                    "created_at,updated_at) VALUES "
+                    "('route:rule-cancel:1','operator:local',1,'rule_cancel',"
+                    "'active','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                )
+            )
+
+
+def test_rule_cancel_interlock_downgrade_lock_failure_refuses_before_ddl(
+    tmp_path,
+):
+    database_path = tmp_path / "rule-cancel-downgrade-lock-failure.db"
+    engine, cfg = _engine_at_revision(database_path, "head")
+    cfg.set_main_option(
+        "sqlalchemy.url",
+        f"{_url(database_path)}?timeout=0.05",
+    )
+
+    with engine.connect() as blocker:
+        blocker.exec_driver_sql("BEGIN IMMEDIATE")
+        blocker.execute(
+            text(
+                "INSERT INTO mutation_interlocks "
+                "(resource_key,owner,generation,operation,state,outcome_code,"
+                "created_at,updated_at) VALUES "
+                "('route:rule-cancel:lock','operator:local',1,'rule_cancel',"
+                "'active','',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="^runtime_tenure_downgrade_blocked$",
+        ):
+            command.downgrade(cfg, "20260729_0017")
+        blocker.commit()
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM alembic_version")
+        ) == "20260730_0018"
+        assert connection.scalar(
+            text("SELECT count(*) FROM mutation_interlocks")
+        ) == 1
+
+
 def test_backtest_artifact_schema_is_bounded_and_run_scoped(tmp_path):
     engine, _cfg = _engine_at_revision(
         tmp_path / "backtest-artifact-schema.db",

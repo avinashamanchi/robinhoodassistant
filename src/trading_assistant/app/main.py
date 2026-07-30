@@ -34,7 +34,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..broker.models import OrderStatus
-from ..db.models import AuditEvent
 from ..dependencies import RequiredDependencyUnavailable
 from ..orders.reconciliation import ReconciliationConflict
 from ..orders.safety_state import enumerate_unsafe_local_state
@@ -1067,22 +1066,6 @@ def _create_app(
         request: Request,
         principal: SessionPrincipal = Depends(csrf_protected),
     ):
-        with service.session_factory() as session:
-            prior_success = session.scalar(
-                select(AuditEvent.id)
-                .where(
-                    AuditEvent.actor == principal.actor,
-                    AuditEvent.action == "http.rule_cancel",
-                    AuditEvent.target_type == "rule",
-                    AuditEvent.target_id == str(rule_id),
-                    AuditEvent.idempotency_key
-                    == request.state.idempotency_key,
-                    AuditEvent.result_code == "http_200",
-                )
-                .limit(1)
-            )
-        if prior_success is not None:
-            return {"rule_id": rule_id, "canceled": True}
         context = _mutation(
             request,
             principal,
@@ -1096,6 +1079,7 @@ def _create_app(
             actor=context.actor,
             reason=context.reason,
             request_id=context.request_id,
+            idempotency_key=context.idempotency_key,
         )
         if result.get("error") == "not found":
             raise ApiError("rule_not_found", 404, "Rule not found")

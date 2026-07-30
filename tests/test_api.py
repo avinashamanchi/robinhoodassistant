@@ -740,6 +740,46 @@ def test_rule_cancel_is_idempotent_and_never_submits_to_broker(client):
     assert terminal.json()["error"]["code"] == "rule_conflict"
 
 
+def test_rule_cancel_replays_durable_receipt_when_boundary_audit_fails(
+    client,
+    monkeypatch,
+):
+    c, svc, _ = client
+    standalone = _create_rule(svc)
+    headers = {"Idempotency-Key": "rule-cancel-boundary-audit-failure"}
+
+    def unavailable_boundary_audit(*_args, **_kwargs):
+        raise RuntimeError("injected boundary audit outage")
+
+    monkeypatch.setattr(
+        c.app.state.audit,
+        "record",
+        unavailable_boundary_audit,
+    )
+    first = c.post(
+        f"/rules/{standalone['rule_id']}/cancel",
+        json={"reason": "operator canceled during audit outage"},
+        headers=headers,
+    )
+    replay = c.post(
+        f"/rules/{standalone['rule_id']}/cancel",
+        json={"reason": "operator canceled during audit outage"},
+        headers=headers,
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    with svc.session_factory() as session:
+        audit = (
+            session.query(AuditEvent)
+            .filter_by(action="rule.cancel", target_id=str(standalone["rule_id"]))
+            .one()
+        )
+    assert audit.idempotency_key == headers["Idempotency-Key"]
+    assert svc.broker.submit_calls == 0
+
+
 def test_rule_cancel_rejects_plan_owned_missing_and_blank_rules(client):
     c, svc, _ = client
     plan_owned = _create_rule(svc, plan_id=901)
