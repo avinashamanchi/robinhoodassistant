@@ -3961,6 +3961,119 @@ def test_static_gate_requires_exact_terminal_security_node_shapes(tmp_path, muta
     assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda source: source.replace(
+            "class OperatorApiClient:\n",
+            "def _replace_opener_default(client):\n"
+            '    client.__init__.__kwdefaults__["opener"] = "attacker-opener"\n'
+            "    return client\n\n\n"
+            "@_replace_opener_default\n"
+            "class OperatorApiClient:\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "from ..config import load_config\n",
+            "from ..config import load_config\n\nbuild_opener = str\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "from ..config import load_config\n",
+            "from ..config import load_config\n\nRequest = str\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "        try:\n"
+            "            with self._opener.open(request,",
+            '        request.full_url = payload["url"]\n'
+            "        try:\n"
+            "            with self._opener.open(request,",
+            1,
+        ),
+        lambda source: source.replace(
+            '_ORIGIN = "https://localhost:8020"\n',
+            '_ORIGIN = "https://localhost:8020"\n'
+            'globals()["_ORIGIN"] = "https://evil.test"\n',
+            1,
+        ),
+        lambda source: source.replace(
+            "class OperatorApiClient:\n",
+            "def _default_side_effect(\n"
+            "    client,\n"
+            '    _mutated=globals().__setitem__("Request", str),\n'
+            "):\n"
+            "    return client\n\n\n"
+            "@_default_side_effect\n"
+            "class OperatorApiClient:\n",
+            1,
+        ),
+        lambda source: source.replace(
+            '_GENERIC_REQUEST_MESSAGE = "Operator API transport failed"\n',
+            '_GENERIC_REQUEST_MESSAGE = "Operator API transport failed"\n'
+            "_ARBITRARY_EXECUTABLE_STATEMENT = 1\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "import json\n",
+            "import json\nimport collections\n",
+            1,
+        ),
+    ],
+    ids=(
+        "class-decorator-mutates-opener-kwdefault",
+        "module-build-opener-rebinding",
+        "module-request-rebinding",
+        "request-url-rebound-before-open",
+        "dynamic-origin-namespace-mutation",
+        "class-decorator-default-side-effect",
+        "arbitrary-module-statement",
+        "added-module-import",
+    ),
+)
+def test_operator_api_whole_module_anchor_rejects_executable_changes(
+    tmp_path,
+    mutation,
+):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    mutated = mutation(source)
+    assert mutated != source
+    root = _operator_api_static_fixture(tmp_path, mutated)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
+def test_operator_api_whole_module_anchor_accepts_formatting_and_comments(tmp_path):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    formatted = source.replace(
+        "from urllib.error import HTTPError, URLError\n",
+        "# Location-only edits do not change the audited executable structure.\n"
+        "from urllib.error import (\n"
+        "    HTTPError,\n"
+        "    URLError,\n"
+        ")\n",
+        1,
+    ).replace(
+        "        request = Request(\n",
+        "        # The fixed-origin request remains structurally identical.\n"
+        "        request = Request(\n",
+        1,
+    )
+    assert formatted != source
+    root = _operator_api_static_fixture(tmp_path, formatted)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_computed_credential_query_key_is_rejected(tmp_path):
     root = _trust_fixture(tmp_path)
     _write_fixture_file(

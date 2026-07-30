@@ -3085,7 +3085,6 @@ _OUTBOUND_REQUEST_METHODS = frozenset(
     }
 )
 _OPERATOR_API_PATH = "src/trading_assistant/ops/operator_api.py"
-_OPERATOR_API_ORIGIN = "https://localhost:8020"
 _PROVIDER_CLIENT_IMPORTS = frozenset(
     {
         "Anthropic",
@@ -3098,216 +3097,491 @@ _PROVIDER_CLIENT_IMPORTS = frozenset(
 )
 
 
-def _is_name(node: ast.AST, name: str) -> bool:
-    return isinstance(node, ast.Name) and node.id == name
+_OPERATOR_API_MODULE_TEMPLATE_SOURCE = r'''
+"""Strict, memory-only HTTPS client for the local operator application."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from http.client import HTTPException
+import json
+import math
+from pathlib import Path
+import secrets
+import ssl
+import stat
+from http.cookiejar import CookieJar
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import (
+    HTTPSHandler,
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+from ..config import load_config
 
 
-def _operator_api_template(source: str) -> ast.AST:
-    """Parse a location-free, reviewable structural template."""
+_ORIGIN = "https://localhost:8020"
+_BIND_HOST = "127.0.0.1"
+_CA_RELATIVE_PATH = Path(".local/tls/rootCA.pem")
+_GENERIC_HTTP_MESSAGE = "Operator API request failed"
+_GENERIC_REQUEST_MESSAGE = "Operator API transport failed"
 
-    return ast.parse(source).body[0]
+
+@dataclass(frozen=True)
+class OperatorSession:
+    actor: str
+    csrf_token: str
+    expires_at: str | None
 
 
-# These templates are the entire audit boundary for the two exempted urllib
-# calls. They compare AST shape (not source locations), so changing executable
-# syntax in any critical node revokes approval while comments and whitespace do
-# not affect the proof.
-_OPERATOR_API_NO_REDIRECT_TEMPLATE = _operator_api_template(
-    '''class _NoRedirect(HTTPRedirectHandler):
-    """Treat every redirect as a failed local request, never a new destination."""
+class OperatorApiError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        status: int | None,
+        code: str,
+        message: str,
+        request_id: str | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        self.status = status
+        self.code = code
+        self.request_id = request_id
+        self.retry_after = retry_after
+        super().__init__(message)
 
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
+
+def _require_text(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise OperatorApiError(
+            status=200,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        )
+    return value
+
+
+def _optional_text(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
         return None
-'''
-)
-_OPERATOR_API_READER_TEMPLATE = _operator_api_template(
-    '''def _read_payload(self, stream: Any, *, status: int | None) -> dict[str, object]:
-    try:
-        body = stream.read(self._max_response_bytes + 1)
-    except Exception:
+    if not isinstance(value, str):
         raise OperatorApiError(
-            status=status,
-            code="operator_response_invalid",
-            message="Operator API response is invalid",
-        ) from None
-    if not isinstance(body, bytes):
-        raise OperatorApiError(
-            status=status,
+            status=200,
             code="operator_response_invalid",
             message="Operator API response is invalid",
         )
-    if len(body) > self._max_response_bytes:
-        raise OperatorApiError(
-            status=status,
-            code="operator_response_too_large",
-            message="Operator API response is too large",
-        )
-    try:
-        payload = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
-    except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
-        raise OperatorApiError(
-            status=status,
-            code="operator_response_invalid",
-            message="Operator API response is invalid",
-        ) from None
-    if not isinstance(payload, dict):
-        raise OperatorApiError(
-            status=status,
-            code="operator_response_invalid",
-            message="Operator API response is invalid",
-        )
-    return payload
-'''
-)
-_OPERATOR_API_INIT_TEMPLATE = _operator_api_template(
-    '''def __init__(
-    self,
-    project_root: Path,
-    *,
-    opener: Any = None,
-    timeout_seconds: float = 10.0,
-    max_response_bytes: int = 1_048_576,
-    config_loader: Callable[[Path], Any] = load_config,
-    ssl_context_factory: Callable[..., ssl.SSLContext] = ssl.create_default_context,
-) -> None:
-    self._project_root = self._resolve_project_root(project_root)
-    self._timeout_seconds = _positive_finite(
-        timeout_seconds, name="operator_timeout_invalid"
-    )
+    return value
+
+
+def _positive_finite(value: float, *, name: str) -> float:
     if (
-        isinstance(max_response_bytes, bool)
-        or not isinstance(max_response_bytes, int)
-        or max_response_bytes <= 0
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
     ):
-        raise ValueError("operator_response_bound_invalid")
-    self._max_response_bytes = max_response_bytes
+        raise ValueError(name)
+    return float(value)
 
-    config = config_loader(self._project_root / "config.yaml")
-    self._validate_config(config)
-    ca_path = self._validated_ca_path(config)
-    context = ssl_context_factory(cafile=str(ca_path))
-    if (
-        getattr(context, "check_hostname", None) is not True
-        or getattr(context, "verify_mode", None) != ssl.CERT_REQUIRED
-    ):
-        raise ValueError("operator_tls_invalid")
 
-    self._cookies = CookieJar()
-    self._csrf_token: str | None = None
+class OperatorApiClient:
+    """Reach only the configured local HTTPS operator application."""
 
-    class _NoRedirect(HTTPRedirectHandler):
-        """Treat every redirect as a failed local request, never a new destination."""
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        opener: Any = None,
+        timeout_seconds: float = 10.0,
+        max_response_bytes: int = 1_048_576,
+        config_loader: Callable[[Path], Any] = load_config,
+        ssl_context_factory: Callable[..., ssl.SSLContext] = ssl.create_default_context,
+    ) -> None:
+        self._project_root = self._resolve_project_root(project_root)
+        self._timeout_seconds = _positive_finite(
+            timeout_seconds, name="operator_timeout_invalid"
+        )
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("operator_response_bound_invalid")
+        self._max_response_bytes = max_response_bytes
 
-        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
-            return None
+        config = config_loader(self._project_root / "config.yaml")
+        self._validate_config(config)
+        ca_path = self._validated_ca_path(config)
+        context = ssl_context_factory(cafile=str(ca_path))
+        if (
+            getattr(context, "check_hostname", None) is not True
+            or getattr(context, "verify_mode", None) != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("operator_tls_invalid")
 
-    self._opener = opener or build_opener(
-        ProxyHandler({}),
-        HTTPCookieProcessor(self._cookies),
-        HTTPSHandler(context=context),
-        _NoRedirect(),
-    )
+        self._cookies = CookieJar()
+        self._csrf_token: str | None = None
+
+        class _NoRedirect(HTTPRedirectHandler):
+            """Treat every redirect as a failed local request, never a new destination."""
+
+            def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                return None
+
+        self._opener = opener or build_opener(
+            ProxyHandler({}),
+            HTTPCookieProcessor(self._cookies),
+            HTTPSHandler(context=context),
+            _NoRedirect(),
+        )
+
+    @staticmethod
+    def _resolve_project_root(project_root: Path) -> Path:
+        root = Path(project_root)
+        if root.is_symlink():
+            raise ValueError("operator_project_root_invalid")
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError:
+            raise ValueError("operator_project_root_invalid") from None
+        if not resolved.is_dir():
+            raise ValueError("operator_project_root_invalid")
+        return resolved
+
+    @staticmethod
+    def _validate_config(config: Any) -> None:
+        server = getattr(config, "server", None)
+        if (
+            server is None
+            or str(getattr(server, "origin", "")) != _ORIGIN
+            or getattr(server, "bind_host", None) != _BIND_HOST
+            or Path(getattr(server, "tls_ca_path", "")) != _CA_RELATIVE_PATH
+        ):
+            raise ValueError("operator_origin_invalid")
+
+    def _validated_ca_path(self, config: Any) -> Path:
+        relative = Path(config.server.tls_ca_path)
+        candidate = self._project_root
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ValueError("operator_ca_invalid")
+        try:
+            mode = candidate.stat().st_mode
+        except OSError:
+            raise ValueError("operator_ca_invalid") from None
+        if not stat.S_ISREG(mode):
+            raise ValueError("operator_ca_invalid")
+        return candidate
+
+    @staticmethod
+    def _path(path: str) -> str:
+        if not isinstance(path, str):
+            raise ValueError("operator_path_invalid")
+        parsed = urlsplit(path)
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or not path.startswith("/")
+            or path.startswith("//")
+            or quote(path, safe="/-._~") != path
+        ):
+            raise ValueError("operator_path_invalid")
+        segments = path.split("/")[1:]
+        if any(segment in {"", ".", ".."} for segment in segments):
+            raise ValueError("operator_path_invalid")
+        return path
+
+    def _read_payload(self, stream: Any, *, status: int | None) -> dict[str, object]:
+        try:
+            body = stream.read(self._max_response_bytes + 1)
+        except Exception:
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            ) from None
+        if not isinstance(body, bytes):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            )
+        if len(body) > self._max_response_bytes:
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_too_large",
+                message="Operator API response is too large",
+            )
+        try:
+            payload = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            ) from None
+        if not isinstance(payload, dict):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            )
+        return payload
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> dict[str, object]:
+        canonical_path = self._path(path)
+        body: bytes | None = None
+        request_headers = {"Accept": "application/json"}
+        if not authenticated:
+            # CookieJar honors an explicitly supplied Cookie header, so this
+            # prevents a prior authenticated session from crossing this
+            # request boundary while retaining its ability to store login
+            # response cookies.
+            request_headers["Cookie"] = ""
+        if headers:
+            request_headers.update(headers)
+        if payload is not None:
+            try:
+                body = json.dumps(
+                    payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError):
+                raise ValueError("operator_payload_invalid") from None
+            request_headers["Content-Type"] = "application/json"
+        request = Request(
+            _ORIGIN + canonical_path,
+            data=body,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
+                status = getattr(response, "status", 200)
+                return self._read_payload(response, status=status)
+        except HTTPError as error:
+            failure = self._http_failure(error)
+        except ssl.SSLError:
+            failure = OperatorApiError(
+                status=None,
+                code="operator_tls_failed",
+                message=_GENERIC_REQUEST_MESSAGE,
+            )
+        except (HTTPException, URLError, TimeoutError, OSError):
+            failure = OperatorApiError(
+                status=None,
+                code="operator_request_failed",
+                message=_GENERIC_REQUEST_MESSAGE,
+            )
+        if failure.status == 401:
+            self._clear_auth_state()
+        raise failure
+
+    def _http_failure(self, error: HTTPError) -> OperatorApiError:
+        status = getattr(error, "code", None)
+        retry_after = _retry_after(getattr(error, "headers", None))
+        try:
+            payload = self._read_payload(error, status=status)
+        except OperatorApiError as invalid:
+            return OperatorApiError(
+                status=status,
+                code=invalid.code,
+                message=str(invalid),
+                retry_after=retry_after,
+            )
+        envelope = payload.get("error")
+        if not isinstance(envelope, dict):
+            return OperatorApiError(
+                status=status,
+                code="operator_http_error",
+                message=_GENERIC_HTTP_MESSAGE,
+                retry_after=retry_after,
+            )
+        code = envelope.get("code")
+        message = envelope.get("message")
+        request_id = envelope.get("request_id")
+        if (
+            not isinstance(code, str)
+            or not code
+            or not isinstance(message, str)
+            or not message
+            or (request_id is not None and not isinstance(request_id, str))
+        ):
+            return OperatorApiError(
+                status=status,
+                code="operator_http_error",
+                message=_GENERIC_HTTP_MESSAGE,
+                retry_after=retry_after,
+            )
+        return OperatorApiError(
+            status=status,
+            code=code,
+            message=message,
+            request_id=request_id,
+            retry_after=retry_after,
+        )
+
+    def login(self, secret: str) -> OperatorSession:
+        try:
+            payload = self._request(
+                "POST", "/auth/login", {"secret": secret}, authenticated=False
+            )
+            csrf_token = _require_text(payload, "csrf_token")
+            actor = _require_text(payload, "actor")
+            expires_at = _optional_text(payload, "expires_at")
+        except OperatorApiError as error:
+            if error.status is not None and 200 <= error.status < 300:
+                self._clear_auth_state()
+            raise
+        self._csrf_token = csrf_token
+        return OperatorSession(
+            actor=actor,
+            csrf_token=csrf_token,
+            expires_at=expires_at,
+        )
+
+    def reauthenticate(self, secret: str) -> OperatorSession:
+        csrf_token = self._require_csrf()
+        payload = self._request(
+            "POST",
+            "/auth/reauth",
+            {"secret": secret},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        return OperatorSession(
+            actor=_require_text(payload, "actor"),
+            csrf_token=csrf_token,
+            expires_at=_optional_text(payload, "expires_at"),
+        )
+
+    def logout(self) -> None:
+        try:
+            self._request(
+                "POST",
+                "/auth/logout",
+                {},
+                headers={"X-CSRF-Token": self._require_csrf()},
+            )
+        finally:
+            self._clear_auth_state()
+
+    def get(self, path: str, *, authenticated: bool = True) -> dict[str, object]:
+        return self._request("GET", path, authenticated=authenticated)
+
+    def mutate(
+        self,
+        path: str,
+        payload: dict[str, object],
+        *,
+        idempotent: bool,
+    ) -> dict[str, object]:
+        headers = {"X-CSRF-Token": self._require_csrf()}
+        if idempotent:
+            headers["Idempotency-Key"] = secrets.token_urlsafe(32)
+        return self._request("POST", path, payload, headers=headers)
+
+    def _require_csrf(self) -> str:
+        if not self._csrf_token:
+            raise OperatorApiError(
+                status=None,
+                code="operator_csrf_missing",
+                message="Operator session is not authenticated",
+            )
+        return self._csrf_token
+
+    def _clear_auth_state(self) -> None:
+        self._csrf_token = None
+        self._cookies.clear()
+
+
+def _reject_constant(_value: str) -> None:
+    raise ValueError("invalid JSON constant")
+
+
+def _retry_after(headers: Any) -> int | None:
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    return min(max(int(value.strip()), 0), 3600)
 '''
+
+
+def _location_free_ast(value: Any) -> Any:
+    """Return deterministic AST structure without source-location metadata."""
+
+    if isinstance(value, ast.AST):
+        return (
+            type(value).__name__,
+            tuple(
+                (field, _location_free_ast(field_value))
+                for field, field_value in ast.iter_fields(value)
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_location_free_ast(item) for item in value)
+    return value
+
+
+# The readable template and candidate are parsed by the same supported Python
+# interpreter. ast.iter_fields includes every executable syntax field known to
+# that interpreter, while source-location attributes, comments, and whitespace
+# are absent. This avoids a precomputed ast.dump hash that could drift across
+# the project's Python 3.11+ runtime matrix.
+_OPERATOR_API_MODULE_TEMPLATE = _location_free_ast(
+    ast.parse(_OPERATOR_API_MODULE_TEMPLATE_SOURCE)
 )
-
-
-def _matches_operator_api_template(node: ast.AST, template: ast.AST) -> bool:
-    return ast.dump(node, include_attributes=False) == ast.dump(
-        template, include_attributes=False
-    )
 
 
 def _operator_api_approved_calls(
     tree: ast.AST,
     relative: str,
 ) -> set[ast.Call]:
-    """Return only the two stdlib transport calls proven safe for Task 2."""
+    """Return only the two calls from the exact audited Task 2 module."""
 
-    if relative != _OPERATOR_API_PATH:
-        return set()
-    if _module_string_constants(tree).get("_ORIGIN") != _OPERATOR_API_ORIGIN:
+    if (
+        relative != _OPERATOR_API_PATH
+        or _location_free_ast(tree) != _OPERATOR_API_MODULE_TEMPLATE
+    ):
         return set()
 
-    clients = [
+    opener_calls = [
         node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "OperatorApiClient"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("build_opener",)
     ]
-    if len(clients) != 1:
-        return set()
-    client = clients[0]
-
-    methods = {
-        node.name: node
-        for node in client.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    initializer = methods.get("__init__")
-    requester = methods.get("_request")
-    reader = methods.get("_read_payload")
-    if (
-        initializer is None
-        or requester is None
-        or reader is None
-        or not _matches_operator_api_template(
-            initializer, _OPERATOR_API_INIT_TEMPLATE
-        )
-        or not _matches_operator_api_template(reader, _OPERATOR_API_READER_TEMPLATE)
-    ):
-        return set()
-
-    redirect_classes = [
-        statement
-        for statement in initializer.body
-        if isinstance(statement, ast.ClassDef) and statement.name == "_NoRedirect"
+    request_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("Request",)
     ]
-    if (
-        len(redirect_classes) != 1
-        or not _matches_operator_api_template(
-            redirect_classes[0], _OPERATOR_API_NO_REDIRECT_TEMPLATE
-        )
-    ):
+    if len(opener_calls) != 1 or len(request_calls) != 1:
         return set()
+    return {opener_calls[0], request_calls[0]}
 
-    opener_statement = initializer.body[-1]
-    if not isinstance(opener_statement, ast.Assign):
-        return set()
-    opener_value = opener_statement.value
-    if not isinstance(opener_value, ast.BoolOp) or len(opener_value.values) != 2:
-        return set()
-    opener_call = opener_value.values[1]
-    if not isinstance(opener_call, ast.Call):
-        return set()
-    request_call = None
-    for node in ast.walk(requester):
-        if not (
-            isinstance(node, ast.Call)
-            and _attribute_path(node.func) == ("Request",)
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.BinOp)
-            and isinstance(node.args[0].op, ast.Add)
-            and _is_name(node.args[0].left, "_ORIGIN")
-            and _is_name(node.args[0].right, "canonical_path")
-        ):
-            continue
-        keywords = {
-            keyword.arg: keyword.value
-            for keyword in node.keywords
-            if keyword.arg is not None
-        }
-        if (
-            set(keywords) == {"data", "headers", "method"}
-            and _is_name(keywords["data"], "body")
-            and _is_name(keywords["headers"], "request_headers")
-            and _is_name(keywords["method"], "method")
-        ):
-            request_call = node
-            break
-    if request_call is None:
-        return set()
-    return {opener_call, request_call}
+
 _APPROVED_PROVIDER_CLIENT_PATHS = {
     "Anthropic": frozenset(
         {"src/trading_assistant/llm/anthropic_backend.py"}
