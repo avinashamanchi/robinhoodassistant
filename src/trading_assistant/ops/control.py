@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -20,6 +22,8 @@ from typing import Callable, Mapping
 _INSTANCE_ID_BYTES = 32
 _MAX_MESSAGE_BYTES = 4096
 _SOCKET_NAME = "app-control.sock"
+_START_LOCK_NAME = "app-control.start.lock"
+_START_INTENT_NAME = "app-control.starting"
 _PROCESS_START_IDENTITY_PREFIX = "ps-lstart-v1:"
 _PROCESS_INSPECTION_ENV = {
     "LC_ALL": "C",
@@ -89,6 +93,204 @@ def _runtime_paths(project: Path) -> tuple[Path, Path, Path, Path]:
     return root, runtime, runtime / _SOCKET_NAME, root / "logs/app.pid"
 
 
+def _valid_instance_id(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == _INSTANCE_ID_BYTES * 2
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _start_intent_path(runtime: Path) -> Path:
+    return runtime / _START_INTENT_NAME
+
+
+def _read_start_intent(path: Path) -> tuple[str, os.stat_result] | None:
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            return None
+        value = path.read_text(encoding="ascii").removesuffix("\n")
+    except (OSError, UnicodeError):
+        return None
+    if not _valid_instance_id(value):
+        return None
+    return value, info
+
+
+def begin_start_intent(project: Path, *, instance_id: str) -> None:
+    """Publish a private intent before the manual launcher spawns the app."""
+    if not _valid_instance_id(instance_id):
+        raise ControlError("control_start_intent_invalid")
+    _root, runtime, _socket_path, _metadata_path = _runtime_paths(project)
+    intent_path = _start_intent_path(runtime)
+    with _exclusive_startup_lock(runtime):
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                intent_path,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, f"{instance_id}\n".encode("ascii"))
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            named = intent_path.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or opened.st_dev != named.st_dev
+                or opened.st_ino != named.st_ino
+            ):
+                raise ControlError("control_start_intent_invalid")
+        except FileExistsError as exc:
+            raise ControlError("control_start_already_pending") from exc
+        except ControlError:
+            try:
+                intent_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        except OSError as exc:
+            try:
+                intent_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ControlError("control_start_intent_invalid") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _consume_start_intent(path: Path, *, instance_id: str) -> None:
+    if not os.path.lexists(path):
+        return
+    current = _read_start_intent(path)
+    if current is None or current[0] != instance_id:
+        raise ControlError("control_start_intent_mismatch")
+    _value, initial = current
+    try:
+        latest = path.lstat()
+        if (
+            latest.st_dev != initial.st_dev
+            or latest.st_ino != initial.st_ino
+            or latest.st_uid != os.getuid()
+            or latest.st_nlink != 1
+            or not stat.S_ISREG(latest.st_mode)
+        ):
+            raise ControlError("control_start_intent_changed")
+        path.unlink()
+    except ControlError:
+        raise
+    except OSError as exc:
+        raise ControlError("control_start_intent_changed") from exc
+
+
+def abandon_start_intent(
+    project: Path,
+    *,
+    instance_id: str,
+    child_pid: int,
+    process_absent_fn: Callable[[int], bool] | None = None,
+) -> bool:
+    """Clear a failed manual start only after its exact child is proven gone."""
+    if not _valid_instance_id(instance_id) or child_pid <= 0:
+        return False
+    _root, runtime, socket_path, metadata_path = _runtime_paths(project)
+    intent_path = _start_intent_path(runtime)
+    absence_checker = process_absent_fn or _process_absent
+    try:
+        with _exclusive_startup_lock(runtime):
+            if (
+                os.path.lexists(socket_path)
+                or os.path.lexists(metadata_path)
+                or not absence_checker(child_pid)
+            ):
+                return False
+            current = _read_start_intent(intent_path)
+            if current is None or current[0] != instance_id:
+                return False
+            _consume_start_intent(
+                intent_path,
+                instance_id=instance_id,
+            )
+            return True
+    except ControlError:
+        return False
+
+
+def prove_start_absent(project: Path) -> bool:
+    """Prove no serialized manual start is pending at this instant."""
+    try:
+        _root, runtime, _socket_path, _metadata_path = _runtime_paths(project)
+        with _exclusive_startup_lock(runtime):
+            return not os.path.lexists(_start_intent_path(runtime))
+    except ControlError:
+        return False
+
+
+def prove_tcp_port_absent(
+    port: int,
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> bool:
+    """Return true only for lsof's clean, explicit no-listener result."""
+    if not 1 <= port <= 65535:
+        return False
+    try:
+        result = runner(
+            [
+                "/usr/sbin/lsof",
+                "-nP",
+                f"-iTCP:{port}",
+                "-sTCP:LISTEN",
+                "-Fp",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=dict(_PROCESS_INSPECTION_ENV),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stdout = getattr(result, "stdout", None)
+    stderr = getattr(result, "stderr", None)
+    return bool(
+        getattr(result, "returncode", None) == 1
+        and isinstance(stdout, str)
+        and not stdout.strip()
+        and isinstance(stderr, str)
+        and not stderr.strip()
+    )
+
+
+def prove_app_absent(project: Path, *, port: int) -> bool:
+    """Atomically exclude a pending manual start and all app artifacts."""
+    try:
+        _root, runtime, socket_path, metadata_path = _runtime_paths(project)
+        with _exclusive_startup_lock(runtime):
+            return bool(
+                not os.path.lexists(_start_intent_path(runtime))
+                and not os.path.lexists(socket_path)
+                and not os.path.lexists(metadata_path)
+                and prove_tcp_port_absent(port)
+            )
+    except ControlError:
+        return False
+
+
 def _process_output(pid: int, field: str) -> str | None:
     try:
         result = subprocess.run(
@@ -111,6 +313,114 @@ def _process_output(pid: int, field: str) -> str | None:
     return value
 
 
+def _process_absent(pid: int) -> bool:
+    """Return true only when the kernel process table proves a PID is absent."""
+    if pid <= 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "pid="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=dict(_PROCESS_INSPECTION_ENV),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (
+        result.returncode == 1
+        and not _trim(result.stdout)
+        and not _trim(result.stderr)
+    )
+
+
+@contextmanager
+def _exclusive_startup_lock(runtime: Path):
+    """Serialize stale recovery, socket bind, and metadata publication."""
+    lock_path = runtime / _START_LOCK_NAME
+    descriptor: int | None = None
+    locked = False
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+        ):
+            raise ControlError("control_start_lock_invalid")
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        named = lock_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+        ):
+            raise ControlError("control_start_lock_invalid")
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            raise ControlError("control_start_in_progress") from exc
+        locked = True
+        current = lock_path.lstat()
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or not stat.S_ISREG(current.st_mode)
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_uid != os.getuid()
+            or current.st_nlink != 1
+        ):
+            raise ControlError("control_start_lock_changed")
+        yield
+    except ControlError:
+        raise
+    except OSError as exc:
+        raise ControlError("control_start_lock_invalid") from exc
+    finally:
+        if descriptor is not None:
+            if locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+
+def expected_app_argv(
+    *,
+    pid: int | None = None,
+    process_output: Callable[[int, str], str | None] = _process_output,
+) -> str:
+    """Build the exact app command as the kernel process table will report it."""
+    observed = process_output(
+        os.getpid() if pid is None else pid,
+        "comm",
+    )
+    if (
+        observed is None
+        or not Path(observed).is_absolute()
+        or "\x00" in observed
+        or "\n" in observed
+    ):
+        raise ControlError("control_process_command_unavailable")
+    return f"{observed} -m trading_assistant.ops.serve"
+
+
 def inspect_process(pid: int) -> ProcessSnapshot | None:
     """Return exact local process identity without ever signalling that PID."""
     if pid <= 0:
@@ -121,7 +431,7 @@ def inspect_process(pid: int) -> ProcessSnapshot | None:
         return None
     try:
         result = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            ["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
             check=False,
             capture_output=True,
             text=True,
@@ -146,6 +456,53 @@ def inspect_process(pid: int) -> ProcessSnapshot | None:
         start_identity=" ".join(start.split()),
         cwd=canonical_cwd,
         argv=argv,
+    )
+
+
+def _process_listens_on_tcp(
+    pid: int,
+    port: int,
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> bool:
+    if pid <= 0 or not 1 <= port <= 65535:
+        return False
+    try:
+        result = runner(
+            [
+                "/usr/sbin/lsof",
+                "-nP",
+                "-a",
+                "-p",
+                str(pid),
+                f"-iTCP:{port}",
+                "-sTCP:LISTEN",
+                "-Fp",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            env=dict(_PROCESS_INSPECTION_ENV),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stdout = getattr(result, "stdout", None)
+    stderr = getattr(result, "stderr", None)
+    process_fields = (
+        [
+            line
+            for line in stdout.splitlines()
+            if line.startswith("p")
+        ]
+        if isinstance(stdout, str)
+        else []
+    )
+    return bool(
+        getattr(result, "returncode", None) == 0
+        and process_fields == [f"p{pid}"]
+        and isinstance(stderr, str)
+        and not stderr.strip()
     )
 
 
@@ -263,6 +620,107 @@ def _matching_live_identity(
         and socket_info.st_dev == metadata.socket_device
         and socket_info.st_ino == metadata.socket_inode
     )
+
+
+def _reclaim_stale_control(
+    *,
+    root: Path,
+    socket_path: Path,
+    metadata_path: Path,
+    process_absent_fn: Callable[[int], bool],
+) -> bool:
+    """Remove only an exact prior socket whose recorded PID is proven gone."""
+    try:
+        metadata_info = metadata_path.lstat()
+    except OSError:
+        return False
+    metadata = read_control_metadata(metadata_path)
+    if (
+        metadata is None
+        or not stat.S_ISREG(metadata_info.st_mode)
+        or stat.S_IMODE(metadata_info.st_mode) != 0o600
+        or metadata_info.st_uid != os.getuid()
+        or metadata_info.st_nlink != 1
+        or metadata.cwd != str(root)
+        or Path(metadata.socket_path) != socket_path
+        or not process_absent_fn(metadata.pid)
+    ):
+        return False
+    try:
+        socket_info = socket_path.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISSOCK(socket_info.st_mode)
+        or stat.S_IMODE(socket_info.st_mode) != 0o600
+        or socket_info.st_dev != metadata.socket_device
+        or socket_info.st_ino != metadata.socket_inode
+        or read_control_metadata(metadata_path) != metadata
+    ):
+        return False
+    try:
+        current_socket = socket_path.lstat()
+        current_metadata = metadata_path.lstat()
+        if (
+            not stat.S_ISSOCK(current_socket.st_mode)
+            or stat.S_IMODE(current_socket.st_mode) != 0o600
+            or current_socket.st_dev != socket_info.st_dev
+            or current_socket.st_ino != socket_info.st_ino
+            or not stat.S_ISREG(current_metadata.st_mode)
+            or current_metadata.st_dev != metadata_info.st_dev
+            or current_metadata.st_ino != metadata_info.st_ino
+            or current_metadata.st_uid != os.getuid()
+            or current_metadata.st_nlink != 1
+        ):
+            return False
+        socket_path.unlink()
+        metadata_path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _reclaim_stale_metadata_only(
+    *,
+    root: Path,
+    socket_path: Path,
+    metadata_path: Path,
+    process_absent_fn: Callable[[int], bool],
+) -> bool:
+    """Recover the only safe partial state from a prior two-step cleanup."""
+    if os.path.lexists(socket_path):
+        return False
+    try:
+        initial = metadata_path.lstat()
+    except OSError:
+        return False
+    metadata = read_control_metadata(metadata_path)
+    if (
+        metadata is None
+        or not stat.S_ISREG(initial.st_mode)
+        or stat.S_IMODE(initial.st_mode) != 0o600
+        or initial.st_uid != os.getuid()
+        or initial.st_nlink != 1
+        or metadata.cwd != str(root)
+        or Path(metadata.socket_path) != socket_path
+        or not process_absent_fn(metadata.pid)
+        or os.path.lexists(socket_path)
+        or read_control_metadata(metadata_path) != metadata
+    ):
+        return False
+    try:
+        current = metadata_path.lstat()
+        if (
+            current.st_dev != initial.st_dev
+            or current.st_ino != initial.st_ino
+            or current.st_uid != os.getuid()
+            or current.st_nlink != 1
+        ):
+            return False
+        metadata_path.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def _socket_request(path: Path, request: dict[str, object]) -> dict[str, object]:
@@ -399,68 +857,171 @@ def start_app_control(
     instance_id: str | None = None,
     on_shutdown: Callable[[], None] = _self_shutdown,
     inspect_process_fn: Callable[[int], ProcessSnapshot | None] = inspect_process,
+    process_absent_fn: Callable[[int], bool] = _process_absent,
 ) -> CooperativeControlServer:
     """Bind the private socket then atomically publish this app's identity."""
-    root, _runtime, socket_path, metadata_path = _runtime_paths(project)
-    if os.path.lexists(socket_path):
-        raise ControlError("control_socket_already_exists")
-    listener: socket.socket | None = None
-    try:
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(socket_path))
-        os.chmod(socket_path, 0o600)
-        listener.listen(1)
-        listener.settimeout(0.2)
-        socket_info = socket_path.lstat()
-    except OSError as exc:
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
-        raise ControlError("control_socket_setup_failed") from exc
-    snapshot = inspect_process_fn(os.getpid())
-    if (
-        snapshot is None
-        or snapshot.pid != os.getpid()
-        or snapshot.cwd != str(root)
-    ):
-        listener.close()
-        socket_path.unlink(missing_ok=True)
-        raise ControlError("control_process_identity_unavailable")
-    identity = instance_id or os.environ.get("TRADING_APP_INSTANCE_ID")
-    metadata = AppControlMetadata(
-        instance_id=identity or secrets.token_hex(_INSTANCE_ID_BYTES),
-        pid=snapshot.pid,
-        start_identity=snapshot.start_identity,
-        cwd=snapshot.cwd,
-        argv=snapshot.argv,
-        socket_path=str(socket_path),
-        socket_device=socket_info.st_dev,
-        socket_inode=socket_info.st_ino,
-    )
-    server = CooperativeControlServer(
-        metadata,
-        on_shutdown=on_shutdown,
-        listener=listener,
-        metadata_path=metadata_path,
-    )
-    try:
-        write_control_metadata(metadata_path, metadata)
-        server.start()
-    except Exception:
-        server.close()
-        raise
-    return server
+    root, runtime, socket_path, metadata_path = _runtime_paths(project)
+    with _exclusive_startup_lock(runtime):
+        identity = (
+            instance_id
+            or os.environ.get("TRADING_APP_INSTANCE_ID")
+            or secrets.token_hex(_INSTANCE_ID_BYTES)
+        )
+        intent_path = _start_intent_path(runtime)
+        if os.path.lexists(intent_path):
+            intent = _read_start_intent(intent_path)
+            if intent is None or intent[0] != identity:
+                raise ControlError("control_start_intent_mismatch")
+        artifacts_exist = (
+            os.path.lexists(socket_path)
+            or os.path.lexists(metadata_path)
+        )
+        if artifacts_exist:
+            complete_pair = (
+                os.path.lexists(socket_path)
+                and os.path.lexists(metadata_path)
+            )
+            reclaimed = (
+                _reclaim_stale_control(
+                    root=root,
+                    socket_path=socket_path,
+                    metadata_path=metadata_path,
+                    process_absent_fn=process_absent_fn,
+                )
+                if complete_pair
+                else _reclaim_stale_metadata_only(
+                    root=root,
+                    socket_path=socket_path,
+                    metadata_path=metadata_path,
+                    process_absent_fn=process_absent_fn,
+                )
+            )
+            if not reclaimed:
+                raise ControlError("control_socket_already_exists")
+        listener: socket.socket | None = None
+        try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            listener.listen(1)
+            listener.settimeout(0.2)
+            socket_info = socket_path.lstat()
+        except OSError as exc:
+            if listener is not None:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+            raise ControlError("control_socket_setup_failed") from exc
+        snapshot = inspect_process_fn(os.getpid())
+        if (
+            snapshot is None
+            or snapshot.pid != os.getpid()
+            or snapshot.cwd != str(root)
+        ):
+            listener.close()
+            socket_path.unlink(missing_ok=True)
+            raise ControlError("control_process_identity_unavailable")
+        metadata = AppControlMetadata(
+            instance_id=identity,
+            pid=snapshot.pid,
+            start_identity=snapshot.start_identity,
+            cwd=snapshot.cwd,
+            argv=snapshot.argv,
+            socket_path=str(socket_path),
+            socket_device=socket_info.st_dev,
+            socket_inode=socket_info.st_ino,
+        )
+        server = CooperativeControlServer(
+            metadata,
+            on_shutdown=on_shutdown,
+            listener=listener,
+            metadata_path=metadata_path,
+        )
+        try:
+            write_control_metadata(metadata_path, metadata)
+            server.start()
+            _consume_start_intent(
+                intent_path,
+                instance_id=identity,
+            )
+        except Exception:
+            server.close()
+            raise
+        return server
 
 
-def _cli(argv: list[str] | None = None) -> int:
+def _cli(
+    argv: list[str] | None = None,
+    *,
+    process_output: Callable[[int, str], str | None] = _process_output,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("stop", "validate"))
-    parser.add_argument("--project", type=Path, required=True)
-    parser.add_argument("--pid-file", type=Path, required=True)
-    parser.add_argument("--expected-argv", required=True)
+    parser.add_argument(
+        "command",
+        choices=(
+            "abandon-start",
+            "app-absent",
+            "begin-start",
+            "expected-argv",
+            "ready",
+            "stop",
+            "validate",
+        ),
+    )
+    parser.add_argument("--project", type=Path)
+    parser.add_argument("--pid-file", type=Path)
+    parser.add_argument("--expected-argv")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--instance-id")
+    parser.add_argument("--child-pid", type=int)
     args = parser.parse_args(argv)
+    if args.command == "expected-argv":
+        try:
+            print(expected_app_argv(process_output=process_output))
+        except ControlError:
+            return 1
+        return 0
+    if args.command == "begin-start":
+        if args.project is None or args.instance_id is None:
+            return 1
+        try:
+            begin_start_intent(
+                args.project,
+                instance_id=args.instance_id,
+            )
+        except ControlError:
+            return 1
+        return 0
+    if args.command == "abandon-start":
+        if (
+            args.project is None
+            or args.instance_id is None
+            or args.child_pid is None
+        ):
+            return 1
+        return int(
+            not abandon_start_intent(
+                args.project,
+                instance_id=args.instance_id,
+                child_pid=args.child_pid,
+            )
+        )
+    if args.command == "app-absent":
+        if args.project is None or args.port is None:
+            return 1
+        return int(
+            not prove_app_absent(
+                args.project,
+                port=args.port,
+            )
+        )
+    if (
+        args.project is None
+        or args.pid_file is None
+        or args.expected_argv is None
+    ):
+        return 1
     metadata = read_control_metadata(args.pid_file)
     if metadata is None:
         return 1
@@ -472,6 +1033,21 @@ def _cli(argv: list[str] | None = None) -> int:
                 expected_argv=args.expected_argv,
                 inspect_process_fn=inspect_process,
                 socket_lstat=Path.lstat,
+            )
+        )
+    if args.command == "ready":
+        return int(
+            args.port is None
+            or not _matching_live_identity(
+                metadata,
+                project=args.project,
+                expected_argv=args.expected_argv,
+                inspect_process_fn=inspect_process,
+                socket_lstat=Path.lstat,
+            )
+            or not _process_listens_on_tcp(
+                metadata.pid,
+                args.port,
             )
         )
     return int(

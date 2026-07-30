@@ -967,6 +967,8 @@ def test_launchd_and_start_scripts_wire_anonymous_liveness_only():
     assert "curl --fail --silent https://localhost:8020/health/live" in install
     assert "trading_assistant.ops.serve" in install
     assert "trading_assistant.ops.serve" in start
+    assert "--cacert \"$TLS_CA\"" in start
+    assert "https://localhost:8020/health/live" in start
     assert "trading_assistant.daemon.main" not in start
     assert "pkill" not in start
     assert "pkill" not in Path("scripts/stop.sh").read_text(encoding="utf-8")

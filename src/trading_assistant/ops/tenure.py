@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import errno
 import os
 import subprocess
-from threading import Event, Lock, Thread, current_thread
-from typing import Literal, Protocol
+from threading import Event, Lock, RLock, Thread, current_thread
+from typing import Iterator, Literal, Protocol
 from uuid import UUID, uuid4
 
 from sqlalchemy import event, select, text, update
@@ -92,6 +93,13 @@ class RenewableTenure(Protocol):
     role: TenureRole
 
     def renew(self, *, ttl_seconds: int) -> None: ...
+
+    def renew_in_transaction(
+        self,
+        connection,
+        *,
+        ttl_seconds: int,
+    ) -> None: ...
 
     def release(self) -> bool: ...
 
@@ -220,6 +228,22 @@ class RuntimeTenureHandle:
             ttl_seconds=ttl_seconds,
         )
 
+    def renew_in_transaction(
+        self,
+        connection,
+        *,
+        ttl_seconds: int,
+    ) -> None:
+        if self._released:
+            raise TenureLost()
+        self.expires_at = self._service._renew_in_transaction(
+            connection,
+            self.resource_key,
+            owner_id=self.owner_id,
+            generation=self.generation,
+            ttl_seconds=ttl_seconds,
+        )
+
     def release(self) -> bool:
         if self._released:
             return False
@@ -288,6 +312,7 @@ class RuntimeTenureGuard:
         self._lost = Event()
         self._stop = Event()
         self._lock = Lock()
+        self._renew_lock = RLock()
         self._thread: Thread | None = None
         self._closed = False
         self._close_result = TenureCloseResult.NOT_ATTEMPTED
@@ -346,14 +371,45 @@ class RuntimeTenureGuard:
             raise TenureLost()
 
     def renew_once(self) -> bool:
-        if self._lost.is_set() or self._closed:
-            return False
-        try:
-            self.handle.renew(ttl_seconds=self.ttl_seconds)
-        except Exception:
-            self._mark_lost()
-            return False
-        return True
+        with self._renew_lock:
+            if self._lost.is_set() or self._closed:
+                return False
+            try:
+                self.handle.renew(ttl_seconds=self.ttl_seconds)
+            except Exception:
+                self._mark_lost()
+                return False
+            return True
+
+    @contextmanager
+    def exclusive_transaction_renewal(self) -> Iterator[None]:
+        """Pause separate-connection renewals during one owned writer txn."""
+        with self._renew_lock:
+            self.ensure_owned()
+            yield
+            self.ensure_owned()
+
+    def renew_in_transaction(self, connection) -> None:
+        """Extend this tenure using the caller's existing write transaction."""
+        with self._renew_lock:
+            self.ensure_owned()
+            renew = getattr(
+                self.handle,
+                "renew_in_transaction",
+                None,
+            )
+            if not callable(renew):
+                self._mark_lost()
+                raise TenureLost()
+            try:
+                renew(
+                    connection,
+                    ttl_seconds=self.ttl_seconds,
+                )
+            except Exception:
+                self._mark_lost()
+                raise TenureLost() from None
+            self.ensure_owned()
 
     def assert_owned_in_transaction(self, connection) -> None:
         """Prove the exact fenced owner inside an existing writer txn."""
@@ -966,6 +1022,40 @@ class RuntimeTenureService:
             raise
         except (SQLAlchemyError, OSError, ValueError, TypeError):
             raise TenureUncertain() from None
+        return expires_at
+
+    def _renew_in_transaction(
+        self,
+        connection,
+        resource_key: str,
+        *,
+        owner_id: str,
+        generation: int,
+        ttl_seconds: int,
+    ) -> datetime:
+        """Renew exact ownership without competing for a second writer lock."""
+        self._validate_ttl(ttl_seconds)
+        now = self._now()
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        try:
+            result = connection.execute(
+                update(RuntimeTenure)
+                .where(
+                    RuntimeTenure.resource_key == resource_key,
+                    RuntimeTenure.state == "held",
+                    RuntimeTenure.owner_id == owner_id,
+                    RuntimeTenure.generation == generation,
+                    RuntimeTenure.expires_at > now,
+                )
+                .values(
+                    renewed_at=now,
+                    expires_at=expires_at,
+                )
+            )
+        except (SQLAlchemyError, OSError, ValueError, TypeError):
+            raise TenureUncertain() from None
+        if result.rowcount != 1:
+            raise TenureLost()
         return expires_at
 
     def _release(

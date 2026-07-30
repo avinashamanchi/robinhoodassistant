@@ -17,6 +17,7 @@ from typing import Optional
 from .base import BrokerClient
 from .models import (
     Account,
+    BrokerOrderType,
     OrderRequest,
     OrderResult,
     OrderStatus,
@@ -128,6 +129,11 @@ class MockBroker(BrokerClient):
             broker_order_id=broker_id,
             status=OrderStatus.SUBMITTED,
             ticker=order.ticker,
+            side=order.side,
+            order_type=BrokerOrderType(order.order_type.value),
+            limit_price=order.limit_price,
+            requested_qty=order.qty,
+            requested_notional=order.notional,
         )
         self._orders_by_key[order.idempotency_key] = result
         self._orders_by_id[broker_id] = result
@@ -168,6 +174,11 @@ class MockBroker(BrokerClient):
             filled_qty=result.filled_qty,
             avg_fill_price=result.avg_fill_price,
             ticker=result.ticker,
+            side=result.side,
+            order_type=result.order_type,
+            limit_price=result.limit_price,
+            requested_qty=result.requested_qty,
+            requested_notional=result.requested_notional,
         )
         self._orders_by_id[order_id] = canceled
         self._orders_by_key[result.idempotency_key] = canceled

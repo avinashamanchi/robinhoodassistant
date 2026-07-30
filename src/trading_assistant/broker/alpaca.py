@@ -54,6 +54,7 @@ from .base import (
 )
 from .models import (
     Account,
+    BrokerOrderType,
     BrokerFill,
     OrderRequest,
     OrderResult,
@@ -719,13 +720,104 @@ class AlpacaBroker(BrokerClient):
                     "invalid Alpaca order symbol",
                     broker_order_id=broker_order_id,
                 ) from exc
+        raw_side = getattr(o, "side", None)
+        side = None
+        if raw_side is not None:
+            try:
+                side = OrderSide(
+                    str(getattr(raw_side, "value", raw_side)).lower()
+                )
+            except ValueError as exc:
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca order side",
+                    broker_order_id=broker_order_id,
+                ) from exc
+        raw_order_type = getattr(
+            o,
+            "type",
+            getattr(o, "order_type", None),
+        )
+        order_type = None
+        if raw_order_type is not None:
+            try:
+                order_type = BrokerOrderType(
+                    str(
+                        getattr(
+                            raw_order_type,
+                            "value",
+                            raw_order_type,
+                        )
+                    ).lower()
+                )
+            except ValueError as exc:
+                raise BrokerDataIntegrityError(
+                    "invalid Alpaca order type",
+                    broker_order_id=broker_order_id,
+                ) from exc
+        raw_limit_price = getattr(o, "limit_price", None)
+        try:
+            limit_price = _d(raw_limit_price)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca limit price",
+                broker_order_id=broker_order_id,
+            ) from exc
+        if limit_price is not None and (
+            not limit_price.is_finite() or limit_price <= 0
+        ):
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca limit price",
+                broker_order_id=broker_order_id,
+            )
+        requested_economics: dict[str, Decimal | None] = {}
+        for field_name, broker_field in (
+            ("requested_qty", "qty"),
+            ("requested_notional", "notional"),
+        ):
+            raw_value = getattr(o, broker_field, None)
+            try:
+                parsed_value = _d(raw_value)
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                raise BrokerDataIntegrityError(
+                    f"invalid Alpaca {broker_field}",
+                    broker_order_id=broker_order_id,
+                ) from exc
+            if parsed_value is not None and (
+                not parsed_value.is_finite() or parsed_value <= 0
+            ):
+                raise BrokerDataIntegrityError(
+                    f"invalid Alpaca {broker_field}",
+                    broker_order_id=broker_order_id,
+                )
+            requested_economics[field_name] = parsed_value
+        submitted_at = getattr(o, "submitted_at", None)
+        if submitted_at is None:
+            submitted_at = datetime.now(timezone.utc)
+        elif (
+            not isinstance(submitted_at, datetime)
+            or submitted_at.tzinfo is None
+        ):
+            raise BrokerDataIntegrityError(
+                "invalid Alpaca submitted_at",
+                broker_order_id=broker_order_id,
+            )
+        else:
+            submitted_at = submitted_at.astimezone(timezone.utc)
         return OrderResult(
             idempotency_key=getattr(o, "client_order_id", "") or "",
             broker_order_id=broker_order_id,
             status=_map_status(o.status),
             filled_qty=filled_qty,
             avg_fill_price=_d(getattr(o, "filled_avg_price", None)),
+            submitted_at=submitted_at,
             ticker=ticker,
+            side=side,
+            order_type=order_type,
+            limit_price=limit_price,
+            requested_qty=requested_economics["requested_qty"],
+            requested_notional=requested_economics[
+                "requested_notional"
+            ],
         )
 
 

@@ -40,6 +40,16 @@ class OrderType(str, enum.Enum):
     LIMIT = "limit"
 
 
+class BrokerOrderType(str, enum.Enum):
+    """Order types that may exist in broker truth, including protective legs."""
+
+    MARKET = "market"
+    LIMIT = "limit"
+    STOP = "stop"
+    STOP_LIMIT = "stop_limit"
+    TRAILING_STOP = "trailing_stop"
+
+
 class OrderTimeInForce(str, enum.Enum):
     DAY = "day"
     GTC = "gtc"
@@ -312,6 +322,11 @@ class OrderResult:
     avg_fill_price: Optional[Decimal] = None
     submitted_at: datetime = field(default_factory=_utcnow)
     ticker: Optional[str] = None
+    side: Optional[OrderSide] = None
+    order_type: Optional[BrokerOrderType] = None
+    limit_price: Optional[Decimal] = None
+    requested_qty: Optional[Decimal] = None
+    requested_notional: Optional[Decimal] = None
 
 
 def order_result_identity_error(

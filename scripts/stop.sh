@@ -7,9 +7,21 @@ cd "$(dirname "$0")/.."
 PROJECT="$(pwd -P)"
 PY="$PROJECT/.venv/bin/python"
 PID_FILE="$PROJECT/logs/app.pid"
-EXPECTED_ARGV="$PY -m trading_assistant.ops.serve"
+
+if [[ ! -x "$PY" ]]; then
+  echo "venv python not found at $PY (run 'uv sync' first)" >&2
+  exit 1
+fi
+
+EXPECTED_ARGV="$("$PY" -m trading_assistant.ops.control expected-argv)"
 
 if [[ ! -e "$PID_FILE" && ! -L "$PID_FILE" ]]; then
+  if ! "$PY" -m trading_assistant.ops.control app-absent \
+    --project "$PROJECT" \
+    --port 8020; then
+    echo "app state is unknown (startup, control artifact, listener, or inspection uncertainty exists)" >&2
+    exit 1
+  fi
   echo "app is not running (no cooperative control metadata)"
   exit 0
 fi
