@@ -3680,6 +3680,89 @@ def test_chained_stdlib_network_clients_are_rejected(tmp_path, source):
     assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
 
 
+def _operator_api_static_fixture(tmp_path: Path, source: str | None = None) -> Path:
+    root = _trust_fixture(tmp_path)
+    operator_source = source or Path(
+        "src/trading_assistant/ops/operator_api.py"
+    ).read_text(encoding="utf-8")
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/operator_api.py",
+        operator_source,
+    )
+    return root
+
+
+def test_static_gate_accepts_only_the_proven_terminal_urllib_shape(tmp_path):
+    root = _operator_api_static_fixture(tmp_path)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            '_ORIGIN = "https://localhost:8020"',
+            '_ORIGIN = "https://evil.test"',
+        ),
+        (
+            "ProxyHandler({})",
+            'ProxyHandler({"https": "http://proxy.test"})',
+        ),
+        (
+            "ssl_context_factory(cafile=str(ca_path))",
+            "ssl_context_factory()",
+        ),
+        (
+            "ssl.CERT_REQUIRED",
+            "ssl.CERT_NONE",
+        ),
+        (
+            "        return None\n\n\ndef _require_text",
+            "        return request\n\n\ndef _require_text",
+        ),
+        (
+            "stream.read(self._max_response_bytes + 1)",
+            "stream.read()",
+        ),
+        (
+            "\n\ndef _reject_constant",
+            "\n\nextra_opener = build_opener()\n\ndef _reject_constant",
+        ),
+    ],
+    ids=(
+        "remote-origin",
+        "proxy-enabled",
+        "missing-local-ca",
+        "insecure-tls",
+        "redirect-following",
+        "unbounded-read",
+        "extra-urllib-opener",
+    ),
+)
+def test_static_gate_rejects_terminal_urllib_shape_regressions(
+    tmp_path,
+    needle,
+    replacement,
+):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    assert needle in source
+    root = _operator_api_static_fixture(
+        tmp_path,
+        source.replace(needle, replacement, 1),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
 def test_computed_credential_query_key_is_rejected(tmp_path):
     root = _trust_fixture(tmp_path)
     _write_fixture_file(

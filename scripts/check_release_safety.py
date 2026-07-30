@@ -3084,6 +3084,8 @@ _OUTBOUND_REQUEST_METHODS = frozenset(
         "ws_connect",
     }
 )
+_OPERATOR_API_PATH = "src/trading_assistant/ops/operator_api.py"
+_OPERATOR_API_ORIGIN = "https://localhost:8020"
 _PROVIDER_CLIENT_IMPORTS = frozenset(
     {
         "Anthropic",
@@ -3094,6 +3096,203 @@ _PROVIDER_CLIENT_IMPORTS = frozenset(
         "TradingClient",
     }
 )
+
+
+def _is_empty_dict(node: ast.AST) -> bool:
+    return isinstance(node, ast.Dict) and not node.keys and not node.values
+
+
+def _is_name(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _is_self_attribute(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == name
+        and _is_name(node.value, "self")
+    )
+
+
+def _operator_api_approved_calls(
+    tree: ast.AST,
+    relative: str,
+) -> set[ast.Call]:
+    """Return only the two stdlib transport calls proven safe for Task 2."""
+
+    if relative != _OPERATOR_API_PATH:
+        return set()
+    if _module_string_constants(tree).get("_ORIGIN") != _OPERATOR_API_ORIGIN:
+        return set()
+
+    classes = {
+        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
+    }
+    client = classes.get("OperatorApiClient")
+    no_redirect = classes.get("_NoRedirect")
+    if client is None or no_redirect is None:
+        return set()
+
+    methods = {
+        node.name: node
+        for node in client.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    initializer = methods.get("__init__")
+    requester = methods.get("_request")
+    reader = methods.get("_read_payload")
+    if initializer is None or requester is None or reader is None:
+        return set()
+
+    redirect_methods = {
+        node.name: node
+        for node in no_redirect.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    redirect = redirect_methods.get("redirect_request")
+    if (
+        redirect is None
+        or not redirect.body
+        or not isinstance(redirect.body[-1], ast.Return)
+        or not isinstance(redirect.body[-1].value, ast.Constant)
+        or redirect.body[-1].value.value is not None
+    ):
+        return set()
+
+    context_call = next(
+        (
+            node
+            for node in ast.walk(initializer)
+            if isinstance(node, ast.Call)
+            and _attribute_path(node.func) == ("ssl_context_factory",)
+            and not node.args
+            and len(node.keywords) == 1
+            and node.keywords[0].arg == "cafile"
+            and isinstance(node.keywords[0].value, ast.Call)
+            and _attribute_path(node.keywords[0].value.func) == ("str",)
+            and len(node.keywords[0].value.args) == 1
+            and _is_name(node.keywords[0].value.args[0], "ca_path")
+        ),
+        None,
+    )
+    tls_guarded = any(
+        isinstance(node, ast.If)
+        and any(
+            isinstance(candidate, ast.Call)
+            and _attribute_path(candidate.func) == ("getattr",)
+            and len(candidate.args) >= 2
+            and _is_name(candidate.args[0], "context")
+            and isinstance(candidate.args[1], ast.Constant)
+            and candidate.args[1].value == "check_hostname"
+            for candidate in ast.walk(node.test)
+        )
+        and any(
+            _attribute_path(candidate) == ("ssl", "CERT_REQUIRED")
+            for candidate in ast.walk(node.test)
+        )
+        and any(
+            isinstance(candidate, ast.Raise) for candidate in ast.walk(node)
+        )
+        for node in ast.walk(initializer)
+    )
+    if context_call is None or not tls_guarded:
+        return set()
+
+    opener_call = None
+    for statement in initializer.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if not any(_is_self_attribute(target, "_opener") for target in targets):
+            continue
+        value = statement.value
+        if not (
+            isinstance(value, ast.BoolOp)
+            and isinstance(value.op, ast.Or)
+            and len(value.values) == 2
+            and _is_name(value.values[0], "opener")
+            and isinstance(value.values[1], ast.Call)
+            and _attribute_path(value.values[1].func) == ("build_opener",)
+        ):
+            continue
+        candidate = value.values[1]
+        if len(candidate.args) != 4 or candidate.keywords:
+            continue
+        proxy, cookies, https, redirect_handler = candidate.args
+        approved = (
+            isinstance(proxy, ast.Call)
+            and _attribute_path(proxy.func) == ("ProxyHandler",)
+            and len(proxy.args) == 1
+            and not proxy.keywords
+            and _is_empty_dict(proxy.args[0])
+            and isinstance(cookies, ast.Call)
+            and _attribute_path(cookies.func) == ("HTTPCookieProcessor",)
+            and len(cookies.args) == 1
+            and not cookies.keywords
+            and _is_self_attribute(cookies.args[0], "_cookies")
+            and isinstance(https, ast.Call)
+            and _attribute_path(https.func) == ("HTTPSHandler",)
+            and not https.args
+            and len(https.keywords) == 1
+            and https.keywords[0].arg == "context"
+            and _is_name(https.keywords[0].value, "context")
+            and isinstance(redirect_handler, ast.Call)
+            and _attribute_path(redirect_handler.func) == ("_NoRedirect",)
+            and not redirect_handler.args
+            and not redirect_handler.keywords
+        )
+        if approved:
+            opener_call = candidate
+            break
+    if opener_call is None:
+        return set()
+
+    bounded_read = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "read"
+        and _is_name(node.func.value, "stream")
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.BinOp)
+        and isinstance(node.args[0].op, ast.Add)
+        and _is_self_attribute(node.args[0].left, "_max_response_bytes")
+        and isinstance(node.args[0].right, ast.Constant)
+        and node.args[0].right.value == 1
+        for node in ast.walk(reader)
+    )
+    request_call = None
+    for node in ast.walk(requester):
+        if not (
+            isinstance(node, ast.Call)
+            and _attribute_path(node.func) == ("Request",)
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.BinOp)
+            and isinstance(node.args[0].op, ast.Add)
+            and _is_name(node.args[0].left, "_ORIGIN")
+            and _is_name(node.args[0].right, "canonical_path")
+        ):
+            continue
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in node.keywords
+            if keyword.arg is not None
+        }
+        if (
+            set(keywords) == {"data", "headers", "method"}
+            and _is_name(keywords["data"], "body")
+            and _is_name(keywords["headers"], "request_headers")
+            and _is_name(keywords["method"], "method")
+        ):
+            request_call = node
+            break
+    if not bounded_read or request_call is None:
+        return set()
+    return {opener_call, request_call}
 _APPROVED_PROVIDER_CLIENT_PATHS = {
     "Anthropic": frozenset(
         {"src/trading_assistant/llm/anthropic_backend.py"}
@@ -4475,6 +4674,10 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             return function, class_node
 
         constants = _module_string_constants(tree)
+        approved_operator_api_calls = _operator_api_approved_calls(
+            tree,
+            relative,
+        )
         mapping_entries = _mapping_alias_entries(tree)
         mapping_aliases = {
             name: (set(entries), dynamic)
@@ -4904,7 +5107,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 or module_dunder_getattr
                 or dynamic_network_import
                 or provider_client_unapproved
-            ):
+            ) and node not in approved_operator_api_calls:
                 findings.append(
                     _finding(
                         "OUTBOUND_CLIENT_UNAPPROVED",
