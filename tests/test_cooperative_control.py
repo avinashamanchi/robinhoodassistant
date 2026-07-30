@@ -9,7 +9,7 @@ import os
 import socket
 import stat
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +18,9 @@ import pytest
 @contextmanager
 def _short_project():
     """Keep AF_UNIX paths below macOS's fixed sockaddr length."""
-    with TemporaryDirectory(prefix="ta-", dir="/private/tmp") as directory:
+    macos_short_root = Path("/private/tmp")
+    short_root = macos_short_root if macos_short_root.is_dir() else Path(gettempdir())
+    with TemporaryDirectory(prefix="ta-", dir=short_root) as directory:
         project = Path(directory) / "p"
         project.mkdir()
         yield project
