@@ -3098,19 +3098,124 @@ _PROVIDER_CLIENT_IMPORTS = frozenset(
 )
 
 
-def _is_empty_dict(node: ast.AST) -> bool:
-    return isinstance(node, ast.Dict) and not node.keys and not node.values
-
-
 def _is_name(node: ast.AST, name: str) -> bool:
     return isinstance(node, ast.Name) and node.id == name
 
 
-def _is_self_attribute(node: ast.AST, name: str) -> bool:
-    return (
-        isinstance(node, ast.Attribute)
-        and node.attr == name
-        and _is_name(node.value, "self")
+def _operator_api_template(source: str) -> ast.AST:
+    """Parse a location-free, reviewable structural template."""
+
+    return ast.parse(source).body[0]
+
+
+# These templates are the entire audit boundary for the two exempted urllib
+# calls. They compare AST shape (not source locations), so changing executable
+# syntax in any critical node revokes approval while comments and whitespace do
+# not affect the proof.
+_OPERATOR_API_NO_REDIRECT_TEMPLATE = _operator_api_template(
+    '''class _NoRedirect(HTTPRedirectHandler):
+    """Treat every redirect as a failed local request, never a new destination."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        return None
+'''
+)
+_OPERATOR_API_READER_TEMPLATE = _operator_api_template(
+    '''def _read_payload(self, stream: Any, *, status: int | None) -> dict[str, object]:
+    try:
+        body = stream.read(self._max_response_bytes + 1)
+    except Exception:
+        raise OperatorApiError(
+            status=status,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        ) from None
+    if not isinstance(body, bytes):
+        raise OperatorApiError(
+            status=status,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        )
+    if len(body) > self._max_response_bytes:
+        raise OperatorApiError(
+            status=status,
+            code="operator_response_too_large",
+            message="Operator API response is too large",
+        )
+    try:
+        payload = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+        raise OperatorApiError(
+            status=status,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        ) from None
+    if not isinstance(payload, dict):
+        raise OperatorApiError(
+            status=status,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        )
+    return payload
+'''
+)
+_OPERATOR_API_INIT_TEMPLATE = _operator_api_template(
+    '''def __init__(
+    self,
+    project_root: Path,
+    *,
+    opener: Any = None,
+    timeout_seconds: float = 10.0,
+    max_response_bytes: int = 1_048_576,
+    config_loader: Callable[[Path], Any] = load_config,
+    ssl_context_factory: Callable[..., ssl.SSLContext] = ssl.create_default_context,
+) -> None:
+    self._project_root = self._resolve_project_root(project_root)
+    self._timeout_seconds = _positive_finite(
+        timeout_seconds, name="operator_timeout_invalid"
+    )
+    if (
+        isinstance(max_response_bytes, bool)
+        or not isinstance(max_response_bytes, int)
+        or max_response_bytes <= 0
+    ):
+        raise ValueError("operator_response_bound_invalid")
+    self._max_response_bytes = max_response_bytes
+
+    config = config_loader(self._project_root / "config.yaml")
+    self._validate_config(config)
+    ca_path = self._validated_ca_path(config)
+    context = ssl_context_factory(cafile=str(ca_path))
+    if (
+        getattr(context, "check_hostname", None) is not True
+        or getattr(context, "verify_mode", None) != ssl.CERT_REQUIRED
+    ):
+        raise ValueError("operator_tls_invalid")
+
+    self._cookies = CookieJar()
+    self._csrf_token: str | None = None
+
+    class _NoRedirect(HTTPRedirectHandler):
+        """Treat every redirect as a failed local request, never a new destination."""
+
+        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            return None
+
+    self._opener = opener or build_opener(
+        ProxyHandler({}),
+        HTTPCookieProcessor(self._cookies),
+        HTTPSHandler(context=context),
+        _NoRedirect(),
+    )
+'''
+)
+
+
+def _matches_operator_api_template(node: ast.AST, template: ast.AST) -> bool:
+    return ast.dump(node, include_attributes=False) == ast.dump(
+        template, include_attributes=False
     )
 
 
@@ -3125,37 +3230,14 @@ def _operator_api_approved_calls(
     if _module_string_constants(tree).get("_ORIGIN") != _OPERATOR_API_ORIGIN:
         return set()
 
-    classes = {
-        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
-    }
-    client = classes.get("OperatorApiClient")
-    no_redirect = classes.get("_NoRedirect")
-    if (
-        client is None
-        or no_redirect is None
-        or sum(
-            isinstance(node, ast.ClassDef) and node.name == "_NoRedirect"
-            for node in tree.body
-        )
-        != 1
-        or any(
-            statement is not no_redirect
-            and any(
-                (
-                    isinstance(node, ast.Name)
-                    and node.id == "_NoRedirect"
-                    and isinstance(node.ctx, (ast.Store, ast.Del))
-                )
-                or (
-                    isinstance(node, ast.alias)
-                    and (node.name == "_NoRedirect" or node.asname == "_NoRedirect")
-                )
-                for node in ast.walk(statement)
-            )
-            for statement in tree.body
-        )
-    ):
+    clients = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "OperatorApiClient"
+    ]
+    if len(clients) != 1:
         return set()
+    client = clients[0]
 
     methods = {
         node.name: node
@@ -3165,212 +3247,39 @@ def _operator_api_approved_calls(
     initializer = methods.get("__init__")
     requester = methods.get("_request")
     reader = methods.get("_read_payload")
-    if initializer is None or requester is None or reader is None:
-        return set()
-
-    redirect_methods = {
-        node.name: node
-        for node in no_redirect.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    redirect = redirect_methods.get("redirect_request")
     if (
-        redirect is None
-        or len(redirect.body) != 2
-        or not isinstance(redirect.body[0], ast.Delete)
-        or {
-            target.id
-            for target in redirect.body[0].targets
-            if isinstance(target, ast.Name)
-        }
-        != {"args", "kwargs"}
-        or not isinstance(redirect.body[1], ast.Return)
-        or not isinstance(redirect.body[1].value, ast.Constant)
-        or redirect.body[1].value.value is not None
-    ):
-        return set()
-
-    def direct_assignment(name: str) -> tuple[int, ast.AST] | None:
-        matches: list[tuple[int, ast.AST]] = []
-        for index, statement in enumerate(initializer.body):
-            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
-                if _is_name(statement.targets[0], name):
-                    matches.append((index, statement.value))
-            elif isinstance(statement, ast.AnnAssign) and _is_name(statement.target, name):
-                matches.append((index, statement.value))
-        return matches[0] if len(matches) == 1 else None
-
-    def stores_to(name: str) -> int:
-        return sum(
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Store)
-            and node.id == name
-            for node in ast.walk(initializer)
+        initializer is None
+        or requester is None
+        or reader is None
+        or not _matches_operator_api_template(
+            initializer, _OPERATOR_API_INIT_TEMPLATE
         )
-
-    ca_assignment = direct_assignment("ca_path")
-    context_assignment = direct_assignment("context")
-    if (
-        ca_assignment is None
-        or context_assignment is None
-        or stores_to("ca_path") != 1
-        or stores_to("context") != 1
-        or ca_assignment[0] + 1 != context_assignment[0]
-        or not isinstance(ca_assignment[1], ast.Call)
-        or _attribute_path(ca_assignment[1].func) != ("self", "_validated_ca_path")
-        or len(ca_assignment[1].args) != 1
-        or not _is_name(ca_assignment[1].args[0], "config")
-        or ca_assignment[1].keywords
-        or not isinstance(context_assignment[1], ast.Call)
-        or _attribute_path(context_assignment[1].func) != ("ssl_context_factory",)
-        or context_assignment[1].args
-        or len(context_assignment[1].keywords) != 1
-        or context_assignment[1].keywords[0].arg != "cafile"
-        or not isinstance(context_assignment[1].keywords[0].value, ast.Call)
-        or _attribute_path(context_assignment[1].keywords[0].value.func) != ("str",)
-        or len(context_assignment[1].keywords[0].value.args) != 1
-        or not _is_name(context_assignment[1].keywords[0].value.args[0], "ca_path")
+        or not _matches_operator_api_template(reader, _OPERATOR_API_READER_TEMPLATE)
     ):
         return set()
 
-    def expected_getattr(node: ast.AST, field: str) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and _attribute_path(node.func) == ("getattr",)
-            and len(node.args) == 3
-            and not node.keywords
-            and _is_name(node.args[0], "context")
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == field
-            and isinstance(node.args[2], ast.Constant)
-            and node.args[2].value is None
-        )
-
-    guard_index = context_assignment[0] + 1
-    if guard_index >= len(initializer.body):
-        return set()
-    guard = initializer.body[guard_index]
-    if not (
-        isinstance(guard, ast.If)
-        and isinstance(guard.test, ast.BoolOp)
-        and isinstance(guard.test.op, ast.Or)
-        and len(guard.test.values) == 2
-        and not guard.orelse
-        and len(guard.body) == 1
-        and isinstance(guard.body[0], ast.Raise)
-        and isinstance(guard.body[0].exc, ast.Call)
-        and _attribute_path(guard.body[0].exc.func) == ("ValueError",)
-        and len(guard.body[0].exc.args) == 1
-        and isinstance(guard.body[0].exc.args[0], ast.Constant)
-        and guard.body[0].exc.args[0].value == "operator_tls_invalid"
-    ):
-        return set()
-    hostname_guard, verify_guard = guard.test.values
-    if not (
-        isinstance(hostname_guard, ast.Compare)
-        and len(hostname_guard.ops) == 1
-        and isinstance(hostname_guard.ops[0], ast.IsNot)
-        and expected_getattr(hostname_guard.left, "check_hostname")
-        and len(hostname_guard.comparators) == 1
-        and isinstance(hostname_guard.comparators[0], ast.Constant)
-        and hostname_guard.comparators[0].value is True
-        and isinstance(verify_guard, ast.Compare)
-        and len(verify_guard.ops) == 1
-        and isinstance(verify_guard.ops[0], ast.NotEq)
-        and expected_getattr(verify_guard.left, "verify_mode")
-        and len(verify_guard.comparators) == 1
-        and _attribute_path(verify_guard.comparators[0]) == ("ssl", "CERT_REQUIRED")
-    ):
-        return set()
-
-    opener_call = None
-    for opener_index, statement in enumerate(initializer.body):
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = (
-            statement.targets
-            if isinstance(statement, ast.Assign)
-            else [statement.target]
-        )
-        if not any(_is_self_attribute(target, "_opener") for target in targets):
-            continue
-        value = statement.value
-        if not (
-            isinstance(value, ast.BoolOp)
-            and isinstance(value.op, ast.Or)
-            and len(value.values) == 2
-            and _is_name(value.values[0], "opener")
-            and isinstance(value.values[1], ast.Call)
-            and _attribute_path(value.values[1].func) == ("build_opener",)
-        ):
-            continue
-        candidate = value.values[1]
-        if len(candidate.args) != 4 or candidate.keywords:
-            continue
-        proxy, cookies, https, redirect_handler = candidate.args
-        approved = (
-            isinstance(proxy, ast.Call)
-            and _attribute_path(proxy.func) == ("ProxyHandler",)
-            and len(proxy.args) == 1
-            and not proxy.keywords
-            and _is_empty_dict(proxy.args[0])
-            and isinstance(cookies, ast.Call)
-            and _attribute_path(cookies.func) == ("HTTPCookieProcessor",)
-            and len(cookies.args) == 1
-            and not cookies.keywords
-            and _is_self_attribute(cookies.args[0], "_cookies")
-            and isinstance(https, ast.Call)
-            and _attribute_path(https.func) == ("HTTPSHandler",)
-            and not https.args
-            and len(https.keywords) == 1
-            and https.keywords[0].arg == "context"
-            and _is_name(https.keywords[0].value, "context")
-            and isinstance(redirect_handler, ast.Call)
-            and _attribute_path(redirect_handler.func) == ("_NoRedirect",)
-            and not redirect_handler.args
-            and not redirect_handler.keywords
-        )
-        if approved:
-            opener_call = candidate
-            break
-    if opener_call is None or opener_index <= guard_index:
-        return set()
-    if any(
-        _is_name(node, "context")
-        for statement in initializer.body[guard_index + 1 : opener_index]
-        for node in ast.walk(statement)
-    ):
-        return set()
-
-    reads = [
-        node
-        for node in ast.walk(reader)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "read"
+    redirect_classes = [
+        statement
+        for statement in initializer.body
+        if isinstance(statement, ast.ClassDef) and statement.name == "_NoRedirect"
     ]
-    bounded_read = (
-        len(reader.body) == 6
-        and isinstance(reader.body[0], ast.Try)
-        and len(reader.body[0].body) == 1
-        and isinstance(reader.body[0].body[0], ast.Assign)
-        and len(reader.body[0].body[0].targets) == 1
-        and _is_name(reader.body[0].body[0].targets[0], "body")
-        and len(reads) == 1
-        and reads[0] is reader.body[0].body[0].value
-        and sum(_is_name(node, "stream") for node in ast.walk(reader)) == 1
-        and isinstance(reader.body[-1], ast.Return)
-        and _is_name(reader.body[-1].value, "payload")
-        and isinstance(reads[0].func, ast.Attribute)
-        and _is_name(reads[0].func.value, "stream")
-        and len(reads[0].args) == 1
-        and not reads[0].keywords
-        and isinstance(reads[0].args[0], ast.BinOp)
-        and isinstance(reads[0].args[0].op, ast.Add)
-        and _is_self_attribute(reads[0].args[0].left, "_max_response_bytes")
-        and isinstance(reads[0].args[0].right, ast.Constant)
-        and reads[0].args[0].right.value == 1
-    )
+    if (
+        len(redirect_classes) != 1
+        or not _matches_operator_api_template(
+            redirect_classes[0], _OPERATOR_API_NO_REDIRECT_TEMPLATE
+        )
+    ):
+        return set()
+
+    opener_statement = initializer.body[-1]
+    if not isinstance(opener_statement, ast.Assign):
+        return set()
+    opener_value = opener_statement.value
+    if not isinstance(opener_value, ast.BoolOp) or len(opener_value.values) != 2:
+        return set()
+    opener_call = opener_value.values[1]
+    if not isinstance(opener_call, ast.Call):
+        return set()
     request_call = None
     for node in ast.walk(requester):
         if not (
@@ -3396,7 +3305,7 @@ def _operator_api_approved_calls(
         ):
             request_call = node
             break
-    if not bounded_read or request_call is None:
+    if request_call is None:
         return set()
     return {opener_call, request_call}
 _APPROVED_PROVIDER_CLIENT_PATHS = {

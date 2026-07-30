@@ -3721,8 +3721,8 @@ def test_static_gate_accepts_only_the_proven_terminal_urllib_shape(tmp_path):
             "ssl.CERT_NONE",
         ),
         (
-            "        return None\n\n\ndef _require_text",
-            "        return request\n\n\ndef _require_text",
+            "                return None\n\n        self._opener",
+            "                return request\n\n        self._opener",
         ),
         (
             "stream.read(self._max_response_bytes + 1)",
@@ -3782,11 +3782,11 @@ def test_static_gate_rejects_terminal_urllib_shape_regressions(
         ),
         lambda source: source.replace("is not True", "is True", 1),
         lambda source: source.replace(
-            "        del args, kwargs\n        return None",
-            "        del args, kwargs\n"
-            "        if args:\n"
-            "            return request\n"
-            "        return None",
+            "                del args, kwargs\n                return None",
+            "                del args, kwargs\n"
+            "                if args:\n"
+            "                    return request\n"
+            "                return None",
             1,
         ),
         lambda source: source.replace(
@@ -3844,7 +3844,14 @@ def test_static_gate_rejects_terminal_control_flow_and_dataflow_bypasses(
             "        ):\n",
             1,
         ),
-        lambda source: source + "\n_NoRedirect = HTTPRedirectHandler\n",
+        lambda source: source.replace(
+            "        class _NoRedirect(HTTPRedirectHandler):\n",
+            "        def _redirect_rebinder(_class):\n"
+            "            return HTTPRedirectHandler\n\n"
+            "        @_redirect_rebinder\n"
+            "        class _NoRedirect(HTTPRedirectHandler):\n",
+            1,
+        ),
         lambda source: source.replace(
             "        self._opener = opener or build_opener(\n",
             "        setattr(context, \"check_hostname\", False)\n"
@@ -3876,6 +3883,71 @@ def test_static_gate_rejects_terminal_active_binding_and_mutation_bypasses(
     tmp_path,
     mutation,
 ):
+    source = Path("src/trading_assistant/ops/operator_api.py").read_text(
+        encoding="utf-8"
+    )
+    mutated = mutation(source)
+    assert mutated != source
+    root = _operator_api_static_fixture(tmp_path, mutated)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "OUTBOUND_CLIENT_UNAPPROVED" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda source: source.replace(
+            "        if not isinstance(body, bytes):\n",
+            "        if (\n"
+            "            body := getattr(locals()[\"stream\"], \"read\")()\n"
+            "        ) and not isinstance(body, bytes):\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "        class _NoRedirect(HTTPRedirectHandler):\n",
+            "        def _redirect_rebinder(_class):\n"
+            "            return HTTPRedirectHandler\n\n"
+            "        @_redirect_rebinder\n"
+            "        class _NoRedirect(HTTPRedirectHandler):\n",
+            1,
+        ),
+        lambda source: source.replace(
+            "        self._opener = opener or build_opener(\n",
+            "        setattr(locals()[\"context\"], \"check_hostname\", False)\n"
+            "        setattr(locals()[\"context\"], \"verify_mode\", 0)\n"
+            "        self._opener = opener or build_opener(\n",
+            1,
+        ),
+        lambda source: source.replace(
+            'body.decode("utf-8")',
+            'body.decode("utf8")',
+            1,
+        ),
+        lambda source: source.replace(
+            '            """Treat every redirect as a failed local request, never a new destination."""\n',
+            '            """Refuse redirects."""\n',
+            1,
+        ),
+        lambda source: source.replace(
+            "        self._opener = opener or build_opener(\n",
+            "        pass\n"
+            "        self._opener = opener or build_opener(\n",
+            1,
+        ),
+    ],
+    ids=(
+        "locals-indirect-unbounded-read",
+        "redirect-class-decorator-rebinding",
+        "locals-context-tls-downgrade",
+        "reader-benign-decode-spelling",
+        "redirect-benign-docstring",
+        "transport-benign-pass",
+    ),
+)
+def test_static_gate_requires_exact_terminal_security_node_shapes(tmp_path, mutation):
     source = Path("src/trading_assistant/ops/operator_api.py").read_text(
         encoding="utf-8"
     )

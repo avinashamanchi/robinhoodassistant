@@ -57,14 +57,6 @@ class OperatorApiError(RuntimeError):
         super().__init__(message)
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    """Treat every redirect as a failed local request, never a new destination."""
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        return None
-
-
 def _require_text(payload: dict[str, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value:
@@ -137,6 +129,14 @@ class OperatorApiClient:
 
         self._cookies = CookieJar()
         self._csrf_token: str | None = None
+
+        class _NoRedirect(HTTPRedirectHandler):
+            """Treat every redirect as a failed local request, never a new destination."""
+
+            def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                return None
+
         self._opener = opener or build_opener(
             ProxyHandler({}),
             HTTPCookieProcessor(self._cookies),
