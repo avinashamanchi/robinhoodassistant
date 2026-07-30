@@ -34,6 +34,7 @@ TERMINAL_MODULE = (
 )
 LOGIN_SECRET = "login-secret-never-print"
 REAUTH_SECRET = "reauth-secret-never-print"
+EVIDENCE_AT = "2026-07-30T12:00:00+00:00"
 
 
 class FakeApi:
@@ -230,6 +231,156 @@ def confirmation_payload(
                 now - timedelta(seconds=2)
             ).isoformat(),
         },
+    }
+
+
+def posture_payload(
+    *,
+    tripped_category: str | None = None,
+    generation: int = 0,
+) -> dict[str, object]:
+    breaker_checks = []
+    for category in ("account", "equity", "crypto", "liquidity"):
+        tripped = category == tripped_category
+        breaker_checks.append(
+            {
+                "name": "circuit_breaker",
+                "status": "tripped" if tripped else "clear",
+                "observed_at": EVIDENCE_AT,
+                "detail_code": (
+                    "breaker_tripped" if tripped else "breaker_clear"
+                ),
+                "scope": category,
+                "count": 1 if tripped else 0,
+                "generation": generation if tripped else 0,
+            }
+        )
+    return {
+        "observed_at": EVIDENCE_AT,
+        "checks": [
+            {
+                "name": "broker_mode",
+                "status": "paper",
+                "observed_at": EVIDENCE_AT,
+                "detail_code": "broker_paper_mode",
+            },
+            {
+                "name": "daemon_heartbeat",
+                "status": "fresh",
+                "observed_at": EVIDENCE_AT,
+                "detail_code": "daemon_heartbeat_fresh",
+                "age_seconds": 1.0,
+                "max_age_seconds": 30.0,
+                "evidence_at": EVIDENCE_AT,
+            },
+            {
+                "name": "startup_reconciliation",
+                "status": "fresh",
+                "observed_at": EVIDENCE_AT,
+                "detail_code": "reconciliation_current",
+                "generation": 3,
+                "completed_generation": 3,
+                "evidence_at": EVIDENCE_AT,
+            },
+            *breaker_checks,
+        ],
+        "can_trade": False,
+    }
+
+
+def health_payload(
+    *,
+    active_breakers: list[dict[str, object]] | None = None,
+    safety_complete: bool = True,
+    unknown_categories: list[str] | None = None,
+) -> dict[str, object]:
+    active = deepcopy(active_breakers or [])
+    unknown = list(unknown_categories or [])
+    return {
+        "broker": "Alpaca",
+        "mode": "paper",
+        "observed_at": EVIDENCE_AT,
+        "db_ok": safety_complete,
+        "database_reachable": safety_complete,
+        "heartbeat_age_seconds": 1.0,
+        "daemon_alive": True if safety_complete else False,
+        "killswitch": {"equity": False, "crypto": False},
+        "killswitch_generation": {"equity": 0, "crypto": 0},
+        "active_breakers": deepcopy(active),
+        "safety": {
+            "observed_at": EVIDENCE_AT,
+            "state": (
+                "unsafe"
+                if active
+                else ("locally_clear" if safety_complete else "unknown")
+            ),
+            "complete": safety_complete,
+            "local_enumeration": (
+                "confirmed" if safety_complete else "unknown"
+            ),
+            "remote_broker_open_orders": "unverified",
+            "operator_global_breaker": {
+                "tripped": any(
+                    item.get("scope") == "operator_global"
+                    for item in active
+                ),
+                "generation": next(
+                    (
+                        item.get("generation")
+                        for item in active
+                        if item.get("scope") == "operator_global"
+                    ),
+                    0,
+                ),
+            },
+            "active_breakers": deepcopy(active),
+            "unsafe_local_state": {
+                "live_or_unknown_order_ids": [],
+                "latched_order_ids": [],
+                "unsafe_fill_ids": [],
+                "active_rule_ids": [],
+                "unsafe_rule_group_ids": [],
+                "unknown_categories": [],
+            },
+            "unknown_categories": unknown,
+        },
+        "broker_contact_observed_at": EVIDENCE_AT,
+        "last_confirmed_broker_contact": EVIDENCE_AT,
+        "broker_contact_evidence_valid": safety_complete,
+        "reconciliation_age_seconds": 1.0,
+        "reconciliation_max_age_seconds": 300.0,
+        "startup_reconciliation": {
+            "state": "ready" if safety_complete else "unknown",
+            "generation": 3,
+            "completed_generation": 3,
+            "observed_at": EVIDENCE_AT,
+        },
+    }
+
+
+def concrete_breaker(
+    *,
+    scope: str = "loss:equity",
+    kind: str = "loss",
+    target: str = "equity",
+    generation: object = 7,
+) -> dict[str, object]:
+    return {
+        "scope": scope,
+        "kind": kind,
+        "target": target,
+        "generation": generation,
+    }
+
+
+def account_payload() -> dict[str, object]:
+    return {
+        "observed_at": EVIDENCE_AT,
+        "buying_power": "100000",
+        "equity": "100000",
+        "cash": "100000",
+        "gross_exposure": "0",
+        "positions": [],
     }
 
 
@@ -441,23 +592,684 @@ def test_unknown_top_level_choice_is_deterministic():
     assert "Invalid choice" in output
 
 
-def test_all_future_top_level_actions_are_dedicated_no_authority_stubs():
+def test_monitoring_remains_a_dedicated_no_authority_stub_until_task_5():
     api = FakeApi()
     menu, output, _input, _secret, _daemon = build_menu(
         api,
-        ["1", "2", "7", "8", "9", "0"],
+        ["7", "0"],
     )
 
     assert menu.run() == 0
-    assert {
-        "system_status_not_available_in_task_3",
-        "paper_account_not_available_in_task_3",
-        "monitoring_not_available_in_task_3",
-        "operations_not_available_in_task_3",
-        "emergency_safety_not_available_in_task_3",
-    }.issubset(output)
+    assert "monitoring_not_available_in_task_3" in output
     assert api.gets == []
     assert api.mutations == []
+
+
+def test_status_and_account_are_read_only_and_use_only_exact_get_paths():
+    api = FakeApi()
+    api.queue_get("/health", health_payload())
+    api.queue_get("/security/posture", posture_payload())
+    api.queue_get("/account", account_payload())
+    api.queue_get(
+        "/positions",
+        {
+            "positions": [
+                {
+                    "ticker": "AAPL",
+                    "qty": "2",
+                    "avg_entry_price": "100",
+                    "current_price": "101",
+                    "market_value": "202",
+                }
+            ]
+        },
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["1", "2", "0"],
+    )
+
+    assert menu.run() == 0
+
+    assert api.gets == [
+        "/health",
+        "/security/posture",
+        "/account",
+        "/positions",
+    ]
+    assert api.mutations == []
+    transcript = "\n".join(output)
+    assert EVIDENCE_AT in transcript
+    assert '"broker": "Alpaca"' in transcript
+    assert '"mode": "paper"' in transcript
+    assert '"source": "unknown"' in transcript
+    assert '"observed_at": "unknown"' in transcript
+
+
+def test_status_never_turns_absent_or_unknown_evidence_into_healthy():
+    api = FakeApi()
+    posture = posture_payload()
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    for check in checks:
+        if (
+            isinstance(check, dict)
+            and check.get("name")
+            in {
+                "circuit_breaker",
+                "daemon_heartbeat",
+                "startup_reconciliation",
+            }
+        ):
+            check["status"] = "unknown"
+            check["detail_code"] = "database_evidence_unavailable"
+    api.queue_get("/health", {})
+    api.queue_get("/security/posture", posture)
+    menu, output, _input, _secret, _daemon = build_menu(api, ["1", "0"])
+
+    assert menu.run() == 0
+
+    transcript = "\n".join(output).lower()
+    assert "unknown" in transcript
+    assert "healthy" not in transcript
+    assert "ready" not in transcript
+    assert api.mutations == []
+
+
+def test_status_redacts_fields_forbidden_by_the_real_posture_schema():
+    api = FakeApi()
+    posture = posture_payload()
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    checks.append(
+        {
+            "name": "unexpected",
+            "status": "unknown",
+            "observed_at": EVIDENCE_AT,
+            "detail_code": "unexpected",
+            "reason": "posture-reason-never-print",
+            "actor": "posture-actor-never-print",
+            "request_id": "posture-request-never-print",
+            "evidence_json": "posture-evidence-never-print",
+            "prompt": "posture-prompt-never-print",
+            "tool_call": "posture-tool-never-print",
+        }
+    )
+    api.queue_get("/health", health_payload())
+    api.queue_get("/security/posture", posture)
+    menu, output, _input, _secret, _daemon = build_menu(api, ["1", "0"])
+
+    assert menu.run() == 0
+
+    transcript = "\n".join(output)
+    for forbidden in (
+        "posture-reason-never-print",
+        "posture-actor-never-print",
+        "posture-request-never-print",
+        "posture-evidence-never-print",
+        "posture-prompt-never-print",
+        "posture-tool-never-print",
+    ):
+        assert forbidden not in transcript
+
+
+@pytest.mark.parametrize(
+    ("operation_choice", "path", "requires_reauth"),
+    [
+        ("1", "/sync", False),
+        ("2", "/reconcile", True),
+    ],
+)
+def test_operations_require_reason_and_mutate_exactly_once(
+    operation_choice,
+    path,
+    requires_reauth,
+):
+    api = FakeApi()
+    api.queue_mutation(
+        {
+            "status": "complete",
+            "secret": "mutation-secret-never-print",
+        }
+    )
+    secrets = (
+        [LOGIN_SECRET, REAUTH_SECRET]
+        if requires_reauth
+        else [LOGIN_SECRET]
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["8", operation_choice, "operator reviewed broker state", "0"],
+        secrets=secrets,
+    )
+
+    assert menu.run() == 0
+
+    assert api.mutations == [
+        (
+            path,
+            {"reason": "operator reviewed broker state"},
+            True,
+        )
+    ]
+    assert api.reauth_secrets == (
+        [REAUTH_SECRET] if requires_reauth else []
+    )
+    assert "mutation-secret-never-print" not in "\n".join(output)
+
+
+def test_operations_logs_are_read_only_bounded_and_redacted():
+    api = FakeApi()
+    api.queue_get(
+        "/log",
+        {
+            "risk_events": [
+                {
+                    "id": 1,
+                    "order_id": 7,
+                    "type": "rejection",
+                    "reason": "risk-reason-secret-never-print",
+                    "at": EVIDENCE_AT,
+                }
+            ],
+            "llm_decisions": [
+                {
+                    "id": 2,
+                    "prompt": "prompt-secret-never-print",
+                    "reasoning_summary": "reasoning-secret-never-print",
+                    "model": "test-model",
+                    "at": EVIDENCE_AT,
+                    "api_key": "api-key-never-print",
+                }
+            ],
+        },
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["8", "3", "0"],
+    )
+
+    assert menu.run() == 0
+
+    assert api.gets == ["/log"]
+    assert api.mutations == []
+    transcript = "\n".join(output)
+    assert "test-model" in transcript
+    for forbidden in (
+        "risk-reason-secret-never-print",
+        "prompt-secret-never-print",
+        "reasoning-secret-never-print",
+        "api-key-never-print",
+    ):
+        assert forbidden not in transcript
+    assert max(map(len, output)) <= MAX_RENDERED_CHARS + 32
+
+
+@pytest.mark.parametrize(
+    ("operation_choice", "requires_reauth"),
+    [("1", False), ("2", True)],
+)
+def test_operation_conflict_refetches_status_once_without_retry(
+    operation_choice,
+    requires_reauth,
+):
+    api = FakeApi()
+    api.queue_mutation(
+        OperatorApiError(
+            status=409,
+            code="mutation_reconciliation_required",
+            message="raw-conflict-message-never-print",
+        )
+    )
+    api.queue_get("/health", health_payload(safety_complete=False))
+    api.queue_get("/security/posture", posture_payload())
+    secrets = (
+        [LOGIN_SECRET, REAUTH_SECRET]
+        if requires_reauth
+        else [LOGIN_SECRET]
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["8", operation_choice, "reviewed conflict", "0"],
+        secrets=secrets,
+    )
+
+    assert menu.run() == 0
+
+    assert len(api.mutations) == 1
+    assert api.gets == ["/health", "/security/posture"]
+    transcript = "\n".join(output)
+    assert transcript.count("mutation_reconciliation_required") == 1
+    assert "raw-conflict-message-never-print" not in transcript
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (403, "policy_denied"),
+        (422, "validation_error"),
+        (429, "rate_limit_exceeded"),
+        (503, "dependency_unavailable"),
+    ],
+)
+def test_operation_error_codes_remain_distinct_and_never_retry(status, code):
+    api = FakeApi()
+    api.queue_mutation(
+        OperatorApiError(
+            status=status,
+            code=code,
+            message="provider-error-never-print",
+            request_id="a" * 32,
+        )
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["8", "1", "reviewed failing sync", "0"],
+    )
+
+    assert menu.run() == 0
+
+    assert len(api.mutations) == 1
+    transcript = "\n".join(output)
+    assert f"status={status}" in transcript
+    assert f"code={code}" in transcript
+    assert "provider-error-never-print" not in transcript
+
+
+def test_panic_requires_reason_reauth_and_exact_phrase():
+    api = FakeApi()
+    menu, _output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "1",
+            "operator emergency",
+            "panic alpaca paper",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert api.reauth_secrets == [REAUTH_SECRET]
+    assert api.mutations == []
+
+
+def test_panic_exact_phrase_performs_at_most_one_idempotent_mutation():
+    api = FakeApi()
+    api.queue_mutation(
+        {
+            "safe": True,
+            "confirmed_canceled": [],
+            "unconfirmed_order_ids": [],
+            "secret": "panic-secret-never-print",
+        }
+    )
+    menu, output, _input, secret_fn, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "1",
+            "operator emergency",
+            "PANIC ALPACA PAPER",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert api.mutations == [
+        (
+            "/panic",
+            {"reason": "operator emergency"},
+            True,
+        )
+    ]
+    assert secret_fn.prompts[-1] == (
+        "Operator secret (reauthentication): "
+    )
+    transcript = "\n".join(output)
+    assert "panic-secret-never-print" not in transcript
+    assert REAUTH_SECRET not in transcript
+
+
+def test_panic_incomplete_is_never_rendered_as_success():
+    api = FakeApi()
+    api.queue_mutation(
+        {
+            "safe": False,
+            "unconfirmed_order_ids": [7],
+            "provider_body": "panic-provider-never-print",
+        }
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "1",
+            "operator emergency",
+            "PANIC ALPACA PAPER",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert len(api.mutations) == 1
+    transcript = "\n".join(output)
+    assert "panic_incomplete" in transcript
+    assert "Panic complete" not in transcript
+    assert "panic-provider-never-print" not in transcript
+
+
+def test_panic_incomplete_error_remains_a_single_failed_attempt():
+    api = FakeApi()
+    api.queue_mutation(
+        OperatorApiError(
+            status=503,
+            code="panic_incomplete",
+            message="panic-receipt-never-print",
+        )
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "1",
+            "operator emergency",
+            "PANIC ALPACA PAPER",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert len(api.mutations) == 1
+    transcript = "\n".join(output)
+    assert "code=panic_incomplete" in transcript
+    assert "panic-receipt-never-print" not in transcript
+
+
+@pytest.mark.parametrize("interrupt_type", [EOFError, KeyboardInterrupt])
+@pytest.mark.parametrize("stage", ["reason", "secret", "phrase"])
+def test_panic_interrupt_at_each_gate_performs_no_mutation(
+    interrupt_type,
+    stage,
+):
+    api = FakeApi()
+    inputs: list[object] = ["9", "1"]
+    secrets: list[object] = [LOGIN_SECRET]
+    if stage == "reason":
+        inputs.append(interrupt_type())
+    elif stage == "secret":
+        inputs.append("operator emergency")
+        secrets.append(interrupt_type())
+    else:
+        inputs.extend(["operator emergency", interrupt_type()])
+        secrets.append(REAUTH_SECRET)
+    menu, _output, _input, _secret, _daemon = build_menu(
+        api,
+        inputs,
+        secrets=secrets,
+    )
+
+    assert menu.run() == 0
+
+    assert api.mutations == []
+
+
+def test_breaker_reset_selects_one_concrete_tripped_scope_and_generation():
+    api = FakeApi()
+    api.queue_get(
+        "/security/posture",
+        posture_payload(tripped_category="equity", generation=7),
+    )
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "2",
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 7",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == [REAUTH_SECRET]
+    assert api.mutations == [
+        (
+            "/killswitch/reset",
+            {
+                "scope": "loss:equity",
+                "expected_generation": 7,
+                "reason": "verified breaker recovery",
+            },
+            True,
+        )
+    ]
+    transcript = "\n".join(output)
+    assert "loss:equity" in transcript
+    assert "generation=7" in transcript
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "missing_scope",
+        "malformed_scope",
+        "duplicate_scope",
+        "bool_generation",
+        "unknown_state",
+    ],
+)
+def test_breaker_reset_rejects_invalid_aggregate_posture_without_prompts(
+    invalid_case,
+):
+    api = FakeApi()
+    posture = posture_payload(tripped_category="equity", generation=7)
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    breakers = [
+        check
+        for check in checks
+        if isinstance(check, dict)
+        and check.get("name") == "circuit_breaker"
+    ]
+    equity = next(
+        check for check in breakers if check.get("scope") == "equity"
+    )
+    if invalid_case == "missing_scope":
+        checks.remove(
+            next(
+                check
+                for check in breakers
+                if check.get("scope") == "crypto"
+            )
+        )
+    elif invalid_case == "malformed_scope":
+        equity["scope"] = "loss:equity"
+    elif invalid_case == "duplicate_scope":
+        checks.append(deepcopy(equity))
+    elif invalid_case == "bool_generation":
+        equity["generation"] = True
+    else:
+        equity["status"] = "unknown"
+        equity["detail_code"] = "breaker_scope_invalid"
+        equity["count"] = None
+        equity["generation"] = None
+    api.queue_get("/security/posture", posture)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_posture_invalid" in output
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "missing_scope",
+        "malformed_scope",
+        "duplicate_scope",
+        "bool_generation",
+        "incomplete_safety",
+        "unknown_breaker_category",
+    ],
+)
+def test_breaker_reset_rejects_invalid_concrete_health_evidence(
+    invalid_case,
+):
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    breaker = concrete_breaker()
+    active = [breaker]
+    safety_complete = True
+    unknown_categories: list[str] = []
+    if invalid_case == "missing_scope":
+        breaker.pop("scope")
+    elif invalid_case == "malformed_scope":
+        breaker["scope"] = "loss:Equity"
+    elif invalid_case == "duplicate_scope":
+        active.append(deepcopy(breaker))
+    elif invalid_case == "bool_generation":
+        breaker["generation"] = True
+    elif invalid_case == "incomplete_safety":
+        safety_complete = False
+    else:
+        unknown_categories = ["active_breakers"]
+    api.queue_get("/security/posture", posture)
+    api.queue_get(
+        "/health",
+        health_payload(
+            active_breakers=active,
+            safety_complete=safety_complete,
+            unknown_categories=unknown_categories,
+        ),
+    )
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_evidence_invalid" in output
+
+
+def test_breaker_reset_is_unavailable_when_no_concrete_scope_is_tripped():
+    api = FakeApi()
+    api.queue_get("/security/posture", posture_payload())
+    api.queue_get("/health", health_payload())
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_reset_unavailable" in output
+
+
+def test_breaker_reset_wrong_phrase_performs_no_mutation():
+    api = FakeApi()
+    api.queue_get(
+        "/security/posture",
+        posture_payload(tripped_category="equity", generation=7),
+    )
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+    )
+    menu, _output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "2",
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 8",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert api.reauth_secrets == [REAUTH_SECRET]
+    assert api.mutations == []
+
+
+def test_breaker_conflict_refetches_fresh_status_and_never_retries():
+    api = FakeApi()
+    api.queue_get(
+        "/security/posture",
+        posture_payload(tripped_category="equity", generation=7),
+    )
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+        health_payload(
+            active_breakers=[concrete_breaker(generation=8)]
+        ),
+    )
+    api.queue_get(
+        "/security/posture",
+        posture_payload(tripped_category="equity", generation=8),
+    )
+    api.queue_mutation(
+        OperatorApiError(
+            status=409,
+            code="breaker_conflict",
+            message="stale-generation-never-print",
+        )
+    )
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "9",
+            "2",
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 7",
+            "0",
+        ],
+        secrets=[LOGIN_SECRET, REAUTH_SECRET],
+    )
+
+    assert menu.run() == 0
+
+    assert len(api.mutations) == 1
+    assert api.gets == [
+        "/security/posture",
+        "/health",
+        "/health",
+        "/security/posture",
+    ]
+    transcript = "\n".join(output)
+    assert transcript.count("breaker_conflict") == 1
+    assert '"generation": 8' in transcript
+    assert "stale-generation-never-print" not in transcript
 
 
 def test_generate_requires_exact_phrase_and_performs_no_side_effect_on_mismatch():

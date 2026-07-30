@@ -112,6 +112,48 @@ _RULE_MENU = "Rules: 1 List | 2 Cancel | 0 Back"
 _PENDING_MENU = (
     "Pending orders: 1 List | 2 Approve | 3 Reject | 4 Cancel | 0 Back"
 )
+_OPERATIONS_MENU = (
+    "Operations: 1 Synchronize open orders | 2 Reconcile positions | "
+    "3 Redacted logs | 0 Back"
+)
+_EMERGENCY_MENU = (
+    "Emergency safety: 1 Panic | 2 Reset circuit breaker | 0 Back"
+)
+_BREAKER_CATEGORIES = ("account", "equity", "crypto", "liquidity")
+_BREAKER_KINDS = frozenset(
+    {
+        "operator_global",
+        "broker_drift",
+        "data",
+        "loss",
+        "drawdown",
+        "liquidity",
+    }
+)
+_ASSET_BREAKER_KINDS = frozenset({"data", "loss", "drawdown"})
+_LIQUIDITY_TARGET = re.compile(r"^[A-Z0-9][A-Z0-9./_-]{0,31}$")
+_LOG_SENSITIVE_KEYS = frozenset(
+    {
+        "detail",
+        "detail_json",
+        "prompt",
+        "reason",
+        "reasoning_summary",
+    }
+)
+_POSTURE_SENSITIVE_KEYS = frozenset(
+    {
+        "actor",
+        "content_hash",
+        "evidence_json",
+        "prompt",
+        "reason",
+        "request_id",
+        "source_hash",
+        "tool_call",
+        "value",
+    }
+)
 
 
 class InputRejected(ValueError):
@@ -143,6 +185,15 @@ class _OrderConfirmation:
     quote_observed_at: datetime
     expires_at: datetime
     rendered: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _BreakerCandidate:
+    scope: str
+    kind: str
+    target: str
+    generation: int
+    category: str
 
 
 def _has_control(value: str) -> bool:
@@ -236,7 +287,7 @@ def confirm_exact(
     )
 
 
-def _sensitive_key(key: str) -> bool:
+def _normalized_key(key: str) -> str:
     separated = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
     separated = re.sub(
         r"([a-z0-9])([A-Z])",
@@ -248,6 +299,11 @@ def _sensitive_key(key: str) -> bool:
         "_",
         separated.lower(),
     ).strip("_")
+    return normalized
+
+
+def _sensitive_key(key: str) -> bool:
+    normalized = _normalized_key(key)
     if normalized in SENSITIVE_KEYS:
         return True
     components = frozenset(normalized.split("_"))
@@ -328,6 +384,67 @@ def render_json_summary(value: object) -> str:
             sort_keys=True,
         )
     return rendered
+
+
+def _redacted_named_value(
+    value: object,
+    *,
+    sensitive_keys: frozenset[str],
+    depth: int = 0,
+) -> object:
+    if depth >= _MAX_RENDER_DEPTH:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        string_keys = sorted(key for key in value if isinstance(key, str))
+        for key in string_keys[:_MAX_COLLECTION_ITEMS]:
+            result[key] = (
+                _REDACTED
+                if (
+                    _sensitive_key(key)
+                    or _normalized_key(key) in sensitive_keys
+                )
+                else _redacted_named_value(
+                    value[key],
+                    sensitive_keys=sensitive_keys,
+                    depth=depth + 1,
+                )
+            )
+        if len(string_keys) > _MAX_COLLECTION_ITEMS:
+            result["<truncated>"] = (
+                len(string_keys) - _MAX_COLLECTION_ITEMS
+            )
+        invalid_keys = len(value) - len(string_keys)
+        if invalid_keys:
+            result["<invalid-keys>"] = invalid_keys
+        return result
+    if isinstance(value, (list, tuple)):
+        items = [
+            _redacted_named_value(
+                item,
+                sensitive_keys=sensitive_keys,
+                depth=depth + 1,
+            )
+            for item in value[:_MAX_COLLECTION_ITEMS]
+        ]
+        if len(value) > _MAX_COLLECTION_ITEMS:
+            items.append("<truncated>")
+        return items
+    return value
+
+
+def _redacted_log_value(value: object) -> object:
+    return _redacted_named_value(
+        value,
+        sensitive_keys=_LOG_SENSITIVE_KEYS,
+    )
+
+
+def _redacted_posture_value(value: object) -> object:
+    return _redacted_named_value(
+        value,
+        sensitive_keys=_POSTURE_SENSITIVE_KEYS,
+    )
 
 
 class OperatorMenu:
@@ -498,24 +615,526 @@ class OperatorMenu:
             secret = None
 
     def _system_status(self) -> bool:
-        self._write("system_status_not_available_in_task_3")
+        health = self.api.get("/health")
+        posture = self.api.get("/security/posture")
+        health_summary = {
+            "observed_at": self._evidence_field(
+                health,
+                "observed_at",
+            ),
+            "broker": self._evidence_field(health, "broker"),
+            "mode": self._evidence_field(health, "mode"),
+            "database_reachable": self._evidence_field(
+                health,
+                "database_reachable",
+            ),
+            "daemon": {
+                "alive": self._evidence_field(
+                    health,
+                    "daemon_alive",
+                ),
+                "heartbeat_age_seconds": self._evidence_field(
+                    health,
+                    "heartbeat_age_seconds",
+                ),
+            },
+            "reconciliation": {
+                "broker_contact_evidence_valid": (
+                    self._evidence_field(
+                        health,
+                        "broker_contact_evidence_valid",
+                    )
+                ),
+                "last_confirmed_broker_contact": (
+                    self._evidence_field(
+                        health,
+                        "last_confirmed_broker_contact",
+                    )
+                ),
+                "reconciliation_age_seconds": (
+                    self._evidence_field(
+                        health,
+                        "reconciliation_age_seconds",
+                    )
+                ),
+                "reconciliation_max_age_seconds": (
+                    self._evidence_field(
+                        health,
+                        "reconciliation_max_age_seconds",
+                    )
+                ),
+                "startup": self._evidence_field(
+                    health,
+                    "startup_reconciliation",
+                ),
+            },
+            "breakers": {
+                "active": self._evidence_field(
+                    health,
+                    "active_breakers",
+                ),
+                "safety": self._evidence_field(health, "safety"),
+            },
+        }
+        posture_summary = {
+            "observed_at": self._evidence_field(
+                posture,
+                "observed_at",
+            ),
+            "can_trade": self._evidence_field(
+                posture,
+                "can_trade",
+            ),
+            "checks": _redacted_posture_value(
+                self._evidence_field(posture, "checks")
+            ),
+        }
+        self._write(
+            "System health evidence: "
+            f"{render_json_summary(health_summary)}"
+        )
+        self._write(
+            "Security posture evidence: "
+            f"{render_json_summary(posture_summary)}"
+        )
         return False
 
     def _paper_account(self) -> bool:
-        self._write("paper_account_not_available_in_task_3")
+        account = self.api.get("/account")
+        positions = self.api.get("/positions")
+        account_summary = {
+            "observed_at": self._evidence_field(
+                account,
+                "observed_at",
+            ),
+            "buying_power": self._evidence_field(
+                account,
+                "buying_power",
+            ),
+            "equity": self._evidence_field(account, "equity"),
+            "cash": self._evidence_field(account, "cash"),
+            "gross_exposure": self._evidence_field(
+                account,
+                "gross_exposure",
+            ),
+            "positions": self._evidence_field(
+                account,
+                "positions",
+            ),
+        }
+        positions_summary = {
+            "observed_at": self._evidence_field(
+                positions,
+                "observed_at",
+            ),
+            "source": self._evidence_field(positions, "source"),
+            "positions": self._evidence_field(
+                positions,
+                "positions",
+            ),
+        }
+        self._write(
+            "Alpaca paper account evidence: "
+            f"{render_json_summary(account_summary)}"
+        )
+        self._write(
+            "Position evidence: "
+            f"{render_json_summary(positions_summary)}"
+        )
         return False
+
+    @staticmethod
+    def _evidence_field(payload: object, key: str) -> object:
+        if not isinstance(payload, dict):
+            return "unknown"
+        value = payload.get(key)
+        return "unknown" if value is None else value
 
     def _monitoring(self) -> bool:
         self._write("monitoring_not_available_in_task_3")
         return False
 
     def _operations(self) -> bool:
-        self._write("operations_not_available_in_task_3")
+        self._write(_OPERATIONS_MENU)
+        choice = self._menu_choice(
+            self._input("Operations choice: ")
+        )
+        if choice == "0":
+            return False
+        if choice == "1":
+            self.sync_open_orders()
+        elif choice == "2":
+            self.reconcile_positions()
+        elif choice == "3":
+            self.show_logs()
+        else:
+            self._write("Invalid choice")
         return False
 
     def _emergency_safety(self) -> bool:
-        self._write("emergency_safety_not_available_in_task_3")
+        self._write(_EMERGENCY_MENU)
+        choice = self._menu_choice(
+            self._input("Emergency choice: ")
+        )
+        if choice == "0":
+            return False
+        if choice == "1":
+            self.panic()
+        elif choice == "2":
+            self.reset_breaker()
+        else:
+            self._write("Invalid choice")
         return False
+
+    def _mutate_once(
+        self,
+        path: str,
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
+        try:
+            return self.api.mutate(
+                path,
+                payload,
+                idempotent=True,
+            )
+        except OperatorApiError as error:
+            if error.status != 409:
+                raise
+            self._show_api_error(error)
+            self._write("mutation_not_retried")
+            self._system_status()
+            return None
+
+    def sync_open_orders(self) -> None:
+        reason = require_reason(self._input("Reason: "))
+        result = self._mutate_once(
+            "/sync",
+            {"reason": reason},
+        )
+        if result is not None:
+            self._write(
+                f"Order synchronization: {render_json_summary(result)}"
+            )
+
+    def reconcile_positions(self) -> None:
+        reason = require_reason(self._input("Reason: "))
+        self._reauthenticate()
+        result = self._mutate_once(
+            "/reconcile",
+            {"reason": reason},
+        )
+        if result is not None:
+            self._write(
+                f"Position reconciliation: {render_json_summary(result)}"
+            )
+
+    def show_logs(self) -> None:
+        payload = self.api.get("/log")
+        self._write(
+            "Redacted logs: "
+            f"{render_json_summary(_redacted_log_value(payload))}"
+        )
+
+    def panic(self) -> None:
+        reason = require_reason(self._input("Reason: "))
+        self._reauthenticate()
+        if not self._confirm_exact("PANIC ALPACA PAPER"):
+            self._write("Canceled")
+            return
+        result = self._mutate_once(
+            "/panic",
+            {"reason": reason},
+        )
+        if result is None:
+            return
+        if result.get("safe") is not True:
+            self._write("panic_incomplete")
+            self._write(
+                f"Panic receipt: {render_json_summary(result)}"
+            )
+            return
+        self._write(
+            f"Panic complete: {render_json_summary(result)}"
+        )
+
+    @staticmethod
+    def _evidence_timestamp(value: object, code: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 80
+            or _has_control(value)
+        ):
+            raise InputRejected(code)
+        try:
+            parsed = datetime.fromisoformat(
+                value[:-1] + "+00:00"
+                if value.endswith("Z")
+                else value
+            )
+        except ValueError:
+            raise InputRejected(code) from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise InputRejected(code)
+        return value
+
+    @classmethod
+    def _breaker_posture(
+        cls,
+        payload: object,
+    ) -> dict[str, dict[str, object]]:
+        code = "breaker_posture_invalid"
+        if (
+            not isinstance(payload, dict)
+            or payload.get("can_trade") is not False
+        ):
+            raise InputRejected(code)
+        cls._evidence_timestamp(payload.get("observed_at"), code)
+        checks = payload.get("checks")
+        if (
+            not isinstance(checks, list)
+            or len(checks) > _MAX_COLLECTION_ITEMS
+        ):
+            raise InputRejected(code)
+        observed: dict[str, dict[str, object]] = {}
+        for check in checks:
+            if (
+                not isinstance(check, dict)
+                or check.get("name") != "circuit_breaker"
+            ):
+                continue
+            scope = check.get("scope")
+            if (
+                not isinstance(scope, str)
+                or scope not in _BREAKER_CATEGORIES
+                or scope in observed
+            ):
+                raise InputRejected(code)
+            cls._evidence_timestamp(check.get("observed_at"), code)
+            status = check.get("status")
+            count = check.get("count")
+            generation = check.get("generation")
+            if (
+                type(count) is not int
+                or type(generation) is not int
+                or count < 0
+                or generation < 0
+            ):
+                raise InputRejected(code)
+            if status == "clear":
+                if (
+                    count != 0
+                    or check.get("detail_code") != "breaker_clear"
+                ):
+                    raise InputRejected(code)
+            elif status == "tripped":
+                if (
+                    count <= 0
+                    or generation <= 0
+                    or check.get("detail_code")
+                    != "breaker_tripped"
+                ):
+                    raise InputRejected(code)
+            else:
+                raise InputRejected(code)
+            observed[scope] = {
+                "status": status,
+                "count": count,
+                "generation": generation,
+            }
+        if tuple(sorted(observed)) != tuple(
+            sorted(_BREAKER_CATEGORIES)
+        ):
+            raise InputRejected(code)
+        return observed
+
+    @staticmethod
+    def _breaker_candidate(value: object) -> _BreakerCandidate:
+        code = "breaker_evidence_invalid"
+        fields = frozenset({"scope", "kind", "target", "generation"})
+        if not isinstance(value, dict) or frozenset(value) != fields:
+            raise InputRejected(code)
+        scope = value.get("scope")
+        kind = value.get("kind")
+        target = value.get("target")
+        generation = value.get("generation")
+        if (
+            not isinstance(scope, str)
+            or not scope
+            or len(scope) > 64
+            or _has_control(scope)
+            or not isinstance(kind, str)
+            or kind not in _BREAKER_KINDS
+            or not isinstance(target, str)
+            or len(target) > 32
+            or _has_control(target)
+            or type(generation) is not int
+            or generation <= 0
+        ):
+            raise InputRejected(code)
+        if kind in {"operator_global", "broker_drift"}:
+            if target or scope != kind:
+                raise InputRejected(code)
+            category = "account"
+        elif kind in _ASSET_BREAKER_KINDS:
+            if (
+                target not in {"equity", "crypto"}
+                or scope != f"{kind}:{target}"
+            ):
+                raise InputRejected(code)
+            category = target
+        elif kind == "liquidity":
+            if (
+                _LIQUIDITY_TARGET.fullmatch(target) is None
+                or scope != f"liquidity:{target}"
+            ):
+                raise InputRejected(code)
+            category = "liquidity"
+        else:
+            raise InputRejected(code)
+        return _BreakerCandidate(
+            scope=scope,
+            kind=kind,
+            target=target,
+            generation=generation,
+            category=category,
+        )
+
+    @classmethod
+    def _concrete_breakers(
+        cls,
+        health: object,
+        posture: dict[str, dict[str, object]],
+    ) -> tuple[_BreakerCandidate, ...]:
+        code = "breaker_evidence_invalid"
+        if not isinstance(health, dict):
+            raise InputRejected(code)
+        health_observed_at = cls._evidence_timestamp(
+            health.get("observed_at"),
+            code,
+        )
+        safety = health.get("safety")
+        if not isinstance(safety, dict):
+            raise InputRejected(code)
+        if (
+            safety.get("complete") is not True
+            or cls._evidence_timestamp(
+                safety.get("observed_at"),
+                code,
+            )
+            != health_observed_at
+        ):
+            raise InputRejected(code)
+        unknown_categories = safety.get("unknown_categories")
+        if (
+            not isinstance(unknown_categories, list)
+            or unknown_categories
+        ):
+            raise InputRejected(code)
+        active = safety.get("active_breakers")
+        if (
+            not isinstance(active, list)
+            or len(active) > _MAX_COLLECTION_ITEMS
+        ):
+            raise InputRejected(code)
+        candidates: list[_BreakerCandidate] = []
+        seen: set[str] = set()
+        category_counts = {
+            category: 0 for category in _BREAKER_CATEGORIES
+        }
+        category_generations = {
+            category: 0 for category in _BREAKER_CATEGORIES
+        }
+        for item in active:
+            candidate = cls._breaker_candidate(item)
+            if candidate.scope in seen:
+                raise InputRejected(code)
+            seen.add(candidate.scope)
+            candidates.append(candidate)
+            category_counts[candidate.category] += 1
+            category_generations[candidate.category] = max(
+                category_generations[candidate.category],
+                candidate.generation,
+            )
+        for category in _BREAKER_CATEGORIES:
+            aggregate = posture[category]
+            count = category_counts[category]
+            expected_status = "tripped" if count else "clear"
+            if (
+                aggregate["status"] != expected_status
+                or aggregate["count"] != count
+                or (
+                    count
+                    and aggregate["generation"]
+                    < category_generations[category]
+                )
+            ):
+                raise InputRejected(code)
+        return tuple(sorted(candidates, key=lambda item: item.scope))
+
+    def reset_breaker(self) -> None:
+        posture_payload = self.api.get("/security/posture")
+        try:
+            posture = self._breaker_posture(posture_payload)
+        except InputRejected:
+            self._write("breaker_posture_invalid")
+            return
+        self._write(
+            "Fresh breaker posture: "
+            + render_json_summary(
+                {
+                    "observed_at": posture_payload["observed_at"],
+                    "breakers": posture,
+                }
+            )
+        )
+        health = self.api.get("/health")
+        try:
+            candidates = self._concrete_breakers(health, posture)
+        except InputRejected:
+            self._write("breaker_evidence_invalid")
+            return
+        if not candidates:
+            self._write("breaker_reset_unavailable")
+            return
+        by_scope = {candidate.scope: candidate for candidate in candidates}
+        for candidate in candidates:
+            self._write(
+                "Tripped breaker: "
+                f"scope={candidate.scope} "
+                f"generation={candidate.generation}"
+            )
+        selected_scope = self._input("Breaker scope: ")
+        if (
+            not isinstance(selected_scope, str)
+            or len(selected_scope) > 64
+            or _has_control(selected_scope)
+            or selected_scope not in by_scope
+        ):
+            self._write("breaker_selection_invalid")
+            return
+        selected = by_scope[selected_scope]
+        reason = require_reason(self._input("Reason: "))
+        self._reauthenticate()
+        phrase = (
+            f"RESET BREAKER {selected.scope} "
+            f"GENERATION {selected.generation}"
+        )
+        if not self._confirm_exact(phrase):
+            self._write("Canceled")
+            return
+        result = self._mutate_once(
+            "/killswitch/reset",
+            {
+                "scope": selected.scope,
+                "expected_generation": selected.generation,
+                "reason": reason,
+            },
+        )
+        if result is not None:
+            self._write(
+                f"Breaker reset: {render_json_summary(result)}"
+            )
 
     @staticmethod
     def _logout_and_exit() -> bool:
