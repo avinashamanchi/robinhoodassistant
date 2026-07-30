@@ -50,6 +50,8 @@ class AppControlMetadata:
     socket_path: str
     socket_device: int
     socket_inode: int
+    socket_mtime_ns: int
+    socket_ctime_ns: int
 
     def handshake(self) -> dict[str, object]:
         return {
@@ -60,6 +62,8 @@ class AppControlMetadata:
             "argv": self.argv,
             "socket_device": self.socket_device,
             "socket_inode": self.socket_inode,
+            "socket_mtime_ns": self.socket_mtime_ns,
+            "socket_ctime_ns": self.socket_ctime_ns,
         }
 
 
@@ -528,6 +532,12 @@ def _metadata_is_well_formed(metadata: AppControlMetadata) -> bool:
         and isinstance(metadata.socket_inode, int)
         and not isinstance(metadata.socket_inode, bool)
         and metadata.socket_inode > 0
+        and isinstance(metadata.socket_mtime_ns, int)
+        and not isinstance(metadata.socket_mtime_ns, bool)
+        and metadata.socket_mtime_ns >= 0
+        and isinstance(metadata.socket_ctime_ns, int)
+        and not isinstance(metadata.socket_ctime_ns, bool)
+        and metadata.socket_ctime_ns >= 0
     )
 
 
@@ -578,6 +588,8 @@ def read_control_metadata(path: Path) -> AppControlMetadata | None:
             "socket_path",
             "socket_device",
             "socket_inode",
+            "socket_mtime_ns",
+            "socket_ctime_ns",
         }:
             return None
         metadata = AppControlMetadata(**payload)
@@ -619,6 +631,26 @@ def _matching_live_identity(
         and stat.S_IMODE(socket_info.st_mode) == 0o600
         and socket_info.st_dev == metadata.socket_device
         and socket_info.st_ino == metadata.socket_inode
+        and socket_info.st_mtime_ns == metadata.socket_mtime_ns
+        and socket_info.st_ctime_ns == metadata.socket_ctime_ns
+    )
+
+
+def _stable_path_identity_matches(
+    initial: os.stat_result,
+    current: os.stat_result,
+) -> bool:
+    """Reject a pathname replacement even when its inode is immediately reused."""
+    return (
+        initial.st_dev == current.st_dev
+        and initial.st_ino == current.st_ino
+        and initial.st_mode == current.st_mode
+        and initial.st_uid == current.st_uid
+        and initial.st_gid == current.st_gid
+        and initial.st_nlink == current.st_nlink
+        and initial.st_size == current.st_size
+        and initial.st_mtime_ns == current.st_mtime_ns
+        and initial.st_ctime_ns == current.st_ctime_ns
     )
 
 
@@ -655,6 +687,8 @@ def _reclaim_stale_control(
         or stat.S_IMODE(socket_info.st_mode) != 0o600
         or socket_info.st_dev != metadata.socket_device
         or socket_info.st_ino != metadata.socket_inode
+        or socket_info.st_mtime_ns != metadata.socket_mtime_ns
+        or socket_info.st_ctime_ns != metadata.socket_ctime_ns
         or read_control_metadata(metadata_path) != metadata
     ):
         return False
@@ -664,11 +698,12 @@ def _reclaim_stale_control(
         if (
             not stat.S_ISSOCK(current_socket.st_mode)
             or stat.S_IMODE(current_socket.st_mode) != 0o600
-            or current_socket.st_dev != socket_info.st_dev
-            or current_socket.st_ino != socket_info.st_ino
+            or not _stable_path_identity_matches(socket_info, current_socket)
             or not stat.S_ISREG(current_metadata.st_mode)
-            or current_metadata.st_dev != metadata_info.st_dev
-            or current_metadata.st_ino != metadata_info.st_ino
+            or not _stable_path_identity_matches(
+                metadata_info,
+                current_metadata,
+            )
             or current_metadata.st_uid != os.getuid()
             or current_metadata.st_nlink != 1
         ):
@@ -711,8 +746,7 @@ def _reclaim_stale_metadata_only(
     try:
         current = metadata_path.lstat()
         if (
-            current.st_dev != initial.st_dev
-            or current.st_ino != initial.st_ino
+            not _stable_path_identity_matches(initial, current)
             or current.st_uid != os.getuid()
             or current.st_nlink != 1
         ):
@@ -833,6 +867,8 @@ class CooperativeControlServer:
                 stat.S_ISSOCK(socket_info.st_mode)
                 and socket_info.st_dev == self.metadata.socket_device
                 and socket_info.st_ino == self.metadata.socket_inode
+                and socket_info.st_mtime_ns == self.metadata.socket_mtime_ns
+                and socket_info.st_ctime_ns == self.metadata.socket_ctime_ns
             ):
                 path.unlink()
         except OSError:
@@ -931,6 +967,8 @@ def start_app_control(
             socket_path=str(socket_path),
             socket_device=socket_info.st_dev,
             socket_inode=socket_info.st_ino,
+            socket_mtime_ns=socket_info.st_mtime_ns,
+            socket_ctime_ns=socket_info.st_ctime_ns,
         )
         server = CooperativeControlServer(
             metadata,

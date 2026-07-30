@@ -42,14 +42,69 @@ def _metadata(tmp_path):
         socket_path=str(project / "runtime/app-control.sock"),
         socket_device=101,
         socket_inode=202,
+        socket_mtime_ns=1_000,
+        socket_ctime_ns=1_000,
     )
 
 
-def _socket_stat(device=101, inode=202):
+def _socket_stat(
+    device=101,
+    inode=202,
+    mtime_ns=1_000,
+    ctime_ns=1_000,
+):
     return SimpleNamespace(
         st_mode=stat.S_IFSOCK | 0o600,
         st_dev=device,
         st_ino=inode,
+        st_mtime_ns=mtime_ns,
+        st_ctime_ns=ctime_ns,
+    )
+
+
+def test_stable_path_identity_rejects_reused_device_and_inode():
+    from trading_assistant.ops.control import _stable_path_identity_matches
+
+    before = SimpleNamespace(
+        st_dev=101,
+        st_ino=202,
+        st_mode=stat.S_IFSOCK | 0o600,
+        st_uid=os.getuid(),
+        st_gid=os.getgid(),
+        st_nlink=1,
+        st_size=0,
+        st_mtime_ns=1_000,
+        st_ctime_ns=1_000,
+    )
+    replacement = SimpleNamespace(
+        **{
+            **vars(before),
+            "st_ctime_ns": 1_001,
+        },
+    )
+
+    assert _stable_path_identity_matches(before, before)
+    assert not _stable_path_identity_matches(before, replacement)
+
+
+def test_live_identity_rejects_reused_inode_with_changed_timestamp(tmp_path):
+    from trading_assistant.ops.control import _matching_live_identity
+
+    metadata = _metadata(tmp_path)
+    replacement = SimpleNamespace(
+        st_mode=stat.S_IFSOCK | 0o600,
+        st_dev=metadata.socket_device,
+        st_ino=metadata.socket_inode,
+        st_mtime_ns=metadata.socket_mtime_ns,
+        st_ctime_ns=metadata.socket_ctime_ns + 1,
+    )
+
+    assert not _matching_live_identity(
+        metadata,
+        project=Path(metadata.cwd),
+        expected_argv=metadata.argv,
+        inspect_process_fn=lambda _pid: _snapshot(metadata),
+        socket_lstat=lambda _path: replacement,
     )
 
 
@@ -283,6 +338,8 @@ def test_start_control_reclaims_exact_socket_only_for_proven_dead_process(
             socket_path=str(socket_path),
             socket_device=socket_info.st_dev,
             socket_inode=socket_info.st_ino,
+            socket_mtime_ns=socket_info.st_mtime_ns,
+            socket_ctime_ns=socket_info.st_ctime_ns,
         )
         write_control_metadata(metadata_path, stale)
         absence_checks: list[int] = []
@@ -340,6 +397,8 @@ def test_start_control_preserves_stale_artifacts_when_death_is_uncertain(
             socket_path=str(socket_path),
             socket_device=socket_info.st_dev,
             socket_inode=socket_info.st_ino,
+            socket_mtime_ns=socket_info.st_mtime_ns,
+            socket_ctime_ns=socket_info.st_ctime_ns,
         )
         write_control_metadata(metadata_path, stale)
 
@@ -376,6 +435,8 @@ def test_start_control_recovers_metadata_only_cleanup_residue():
             socket_path=str(socket_path),
             socket_device=101,
             socket_inode=202,
+            socket_mtime_ns=1_000,
+            socket_ctime_ns=1_000,
         )
         write_control_metadata(metadata_path, stale)
 
@@ -423,6 +484,8 @@ def test_reclaim_refuses_socket_replaced_during_identity_recheck(monkeypatch):
             socket_path=str(socket_path),
             socket_device=stale_info.st_dev,
             socket_inode=stale_info.st_ino,
+            socket_mtime_ns=stale_info.st_mtime_ns,
+            socket_ctime_ns=stale_info.st_ctime_ns,
         )
         write_control_metadata(metadata_path, stale)
         real_read = control.read_control_metadata
@@ -492,6 +555,8 @@ def test_reclaim_refuses_metadata_replaced_during_identity_recheck(
             socket_path=str(socket_path),
             socket_device=socket_info.st_dev,
             socket_inode=socket_info.st_ino,
+            socket_mtime_ns=socket_info.st_mtime_ns,
+            socket_ctime_ns=socket_info.st_ctime_ns,
         )
         write_control_metadata(metadata_path, stale)
         real_read = control.read_control_metadata
@@ -628,6 +693,8 @@ def test_cooperative_control_authorizes_only_the_exact_handshake(tmp_path):
             "argv": metadata.argv,
             "socket_device": metadata.socket_device,
             "socket_inode": metadata.socket_inode,
+            "socket_mtime_ns": metadata.socket_mtime_ns,
+            "socket_ctime_ns": metadata.socket_ctime_ns,
         }
     )
 
@@ -690,6 +757,8 @@ def test_valid_cooperative_stop_sends_no_external_pid_signal(tmp_path):
             "argv": metadata.argv,
             "socket_device": metadata.socket_device,
             "socket_inode": metadata.socket_inode,
+            "socket_mtime_ns": metadata.socket_mtime_ns,
+            "socket_ctime_ns": metadata.socket_ctime_ns,
         }
     ]
 
