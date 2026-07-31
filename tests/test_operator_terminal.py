@@ -34,7 +34,10 @@ TERMINAL_MODULE = (
 )
 LOGIN_SECRET = "login-secret-never-print"
 REAUTH_SECRET = "reauth-secret-never-print"
-EVIDENCE_AT = datetime.now(timezone.utc).isoformat()
+
+
+def fresh_evidence_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class FakeApi:
@@ -238,8 +241,10 @@ def posture_payload(
     *,
     tripped_category: str | None = None,
     generation: int = 0,
-    observed_at: str = EVIDENCE_AT,
+    observed_at: str | None = None,
 ) -> dict[str, object]:
+    if observed_at is None:
+        observed_at = fresh_evidence_at()
     breaker_checks = []
     for category in ("account", "equity", "crypto", "liquidity"):
         tripped = category == tripped_category
@@ -294,8 +299,10 @@ def health_payload(
     active_breakers: list[dict[str, object]] | None = None,
     safety_complete: bool = True,
     unknown_categories: list[str] | None = None,
-    observed_at: str = EVIDENCE_AT,
+    observed_at: str | None = None,
 ) -> dict[str, object]:
+    if observed_at is None:
+        observed_at = fresh_evidence_at()
     active = deepcopy(active_breakers or [])
     unknown = list(unknown_categories or [])
     return {
@@ -377,7 +384,7 @@ def concrete_breaker(
 
 def account_payload() -> dict[str, object]:
     return {
-        "observed_at": EVIDENCE_AT,
+        "observed_at": fresh_evidence_at(),
         "buying_power": "100000",
         "equity": "100000",
         "cash": "100000",
@@ -609,9 +616,12 @@ def test_monitoring_remains_a_dedicated_no_authority_stub_until_task_5():
 
 def test_status_and_account_are_read_only_and_use_only_exact_get_paths():
     api = FakeApi()
-    api.queue_get("/health", health_payload())
-    api.queue_get("/security/posture", posture_payload())
-    api.queue_get("/account", account_payload())
+    health = health_payload()
+    posture = posture_payload()
+    account = account_payload()
+    api.queue_get("/health", health)
+    api.queue_get("/security/posture", posture)
+    api.queue_get("/account", account)
     api.queue_get(
         "/positions",
         {
@@ -641,11 +651,36 @@ def test_status_and_account_are_read_only_and_use_only_exact_get_paths():
     ]
     assert api.mutations == []
     transcript = "\n".join(output)
-    assert EVIDENCE_AT in transcript
+    assert health["observed_at"] in transcript
+    assert posture["observed_at"] in transcript
+    assert account["observed_at"] in transcript
     assert '"broker": "Alpaca"' in transcript
     assert '"mode": "paper"' in transcript
     assert '"source": "unknown"' in transcript
     assert '"observed_at": "unknown"' in transcript
+
+
+def test_status_ignores_non_authoritative_posture_can_trade_value():
+    api = FakeApi()
+    posture = posture_payload()
+    posture["can_trade"] = "posture-authority-marker-never-print"
+    api.queue_get("/health", health_payload())
+    api.queue_get("/security/posture", posture)
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["1", "0"],
+    )
+
+    assert menu.run() == 0
+
+    posture_line = next(
+        line
+        for line in output
+        if line.startswith("Security posture evidence: ")
+    )
+    assert "can_trade" not in posture_line
+    assert "posture-authority-marker-never-print" not in posture_line
+    assert '"evidence_state": "current"' in posture_line
 
 
 def test_status_never_turns_absent_or_unknown_evidence_into_healthy():
@@ -792,7 +827,7 @@ def test_status_suppresses_healthy_posture_values_when_evidence_is_not_current(
         if line.startswith("Security posture evidence: ")
     )
     assert f'"evidence_state": "{evidence_state}"' in posture_line
-    assert '"can_trade": "unknown"' in posture_line
+    assert "can_trade" not in posture_line
     assert '"checks": "unknown"' in posture_line
     assert '"fresh"' not in posture_line
     assert api.mutations == []
@@ -807,7 +842,7 @@ def test_status_redacts_fields_forbidden_by_the_real_posture_schema():
         {
             "name": "unexpected",
             "status": "unknown",
-            "observed_at": EVIDENCE_AT,
+            "observed_at": posture["observed_at"],
             "detail_code": "unexpected",
             "reason": "posture-reason-never-print",
             "actor": "posture-actor-never-print",
@@ -882,6 +917,7 @@ def test_operations_require_reason_and_mutate_exactly_once(
 
 def test_operations_logs_are_read_only_bounded_and_redacted():
     api = FakeApi()
+    observed_at = fresh_evidence_at()
     api.queue_get(
         "/log",
         {
@@ -891,7 +927,7 @@ def test_operations_logs_are_read_only_bounded_and_redacted():
                     "order_id": 7,
                     "type": "rejection",
                     "reason": "risk-reason-secret-never-print",
-                    "at": EVIDENCE_AT,
+                    "at": observed_at,
                 }
             ],
             "llm_decisions": [
@@ -900,7 +936,7 @@ def test_operations_logs_are_read_only_bounded_and_redacted():
                     "prompt": "prompt-secret-never-print",
                     "reasoning_summary": "reasoning-secret-never-print",
                     "model": "test-model",
-                    "at": EVIDENCE_AT,
+                    "at": observed_at,
                     "api_key": "api-key-never-print",
                 }
             ],
@@ -1185,6 +1221,43 @@ def test_breaker_reset_selects_one_concrete_tripped_scope_and_generation():
     transcript = "\n".join(output)
     assert "loss:equity" in transcript
     assert "generation=7" in transcript
+
+
+def test_breaker_reset_ignores_non_authoritative_posture_can_trade_value():
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    posture["can_trade"] = True
+    api.queue_get("/security/posture", posture)
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+    )
+    menu, _output, _input, _secret, _daemon = build_menu(
+        api,
+        [
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 7",
+        ],
+        secrets=[REAUTH_SECRET],
+    )
+
+    menu.reset_breaker()
+
+    assert api.mutations == [
+        (
+            "/killswitch/reset",
+            {
+                "scope": "loss:equity",
+                "expected_generation": 7,
+                "reason": "verified breaker recovery",
+            },
+            True,
+        )
+    ]
 
 
 @pytest.mark.parametrize(

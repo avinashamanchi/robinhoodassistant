@@ -786,11 +786,6 @@ class OperatorMenu:
                 if posture_observed_at is not None
                 else "unknown"
             ),
-            "can_trade": (
-                self._evidence_field(posture, "can_trade")
-                if posture_current
-                else "unknown"
-            ),
             "checks": (
                 _redacted_posture_value(
                     self._evidence_field(posture, "checks")
@@ -996,10 +991,7 @@ class OperatorMenu:
         now: datetime,
     ) -> tuple[datetime, dict[str, dict[str, object]]]:
         code = "breaker_posture_invalid"
-        if (
-            not isinstance(payload, dict)
-            or payload.get("can_trade") is not False
-        ):
+        if not isinstance(payload, dict):
             raise InputRejected(code)
         state, report_observed_at = cls._observation_state(
             payload.get("observed_at"),
