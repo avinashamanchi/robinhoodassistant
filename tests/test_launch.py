@@ -5,10 +5,17 @@ from __future__ import annotations
 
 import base64
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 import plistlib
+import subprocess
+import sys
+import textwrap
+import time
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +38,315 @@ from trading_assistant.security.sensitive_fields import (
     sensitive_store,
 )
 from tests.safety_helpers import bootstrap_database_to_revision
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+_START_SCRIPT = _ROOT / "scripts/start.sh"
+_START_CURL = "/usr/bin/curl"
+_LIVENESS_URL = "https://localhost:8020/health/live"
+_LIVE_PAYLOAD = '{"alive":true,"database_reachable":true}'
+_TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _write_start_harness_executable(path: Path, source: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o700)
+
+
+@dataclass(frozen=True)
+class StartScriptHarness:
+    project: Path
+    script: Path
+    ca: Path
+    log: Path
+    curl_state: Path
+    serve_state: Path
+    parent: Path
+
+    def run(
+        self,
+        *,
+        control: str = "running",
+        liveness: str = "valid",
+        environment_overrides: dict[str, str] | None = None,
+        interpreter: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        pid_file = self.project / "logs/app.pid"
+        if control == "running":
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text("123\n", encoding="ascii")
+        elif pid_file.exists():
+            pid_file.unlink()
+
+        environment = {
+            "HARNESS_CONTROL": control,
+            "HARNESS_CURL_STATE": str(self.curl_state),
+            "HARNESS_LIVENESS": liveness,
+            "HARNESS_LOG": str(self.log),
+            "HARNESS_SERVE_STATE": str(self.serve_state),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        if environment_overrides is not None:
+            environment.update(environment_overrides)
+        command = [
+            *interpreter,
+            str(self.script),
+        ]
+        return subprocess.run(
+            command,
+            cwd=self.project,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    def events(self) -> list[dict[str, object]]:
+        if not self.log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        ]
+
+
+@pytest.fixture
+def start_script_harness(tmp_path: Path) -> StartScriptHarness:
+    project = tmp_path / "project"
+    script = project / "scripts/start.sh"
+    python = project / ".venv/bin/python"
+    ca = project / ".local/tls/rootCA.pem"
+    fake_curl = tmp_path / "absolute-curl"
+    log = tmp_path / "events.jsonl"
+    curl_state = tmp_path / "curl-count"
+    serve_state = tmp_path / "serve-seen"
+
+    ca.parent.mkdir(parents=True)
+    ca.write_text("test-only CA placeholder\n", encoding="ascii")
+
+    fake_python_source = textwrap.dedent(
+        f"""\
+        #!{sys.executable} -I
+        import json
+        import os
+        from pathlib import Path
+        import sys
+
+        REAL_PYTHON = {sys.executable!r}
+        log = Path(os.environ["HARNESS_LOG"])
+        serve_state = Path(os.environ["HARNESS_SERVE_STATE"])
+
+        def record(**detail):
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {{"event": "python", **detail}},
+                        sort_keys=True,
+                    )
+                    + "\\n"
+                )
+
+        arguments = sys.argv[1:]
+        injected_environment = sorted(
+            name
+            for name in (
+                "PYTHONBREAKPOINT",
+                "PYTHONCASEOK",
+                "PYTHONEXECUTABLE",
+                "PYTHONHOME",
+                "PYTHONINSPECT",
+                "PYTHONPATH",
+                "PYTHONPLATLIBDIR",
+                "PYTHONSTARTUP",
+                "PYTHONUSERBASE",
+                "PYTHONWARNINGS",
+            )
+            if name in os.environ
+        )
+        record(
+            arguments=arguments,
+            bash_env=os.environ.get("BASH_ENV"),
+            injected_environment=injected_environment,
+            instance_id=os.environ.get("TRADING_APP_INSTANCE_ID"),
+            path=os.environ.get("PATH"),
+            python_no_user_site=os.environ.get("PYTHONNOUSERSITE"),
+            python_safe_path=os.environ.get("PYTHONSAFEPATH"),
+        )
+
+        validator = (
+            arguments[:2] == ["-I", "-c"]
+            or (
+                arguments[:1] == ["-c"]
+                and "secrets.token_hex" not in arguments[1]
+            )
+        )
+        if validator:
+            validator_environment = os.environ.copy()
+            for name in (
+                "PYTHONBREAKPOINT",
+                "PYTHONCASEOK",
+                "PYTHONEXECUTABLE",
+                "PYTHONHOME",
+                "PYTHONINSPECT",
+                "PYTHONNOUSERSITE",
+                "PYTHONPATH",
+                "PYTHONPLATLIBDIR",
+                "PYTHONSAFEPATH",
+                "PYTHONSTARTUP",
+                "PYTHONUSERBASE",
+                "PYTHONWARNINGS",
+            ):
+                validator_environment.pop(name, None)
+            os.execve(
+                REAL_PYTHON,
+                [REAL_PYTHON, *arguments],
+                validator_environment,
+            )
+
+        if (
+            arguments[:2]
+            == ["-m", "trading_assistant.ops.control"]
+            and len(arguments) >= 3
+        ):
+            command = arguments[2]
+            if command == "expected-argv":
+                print(
+                    "/test/python "
+                    "-m trading_assistant.ops.serve"
+                )
+                raise SystemExit(0)
+            if command == "validate":
+                raise SystemExit(
+                    0
+                    if os.environ["HARNESS_CONTROL"] == "running"
+                    else 1
+                )
+            if command == "ready":
+                raise SystemExit(
+                    0
+                    if (
+                        os.environ["HARNESS_CONTROL"] == "running"
+                        or serve_state.exists()
+                    )
+                    else 1
+                )
+            if command in {{"begin-start", "abandon-start"}}:
+                raise SystemExit(0)
+            raise SystemExit(97)
+
+        if (
+            arguments[:1] == ["-c"]
+            and "secrets.token_hex" in arguments[1]
+        ):
+            print("a" * 64)
+            raise SystemExit(0)
+
+        if arguments == [
+            "-m",
+            "trading_assistant.ops.serve",
+        ]:
+            serve_state.touch()
+            raise SystemExit(0)
+
+        raise SystemExit(98)
+        """
+    )
+    _write_start_harness_executable(python, fake_python_source)
+
+    fake_curl_source = textwrap.dedent(
+        f"""\
+        #!{sys.executable} -I
+        import json
+        import os
+        from pathlib import Path
+        import sys
+        import time
+
+        log = Path(os.environ["HARNESS_LOG"])
+        state = Path(os.environ["HARNESS_CURL_STATE"])
+        call_number = (
+            int(state.read_text(encoding="ascii"))
+            if state.exists()
+            else 0
+        ) + 1
+        state.write_text(str(call_number), encoding="ascii")
+        arguments = sys.argv[1:]
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {{
+                        "event": "curl",
+                        "arguments": arguments,
+                        "home": os.environ.get("HOME"),
+                        "https_proxy": os.environ.get("HTTPS_PROXY"),
+                        "path": os.environ.get("PATH"),
+                    }},
+                    sort_keys=True,
+                )
+                + "\\n"
+            )
+
+        mode = os.environ["HARNESS_LIVENESS"]
+        first_call = call_number == 1
+        if mode == "stall-once" and first_call:
+            bounded = (
+                "--connect-timeout" in arguments
+                and "--max-time" in arguments
+            )
+            time.sleep(0.05 if bounded else 1.2)
+            raise SystemExit(28)
+        if mode == "curl-error-valid-body-once" and first_call:
+            print({_LIVE_PAYLOAD!r})
+            raise SystemExit(22)
+        if first_call and mode == "duplicate-json":
+            print(
+                '{{"alive":false,"alive":true,'
+                '"database_reachable":true}}'
+            )
+        elif first_call and mode == "integer-json":
+            print('{{"alive":1,"database_reachable":1}}')
+        elif first_call and mode == "float-json":
+            print('{{"alive":1.0,"database_reachable":1.0}}')
+        elif first_call and mode == "oversized":
+            print({_LIVE_PAYLOAD!r} + (" " * 2048))
+        elif first_call and mode == "invalid-utf8":
+            sys.stdout.buffer.write(
+                b'{{"alive":true,"database_reachable":true}}\\xff'
+            )
+        elif first_call and mode == "extra-json":
+            print(
+                '{{"alive":true,"database_reachable":true,'
+                '"extra":true}}'
+            )
+        elif first_call and mode == "false-json":
+            print('{{"alive":false,"database_reachable":true}}')
+        else:
+            print({_LIVE_PAYLOAD!r})
+        """
+    )
+    _write_start_harness_executable(fake_curl, fake_curl_source)
+
+    production_source = _START_SCRIPT.read_text(encoding="utf-8")
+    assert _START_CURL in production_source
+    injected_source = production_source.replace(
+        _START_CURL,
+        str(fake_curl),
+    )
+    _write_start_harness_executable(script, injected_source)
+
+    return StartScriptHarness(
+        project=project,
+        script=script,
+        ca=ca,
+        log=log,
+        curl_state=curl_state,
+        serve_state=serve_state,
+        parent=tmp_path,
+    )
 
 
 def _persist_audit_fixture(session, event: AuditEvent) -> AuditEvent:
@@ -195,6 +511,253 @@ def test_stop_uses_only_cooperative_control_and_never_targets_a_pid():
     assert "trading_assistant.ops.control stop" in stop
     assert "kill " not in stop
     assert "kill " not in identity
+
+
+def test_operator_console_script_targets_fixed_terminal_entrypoint():
+    project = tomllib.loads(
+        Path("pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+
+    assert project["scripts"]["trading-operator"] == (
+        "trading_assistant.ops.operator_terminal:main"
+    )
+
+
+def test_controlled_start_rejects_nonprivileged_shell_entry(
+    start_script_harness: StartScriptHarness,
+):
+    completed = start_script_harness.run(
+        interpreter=("/bin/bash",),
+    )
+
+    assert completed.returncode != 0
+    assert start_script_harness.events() == []
+
+
+def test_controlled_start_isolates_shell_and_python_environment(
+    start_script_harness: StartScriptHarness,
+):
+    fake_bin = start_script_harness.parent / "fake-bin"
+    fake_bash_marker = start_script_harness.parent / "fake-bash-used"
+    bash_env_marker = start_script_harness.parent / "bash-env-used"
+    _write_start_harness_executable(
+        fake_bin / "bash",
+        textwrap.dedent(
+            """\
+            #!/bin/bash
+            /usr/bin/touch "$HARNESS_FAKE_BASH_MARKER"
+            exec /bin/bash "$@"
+            """
+        ),
+    )
+    bash_env = start_script_harness.parent / "bash-env"
+    bash_env.write_text(
+        '/usr/bin/touch "$HARNESS_BASH_ENV_MARKER"\n',
+        encoding="utf-8",
+    )
+
+    completed = start_script_harness.run(
+        environment_overrides={
+            "BASH_ENV": str(bash_env),
+            "CDPATH": "/attacker",
+            "ENV": str(bash_env),
+            "HARNESS_BASH_ENV_MARKER": str(bash_env_marker),
+            "HARNESS_FAKE_BASH_MARKER": str(fake_bash_marker),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PYTHONBREAKPOINT": "attacker.breakpoint",
+            "PYTHONCASEOK": "1",
+            "PYTHONEXECUTABLE": "/attacker/python",
+            "PYTHONHOME": "/attacker",
+            "PYTHONINSPECT": "1",
+            "PYTHONNOUSERSITE": "0",
+            "PYTHONPATH": "/attacker",
+            "PYTHONPLATLIBDIR": "attacker",
+            "PYTHONSAFEPATH": "0",
+            "PYTHONSTARTUP": "/attacker/startup.py",
+            "PYTHONUSERBASE": "/attacker",
+            "PYTHONWARNINGS": "error::attacker.Warning",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not fake_bash_marker.exists()
+    assert not bash_env_marker.exists()
+    python_events = [
+        event
+        for event in start_script_harness.events()
+        if event["event"] == "python"
+    ]
+    assert python_events
+    assert all(
+        event["path"] == _TRUSTED_PATH
+        and event["bash_env"] is None
+        and event["injected_environment"] == []
+        and event["python_no_user_site"] == "1"
+        and event["python_safe_path"] == "1"
+        for event in python_events
+    )
+
+
+def test_controlled_start_uses_pinned_bounded_https_liveness(
+    start_script_harness: StartScriptHarness,
+):
+    home = start_script_harness.parent / "home"
+    home.mkdir()
+    (home / ".curlrc").write_text("--insecure\n", encoding="utf-8")
+
+    completed = start_script_harness.run(
+        environment_overrides={
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "HOME": str(home),
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    events = start_script_harness.events()
+    curl = next(event for event in events if event["event"] == "curl")
+    assert curl["arguments"] == [
+        "--disable",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--noproxy",
+        "*",
+        "--resolve",
+        "localhost:8020:127.0.0.1",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "2",
+        "--max-time",
+        "3",
+        "--max-filesize",
+        "1024",
+        "--cacert",
+        str(start_script_harness.ca),
+        _LIVENESS_URL,
+    ]
+    assert curl["path"] == _TRUSTED_PATH
+    validators = [
+        event
+        for event in events
+        if event["event"] == "python"
+        and event["arguments"][:2] == ["-I", "-c"]
+    ]
+    assert len(validators) == 1
+
+
+@pytest.mark.parametrize(
+    "liveness",
+    (
+        "duplicate-json",
+        "integer-json",
+        "float-json",
+        "oversized",
+        "invalid-utf8",
+        "extra-json",
+        "false-json",
+    ),
+)
+def test_controlled_start_retries_noncanonical_liveness(
+    start_script_harness: StartScriptHarness,
+    liveness: str,
+):
+    completed = start_script_harness.run(liveness=liveness)
+
+    assert completed.returncode == 0, completed.stderr
+    curl_events = [
+        event
+        for event in start_script_harness.events()
+        if event["event"] == "curl"
+    ]
+    assert len(curl_events) == 2
+
+
+def test_controlled_start_uses_finite_liveness_timeouts(
+    start_script_harness: StartScriptHarness,
+):
+    started = time.monotonic()
+    completed = start_script_harness.run(liveness="stall-once")
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 0, completed.stderr
+    # Assert the launcher bounds each liveness curl with --connect-timeout AND
+    # --max-time (the property the harness branches on to sleep 0.05s vs 1.2s),
+    # instead of racing a tight wall-clock bound that is brittle under host
+    # subprocess/interpreter startup overhead.
+    curl_calls = [
+        event
+        for event in start_script_harness.events()
+        if event["event"] == "curl"
+    ]
+    assert len(curl_calls) == 2
+    assert all(
+        "--connect-timeout" in call["arguments"]
+        and "--max-time" in call["arguments"]
+        for call in curl_calls
+    )
+    assert elapsed < 5.0
+
+
+def test_controlled_start_preserves_pipefail_for_curl_errors(
+    start_script_harness: StartScriptHarness,
+):
+    completed = start_script_harness.run(
+        liveness="curl-error-valid-body-once",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sum(
+        event["event"] == "curl"
+        for event in start_script_harness.events()
+    ) == 2
+
+
+def test_controlled_start_preserves_serve_and_expected_argv(
+    start_script_harness: StartScriptHarness,
+):
+    completed = start_script_harness.run(
+        control="absent",
+        environment_overrides={
+            "PYTHONBREAKPOINT": "attacker.breakpoint",
+            "PYTHONHOME": "/attacker",
+            "PYTHONPATH": "/attacker",
+            "PYTHONWARNINGS": "error::attacker.Warning",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    python_events = [
+        event
+        for event in start_script_harness.events()
+        if event["event"] == "python"
+    ]
+    expected_argv = next(
+        event
+        for event in python_events
+        if event["arguments"][-1:] == ["expected-argv"]
+    )
+    serve = next(
+        event
+        for event in python_events
+        if event["arguments"][-1:] == [
+            "trading_assistant.ops.serve"
+        ]
+    )
+    assert expected_argv["arguments"] == [
+        "-m",
+        "trading_assistant.ops.control",
+        "expected-argv",
+    ]
+    assert serve["arguments"] == [
+        "-m",
+        "trading_assistant.ops.serve",
+    ]
+    assert serve["instance_id"] == "a" * 64
+    assert serve["injected_environment"] == []
+    assert serve["python_no_user_site"] == "1"
+    assert serve["python_safe_path"] == "1"
 
 
 def test_manual_launchers_check_interpreter_before_using_it_and_delegate_recovery():

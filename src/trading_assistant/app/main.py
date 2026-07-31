@@ -866,6 +866,12 @@ def _create_app(
     ):
         return {"pending": service.get_pending()}
 
+    @app.get("/rules")
+    def list_rules(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return {"rules": service.list_rules()}
+
     @app.get("/pending/{order_id}/confirmation")
     def pending_confirmation(
         order_id: int,
@@ -1050,6 +1056,38 @@ def _create_app(
                 "order_conflict",
                 409,
                 "Order cancellation could not be confirmed",
+            )
+        return result
+
+    @app.post("/rules/{rule_id}/cancel")
+    def cancel_rule(
+        rule_id: int,
+        body: ApprovalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.rule_cancel",
+            "rule",
+            rule_id,
+        )
+        result = service.cancel_rule(
+            rule_id,
+            actor=context.actor,
+            reason=context.reason,
+            request_id=context.request_id,
+            idempotency_key=context.idempotency_key,
+        )
+        if result.get("error") == "not found":
+            raise ApiError("rule_not_found", 404, "Rule not found")
+        if "error" in result:
+            raise ApiError(
+                "rule_conflict",
+                409,
+                "Rule cancellation is no longer current",
             )
         return result
 

@@ -2938,6 +2938,793 @@ def _check_encrypted_operational_backup_surface(root: Path) -> None:
             _fail(f"plaintext operational backup entrypoint: {surface}")
 
 
+_RUNTIME_CONSOLIDATION_MODULE = (
+    "src/trading_assistant/ops/runtime_consolidation.py"
+)
+_PREEXISTING_SQLITE_COPY_AUTHORITIES = {
+    (
+        "src/trading_assistant/ops/backup.py",
+        "create_encrypted_database_backup",
+    ),
+    (
+        "src/trading_assistant/ops/safety_drill.py",
+        "_online_copy_from_held",
+    ),
+}
+
+
+def _runtime_transfer_function(
+    tree: ast.AST,
+    name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    return next(
+        (
+            node
+            for node in getattr(tree, "body", ())
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ),
+        None,
+    )
+
+
+def _runtime_transfer_function_owners(
+    tree: ast.AST,
+) -> dict[int, str | None]:
+    owners: dict[int, str | None] = {}
+
+    def record(node: ast.AST, owner: str | None) -> None:
+        current = (
+            node.name
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else owner
+        )
+        owners[id(node)] = current
+        for child in ast.iter_child_nodes(node):
+            record(child, current)
+
+    record(tree, None)
+    return owners
+
+
+def _runtime_transfer_tokens(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    tokens: set[str] = set()
+    for candidate in ast.walk(node):
+        if isinstance(candidate, ast.Name):
+            tokens.add(candidate.id)
+        elif isinstance(candidate, ast.Attribute):
+            tokens.add(candidate.attr)
+        elif (
+            isinstance(candidate, ast.Constant)
+            and isinstance(candidate.value, str)
+        ):
+            tokens.add(candidate.value)
+    return tokens
+
+
+def _runtime_transfer_call(
+    node: ast.AST,
+    *,
+    name: str,
+    owner: str | None = None,
+) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    if owner is None:
+        return _call_name(node) == name
+    return _attribute_path(node.func) == (owner, name)
+
+
+def _runtime_transfer_mode(call: ast.Call) -> int | None:
+    if len(call.args) >= 3:
+        mode = call.args[2]
+        if isinstance(mode, ast.Constant) and type(mode.value) is int:
+            return mode.value
+    for keyword in call.keywords:
+        if (
+            keyword.arg == "mode"
+            and isinstance(keyword.value, ast.Constant)
+            and type(keyword.value.value) is int
+        ):
+            return keyword.value.value
+    return None
+
+
+def _runtime_transfer_assigned_calls(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    called: str,
+) -> dict[str, ast.Call]:
+    assigned: dict[str, ast.Call] = {}
+    for node in ast.walk(function):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if not (
+            isinstance(node.value, ast.Call)
+            and _call_name(node.value) == called
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned[target.id] = node.value
+    return assigned
+
+
+def _runtime_transfer_imports(
+    tree: ast.AST,
+    name: str,
+) -> bool:
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and any(
+            imported.name == name
+            for imported in node.names
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _runtime_transfer_calls(
+    node: ast.AST,
+    name: str,
+) -> list[ast.Call]:
+    return [
+        candidate
+        for candidate in ast.walk(node)
+        if isinstance(candidate, ast.Call)
+        and _call_name(candidate) == name
+    ]
+
+
+def _runtime_transfer_plaintext_stage(
+    call: ast.Call,
+    assigned_plaintext_paths: set[str],
+) -> bool:
+    argument = (
+        call.args[0]
+        if call.args
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "database"
+            ),
+            None,
+        )
+    )
+    if argument is None:
+        return False
+    for candidate in ast.walk(argument):
+        if isinstance(candidate, ast.Name):
+            lowered = candidate.id.lower()
+            if (
+                candidate.id in assigned_plaintext_paths
+                or any(
+                    marker in lowered
+                    for marker in (
+                        "stage",
+                        "staging",
+                        "copy",
+                        "snapshot",
+                        "temporary",
+                    )
+                )
+            ):
+                return True
+        if (
+            isinstance(candidate, ast.Constant)
+            and isinstance(candidate.value, str)
+        ):
+            lowered = candidate.value.lower()
+            if lowered.endswith((".db", ".sqlite", ".sqlite3")):
+                return True
+            if any(
+                marker in lowered
+                for marker in (
+                    "stage",
+                    "staging",
+                    "copy",
+                    "snapshot",
+                    "temporary",
+                )
+            ):
+                return True
+    return False
+
+
+def _check_runtime_transfer_exclusivity(root: Path) -> None:
+    approved = {
+        *_PREEXISTING_SQLITE_COPY_AUTHORITIES,
+        (_RUNTIME_CONSOLIDATION_MODULE, "consolidate_runtime"),
+    }
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        function_owners = _runtime_transfer_function_owners(tree)
+        backup_aliases = _call_aliases(
+            tree,
+            {"backup"},
+            dynamic_getattr=False,
+        )
+        assigned_plaintext_paths: set[str] = set()
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = _literal_string(assignment.value)
+            if value is None or not value.lower().endswith(
+                (".db", ".sqlite", ".sqlite3")
+            ):
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            assigned_plaintext_paths.update(
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            )
+
+        for node in ast.walk(tree):
+            enclosing = function_owners.get(id(node))
+            authority = (relative, enclosing or "")
+            if isinstance(node, ast.Call):
+                direct_backup = (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "backup"
+                )
+                aliased_backup = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in backup_aliases
+                )
+                if (direct_backup or aliased_backup) and authority not in approved:
+                    _fail(
+                        "SQLite backup outside verified transfer authority: "
+                        f"{relative}:{node.lineno}"
+                    )
+                if (
+                    _runtime_transfer_call(
+                        node,
+                        name="connect",
+                        owner="sqlite3",
+                    )
+                    and _runtime_transfer_plaintext_stage(
+                        node,
+                        assigned_plaintext_paths,
+                    )
+                    and authority not in approved
+                ):
+                    _fail(
+                        "plaintext SQLite staging outside verified transfer "
+                        f"authority: {relative}:{node.lineno}"
+                    )
+
+            database_copy_name = (
+                isinstance(node, ast.Name)
+                and "database_copy" in node.id.lower()
+            ) or (
+                isinstance(node, ast.arg)
+                and "database_copy" in node.arg.lower()
+            ) or (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and re.search(
+                    r"database[_ -]?copy",
+                    node.value,
+                    flags=re.IGNORECASE,
+                )
+                is not None
+            )
+            database_copy_authorized = (
+                relative
+                == "src/trading_assistant/ops/safety_drill.py"
+                or authority
+                == (
+                    _RUNTIME_CONSOLIDATION_MODULE,
+                    "consolidate_runtime",
+                )
+            )
+            if database_copy_name and not database_copy_authorized:
+                _fail(
+                    "database-copy naming outside verified transfer "
+                    f"authority: {relative}:{getattr(node, 'lineno', 1)}"
+                )
+
+
+def _check_verified_runtime_consolidation_transfer(root: Path) -> None:
+    _check_runtime_transfer_exclusivity(root)
+    relative = _RUNTIME_CONSOLIDATION_MODULE
+    path = root / relative
+    if not path.exists():
+        return
+    source_text = path.read_text(encoding="utf-8")
+    tree = ast.parse(source_text, filename=relative)
+    function = _runtime_transfer_function(tree, "consolidate_runtime")
+    if function is None or isinstance(function, ast.AsyncFunctionDef):
+        _fail("verified runtime consolidation entrypoint missing")
+
+    forbidden_imports = {
+        "aiohttp",
+        "alpaca",
+        "broker",
+        "glob",
+        "http",
+        "httpx",
+        "llm",
+        "requests",
+        "shlex",
+        "socket",
+        "subprocess",
+        "urllib",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_parts = {
+                part
+                for imported in node.names
+                for part in imported.name.split(".")
+            }
+            if imported_parts & forbidden_imports:
+                _fail("runtime consolidation imports active integration")
+        elif isinstance(node, ast.ImportFrom):
+            imported_parts = (
+                set(node.module.split("."))
+                if isinstance(node.module, str)
+                else set()
+            )
+            imported_parts.update(
+                imported.name
+                for imported in node.names
+            )
+            if imported_parts & forbidden_imports:
+                _fail("runtime consolidation imports active integration")
+
+    constants = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+    }
+    production_destination = (
+        "/Users/avi/Desktop/robinhood/trading-assistant"
+    )
+    production_source = (
+        production_destination
+        + "/.worktrees/safety-foundation"
+    )
+    if production_destination not in constants:
+        _fail("runtime consolidation destination root is not exact")
+    source_assignment = next(
+        (
+            node
+            for node in getattr(tree, "body", ())
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id in {
+                    "_PRODUCTION_SOURCE",
+                    "PRODUCTION_SOURCE",
+                }
+                for target in (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+            )
+        ),
+        None,
+    )
+    source_composed = bool(
+        source_assignment is not None
+        and "_PRODUCTION_DESTINATION"
+        in _runtime_transfer_tokens(source_assignment.value)
+        and ".worktrees"
+        in _runtime_transfer_tokens(source_assignment.value)
+        and "safety-foundation"
+        in _runtime_transfer_tokens(source_assignment.value)
+    )
+    if production_source not in constants and not source_composed:
+        _fail("runtime consolidation source root is not exact")
+
+    worktree_comparison = any(
+        isinstance(node, ast.Compare)
+        and _attribute_path(node.left)
+        in {
+            ("source_root", "parent", "name"),
+            ("Path", "source_root", "parent", "name"),
+        }
+        and ".worktrees" in _runtime_transfer_tokens(node)
+        for node in ast.walk(tree)
+    )
+    if not source_composed and not worktree_comparison:
+        _fail("runtime consolidation worktree identity is unproven")
+
+    strict_resolves = [
+        call
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "resolve"
+        and any(
+            keyword.arg == "strict"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+    ]
+    validate_exact_root = _runtime_transfer_function(
+        tree,
+        "_validate_exact_root",
+    )
+    validate_inputs = _runtime_transfer_function(tree, "_validate_inputs")
+    helper_root_validation = bool(
+        validate_exact_root is not None
+        and validate_inputs is not None
+        and len(
+            _runtime_transfer_calls(
+                validate_inputs,
+                "_validate_exact_root",
+            )
+        )
+        >= 2
+        and _runtime_transfer_calls(function, "_validate_inputs")
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "resolve"
+            and any(
+                keyword.arg == "strict"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in call.keywords
+            )
+            for call in ast.walk(validate_exact_root)
+        )
+    )
+    if len(strict_resolves) < 2 and not helper_root_validation:
+        _fail("runtime consolidation root resolution is unproven")
+
+    module_tokens = _runtime_transfer_tokens(tree)
+    if not {
+        "lstat",
+        "fstat",
+        "st_uid",
+        "st_mode",
+        "st_nlink",
+    }.issubset(module_tokens):
+        _fail("runtime consolidation descriptor validation is incomplete")
+    if not (
+        _runtime_transfer_imports(tree, "prove_app_absent")
+        and _runtime_transfer_calls(tree, "prove_app_absent")
+        and _runtime_transfer_imports(tree, "RuntimeTenureService")
+    ):
+        _fail("runtime consolidation cooperative absence is unproven")
+
+    direct_maintenance = _runtime_transfer_calls(
+        function,
+        "acquire_maintenance",
+    )
+    maintenance_helper = _runtime_transfer_function(tree, "_maintenance")
+    helper_maintenance = bool(
+        maintenance_helper is not None
+        and _runtime_transfer_calls(
+            maintenance_helper,
+            "acquire_maintenance",
+        )
+        and len(_runtime_transfer_calls(function, "_maintenance")) >= 2
+    )
+    if len(direct_maintenance) < 2 and not helper_maintenance:
+        _fail("runtime consolidation dual maintenance is unproven")
+
+    assigned_backups = _runtime_transfer_assigned_calls(
+        function,
+        "backup_database",
+    )
+    source_backup = assigned_backups.get("source_backup")
+    destination_backup = assigned_backups.get("destination_backup")
+    if source_backup is None or destination_backup is None:
+        _fail("runtime consolidation encrypted backups are incomplete")
+    if source_backup.lineno >= destination_backup.lineno:
+        _fail("runtime consolidation backup ordering is unproven")
+    if (
+        "source"
+        not in " ".join(_runtime_transfer_tokens(source_backup)).lower()
+        or "destination"
+        not in " ".join(
+            _runtime_transfer_tokens(destination_backup)
+        ).lower()
+    ):
+        _fail("runtime consolidation backup identities are unproven")
+    verified_receipts: set[str] = set()
+    for name in ("source_backup", "destination_backup"):
+        helper_verified = any(
+            _call_name(call) == "_verify_backup_receipt"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == name
+            for call in (
+                candidate
+                for candidate in ast.walk(function)
+                if isinstance(candidate, ast.Call)
+            )
+        )
+        receipt_attributes = {
+            node.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+        }
+        if helper_verified or {
+            "verified",
+            "backup_key_id",
+        }.issubset(receipt_attributes):
+            verified_receipts.add(name)
+    if verified_receipts != {"source_backup", "destination_backup"}:
+        _fail("runtime consolidation backup verification is incomplete")
+
+    open_flags = _runtime_transfer_function(tree, "_open_flags")
+    helper_nofollow = bool(
+        open_flags is not None
+        and "O_NOFOLLOW" in _runtime_transfer_tokens(open_flags)
+    )
+    open_calls = [
+        call
+        for call in ast.walk(function)
+        if _runtime_transfer_call(call, name="open", owner="os")
+    ]
+    staging_opens = [
+        call
+        for call in open_calls
+        if call.args
+        and {
+            "staging",
+            "staging_path",
+        }
+        & _runtime_transfer_tokens(call.args[0])
+    ]
+    if len(staging_opens) != 1:
+        _fail("runtime consolidation staging creation is unproven")
+    staging_open = staging_opens[0]
+    staging_flag_tokens = (
+        _runtime_transfer_tokens(staging_open.args[1])
+        if len(staging_open.args) >= 2
+        else set()
+    )
+    if (
+        "O_EXCL" not in staging_flag_tokens
+        or _runtime_transfer_mode(staging_open) != 0o600
+        or not (
+            "O_NOFOLLOW" in staging_flag_tokens
+            or helper_nofollow
+            and "_open_flags" in staging_flag_tokens
+        )
+    ):
+        _fail("runtime consolidation staging creation is unsafe")
+    if not helper_nofollow:
+        source_opens = [
+            call
+            for call in open_calls
+            if call.args
+            and "source" in _runtime_transfer_tokens(call.args[0])
+        ]
+        if not source_opens or not all(
+            len(call.args) >= 2
+            and "O_NOFOLLOW"
+            in _runtime_transfer_tokens(call.args[1])
+            for call in source_opens
+        ):
+            _fail("runtime consolidation source descriptor can follow links")
+
+    private_mode = any(
+        (
+            _runtime_transfer_call(call, name="mkdir")
+            and any(
+                keyword.arg == "mode"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == 0o700
+                for keyword in call.keywords
+            )
+        )
+        or (
+            _runtime_transfer_call(call, name="chmod", owner="os")
+            and len(call.args) >= 2
+            and isinstance(call.args[1], ast.Constant)
+            and call.args[1].value == 0o700
+        )
+        for call in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        )
+    )
+    if not private_mode:
+        _fail("runtime consolidation private directory mode is unsafe")
+
+    sqlite_backup_calls = [
+        call
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "backup"
+    ]
+    if len(sqlite_backup_calls) != 1:
+        _fail("runtime consolidation SQLite transfer authority is unproven")
+    if not {
+        "PRAGMA quick_check",
+        "PRAGMA foreign_key_check",
+    }.issubset(constants):
+        _fail("runtime consolidation integrity checks are incomplete")
+
+    schema_helper = _runtime_transfer_function(tree, "_require_schema")
+    direct_schema_checks = _runtime_transfer_calls(
+        function,
+        "require_current_schema",
+    )
+    helper_schema_checks = bool(
+        schema_helper is not None
+        and _runtime_transfer_calls(
+            schema_helper,
+            "require_current_schema",
+        )
+        and len(_runtime_transfer_calls(function, "_require_schema")) >= 2
+    )
+    if len(direct_schema_checks) < 2 and not helper_schema_checks:
+        _fail("runtime consolidation schema checks are incomplete")
+
+    summary_calls = [
+        call
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and _call_name(call) in {"logical_summary", "_logical_summary"}
+    ]
+    if len(summary_calls) < 2:
+        _fail("runtime consolidation logical summary is incomplete")
+
+    staged_fsync = any(
+        _runtime_transfer_call(call, name="fsync", owner="os")
+        and call.args
+        and any(
+            "staging" in token.lower()
+            for token in _runtime_transfer_tokens(call.args[0])
+        )
+        for call in ast.walk(function)
+    )
+    directory_fsync = bool(
+        _runtime_transfer_calls(function, "_fsync_directory")
+        or any(
+            _runtime_transfer_call(call, name="fsync", owner="os")
+            and call.args
+            and any(
+                "directory" in token.lower()
+                for token in _runtime_transfer_tokens(call.args[0])
+            )
+            for call in ast.walk(function)
+        )
+    )
+    if not staged_fsync or not directory_fsync:
+        _fail("runtime consolidation fsync sequence is incomplete")
+
+    rename_calls = [
+        call
+        for call in ast.walk(function)
+        if _runtime_transfer_call(call, name="rename", owner="os")
+        and len(call.args) >= 2
+    ]
+    replacement_renames = [
+        call
+        for call in rename_calls
+        if "replacement" in _runtime_transfer_tokens(call.args[1])
+    ]
+    staging_renames = [
+        call
+        for call in rename_calls
+        if any(
+            "staging" in token.lower()
+            for token in _runtime_transfer_tokens(call.args[0])
+        )
+    ]
+    if (
+        len(replacement_renames) != 1
+        or len(staging_renames) != 1
+        or replacement_renames[0].lineno >= staging_renames[0].lineno
+    ):
+        _fail("runtime consolidation atomic install is unproven")
+
+    if "migration_uncertain" not in constants:
+        _fail("runtime consolidation uncertainty marker is missing")
+    marker_functions = [
+        candidate
+        for candidate in ast.walk(tree)
+        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and "marker" in candidate.name
+    ]
+    marker_scope: ast.AST = (
+        marker_functions[0] if marker_functions else function
+    )
+    marker_opens = [
+        call
+        for call in ast.walk(marker_scope)
+        if _runtime_transfer_call(call, name="open", owner="os")
+    ]
+    if marker_functions and not marker_opens:
+        marker_scope = function
+        marker_opens = [
+            call
+            for call in ast.walk(marker_scope)
+            if _runtime_transfer_call(call, name="open", owner="os")
+            and call.args
+            and "marker" in _runtime_transfer_tokens(call.args[0])
+        ]
+    if not any(
+        _runtime_transfer_mode(call) == 0o600
+        and len(call.args) >= 2
+        and "O_EXCL" in _runtime_transfer_tokens(call.args[1])
+        and (
+            "O_NOFOLLOW" in _runtime_transfer_tokens(call.args[1])
+            or helper_nofollow
+            and "_open_flags" in _runtime_transfer_tokens(call.args[1])
+        )
+        for call in marker_opens
+    ):
+        _fail("runtime consolidation uncertainty marker is unsafe")
+
+    for call in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    ):
+        called = _call_name(call)
+        if called not in {"unlink", "_unlink_validated_regular"}:
+            continue
+        deletion = (
+            call.args[0]
+            if call.args
+            else call.func.value
+            if isinstance(call.func, ast.Attribute)
+            else None
+        )
+        deletion_tokens = {
+            token.lower()
+            for token in _runtime_transfer_tokens(deletion)
+        }
+        if any(
+            token.startswith("source")
+            or token == "destination_backup"
+            for token in deletion_tokens
+        ):
+            _fail("runtime consolidation deletes protected authority")
+
+    if any(
+        isinstance(node, ast.Return)
+        and any(
+            marker in token.lower()
+            for token in _runtime_transfer_tokens(node.value)
+            for marker in ("replacement", "archive")
+        )
+        for node in ast.walk(function)
+    ):
+        _fail("runtime consolidation retains plaintext archive authority")
+    replacement_cleanup = any(
+        isinstance(call, ast.Call)
+        and _call_name(call) in {"unlink", "_unlink_validated_regular"}
+        and (
+            call.args
+            and "replacement"
+            in _runtime_transfer_tokens(call.args[0])
+            or isinstance(call.func, ast.Attribute)
+            and "replacement"
+            in _runtime_transfer_tokens(call.func.value)
+        )
+        for call in ast.walk(function)
+    )
+    if not replacement_cleanup:
+        _fail("runtime consolidation replacement cleanup is missing")
+
+
 _APPROVED_PROVIDER_ORIGINS = {
     "alpaca_trading": "https://paper-api.alpaca.markets",
     "alpaca_data": "https://data.alpaca.markets",
@@ -3084,6 +3871,7 @@ _OUTBOUND_REQUEST_METHODS = frozenset(
         "ws_connect",
     }
 )
+_OPERATOR_API_PATH = "src/trading_assistant/ops/operator_api.py"
 _PROVIDER_CLIENT_IMPORTS = frozenset(
     {
         "Anthropic",
@@ -3094,6 +3882,493 @@ _PROVIDER_CLIENT_IMPORTS = frozenset(
         "TradingClient",
     }
 )
+
+
+_OPERATOR_API_MODULE_TEMPLATE_SOURCE = r'''
+"""Strict, memory-only HTTPS client for the local operator application."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from http.client import HTTPException
+import json
+import math
+from pathlib import Path
+import secrets
+import ssl
+import stat
+from http.cookiejar import CookieJar
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import (
+    HTTPSHandler,
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+from ..config import load_config
+
+
+_ORIGIN = "https://localhost:8020"
+_BIND_HOST = "127.0.0.1"
+_CA_RELATIVE_PATH = Path(".local/tls/rootCA.pem")
+_GENERIC_HTTP_MESSAGE = "Operator API request failed"
+_GENERIC_REQUEST_MESSAGE = "Operator API transport failed"
+
+
+@dataclass(frozen=True)
+class OperatorSession:
+    actor: str
+    csrf_token: str
+    expires_at: str | None
+
+
+class OperatorApiError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        status: int | None,
+        code: str,
+        message: str,
+        request_id: str | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        self.status = status
+        self.code = code
+        self.request_id = request_id
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
+def _require_text(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise OperatorApiError(
+            status=200,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        )
+    return value
+
+
+def _optional_text(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise OperatorApiError(
+            status=200,
+            code="operator_response_invalid",
+            message="Operator API response is invalid",
+        )
+    return value
+
+
+def _positive_finite(value: float, *, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValueError(name)
+    return float(value)
+
+
+class OperatorApiClient:
+    """Reach only the configured local HTTPS operator application."""
+
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        opener: Any = None,
+        timeout_seconds: float = 10.0,
+        max_response_bytes: int = 1_048_576,
+        config_loader: Callable[[Path], Any] = load_config,
+        ssl_context_factory: Callable[..., ssl.SSLContext] = ssl.create_default_context,
+    ) -> None:
+        self._project_root = self._resolve_project_root(project_root)
+        self._timeout_seconds = _positive_finite(
+            timeout_seconds, name="operator_timeout_invalid"
+        )
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("operator_response_bound_invalid")
+        self._max_response_bytes = max_response_bytes
+
+        config = config_loader(self._project_root / "config.yaml")
+        self._validate_config(config)
+        ca_path = self._validated_ca_path(config)
+        context = ssl_context_factory(cafile=str(ca_path))
+        if (
+            getattr(context, "check_hostname", None) is not True
+            or getattr(context, "verify_mode", None) != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("operator_tls_invalid")
+
+        self._cookies = CookieJar()
+        self._csrf_token: str | None = None
+
+        class _NoRedirect(HTTPRedirectHandler):
+            """Treat every redirect as a failed local request, never a new destination."""
+
+            def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                return None
+
+        self._opener = opener or build_opener(
+            ProxyHandler({}),
+            HTTPCookieProcessor(self._cookies),
+            HTTPSHandler(context=context),
+            _NoRedirect(),
+        )
+
+    @staticmethod
+    def _resolve_project_root(project_root: Path) -> Path:
+        root = Path(project_root)
+        if root.is_symlink():
+            raise ValueError("operator_project_root_invalid")
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError:
+            raise ValueError("operator_project_root_invalid") from None
+        if not resolved.is_dir():
+            raise ValueError("operator_project_root_invalid")
+        return resolved
+
+    @staticmethod
+    def _validate_config(config: Any) -> None:
+        server = getattr(config, "server", None)
+        if (
+            server is None
+            or str(getattr(server, "origin", "")) != _ORIGIN
+            or getattr(server, "bind_host", None) != _BIND_HOST
+            or Path(getattr(server, "tls_ca_path", "")) != _CA_RELATIVE_PATH
+        ):
+            raise ValueError("operator_origin_invalid")
+
+    def _validated_ca_path(self, config: Any) -> Path:
+        relative = Path(config.server.tls_ca_path)
+        candidate = self._project_root
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ValueError("operator_ca_invalid")
+        try:
+            mode = candidate.stat().st_mode
+        except OSError:
+            raise ValueError("operator_ca_invalid") from None
+        if not stat.S_ISREG(mode):
+            raise ValueError("operator_ca_invalid")
+        return candidate
+
+    @staticmethod
+    def _path(path: str) -> str:
+        if not isinstance(path, str):
+            raise ValueError("operator_path_invalid")
+        parsed = urlsplit(path)
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or not path.startswith("/")
+            or path.startswith("//")
+            or quote(path, safe="/-._~") != path
+        ):
+            raise ValueError("operator_path_invalid")
+        segments = path.split("/")[1:]
+        if any(segment in {"", ".", ".."} for segment in segments):
+            raise ValueError("operator_path_invalid")
+        return path
+
+    def _read_payload(self, stream: Any, *, status: int | None) -> dict[str, object]:
+        try:
+            body = stream.read(self._max_response_bytes + 1)
+        except Exception:
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            ) from None
+        if not isinstance(body, bytes):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            )
+        if len(body) > self._max_response_bytes:
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_too_large",
+                message="Operator API response is too large",
+            )
+        try:
+            payload = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            ) from None
+        if not isinstance(payload, dict):
+            raise OperatorApiError(
+                status=status,
+                code="operator_response_invalid",
+                message="Operator API response is invalid",
+            )
+        return payload
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        authenticated: bool = True,
+    ) -> dict[str, object]:
+        canonical_path = self._path(path)
+        body: bytes | None = None
+        request_headers = {"Accept": "application/json"}
+        if not authenticated:
+            # CookieJar honors an explicitly supplied Cookie header, so this
+            # prevents a prior authenticated session from crossing this
+            # request boundary while retaining its ability to store login
+            # response cookies.
+            request_headers["Cookie"] = ""
+        if headers:
+            request_headers.update(headers)
+        if payload is not None:
+            try:
+                body = json.dumps(
+                    payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError):
+                raise ValueError("operator_payload_invalid") from None
+            request_headers["Content-Type"] = "application/json"
+        request = Request(
+            _ORIGIN + canonical_path,
+            data=body,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
+                status = getattr(response, "status", 200)
+                return self._read_payload(response, status=status)
+        except HTTPError as error:
+            failure = self._http_failure(error)
+        except ssl.SSLError:
+            failure = OperatorApiError(
+                status=None,
+                code="operator_tls_failed",
+                message=_GENERIC_REQUEST_MESSAGE,
+            )
+        except (HTTPException, URLError, TimeoutError, OSError):
+            failure = OperatorApiError(
+                status=None,
+                code="operator_request_failed",
+                message=_GENERIC_REQUEST_MESSAGE,
+            )
+        if failure.status == 401:
+            self._clear_auth_state()
+        raise failure
+
+    def _http_failure(self, error: HTTPError) -> OperatorApiError:
+        status = getattr(error, "code", None)
+        retry_after = _retry_after(getattr(error, "headers", None))
+        try:
+            payload = self._read_payload(error, status=status)
+        except OperatorApiError as invalid:
+            return OperatorApiError(
+                status=status,
+                code=invalid.code,
+                message=str(invalid),
+                retry_after=retry_after,
+            )
+        envelope = payload.get("error")
+        if not isinstance(envelope, dict):
+            return OperatorApiError(
+                status=status,
+                code="operator_http_error",
+                message=_GENERIC_HTTP_MESSAGE,
+                retry_after=retry_after,
+            )
+        code = envelope.get("code")
+        message = envelope.get("message")
+        request_id = envelope.get("request_id")
+        if (
+            not isinstance(code, str)
+            or not code
+            or not isinstance(message, str)
+            or not message
+            or (request_id is not None and not isinstance(request_id, str))
+        ):
+            return OperatorApiError(
+                status=status,
+                code="operator_http_error",
+                message=_GENERIC_HTTP_MESSAGE,
+                retry_after=retry_after,
+            )
+        return OperatorApiError(
+            status=status,
+            code=code,
+            message=message,
+            request_id=request_id,
+            retry_after=retry_after,
+        )
+
+    def login(self, secret: str) -> OperatorSession:
+        try:
+            payload = self._request(
+                "POST", "/auth/login", {"secret": secret}, authenticated=False
+            )
+            csrf_token = _require_text(payload, "csrf_token")
+            actor = _require_text(payload, "actor")
+            expires_at = _optional_text(payload, "expires_at")
+        except OperatorApiError as error:
+            if error.status is not None and 200 <= error.status < 300:
+                self._clear_auth_state()
+            raise
+        self._csrf_token = csrf_token
+        return OperatorSession(
+            actor=actor,
+            csrf_token=csrf_token,
+            expires_at=expires_at,
+        )
+
+    def reauthenticate(self, secret: str) -> OperatorSession:
+        csrf_token = self._require_csrf()
+        payload = self._request(
+            "POST",
+            "/auth/reauth",
+            {"secret": secret},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        return OperatorSession(
+            actor=_require_text(payload, "actor"),
+            csrf_token=csrf_token,
+            expires_at=_optional_text(payload, "expires_at"),
+        )
+
+    def logout(self) -> None:
+        try:
+            self._request(
+                "POST",
+                "/auth/logout",
+                {},
+                headers={"X-CSRF-Token": self._require_csrf()},
+            )
+        finally:
+            self._clear_auth_state()
+
+    def get(self, path: str, *, authenticated: bool = True) -> dict[str, object]:
+        return self._request("GET", path, authenticated=authenticated)
+
+    def mutate(
+        self,
+        path: str,
+        payload: dict[str, object],
+        *,
+        idempotent: bool,
+    ) -> dict[str, object]:
+        headers = {"X-CSRF-Token": self._require_csrf()}
+        if idempotent:
+            headers["Idempotency-Key"] = secrets.token_urlsafe(32)
+        return self._request("POST", path, payload, headers=headers)
+
+    def _require_csrf(self) -> str:
+        if not self._csrf_token:
+            raise OperatorApiError(
+                status=None,
+                code="operator_csrf_missing",
+                message="Operator session is not authenticated",
+            )
+        return self._csrf_token
+
+    def _clear_auth_state(self) -> None:
+        self._csrf_token = None
+        self._cookies.clear()
+
+
+def _reject_constant(_value: str) -> None:
+    raise ValueError("invalid JSON constant")
+
+
+def _retry_after(headers: Any) -> int | None:
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    return min(max(int(value.strip()), 0), 3600)
+'''
+
+
+def _location_free_ast(value: Any) -> Any:
+    """Return deterministic AST structure without source-location metadata."""
+
+    if isinstance(value, ast.AST):
+        return (
+            type(value).__name__,
+            tuple(
+                (field, _location_free_ast(field_value))
+                for field, field_value in ast.iter_fields(value)
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_location_free_ast(item) for item in value)
+    return value
+
+
+# The readable template and candidate are parsed by the same supported Python
+# interpreter. ast.iter_fields includes every executable syntax field known to
+# that interpreter, while source-location attributes, comments, and whitespace
+# are absent. This avoids a precomputed ast.dump hash that could drift across
+# the project's Python 3.11+ runtime matrix.
+_OPERATOR_API_MODULE_TEMPLATE = _location_free_ast(
+    ast.parse(_OPERATOR_API_MODULE_TEMPLATE_SOURCE)
+)
+
+
+def _operator_api_approved_calls(
+    tree: ast.AST,
+    relative: str,
+) -> set[ast.Call]:
+    """Return only the two calls from the exact audited Task 2 module."""
+
+    if (
+        relative != _OPERATOR_API_PATH
+        or _location_free_ast(tree) != _OPERATOR_API_MODULE_TEMPLATE
+    ):
+        return set()
+
+    opener_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("build_opener",)
+    ]
+    request_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("Request",)
+    ]
+    if len(opener_calls) != 1 or len(request_calls) != 1:
+        return set()
+    return {opener_calls[0], request_calls[0]}
+
+
 _APPROVED_PROVIDER_CLIENT_PATHS = {
     "Anthropic": frozenset(
         {"src/trading_assistant/llm/anthropic_backend.py"}
@@ -4475,6 +5750,10 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
             return function, class_node
 
         constants = _module_string_constants(tree)
+        approved_operator_api_calls = _operator_api_approved_calls(
+            tree,
+            relative,
+        )
         mapping_entries = _mapping_alias_entries(tree)
         mapping_aliases = {
             name: (set(entries), dynamic)
@@ -4904,7 +6183,7 @@ def _scan_outbound_clients(root: Path) -> list[ReleaseViolation]:
                 or module_dunder_getattr
                 or dynamic_network_import
                 or provider_client_unapproved
-            ):
+            ) and node not in approved_operator_api_calls:
                 findings.append(
                     _finding(
                         "OUTBOUND_CLIENT_UNAPPROVED",
@@ -7693,6 +8972,11 @@ _LEGACY_RELEASE_CHECKS = (
         _check_encrypted_operational_backup_surface,
         "PLAINTEXT_BACKUP_SURFACE",
         "src/trading_assistant/ops/backup.py",
+    ),
+    (
+        _check_verified_runtime_consolidation_transfer,
+        "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN",
+        _RUNTIME_CONSOLIDATION_MODULE,
     ),
 )
 

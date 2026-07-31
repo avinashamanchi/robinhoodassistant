@@ -1,8 +1,38 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Start only the loopback HTTPS operator console. The strict launcher performs
 # local structural checks before it constructs the application.
 set -euo pipefail
 umask 077
+
+case "$-" in
+  *p*) ;;
+  *)
+    echo "controlled start requires privileged Bash mode" >&2
+    exit 1
+    ;;
+esac
+
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+IFS=$' \t\n'
+unset BASH_ENV ENV CDPATH
+unset \
+  PYTHONBREAKPOINT \
+  PYTHONCASEOK \
+  PYTHONEXECUTABLE \
+  PYTHONHOME \
+  PYTHONINSPECT \
+  PYTHONNOUSERSITE \
+  PYTHONPATH \
+  PYTHONPLATLIBDIR \
+  PYTHONSAFEPATH \
+  PYTHONSTARTUP \
+  PYTHONUSERBASE \
+  PYTHONWARNINGS
+PYTHONNOUSERSITE=1
+PYTHONSAFEPATH=1
+export PYTHONNOUSERSITE PYTHONSAFEPATH
+
 cd "$(dirname "$0")/.."
 
 PROJECT="$(pwd -P)"
@@ -37,19 +67,57 @@ if [[ ! -x "$CURL" || ! -f "$TLS_CA" ]]; then
 fi
 
 health_is_live () {
-  "$CURL" --fail --silent --show-error \
+  "$CURL" --disable \
+    --fail \
+    --silent \
+    --show-error \
+    --noproxy "*" \
+    --resolve "localhost:8020:127.0.0.1" \
+    --proto "=https" \
+    --connect-timeout 2 \
+    --max-time 3 \
+    --max-filesize 1024 \
     --cacert "$TLS_CA" \
     "https://localhost:8020/health/live" \
-    | "$PY" -c '
+    | "$PY" -I -c '
 import json
 import sys
 
-try:
-    payload = json.load(sys.stdin)
-except Exception:
+maximum_bytes = 1024
+encoded = sys.stdin.buffer.read(maximum_bytes + 1)
+if len(encoded) > maximum_bytes:
     raise SystemExit(1)
-expected = {"alive": True, "database_reachable": True}
-raise SystemExit(0 if type(payload) is dict and payload == expected else 1)
+try:
+    document = encoded.decode("utf-8", errors="strict")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+
+def exact_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+try:
+    payload = json.loads(document, object_pairs_hook=exact_object)
+except (TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected_keys = {"alive", "database_reachable"}
+if type(payload) is not dict or set(payload) != expected_keys:
+    raise SystemExit(1)
+if (
+    type(payload["alive"]) is not bool
+    or type(payload["database_reachable"]) is not bool
+):
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if payload["alive"] is True
+    and payload["database_reachable"] is True
+    else 1
+)
 '
 }
 

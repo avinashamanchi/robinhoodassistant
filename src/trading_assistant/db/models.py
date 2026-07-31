@@ -784,6 +784,7 @@ class MutationInterlock(Base):
         CheckConstraint(
             "operation IN ("
             "'order_approve','order_reject','breaker_reset','order_cancel',"
+            "'rule_cancel',"
             "'portfolio_reconcile','order_sync','panic','analysis',"
             "'plan_approve','plan_cancel','proposal_batch','backtest'"
             ")",

@@ -128,6 +128,7 @@ _MUTATION_OPERATIONS = frozenset(
         "order_reject",
         "breaker_reset",
         "order_cancel",
+        "rule_cancel",
         "portfolio_reconcile",
         "order_sync",
         "panic",

@@ -93,6 +93,20 @@ features:
   telegram_notifications: false           # (Phase 4)
   shadow_mode: true                       # screen+analyze+grade live, zero orders (D1)
 
+# Opt-in autonomous paper-trading loop (trading_assistant.autopilot).
+# PAPER-ONLY: the autopilot refuses to run unless trading.mode=paper, and every
+# order it places still passes through the deterministic risk engine below, which
+# stays the final authority. Nothing trades until you run:
+#   uv run python -m trading_assistant.autopilot        (loop)
+#   uv run python -m trading_assistant.autopilot --once (single cycle)
+autopilot:
+  enabled: true
+  strategy: sma_crossover
+  universe: []                            # empty -> risk.ticker_allowlist
+  notional_per_trade: 1000                # USD per entry (<= risk.max_notional_per_order)
+  max_orders_per_day: 8
+  poll_interval_seconds: 300
+
 execution:
   prefer_bracket_orders: false            # OFF until extended paper concurrency drills pass
 

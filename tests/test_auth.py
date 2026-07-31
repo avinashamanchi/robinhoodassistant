@@ -93,6 +93,31 @@ def test_all_non_liveness_routes_require_session(client):
         assert client.get(path).status_code == 401, path
 
 
+def test_rule_routes_require_expected_auth(client):
+    assert client.get("/rules").status_code == 401
+    assert (
+        client.post(
+            "/rules/1/cancel",
+            json={"reason": "operator requested cancellation"},
+            headers={"Idempotency-Key": "rule-cancel-without-session"},
+        ).status_code
+        == 401
+    )
+
+
+def test_rule_cancel_requires_csrf(authenticated_client):
+    client, _csrf = authenticated_client
+
+    response = client.post(
+        "/rules/1/cancel",
+        json={"reason": "operator requested cancellation"},
+        headers={"Idempotency-Key": "rule-cancel-without-csrf"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "csrf_required"
+
+
 def test_login_sets_http_only_same_site_cookie(client):
     response = client.post("/auth/login", json={"secret": TOKEN})
 

@@ -335,6 +335,24 @@ class AnalystExtrasConfig(_Strict):
     suppress_ranging: bool = True    # v2: force NO_TRADE in RANGING regimes
 
 
+class AutopilotConfig(_Strict):
+    """Opt-in autonomous paper-trading loop (see ``trading_assistant.autopilot``).
+
+    Disabled by default. When enabled it is the only component that both decides
+    and executes without a human, but it refuses to run on anything other than
+    ``trading.mode: paper`` and every order it places still passes through the
+    deterministic risk engine, which stays the final authority.
+    """
+
+    enabled: bool = False
+    strategy: Literal["sma_crossover"] = "sma_crossover"
+    # Empty -> fall back to screener.universe, then risk.ticker_allowlist.
+    universe: list[str] = Field(default_factory=list)
+    notional_per_trade: Decimal = Field(default=Decimal("1000"), gt=0)
+    max_orders_per_day: int = Field(default=8, gt=0)
+    poll_interval_seconds: int = Field(default=300, gt=0)
+
+
 class AppConfig(_Strict):
     server: ServerConfig = Field(default_factory=ServerConfig)
     provider_origins: ProviderOriginsConfig = Field(
@@ -352,6 +370,7 @@ class AppConfig(_Strict):
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
+    autopilot: AutopilotConfig = Field(default_factory=AutopilotConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
