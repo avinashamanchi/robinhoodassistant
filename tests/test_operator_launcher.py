@@ -911,7 +911,19 @@ def test_operator_launcher_bounds_stalled_liveness_response(
     elapsed = time.monotonic() - started
 
     assert completed.returncode != 0
-    assert elapsed < 1.0
+    # The launcher must bound its liveness probe with an explicit --max-time so a
+    # stalled endpoint cannot hang it. The fake curl sleeps 0.05s when --max-time
+    # is present and 1.5s otherwise; assert that property directly instead of
+    # racing a tight wall-clock bound, which is brittle under subprocess and
+    # interpreter startup overhead on slower hosts.
+    curl_calls = [
+        event
+        for event in launcher_harness.events()
+        if event.get("event") == "curl"
+    ]
+    assert curl_calls
+    assert all("--max-time" in call["arguments"] for call in curl_calls)
+    assert elapsed < 5.0
     _assert_menu_was_not_launched(launcher_harness)
 
 

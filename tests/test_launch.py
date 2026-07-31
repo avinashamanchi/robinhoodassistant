@@ -682,11 +682,22 @@ def test_controlled_start_uses_finite_liveness_timeouts(
     elapsed = time.monotonic() - started
 
     assert completed.returncode == 0, completed.stderr
-    assert elapsed < 1.0
-    assert sum(
-        event["event"] == "curl"
+    # Assert the launcher bounds each liveness curl with --connect-timeout AND
+    # --max-time (the property the harness branches on to sleep 0.05s vs 1.2s),
+    # instead of racing a tight wall-clock bound that is brittle under host
+    # subprocess/interpreter startup overhead.
+    curl_calls = [
+        event
         for event in start_script_harness.events()
-    ) == 2
+        if event["event"] == "curl"
+    ]
+    assert len(curl_calls) == 2
+    assert all(
+        "--connect-timeout" in call["arguments"]
+        and "--max-time" in call["arguments"]
+        for call in curl_calls
+    )
+    assert elapsed < 5.0
 
 
 def test_controlled_start_preserves_pipefail_for_curl_errors(
