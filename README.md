@@ -129,6 +129,12 @@ uv run python -m trading_assistant.preflight
 # In a separate operator-controlled terminal, and only after preflight passes:
 uv run python -m trading_assistant.daemon.main
 
+# AUTONOMOUS paper trading (opt-in; paper-only). Decides with a deterministic
+# strategy and executes with no human in the loop — the risk engine still runs
+# on every order. Requires autopilot.enabled: true and trading.mode: paper.
+uv run python -m trading_assistant.autopilot          # continuous loop
+uv run python -m trading_assistant.autopilot --once   # a single cycle, then exit
+
 # Credentialed paper-account drills are not startup steps. Use only the
 # separately reviewed procedure in docs/RUNBOOK.md.
 
@@ -183,11 +189,36 @@ provider construction or loading fails: local TLS, field-encryption metadata,
 the outbound manifest, and disabled integrations are still evaluated. Any
 failed structural row stops before broker, provider, or notifier construction.
 
-The checked-in operating profile is intentionally conservative:
-`trading.mode: paper`, autonomous pre-approved-rule execution OFF, broker bracket
-submission OFF, and shadow analysis ON. Do not enable execution features from
-backtest results alone; require the scorecard/paper evidence gates in the runbook
-and a separate manual decision.
+The checked-in operating profile stays `trading.mode: paper`, with the LLM
+pre-approved-rule path, broker bracket submission OFF, and shadow analysis ON.
+The one autonomous path is the opt-in **autopilot** (`autopilot.enabled: true`),
+a paper-only deterministic loop that both decides and executes without a human —
+see [Autonomous paper trading](#autonomous-paper-trading-autopilot). Do not
+enable execution features from backtest results alone; require the scorecard/paper
+evidence gates in the runbook and a separate manual decision.
+
+## Autonomous paper trading (autopilot)
+
+`trading_assistant.autopilot` is the only component that both decides and
+executes with **no human in the loop**. It is deliberately additive and opt-in:
+disabled unless `autopilot.enabled: true`, and it **refuses to run unless
+`trading.mode: paper`**. It does not weaken a single guardrail — every order is
+placed through the same `propose_order` → `approve_order` path as a human
+approval, so the deterministic risk engine (allowlist, per-order/position/portfolio
+caps, price-sanity, market-hours, spread/quote-freshness, and the daily-loss kill
+switch) runs on every order and stays the final authority. A rejected proposal is
+skipped, never force-submitted.
+
+Decisions come from a deterministic strategy (`autopilot.strategy`, default
+`sma_crossover`) computed over the same `MarketFeatures` the analyst reads — no
+LLM in the execution path, so behaviour is reproducible. Each cycle it evaluates
+`autopilot.universe` (defaulting to `risk.ticker_allowlist`), buys a
+`notional_per_trade` position when a name turns long and is not already held, and
+exits the full position when the signal turns flat. A `max_orders_per_day` cap
+and position de-dupe bound activity. It runs as its own process; nothing trades
+until you start it. **Paper trading is a simulation: this does not authorize live
+trading, predict live results, or guarantee profit — an autonomous strategy will
+take losing trades.**
 
 ## LLM providers & market data
 
@@ -211,10 +242,14 @@ is shipped.
 ## Safety model
 
 1. This safety-foundation runtime is paper-only and rejects live mode at startup.
-2. The LLM only ever produces `PROPOSED` orders. Execution needs human approval;
-   autonomous pre-approved-rule execution is disabled in the release profile.
-3. The risk engine runs on every order and cannot be bypassed.
-4. Everything dangerous defaults OFF.
+2. The LLM only ever produces `PROPOSED` orders. LLM-path execution needs human
+   approval; autonomous pre-approved-rule execution is disabled in the release
+   profile. The one autonomous path is the opt-in, paper-only **autopilot**
+   (deterministic, no LLM in the execution path); it is disabled by default and
+   refuses to run outside paper mode.
+3. The risk engine runs on every order — including every autopilot order — and
+   cannot be bypassed.
+4. Everything dangerous defaults OFF; the autopilot is opt-in and paper-only.
 5. Every production runtime role writes redacted, owner-only, bounded rotating
    logs under `logs/`.
 6. Chat has an exact read-only tool allowlist plus immutable draft constructors.
