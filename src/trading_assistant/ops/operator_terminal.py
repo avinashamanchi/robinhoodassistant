@@ -92,6 +92,9 @@ _MAX_SECRET_CHARS = 4_096
 _MAX_IDENTIFIER = 2**63 - 1
 _MAX_QUOTE_AGE_SECONDS = 300.0
 _MAX_CLOCK_SKEW_SECONDS = 5.0
+_MAX_EVIDENCE_AGE_SECONDS = 30.0
+_MAX_EVIDENCE_FUTURE_SKEW_SECONDS = 5.0
+_MAX_RESET_EVIDENCE_DELTA_SECONDS = 5.0
 _REDACTED = "<redacted>"
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _TICKER = re.compile(r"^[A-Z0-9][A-Z0-9./-]{0,19}$")
@@ -614,79 +617,171 @@ class OperatorMenu:
         finally:
             secret = None
 
+    @classmethod
+    def _observation_state(
+        cls,
+        value: object,
+        *,
+        now: datetime,
+    ) -> tuple[str, datetime | None]:
+        try:
+            observed_at = cls._evidence_timestamp(
+                value,
+                "evidence_timestamp_invalid",
+            )
+        except InputRejected:
+            return "unknown", None
+        age_seconds = (now - observed_at).total_seconds()
+        if age_seconds > _MAX_EVIDENCE_AGE_SECONDS:
+            return "stale", observed_at
+        if age_seconds < -_MAX_EVIDENCE_FUTURE_SKEW_SECONDS:
+            return "unknown", observed_at
+        return "current", observed_at
+
+    @classmethod
+    def _health_observation_state(
+        cls,
+        payload: object,
+        *,
+        now: datetime,
+    ) -> tuple[str, datetime | None]:
+        if not isinstance(payload, dict):
+            return "unknown", None
+        state, observed_at = cls._observation_state(
+            payload.get("observed_at"),
+            now=now,
+        )
+        if state != "current" or observed_at is None:
+            return state, observed_at
+        safety = payload.get("safety")
+        if not isinstance(safety, dict):
+            return "unknown", observed_at
+        try:
+            safety_observed_at = cls._evidence_timestamp(
+                safety.get("observed_at"),
+                "evidence_timestamp_invalid",
+            )
+        except InputRejected:
+            return "unknown", observed_at
+        if safety_observed_at != observed_at:
+            return "unknown", observed_at
+        return "current", observed_at
+
+    @classmethod
+    def _posture_observation_state(
+        cls,
+        payload: object,
+        *,
+        now: datetime,
+    ) -> tuple[str, datetime | None]:
+        if not isinstance(payload, dict):
+            return "unknown", None
+        state, observed_at = cls._observation_state(
+            payload.get("observed_at"),
+            now=now,
+        )
+        if state != "current" or observed_at is None:
+            return state, observed_at
+        checks = payload.get("checks")
+        if (
+            not isinstance(checks, list)
+            or len(checks) > _MAX_COLLECTION_ITEMS
+        ):
+            return "unknown", observed_at
+        try:
+            coherent = all(
+                isinstance(check, dict)
+                and cls._evidence_timestamp(
+                    check.get("observed_at"),
+                    "evidence_timestamp_invalid",
+                )
+                == observed_at
+                for check in checks
+            )
+        except InputRejected:
+            coherent = False
+        if not coherent:
+            return "unknown", observed_at
+        return "current", observed_at
+
     def _system_status(self) -> bool:
         health = self.api.get("/health")
         posture = self.api.get("/security/posture")
+        now = datetime.now(timezone.utc)
+        health_state, health_observed_at = (
+            self._health_observation_state(health, now=now)
+        )
+        posture_state, posture_observed_at = (
+            self._posture_observation_state(posture, now=now)
+        )
+        health_current = health_state == "current"
+        posture_current = posture_state == "current"
+
+        def health_field(key: str) -> object:
+            return (
+                self._evidence_field(health, key)
+                if health_current
+                else "unknown"
+            )
+
         health_summary = {
-            "observed_at": self._evidence_field(
-                health,
-                "observed_at",
+            "evidence_state": health_state,
+            "observed_at": (
+                self._evidence_field(health, "observed_at")
+                if health_observed_at is not None
+                else "unknown"
             ),
-            "broker": self._evidence_field(health, "broker"),
-            "mode": self._evidence_field(health, "mode"),
-            "database_reachable": self._evidence_field(
-                health,
-                "database_reachable",
+            "broker": health_field("broker"),
+            "mode": health_field("mode"),
+            "database_reachable": health_field(
+                "database_reachable"
             ),
             "daemon": {
-                "alive": self._evidence_field(
-                    health,
-                    "daemon_alive",
-                ),
-                "heartbeat_age_seconds": self._evidence_field(
-                    health,
-                    "heartbeat_age_seconds",
+                "alive": health_field("daemon_alive"),
+                "heartbeat_age_seconds": health_field(
+                    "heartbeat_age_seconds"
                 ),
             },
             "reconciliation": {
-                "broker_contact_evidence_valid": (
-                    self._evidence_field(
-                        health,
-                        "broker_contact_evidence_valid",
-                    )
+                "broker_contact_evidence_valid": health_field(
+                    "broker_contact_evidence_valid"
                 ),
-                "last_confirmed_broker_contact": (
-                    self._evidence_field(
-                        health,
-                        "last_confirmed_broker_contact",
-                    )
+                "last_confirmed_broker_contact": health_field(
+                    "last_confirmed_broker_contact"
                 ),
-                "reconciliation_age_seconds": (
-                    self._evidence_field(
-                        health,
-                        "reconciliation_age_seconds",
-                    )
+                "reconciliation_age_seconds": health_field(
+                    "reconciliation_age_seconds"
                 ),
-                "reconciliation_max_age_seconds": (
-                    self._evidence_field(
-                        health,
-                        "reconciliation_max_age_seconds",
-                    )
+                "reconciliation_max_age_seconds": health_field(
+                    "reconciliation_max_age_seconds"
                 ),
-                "startup": self._evidence_field(
-                    health,
-                    "startup_reconciliation",
+                "startup": health_field(
+                    "startup_reconciliation"
                 ),
             },
             "breakers": {
-                "active": self._evidence_field(
-                    health,
-                    "active_breakers",
-                ),
-                "safety": self._evidence_field(health, "safety"),
+                "active": health_field("active_breakers"),
+                "safety": health_field("safety"),
             },
         }
         posture_summary = {
-            "observed_at": self._evidence_field(
-                posture,
-                "observed_at",
+            "evidence_state": posture_state,
+            "observed_at": (
+                self._evidence_field(posture, "observed_at")
+                if posture_observed_at is not None
+                else "unknown"
             ),
-            "can_trade": self._evidence_field(
-                posture,
-                "can_trade",
+            "can_trade": (
+                self._evidence_field(posture, "can_trade")
+                if posture_current
+                else "unknown"
             ),
-            "checks": _redacted_posture_value(
-                self._evidence_field(posture, "checks")
+            "checks": (
+                _redacted_posture_value(
+                    self._evidence_field(posture, "checks")
+                )
+                if posture_current
+                else "unknown"
             ),
         }
         self._write(
@@ -858,7 +953,7 @@ class OperatorMenu:
         )
 
     @staticmethod
-    def _evidence_timestamp(value: object, code: str) -> str:
+    def _evidence_timestamp(value: object, code: str) -> datetime:
         if (
             not isinstance(value, str)
             or not value
@@ -872,28 +967,56 @@ class OperatorMenu:
                 if value.endswith("Z")
                 else value
             )
-        except ValueError:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            return parsed.astimezone(timezone.utc)
+        except (OverflowError, ValueError):
             raise InputRejected(code) from None
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise InputRejected(code)
-        return value
 
     @classmethod
     def _breaker_posture(
         cls,
         payload: object,
-    ) -> dict[str, dict[str, object]]:
+        *,
+        now: datetime,
+    ) -> tuple[datetime, dict[str, dict[str, object]]]:
         code = "breaker_posture_invalid"
         if (
             not isinstance(payload, dict)
             or payload.get("can_trade") is not False
         ):
             raise InputRejected(code)
-        cls._evidence_timestamp(payload.get("observed_at"), code)
+        state, report_observed_at = cls._observation_state(
+            payload.get("observed_at"),
+            now=now,
+        )
+        if state != "current" or report_observed_at is None:
+            raise InputRejected(code)
         checks = payload.get("checks")
         if (
             not isinstance(checks, list)
             or len(checks) > _MAX_COLLECTION_ITEMS
+        ):
+            raise InputRejected(code)
+        broker_mode_checks = [
+            check
+            for check in checks
+            if isinstance(check, dict)
+            and check.get("name") == "broker_mode"
+        ]
+        if len(broker_mode_checks) != 1:
+            raise InputRejected(code)
+        broker_mode = broker_mode_checks[0]
+        if (
+            broker_mode.get("status") != "paper"
+            or broker_mode.get("detail_code")
+            != "broker_paper_mode"
+            or broker_mode.get("scope") is not None
+            or cls._evidence_timestamp(
+                broker_mode.get("observed_at"),
+                code,
+            )
+            != report_observed_at
         ):
             raise InputRejected(code)
         observed: dict[str, dict[str, object]] = {}
@@ -910,7 +1033,14 @@ class OperatorMenu:
                 or scope in observed
             ):
                 raise InputRejected(code)
-            cls._evidence_timestamp(check.get("observed_at"), code)
+            if (
+                cls._evidence_timestamp(
+                    check.get("observed_at"),
+                    code,
+                )
+                != report_observed_at
+            ):
+                raise InputRejected(code)
             status = check.get("status")
             count = check.get("count")
             generation = check.get("generation")
@@ -946,7 +1076,7 @@ class OperatorMenu:
             sorted(_BREAKER_CATEGORIES)
         ):
             raise InputRejected(code)
-        return observed
+        return report_observed_at, observed
 
     @staticmethod
     def _breaker_candidate(value: object) -> _BreakerCandidate:
@@ -1001,28 +1131,69 @@ class OperatorMenu:
         )
 
     @classmethod
+    def _breaker_surface(
+        cls,
+        value: object,
+    ) -> tuple[_BreakerCandidate, ...]:
+        code = "breaker_evidence_invalid"
+        if (
+            not isinstance(value, list)
+            or len(value) > _MAX_COLLECTION_ITEMS
+        ):
+            raise InputRejected(code)
+        candidates: list[_BreakerCandidate] = []
+        seen: set[str] = set()
+        for item in value:
+            candidate = cls._breaker_candidate(item)
+            if candidate.scope in seen:
+                raise InputRejected(code)
+            seen.add(candidate.scope)
+            candidates.append(candidate)
+        return tuple(
+            sorted(candidates, key=lambda candidate: candidate.scope)
+        )
+
+    @classmethod
     def _concrete_breakers(
         cls,
         health: object,
         posture: dict[str, dict[str, object]],
+        *,
+        posture_observed_at: datetime,
+        now: datetime,
     ) -> tuple[_BreakerCandidate, ...]:
         code = "breaker_evidence_invalid"
-        if not isinstance(health, dict):
+        if (
+            not isinstance(health, dict)
+            or health.get("broker") != "Alpaca"
+            or health.get("mode") != "paper"
+        ):
             raise InputRejected(code)
-        health_observed_at = cls._evidence_timestamp(
+        health_state, health_observed_at = cls._observation_state(
             health.get("observed_at"),
-            code,
+            now=now,
         )
+        if health_state != "current" or health_observed_at is None:
+            raise InputRejected(code)
         safety = health.get("safety")
         if not isinstance(safety, dict):
             raise InputRejected(code)
+        safety_state, safety_observed_at = cls._observation_state(
+            safety.get("observed_at"),
+            now=now,
+        )
         if (
             safety.get("complete") is not True
-            or cls._evidence_timestamp(
-                safety.get("observed_at"),
-                code,
-            )
-            != health_observed_at
+            or safety_state != "current"
+            or safety_observed_at != health_observed_at
+        ):
+            raise InputRejected(code)
+        request_delta = (
+            health_observed_at - posture_observed_at
+        ).total_seconds()
+        if (
+            request_delta < 0
+            or request_delta > _MAX_RESET_EVIDENCE_DELTA_SECONDS
         ):
             raise InputRejected(code)
         unknown_categories = safety.get("unknown_categories")
@@ -1031,26 +1202,22 @@ class OperatorMenu:
             or unknown_categories
         ):
             raise InputRejected(code)
-        active = safety.get("active_breakers")
-        if (
-            not isinstance(active, list)
-            or len(active) > _MAX_COLLECTION_ITEMS
-        ):
+        top_level_candidates = cls._breaker_surface(
+            health.get("active_breakers")
+        )
+        safety_candidates = cls._breaker_surface(
+            safety.get("active_breakers")
+        )
+        if top_level_candidates != safety_candidates:
             raise InputRejected(code)
-        candidates: list[_BreakerCandidate] = []
-        seen: set[str] = set()
+        candidates = top_level_candidates
         category_counts = {
             category: 0 for category in _BREAKER_CATEGORIES
         }
         category_generations = {
             category: 0 for category in _BREAKER_CATEGORIES
         }
-        for item in active:
-            candidate = cls._breaker_candidate(item)
-            if candidate.scope in seen:
-                raise InputRejected(code)
-            seen.add(candidate.scope)
-            candidates.append(candidate)
+        for candidate in candidates:
             category_counts[candidate.category] += 1
             category_generations[candidate.category] = max(
                 category_generations[candidate.category],
@@ -1070,14 +1237,28 @@ class OperatorMenu:
                 )
             ):
                 raise InputRejected(code)
-        return tuple(sorted(candidates, key=lambda item: item.scope))
+        return candidates
 
     def reset_breaker(self) -> None:
         posture_payload = self.api.get("/security/posture")
         try:
-            posture = self._breaker_posture(posture_payload)
+            posture_observed_at, posture = self._breaker_posture(
+                posture_payload,
+                now=datetime.now(timezone.utc),
+            )
         except InputRejected:
             self._write("breaker_posture_invalid")
+            return
+        health = self.api.get("/health")
+        try:
+            candidates = self._concrete_breakers(
+                health,
+                posture,
+                posture_observed_at=posture_observed_at,
+                now=datetime.now(timezone.utc),
+            )
+        except InputRejected:
+            self._write("breaker_evidence_invalid")
             return
         self._write(
             "Fresh breaker posture: "
@@ -1088,12 +1269,6 @@ class OperatorMenu:
                 }
             )
         )
-        health = self.api.get("/health")
-        try:
-            candidates = self._concrete_breakers(health, posture)
-        except InputRejected:
-            self._write("breaker_evidence_invalid")
-            return
         if not candidates:
             self._write("breaker_reset_unavailable")
             return

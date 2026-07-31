@@ -34,7 +34,7 @@ TERMINAL_MODULE = (
 )
 LOGIN_SECRET = "login-secret-never-print"
 REAUTH_SECRET = "reauth-secret-never-print"
-EVIDENCE_AT = "2026-07-30T12:00:00+00:00"
+EVIDENCE_AT = datetime.now(timezone.utc).isoformat()
 
 
 class FakeApi:
@@ -238,6 +238,7 @@ def posture_payload(
     *,
     tripped_category: str | None = None,
     generation: int = 0,
+    observed_at: str = EVIDENCE_AT,
 ) -> dict[str, object]:
     breaker_checks = []
     for category in ("account", "equity", "crypto", "liquidity"):
@@ -246,7 +247,7 @@ def posture_payload(
             {
                 "name": "circuit_breaker",
                 "status": "tripped" if tripped else "clear",
-                "observed_at": EVIDENCE_AT,
+                "observed_at": observed_at,
                 "detail_code": (
                     "breaker_tripped" if tripped else "breaker_clear"
                 ),
@@ -256,31 +257,31 @@ def posture_payload(
             }
         )
     return {
-        "observed_at": EVIDENCE_AT,
+        "observed_at": observed_at,
         "checks": [
             {
                 "name": "broker_mode",
                 "status": "paper",
-                "observed_at": EVIDENCE_AT,
+                "observed_at": observed_at,
                 "detail_code": "broker_paper_mode",
             },
             {
                 "name": "daemon_heartbeat",
                 "status": "fresh",
-                "observed_at": EVIDENCE_AT,
+                "observed_at": observed_at,
                 "detail_code": "daemon_heartbeat_fresh",
                 "age_seconds": 1.0,
                 "max_age_seconds": 30.0,
-                "evidence_at": EVIDENCE_AT,
+                "evidence_at": observed_at,
             },
             {
                 "name": "startup_reconciliation",
                 "status": "fresh",
-                "observed_at": EVIDENCE_AT,
+                "observed_at": observed_at,
                 "detail_code": "reconciliation_current",
                 "generation": 3,
                 "completed_generation": 3,
-                "evidence_at": EVIDENCE_AT,
+                "evidence_at": observed_at,
             },
             *breaker_checks,
         ],
@@ -293,13 +294,14 @@ def health_payload(
     active_breakers: list[dict[str, object]] | None = None,
     safety_complete: bool = True,
     unknown_categories: list[str] | None = None,
+    observed_at: str = EVIDENCE_AT,
 ) -> dict[str, object]:
     active = deepcopy(active_breakers or [])
     unknown = list(unknown_categories or [])
     return {
         "broker": "Alpaca",
         "mode": "paper",
-        "observed_at": EVIDENCE_AT,
+        "observed_at": observed_at,
         "db_ok": safety_complete,
         "database_reachable": safety_complete,
         "heartbeat_age_seconds": 1.0,
@@ -308,7 +310,7 @@ def health_payload(
         "killswitch_generation": {"equity": 0, "crypto": 0},
         "active_breakers": deepcopy(active),
         "safety": {
-            "observed_at": EVIDENCE_AT,
+            "observed_at": observed_at,
             "state": (
                 "unsafe"
                 if active
@@ -344,8 +346,8 @@ def health_payload(
             },
             "unknown_categories": unknown,
         },
-        "broker_contact_observed_at": EVIDENCE_AT,
-        "last_confirmed_broker_contact": EVIDENCE_AT,
+        "broker_contact_observed_at": observed_at,
+        "last_confirmed_broker_contact": observed_at,
         "broker_contact_evidence_valid": safety_complete,
         "reconciliation_age_seconds": 1.0,
         "reconciliation_max_age_seconds": 300.0,
@@ -353,7 +355,7 @@ def health_payload(
             "state": "ready" if safety_complete else "unknown",
             "generation": 3,
             "completed_generation": 3,
-            "observed_at": EVIDENCE_AT,
+            "observed_at": observed_at,
         },
     }
 
@@ -673,6 +675,126 @@ def test_status_never_turns_absent_or_unknown_evidence_into_healthy():
     assert "unknown" in transcript
     assert "healthy" not in transcript
     assert "ready" not in transcript
+    assert api.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "evidence_state"),
+    [
+        ("stale_report", "stale"),
+        ("missing_report_time", "unknown"),
+        ("future_report", "unknown"),
+        ("malformed_report_time", "unknown"),
+        ("overflowing_report_time", "unknown"),
+        ("missing_safety_time", "unknown"),
+        ("safety_time_mismatch", "unknown"),
+    ],
+)
+def test_status_suppresses_healthy_health_values_when_evidence_is_not_current(
+    invalid_case,
+    evidence_state,
+):
+    api = FakeApi()
+    health = health_payload()
+    safety = health["safety"]
+    assert isinstance(safety, dict)
+    if invalid_case == "stale_report":
+        health["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=31)
+        ).isoformat()
+    elif invalid_case == "missing_report_time":
+        health.pop("observed_at")
+    elif invalid_case == "future_report":
+        health["observed_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=6)
+        ).isoformat()
+    elif invalid_case == "malformed_report_time":
+        health["observed_at"] = "not-a-timestamp"
+    elif invalid_case == "overflowing_report_time":
+        health["observed_at"] = "0001-01-01T00:00:00+14:00"
+    elif invalid_case == "missing_safety_time":
+        safety.pop("observed_at")
+    else:
+        safety["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+    api.queue_get("/health", health)
+    api.queue_get("/security/posture", posture_payload())
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["1", "0"],
+    )
+
+    assert menu.run() == 0
+
+    health_line = next(
+        line
+        for line in output
+        if line.startswith("System health evidence: ")
+    )
+    assert f'"evidence_state": "{evidence_state}"' in health_line
+    assert '"alive": "unknown"' in health_line
+    assert '"startup": "unknown"' in health_line
+    assert '"active": "unknown"' in health_line
+    assert '"ready"' not in health_line
+    assert api.mutations == []
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "evidence_state"),
+    [
+        ("stale_report", "stale"),
+        ("missing_report_time", "unknown"),
+        ("future_report", "unknown"),
+        ("malformed_report_time", "unknown"),
+        ("overflowing_report_time", "unknown"),
+        ("check_time_mismatch", "unknown"),
+    ],
+)
+def test_status_suppresses_healthy_posture_values_when_evidence_is_not_current(
+    invalid_case,
+    evidence_state,
+):
+    api = FakeApi()
+    posture = posture_payload()
+    if invalid_case == "stale_report":
+        posture["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=31)
+        ).isoformat()
+    elif invalid_case == "missing_report_time":
+        posture.pop("observed_at")
+    elif invalid_case == "future_report":
+        posture["observed_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=6)
+        ).isoformat()
+    elif invalid_case == "malformed_report_time":
+        posture["observed_at"] = "not-a-timestamp"
+    elif invalid_case == "overflowing_report_time":
+        posture["observed_at"] = "0001-01-01T00:00:00+14:00"
+    else:
+        checks = posture["checks"]
+        assert isinstance(checks, list)
+        checks[0]["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+    api.queue_get("/health", health_payload())
+    api.queue_get("/security/posture", posture)
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["1", "0"],
+    )
+
+    assert menu.run() == 0
+
+    posture_line = next(
+        line
+        for line in output
+        if line.startswith("Security posture evidence: ")
+    )
+    assert f'"evidence_state": "{evidence_state}"' in posture_line
+    assert '"can_trade": "unknown"' in posture_line
+    assert '"checks": "unknown"' in posture_line
+    assert '"fresh"' not in posture_line
     assert api.mutations == []
 
 
@@ -1068,6 +1190,114 @@ def test_breaker_reset_selects_one_concrete_tripped_scope_and_generation():
 @pytest.mark.parametrize(
     "invalid_case",
     [
+        "stale_report",
+        "future_report",
+        "breaker_check_time_mismatch",
+    ],
+)
+def test_breaker_reset_rejects_stale_or_incoherent_posture_before_health(
+    invalid_case,
+):
+    api = FakeApi()
+    if invalid_case == "stale_report":
+        observed_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=31)
+        ).isoformat()
+        posture = posture_payload(
+            tripped_category="equity",
+            generation=7,
+            observed_at=observed_at,
+        )
+    elif invalid_case == "future_report":
+        observed_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=6)
+        ).isoformat()
+        posture = posture_payload(
+            tripped_category="equity",
+            generation=7,
+            observed_at=observed_at,
+        )
+    else:
+        posture = posture_payload(
+            tripped_category="equity",
+            generation=7,
+        )
+        checks = posture["checks"]
+        assert isinstance(checks, list)
+        breaker = next(
+            check
+            for check in checks
+            if check.get("name") == "circuit_breaker"
+        )
+        breaker["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+    api.queue_get("/security/posture", posture)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_posture_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "missing",
+        "blocked",
+        "unknown",
+        "duplicate",
+        "time_mismatch",
+    ],
+)
+def test_breaker_reset_requires_one_current_paper_broker_mode_check(
+    invalid_case,
+):
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    broker_mode = next(
+        check for check in checks if check.get("name") == "broker_mode"
+    )
+    if invalid_case == "missing":
+        checks.remove(broker_mode)
+    elif invalid_case == "blocked":
+        broker_mode["status"] = "blocked"
+        broker_mode["detail_code"] = "broker_mode_not_paper"
+    elif invalid_case == "unknown":
+        broker_mode["status"] = "unknown"
+        broker_mode["detail_code"] = "broker_mode_not_paper"
+    elif invalid_case == "duplicate":
+        checks.append(deepcopy(broker_mode))
+    else:
+        broker_mode["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+    api.queue_get("/security/posture", posture)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_posture_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
         "missing_scope",
         "malformed_scope",
         "duplicate_scope",
@@ -1175,6 +1405,183 @@ def test_breaker_reset_rejects_invalid_concrete_health_evidence(
     assert api.mutations == []
     assert input_fn.prompts == []
     assert "breaker_evidence_invalid" in output
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "stale_health",
+        "future_health",
+        "missing_health_time",
+        "missing_safety_time",
+        "health_safety_mismatch",
+        "health_before_posture",
+        "request_delta_too_large",
+    ],
+)
+def test_breaker_reset_rejects_stale_or_incoherent_health_evidence(
+    invalid_case,
+):
+    api = FakeApi()
+    now = datetime.now(timezone.utc)
+    posture_at = now
+    health_at = now
+    if invalid_case == "stale_health":
+        health_at = now - timedelta(seconds=31)
+    elif invalid_case == "future_health":
+        health_at = now + timedelta(seconds=6)
+    elif invalid_case == "health_before_posture":
+        posture_at = now - timedelta(seconds=2)
+        health_at = posture_at - timedelta(seconds=1)
+    elif invalid_case == "request_delta_too_large":
+        posture_at = now - timedelta(seconds=10)
+        health_at = posture_at + timedelta(seconds=6)
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+        observed_at=posture_at.isoformat(),
+    )
+    health = health_payload(
+        active_breakers=[concrete_breaker()],
+        observed_at=health_at.isoformat(),
+    )
+    safety = health["safety"]
+    assert isinstance(safety, dict)
+    if invalid_case == "missing_health_time":
+        health.pop("observed_at")
+    elif invalid_case == "missing_safety_time":
+        safety.pop("observed_at")
+    elif invalid_case == "health_safety_mismatch":
+        safety["observed_at"] = (
+            health_at - timedelta(seconds=1)
+        ).isoformat()
+    api.queue_get("/security/posture", posture)
+    api.queue_get("/health", health)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_evidence_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("broker", "Mock"),
+        ("mode", "live"),
+    ],
+)
+def test_breaker_reset_requires_alpaca_paper_health_identity(field, value):
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    health = health_payload(
+        active_breakers=[concrete_breaker()],
+    )
+    health[field] = value
+    api.queue_get("/security/posture", posture)
+    api.queue_get("/health", health)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_evidence_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+@pytest.mark.parametrize("surface", ["top_level", "safety"])
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "missing_surface",
+        "non_list_surface",
+        "missing_scope",
+        "duplicate_scope",
+        "bool_generation",
+        "noncanonical_scope",
+    ],
+)
+def test_breaker_reset_validates_each_health_breaker_surface(
+    surface,
+    invalid_case,
+):
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    health = health_payload(
+        active_breakers=[concrete_breaker()],
+    )
+    safety = health["safety"]
+    assert isinstance(safety, dict)
+    target = health if surface == "top_level" else safety
+    if invalid_case == "missing_surface":
+        target.pop("active_breakers")
+    elif invalid_case == "non_list_surface":
+        target["active_breakers"] = {"scope": "loss:equity"}
+    else:
+        active = target["active_breakers"]
+        assert isinstance(active, list)
+        breaker = active[0]
+        assert isinstance(breaker, dict)
+        if invalid_case == "missing_scope":
+            breaker.pop("scope")
+        elif invalid_case == "duplicate_scope":
+            active.append(deepcopy(breaker))
+        elif invalid_case == "bool_generation":
+            breaker["generation"] = True
+        else:
+            breaker["scope"] = "loss:Equity"
+    api.queue_get("/security/posture", posture)
+    api.queue_get("/health", health)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_evidence_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+def test_breaker_reset_rejects_contradictory_health_breaker_surfaces():
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    health = health_payload(
+        active_breakers=[concrete_breaker()],
+    )
+    top_level = health["active_breakers"]
+    assert isinstance(top_level, list)
+    top_level[0]["generation"] = 8
+    api.queue_get("/security/posture", posture)
+    api.queue_get("/health", health)
+    menu, output, input_fn, _secret, _daemon = build_menu(api, [])
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture", "/health"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_evidence_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
 
 
 def test_breaker_reset_is_unavailable_when_no_concrete_scope_is_tripped():
