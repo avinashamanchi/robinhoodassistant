@@ -1245,6 +1245,81 @@ def test_breaker_reset_rejects_stale_or_incoherent_posture_before_health(
     assert not any("Fresh breaker posture" in line for line in output)
 
 
+def test_breaker_reset_rejects_stale_non_breaker_check_before_health():
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    heartbeat = next(
+        check
+        for check in checks
+        if check.get("name") == "daemon_heartbeat"
+    )
+    heartbeat["observed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=31)
+    ).isoformat()
+    api.queue_get("/security/posture", posture)
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+    )
+    menu, output, input_fn, _secret, _daemon = build_menu(
+        api,
+        [
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 7",
+        ],
+        secrets=[REAUTH_SECRET],
+    )
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_posture_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
+def test_breaker_reset_rejects_malformed_extra_check_before_health():
+    api = FakeApi()
+    posture = posture_payload(
+        tripped_category="equity",
+        generation=7,
+    )
+    checks = posture["checks"]
+    assert isinstance(checks, list)
+    checks.append("malformed-extra-check")
+    api.queue_get("/security/posture", posture)
+    api.queue_get(
+        "/health",
+        health_payload(active_breakers=[concrete_breaker()]),
+    )
+    menu, output, input_fn, _secret, _daemon = build_menu(
+        api,
+        [
+            "loss:equity",
+            "verified breaker recovery",
+            "RESET BREAKER loss:equity GENERATION 7",
+        ],
+        secrets=[REAUTH_SECRET],
+    )
+
+    menu.reset_breaker()
+
+    assert api.gets == ["/security/posture"]
+    assert api.reauth_secrets == []
+    assert api.mutations == []
+    assert input_fn.prompts == []
+    assert "breaker_posture_invalid" in output
+    assert not any("Fresh breaker posture" in line for line in output)
+
+
 @pytest.mark.parametrize(
     "invalid_case",
     [

@@ -682,27 +682,42 @@ class OperatorMenu:
         )
         if state != "current" or observed_at is None:
             return state, observed_at
-        checks = payload.get("checks")
-        if (
-            not isinstance(checks, list)
-            or len(checks) > _MAX_COLLECTION_ITEMS
-        ):
-            return "unknown", observed_at
         try:
-            coherent = all(
-                isinstance(check, dict)
-                and cls._evidence_timestamp(
-                    check.get("observed_at"),
-                    "evidence_timestamp_invalid",
-                )
-                == observed_at
-                for check in checks
+            cls._coherent_posture_checks(
+                payload.get("checks"),
+                observed_at=observed_at,
+                code="evidence_timestamp_invalid",
             )
         except InputRejected:
-            coherent = False
-        if not coherent:
             return "unknown", observed_at
         return "current", observed_at
+
+    @classmethod
+    def _coherent_posture_checks(
+        cls,
+        value: object,
+        *,
+        observed_at: datetime,
+        code: str,
+    ) -> list[dict[str, object]]:
+        if (
+            not isinstance(value, list)
+            or len(value) > _MAX_COLLECTION_ITEMS
+        ):
+            raise InputRejected(code)
+        checks: list[dict[str, object]] = []
+        for check in value:
+            if (
+                not isinstance(check, dict)
+                or cls._evidence_timestamp(
+                    check.get("observed_at"),
+                    code,
+                )
+                != observed_at
+            ):
+                raise InputRejected(code)
+            checks.append(check)
+        return checks
 
     def _system_status(self) -> bool:
         health = self.api.get("/health")
@@ -992,17 +1007,15 @@ class OperatorMenu:
         )
         if state != "current" or report_observed_at is None:
             raise InputRejected(code)
-        checks = payload.get("checks")
-        if (
-            not isinstance(checks, list)
-            or len(checks) > _MAX_COLLECTION_ITEMS
-        ):
-            raise InputRejected(code)
+        checks = cls._coherent_posture_checks(
+            payload.get("checks"),
+            observed_at=report_observed_at,
+            code=code,
+        )
         broker_mode_checks = [
             check
             for check in checks
-            if isinstance(check, dict)
-            and check.get("name") == "broker_mode"
+            if check.get("name") == "broker_mode"
         ]
         if len(broker_mode_checks) != 1:
             raise InputRejected(code)
@@ -1012,33 +1025,17 @@ class OperatorMenu:
             or broker_mode.get("detail_code")
             != "broker_paper_mode"
             or broker_mode.get("scope") is not None
-            or cls._evidence_timestamp(
-                broker_mode.get("observed_at"),
-                code,
-            )
-            != report_observed_at
         ):
             raise InputRejected(code)
         observed: dict[str, dict[str, object]] = {}
         for check in checks:
-            if (
-                not isinstance(check, dict)
-                or check.get("name") != "circuit_breaker"
-            ):
+            if check.get("name") != "circuit_breaker":
                 continue
             scope = check.get("scope")
             if (
                 not isinstance(scope, str)
                 or scope not in _BREAKER_CATEGORIES
                 or scope in observed
-            ):
-                raise InputRejected(code)
-            if (
-                cls._evidence_timestamp(
-                    check.get("observed_at"),
-                    code,
-                )
-                != report_observed_at
             ):
                 raise InputRejected(code)
             status = check.get("status")
