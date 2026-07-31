@@ -15,6 +15,9 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+[project.scripts]
+trading-operator = "trading_assistant.ops.operator_terminal:main"
+
 [project.optional-dependencies]
 # Broker / server / app deps land in later phases; kept optional so Phase 1
 # installs and tests with zero network-capable packages.

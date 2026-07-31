@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import plistlib
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -195,6 +196,16 @@ def test_stop_uses_only_cooperative_control_and_never_targets_a_pid():
     assert "trading_assistant.ops.control stop" in stop
     assert "kill " not in stop
     assert "kill " not in identity
+
+
+def test_operator_console_script_targets_fixed_terminal_entrypoint():
+    project = tomllib.loads(
+        Path("pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+
+    assert project["scripts"]["trading-operator"] == (
+        "trading_assistant.ops.operator_terminal:main"
+    )
 
 
 def test_manual_launchers_check_interpreter_before_using_it_and_delegate_recovery():
