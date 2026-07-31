@@ -16,6 +16,7 @@ export PATH
 IFS=$' \t\n'
 unset BASH_ENV ENV CDPATH
 unset \
+  PYTHONBREAKPOINT \
   PYTHONCASEOK \
   PYTHONEXECUTABLE \
   PYTHONHOME \
@@ -25,7 +26,8 @@ unset \
   PYTHONPLATLIBDIR \
   PYTHONSAFEPATH \
   PYTHONSTARTUP \
-  PYTHONUSERBASE
+  PYTHONUSERBASE \
+  PYTHONWARNINGS
 
 CANONICAL_PROJECT="/Users/avi/Desktop/robinhood/trading-assistant"
 CURL="/usr/bin/curl"
@@ -144,14 +146,17 @@ if [[ ! -f "$START_SCRIPT" || -L "$START_SCRIPT" || ! -x "$START_SCRIPT" ]]; the
   exit 1
 fi
 if ! START_METADATA="$(
-  /usr/bin/stat -f '%p' -- "$START_SCRIPT"
+  /usr/bin/stat -f '%u:%p:%l' -- "$START_SCRIPT"
 )"; then
   echo "controlled start launcher metadata is unavailable" >&2
   exit 1
 fi
-if [[ ! "$START_METADATA" =~ ^[0-7]+$ ]] \
-  || (( (8#$START_METADATA & 0170000) != 0100000 )) \
-  || (( (8#$START_METADATA & 0022) != 0 )); then
+IFS=: read -r START_OWNER START_MODE START_LINKS <<< "$START_METADATA"
+if [[ "$START_OWNER" != "$CURRENT_UID" ]] \
+  || [[ ! "$START_MODE" =~ ^[0-7]+$ ]] \
+  || [[ "$START_LINKS" != "1" ]] \
+  || (( (8#$START_MODE & 0170000) != 0100000 )) \
+  || (( (8#$START_MODE & 0022) != 0 )); then
   echo "controlled start launcher is not trusted" >&2
   exit 1
 fi
@@ -211,8 +216,20 @@ try:
     payload = json.loads(document, object_pairs_hook=exact_object)
 except (TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-expected = {"alive": True, "database_reachable": True}
-raise SystemExit(0 if type(payload) is dict and payload == expected else 1)
+expected_keys = {"alive", "database_reachable"}
+if type(payload) is not dict or set(payload) != expected_keys:
+    raise SystemExit(1)
+if (
+    type(payload["alive"]) is not bool
+    or type(payload["database_reachable"]) is not bool
+):
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if payload["alive"] is True
+    and payload["database_reachable"] is True
+    else 1
+)
 '
 }
 
@@ -229,7 +246,8 @@ if ! app_is_ready; then
     echo "app state is not safely absent or ready" >&2
     exit 1
   fi
-  if ! /bin/bash -p "$START_SCRIPT"; then
+  if ! PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+    /bin/bash -p "$START_SCRIPT"; then
     echo "controlled HTTPS app start failed" >&2
     exit 1
   fi

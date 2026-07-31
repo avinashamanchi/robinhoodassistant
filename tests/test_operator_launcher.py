@@ -16,6 +16,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _LAUNCHER = _ROOT / "scripts/operator.sh"
 _CANONICAL_ROOT = "/Users/avi/Desktop/robinhood/trading-assistant"
 _CURL = "/usr/bin/curl"
+_STAT = "/usr/bin/stat"
 _LIVENESS_URL = "https://localhost:8020/health/live"
 _LIVE_PAYLOAD = '{"alive":true,"database_reachable":true}'
 
@@ -35,6 +36,7 @@ class LauncherHarness:
     ca: Path
     start_script: Path
     fake_curl: Path
+    fake_stat: Path
     log: Path
     state: Path
     parent: Path
@@ -59,7 +61,9 @@ class LauncherHarness:
             "HARNESS_CONTROL": control,
             "HARNESS_LIVENESS": liveness,
             "HARNESS_LOG": str(self.log),
+            "HARNESS_REAL_PYTHON": sys.executable,
             "HARNESS_START": start,
+            "HARNESS_START_SCRIPT": str(self.start_script),
             "HARNESS_STATE": str(self.state),
             "LANG": "C",
             "LC_ALL": "C",
@@ -109,6 +113,7 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
     python = project / ".venv/bin/python"
     ca = project / ".local/tls/rootCA.pem"
     fake_curl = tmp_path / "absolute-curl"
+    fake_stat = tmp_path / "absolute-stat"
     log = tmp_path / "events.jsonl"
     state = tmp_path / "app-started"
     python_target = tmp_path / "repo-python-target"
@@ -144,11 +149,15 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
             name
             for name in (
                 "PYTHONEXECUTABLE",
+                "PYTHONBREAKPOINT",
                 "PYTHONHOME",
                 "PYTHONINSPECT",
+                "PYTHONNOUSERSITE",
                 "PYTHONPATH",
+                "PYTHONSAFEPATH",
                 "PYTHONSTARTUP",
                 "PYTHONUSERBASE",
+                "PYTHONWARNINGS",
             )
             if name in os.environ
         )
@@ -225,8 +234,30 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
           *) privileged=false ;;
         esac
         /usr/bin/printf \
-          '{"event":"start","privileged":%s}\n' \
+          '{"event":"start","privileged":%s}\\n' \
           "$privileged" >> "$HARNESS_LOG"
+        if [[ "${HARNESS_WARNING_PROBE:-0}" == "1" ]]; then
+          PYTHONPATH="$HARNESS_WARNING_MODULE_PATH" \
+            "$HARNESS_REAL_PYTHON" -c '
+        import json
+        import os
+        from pathlib import Path
+        import sys
+
+        event = {
+            "event": "start-python",
+            "no_user_site": bool(sys.flags.no_user_site),
+            "pythonbreakpoint": os.environ.get("PYTHONBREAKPOINT"),
+            "pythonwarnings": os.environ.get("PYTHONWARNINGS"),
+            "safe_path": bool(sys.flags.safe_path),
+        }
+        with Path(os.environ["HARNESS_LOG"]).open(
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\\n")
+        '
+        fi
         if [[ "$HARNESS_START" == "fail" ]]; then
           exit 23
         fi
@@ -286,21 +317,61 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
                 '{{"alive":true,"database_reachable":true,'
                 '"extra":true}}'
             )
+        elif mode == "integer-truthy-json":
+            print('{{"alive":1,"database_reachable":1}}')
+        elif mode == "float-truthy-json":
+            print('{{"alive":1.0,"database_reachable":1.0}}')
         else:
             print({_LIVE_PAYLOAD!r})
         """
     )
     _write_executable(fake_curl, fake_curl_source)
 
+    fake_stat_source = textwrap.dedent(
+        f"""\
+        #!{sys.executable} -I
+        import os
+        import subprocess
+        import sys
+
+        arguments = sys.argv[1:]
+        completed = subprocess.run(
+            [{_STAT!r}, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = completed.stdout
+        if (
+            completed.returncode == 0
+            and os.environ.get("HARNESS_FOREIGN_START_OWNER") == "1"
+            and arguments[-1:] == [
+                os.environ["HARNESS_START_SCRIPT"]
+            ]
+            and "%u:%p:%l" in arguments
+        ):
+            owner, mode, links = output.strip().split(":")
+            output = f"{{int(owner) + 1}}:{{mode}}:{{links}}\\n"
+        sys.stdout.write(output)
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
+        """
+    )
+    _write_executable(fake_stat, fake_stat_source)
+
     production_source = _LAUNCHER.read_text(encoding="utf-8")
     assert _CANONICAL_ROOT in production_source
     assert _CURL in production_source
+    assert _STAT in production_source
     injected_source = production_source.replace(
         _CANONICAL_ROOT,
         str(project),
     ).replace(
         _CURL,
         str(fake_curl),
+    ).replace(
+        _STAT,
+        str(fake_stat),
     )
     _write_executable(launcher, injected_source)
 
@@ -312,6 +383,7 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
         ca=ca,
         start_script=start_script,
         fake_curl=fake_curl,
+        fake_stat=fake_stat,
         log=log,
         state=state,
         parent=tmp_path,
@@ -565,6 +637,78 @@ def test_operator_launcher_blocks_pythonpath_startup_hijack(
     )
 
 
+def test_operator_launcher_scrubs_start_child_python_injection(
+    launcher_harness: LauncherHarness,
+):
+    marker = launcher_harness.parent / "pythonwarnings-imported"
+    warning_modules = launcher_harness.parent / "warning-modules"
+    warning_modules.mkdir()
+    probe_environment = {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": str(warning_modules),
+    }
+    warning_hook = warning_modules / "warning_probe.py"
+    warning_hook.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).touch()\n"
+        "class InjectedWarning(Warning):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    warning_option = "ignore::warning_probe.InjectedWarning"
+    primitive = subprocess.run(
+        [sys.executable, "-c", "pass"],
+        cwd=launcher_harness.project,
+        env={
+            **probe_environment,
+            "PYTHONWARNINGS": warning_option,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert primitive.returncode == 0, primitive.stderr
+    assert marker.exists(), (
+        "test warning hook did not execute: "
+        f"{primitive.stderr}"
+    )
+    marker.unlink()
+
+    completed = launcher_harness.run(
+        direct=True,
+        control="absent",
+        liveness="after-start",
+        environment_overrides={
+            "HARNESS_WARNING_MODULE_PATH": str(warning_modules),
+            "HARNESS_WARNING_PROBE": "1",
+            "PYTHONBREAKPOINT": "warning_probe.injected_breakpoint",
+            "PYTHONWARNINGS": warning_option,
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    child = next(
+        event
+        for event in launcher_harness.events()
+        if event["event"] == "start-python"
+    )
+    assert child == {
+        "event": "start-python",
+        "no_user_site": True,
+        "pythonbreakpoint": None,
+        "pythonwarnings": None,
+        "safe_path": True,
+    }
+    assert all(
+        event["startup_environment"] == []
+        for event in _python_events(launcher_harness)
+    )
+
+
 @pytest.mark.parametrize(
     "relative_path",
     (
@@ -671,6 +815,40 @@ def test_operator_launcher_rejects_writable_start_script(
     assert launcher_harness.events() == []
 
 
+def test_operator_launcher_rejects_hardlinked_start_script(
+    launcher_harness: LauncherHarness,
+):
+    os.link(
+        launcher_harness.start_script,
+        launcher_harness.parent / "start-hardlink",
+    )
+
+    completed = launcher_harness.run(
+        direct=True,
+        control="absent",
+        liveness="after-start",
+    )
+
+    assert completed.returncode != 0
+    assert launcher_harness.events() == []
+
+
+def test_operator_launcher_rejects_foreign_owned_start_script(
+    launcher_harness: LauncherHarness,
+):
+    completed = launcher_harness.run(
+        direct=True,
+        control="absent",
+        liveness="after-start",
+        environment_overrides={
+            "HARNESS_FOREIGN_START_OWNER": "1",
+        },
+    )
+
+    assert completed.returncode != 0
+    assert launcher_harness.events() == []
+
+
 @pytest.mark.parametrize(
     "liveness",
     ["fail", "wrong-json", "extra-json"],
@@ -680,6 +858,24 @@ def test_operator_launcher_requires_exact_verified_liveness_before_menu(
     liveness: str,
 ):
     completed = launcher_harness.run(liveness=liveness)
+
+    assert completed.returncode != 0
+    assert "start" not in _event_names(launcher_harness)
+    _assert_menu_was_not_launched(launcher_harness)
+
+
+@pytest.mark.parametrize(
+    "liveness",
+    ["integer-truthy-json", "float-truthy-json"],
+)
+def test_operator_launcher_requires_boolean_liveness_values(
+    launcher_harness: LauncherHarness,
+    liveness: str,
+):
+    completed = launcher_harness.run(
+        direct=True,
+        liveness=liveness,
+    )
 
     assert completed.returncode != 0
     assert "start" not in _event_names(launcher_harness)
