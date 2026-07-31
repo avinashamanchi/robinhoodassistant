@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import signal
@@ -16,6 +17,7 @@ _STARTUP_TIMEOUT_SECONDS = 15.0
 _STARTUP_POLL_SECONDS = 0.1
 _MAX_POSTURE_AGE_SECONDS = 30.0
 _MAX_POSTURE_FUTURE_SKEW_SECONDS = 5.0
+_RECONCILIATION_AGE_TOLERANCE_SECONDS = 1e-6
 _BREAKER_SCOPES = frozenset(
     {"account", "equity", "crypto", "liquidity"}
 )
@@ -361,7 +363,9 @@ class DaemonSupervisor:
         fields: tuple[str, ...],
     ) -> bool:
         return all(
-            type(check.get(field)) is float and check[field] >= 0
+            type(check.get(field)) is float
+            and math.isfinite(check[field])
+            and check[field] >= 0
             for field in fields
         )
 
@@ -477,6 +481,8 @@ class DaemonSupervisor:
     def _common_safety_block(
         cls,
         checks: dict[str, list[dict[str, object]]],
+        *,
+        observed_at: datetime,
     ) -> str | None:
         broker = cls._one(checks, "broker_mode")
         if (
@@ -583,6 +589,11 @@ class DaemonSupervisor:
             if reconciliation is not None
             else None
         )
+        reconciliation_age = (
+            (observed_at - reconciliation_completed).total_seconds()
+            if reconciliation_completed is not None
+            else None
+        )
         if (
             reconciliation is None
             or reconciliation.get("status") != "pass"
@@ -600,11 +611,22 @@ class DaemonSupervisor:
                 ("age_seconds", "max_age_seconds"),
             )
             or reconciliation["max_age_seconds"] <= 0
-            or reconciliation["age_seconds"]
-            > reconciliation["max_age_seconds"]
             or reconciliation_started is None
             or reconciliation_completed is None
             or reconciliation_updated is None
+            or reconciliation_age is None
+            or not math.isfinite(reconciliation_age)
+            or reconciliation_age < 0
+            or not math.isclose(
+                reconciliation["age_seconds"],
+                reconciliation_age,
+                rel_tol=0.0,
+                abs_tol=(
+                    _RECONCILIATION_AGE_TOLERANCE_SECONDS
+                ),
+            )
+            or reconciliation_age
+            > reconciliation["max_age_seconds"]
             or not (
                 reconciliation_started
                 <= reconciliation_completed
@@ -739,7 +761,10 @@ class DaemonSupervisor:
             return "posture_invalid", None, None
         if not cls._observation_is_current(observed_at):
             return "posture_not_fresh", None, None
-        block_code = cls._common_safety_block(checks)
+        block_code = cls._common_safety_block(
+            checks,
+            observed_at=observed_at,
+        )
         if block_code is not None:
             return block_code, None, None
         return None, observed_at, checks

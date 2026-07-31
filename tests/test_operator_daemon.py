@@ -787,6 +787,122 @@ def test_start_rejects_incoherent_safety_evidence_timeline(
     assert factory.calls == []
 
 
+def test_start_recomputes_reconciliation_age_from_completion_time(
+    tmp_path,
+):
+    report = safe_posture()
+    observed_at = datetime.fromisoformat(str(report["observed_at"]))
+    completed_at = observed_at - timedelta(days=2)
+    reconciliation = posture_check(
+        report,
+        "startup_reconciliation",
+    )
+    reconciliation.update(
+        {
+            "age_seconds": 1.0,
+            "max_age_seconds": 300.0,
+            "started_at": (
+                completed_at - timedelta(seconds=1)
+            ).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "updated_at": completed_at.isoformat(),
+        }
+    )
+    supervisor, factory, _clock = build_supervisor(
+        tmp_path,
+        FakeChild(pid=4242),
+    )
+
+    result = supervisor.start(
+        posture=report,
+        heartbeat_loader=fresh_heartbeat_posture,
+    )
+
+    assert result.state == "start_blocked"
+    assert result.detail_code == "posture_reconciliation_unsafe"
+    assert factory.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("age_seconds", float("inf")),
+        ("age_seconds", float("-inf")),
+        ("age_seconds", float("nan")),
+        ("max_age_seconds", float("inf")),
+        ("max_age_seconds", float("-inf")),
+        ("max_age_seconds", float("nan")),
+    ],
+    ids=(
+        "age-positive-infinity",
+        "age-negative-infinity",
+        "age-nan",
+        "max-positive-infinity",
+        "max-negative-infinity",
+        "max-nan",
+    ),
+)
+def test_start_rejects_nonfinite_reconciliation_age_evidence(
+    tmp_path,
+    field,
+    value,
+):
+    report = safe_posture()
+    reconciliation = posture_check(
+        report,
+        "startup_reconciliation",
+    )
+    reconciliation[field] = value
+    supervisor, factory, _clock = build_supervisor(
+        tmp_path,
+        FakeChild(pid=4242),
+    )
+
+    result = supervisor.start(
+        posture=report,
+        heartbeat_loader=fresh_heartbeat_posture,
+    )
+
+    assert result.state == "start_blocked"
+    assert result.detail_code == "posture_reconciliation_unsafe"
+    assert factory.calls == []
+
+
+def test_start_accepts_finite_producer_consistent_reconciliation_age(
+    tmp_path,
+):
+    report = safe_posture()
+    observed_at = datetime.fromisoformat(str(report["observed_at"]))
+    completed_at = observed_at - timedelta(seconds=2)
+    reconciliation = posture_check(
+        report,
+        "startup_reconciliation",
+    )
+    reconciliation.update(
+        {
+            "age_seconds": 2.0,
+            "max_age_seconds": 300.0,
+            "started_at": (
+                completed_at - timedelta(seconds=1)
+            ).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "updated_at": completed_at.isoformat(),
+        }
+    )
+    supervisor, factory, _clock = build_supervisor(
+        tmp_path,
+        FakeChild(pid=4242),
+    )
+
+    result = supervisor.start(
+        posture=report,
+        heartbeat_loader=fresh_heartbeat_posture,
+    )
+
+    assert result.state == "running"
+    assert len(factory.calls) == 1
+
+
 @pytest.mark.parametrize(
     ("name", "scope", "status", "detail_code"),
     [
