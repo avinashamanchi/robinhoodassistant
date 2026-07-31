@@ -4947,3 +4947,286 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
         '"$verifier_python" -I -S scripts/verify_loopback_release.py',
         "",
     )
+
+
+def _runtime_consolidation_static_fixture() -> str:
+    return (
+        "import os\n"
+        "import sqlite3\n"
+        "from pathlib import Path\n"
+        "from trading_assistant.db.schema import require_current_schema\n"
+        "from trading_assistant.ops.backup import backup_database\n"
+        "from trading_assistant.ops.control import prove_app_absent\n"
+        "from trading_assistant.ops.tenure import RuntimeTenureService\n\n"
+        "PRODUCTION_SOURCE = Path("
+        "'/Users/avi/Desktop/robinhood/trading-assistant/.worktrees/"
+        "safety-foundation')\n"
+        "PRODUCTION_DESTINATION = Path("
+        "'/Users/avi/Desktop/robinhood/trading-assistant')\n"
+        "MIGRATION_UNCERTAIN = 'migration_uncertain'\n\n"
+        "def logical_summary(connection):\n"
+        "    return connection.execute("
+        "'SELECT COUNT(*) FROM probe').fetchone()\n\n"
+        "def consolidate_runtime(source_root, destination_root, *, "
+        "backup_key, backup_key_id, process_identity, process_inspector):\n"
+        "    source_root = source_root.resolve(strict=True)\n"
+        "    destination_root = destination_root.resolve(strict=True)\n"
+        "    assert source_root == PRODUCTION_SOURCE.resolve(strict=True)\n"
+        "    assert destination_root == "
+        "PRODUCTION_DESTINATION.resolve(strict=True)\n"
+        "    assert source_root.name == 'safety-foundation'\n"
+        "    assert source_root.parent.name == '.worktrees'\n"
+        "    source = source_root / 'trading_assistant.db'\n"
+        "    destination = destination_root / 'trading_assistant.db'\n"
+        "    source_lstat = source.lstat()\n"
+        "    source_fd = os.open("
+        "source, os.O_RDONLY | os.O_NOFOLLOW)\n"
+        "    source_fstat = os.fstat(source_fd)\n"
+        "    assert source_lstat.st_ino == source_fstat.st_ino\n"
+        "    assert source_fstat.st_uid == os.getuid()\n"
+        "    assert source_fstat.st_nlink == 1\n"
+        "    assert source_fstat.st_mode & 0o177 == 0\n"
+        "    assert prove_app_absent(source_root, port=8020)\n"
+        "    source_service = RuntimeTenureService("
+        "source, process_inspector=process_inspector)\n"
+        "    destination_service = RuntimeTenureService("
+        "destination, process_inspector=process_inspector)\n"
+        "    source_backup = backup_database(source, "
+        "source_root / '.local/encrypted-backups', "
+        "backup_key=backup_key, backup_key_id=backup_key_id, "
+        "process_identity=process_identity, "
+        "process_inspector=process_inspector)\n"
+        "    destination_backup = backup_database(destination, "
+        "destination_root / '.local/encrypted-backups', "
+        "backup_key=backup_key, backup_key_id=backup_key_id, "
+        "process_identity=process_identity, "
+        "process_inspector=process_inspector)\n"
+        "    assert source_backup.verified is True\n"
+        "    assert destination_backup.verified is True\n"
+        "    assert source_backup.backup_key_id == backup_key_id\n"
+        "    assert destination_backup.backup_key_id == backup_key_id\n"
+        "    source_guard = source_service.acquire_maintenance("
+        "process_identity, ttl_seconds=300)\n"
+        "    destination_guard = destination_service.acquire_maintenance("
+        "process_identity, ttl_seconds=300)\n"
+        "    staging_dir = destination_root / '.local' / "
+        "'runtime-consolidation-stage-private'\n"
+        "    staging_dir.mkdir(mode=0o700)\n"
+        "    staging = staging_dir / 'runtime.sqlite3'\n"
+        "    staging_fd = os.open(staging, os.O_RDWR | os.O_CREAT | "
+        "os.O_EXCL | os.O_NOFOLLOW, 0o600)\n"
+        "    with sqlite3.connect(source) as source_connection, "
+        "sqlite3.connect(staging) as staging_connection:\n"
+        "        source_connection.backup(staging_connection)\n"
+        "        assert source_connection.execute("
+        "'PRAGMA quick_check').fetchall() == [('ok',)]\n"
+        "        assert not source_connection.execute("
+        "'PRAGMA foreign_key_check').fetchall()\n"
+        "        require_current_schema(source_connection)\n"
+        "        require_current_schema(staging_connection)\n"
+        "        assert logical_summary(source_connection) == "
+        "logical_summary(staging_connection)\n"
+        "    os.fchmod(staging_fd, 0o600)\n"
+        "    os.fsync(staging_fd)\n"
+        "    directory_fd = os.open(staging_dir, os.O_RDONLY | "
+        "os.O_NOFOLLOW)\n"
+        "    os.fsync(directory_fd)\n"
+        "    replacement = destination.with_name("
+        "'.trading_assistant.db.runtime-consolidation-old-protected')\n"
+        "    os.rename(destination, replacement)\n"
+        "    os.rename(staging, destination)\n"
+        "    os.fsync(directory_fd)\n"
+        "    uncertainty_marker = destination_root / '.local' / "
+        "'runtime-consolidation.migration_uncertain'\n"
+        "    marker_fd = os.open(uncertainty_marker, os.O_WRONLY | "
+        "os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)\n"
+        "    os.fchmod(marker_fd, 0o600)\n"
+        "    source_guard.release()\n"
+        "    destination_guard.release()\n"
+        "    replacement.unlink()\n"
+        "    return MIGRATION_UNCERTAIN\n"
+    )
+
+
+def test_release_static_gate_authorizes_only_verified_runtime_consolidation(
+    tmp_path,
+):
+    root = _static_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/runtime_consolidation.py",
+        _runtime_consolidation_static_fixture(),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            "/Users/avi/Desktop/robinhood/trading-assistant/.worktrees/"
+            "safety-foundation",
+            "/tmp/safety-foundation",
+        ),
+        ("source_root.parent.name == '.worktrees'", "True"),
+        ("os.O_NOFOLLOW", "os.O_RDONLY"),
+        ("os.O_EXCL", "os.O_CREAT"),
+        ("mode=0o700", "mode=0o755"),
+        (", 0o600)", ", 0o644)"),
+        ("prove_app_absent", "unproven_app_absence"),
+        ("acquire_maintenance", "acquire_runtime"),
+        (
+            "source_backup = backup_database",
+            "source_backup = unsafe_backup",
+        ),
+        (
+            "destination_backup = backup_database",
+            "destination_backup = unsafe_backup",
+        ),
+        ("'PRAGMA quick_check'", "'SELECT 1'"),
+        ("'PRAGMA foreign_key_check'", "'SELECT 1'"),
+        ("require_current_schema(source_connection)", "None"),
+        ("logical_summary(source_connection)", "None"),
+        ("os.fsync(staging_fd)", "None"),
+        ("os.rename(staging, destination)", "None"),
+        ("'migration_uncertain'", "'unknown'"),
+    ],
+)
+def test_release_static_gate_rejects_removed_runtime_transfer_guard(
+    tmp_path,
+    needle,
+    replacement,
+):
+    root = _static_fixture(tmp_path)
+    source = _runtime_consolidation_static_fixture()
+    assert needle in source
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/runtime_consolidation.py",
+        source.replace(needle, replacement, 1),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        (
+            "src/trading_assistant/ops/unsafe_transfer.py",
+            "def transfer(source_connection, destination_connection):\n"
+            "    source_connection.backup(destination_connection)\n",
+        ),
+        (
+            "src/trading_assistant/ops/unsafe_transfer.py",
+            "database_copy_path = '.local/plain-copy.db'\n",
+        ),
+        (
+            "src/trading_assistant/ops/unsafe_transfer.py",
+            "import sqlite3\n"
+            "staging = sqlite3.connect("
+            "'.local/plaintext-stage.sqlite3')\n",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_runtime_transfer_outside_authority(
+    tmp_path,
+    relative,
+    source,
+):
+    root = _static_fixture(tmp_path)
+    _write_fixture_file(root, relative, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "unsafe_import",
+    [
+        "import glob\n",
+        "import requests\n",
+        "import shlex\n",
+        "import subprocess\n",
+        "from trading_assistant.broker import alpaca\n",
+        "from trading_assistant.llm import factory\n",
+    ],
+)
+def test_release_static_gate_rejects_active_runtime_transfer_imports(
+    tmp_path,
+    unsafe_import,
+):
+    root = _static_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/runtime_consolidation.py",
+        unsafe_import + _runtime_consolidation_static_fixture(),
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "unsafe_line",
+    [
+        "    source.unlink()\n",
+        "    source_backup.path.unlink()\n",
+        "    return replacement\n",
+    ],
+)
+def test_release_static_gate_rejects_source_backup_deletion_or_archive_retention(
+    tmp_path,
+    unsafe_line,
+):
+    root = _static_fixture(tmp_path)
+    source = _runtime_consolidation_static_fixture().replace(
+        "    return MIGRATION_UNCERTAIN\n",
+        unsafe_line + "    return MIGRATION_UNCERTAIN\n",
+    )
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/runtime_consolidation.py",
+        source,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "unsafe_helper",
+    [
+        "\ndef erase_source(source):\n"
+        "    source.unlink()\n",
+        "\ndef erase_backup(source_backup):\n"
+        "    source_backup.path.unlink()\n",
+    ],
+)
+def test_release_static_gate_rejects_protected_deletion_in_helper(
+    tmp_path,
+    unsafe_helper,
+):
+    root = _static_fixture(tmp_path)
+    _write_fixture_file(
+        root,
+        "src/trading_assistant/ops/runtime_consolidation.py",
+        _runtime_consolidation_static_fixture() + unsafe_helper,
+    )
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode == 1
+    assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
