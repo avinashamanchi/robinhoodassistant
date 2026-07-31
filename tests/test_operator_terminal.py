@@ -108,6 +108,7 @@ class FakeDaemon:
     start_state: str = "running"
     stop_state: str = "off"
     load_heartbeat: bool = False
+    start_error: BaseException | None = None
     start_calls: list[tuple[dict[str, object], object]] | None = None
     stop_calls: int = 0
 
@@ -115,6 +116,9 @@ class FakeDaemon:
         if self.start_calls is None:
             self.start_calls = []
         self.start_calls.append((deepcopy(posture), heartbeat_loader))
+        if self.start_error is not None:
+            self.owns_child = True
+            raise self.start_error
         if self.load_heartbeat:
             heartbeat_loader()
         if self.start_state in {"starting", "running"}:
@@ -668,6 +672,27 @@ def test_monitoring_start_fetches_posture_before_confirmation():
     assert daemon.start_calls is None
     assert "Confirmation: " not in input_fn.prompts
     assert any("code=posture_unavailable" in line for line in output)
+
+
+@pytest.mark.parametrize("interrupt", [EOFError(), KeyboardInterrupt()])
+def test_monitoring_start_interrupt_cleans_up_only_newly_owned_child(
+    interrupt,
+):
+    api = FakeApi()
+    api.queue_get("/security/posture", posture_payload())
+    daemon = FakeDaemon(start_error=interrupt)
+    menu, _output, _input, _secret, _daemon = build_menu(
+        api,
+        ["7", "1", "START PAPER MONITORING"],
+        daemon=daemon,
+    )
+
+    assert menu.run() == 0
+    assert daemon.start_calls is not None
+    assert len(daemon.start_calls) == 1
+    assert daemon.stop_calls == 1
+    assert daemon.owns_child is False
+    assert api.logout_calls == 1
 
 
 @pytest.mark.parametrize(
