@@ -14,6 +14,7 @@ import unicodedata
 from typing import Any, Callable
 
 from .operator_api import OperatorApiClient, OperatorApiError
+from .operator_daemon import DaemonSupervisor
 
 
 CANONICAL_PROJECT_ROOT = Path(
@@ -114,6 +115,10 @@ _PLAN_MENU = (
 _RULE_MENU = "Rules: 1 List | 2 Cancel | 0 Back"
 _PENDING_MENU = (
     "Pending orders: 1 List | 2 Approve | 3 Reject | 4 Cancel | 0 Back"
+)
+_MONITORING_MENU = (
+    "Monitoring: 1 Start paper monitoring | "
+    "2 Stop paper monitoring | 0 Back"
 )
 _OPERATIONS_MENU = (
     "Operations: 1 Synchronize open orders | 2 Reconcile positions | "
@@ -856,8 +861,71 @@ class OperatorMenu:
         return "unknown" if value is None else value
 
     def _monitoring(self) -> bool:
-        self._write("monitoring_not_available_in_task_3")
+        self._write(_MONITORING_MENU)
+        choice = self._menu_choice(
+            self._input("Monitoring choice: ")
+        )
+        if choice == "0":
+            return False
+        if choice == "1":
+            posture = self.api.get("/security/posture")
+            self._write(
+                "Monitoring may create pending proposals but "
+                "never approves them."
+            )
+            if not self._confirm_exact("START PAPER MONITORING"):
+                self._write("monitoring_start_cancelled")
+                return False
+            result = self.daemon.start(
+                posture=posture,
+                heartbeat_loader=lambda: self.api.get(
+                    "/security/posture"
+                ),
+            )
+            self._write(
+                "Paper monitoring start: "
+                f"{render_json_summary(self._daemon_status(result))}"
+            )
+            return False
+        if choice == "2":
+            if not self._confirm_exact("STOP PAPER MONITORING"):
+                self._write("monitoring_stop_cancelled")
+                return False
+            result = self.daemon.stop()
+            self._write(
+                "Paper monitoring stop: "
+                f"{render_json_summary(self._daemon_status(result))}"
+            )
+            return False
+        self._write("Invalid monitoring choice")
         return False
+
+    @staticmethod
+    def _daemon_status(result: object) -> dict[str, object]:
+        state = getattr(result, "state", None)
+        if state not in {
+            "off",
+            "starting",
+            "running",
+            "exited",
+            "start_blocked",
+            "stop_unconfirmed",
+        }:
+            state = "unknown"
+        pid = getattr(result, "pid", None)
+        if type(pid) is not int or pid <= 0:
+            pid = None
+        detail_code = getattr(result, "detail_code", None)
+        if (
+            not isinstance(detail_code, str)
+            or _SAFE_ERROR_CODE.fullmatch(detail_code) is None
+        ):
+            detail_code = "unknown"
+        return {
+            "state": state,
+            "pid": pid,
+            "detail_code": detail_code,
+        }
 
     def _operations(self) -> bool:
         self._write(_OPERATIONS_MENU)
@@ -1858,10 +1926,6 @@ class OperatorMenu:
         )
 
 
-class _NoOwnedDaemon:
-    owns_child = False
-
-
 def main(argv: list[str] | None = None) -> int:
     """Start the fixed-root terminal without URL or TLS override arguments."""
     arguments = sys.argv[1:] if argv is None else list(argv)
@@ -1870,7 +1934,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         api = OperatorApiClient(CANONICAL_PROJECT_ROOT)
-        return OperatorMenu(api, _NoOwnedDaemon()).run()
+        daemon = DaemonSupervisor(CANONICAL_PROJECT_ROOT)
+        return OperatorMenu(api, daemon).run()
     except (KeyboardInterrupt, EOFError):
         return 0
     except Exception:

@@ -105,11 +105,30 @@ class FakeApi:
 @dataclass
 class FakeDaemon:
     owns_child: bool = False
+    start_state: str = "running"
     stop_state: str = "off"
+    load_heartbeat: bool = False
+    start_calls: list[tuple[dict[str, object], object]] | None = None
     stop_calls: int = 0
+
+    def start(self, *, posture, heartbeat_loader) -> SimpleNamespace:
+        if self.start_calls is None:
+            self.start_calls = []
+        self.start_calls.append((deepcopy(posture), heartbeat_loader))
+        if self.load_heartbeat:
+            heartbeat_loader()
+        if self.start_state in {"starting", "running"}:
+            self.owns_child = True
+        return SimpleNamespace(
+            state=self.start_state,
+            pid=4242,
+            detail_code=self.start_state,
+        )
 
     def stop(self) -> SimpleNamespace:
         self.stop_calls += 1
+        if self.stop_state in {"off", "exited"}:
+            self.owns_child = False
         return SimpleNamespace(
             state=self.stop_state,
             pid=None,
@@ -601,17 +620,110 @@ def test_unknown_top_level_choice_is_deterministic():
     assert "Invalid choice" in output
 
 
-def test_monitoring_remains_a_dedicated_no_authority_stub_until_task_5():
+def test_monitoring_start_fetches_posture_and_requires_exact_phrase():
     api = FakeApi()
-    menu, output, _input, _secret, _daemon = build_menu(
+    posture = posture_payload()
+    api.queue_get("/security/posture", posture, posture_payload())
+    daemon = FakeDaemon(load_heartbeat=True)
+    menu, output, input_fn, _secret, _daemon = build_menu(
         api,
-        ["7", "0"],
+        ["7", "1", "START PAPER MONITORING", "0"],
+        daemon=daemon,
     )
 
     assert menu.run() == 0
-    assert "monitoring_not_available_in_task_3" in output
+    assert api.gets == ["/security/posture", "/security/posture"]
+    assert api.mutations == []
+    assert daemon.start_calls is not None
+    assert len(daemon.start_calls) == 1
+    assert daemon.start_calls[0][0] == posture
+    assert daemon.stop_calls == 1
+    assert "Confirmation: " in input_fn.prompts
+    transcript = "\n".join(output)
+    assert "Monitoring may create pending proposals" in transcript
+    assert "never approves them" in transcript
+    assert "Type exactly: START PAPER MONITORING" in output
+    assert '"state": "running"' in transcript
+
+
+def test_monitoring_start_fetches_posture_before_confirmation():
+    api = FakeApi()
+    api.queue_get(
+        "/security/posture",
+        OperatorApiError(
+            status=503,
+            code="posture_unavailable",
+            message="posture unavailable",
+        ),
+    )
+    daemon = FakeDaemon()
+    menu, output, input_fn, _secret, _daemon = build_menu(
+        api,
+        ["7", "1", "START PAPER MONITORING", "0"],
+        daemon=daemon,
+    )
+
+    assert menu.run() == 0
+    assert api.gets == ["/security/posture"]
+    assert daemon.start_calls is None
+    assert "Confirmation: " not in input_fn.prompts
+    assert any("code=posture_unavailable" in line for line in output)
+
+
+@pytest.mark.parametrize(
+    "provided",
+    [
+        "start paper monitoring",
+        " START PAPER MONITORING ",
+        "START PAPER MONITORING\n",
+    ],
+)
+def test_monitoring_start_rejects_every_inexact_phrase(provided):
+    api = FakeApi()
+    api.queue_get("/security/posture", posture_payload())
+    daemon = FakeDaemon()
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["7", "1", provided, "0"],
+        daemon=daemon,
+    )
+
+    assert menu.run() == 0
+    assert api.gets == ["/security/posture"]
+    assert daemon.start_calls is None
+    assert daemon.stop_calls == 0
+    assert "monitoring_start_cancelled" in output
+
+
+def test_monitoring_stop_requires_exact_phrase_and_stops_owned_child():
+    api = FakeApi()
+    daemon = FakeDaemon(owns_child=True)
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["7", "2", "STOP PAPER MONITORING", "0"],
+        daemon=daemon,
+    )
+
+    assert menu.run() == 0
     assert api.gets == []
     assert api.mutations == []
+    assert daemon.stop_calls == 1
+    assert "Type exactly: STOP PAPER MONITORING" in output
+    assert any('"state": "off"' in line for line in output)
+
+
+def test_monitoring_stop_rejects_inexact_phrase_without_signaling():
+    api = FakeApi()
+    daemon = FakeDaemon(owns_child=True)
+    menu, output, _input, _secret, _daemon = build_menu(
+        api,
+        ["7", "2", "stop paper monitoring", "0"],
+        daemon=daemon,
+    )
+
+    assert menu.run() == 0
+    assert daemon.stop_calls == 1
+    assert "monitoring_stop_cancelled" in output
 
 
 def test_status_and_account_are_read_only_and_use_only_exact_get_paths():
@@ -2616,15 +2728,25 @@ def test_main_constructs_only_the_fixed_root_client_and_injected_menu(
         def run(self):
             return 0
 
+    class Supervisor:
+        owns_child = False
+
+        def __init__(self, project_root):
+            seen["daemon_project_root"] = project_root
+
     monkeypatch.setattr(operator_terminal, "OperatorApiClient", Client)
     monkeypatch.setattr(operator_terminal, "OperatorMenu", Menu)
+    monkeypatch.setattr(operator_terminal, "DaemonSupervisor", Supervisor)
 
     assert operator_terminal.main([]) == 0
     assert seen["project_root"] == Path(
         "/Users/avi/Desktop/robinhood/trading-assistant"
     )
+    assert seen["daemon_project_root"] == Path(
+        "/Users/avi/Desktop/robinhood/trading-assistant"
+    )
     assert seen["api"].__class__ is Client
-    assert seen["daemon"].owns_child is False
+    assert seen["daemon"].__class__ is Supervisor
 
 
 def test_main_rejects_all_arguments_without_echoing_them(
