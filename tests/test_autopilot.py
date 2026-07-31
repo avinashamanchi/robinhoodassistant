@@ -168,6 +168,20 @@ def test_dry_run_decides_but_places_no_orders(make_service):
     assert service.broker.submit_calls == 0
 
 
+def test_run_once_skips_all_when_market_closed(make_service):
+    service = make_service(market_open=False)
+    feats = {"AAPL": _features("AAPL", 105, 100, sma200=90, last_close=100)}
+    ap = Autopilot(
+        service,
+        _provider(feats),
+        universe=["AAPL"],
+        notional_per_trade=Decimal("100"),
+        max_orders_per_day=8,
+    )
+    assert ap.run_once() == []
+    assert service.broker.submit_calls == 0
+
+
 def test_run_once_skips_flat_names_without_position(make_service):
     service = make_service()
     feats = {"AAPL": _features("AAPL", 95, 100)}  # flat, nothing held

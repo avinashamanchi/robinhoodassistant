@@ -197,12 +197,31 @@ class Autopilot:
         log.info("autopilot placed %s", result)
         return result
 
+    def _market_open(self, symbol: str, cache: dict) -> bool:
+        """Asset-class-aware market-open check, cached once per class per cycle."""
+        from .assets import AssetClass
+
+        ac = AssetClass.for_symbol(symbol)
+        if ac not in cache:
+            try:
+                cache[ac] = bool(self.service.market_is_open(symbol))
+            except Exception:
+                cache[ac] = False
+        return cache[ac]
+
     # ── one evaluation pass ───────────────────────────────────────────────────
     def run_once(self) -> list[dict]:
-        """Evaluate the whole universe once and place any resulting paper orders."""
+        """Evaluate the whole universe once and place any resulting paper orders.
+
+        Symbols whose market is closed are skipped entirely — attempting orders
+        after hours only trips data/liquidity breakers on stale quotes, so the
+        loop can run continuously and simply resume trading when the market opens.
+        """
         require_paper(self.service.config)
         executed: list[dict] = []
         placed = self._orders_today()
+        open_cache: dict = {}
+        closed_symbols: list[str] = []
         for symbol in self.universe:
             if placed >= self.max_orders_per_day:
                 log.info(
@@ -210,6 +229,9 @@ class Autopilot:
                     self.max_orders_per_day,
                 )
                 break
+            if not self._market_open(symbol, open_cache):
+                closed_symbols.append(symbol)
+                continue
             try:
                 features = self.feature_provider(symbol)
             except Exception:
@@ -234,6 +256,11 @@ class Autopilot:
             if result is not None:
                 executed.append(result)
                 placed += 1
+        if closed_symbols:
+            log.info(
+                "autopilot: market closed for %s; skipped this cycle",
+                ",".join(closed_symbols),
+            )
         return executed
 
 
