@@ -168,6 +168,54 @@ def test_dry_run_decides_but_places_no_orders(make_service):
     assert service.broker.submit_calls == 0
 
 
+def _trip_breaker(service, scope):
+    from uuid import uuid4
+
+    from trading_assistant.risk.breakers import trip_in_session
+
+    with service.session_factory() as s:
+        trip_in_session(
+            s, scope, "test trip", "test", request_id=uuid4().hex
+        )
+        s.commit()
+
+
+def test_self_heal_clears_transient_liquidity_breaker(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()  # market open, AAPL @ $100
+    scope = BreakerScope.liquidity("AAPL")
+    _trip_breaker(service, scope)
+    ap = Autopilot(
+        service,
+        _provider({"AAPL": _features("AAPL", 95, 100)}),
+        universe=["AAPL"],
+        notional_per_trade=Decimal("100"),
+        max_orders_per_day=8,
+    )
+    ap._heal_transient_breakers()
+    state = service.breakers.get(scope)
+    assert state is None or not state.tripped
+
+
+def test_self_heal_never_touches_broker_drift(make_service):
+    from trading_assistant.risk.breakers import BreakerScope
+
+    service = make_service()
+    drift = BreakerScope.broker_drift()
+    _trip_breaker(service, drift)
+    ap = Autopilot(
+        service,
+        _provider({"AAPL": _features("AAPL", 95, 100)}),
+        universe=["AAPL"],
+        notional_per_trade=Decimal("100"),
+        max_orders_per_day=8,
+    )
+    ap._heal_transient_breakers()
+    # broker_drift is a real safety latch — the autopilot must leave it tripped.
+    assert service.breakers.get(drift).tripped is True
+
+
 def test_run_once_skips_all_when_market_closed(make_service):
     service = make_service(market_open=False)
     feats = {"AAPL": _features("AAPL", 105, 100, sma200=90, last_close=100)}

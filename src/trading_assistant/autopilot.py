@@ -197,6 +197,54 @@ class Autopilot:
         log.info("autopilot placed %s", result)
         return result
 
+    def _transient_breaker_scopes(self):
+        """data:<class> per asset class + liquidity:<symbol> per universe symbol.
+
+        Deliberately EXCLUDES broker_drift / loss / drawdown / operator_global —
+        those are real safety latches a human must clear, never the autopilot.
+        """
+        from .assets import AssetClass
+        from .risk.breakers import BreakerScope
+
+        scopes = []
+        seen_classes = set()
+        for symbol in self.universe:
+            ac = AssetClass.for_symbol(symbol)
+            if ac not in seen_classes:
+                seen_classes.add(ac)
+                scopes.append(BreakerScope.data(ac))
+            scopes.append(BreakerScope.liquidity(symbol))
+        return scopes
+
+    def _heal_transient_breakers(self) -> None:
+        """Auto-clear latched TRANSIENT market-condition breakers (stale-data,
+        per-symbol liquidity/spread). Safe because the real-time staleness and
+        spread checks still run on every order — the latch is just what a
+        long-running/after-hours session left behind. Resets only succeed when
+        conditions are readable (market open); otherwise they no-op. Never touches
+        drift/loss/drawdown/global breakers.
+        """
+        for scope in self._transient_breaker_scopes():
+            try:
+                state = self.service.breakers.get(scope)
+            except Exception:
+                continue
+            if state is None or not state.tripped:
+                continue
+            try:
+                self.service.reset_killswitch(
+                    scope,
+                    actor=self.actor,
+                    reason="autopilot transient-breaker self-heal",
+                    expected_generation=state.generation,
+                    request_id=uuid4().hex,
+                )
+                log.info("autopilot cleared transient breaker %s", scope.key)
+            except Exception as exc:
+                log.info(
+                    "autopilot left breaker %s tripped (%s)", scope.key, exc
+                )
+
     def _market_open(self, symbol: str, cache: dict) -> bool:
         """Asset-class-aware market-open check, cached once per class per cycle."""
         from .assets import AssetClass
@@ -218,6 +266,8 @@ class Autopilot:
         loop can run continuously and simply resume trading when the market opens.
         """
         require_paper(self.service.config)
+        if not self.dry_run:
+            self._heal_transient_breakers()
         executed: list[dict] = []
         placed = self._orders_today()
         open_cache: dict = {}
