@@ -12,8 +12,20 @@ spread/quote-freshness, and the daily-loss kill switch — runs on every order a
 remains the final authority. A rejected proposal is simply skipped; the autopilot
 never re-enables live trading and never touches ``approve_order`` on a rejection.
 
-Decisions come from a deterministic strategy over the same ``MarketFeatures`` the
-analyst reads (no LLM in the execution path), so behaviour is reproducible.
+Decisions come from a deterministic strategy class shared with the backtest
+harness (``trading_assistant.strategies``), evaluated over the same
+``MarketFeatures`` the analyst reads (no LLM in the execution path), so a
+backtest of ``autopilot.strategy`` evaluates exactly the rule that trades.
+
+Before acting on a symbol the autopilot also requires:
+
+* broker order truth synced first (``sync_open_orders``), so fills from
+  earlier cycles are on the local ledger before anything is decided;
+* fresh features (newest bar within ``autopilot.max_feature_age_hours``);
+* no order for that symbol already in flight at the broker;
+* ownership: it exits only the quantity its own fills bought, and never buys
+  into or sells out of a position another workflow (a plan, a human approval)
+  holds.
 
     uv run python -m trading_assistant.autopilot --once   # one cycle, then exit
     uv run python -m trading_assistant.autopilot          # run the loop
@@ -24,50 +36,83 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 from uuid import uuid4
 
 from sqlalchemy import func, select
 
-from .broker.models import OrderStatus
+from .broker.models import OrderSide, OrderStatus
 from .config import AppConfig, BrokerKind, TradingMode
-from .db.models import Order
+from .db.models import NONTERMINAL_STATES, Fill, Order, fill_has_trusted_identity
 from .dependencies import RequiredDependencyUnavailable
 from .signals.models import MarketFeatures
+from .strategies.base import SignalAction, Strategy
+from .strategies.sma_crossover import SmaCrossover
+from .strategies.sma_trend import SmaTrend
 
 log = logging.getLogger(__name__)
+
+ACTOR_PREFIX = "autopilot:"
+
+LONG = "long"
+FLAT = "flat"
+HOLD = "hold"
 
 
 class AutopilotDisabled(RuntimeError):
     """Refuse to run the autopilot unless it is explicitly enabled on paper."""
 
 
-# ── deterministic strategies (MarketFeatures -> "long" | "flat") ──────────────
-def sma_crossover_decision(f: MarketFeatures) -> str:
-    """Trend-following long/flat rule.
-
-    Long while the fast average leads the slow average *and* price holds above the
-    long-term trend; otherwise flat. Missing inputs are treated as flat, so the
-    autopilot never trades on incomplete data.
-    """
-    if f.sma_20 is None or f.sma_50 is None:
-        return "flat"
-    if f.sma_20 <= f.sma_50:
-        return "flat"
-    if (
-        f.sma_200 is not None
-        and f.last_close is not None
-        and f.last_close < f.sma_200
-    ):
-        return "flat"
-    return "long"
-
-
-STRATEGIES: dict[str, Callable[[MarketFeatures], str]] = {
-    "sma_crossover": sma_crossover_decision,
+# ── deterministic strategies (MarketFeatures -> long | flat | hold) ───────────
+# Only stateless strategies belong here: ``--once`` runs start a fresh process
+# every day, so a strategy that remembers earlier bars would silently reset.
+STRATEGIES: dict[str, Callable[[], Strategy]] = {
+    "sma_trend": SmaTrend,
+    "sma_crossover": SmaCrossover,
 }
+
+
+def strategy_decision(strategy: Strategy, features: MarketFeatures) -> str:
+    """Translate a strategy signal into the desired position state.
+
+    BUY means "be long", SELL means "be flat", and HOLD means "change nothing" —
+    in particular, incomplete features never produce an exit.
+    """
+    action = strategy.on_bar(features).action
+    if action is SignalAction.BUY:
+        return LONG
+    if action is SignalAction.SELL:
+        return FLAT
+    return HOLD
+
+
+# Orders that may still execute at the broker. A PROPOSED order cannot execute
+# without approval and expires on its own, so it does not block a symbol.
+_IN_FLIGHT_STATUSES = tuple(
+    status.value
+    for status in NONTERMINAL_STATES
+    if status is not OrderStatus.PROPOSED
+)
+
+# Startup failures that mean "the broker could not be reached", not "local and
+# broker state disagree". Only these are retried; drift always fails closed.
+_TRANSIENT_STARTUP_FAILURES = frozenset(
+    {"broker_reconciliation_dependency_unavailable"}
+)
+
+# Skip reasons that mean the cycle could not see the market properly. A
+# ``--once`` run that hits any of them exits nonzero so launchd shows it.
+DEGRADED_REASONS = frozenset(
+    {
+        "order_sync_unavailable",
+        "features_unavailable",
+        "features_stale",
+        "positions_unavailable",
+    }
+)
 
 
 def _utcnow() -> datetime:
@@ -82,6 +127,18 @@ def require_paper(config: AppConfig) -> None:
         )
 
 
+@dataclass(frozen=True)
+class Decision:
+    """What the autopilot concluded for one symbol in one cycle."""
+
+    symbol: str
+    signal: str
+    action: str
+    reason: str
+    held: Optional[Decimal] = None
+    owned: Optional[Decimal] = None
+
+
 class Autopilot:
     def __init__(
         self,
@@ -91,10 +148,11 @@ class Autopilot:
         universe: list[str],
         notional_per_trade: Decimal,
         max_orders_per_day: int,
-        strategy: str = "sma_crossover",
+        strategy: str = "sma_trend",
         decide: Optional[Callable[[MarketFeatures], str]] = None,
         now: Callable[[], datetime] = _utcnow,
         dry_run: bool = False,
+        max_feature_age: Optional[timedelta] = timedelta(hours=120),
     ) -> None:
         if not universe:
             raise ValueError("autopilot requires a non-empty universe")
@@ -106,10 +164,15 @@ class Autopilot:
         self.notional_per_trade = Decimal(str(notional_per_trade))
         self.max_orders_per_day = int(max_orders_per_day)
         self.strategy = strategy
-        self.decide = decide or STRATEGIES[strategy]
+        if decide is None:
+            rule = STRATEGIES[strategy]()
+            decide = lambda features: strategy_decision(rule, features)  # noqa: E731
+        self.decide = decide
         self.now = now
         self.dry_run = dry_run
-        self.actor = f"autopilot:{strategy}"
+        self.max_feature_age = max_feature_age
+        self.actor = f"{ACTOR_PREFIX}{strategy}"
+        self.last_decisions: list[Decision] = []
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _orders_today(self) -> int:
@@ -125,22 +188,63 @@ class Autopilot:
                     select(func.count())
                     .select_from(Order)
                     .where(
-                        Order.approval_actor.like("autopilot:%"),
+                        Order.approval_actor.like(f"{ACTOR_PREFIX}%"),
                         Order.approved_at >= start,
                     )
                 ).scalar_one()
             )
 
-    def _held_qty(self, symbol: str) -> Optional[Decimal]:
-        """Signed quantity currently held, or None if positions can't be read."""
+    def _positions(self) -> Optional[dict[str, Decimal]]:
+        """Signed broker quantity per symbol, or None if positions can't be read."""
         try:
             positions = self.service.get_positions()
         except RequiredDependencyUnavailable:
             return None
-        for p in positions:
-            if str(p["ticker"]).upper() == symbol:
-                return Decimal(str(p["qty"]))
-        return Decimal(0)
+        return {
+            str(p["ticker"]).upper(): Decimal(str(p["qty"])) for p in positions
+        }
+
+    def _has_in_flight_order(self, session, symbol: str) -> bool:
+        """Whether any workflow has an order for ``symbol`` that may still fill."""
+        return (
+            session.execute(
+                select(Order.id)
+                .where(
+                    Order.ticker == symbol,
+                    Order.status.in_(_IN_FLIGHT_STATUSES),
+                )
+                .limit(1)
+            ).first()
+            is not None
+        )
+
+    def _owned_qty(self, session, symbol: str) -> Decimal:
+        """Net quantity bought by autopilot orders, from trusted fills only."""
+        fills = session.execute(
+            select(Fill)
+            .join(Order, Fill.order_id == Order.id)
+            .where(
+                Order.ticker == symbol,
+                Order.approval_actor.like(f"{ACTOR_PREFIX}%"),
+            )
+        ).scalars().all()
+        net = Decimal(0)
+        for fill in fills:
+            if not fill_has_trusted_identity(fill):
+                continue
+            if fill.side == OrderSide.BUY.value:
+                net += fill.qty
+            elif fill.side == OrderSide.SELL.value:
+                net -= fill.qty
+        return max(net, Decimal(0))
+
+    def _features_stale(self, features: MarketFeatures) -> bool:
+        if self.max_feature_age is None:
+            return False
+        as_of = features.as_of
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        return self.now() - as_of > self.max_feature_age
 
     def _submit(
         self,
@@ -198,7 +302,8 @@ class Autopilot:
         return result
 
     def _transient_breaker_scopes(self):
-        """data:<class> per asset class + liquidity:<symbol> per universe symbol.
+        """(symbol, scope) pairs: data:<class> once per asset class, plus
+        liquidity:<symbol> per universe symbol.
 
         Deliberately EXCLUDES broker_drift / loss / drawdown / operator_global —
         those are real safety latches a human must clear, never the autopilot.
@@ -212,19 +317,23 @@ class Autopilot:
             ac = AssetClass.for_symbol(symbol)
             if ac not in seen_classes:
                 seen_classes.add(ac)
-                scopes.append(BreakerScope.data(ac))
-            scopes.append(BreakerScope.liquidity(symbol))
+                scopes.append((symbol, BreakerScope.data(ac)))
+            scopes.append((symbol, BreakerScope.liquidity(symbol)))
         return scopes
 
-    def _heal_transient_breakers(self) -> None:
+    def _heal_transient_breakers(self, open_cache: Optional[dict] = None) -> None:
         """Auto-clear latched TRANSIENT market-condition breakers (stale-data,
-        per-symbol liquidity/spread). Safe because the real-time staleness and
-        spread checks still run on every order — the latch is just what a
-        long-running/after-hours session left behind. Resets only succeed when
-        conditions are readable (market open); otherwise they no-op. Never touches
-        drift/loss/drawdown/global breakers.
+        per-symbol liquidity/spread) for markets that are currently open.
+
+        Safe because the real-time staleness and spread checks still run on
+        every order — the latch is just what a long-running/after-hours session
+        left behind. Closed markets are left alone (a reset there cannot prove
+        fresh conditions). Never touches drift/loss/drawdown/global breakers.
         """
-        for scope in self._transient_breaker_scopes():
+        cache = {} if open_cache is None else open_cache
+        for symbol, scope in self._transient_breaker_scopes():
+            if not self._market_open(symbol, cache):
+                continue
             try:
                 state = self.service.breakers.get(scope)
             except Exception:
@@ -239,7 +348,9 @@ class Autopilot:
                     expected_generation=state.generation,
                     request_id=uuid4().hex,
                 )
-                log.info("autopilot cleared transient breaker %s", scope.key)
+                log.warning(
+                    "autopilot cleared transient breaker %s", scope.key
+                )
             except Exception as exc:
                 log.info(
                     "autopilot left breaker %s tripped (%s)", scope.key, exc
@@ -257,6 +368,42 @@ class Autopilot:
                 cache[ac] = False
         return cache[ac]
 
+    def _sync_broker_orders(self) -> bool:
+        """Pull broker order/fill truth onto the local ledger before deciding.
+
+        Without this a long-running loop would keep seeing its own filled
+        orders as in flight and never credit their fills to ownership.
+        """
+        try:
+            self.service.sync_open_orders(
+                actor=self.actor,
+                reason="autopilot pre-decision broker order sync",
+                request_id=uuid4().hex,
+            )
+        except Exception:
+            log.warning("autopilot broker order sync unavailable; skipping cycle")
+            return False
+        return True
+
+    def _plan(
+        self, signal: str, held: Decimal, owned: Decimal
+    ) -> tuple[str, Optional[Decimal], str]:
+        """Choose (action, sell quantity, reason) for one symbol."""
+        if signal == LONG:
+            if held == 0:
+                return "buy", None, "enter_long"
+            if held > 0 and owned > 0:
+                return "none", None, "already_long"
+            return "none", None, "position_managed_elsewhere"
+        if signal == FLAT:
+            if held == 0:
+                return "none", None, "already_flat"
+            sell_qty = min(owned, held) if held > 0 else Decimal(0)
+            if sell_qty > 0:
+                return "sell", sell_qty, "exit_long"
+            return "none", None, "position_managed_elsewhere"
+        return "none", None, "signal_hold"
+
     # ── one evaluation pass ───────────────────────────────────────────────────
     def run_once(self) -> list[dict]:
         """Evaluate the whole universe once and place any resulting paper orders.
@@ -264,23 +411,34 @@ class Autopilot:
         Symbols whose market is closed are skipped entirely — attempting orders
         after hours only trips data/liquidity breakers on stale quotes, so the
         loop can run continuously and simply resume trading when the market opens.
+        Every symbol's outcome is logged and kept in ``last_decisions``.
         """
         require_paper(self.service.config)
-        if not self.dry_run:
-            self._heal_transient_breakers()
-        executed: list[dict] = []
-        placed = self._orders_today()
         open_cache: dict = {}
-        closed_symbols: list[str] = []
+        if not self.dry_run:
+            if not self._sync_broker_orders():
+                self.last_decisions = [
+                    Decision(symbol, "n/a", "none", "order_sync_unavailable")
+                    for symbol in self.universe
+                ]
+                return []
+            self._heal_transient_breakers(open_cache)
+        executed: list[dict] = []
+        decisions: list[Decision] = []
+        placed = self._orders_today()
+        positions: Optional[dict[str, Decimal]] = None
         for symbol in self.universe:
             if placed >= self.max_orders_per_day:
                 log.info(
                     "autopilot daily order cap reached (%d)",
                     self.max_orders_per_day,
                 )
+                decisions.append(
+                    Decision(symbol, "n/a", "none", "daily_cap_reached")
+                )
                 break
             if not self._market_open(symbol, open_cache):
-                closed_symbols.append(symbol)
+                decisions.append(Decision(symbol, "n/a", "none", "market_closed"))
                 continue
             try:
                 features = self.feature_provider(symbol)
@@ -288,29 +446,67 @@ class Autopilot:
                 log.warning(
                     "autopilot features unavailable for %s; skipping", symbol
                 )
-                continue
-            target = self.decide(features)
-            held = self._held_qty(symbol)
-            if held is None:
-                log.warning(
-                    "autopilot positions unavailable; skipping %s", symbol
+                decisions.append(
+                    Decision(symbol, "n/a", "none", "features_unavailable")
                 )
                 continue
+            if self._features_stale(features):
+                log.warning(
+                    "autopilot features for %s are stale (as_of=%s); skipping",
+                    symbol,
+                    features.as_of.isoformat(),
+                )
+                decisions.append(Decision(symbol, "n/a", "none", "features_stale"))
+                continue
+            signal = self.decide(features)
+            if signal not in (LONG, FLAT):
+                decisions.append(Decision(symbol, signal, "none", "signal_hold"))
+                continue
+            if positions is None:
+                positions = self._positions()
+                if positions is None:
+                    log.warning(
+                        "autopilot positions unavailable; ending cycle"
+                    )
+                    decisions.append(
+                        Decision(symbol, signal, "none", "positions_unavailable")
+                    )
+                    break
+            held = positions.get(symbol, Decimal(0))
+            with self.service.session_factory() as s:
+                in_flight = self._has_in_flight_order(s, symbol)
+                owned = self._owned_qty(s, symbol)
+            if in_flight:
+                decisions.append(
+                    Decision(symbol, signal, "none", "order_in_flight", held, owned)
+                )
+                continue
+            action, sell_qty, reason = self._plan(signal, held, owned)
             result: Optional[dict] = None
-            if target == "long" and held <= 0:
+            if action == "buy":
                 result = self._submit(
                     symbol, "buy", notional=self.notional_per_trade
                 )
-            elif target == "flat" and held > 0:
-                result = self._submit(symbol, "sell", qty=held)
+            elif action == "sell":
+                result = self._submit(symbol, "sell", qty=sell_qty)
+            if action != "none" and result is None:
+                reason = "risk_rejected"
+            decisions.append(Decision(symbol, signal, action, reason, held, owned))
             if result is not None:
                 executed.append(result)
                 placed += 1
-        if closed_symbols:
+        for decision in decisions:
             log.info(
-                "autopilot: market closed for %s; skipped this cycle",
-                ",".join(closed_symbols),
+                "autopilot decision symbol=%s signal=%s action=%s reason=%s "
+                "held=%s owned=%s",
+                decision.symbol,
+                decision.signal,
+                decision.action,
+                decision.reason,
+                decision.held,
+                decision.owned,
             )
+        self.last_decisions = decisions
         return executed
 
 
@@ -354,7 +550,55 @@ def build_autopilot(
         max_orders_per_day=config.autopilot.max_orders_per_day,
         strategy=config.autopilot.strategy,
         dry_run=dry_run,
+        max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
     )
+
+
+def build_container_with_retry(
+    build: Callable[[], object],
+    *,
+    attempts: int,
+    retry_seconds: float,
+    sleep: Callable[[float], None] = time.sleep,
+):
+    """Build the runtime container, retrying only transient broker outages.
+
+    A once-a-day run that dies on a momentary broker blip loses the whole day.
+    Startup reconciliation that fails because the broker was *unreachable* is
+    retried; any other failure (including real drift) fails closed at once. A
+    failed attempt has already released its runtime tenure.
+    """
+    from .orders.startup import StartupReconciliationFailed
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return build()
+        except StartupReconciliationFailed as exc:
+            if str(exc) not in _TRANSIENT_STARTUP_FAILURES or attempt >= attempts:
+                raise
+            log.warning(
+                "autopilot startup broker reconciliation unavailable "
+                "(attempt %d/%d); retrying in %ss",
+                attempt,
+                attempts,
+                retry_seconds,
+            )
+            sleep(retry_seconds)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -371,6 +615,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="decide and log intended orders without placing any (safe check)",
     )
+    parser.add_argument(
+        "--startup-attempts",
+        type=_positive_int,
+        default=3,
+        help="attempts when the broker is unreachable at startup (default 3)",
+    )
+    parser.add_argument(
+        "--startup-retry-seconds",
+        type=_nonnegative_float,
+        default=60.0,
+        help="delay between startup attempts (default 60)",
+    )
     args = parser.parse_args(argv)
 
     from . import bootstrap
@@ -378,7 +634,6 @@ def main(argv: list[str] | None = None) -> int:
     from .logging import runtime_startup
     from .security.secrets import load_role_secrets
 
-    logging.basicConfig(level=logging.INFO)
     config = load_config()
     if not config.autopilot.enabled:
         raise AutopilotDisabled(
@@ -392,9 +647,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     secrets = load_role_secrets(_RUNTIME_ROLE, config=config)
+    # runtime_startup installs the redacted, owner-only, rotating role log
+    # (logs/paper-drill.runtime.log); no other handler is added here so lines
+    # are not duplicated into an unbounded launchd stream file.
     with runtime_startup(_RUNTIME_ROLE, secrets):
-        container = bootstrap.build_container(
-            config, secrets, runtime_role=_RUNTIME_ROLE
+        container = build_container_with_retry(
+            lambda: bootstrap.build_container(
+                config, secrets, runtime_role=_RUNTIME_ROLE
+            ),
+            attempts=args.startup_attempts,
+            retry_seconds=args.startup_retry_seconds,
         )
         primary_failure = False
         try:
@@ -403,10 +665,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.once or args.dry_run:
                 results = autopilot.run_once()
-                print(
-                    f"autopilot cycle placed {len(results)} order(s): {results}"
+                degraded = sorted(
+                    {
+                        d.reason
+                        for d in autopilot.last_decisions
+                        if d.reason in DEGRADED_REASONS
+                    }
                 )
-                return 0
+                summary = (
+                    f"autopilot cycle placed {len(results)} order(s); "
+                    f"evaluated {len(autopilot.last_decisions)} symbol(s)"
+                    + (f"; degraded: {','.join(degraded)}" if degraded else "")
+                )
+                log.info(summary)
+                print(f"{summary}: {results}")
+                return 1 if degraded else 0
             interval = config.autopilot.poll_interval_seconds
             log.info("autopilot loop starting; interval=%ss", interval)
             while True:

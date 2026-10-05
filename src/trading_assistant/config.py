@@ -345,12 +345,20 @@ class AutopilotConfig(_Strict):
     """
 
     enabled: bool = False
-    strategy: Literal["sma_crossover"] = "sma_crossover"
+    # Names match ``trading_assistant.strategies`` so a backtest of the same
+    # name evaluates the exact rule the autopilot trades. ``sma_trend`` is the
+    # 20/50 + 200-day-filter rule the autopilot originally shipped with;
+    # ``sma_crossover`` is the backtester's 50/200 golden-cross rule.
+    strategy: Literal["sma_trend", "sma_crossover"] = "sma_trend"
     # Empty -> fall back to screener.universe, then risk.ticker_allowlist.
     universe: list[str] = Field(default_factory=list)
     notional_per_trade: Decimal = Field(default=Decimal("1000"), gt=0)
     max_orders_per_day: int = Field(default=8, gt=0)
     poll_interval_seconds: int = Field(default=300, gt=0)
+    # Skip a symbol whose newest bar is older than this. Daily bars are ~3.5
+    # days old after a long weekend, so 120h tolerates holidays while refusing
+    # to decide on a cache that stopped updating.
+    max_feature_age_hours: int = Field(default=120, gt=0)
 
 
 class AppConfig(_Strict):
