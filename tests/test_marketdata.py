@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -262,3 +263,139 @@ def test_injected_alpaca_history_fake_is_not_mutated_as_a_real_sdk_client(
     )
 
     assert result["close"].iloc[-1] == 100.5
+
+
+# ── live cache expiry ───────────────────────────────────────────
+def _fake_alpaca_history(monkeypatch, closes):
+    """Install a fake SDK client that returns a new last close per download."""
+    from alpaca.data import historical as alpaca_historical
+
+    served = iter(closes)
+
+    class FakeAlpacaHistory:
+        calls = 0
+
+        def get_stock_bars(self, _request):
+            FakeAlpacaHistory.calls += 1
+            frame = pd.DataFrame(
+                {
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [next(served)],
+                    "volume": [1_000.0],
+                },
+                index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+            )
+            return type("Bars", (), {"df": frame})()
+
+    monkeypatch.setattr(
+        backtest_data,
+        "install_pinned_session",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        alpaca_historical,
+        "StockHistoricalDataClient",
+        lambda *_args: FakeAlpacaHistory(),
+    )
+    return FakeAlpacaHistory
+
+
+def test_alpaca_cache_without_age_bound_is_reused_forever(tmp_path, monkeypatch):
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+
+    download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+    os.utime(path, (0, 0))  # decades old
+    again = download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+
+    assert fake.calls == 1
+    assert again["close"].iloc[-1] == 100.5
+
+
+def test_alpaca_cache_older_than_bound_is_refreshed(tmp_path, monkeypatch):
+    """A live caller must never keep deciding on bars frozen at first download."""
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    now = 1_000_000.0
+
+    download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=60, clock=lambda: now,
+    )
+    fresh = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=10**9, clock=lambda: now,
+    )
+    assert fake.calls == 1
+    assert fresh["close"].iloc[-1] == 100.5
+
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+    os.utime(path, (now - 3_600, now - 3_600))
+    refreshed = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=60, clock=lambda: now,
+    )
+
+    assert fake.calls == 2
+    assert refreshed["close"].iloc[-1] == 222.0
+    assert backtest_data.load_parquet(path)["close"].iloc[-1] == 222.0
+
+
+def test_cache_publication_leaves_no_staging_file(tmp_path):
+    frame = pd.DataFrame(
+        {"close": [1.0]},
+        index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+    )
+    target = tmp_path / "nested" / "X_1Day.parquet"
+
+    backtest_data.write_parquet_atomic(frame, target)
+
+    assert sorted(p.name for p in target.parent.iterdir()) == ["X_1Day.parquet"]
+
+
+def test_coingecko_cache_older_than_bound_is_refreshed(tmp_path):
+    closes = iter([100.5, 222.0])
+
+    def router(url, params):
+        if "/ohlc" in url:
+            return [[1672790400000, 100, 101, 99, next(closes)]]
+        return {"total_volumes": [[1672790400000, 5000]]}
+
+    now = 1_000_000.0
+    http = _HTTP(router)
+    client = CoinGeckoClient(
+        http=http,
+        cache_dir=tmp_path,
+        max_cache_age_seconds=60,
+        clock=lambda: now,
+    )
+
+    assert client.bars("BTC/USD")["close"].iloc[-1] == 100.5
+    path = backtest_data.cache_path(tmp_path, "BTC/USD", "coingecko")
+    os.utime(path, (now - 3_600, now - 3_600))
+
+    assert client.bars("BTC/USD")["close"].iloc[-1] == 222.0
+    assert http.calls == 4  # ohlc + volume per refresh
+
+
+def test_live_feature_fetches_default_to_a_bounded_cache_age(monkeypatch):
+    from trading_assistant.analyst import live_features
+
+    observed = {}
+
+    def fake_download(*_args, **kwargs):
+        observed.update(kwargs)
+        raise RuntimeError("stop after capturing arguments")
+
+    monkeypatch.setattr(backtest_data, "download_alpaca_bars", fake_download)
+    with pytest.raises(RuntimeError):
+        live_features._fetch_equity_df(
+            "AAPL",
+            SimpleNamespace(alpaca_api_key="k", alpaca_secret_key="s"),
+        )
+
+    assert observed["max_cache_age_seconds"] == (
+        live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS
+    )
+    assert live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS <= 24 * 60 * 60

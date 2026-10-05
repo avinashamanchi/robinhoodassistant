@@ -10,6 +10,7 @@ injectable so parsing is unit-tested without network.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,7 +25,7 @@ from ..security.outbound import (
     read_bounded_json,
     require_origin,
 )
-from .data import cache_path, load_parquet
+from .data import cache_is_fresh, cache_path, load_parquet, write_parquet_atomic
 
 BASE = "https://api.coingecko.com/api/v3"
 _ORIGIN_POLICY = OutboundPolicy("https://api.coingecko.com")
@@ -50,9 +51,13 @@ class CoinGeckoClient:
         attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         runtime_role: str = "app",
+        max_cache_age_seconds: float | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._http = http
         self._cache_dir = cache_dir
+        self._max_cache_age_seconds = max_cache_age_seconds
+        self._clock = clock
         self._attempt_gate = attempt_gate
         self._max_response_bytes = max_response_bytes
         self._runtime_role = runtime_role
@@ -101,12 +106,13 @@ class CoinGeckoClient:
 
     def bars(self, symbol: str, days: int = 365, use_cache: bool = True) -> pd.DataFrame:
         path = cache_path(self._cache_dir, symbol, "coingecko")
-        if use_cache and Path(path).exists():
+        if use_cache and cache_is_fresh(
+            path, self._max_cache_age_seconds, clock=self._clock
+        ):
             return load_parquet(path)
         frame = _merge_ohlc_volume(self.ohlc(symbol, days), self.volumes(symbol, days))
         if not frame.empty:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            frame.to_parquet(path)
+            write_parquet_atomic(frame, path)
         return frame
 
 

@@ -11,6 +11,8 @@ future data either.
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -107,6 +109,38 @@ def cache_path(cache_dir: str | Path, symbol: str, timeframe: str) -> Path:
     return Path(cache_dir) / f"{safe}_{timeframe}.parquet"
 
 
+def cache_is_fresh(
+    path: str | Path,
+    max_age_seconds: float | None,
+    *,
+    clock: Callable[[], float] = time.time,
+) -> bool:
+    """Whether a cached frame may be reused instead of re-downloaded.
+
+    ``max_age_seconds=None`` keeps the historical behaviour (a cache file is
+    reused forever), which is what reproducible backtests want. Live callers
+    pass a bound so decisions are never made on bars frozen at download time.
+    """
+    candidate = Path(path)
+    if not candidate.exists():
+        return False
+    if max_age_seconds is None:
+        return True
+    return clock() - candidate.stat().st_mtime <= max_age_seconds
+
+
+def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
+    """Publish a cache file atomically so a crash never leaves a torn frame."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_parquet(staging)
+        os.replace(staging, target)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def download_alpaca_bars(
     symbol: str,
     api_key: str,
@@ -118,18 +152,23 @@ def download_alpaca_bars(
     runtime_role: str = "app",
     client_factory: Callable[[str, str], Any] | None = None,
     attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
+    max_cache_age_seconds: float | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> pd.DataFrame:
     """Download corporate-action-adjusted bars and cache to parquet.
 
     Kept dependency-light and lazy: only imported/exercised when real credentials
     are supplied. CI never calls this — it uses ``backtest.synthetic``.
+
+    ``max_cache_age_seconds`` bounds how long a cached file is reused; ``None``
+    reuses it forever (backtests). Live feature callers must pass a bound.
     """
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
     path = cache_path(cache_dir, symbol, timeframe)
-    if path.exists():
+    if cache_is_fresh(path, max_cache_age_seconds, clock=clock):
         return load_parquet(path)
 
     production_client = client_factory is None
@@ -163,6 +202,5 @@ def download_alpaca_bars(
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level="symbol")
     bars = bars.rename_axis("ts")[["open", "high", "low", "close", "volume"]]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    bars.to_parquet(path)
+    write_parquet_atomic(bars, path)
     return bars

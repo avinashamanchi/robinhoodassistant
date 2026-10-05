@@ -1,9 +1,11 @@
 """Build MarketFeatures from real bars for the live /analyze + /screen paths.
 
 Equities: Alpaca daily bars (adjusted). Crypto: CoinGecko. SPY provides market
-context. Everything is cached to parquet by the underlying loaders, so repeat
-calls are cheap. Kept lazy/defensive so a missing key degrades to a clear error
-rather than crashing app startup.
+context. Bars are cached to parquet by the underlying loaders, but live callers
+bound the cache age (``LIVE_BAR_CACHE_MAX_AGE_SECONDS``) so features keep
+tracking the market instead of freezing at the first download. Kept
+lazy/defensive so a missing key degrades to a clear error rather than crashing
+app startup.
 """
 
 from __future__ import annotations
@@ -18,6 +20,11 @@ from ..dependencies import RequiredDependencyUnavailable
 from ..security.secrets import secret_value
 from ..signals.features import build_features
 from ..signals.models import MarketFeatures
+
+# Live features must reflect recent bars. Daily bars change at most once per
+# session, so a few hours of reuse keeps provider calls low without letting a
+# cache from a previous week drive analysis or autopilot decisions.
+LIVE_BAR_CACHE_MAX_AGE_SECONDS = 4 * 60 * 60
 
 
 def _historical_attempt_gate(
@@ -76,6 +83,7 @@ def _fetch_equity_df(
     client_factory=None,
     cache_dir: str | Path = ".cache/bars",
     runtime_role: str = "app",
+    max_cache_age_seconds: float | None = LIVE_BAR_CACHE_MAX_AGE_SECONDS,
 ):
     from ..backtest.data import download_alpaca_bars
     from ..daemon.backoff import ALPACA_MARKET_DATA_PRINCIPAL
@@ -89,6 +97,7 @@ def _fetch_equity_df(
         cache_dir=cache_dir,
         runtime_role=runtime_role,
         client_factory=client_factory,
+        max_cache_age_seconds=max_cache_age_seconds,
         attempt_gate=_historical_attempt_gate(
             config,
             service=service,
@@ -109,6 +118,7 @@ def _fetch_crypto_df(
     http: Any = None,
     cache_dir: str | Path = ".cache/bars",
     runtime_role: str = "app",
+    max_cache_age_seconds: float | None = LIVE_BAR_CACHE_MAX_AGE_SECONDS,
 ):
     from ..backtest.coingecko import CoinGeckoClient
     from ..daemon.backoff import COINGECKO_MARKET_DATA_PRINCIPAL
@@ -117,6 +127,7 @@ def _fetch_crypto_df(
         http=http,
         cache_dir=cache_dir,
         runtime_role=runtime_role,
+        max_cache_age_seconds=max_cache_age_seconds,
         attempt_gate=_historical_attempt_gate(
             config,
             service=service,
