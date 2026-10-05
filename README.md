@@ -132,8 +132,9 @@ uv run python -m trading_assistant.daemon.main
 # AUTONOMOUS paper trading (opt-in; paper-only). Decides with a deterministic
 # strategy and executes with no human in the loop — the risk engine still runs
 # on every order. Requires autopilot.enabled: true and trading.mode: paper.
-uv run python -m trading_assistant.autopilot          # continuous loop
-uv run python -m trading_assistant.autopilot --once   # a single cycle, then exit
+uv run python -m trading_assistant.autopilot --dry-run # decide + log, no orders
+uv run python -m trading_assistant.autopilot --once    # a single cycle, then exit
+uv run python -m trading_assistant.autopilot           # continuous loop
 
 # Credentialed paper-account drills are not startup steps. Use only the
 # separately reviewed procedure in docs/RUNBOOK.md.
@@ -193,7 +194,9 @@ The checked-in operating profile stays `trading.mode: paper`, with the LLM
 pre-approved-rule path, broker bracket submission OFF, and shadow analysis ON.
 The one autonomous path is the opt-in **autopilot** (`autopilot.enabled: true`),
 a paper-only deterministic loop that both decides and executes without a human —
-see [Autonomous paper trading](#autonomous-paper-trading-autopilot). Do not
+see [Autonomous paper trading](#autonomous-paper-trading-autopilot). Its code
+default is OFF, but the checked-in `config.yaml` currently opts in; shadow mode
+does not gate it (shadow mode only governs the daemon's analysis path). Do not
 enable execution features from backtest results alone; require the scorecard/paper
 evidence gates in the runbook and a separate manual decision.
 
@@ -210,15 +213,39 @@ switch) runs on every order and stays the final authority. A rejected proposal i
 skipped, never force-submitted.
 
 Decisions come from a deterministic strategy (`autopilot.strategy`, default
-`sma_crossover`) computed over the same `MarketFeatures` the analyst reads — no
-LLM in the execution path, so behaviour is reproducible. Each cycle it evaluates
-`autopilot.universe` (defaulting to `risk.ticker_allowlist`), buys a
-`notional_per_trade` position when a name turns long and is not already held, and
-exits the full position when the signal turns flat. A `max_orders_per_day` cap
-and position de-dupe bound activity. It runs as its own process; nothing trades
-until you start it. **Paper trading is a simulation: this does not authorize live
-trading, predict live results, or guarantee profit — an autonomous strategy will
-take losing trades.**
+`sma_trend`) computed over the same `MarketFeatures` the analyst reads — no LLM
+in the execution path, so behaviour is reproducible. The strategy names are the
+backtester's own classes in `strategies/`, so a backtest of `sma_trend` (20-day
+above 50-day, with price above the 200-day) or `sma_crossover` (50-day above
+200-day) evaluates exactly the rule the autopilot trades.
+
+Each cycle it:
+
+1. syncs broker order and fill truth onto the local ledger (`sync_open_orders`)
+   and skips the cycle if the broker cannot be read;
+2. clears only *transient* data/liquidity breakers for markets that are open
+   (never drift, loss, drawdown, or operator-global latches);
+3. for each symbol in `autopilot.universe` (default `risk.ticker_allowlist`)
+   whose market is open, requires features whose newest bar is within
+   `autopilot.max_feature_age_hours` and no order already in flight for that
+   symbol;
+4. buys `notional_per_trade` when the signal is long and the account holds none
+   of the symbol; sells, on a flat signal, only the quantity its own fills
+   bought. Positions opened by a plan or a human approval are never bought into
+   or sold out of, and a HOLD signal (incomplete data) never exits anything.
+
+A `max_orders_per_day` cap bounds activity. Every symbol's decision and reason is
+logged to the role log (`logs/paper-drill.runtime.log`); `--once` exits `1` when
+order sync, features, or positions were unavailable, so a scheduler can see a
+degraded run. A broker that is briefly unreachable during startup reconciliation
+is retried (`--startup-attempts`, `--startup-retry-seconds`); real drift is never
+retried. Schedule weekday runs with `./scripts/launchd/install.sh
+--with-autopilot` (see `scripts/launchd/README.md`). It currently runs as the
+`paper-drill` role, whose exclusive maintenance tenure means it cannot run while
+the app, daemon, or MCP server is up. It runs as its own process;
+nothing trades until you start it. **Paper trading is a simulation: this does not
+authorize live trading, predict live results, or guarantee profit — an
+autonomous strategy will take losing trades.**
 
 ## LLM providers & market data
 
@@ -233,7 +260,10 @@ under configured accounts in macOS Keychain and audited with
 
 Historical equity bars come from the exact pinned Alpaca data origin and are
 cached to parquet. Crypto OHLCV uses the exact pinned CoinGecko origin and has
-no credential query parameter. Query-string credentials are prohibited.
+no credential query parameter. Query-string credentials are prohibited. Live
+feature paths (`/analyze`, `/screen`, shadow analysis, autopilot) refresh a
+cached frame once it is older than four hours; backtests keep reusing their
+cache for reproducibility.
 
 The abstract read-only external-account protocol and deterministic mock remain for
 portfolio tests. No unofficial Robinhood login library or production factory path
@@ -249,7 +279,8 @@ is shipped.
    refuses to run outside paper mode.
 3. The risk engine runs on every order — including every autopilot order — and
    cannot be bypassed.
-4. Everything dangerous defaults OFF; the autopilot is opt-in and paper-only.
+4. Everything dangerous defaults OFF in code; the autopilot is opt-in and
+   paper-only (the checked-in `config.yaml` currently opts in).
 5. Every production runtime role writes redacted, owner-only, bounded rotating
    logs under `logs/`.
 6. Chat has an exact read-only tool allowlist plus immutable draft constructors.
