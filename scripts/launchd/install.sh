@@ -2,10 +2,30 @@
 # Install the loopback HTTPS app, watchdog, and backup jobs. The daemon is not
 # installed here; it remains an explicit operator workflow after preflight.
 #
-#   ./scripts/launchd/install.sh          # install + load
-#   ./scripts/launchd/uninstall.sh        # stop + remove
+#   ./scripts/launchd/install.sh                  # install + load
+#   ./scripts/launchd/install.sh --with-autopilot # also schedule the autopilot
+#   ./scripts/launchd/uninstall.sh                # stop + remove
+#
+# --with-autopilot schedules `trading_assistant.autopilot --once` on weekdays at
+# AUTOPILOT_AT (local HH:MM, default 07:00). Pick a local time after the 09:30
+# America/New_York open; before the open every equity symbol is skipped.
 set -euo pipefail
 umask 077
+
+WITH_AUTOPILOT=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-autopilot) WITH_AUTOPILOT=1 ;;
+    *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+AUTOPILOT_AT="${AUTOPILOT_AT:-07:00}"
+if [[ ! "$AUTOPILOT_AT" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+  echo "error: AUTOPILOT_AT must be HH:MM (24h), got: $AUTOPILOT_AT" >&2
+  exit 2
+fi
+AUTOPILOT_HOUR=$((10#${BASH_REMATCH[1]}))
+AUTOPILOT_MINUTE=$((10#${BASH_REMATCH[2]}))
 
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PY="$PROJ/.venv/bin/python"
@@ -106,9 +126,49 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
   echo "loaded $label"
 }
 
+emit_weekdays () {  # $1=label $2=hour $3=minute $4...=program args (Mon-Fri)
+  local label="$1"; shift
+  local hour="$1"; shift
+  local minute="$1"; shift
+  local plist="$LA/$label.plist"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$label"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>ProgramArguments</key>\n  <array>\n'
+    for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+    printf '  </array>\n'
+    printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>Umask</key><integer>63</integer>\n'
+    printf '  <key>RunAtLoad</key><false/>\n'
+    printf '  <key>StartCalendarInterval</key>\n  <array>\n'
+    for weekday in 1 2 3 4 5; do
+      printf '    <dict><key>Weekday</key><integer>%s</integer><key>Hour</key><integer>%s</integer><key>Minute</key><integer>%s</integer></dict>\n' "$weekday" "$hour" "$minute"
+    done
+    printf '  </array>\n'
+    printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+    printf '  <key>StandardErrorPath</key><string>/dev/null</string>\n'
+    printf '</dict></plist>\n'
+  } > "$plist"
+  reload_plist "$label" "$plist"
+  echo "loaded $label"
+}
+
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
 emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
+if [ "$WITH_AUTOPILOT" = 1 ]; then
+  # Output goes to the redacted, owner-only, rotating logs/paper-drill.runtime.log.
+  emit_weekdays com.trading.autopilot "$AUTOPILOT_HOUR" "$AUTOPILOT_MINUTE" "$PY" -m trading_assistant.autopilot --once
+  echo "note: the autopilot runs as the paper-drill role, which needs exclusive"
+  echo "      maintenance tenure; a scheduled run fails while the app, daemon,"
+  echo "      or MCP server holds runtime tenure (see scripts/launchd/README.md)"
+elif [ -f "$LA/com.trading.autopilot.plist" ]; then
+  echo "note: com.trading.autopilot is still installed from an earlier run;"
+  echo "      re-run with --with-autopilot to refresh it or uninstall.sh to remove it"
+fi
 
 sleep 6
 echo "=== status ==="

@@ -950,6 +950,75 @@ def test_launchd_installer_generates_only_bounded_stream_jobs(
         assert payload["Umask"] == 0o77
 
 
+def _run_installer(tmp_path, *args, extra_env=None):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command in ("launchctl", "sleep", "curl"):
+        executable = fake_bin / command
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{Path('/usr/bin')}:{Path('/bin')}",
+        **(extra_env or {}),
+    }
+    completed = subprocess.run(
+        ["bash", "scripts/launchd/install.sh", *args],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    launch_agents = home / "Library" / "LaunchAgents"
+    plists = {
+        path.stem: plistlib.loads(path.read_bytes())
+        for path in launch_agents.glob("com.trading.*.plist")
+    }
+    return completed, plists
+
+
+def test_launchd_installer_schedules_autopilot_only_on_request(tmp_path):
+    completed, plists = _run_installer(
+        tmp_path,
+        "--with-autopilot",
+        extra_env={"AUTOPILOT_AT": "07:05"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    autopilot = plists["com.trading.autopilot"]
+    assert autopilot["ProgramArguments"][-2:] == [
+        "trading_assistant.autopilot",
+        "--once",
+    ]
+    assert autopilot["WorkingDirectory"] == str(
+        Path(__file__).resolve().parent.parent
+    )
+    assert autopilot["StartCalendarInterval"] == [
+        {"Weekday": weekday, "Hour": 7, "Minute": 5}
+        for weekday in (1, 2, 3, 4, 5)
+    ]
+    assert autopilot["RunAtLoad"] is False
+    assert "KeepAlive" not in autopilot
+    assert autopilot["StandardOutPath"] == "/dev/null"
+    assert autopilot["StandardErrorPath"] == "/dev/null"
+    assert autopilot["Umask"] == 0o77
+
+
+def test_launchd_installer_rejects_malformed_autopilot_time(tmp_path):
+    completed, plists = _run_installer(
+        tmp_path,
+        "--with-autopilot",
+        extra_env={"AUTOPILOT_AT": "7am"},
+    )
+
+    assert completed.returncode == 2
+    assert "AUTOPILOT_AT" in completed.stderr
+    assert plists == {}
+
+
 def _alpaca_config(app_config):
     return app_config.model_copy(
         update={

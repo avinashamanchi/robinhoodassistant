@@ -24,8 +24,10 @@ uv run python -m trading_assistant.preflight
 ```
 
 Idempotent — re-run it after pulling code changes to reload with the new binary.
-It regenerates both plists from the repo's current path, so it works on any
-machine where the repo is checked out and `.venv` exists (`uv sync`). Do not
+It regenerates every plist from the repo's current path, so it works on any
+machine where the repo is checked out and `.venv` exists (`uv sync`). **Re-run it
+whenever the checkout moves**: launchd keeps the absolute paths it was given, and
+a job whose `WorkingDirectory` no longer exists fails on every run. Do not
 install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
 `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. The five rows execute
 independently even after a Keychain construction/load
@@ -45,6 +47,34 @@ retained key ID, run the field rotation, complete the coordinated
 active/retained config transition, then audit Keychain and verify all envelopes
 before reinstalling or restarting jobs.
 
+### Scheduled autopilot (opt-in)
+
+```bash
+./scripts/launchd/install.sh --with-autopilot              # weekdays 07:00 local
+AUTOPILOT_AT=06:45 ./scripts/launchd/install.sh --with-autopilot
+```
+
+`--with-autopilot` adds `com.trading.autopilot`, which runs
+`python -m trading_assistant.autopilot --once` Monday–Friday at `AUTOPILOT_AT`
+(local `HH:MM`, default `07:00`). Choose a local time after the 09:30
+America/New_York open — 07:00 is 10:00 in New York only on a Pacific-time
+machine; before the open every equity symbol is skipped as `market_closed`. The
+process itself still refuses to run unless `autopilot.enabled: true` and
+`trading.mode: paper`. A fresh process per day avoids holding runtime tenure
+across sleep. Its output goes to the redacted, rotating
+`logs/paper-drill.runtime.log` (one `autopilot decision ...` line per symbol);
+launchd's own streams are discarded like every other job. A run that could not
+sync orders or read features or positions exits `1`, visible in
+`launchctl list | grep com.trading.autopilot`. Re-running `install.sh` without
+the flag leaves an existing autopilot job in place and says so.
+
+**Known constraint:** the autopilot currently runs as the `paper-drill` role,
+which acquires the exclusive *maintenance* tenure. Maintenance tenure cannot be
+taken while the app, daemon, MCP, or validation runtime holds tenure, so a
+scheduled run fails closed (exit `1`, `startup_failed role=paper-drill`) whenever
+`com.trading.app` is up. Until the autopilot gets its own runtime role, schedule
+it only on a machine where the app is not kept alive at that time.
+
 ## Remove
 
 ```bash
@@ -59,6 +89,7 @@ before reinstalling or restarting jobs.
 | `com.trading.daemon` | Disabled by the app installer; explicit operator launch only |
 | `com.trading.watchdog` | watchdog every 60 seconds |
 | `com.trading.backup` | Verified AES-256-GCM backup daily at 02:00 |
+| `com.trading.autopilot` | Only with `--with-autopilot`: `autopilot --once` on weekdays |
 
 All jobs use `WorkingDirectory` = repo root so `config.yaml` and the SQLite DB
 resolve correctly. Runtime secrets come only from macOS Keychain; `.env` is not
@@ -94,6 +125,7 @@ launchctl bootout  gui/$(id -u)/com.trading.app
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trading.app.plist
 ```
 
-The checked-in `com.trading.app.plist` / `com.trading.daemon.plist` are reference
-snapshots with absolute paths for this machine; `install.sh` is the source of
-truth and rewrites them on install.
+The checked-in `com.trading.app.plist` / `com.trading.daemon.plist` /
+`com.trading.autopilot.plist` are reference snapshots with absolute paths for
+one machine; never copy them into `~/Library/LaunchAgents`. `install.sh` is the
+source of truth and writes the installed copies.
