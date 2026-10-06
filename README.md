@@ -12,12 +12,14 @@ a deterministic risk engine is the final authority on every order.
 
 Built in phases (see `docs/superpowers/specs/`):
 
-Current release evidence is separated into
+Release evidence is separated into
 [`software verification`](docs/release/2026-07-27-verification.md) and
-[`operational status`](docs/release/2026-07-27-operational-status.md).
-Deterministic verification passes, while normal Alpaca paper operation remains
-**BLOCKED / NOT STARTED** until the operator-authorized credentialed preflight
-succeeds.
+[`operational status`](docs/release/2026-07-27-operational-status.md). Those
+dated reports are point-in-time evidence from 2026-07-27 and predate the
+autopilot. The current deterministic verification result is the CI
+`verification` job (`scripts/verify_loopback_release.py`) for the exact commit.
+Normal Alpaca paper operation remains **BLOCKED / NOT STARTED** until the
+operator-authorized credentialed preflight succeeds.
 
 - **Phase 1 ✅** — scaffold, config, DB models + order state machine, `BrokerClient`
   ABC + `MockBroker`, risk engine (pure) with FIFO P&L + persistent kill switch +
@@ -239,7 +241,12 @@ logged to the role log (`logs/paper-drill.runtime.log`); `--once` exits `1` when
 order sync, features, or positions were unavailable, so a scheduler can see a
 degraded run. A broker that is briefly unreachable during startup reconciliation
 is retried (`--startup-attempts`, `--startup-retry-seconds`); real drift is never
-retried. Schedule weekday runs with `./scripts/launchd/install.sh
+retried. It refuses to start when a universe symbol is crypto (its runtime role
+cannot read crypto data) or outside `risk.ticker_allowlist`, or when
+`notional_per_trade` exceeds `risk.max_notional_per_order`. These are settings
+the risk engine would otherwise reject on every cycle. It stops instead of
+continuing if its runtime tenure lapses, re-checking ownership before every
+order. Schedule weekday runs with `./scripts/launchd/install.sh
 --with-autopilot` (see `scripts/launchd/README.md`). It currently runs as the
 `paper-drill` role, whose exclusive maintenance tenure means it cannot run while
 the app, daemon, or MCP server is up. It runs as its own process;

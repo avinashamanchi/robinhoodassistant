@@ -6,6 +6,19 @@ least-hardened component (the autonomous paper **autopilot**, commits
 machine: LaunchAgents, the bar cache, and the autopilot log. Everything changed
 in this review is listed under [Improved version](#improved-version).
 
+> **Corrections (2026-10-06).** The follow-up review
+> ([`2026-10-06-review-followup.md`](2026-10-06-review-followup.md)) found
+> three errors here:
+>
+> 1. The project pins a canonical root, `/Users/avi/Desktop/robinhood/trading-assistant`,
+>    in the operator launcher, the operator terminal, runtime consolidation, and
+>    the release gate. The fix for the moved checkout is to move it back, not to
+>    re-install from the new path (recommendation 1 below is updated).
+> 2. "Release gate and CI" was listed as a strength, but `main`'s CI had been red
+>    since 2026-07-31 (`MIGRATION_HEAD_MISMATCH`, stale test manifests).
+> 3. The 46 local `tests/test_release_verifier.py` failures were caused by an
+>    untrusted user-level `node` shim on `PATH`, not by Homebrew `uv`.
+
 This is a software and operations review. It does not judge whether any
 strategy is profitable and is not investment advice.
 
@@ -98,16 +111,16 @@ Severity reflects impact on correctness and safety for this paper setup.
 
 ### High priority (next)
 
-1. **Repair the local install after the move** (operator, five minutes):
+1. **Repair the local install after the move** (operator; corrected
+   2026-10-06). Move the checkout back to the canonical root
+   `/Users/avi/Desktop/robinhood/trading-assistant`. The venv's editable
+   install, the installed LaunchAgents, `scripts/operator.sh`, and runtime
+   consolidation all expect it there. Then:
 
    ```bash
-   uv sync --all-extras --dev   # re-points the editable install at the new path
    uv run python -m trading_assistant.autopilot --dry-run
    ./scripts/launchd/install.sh --with-autopilot   # only after reading #2
    ```
-
-   If `uv sync` does not fix the stale script shebangs, recreate the venv with
-   `uv venv --python 3.11` and then run `uv sync` again.
 
 2. **Give the autopilot its own runtime, not the drill's maintenance lock.**
    There are two viable designs:
