@@ -631,6 +631,31 @@ The job then:
 3. runs the mock safety drill against a separate copy of the generated database;
 4. scans the complete Git history with a commit-pinned gitleaks action.
 
+**Re-pinning after a new migration or test.** `EXPECTED_MIGRATION_HEAD` and the
+five `*_TEST_MANIFEST` pins in `scripts/verify_loopback_release.py` are
+deliberate tripwires: a new migration or any added, renamed, or removed test
+fails CI (`MIGRATION_HEAD_MISMATCH` / `TEST_MANIFEST_MISMATCH`) until they are
+re-pinned in the same change. `tests/test_release_verifier.py` checks the
+migration head against Alembic, so that drift also fails the normal suite. To
+re-pin a suite, collect its exact node IDs with the same file arguments the
+verifier uses and hash them the way `_test_manifest` does:
+
+```bash
+uv run python -m pytest --collect-only -q -o addopts= -p no:cacheprovider \
+  | grep '::' | sort | uv run python -c \
+  'import hashlib,sys; ids=[l.strip() for l in sys.stdin if l.strip()]; print(len(ids), "sha256:"+hashlib.sha256("".join(i+"\n" for i in ids).encode()).hexdigest())'
+```
+
+Before committing new pins, diff the old and new node-ID lists and confirm
+that every removed ID was removed on purpose. The pin exists to catch tests that
+silently stop running.
+
+The local verifier trusts `git`, `node`, and `uv` only under fixed system or
+Homebrew Cellar roots. A user-level shim earlier on `PATH` (for example a
+version-manager `node`) makes it report `TOOLCHAIN_UNPROVEN` locally, and
+`tests/test_release_verifier.py` fails for the same reason. Put a trusted
+`node` first on `PATH` before running either locally.
+
 The verifier writes private, redacted evidence to
 `.local/verification/release-results.json`. A passing result is evidence only for
 the exact commit recorded in that file. It is never permission to clear a
