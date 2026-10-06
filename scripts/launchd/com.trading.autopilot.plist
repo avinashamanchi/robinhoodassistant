@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.trading.autopilot</string>
-  <key>WorkingDirectory</key><string>/Users/avi/Desktop/project/robinhood/trading-assistant</string>
+  <key>WorkingDirectory</key><string>/Users/avi/Desktop/robinhood/trading-assistant</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/avi/Desktop/project/robinhood/trading-assistant/.venv/bin/python</string>
+    <string>/Users/avi/Desktop/robinhood/trading-assistant/.venv/bin/python</string>
     <string>-m</string>
     <string>trading_assistant.autopilot</string>
     <string>--once</string>

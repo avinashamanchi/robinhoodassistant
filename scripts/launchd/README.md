@@ -25,9 +25,14 @@ uv run python -m trading_assistant.preflight
 
 Idempotent — re-run it after pulling code changes to reload with the new binary.
 It regenerates every plist from the repo's current path, so it works on any
-machine where the repo is checked out and `.venv` exists (`uv sync`). **Re-run it
-whenever the checkout moves**: launchd keeps the absolute paths it was given, and
-a job whose `WorkingDirectory` no longer exists fails on every run. Do not
+machine where the repo is checked out and `.venv` exists (`uv sync`). launchd
+keeps the absolute paths it was given, so a job whose `WorkingDirectory` no
+longer exists fails on every run (`launchctl list` shows exit `78`). Keep the
+checkout at the canonical root `/Users/avi/Desktop/robinhood/trading-assistant`:
+`scripts/operator.sh`, the operator terminal, and runtime consolidation accept
+only that root, and `.venv`'s editable install records it too. If the checkout
+moves anyway, move it back (or deliberately re-anchor those checks), then re-run
+`uv sync` and this installer. Do not
 install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
 `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. The five rows execute
 independently even after a Keychain construction/load
