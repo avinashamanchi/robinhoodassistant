@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -133,7 +134,9 @@ def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
     """Publish a cache file atomically so a crash never leaves a torn frame."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    # Unique per call: the app refreshes on concurrent request threads that
+    # share one PID, and each writer must own its staging file.
+    staging = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
         frame.to_parquet(staging)
         os.replace(staging, target)

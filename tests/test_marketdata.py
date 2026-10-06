@@ -354,6 +354,31 @@ def test_cache_publication_leaves_no_staging_file(tmp_path):
     assert sorted(p.name for p in target.parent.iterdir()) == ["X_1Day.parquet"]
 
 
+def test_cache_publication_uses_a_unique_staging_file_per_write(
+    tmp_path, monkeypatch
+):
+    """Request threads share a PID, so a PID-named staging file would collide."""
+    staged = []
+    original = pd.DataFrame.to_parquet
+
+    def spy(self, path, *args, **kwargs):
+        staged.append(Path(path).name)
+        return original(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", spy)
+    frame = pd.DataFrame(
+        {"close": [1.0]},
+        index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+    )
+    target = tmp_path / "X_1Day.parquet"
+
+    backtest_data.write_parquet_atomic(frame, target)
+    backtest_data.write_parquet_atomic(frame, target)
+
+    assert len(staged) == 2
+    assert staged[0] != staged[1]
+
+
 def test_coingecko_cache_older_than_bound_is_refreshed(tmp_path):
     closes = iter([100.5, 222.0])
 
