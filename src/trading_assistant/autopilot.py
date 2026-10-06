@@ -153,6 +153,7 @@ class Autopilot:
         now: Callable[[], datetime] = _utcnow,
         dry_run: bool = False,
         max_feature_age: Optional[timedelta] = timedelta(hours=120),
+        tenure_guard=None,
     ) -> None:
         if not universe:
             raise ValueError("autopilot requires a non-empty universe")
@@ -171,10 +172,22 @@ class Autopilot:
         self.now = now
         self.dry_run = dry_run
         self.max_feature_age = max_feature_age
+        self.tenure_guard = tenure_guard
         self.actor = f"{ACTOR_PREFIX}{strategy}"
         self.last_decisions: list[Decision] = []
 
     # ── helpers ───────────────────────────────────────────────────────────────
+    def _require_tenure(self) -> None:
+        """Fail closed once this runtime no longer owns its tenure.
+
+        The guard renews in a background thread; after a lapse (for example
+        a laptop sleep longer than the lease) another maintenance owner may
+        hold the database, so no further order or ledger write may happen.
+        Raises ``TenureLost``.
+        """
+        if self.tenure_guard is not None:
+            self.tenure_guard.ensure_owned()
+
     def _orders_today(self) -> int:
         """Count orders this autopilot has already submitted since UTC midnight."""
         start = (
@@ -414,6 +427,7 @@ class Autopilot:
         Every symbol's outcome is logged and kept in ``last_decisions``.
         """
         require_paper(self.service.config)
+        self._require_tenure()
         open_cache: dict = {}
         if not self.dry_run:
             if not self._sync_broker_orders():
@@ -483,6 +497,8 @@ class Autopilot:
                 continue
             action, sell_qty, reason = self._plan(signal, held, owned)
             result: Optional[dict] = None
+            if action != "none":
+                self._require_tenure()
             if action == "buy":
                 result = self._submit(
                     symbol, "buy", notional=self.notional_per_trade
@@ -551,7 +567,63 @@ def build_autopilot(
         strategy=config.autopilot.strategy,
         dry_run=dry_run,
         max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        tenure_guard=getattr(container, "runtime_tenure_guard", None),
     )
+
+
+def autopilot_config_problems(config: AppConfig) -> list[str]:
+    """Settings that would make every cycle a silent no-op or a daily failure.
+
+    Each problem is something the risk engine or outbound policy would reject
+    on every single cycle, so it is reported at startup instead.
+    """
+    from .assets import AssetClass
+
+    problems: list[str] = []
+    notional = Decimal(str(config.autopilot.notional_per_trade))
+    for symbol in resolve_universe(config):
+        if AssetClass.for_symbol(symbol) is AssetClass.CRYPTO:
+            problems.append(
+                f"{symbol}: the autopilot runtime role cannot read crypto "
+                "market data"
+            )
+            continue
+        if symbol not in {s.upper() for s in config.risk.ticker_allowlist}:
+            problems.append(f"{symbol}: not in risk.ticker_allowlist")
+    if notional > Decimal(str(config.risk.max_notional_per_order)):
+        problems.append(
+            "autopilot.notional_per_trade exceeds risk.max_notional_per_order"
+        )
+    return problems
+
+
+def run_loop(
+    autopilot: Autopilot,
+    *,
+    interval: float,
+    sleep: Callable[[float], None] = time.sleep,
+    max_cycles: Optional[int] = None,
+) -> None:
+    """Run cycles forever (or ``max_cycles``), surviving ordinary failures.
+
+    A failed cycle is logged and retried next interval, but losing runtime
+    tenure or being disabled ends the loop: continuing would trade without
+    the exclusive ownership the role requires.
+    """
+    from .ops.tenure import TenureLost
+
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        try:
+            results = autopilot.run_once()
+            if results:
+                log.info("autopilot placed %d order(s)", len(results))
+        except (AutopilotDisabled, TenureLost):
+            raise
+        except Exception:
+            log.exception("autopilot cycle failed; continuing")
+        sleep(interval)
 
 
 def build_container_with_retry(
@@ -645,6 +717,11 @@ def main(argv: list[str] | None = None) -> int:
             "autopilot requires trading.broker=alpaca (paper) to place real "
             "paper orders"
         )
+    problems = autopilot_config_problems(config)
+    if problems:
+        raise AutopilotDisabled(
+            "autopilot configuration cannot trade: " + "; ".join(problems)
+        )
 
     secrets = load_role_secrets(_RUNTIME_ROLE, config=config)
     # runtime_startup installs the redacted, owner-only, rotating role log
@@ -682,16 +759,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1 if degraded else 0
             interval = config.autopilot.poll_interval_seconds
             log.info("autopilot loop starting; interval=%ss", interval)
-            while True:
-                try:
-                    results = autopilot.run_once()
-                    if results:
-                        log.info("autopilot placed %d order(s)", len(results))
-                except AutopilotDisabled:
-                    raise
-                except Exception:
-                    log.exception("autopilot cycle failed; continuing")
-                time.sleep(interval)
+            run_loop(autopilot, interval=interval)
         except BaseException:
             primary_failure = True
             raise

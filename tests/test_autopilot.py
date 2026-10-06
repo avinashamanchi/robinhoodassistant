@@ -409,3 +409,184 @@ def test_startup_never_retries_real_drift():
             build, attempts=5, retry_seconds=0, sleep=lambda _s: None
         )
     assert len(attempts) == 1
+
+
+# ── runtime tenure ────────────────────────────────────────────────────────────
+class _Guard:
+    """Tenure guard double: owned for ``owned_checks`` checks, then lost."""
+
+    def __init__(self, owned_checks):
+        self.owned_checks = owned_checks
+        self.checks = 0
+
+    def ensure_owned(self):
+        from trading_assistant.ops.tenure import TenureLost
+
+        self.checks += 1
+        if self.checks > self.owned_checks:
+            raise TenureLost()
+
+
+def test_lost_tenure_stops_the_cycle_before_any_work(make_service):
+    from trading_assistant.ops.tenure import TenureLost
+
+    service = make_service()
+    ap = _autopilot(service, LONG_AAPL, tenure_guard=_Guard(owned_checks=0))
+    with pytest.raises(TenureLost):
+        ap.run_once()
+    assert service.broker.submit_calls == 0
+
+
+def test_tenure_lost_mid_cycle_blocks_the_order(make_service):
+    """A lease that lapses while features are fetched must not submit."""
+    from trading_assistant.ops.tenure import TenureLost
+
+    service = make_service()
+    guard = _Guard(owned_checks=1)
+    ap = _autopilot(service, LONG_AAPL, tenure_guard=guard)
+    with pytest.raises(TenureLost):
+        ap.run_once()
+    assert guard.checks == 2
+    assert service.broker.submit_calls == 0
+
+
+def test_owned_tenure_is_checked_before_each_order(make_service):
+    service = make_service()
+    guard = _Guard(owned_checks=10)
+    ap = _autopilot(service, LONG_AAPL, tenure_guard=guard)
+    assert len(ap.run_once()) == 1
+    assert guard.checks == 2
+
+
+def test_loop_survives_ordinary_failures_but_stops_on_tenure_loss():
+    from trading_assistant.autopilot import run_loop
+    from trading_assistant.ops.tenure import TenureLost
+
+    outcomes = [RuntimeError("broker blip"), [], TenureLost(), [], []]
+    calls = []
+
+    class Scripted:
+        def run_once(self):
+            outcome = outcomes[len(calls)]
+            calls.append(1)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    sleeps = []
+    # Bounded so a regression that swallows TenureLost fails instead of hanging.
+    with pytest.raises(TenureLost):
+        run_loop(
+            Scripted(),
+            interval=7,
+            sleep=sleeps.append,
+            max_cycles=len(outcomes),
+        )
+    assert len(calls) == 3
+    assert sleeps == [7, 7]
+
+
+# ── startup configuration checks ──────────────────────────────────────────────
+def _with_autopilot(app_config, **autopilot):
+    return app_config.model_copy(
+        update={
+            "autopilot": app_config.autopilot.model_copy(update=autopilot)
+        }
+    )
+
+
+def test_checked_in_autopilot_profile_has_no_config_problems():
+    from trading_assistant.autopilot import autopilot_config_problems
+    from trading_assistant.config import load_config
+
+    assert autopilot_config_problems(load_config()) == []
+
+
+def test_config_problems_name_every_cycle_long_failure(app_config):
+    from trading_assistant.autopilot import autopilot_config_problems
+
+    config = _with_autopilot(
+        app_config,
+        universe=["AAPL", "BTC/USD", "ZZZZ"],
+        notional_per_trade=Decimal("10000"),
+    )
+    problems = autopilot_config_problems(config)
+
+    assert any(p.startswith("BTC/USD:") for p in problems)
+    assert any(p.startswith("ZZZZ:") for p in problems)
+    assert any("notional_per_trade" in p for p in problems)
+    assert not any(p.startswith("AAPL:") for p in problems)
+
+
+# ── live data refresh, as the autopilot runtime performs it ───────────────────
+def _daily_bars(last_day, count=260, start_price=100.0):
+    import pandas as pd
+
+    index = pd.bdate_range(end=last_day, periods=count, tz="UTC")
+    closes = [start_price + i * 0.5 for i in range(count)]
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1_000_000.0] * count,
+        },
+        index=index.rename("ts"),
+    )
+
+
+def test_autopilot_refreshes_a_stale_bar_cache_into_fresh_features(
+    app_config, make_service, tmp_path
+):
+    """The production cache had July bars in October; the refresh must win."""
+    import os
+
+    from trading_assistant.analyst.live_features import (
+        build_live_feature_provider,
+    )
+    from trading_assistant.app.limits import DurableRateLimiter
+    from trading_assistant.autopilot import _RUNTIME_ROLE
+    from trading_assistant.backtest import data as backtest_data
+    from trading_assistant.config import Secrets
+    from trading_assistant.security.outbound import require_origin
+
+    # The runtime role must be allowed to reach the historical-data origin.
+    assert require_origin(
+        _RUNTIME_ROLE, "alpaca.historical", "https://data.alpaca.markets"
+    )
+
+    today = datetime.now(timezone.utc).date()
+    stale_day = today - timedelta(days=90)
+    for symbol in ("AAPL", "SPY"):
+        path = backtest_data.cache_path(tmp_path, symbol, "1Day")
+        backtest_data.write_parquet_atomic(_daily_bars(stale_day), path)
+        old = (datetime.now(timezone.utc) - timedelta(days=90)).timestamp()
+        os.utime(path, (old, old))
+
+    downloads = []
+
+    class FakeHistory:
+        def get_stock_bars(self, request):
+            downloads.append(request.symbol_or_symbols)
+            frame = _daily_bars(today - timedelta(days=1))
+            return SimpleNamespace(df=frame)
+
+    service = make_service()
+    provider = build_live_feature_provider(
+        app_config,
+        Secrets(alpaca_api_key="test-key", alpaca_secret_key="test-secret"),
+        scheduled_service=service,
+        rate_limiter=DurableRateLimiter(service.session_factory),
+        alpaca_client_factory=lambda *_args: FakeHistory(),
+        cache_dir=tmp_path,
+        runtime_role=_RUNTIME_ROLE,
+    )
+
+    features = provider("AAPL")
+
+    assert sorted(downloads) == ["AAPL", "SPY"]
+    assert features.as_of.date() >= today - timedelta(days=4)
+    assert features.sma_20 is not None and features.sma_200 is not None
+    ap = _autopilot(service, {"AAPL": features})
+    assert not ap._features_stale(features)
