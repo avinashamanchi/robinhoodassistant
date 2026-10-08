@@ -34,6 +34,7 @@ from ..security.secrets import (
 )
 from .backup import EncryptedBackupReceipt, backup_database
 from .control import prove_app_absent
+from ..installation import InstallationError, require_designated
 from .tenure import (
     LocalProcessInspector,
     ProcessIdentity,
@@ -46,12 +47,22 @@ from .tenure import (
 )
 
 
-_PRODUCTION_DESTINATION = Path(
-    "/Users/avi/Desktop/robinhood/trading-assistant"
-)
-_PRODUCTION_SOURCE = (
-    _PRODUCTION_DESTINATION / ".worktrees" / "safety-foundation"
-)
+def _production_roots() -> "ConsolidationRoots":
+    """Exact production roots: the designated installation and its worktree.
+
+    The destination is the operator's designated runtime installation
+    (``trading_assistant.installation``), never a hard-coded path; the source
+    is that installation's ``.worktrees/safety-foundation`` checkout.
+    """
+    try:
+        destination = require_designated()
+    except InstallationError:
+        raise ConsolidationError("root_mismatch") from None
+    return ConsolidationRoots(
+        source_root=destination / ".worktrees" / "safety-foundation",
+        destination_root=destination,
+    )
+
 _DATABASE_NAME = "trading_assistant.db"
 _BACKUP_DIRECTORY = Path(".local/encrypted-backups")
 _UNCERTAINTY_MARKER = Path(
@@ -1341,14 +1352,12 @@ def _validate_inputs(
     _ValidatedDatabase,
     _ValidatedDatabase | None,
 ]:
-    expected = roots or ConsolidationRoots(
-        source_root=_PRODUCTION_SOURCE,
-        destination_root=_PRODUCTION_DESTINATION,
-    )
+    expected = roots or _production_roots()
+    source_root = Path(source_root)
     if roots is None:
         if (
-            Path(source_root).name != "safety-foundation"
-            or Path(source_root).parent.name != ".worktrees"
+            source_root.name != "safety-foundation"
+            or source_root.parent.name != ".worktrees"
         ):
             raise ConsolidationError("root_mismatch")
     if (
@@ -1371,9 +1380,7 @@ def _validate_inputs(
             expected.destination_root,
         )
         if roots is None and destination.path != (
-            Path(
-                "/Users/avi/Desktop/robinhood/trading-assistant"
-            ).resolve(strict=True)
+            expected.destination_root.resolve(strict=True)
         ):
             raise ConsolidationError("root_mismatch")
         source_database = _validate_database(
