@@ -15,7 +15,42 @@ import pytest
 from trading_assistant.config import load_config
 
 
-TEST_CA = Path("/etc/ssl/cert.pem").read_text(encoding="ascii")
+def _generated_test_ca() -> str:
+    """A throwaway self-signed CA, so the suite needs no OS trust bundle.
+
+    The fixture only needs a PEM that ``ssl.create_default_context`` accepts;
+    reading ``/etc/ssl/cert.pem`` tied collection to macOS.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "operator-api-test-ca")]
+    )
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None),
+            critical=True,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+TEST_CA = _generated_test_ca()
 
 
 class _Response:

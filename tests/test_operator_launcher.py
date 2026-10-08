@@ -327,34 +327,48 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
     )
     _write_executable(fake_curl, fake_curl_source)
 
+    # Emulates the BSD ``stat -f`` forms the launcher uses (``%u`` owner,
+    # ``%p`` octal st_mode including type bits, ``%l`` link count) with
+    # os.stat, so launcher behavior is tested identically on macOS and on the
+    # Linux CI runner, whose GNU stat has no BSD ``-f`` format option.
     fake_stat_source = textwrap.dedent(
         f"""\
         #!{sys.executable} -I
         import os
-        import subprocess
         import sys
 
         arguments = sys.argv[1:]
-        completed = subprocess.run(
-            [{_STAT!r}, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        output = completed.stdout
+        follow = "-L" in arguments
+        try:
+            fmt = arguments[arguments.index("-f") + 1]
+            separator = arguments.index("--")
+            (path,) = arguments[separator + 1:]
+        except (ValueError, IndexError):
+            sys.stderr.write("fake stat: unsupported arguments\\n")
+            raise SystemExit(2)
+        try:
+            result = os.stat(path) if follow else os.lstat(path)
+        except OSError as error:
+            sys.stderr.write(f"stat: {{path}}: {{error.strerror}}\\n")
+            raise SystemExit(1)
+        fields = {{
+            "%u": str(result.st_uid),
+            "%p": format(result.st_mode, "o"),
+            "%l": str(result.st_nlink),
+        }}
+        if fmt not in {{"%u:%p:%l", "%u:%p"}}:
+            sys.stderr.write("fake stat: unsupported format\\n")
+            raise SystemExit(2)
+        output = ":".join(fields[part] for part in fmt.split(":")) + "\\n"
         if (
-            completed.returncode == 0
-            and os.environ.get("HARNESS_FOREIGN_START_OWNER") == "1"
-            and arguments[-1:] == [
-                os.environ["HARNESS_START_SCRIPT"]
-            ]
-            and "%u:%p:%l" in arguments
+            os.environ.get("HARNESS_FOREIGN_START_OWNER") == "1"
+            and path == os.environ["HARNESS_START_SCRIPT"]
+            and fmt == "%u:%p:%l"
         ):
             owner, mode, links = output.strip().split(":")
             output = f"{{int(owner) + 1}}:{{mode}}:{{links}}\\n"
         sys.stdout.write(output)
-        sys.stderr.write(completed.stderr)
-        raise SystemExit(completed.returncode)
+        raise SystemExit(0)
         """
     )
     _write_executable(fake_stat, fake_stat_source)
