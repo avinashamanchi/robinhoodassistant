@@ -91,7 +91,11 @@ def _finish_monitor(
         from decimal import Decimal
 
         from ..analyst.analyst import Analyst
-        from ..analyst.live_features import build_live_feature_provider, build_screen_source
+        from ..analyst.live_features import (
+            RefreshingScreenSource,
+            build_live_feature_provider,
+            build_screen_source,
+        )
         from ..analyst.planning import PlanningService
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
@@ -131,12 +135,14 @@ def _finish_monitor(
             secrets,
         )
         universe = config.screener.universe or config.risk.ticker_allowlist
-        screen_source = build_screen_source(
-            [s.upper() for s in universe],
-            secrets,
-            config=config,
-            runtime_role="daemon",
-            **historical_kwargs,
+        screen_source = RefreshingScreenSource(
+            lambda: build_screen_source(
+                [s.upper() for s in universe],
+                secrets,
+                config=config,
+                runtime_role="daemon",
+                **historical_kwargs,
+            )
         )
 
         def _price(sym: str):

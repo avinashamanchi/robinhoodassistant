@@ -424,3 +424,27 @@ def test_live_feature_fetches_default_to_a_bounded_cache_age(monkeypatch):
         live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS
     )
     assert live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS <= 24 * 60 * 60
+
+
+def test_screen_source_rebuilds_once_its_bars_are_too_old():
+    """The app and daemon kept one screen source for the whole process life."""
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    now = [0.0]
+
+    def build():
+        builds.append(len(builds))
+        version = len(builds)
+        return SimpleNamespace(
+            symbols=["AAPL"],
+            full=lambda symbol: f"{symbol}@v{version}",
+        )
+
+    source = RefreshingScreenSource(build, max_age_seconds=60, clock=lambda: now[0])
+    assert source.full("AAPL") == "AAPL@v1"
+    now[0] = 59
+    assert source.symbols == ["AAPL"] and source.full("AAPL") == "AAPL@v1"
+    now[0] = 61
+    assert source.full("AAPL") == "AAPL@v2"
+    assert len(builds) == 2

@@ -25,15 +25,18 @@ from ..broker.models import (
 from ..config import BacktestConfig, RiskConfig
 from ..risk.engine import RiskEngine
 from ..signals.features import build_features
+from ..signals.sessions import FEATURE_LOOKBACK
 from ..strategies.base import SignalAction, Strategy
 from .data import DataSource
 from .sim_broker import SimBroker, SimFill
 
 TARGET_PCT = 0.95  # fraction of equity a full-size long deploys
-# Feature indicators are causal and need at most ~252 bars (52-week window); a
-# bounded lookback yields identical values while keeping the run O(n·window),
-# not O(n^2). Still strictly <= t, so the no-lookahead guarantee is untouched.
-FEATURE_LOOKBACK = 320
+# Features use a bounded trailing window (shared with live consumers through
+# ``signals.sessions`` so both see the same bars): it keeps the run
+# O(n·window), not O(n^2), and stays strictly <= t, so the no-lookahead
+# guarantee is untouched. Simple averages are window-independent once warm;
+# exponential ones (EMA, MACD, ADX) are not, which is why live decisions must
+# use this exact window too.
 
 
 def permissive_risk_config(symbols: list[str], capital: float = 1e9) -> RiskConfig:

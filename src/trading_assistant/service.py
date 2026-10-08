@@ -302,6 +302,10 @@ class TradingService:
         ac = self._asset_class(ticker)
         return self._clock_for(ac).is_open()
 
+    def market_clock(self, asset_class: AssetClass) -> MarketClock:
+        """The configured session clock for an asset class (read-only use)."""
+        return self._clock_for(asset_class)
+
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
         self, session: Session, asset_class: AssetClass = AssetClass.EQUITY

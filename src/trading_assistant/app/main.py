@@ -566,6 +566,7 @@ def _create_app(
                 build_live_feature_provider(
                     service.config,
                     runtime_secrets,
+                    market_clock=service.market_clock,
                 ),
                 runtime_secrets,
             )
@@ -1344,12 +1345,18 @@ def _create_app(
             sec = _secrets_holder.get("s")
             if sec is None:
                 raise _dependency_unavailable()
-            from ..analyst.live_features import build_screen_source
+            from ..analyst.live_features import (
+                RefreshingScreenSource,
+                build_screen_source,
+            )
 
             try:
-                screen_source = build_screen_source(
-                    [s.upper() for s in universe],
-                    sec,
+                screen_source = RefreshingScreenSource(
+                    lambda: build_screen_source(
+                        [s.upper() for s in universe],
+                        sec,
+                        market_clock=service.market_clock,
+                    )
                 )
             except RequiredDependencyUnavailable:
                 raise _dependency_unavailable() from None

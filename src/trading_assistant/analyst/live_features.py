@@ -10,7 +10,9 @@ app startup.
 
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
 from pathlib import Path
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -20,6 +22,11 @@ from ..dependencies import RequiredDependencyUnavailable
 from ..security.secrets import secret_value
 from ..signals.features import build_features
 from ..signals.models import MarketFeatures
+from ..signals.sessions import (
+    completed_bars,
+    decision_bars,
+    completed_through,
+)
 
 # Live features must reflect recent bars. Daily bars change at most once per
 # session, so a few hours of reuse keeps provider calls low without letting a
@@ -138,6 +145,47 @@ def _fetch_crypto_df(
     ).bars(symbol, days=days)
 
 
+def _session_cutoff(
+    *,
+    scheduled_service=None,
+    market_clock=None,
+    now: Callable[[], datetime] | None = None,
+) -> Callable[[AssetClass], date]:
+    """Latest completed session per asset class at the decision instant.
+
+    Uses one clock observation per asset class (memoised for a minute, since
+    the Alpaca clock reads the exchange calendar). A clock that cannot be read
+    fails closed; no clock at all falls back to the conservative policy in
+    ``signals.sessions``.
+    """
+    clock_for = market_clock
+    if clock_for is None and scheduled_service is not None:
+        clock_for = getattr(scheduled_service, "market_clock", None)
+    current = now or (lambda: datetime.now(timezone.utc))
+    memo: dict[AssetClass, tuple[float, date]] = {}
+
+    def cutoff(asset_class: AssetClass) -> date:
+        cached = memo.get(asset_class)
+        if cached is not None and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        at = current()
+        observation = None
+        if clock_for is not None:
+            try:
+                observation = clock_for(asset_class).observe(at)
+            except Exception:
+                raise RequiredDependencyUnavailable from None
+        through = completed_through(
+            now=at,
+            asset_class=asset_class,
+            observation=observation,
+        )
+        memo[asset_class] = (time.monotonic(), through)
+        return through
+
+    return cutoff
+
+
 def build_live_feature_provider(
     config,
     secrets,
@@ -148,7 +196,19 @@ def build_live_feature_provider(
     coingecko_http: Any = None,
     cache_dir: str | Path = ".cache/bars",
     runtime_role: str = "app",
+    market_clock: Callable[[AssetClass], Any] | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> Callable[[str], MarketFeatures]:
+    """Features on completed sessions only, over the backtest's window.
+
+    See ``signals.sessions`` for the shared decision-time bar policy.
+    """
+    cutoff = _session_cutoff(
+        scheduled_service=scheduled_service,
+        market_clock=market_clock,
+        now=now,
+    )
+
     def provider(symbol: str) -> MarketFeatures:
         ac = AssetClass.for_symbol(symbol)
         try:
@@ -178,17 +238,24 @@ def build_live_feature_provider(
             raise
         except Exception:
             raise RequiredDependencyUnavailable from None
+        df = decision_bars(df, asset_class=ac, through=cutoff(ac))
+        if df.empty:
+            raise RequiredDependencyUnavailable
         spy_df = None
         try:
-            spy_df = _fetch_equity_df(
-                "SPY",
-                secrets,
-                config=config,
-                service=scheduled_service,
-                rate_limiter=rate_limiter,
-                client_factory=alpaca_client_factory,
-                cache_dir=cache_dir,
-                runtime_role=runtime_role,
+            spy_df = decision_bars(
+                _fetch_equity_df(
+                    "SPY",
+                    secrets,
+                    config=config,
+                    service=scheduled_service,
+                    rate_limiter=rate_limiter,
+                    client_factory=alpaca_client_factory,
+                    cache_dir=cache_dir,
+                    runtime_role=runtime_role,
+                ),
+                asset_class=AssetClass.EQUITY,
+                through=cutoff(AssetClass.EQUITY),
             )
         except Exception:
             spy_df = None
@@ -208,10 +275,20 @@ def build_screen_source(
     coingecko_http: Any = None,
     cache_dir: str | Path = ".cache/bars",
     runtime_role: str = "app",
+    market_clock: Callable[[AssetClass], Any] | None = None,
+    now: Callable[[], datetime] | None = None,
 ):
-    """Build a DataSource across the universe (+ SPY) from cached bars."""
+    """Build a DataSource across the universe (+ SPY) from cached bars.
+
+    Frames hold completed sessions only (``signals.sessions``).
+    """
     from ..backtest.data import DataSource
 
+    cutoff = _session_cutoff(
+        scheduled_service=scheduled_service,
+        market_clock=market_clock,
+        now=now,
+    )
     requested = set(universe)
     frames = {}
     for sym in requested | {"SPY"}:
@@ -239,6 +316,51 @@ def build_screen_source(
                 )
         except Exception:
             continue
+    for sym in list(frames):
+        ac = AssetClass.for_symbol(sym)
+        try:
+            frames[sym] = completed_bars(
+                frames[sym], asset_class=ac, through=cutoff(ac)
+            )
+        except RequiredDependencyUnavailable:
+            del frames[sym]
     if not requested.intersection(frames):
         raise RequiredDependencyUnavailable
     return DataSource(frames)
+
+
+class RefreshingScreenSource:
+    """A screen source that rebuilds itself once its bars are too old.
+
+    The app and daemon used to build their screen ``DataSource`` once per
+    process, so screening, shadow analysis and the digest kept serving the
+    bars from process start. This wrapper exposes the two members consumers
+    use (``symbols``, ``full``) and rebuilds through ``build`` after
+    ``max_age_seconds``.
+    """
+
+    def __init__(
+        self,
+        build: Callable[[], Any],
+        *,
+        max_age_seconds: float = LIVE_BAR_CACHE_MAX_AGE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._build = build
+        self._max_age_seconds = max_age_seconds
+        self._clock = clock
+        self._source = build()
+        self._built_at = clock()
+
+    def _current(self):
+        if self._clock() - self._built_at > self._max_age_seconds:
+            self._source = self._build()
+            self._built_at = self._clock()
+        return self._source
+
+    @property
+    def symbols(self) -> list[str]:
+        return self._current().symbols
+
+    def full(self, symbol: str):
+        return self._current().full(symbol)

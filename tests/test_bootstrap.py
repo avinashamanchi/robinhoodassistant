@@ -1013,16 +1013,22 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
     monkeypatch.setattr(
         live_features,
         "build_live_feature_provider",
-        lambda config, supplied: seen.append(
-            ("feature_secrets", supplied)
+        lambda config, supplied, *, market_clock: seen.extend(
+            [
+                ("feature_secrets", supplied),
+                ("feature_clock", market_clock),
+            ]
         )
         or object(),
     )
     monkeypatch.setattr(
         live_features,
         "build_screen_source",
-        lambda symbols, supplied: seen.append(
-            ("screen_secrets", supplied)
+        lambda symbols, supplied, *, market_clock: seen.extend(
+            [
+                ("screen_secrets", supplied),
+                ("screen_clock", market_clock),
+            ]
         )
         or object(),
     )
@@ -1052,6 +1058,10 @@ def test_automatic_planning_and_screen_use_exact_injected_secrets(
     assert app.state.runtime_secrets is secrets
     assert app.state.planning is not None
     assert ("planning_service", service) in seen
+    # Live features and screening decide on completed sessions, so both
+    # must receive the service's market clock (signals.sessions).
+    assert ("feature_clock", service.market_clock) in seen
+    assert ("screen_clock", service.market_clock) in seen
     for label in (
         "backend_secrets",
         "feature_secrets",
