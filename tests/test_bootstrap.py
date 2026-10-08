@@ -52,6 +52,19 @@ from trading_assistant.orders.startup import StartupReconciliationFailed
 from trading_assistant.risk.clock import FakeClock
 
 
+@pytest.fixture(autouse=True)
+def designated_repository(tmp_path_factory, monkeypatch):
+    """Production containers bind a real broker only from the designated
+    installation; designate this checkout in a disposable HOME (the real
+    check runs, never the operator's own designation)."""
+    from trading_assistant import installation
+
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    installation.designate(installation.source_root(), home=home)
+    return home
+
+
 def _migrated_secrets(tmp_path: Path) -> Secrets:
     database_url = f"sqlite:///{tmp_path}/runtime.db"
     engine = create_db_engine(database_url)
@@ -2814,3 +2827,67 @@ def test_production_runtime_role_installs_private_bounded_log(
     assert expected.exists()
     assert (expected.stat().st_mode & 0o777) == 0o600
     assert (expected.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_production_container_refuses_an_undesignated_checkout_before_the_broker(
+    tmp_path,
+    app_config,
+    monkeypatch,
+):
+    from trading_assistant import bootstrap
+
+    monkeypatch.setenv("HOME", str(tmp_path / "empty home"))
+    (tmp_path / "empty home").mkdir()
+
+    def broker_must_not_be_built(*_args, **_kwargs):
+        raise AssertionError("broker constructed outside the designated installation")
+
+    monkeypatch.setattr(bootstrap, "build_broker", broker_must_not_be_built)
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    with pytest.raises(bootstrap.StartupInstallationBlocked) as blocked:
+        bootstrap.build_container(
+            config,
+            _migrated_secrets(tmp_path),
+            runtime_role="daemon",
+        )
+    assert blocked.value.stable_code == "installation_not_designated"
+
+
+def test_production_container_refuses_another_designated_checkout(
+    tmp_path,
+    app_config,
+    monkeypatch,
+    designated_repository,
+):
+    from trading_assistant import bootstrap, installation
+
+    other = tmp_path / "other checkout"
+    for relative in ("pyproject.toml", "scripts/operator.sh", "src/trading_assistant/__init__.py"):
+        (other / relative).parent.mkdir(parents=True, exist_ok=True)
+        (other / relative).write_text("", encoding="utf-8")
+    installation.designate(other.resolve(), home=designated_repository, replace=True)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_broker",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("broker built")),
+    )
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    with pytest.raises(bootstrap.StartupInstallationBlocked) as blocked:
+        bootstrap.build_container(
+            config,
+            _migrated_secrets(tmp_path),
+            runtime_role="daemon",
+        )
+    assert blocked.value.stable_code == "installation_root_mismatch"

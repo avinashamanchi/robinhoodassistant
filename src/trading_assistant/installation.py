@@ -14,25 +14,46 @@ designation is now explicit, per user, and outside the repository:
     ~/Library/Application Support/trading-assistant/installation-root
 
 It holds one absolute, symlink-free path. It must be a regular file owned by
-the current user with no group or other permissions. ``designate`` writes it
-for the current checkout; ``check`` and ``status`` report on it. The home
-directory comes from ``HOME`` (validated), matching the shell launcher.
+the current user with no group or other permissions, inside a private
+(0700, non-symlink) directory. The home directory comes from ``HOME``
+(validated), matching the shell launcher.
+
+Read-only commands never change the designation:
 
     python -m trading_assistant.installation status
-    python -m trading_assistant.installation designate
-    python -m trading_assistant.installation check --project PATH
+    python -m trading_assistant.installation check --project PATH [--venv-python PY]
+
+Only ``designate`` changes it, and it refuses to replace a different existing
+designation unless ``--replace`` is given:
+
+    python -m trading_assistant.installation designate [--replace]
+
+The module is stdlib-only, so ``install.sh`` can run this file directly with
+the venv interpreter even when the package itself cannot be imported.
+
+Scope of the protection: one designated checkout per macOS user account.
+It does not stop another user account, another machine, a second ``HOME``,
+or someone deliberately re-designating, from running a second runtime
+against the same Alpaca paper account; nothing local can. Within that scope,
+production runtimes refuse to bind a real broker outside the designated
+checkout (``bootstrap``), and each runtime's database tenure still prevents
+two writers on one database.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import os
 from pathlib import Path
 import plistlib
 import pwd
 import stat
+import subprocess
 import sys
 from typing import Iterator
+import uuid
 
 DESIGNATION_RELATIVE = (
     Path("Library") / "Application Support" / "trading-assistant"
@@ -80,9 +101,38 @@ def designation_path(home: Path | None = None) -> Path:
     return (home or account_home()) / DESIGNATION_RELATIVE
 
 
+def _require_private_directory(directory: Path) -> None:
+    try:
+        info = os.lstat(directory)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        raise InstallationError(
+            "installation_designation_untrusted", str(directory)
+        )
+
+
+def _require_physical_components(home: Path, path: Path) -> None:
+    """No component between HOME and the record may be a symlink."""
+    current = home
+    for part in path.relative_to(home).parts:
+        current = current / part
+        if current.is_symlink():
+            raise InstallationError(
+                "installation_designation_untrusted", str(current)
+            )
+
+
 def read_designation(home: Path | None = None) -> Path:
     """The designated installation root, after validating the record."""
-    path = designation_path(home)
+    base = home or account_home()
+    path = designation_path(base)
+    _require_physical_components(base, path)
+    _require_private_directory(path.parent)
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -129,24 +179,90 @@ def require_designated(
     return designated
 
 
-def designate(root: Path | None = None, *, home: Path | None = None) -> Path:
-    """Record ``root`` (default: this checkout) as the designated runtime."""
+@contextmanager
+def _designation_lock(directory: Path) -> Iterator[None]:
+    """Serialise designation changes (read-check-replace is one step)."""
+    descriptor = os.open(
+        directory / ".installation-root.lock",
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def designate(
+    root: Path | None = None,
+    *,
+    home: Path | None = None,
+    replace: bool = False,
+) -> tuple[Path, Path | None]:
+    """Record ``root`` (default: this checkout) as the designated runtime.
+
+    Returns ``(designated, previous)``. Replacing a *different* existing,
+    valid designation requires ``replace=True``; re-designating the same
+    root, or replacing an unusable record (for example after the old
+    checkout was moved away), does not.
+    """
     target = (root if root is not None else source_root()).resolve(strict=True)
     _require_checkout(target)
-    path = designation_path(home)
+    base = home or account_home()
+    path = designation_path(base)
+    _require_physical_components(base, path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
-    staging = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(f"{target}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staging, path)
-    finally:
-        staging.unlink(missing_ok=True)
-    return target
+    _require_private_directory(path.parent)
+    with _designation_lock(path.parent):
+        previous: Path | None
+        try:
+            previous = read_designation(home)
+        except InstallationError:
+            previous = None
+        if previous is not None and previous != target and not replace:
+            raise InstallationError(
+                "installation_already_designated",
+                f"{previous} is designated; pass --replace to change it",
+            )
+        staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        descriptor = os.open(
+            staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(f"{target}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(staging, path)
+        finally:
+            staging.unlink(missing_ok=True)
+    return target, previous
+
+
+def venv_imports(venv_python: Path) -> Path:
+    """The package directory a virtual environment's interpreter imports."""
+    completed = subprocess.run(
+        [
+            str(venv_python),
+            "-I",
+            "-c",
+            "import pathlib, trading_assistant; "
+            "print(pathlib.Path(trading_assistant.__file__).resolve().parent)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise InstallationError(
+            "venv_cannot_import_package",
+            "repair with: uv sync --all-extras --dev",
+        )
+    return Path(completed.stdout.strip())
 
 
 def venv_editable_targets(root: Path) -> list[Path]:
@@ -215,27 +331,61 @@ def status_lines(home: Path | None = None) -> tuple[list[str], bool]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m trading_assistant.installation",
-        description="Designated runtime installation management.",
+        description=(
+            "Designated runtime installation. status and check are "
+            "read-only; only designate changes the designation."
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status", help="report checkout, designation, venv and launchd paths")
-    commands.add_parser("designate", help="designate this checkout as the runtime installation")
-    check = commands.add_parser("check", help="exit 0 only if PROJECT is this checkout and designated")
+    commands.add_parser(
+        "status",
+        help="read-only: checkout, designation, venv and launchd paths",
+    )
+    check = commands.add_parser(
+        "check",
+        help="read-only: exit 0 only if PROJECT is this checkout and designated",
+    )
     check.add_argument("--project", required=True)
+    check.add_argument(
+        "--venv-python",
+        help="also require this interpreter to import this checkout",
+    )
+    designate_parser = commands.add_parser(
+        "designate",
+        help="CHANGES STATE: designate this checkout as the runtime installation",
+    )
+    designate_parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="replace a different existing designation",
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.command == "designate":
-            print(f"designated runtime installation: {designate()}")
+            target, previous = designate(replace=args.replace)
+            if previous is None or previous == target:
+                print(f"designated runtime installation: {target}")
+            else:
+                print(f"designated runtime installation: {target} (was {previous})")
             return 0
         if args.command == "check":
-            project = Path(args.project)
-            if source_root() != project.resolve(strict=True):
+            project = Path(args.project).resolve(strict=True)
+            if source_root() != project:
                 raise InstallationError(
                     "venv_imports_other_checkout",
                     f"{project} runs code from {source_root()}",
                 )
             require_designated(project)
+            if args.venv_python is not None:
+                imported = venv_imports(Path(args.venv_python))
+                expected = project / "src" / "trading_assistant"
+                if imported != expected:
+                    raise InstallationError(
+                        "venv_imports_other_checkout",
+                        f"{args.venv_python} imports {imported}; "
+                        "repair with: uv sync --all-extras --dev",
+                    )
             return 0
         lines, healthy = status_lines()
         print("\n".join(lines))

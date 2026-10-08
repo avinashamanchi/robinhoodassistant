@@ -27,12 +27,25 @@ fi
 AUTOPILOT_HOUR=$((10#${BASH_REMATCH[1]}))
 AUTOPILOT_MINUTE=$((10#${BASH_REMATCH[2]}))
 
-PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PY="$PROJ/.venv/bin/python"
 LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
+
+# Before any side effect: every generated job runs from $PROJ, so it must be
+# the operator's designated runtime installation and its venv must import
+# this checkout (a moved checkout's venv still imports the old path). The
+# check is the stdlib-only module run as a file, so it works even when the
+# package cannot be imported.
+if ! "$PY" -I "$PROJ/src/trading_assistant/installation.py" check \
+    --project "$PROJ" --venv-python "$PY"; then
+  echo "error: refusing to install launchd jobs for $PROJ" >&2
+  echo "       inspect: $PY -I $PROJ/src/trading_assistant/installation.py status" >&2
+  exit 1
+fi
+
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/.local/encrypted-backups"
 chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
