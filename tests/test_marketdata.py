@@ -448,3 +448,115 @@ def test_screen_source_rebuilds_once_its_bars_are_too_old():
     now[0] = 61
     assert source.full("AAPL") == "AAPL@v2"
     assert len(builds) == 2
+
+
+def _counting_build(builds, *, fail_when=None, pause=None):
+    def build():
+        version = len(builds) + 1
+        builds.append(version)
+        if pause is not None:
+            pause()
+        if fail_when is not None and fail_when(version):
+            raise RuntimeError("provider unavailable")
+        return SimpleNamespace(
+            symbols=["AAPL"], full=lambda symbol: f"{symbol}@v{version}"
+        )
+
+    return build
+
+
+def test_screen_source_rebuilds_when_a_new_session_becomes_final():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    ny = ZoneInfo("America/New_York")
+    now = [datetime(2026, 9, 29, 19, 0, tzinfo=ny)]
+    builds = []
+    source = RefreshingScreenSource(
+        _counting_build(builds),
+        max_age_seconds=10**9,
+        clock=lambda: 0.0,
+        now=lambda: now[0],
+    )
+    assert source.full("AAPL") == "AAPL@v1"
+    now[0] = datetime(2026, 9, 29, 19, 59, tzinfo=ny)
+    assert source.full("AAPL") == "AAPL@v1"   # Sep 29 bar not final yet
+    now[0] = datetime(2026, 9, 29, 20, 1, tzinfo=ny)
+    assert source.full("AAPL") == "AAPL@v2"   # Sep 29 became final
+    assert builds == [1, 2]
+
+
+def test_screen_source_failed_rebuild_never_serves_stale_bars():
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    tick = [0.0]
+    source = RefreshingScreenSource(
+        _counting_build(builds, fail_when=lambda version: version == 2),
+        max_age_seconds=60,
+        clock=lambda: tick[0],
+    )
+    tick[0] = 61
+    with pytest.raises(RuntimeError):
+        source.full("AAPL")
+    # The stale v1 source was discarded; the next call rebuilds.
+    assert source.full("AAPL") == "AAPL@v3"
+
+
+def test_screen_source_concurrent_readers_trigger_one_rebuild():
+    import threading
+    import time as time_module
+
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    tick = [0.0]
+    source = RefreshingScreenSource(
+        _counting_build(builds, pause=lambda: time_module.sleep(0.05)),
+        max_age_seconds=60,
+        clock=lambda: tick[0],
+    )
+    tick[0] = 61
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(source.full("AAPL")))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert builds == [1, 2]
+    assert results == ["AAPL@v2"] * 8
+
+
+def test_alpaca_cache_captured_before_a_bar_was_final_is_refreshed(
+    tmp_path, monkeypatch
+):
+    from datetime import datetime, timezone
+
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+    first = download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+    assert first.attrs["fetched_at"] == backtest_data.fetched_at(path)
+
+    captured = datetime(2026, 9, 29, 19, 0, tzinfo=timezone.utc)
+    os.utime(path, (captured.timestamp(), captured.timestamp()))
+    final_after = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)
+
+    refreshed = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        refresh_if_fetched_before=final_after,
+    )
+    assert fake.calls == 2
+    assert refreshed["close"].iloc[-1] == 222.0
+    assert refreshed.attrs["fetched_at"] >= final_after
+
+    reused = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        refresh_if_fetched_before=final_after,
+    )
+    assert fake.calls == 2
+    assert reused["close"].iloc[-1] == 222.0

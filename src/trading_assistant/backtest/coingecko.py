@@ -11,6 +11,7 @@ injectable so parsing is unit-tested without network.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,7 +26,13 @@ from ..security.outbound import (
     read_bounded_json,
     require_origin,
 )
-from .data import cache_is_fresh, cache_path, load_parquet, write_parquet_atomic
+from .data import (
+    cache_is_fresh,
+    cache_path,
+    fetched_at,
+    load_parquet,
+    write_parquet_atomic,
+)
 
 BASE = "https://api.coingecko.com/api/v3"
 _ORIGIN_POLICY = OutboundPolicy("https://api.coingecko.com")
@@ -104,15 +111,28 @@ class CoinGeckoClient:
         )
         return data.get("total_volumes", [])
 
-    def bars(self, symbol: str, days: int = 365, use_cache: bool = True) -> pd.DataFrame:
+    def bars(
+        self,
+        symbol: str,
+        days: int = 365,
+        use_cache: bool = True,
+        *,
+        refresh_if_fetched_before: datetime | None = None,
+    ) -> pd.DataFrame:
         path = cache_path(self._cache_dir, symbol, "coingecko")
         if use_cache and cache_is_fresh(
-            path, self._max_cache_age_seconds, clock=self._clock
+            path,
+            self._max_cache_age_seconds,
+            clock=self._clock,
+            fetched_after=refresh_if_fetched_before,
         ):
-            return load_parquet(path)
+            cached = load_parquet(path)
+            cached.attrs["fetched_at"] = fetched_at(path)
+            return cached
         frame = _merge_ohlc_volume(self.ohlc(symbol, days), self.volumes(symbol, days))
         if not frame.empty:
             write_parquet_atomic(frame, path)
+            frame.attrs["fetched_at"] = fetched_at(path)
         return frame
 
 

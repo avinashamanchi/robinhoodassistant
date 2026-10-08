@@ -23,6 +23,13 @@ cutoff, so this module defines the policy once:
 
 * With no clock available the policy is conservative: only sessions before
   the current calendar date (in the session timezone) count as complete.
+  Order-placing consumers must not use this fallback; they require a clock.
+* A session's bar is only *final* if the frame holding it was fetched after
+  the bar could no longer change: 20:00 New York time on the session date for
+  equities (after extended hours; also covers early closes), one hour after
+  UTC midnight for crypto. A frame fetched at 15:00 therefore never supplies
+  that day's close, even after the market closes; the consumer refreshes it.
+  ``decision_cutoff`` combines clock completion with that finality rule.
 * Duplicate bars for one session keep the last row; bars stay sorted.
 * Features are computed on the same trailing window the backtest uses
   (``FEATURE_LOOKBACK`` bars), because exponential averages, MACD and ADX
@@ -31,7 +38,7 @@ cutoff, so this module defines the policy once:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -41,6 +48,8 @@ from ..risk.clock import MarketClockObservation
 
 FEATURE_LOOKBACK = 320
 EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
+EQUITY_BAR_FINAL_AT = time(20, 0)        # New York local time on the session date
+CRYPTO_BAR_FINAL_DELAY = timedelta(hours=1)  # after the UTC day ends
 
 
 def session_timezone(asset_class: AssetClass) -> tzinfo:
@@ -79,6 +88,46 @@ def completed_through(
     return current
 
 
+def final_instant(session: date, asset_class: AssetClass) -> datetime:
+    """The UTC instant after which a session's daily bar no longer changes."""
+    if asset_class is AssetClass.CRYPTO:
+        return (
+            datetime.combine(session + timedelta(days=1), time(0), timezone.utc)
+            + CRYPTO_BAR_FINAL_DELAY
+        )
+    return datetime.combine(
+        session, EQUITY_BAR_FINAL_AT, EXCHANGE_TIMEZONE
+    ).astimezone(timezone.utc)
+
+
+def final_through(fetched_at: datetime, asset_class: AssetClass) -> date:
+    """Latest session whose bar was already final when a frame was fetched."""
+    moment = _aware(fetched_at)
+    if asset_class is AssetClass.CRYPTO:
+        shifted = moment.astimezone(timezone.utc) - CRYPTO_BAR_FINAL_DELAY
+        return shifted.date() - timedelta(days=1)
+    local = moment.astimezone(EXCHANGE_TIMEZONE)
+    if local.time() >= EQUITY_BAR_FINAL_AT:
+        return local.date()
+    return local.date() - timedelta(days=1)
+
+
+def decision_cutoff(
+    *,
+    now: datetime,
+    asset_class: AssetClass,
+    observation: MarketClockObservation | None,
+) -> date:
+    """Latest session a decision at ``now`` may use: closed per the clock
+    *and* old enough that its bar is final."""
+    return min(
+        completed_through(
+            now=now, asset_class=asset_class, observation=observation
+        ),
+        final_through(now, asset_class),
+    )
+
+
 def completed_bars(
     frame: pd.DataFrame,
     *,
@@ -101,8 +150,15 @@ def decision_bars(
     *,
     asset_class: AssetClass,
     through: date,
+    fetched_at: datetime | None = None,
 ) -> pd.DataFrame:
-    """Completed sessions, trimmed to the backtest's feature window."""
+    """Completed, final sessions, trimmed to the backtest's feature window.
+
+    ``fetched_at`` (when the frame left the provider) caps ``through`` so a
+    bar captured mid-session is never treated as that session's final bar.
+    """
+    if fetched_at is not None:
+        through = min(through, final_through(fetched_at, asset_class))
     return completed_bars(frame, asset_class=asset_class, through=through).tail(
         FEATURE_LOOKBACK
     )

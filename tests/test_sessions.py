@@ -206,9 +206,22 @@ def _trading_days(end, count):
 
 
 def _live_features(frame, spy, *, now, observation, tmp_path):
+    """Run the live provider with caches captured at the decision instant.
+
+    The cache file time is the frame's fetch provenance, so it must agree
+    with the simulated ``now``: a frame fetched today cannot hold bars from
+    a later simulated date.
+    """
+    import os
+
     from trading_assistant.analyst.live_features import build_live_feature_provider
+    from trading_assistant.backtest import data as backtest_data
 
     frames = {"AAPL": frame, "SPY": spy}
+    for symbol, data in frames.items():
+        path = backtest_data.cache_path(tmp_path, symbol, "1Day")
+        backtest_data.write_parquet_atomic(data, path)
+        os.utime(path, (now.timestamp(), now.timestamp()))
 
     class FakeHistory:
         def get_stock_bars(self, request):
@@ -287,3 +300,180 @@ def test_without_the_policy_the_in_progress_bar_would_leak_in(tmp_path):
         tmp_path=tmp_path,
     )
     assert raw.last_close != live.last_close
+
+
+# ── bar finality: a mid-session capture is never a final bar ──────────────────
+from trading_assistant.signals.sessions import (  # noqa: E402
+    decision_cutoff,
+    final_instant,
+    final_through,
+)
+
+
+@pytest.mark.parametrize(
+    ("fetched", "expected"),
+    [
+        (ny(2026, 9, 29, 15, 0), date(2026, 9, 28)),   # mid-session
+        (ny(2026, 9, 29, 16, 30), date(2026, 9, 28)),  # closed, not yet final
+        (ny(2026, 9, 29, 20, 0), date(2026, 9, 29)),   # final
+        (ny(2026, 11, 2, 19, 59), date(2026, 11, 1)),  # EST, just before
+        (ny(2026, 3, 9, 20, 1), date(2026, 3, 9)),     # EDT, just after
+    ],
+)
+def test_equity_bar_finality_follows_new_york_time(fetched, expected):
+    assert final_through(fetched.astimezone(timezone.utc), EQUITY) == expected
+    assert final_through(fetched.astimezone(ZoneInfo("Asia/Tokyo")), EQUITY) == expected
+
+
+def test_final_instant_and_final_through_agree():
+    for session in (date(2026, 3, 9), date(2026, 7, 10), date(2026, 11, 2)):
+        for ac in (EQUITY, CRYPTO):
+            instant = final_instant(session, ac)
+            assert final_through(instant, ac) == session
+            assert final_through(instant - timedelta(seconds=1), ac) < session
+
+
+def test_crypto_candle_is_final_an_hour_after_the_utc_day():
+    day = date(2026, 10, 6)
+    assert final_through(datetime(2026, 10, 7, 0, 30, tzinfo=timezone.utc), CRYPTO) == date(2026, 10, 5)
+    assert final_through(datetime(2026, 10, 7, 1, 0, tzinfo=timezone.utc), CRYPTO) == day
+
+
+def test_closed_market_does_not_make_an_unfinal_bar_usable():
+    observation = observed(False, ny(2026, 9, 29, 9, 30))
+    assert decision_cutoff(
+        now=ny(2026, 9, 29, 16, 30), asset_class=EQUITY, observation=observation
+    ) == date(2026, 9, 28)
+    assert decision_cutoff(
+        now=ny(2026, 9, 29, 20, 30), asset_class=EQUITY, observation=observation
+    ) == date(2026, 9, 29)
+
+
+def _provider_on_cache(tmp_path, *, now, observation, cached, cached_at, served):
+    """A live provider over a pre-populated cache and a recording fake SDK."""
+    import os
+
+    from trading_assistant.analyst.live_features import build_live_feature_provider
+    from trading_assistant.backtest import data as backtest_data
+
+    for symbol in ("AAPL", "SPY"):
+        path = backtest_data.cache_path(tmp_path, symbol, "1Day")
+        backtest_data.write_parquet_atomic(cached, path)
+        os.utime(path, (cached_at.timestamp(), cached_at.timestamp()))
+    calls = []
+
+    class FakeHistory:
+        def get_stock_bars(self, request):
+            calls.append(request.symbol_or_symbols)
+            return SimpleNamespace(df=served.copy())
+
+    provider = build_live_feature_provider(
+        None,
+        SimpleNamespace(alpaca_api_key="k", alpaca_secret_key="s"),
+        alpaca_client_factory=lambda *_a: FakeHistory(),
+        cache_dir=tmp_path,
+        market_clock=lambda _ac: SimpleNamespace(observe=lambda _at: observation),
+        now=lambda: now,
+        require_market_clock=True,
+    )
+    return provider, calls
+
+
+def test_a_forming_bar_never_supplies_the_close(tmp_path):
+    """At 16:30 the market is closed, but today's bar is not final until
+    20:00 ET. Whether it comes from a 15:00 cache or a fresh fetch that
+    still returns the forming bar, it must not drive a decision."""
+    days = _trading_days(date(2026, 9, 29), 260)
+    forming = alpaca_daily(days)
+    forming.loc[forming.index[-1], "close"] = 999.0       # not final
+    closed = observed(False, ny(2026, 9, 29, 9, 30))
+
+    provider, _calls = _provider_on_cache(
+        tmp_path,
+        now=ny(2026, 9, 29, 16, 30),
+        observation=closed,
+        cached=forming,
+        cached_at=ny(2026, 9, 29, 15, 0),
+        served=forming,
+    )
+    features = provider("AAPL")
+    assert session_date(features.as_of, EQUITY) == date(2026, 9, 28)
+    assert features.last_close != 999.0
+
+
+def test_after_the_bar_is_final_a_stale_capture_is_refreshed(tmp_path):
+    days = _trading_days(date(2026, 9, 29), 260)
+    partial = alpaca_daily(days)
+    partial.loc[partial.index[-1], "close"] = 999.0
+    final = alpaca_daily(days)
+    final.loc[final.index[-1], "close"] = 123.0
+
+    provider, calls = _provider_on_cache(
+        tmp_path,
+        now=ny(2026, 9, 29, 20, 30),
+        observation=observed(False, ny(2026, 9, 29, 9, 30)),
+        cached=partial,
+        cached_at=ny(2026, 9, 29, 15, 0),
+        served=final,
+    )
+    features = provider("AAPL")
+    assert sorted(calls) == ["AAPL", "SPY"]
+    assert session_date(features.as_of, EQUITY) == date(2026, 9, 29)
+    assert features.last_close == 123.0
+
+
+def test_order_paths_require_a_market_clock():
+    from trading_assistant.analyst.live_features import build_live_feature_provider
+    from trading_assistant.dependencies import RequiredDependencyUnavailable
+
+    with pytest.raises(RequiredDependencyUnavailable):
+        build_live_feature_provider(None, SimpleNamespace(), require_market_clock=True)
+
+
+def test_an_unreadable_clock_fails_closed(tmp_path):
+    from trading_assistant.analyst.live_features import build_live_feature_provider
+    from trading_assistant.dependencies import RequiredDependencyUnavailable
+
+    def broken(_at):
+        raise TimeoutError("clock unavailable")
+
+    provider = build_live_feature_provider(
+        None,
+        SimpleNamespace(alpaca_api_key="k", alpaca_secret_key="s"),
+        cache_dir=tmp_path,
+        market_clock=lambda _ac: SimpleNamespace(observe=broken),
+    )
+    with pytest.raises(RequiredDependencyUnavailable):
+        provider("AAPL")
+
+
+@pytest.mark.parametrize(
+    ("first", "first_state", "later", "expected_both"),
+    [
+        # Cached "open" observation lingers 50s past the 16:00 close.
+        (ny(2026, 9, 29, 15, 59),
+         (True, ny(2026, 9, 29, 9, 30)), ny(2026, 9, 29, 16, 0), date(2026, 9, 28)),
+        # Cached "closed" observation lingers past the 09:30 open.
+        (ny(2026, 9, 29, 9, 29), (False, ny(2026, 9, 28, 9, 30)), ny(2026, 9, 29, 9, 30),
+         date(2026, 9, 28)),
+    ],
+)
+def test_clock_memo_is_only_ever_conservative(first, first_state, later, expected_both):
+    from trading_assistant.analyst.live_features import _session_cutoff
+
+    instants = iter([first, later])
+    ticks = iter([0.0, 0.0, 50.0])
+    observations = []
+
+    def observe(at):
+        observations.append(at)
+        return observed(*first_state)
+
+    cutoff = _session_cutoff(
+        market_clock=lambda _ac: SimpleNamespace(observe=observe),
+        now=lambda: next(instants),
+        monotonic=lambda: next(ticks),
+    )
+    assert cutoff(EQUITY) == expected_both
+    assert cutoff(EQUITY) == expected_both  # memo hit 50s later
+    assert len(observations) == 1

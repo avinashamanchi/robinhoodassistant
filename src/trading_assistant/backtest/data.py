@@ -115,19 +115,30 @@ def cache_is_fresh(
     max_age_seconds: float | None,
     *,
     clock: Callable[[], float] = time.time,
+    fetched_after: datetime | None = None,
 ) -> bool:
     """Whether a cached frame may be reused instead of re-downloaded.
 
     ``max_age_seconds=None`` keeps the historical behaviour (a cache file is
     reused forever), which is what reproducible backtests want. Live callers
-    pass a bound so decisions are never made on bars frozen at download time.
+    pass a bound so decisions are never made on bars frozen at download time,
+    and ``fetched_after`` so a frame captured before the latest session's bar
+    became final is refreshed regardless of its age.
     """
     candidate = Path(path)
     if not candidate.exists():
         return False
+    fetched = candidate.stat().st_mtime
+    if fetched_after is not None and fetched < fetched_after.timestamp():
+        return False
     if max_age_seconds is None:
         return True
-    return clock() - candidate.stat().st_mtime <= max_age_seconds
+    return clock() - fetched <= max_age_seconds
+
+
+def fetched_at(path: str | Path) -> datetime:
+    """When a cached frame was written (its provenance for bar finality)."""
+    return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc)
 
 
 def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
@@ -157,6 +168,7 @@ def download_alpaca_bars(
     attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
     max_cache_age_seconds: float | None = None,
     clock: Callable[[], float] = time.time,
+    refresh_if_fetched_before: datetime | None = None,
 ) -> pd.DataFrame:
     """Download corporate-action-adjusted bars and cache to parquet.
 
@@ -165,14 +177,22 @@ def download_alpaca_bars(
 
     ``max_cache_age_seconds`` bounds how long a cached file is reused; ``None``
     reuses it forever (backtests). Live feature callers must pass a bound.
+    The returned frame carries ``attrs["fetched_at"]`` (cache write time).
     """
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
     path = cache_path(cache_dir, symbol, timeframe)
-    if cache_is_fresh(path, max_cache_age_seconds, clock=clock):
-        return load_parquet(path)
+    if cache_is_fresh(
+        path,
+        max_cache_age_seconds,
+        clock=clock,
+        fetched_after=refresh_if_fetched_before,
+    ):
+        cached = load_parquet(path)
+        cached.attrs["fetched_at"] = fetched_at(path)
+        return cached
 
     production_client = client_factory is None
     factory = client_factory or StockHistoricalDataClient
@@ -206,4 +226,5 @@ def download_alpaca_bars(
         bars = bars.xs(symbol, level="symbol")
     bars = bars.rename_axis("ts")[["open", "high", "low", "close", "volume"]]
     write_parquet_atomic(bars, path)
+    bars.attrs["fetched_at"] = fetched_at(path)
     return bars
