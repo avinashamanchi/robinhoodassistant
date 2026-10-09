@@ -559,11 +559,64 @@ breaker or changes trading mode. On failure, inspect the role-specific bounded
 runtime log, audit Keychain, validate TLS and database permissions, run
 migration/field verification and preflight manually, then reload only the
 affected plist. Use
-`./scripts/launchd/uninstall.sh` to remove all four agents.
+`./scripts/launchd/uninstall.sh` to remove every agent, including a retired
+`com.trading.autopilot` from earlier versions. No launchd job trades.
 
 The scheduled artifact name ends in
 `whole-database-v1.sqlite3.aesgcm`; no plaintext operational backup is
 retained. Keep FileVault enabled and off-device backups encrypted.
+
+## Installation designation and local repair
+
+Production runtimes, the operator launcher, runtime consolidation and the
+launchd installer act only from the designated installation:
+
+```bash
+uv run python -m trading_assistant.installation status     # read-only
+uv run python -m trading_assistant.installation designate  # changes it
+```
+
+After moving a checkout, everything that recorded the old absolute path is
+stale: the designation, `.venv` (editable install and console-script
+shebangs), installed LaunchAgents, and any git worktree registration. Repair in
+this order, with backups, and verify with `status` at the end:
+
+1. Stop app, daemon and MCP (`./scripts/launchd/uninstall.sh` removes all jobs,
+   including a retired `com.trading.autopilot`). Copy
+   `~/Library/LaunchAgents/com.trading.*.plist` aside first.
+2. Recreate the venv. Move it aside (`mv .venv .venv.moved-$(date +%Y%m%dT%H%M%S)`)
+   so rollback is a rename, then run `uv sync --frozen --all-extras --dev`.
+3. Repair worktree links with `git worktree repair <path>`. Back up the two
+   one-line link files (`.git/worktrees/<name>/gitdir` and `<path>/.git`) first;
+   never prune a worktree that still exists on disk.
+4. Re-designate (`designate --replace`), then `./scripts/launchd/install.sh`.
+
+None of these steps enables order execution. The autopilot's mode is
+configuration (`autopilot.mode`), and paper orders additionally require its
+readiness gate.
+
+## Autopilot readiness and evidence
+
+See `docs/autopilot.md` for the full design. In short:
+
+- Run the daemon with `autopilot.mode: observe`. Each session's cycle records
+  encrypted evidence (`autopilot.cycle`) and rewrites
+  `.local/autopilot/readiness.json`.
+- Record backtest evidence (real Alpaca data, operator credentials; stop the
+  app and daemon first) with
+  `uv run python -m trading_assistant.autopilot backtest`.
+- Point `autopilot.readiness.release_evidence_path` at a verifier result for
+  the exact running commit. The verifier refuses a checkout with a root `.env`,
+  so run it in a clean clone.
+- Review `uv run python -m trading_assistant.autopilot readiness`. Only when
+  every other requirement passes, set
+  `autopilot.readiness.approved_fingerprint` to the printed approval
+  fingerprint and switch `autopilot.mode` to `paper`. Any change to strategy,
+  universe, sizing, cadence, risk limits or decision code produces new
+  fingerprints: evidence restarts and the approval is void.
+
+Readiness is not evidence of profitability, and nothing in this release
+authorizes live trading.
 
 ## Analyst version and future evidence gates
 
