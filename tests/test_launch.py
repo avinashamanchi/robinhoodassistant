@@ -1108,7 +1108,6 @@ def test_operations_domain_success_survives_supplementary_audit_failure(
     [
         "com.trading.app.plist",
         "com.trading.daemon.plist",
-        "com.trading.autopilot.plist",
     ],
 )
 def test_launchd_discards_unbounded_stream_files(plist_name):

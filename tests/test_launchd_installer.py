@@ -228,3 +228,29 @@ def test_installer_unknown_argument_has_no_side_effects(installer):
 
     assert completed.returncode == 2
     _assert_no_side_effects(installer)
+
+
+# ── no scheduled trading job exists ──────────────────────────────────────────
+def test_installer_refuses_the_retired_autopilot_schedule(installer):
+    installer.designate()
+
+    completed = installer.run("--with-autopilot")
+
+    assert completed.returncode == 2
+    assert "daemon hosts the autopilot" in completed.stderr
+    _assert_no_side_effects(installer)
+
+
+def test_installer_warns_about_a_leftover_autopilot_job(installer):
+    installer.designate()
+    agents = installer.home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    (agents / "com.trading.autopilot.plist").write_bytes(
+        plistlib.dumps({"Label": "com.trading.autopilot"})
+    )
+
+    completed = installer.run()
+
+    assert completed.returncode == 0, completed.stderr
+    assert "retired com.trading.autopilot job is still installed" in completed.stdout
+    assert "com.trading.autopilot" in installer.plists()  # left for uninstall.sh

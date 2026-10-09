@@ -153,6 +153,11 @@ def app_config() -> AppConfig:
     risk caps) can never break the test baseline. Risk caps + allowlist are pinned
     to the same values as the ``risk_config`` fixture."""
     cfg = load_config(REPO_ROOT / "config.yaml")
+    # The daemon-hosted autopilot is opt-in per test, never inherited from
+    # the checked-in operating profile.
+    cfg = cfg.model_copy(
+        update={"autopilot": cfg.autopilot.model_copy(update={"mode": "off"})}
+    )
     return cfg.model_copy(update={
         "trading": cfg.trading.model_copy(update={"broker": BrokerKind.MOCK}),
         "risk": cfg.risk.model_copy(update={

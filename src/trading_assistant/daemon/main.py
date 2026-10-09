@@ -171,6 +171,15 @@ def _finish_monitor(
 
         shadow = ShadowRunner(service, planning, screen_source, _price, top_n=3)
 
+    autopilot = _build_autopilot_runner(
+        config,
+        secrets,
+        container=container,
+        runtime_tenure_guard=runtime_tenure_guard,
+        historical_alpaca_client_factory=historical_alpaca_client_factory,
+        historical_cache_dir=historical_cache_dir,
+    )
+
     return Monitor(
         service,
         notifier,
@@ -191,6 +200,69 @@ def _finish_monitor(
             None,
         ),
         runtime_tenure_guard=runtime_tenure_guard,
+        autopilot=autopilot,
+        autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
+    )
+
+
+def _build_autopilot_runner(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    container,
+    runtime_tenure_guard,
+    historical_alpaca_client_factory,
+    historical_cache_dir,
+):
+    """The daemon is the single owner of autopilot scheduling and orders."""
+    if config.autopilot.mode == "off":
+        return None
+    from datetime import timedelta
+
+    from ..analyst.live_features import build_live_feature_provider
+    from ..autopilot import Autopilot, AutopilotDisabled, autopilot_config_problems
+    from ..autopilot.decisions import require_paper, resolve_universe
+    from ..autopilot.evidence import EvidenceStore
+    from ..autopilot.runner import AutopilotRunner
+    from ..installation import source_root
+
+    require_paper(config)
+    problems = autopilot_config_problems(config)
+    if problems:
+        raise AutopilotDisabled(
+            "autopilot configuration cannot trade: " + "; ".join(problems)
+        )
+    service = container.service
+    autopilot = Autopilot(
+        service,
+        build_live_feature_provider(
+            config,
+            secrets,
+            scheduled_service=service,
+            rate_limiter=container.rate_limiter,
+            alpaca_client_factory=historical_alpaca_client_factory,
+            cache_dir=historical_cache_dir,
+            runtime_role="daemon",
+            require_market_clock=True,
+        ),
+        universe=resolve_universe(config),
+        notional_per_trade=config.autopilot.notional_per_trade,
+        max_orders_per_day=config.autopilot.max_orders_per_day,
+        strategy=config.autopilot.strategy,
+        dry_run=True,
+        max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        tenure_guard=runtime_tenure_guard,
+    )
+    return AutopilotRunner(
+        config=config,
+        service=service,
+        autopilot=autopilot,
+        store=EvidenceStore(
+            container.session_factory,
+            actor=f"autopilot:{config.autopilot.strategy}",
+        ),
+        root=source_root(),
+        tenure_guard=runtime_tenure_guard,
     )
 
 

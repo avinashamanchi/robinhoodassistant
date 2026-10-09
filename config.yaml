@@ -93,22 +93,33 @@ features:
   telegram_notifications: false           # (Phase 4)
   shadow_mode: true                       # screen+analyze+grade live, zero orders (D1)
 
-# Opt-in autonomous paper-trading loop (trading_assistant.autopilot).
-# PAPER-ONLY: the autopilot refuses to run unless trading.mode=paper, and every
-# order it places still passes through the deterministic risk engine below, which
-# stays the final authority. Nothing trades until you run:
-#   uv run python -m trading_assistant.autopilot        (loop)
-#   uv run python -m trading_assistant.autopilot --once (single cycle)
-# NOTE: this checked-in profile currently OPTS IN (enabled: true). The code
-# default is false; set enabled: false to stop scheduled autopilot runs.
+# Daemon-hosted autopilot (trading_assistant.autopilot). mode:
+#   off      nothing runs
+#   observe  once per session the daemon decides and records evidence; no orders
+#   paper    as observe, and places Alpaca PAPER orders only when the readiness
+#            gate passes (python -m trading_assistant.autopilot readiness)
+# Live trading is not a mode. The daemon itself only runs when the operator
+# starts it. Every order still passes the risk engine below.
 autopilot:
-  enabled: true
+  mode: observe
   strategy: sma_trend                     # same rule as the backtester's sma_trend
   universe: []                            # empty -> risk.ticker_allowlist
   notional_per_trade: 1000                # USD per entry (<= risk.max_notional_per_order)
   max_orders_per_day: 8
-  poll_interval_seconds: 300
   max_feature_age_hours: 120              # skip symbols whose newest bar is older
+  run_after_open_minutes: 30
+  cycle_timeout_seconds: 120
+  readiness:
+    min_observed_sessions: 20
+    min_observation_calendar_days: 28
+    max_degraded_sessions: 2
+    max_failed_cycles: 0
+    max_evidence_age_hours: 96
+    backtest_max_age_days: 90
+    min_backtest_calendar_days: 730
+    require_release_verification: true
+    release_evidence_path: .local/verification/release-results.json
+    approved_fingerprint: null            # set only after reviewing the readiness report
 
 execution:
   prefer_bracket_orders: false            # OFF until extended paper concurrency drills pass

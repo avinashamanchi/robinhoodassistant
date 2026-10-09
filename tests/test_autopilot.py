@@ -22,10 +22,10 @@ from trading_assistant.autopilot import (
     STRATEGIES,
     Autopilot,
     AutopilotDisabled,
-    build_container_with_retry,
     require_paper,
     strategy_decision,
 )
+from trading_assistant.autopilot.cli import build_container_with_retry
 from trading_assistant.broker.mock import MockBroker
 from trading_assistant.broker.models import Position
 from trading_assistant.config import AutopilotConfig, TradingMode
@@ -455,35 +455,8 @@ def test_owned_tenure_is_checked_before_each_order(make_service):
     guard = _Guard(owned_checks=10)
     ap = _autopilot(service, LONG_AAPL, tenure_guard=guard)
     assert len(ap.run_once()) == 1
-    assert guard.checks == 2
-
-
-def test_loop_survives_ordinary_failures_but_stops_on_tenure_loss():
-    from trading_assistant.autopilot import run_loop
-    from trading_assistant.ops.tenure import TenureLost
-
-    outcomes = [RuntimeError("broker blip"), [], TenureLost(), [], []]
-    calls = []
-
-    class Scripted:
-        def run_once(self):
-            outcome = outcomes[len(calls)]
-            calls.append(1)
-            if isinstance(outcome, BaseException):
-                raise outcome
-            return outcome
-
-    sleeps = []
-    # Bounded so a regression that swallows TenureLost fails instead of hanging.
-    with pytest.raises(TenureLost):
-        run_loop(
-            Scripted(),
-            interval=7,
-            sleep=sleeps.append,
-            max_cycles=len(outcomes),
-        )
-    assert len(calls) == 3
-    assert sleeps == [7, 7]
+    # cycle start, before recording intent (propose), before approving
+    assert guard.checks == 3
 
 
 # ── startup configuration checks ──────────────────────────────────────────────
@@ -546,7 +519,7 @@ def test_autopilot_refreshes_a_stale_bar_cache_into_fresh_features(
         build_live_feature_provider,
     )
     from trading_assistant.app.limits import DurableRateLimiter
-    from trading_assistant.autopilot import _RUNTIME_ROLE
+    _RUNTIME_ROLE = "daemon"  # the daemon hosts the autopilot
     from trading_assistant.backtest import data as backtest_data
     from trading_assistant.config import Secrets
     from trading_assistant.security.outbound import require_origin
@@ -590,3 +563,4 @@ def test_autopilot_refreshes_a_stale_bar_cache_into_fresh_features(
     assert features.sma_20 is not None and features.sma_200 is not None
     ap = _autopilot(service, {"AAPL": features})
     assert not ap._features_stale(features)
+    assert provider is not None
