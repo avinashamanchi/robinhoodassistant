@@ -3718,7 +3718,6 @@ def test_blocked_durable_limiter_does_not_delay_exact_liveness(
             transport=transport,
             base_url="https://localhost:8020",
         ) as client:
-            started_at = time.monotonic()
             login = asyncio.create_task(
                 client.post(
                     "/auth/login",
@@ -3726,17 +3725,26 @@ def test_blocked_durable_limiter_does_not_delay_exact_liveness(
                 )
             )
             assert await asyncio.to_thread(blocked.wait, 1)
+            # Time only the liveness probe, from the moment the limiter is
+            # known to be blocking: login's own setup time is not the claim
+            # and made this flaky under load.
+            probe_started = time.monotonic()
             liveness = await asyncio.wait_for(
                 client.get("/health/live"),
                 timeout=0.2,
             )
-            elapsed = time.monotonic() - started_at
+            elapsed = time.monotonic() - probe_started
+            login_still_blocked = not login.done() and not release.is_set()
             release.set()
             login_response = await login
-            return liveness, login_response, elapsed
+            return liveness, login_response, elapsed, login_still_blocked
 
-    liveness, login_response, elapsed = asyncio.run(exercise())
+    liveness, login_response, elapsed, login_still_blocked = asyncio.run(
+        exercise()
+    )
 
     assert liveness.status_code == 200
     assert login_response.status_code == 200
+    # Liveness answered while the limiter still held the login request.
+    assert login_still_blocked
     assert elapsed < 0.25
