@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import struct
 from threading import Event
 
@@ -307,9 +308,15 @@ def test_invalid_commit_state_fails_closed_for_listing_and_header(
         original = state.read_bytes() if state.exists() else b"x" * 1024
         state.write_bytes(original[: len(original) // 2])
     elif damage == "inode_replaced":
-        original = state.read_bytes() if state.exists() else b"x" * 1024
-        state.unlink(missing_ok=True)
-        state.write_bytes(original)
+        # Copy while the original still exists: after an unlink, Linux often
+        # hands the freed inode number to the next file, which would leave an
+        # identical, undamaged state behind.
+        original_stat = state.stat()
+        replacement = state.with_name(f"{state.name}.replacement")
+        replacement.write_bytes(state.read_bytes())
+        os.chmod(replacement, stat.S_IMODE(original_stat.st_mode))
+        os.replace(replacement, state)
+        assert state.stat().st_ino != original_stat.st_ino
     else:
         _replace_state_payload(
             state,
