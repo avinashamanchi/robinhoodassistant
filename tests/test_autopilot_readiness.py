@@ -29,6 +29,8 @@ from trading_assistant.autopilot.identity import (
     approval_fingerprint,
     config_fingerprint,
     decision_code_fingerprint,
+    evidence_fingerprint,
+    gate_fingerprint,
 )
 from trading_assistant.autopilot.readiness import (
     REPORT_RELATIVE,
@@ -53,7 +55,9 @@ def _paper_config(app_config, **autopilot):
 
 def _approved(config, fingerprint=None):
     fp = fingerprint or approval_fingerprint(
-        config_fingerprint(config), decision_code_fingerprint(config.autopilot.strategy)
+        config_fingerprint(config),
+        decision_code_fingerprint(config.autopilot.strategy),
+        gate_fingerprint(config),
     )
     return config.model_copy(
         update={
@@ -111,7 +115,7 @@ def _seed_cycles(store, config, sessions, *, result="observed", last_created=NOW
     code_fp = decision_code_fingerprint(config.autopilot.strategy)
     for session in sessions:
         store.record_cycle(
-            key=cycle_key("observe", session, approval_fingerprint(config_fp, code_fp)),
+            key=cycle_key("observe", session, evidence_fingerprint(config_fp, code_fp)),
             session=session,
             result_code=result,
             detail={
@@ -333,6 +337,21 @@ def test_approval_is_required_and_exact(baseline):
     assert _unmet(_evaluate(baseline, config=unapproved)) == {"operator_approval"}
     wrong = _approved(baseline.config, fingerprint="0" * 64)
     assert _unmet(_evaluate(baseline, config=wrong)) == {"operator_approval"}
+
+    # Loosening the gate after approval voids the approval, not the evidence.
+    for loosened in (
+        {"min_observed_sessions": 1},
+        {"max_failed_cycles": 5},
+        {"require_release_verification": False},
+    ):
+        weaker = baseline.config.model_copy(
+            update={"autopilot": baseline.config.autopilot.model_copy(update={
+                "readiness": baseline.config.autopilot.readiness.model_copy(update=loosened)
+            })}
+        )
+        report = _evaluate(baseline, config=weaker)
+        assert _unmet(report) == {"operator_approval"}, loosened
+        assert report.observed_sessions == _evaluate(baseline).observed_sessions
 
 
 # ── relevant changes void evidence and approval ──────────────────────────────

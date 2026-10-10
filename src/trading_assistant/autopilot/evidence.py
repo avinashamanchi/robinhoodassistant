@@ -41,8 +41,8 @@ CLEAN_RESULTS = frozenset({"observed", "executed", "blocked"})
 EVIDENCE_SCHEMA = 1
 
 
-def cycle_key(mode: str, session: date, approval_fp: str) -> str:
-    material = f"{mode}|{session.isoformat()}|{approval_fp}"
+def cycle_key(mode: str, session: date, evidence_fp: str) -> str:
+    material = f"{mode}|{session.isoformat()}|{evidence_fp}"
     return "ap-cycle-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:40]
 
 

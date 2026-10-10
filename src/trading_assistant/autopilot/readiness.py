@@ -4,8 +4,9 @@ The gate fails closed: every requirement must pass, and any missing, stale,
 failed or mismatched evidence fails it. Evidence counts only when it was
 produced under the current configuration *and* decision-code fingerprints
 (``identity``), so changing the rule, the universe, sizing or risk limits
-starts the observation period again, and the operator's approval
-(``autopilot.readiness.approved_fingerprint``) is bound to the same pair.
+starts the observation period again. The operator's approval
+(``autopilot.readiness.approved_fingerprint``) is bound to the same pair and
+to the gate's own thresholds, so loosening a threshold voids the approval.
 
 Observation is measured in distinct market sessions with a clean cycle, and
 separately in calendar days spanned, so a burst of cycles cannot stand in
@@ -36,6 +37,7 @@ from .identity import (
     code_identity,
     config_fingerprint,
     decision_code_fingerprint,
+    gate_fingerprint,
 )
 
 REPORT_RELATIVE = Path(".local") / "autopilot" / "readiness.json"
@@ -199,7 +201,7 @@ def evaluate_readiness(
     readiness = config.autopilot.readiness
     config_fp = config_fingerprint(config)
     code_fp = decision_code_fingerprint(config.autopilot.strategy)
-    approval_fp = approval_fingerprint(config_fp, code_fp)
+    approval_fp = approval_fingerprint(config_fp, code_fp, gate_fingerprint(config))
     commit = code_identity(root)
     now = _aware(now)
     requirements: list[Requirement] = []

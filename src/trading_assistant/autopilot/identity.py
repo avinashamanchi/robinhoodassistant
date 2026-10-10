@@ -9,6 +9,8 @@
 * ``decision_code_fingerprint`` hashes the source of the rule, the feature
   pipeline and the shared session policy, so evidence produced by different
   decision code never counts toward readiness.
+* ``approval_fingerprint`` binds the operator's approval to both of those and
+  to the readiness thresholds (``gate_fingerprint``).
 * ``code_identity`` is the git commit the process runs (for release
   evidence); it is read from ``.git`` without running git.
 """
@@ -100,9 +102,33 @@ def decision_code_fingerprint(strategy: str) -> str:
     return digest.hexdigest()
 
 
-def approval_fingerprint(config_fp: str, code_fp: str) -> str:
-    """What ``autopilot.readiness.approved_fingerprint`` must equal."""
+def evidence_fingerprint(config_fp: str, code_fp: str) -> str:
+    """The configuration and decision-code pair that one cycle's evidence is for."""
     return hashlib.sha256(f"{config_fp}:{code_fp}".encode("utf-8")).hexdigest()
+
+
+def gate_fingerprint(config: AppConfig) -> str:
+    """The readiness thresholds an approval was given under.
+
+    Excludes the approval itself and where release evidence is read from:
+    neither loosens the gate.
+    """
+    thresholds = config.autopilot.readiness.model_dump(
+        mode="json",
+        exclude={"approved_fingerprint", "release_evidence_path"},
+    )
+    return hashlib.sha256(_canonical(thresholds).encode("utf-8")).hexdigest()
+
+
+def approval_fingerprint(config_fp: str, code_fp: str, gate_fp: str) -> str:
+    """What ``autopilot.readiness.approved_fingerprint`` must equal.
+
+    Loosening any readiness threshold therefore voids an approval, while
+    the evidence (keyed by ``evidence_fingerprint``) still counts.
+    """
+    return hashlib.sha256(
+        f"{evidence_fingerprint(config_fp, code_fp)}:{gate_fp}".encode("utf-8")
+    ).hexdigest()
 
 
 def code_identity(root: Path) -> str | None:

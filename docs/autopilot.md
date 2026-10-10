@@ -119,7 +119,10 @@ pass:
 Evidence counts only under the current **configuration fingerprint** (strategy,
 universe, sizing, cadence, risk limits) and **decision-code fingerprint** (the
 rule, feature pipeline, session policy and engine source). The approval binds to
-both. Any relevant change restarts observation and voids the approval.
+both and to the readiness thresholds themselves. Any relevant change restarts
+observation and voids the approval. Loosening a threshold (fewer sessions, more
+failures allowed, release verification off) voids only the approval, so the
+gate cannot be weakened under an existing approval.
 Observation is measured in distinct sessions and, separately, in calendar days,
 so a burst of cycles cannot stand in for elapsed time.
 

@@ -37,7 +37,7 @@ from ..assets import AssetClass
 from .decisions import DEGRADED_REASONS
 from .engine import Autopilot
 from .evidence import EvidenceStore, cycle_key, decision_counts
-from .identity import approval_fingerprint, config_fingerprint, decision_code_fingerprint
+from .identity import config_fingerprint, decision_code_fingerprint, evidence_fingerprint
 from .readiness import evaluate_readiness, write_report
 
 log = logging.getLogger("trading_assistant.autopilot")
@@ -120,7 +120,7 @@ class AutopilotRunner:
         mode = self.config.autopilot.mode
         config_fp = config_fingerprint(self.config)
         code_fp = decision_code_fingerprint(self.config.autopilot.strategy)
-        key = cycle_key(mode, session, approval_fingerprint(config_fp, code_fp))
+        key = cycle_key(mode, session, evidence_fingerprint(config_fp, code_fp))
         if self.store.session_completed(key):
             return None
         if self.store.failed_attempts(key) >= MAX_FAILED_ATTEMPTS_PER_SESSION:
