@@ -27,6 +27,7 @@ from .app.limits import (
 )
 from .broker.base import BrokerClient
 from .broker.factory import build_broker, build_clock
+from .installation import InstallationError, require_designated
 from .config import (
     AppConfig,
     BrokerKind,
@@ -90,6 +91,15 @@ from .service import TradingService
 class DatabaseRuntime:
     engine: Engine
     session_factory: sessionmaker[Session]
+
+
+class StartupInstallationBlocked(RuntimeError):
+    """A production runtime may only bind a real broker from the designated
+    runtime installation (``trading_assistant.installation``)."""
+
+    def __init__(self, stable_code: str) -> None:
+        self.stable_code = stable_code
+        super().__init__(stable_code)
 
 
 class StartupEncryptionBlocked(RuntimeError):
@@ -1053,6 +1063,12 @@ def _finish_container(
 
     production_broker = broker is None
     if broker is None:
+        # One runtime per operator account: a second checkout (with its own
+        # database) must not bind the same real broker account.
+        try:
+            require_designated()
+        except InstallationError as error:
+            raise StartupInstallationBlocked(error.code) from None
         if runtime_tenure_guard is not None:
             runtime_tenure_guard.ensure_owned()
         broker = build_broker(

@@ -12,12 +12,14 @@ a deterministic risk engine is the final authority on every order.
 
 Built in phases (see `docs/superpowers/specs/`):
 
-Current release evidence is separated into
+Release evidence is separated into
 [`software verification`](docs/release/2026-07-27-verification.md) and
-[`operational status`](docs/release/2026-07-27-operational-status.md).
-Deterministic verification passes, while normal Alpaca paper operation remains
-**BLOCKED / NOT STARTED** until the operator-authorized credentialed preflight
-succeeds.
+[`operational status`](docs/release/2026-07-27-operational-status.md). Those
+dated reports are point-in-time evidence from 2026-07-27 and predate the
+autopilot. The current deterministic verification result is the CI
+`verification` job (`scripts/verify_loopback_release.py`) for the exact commit.
+Normal Alpaca paper operation remains **BLOCKED / NOT STARTED** until the
+operator-authorized credentialed preflight succeeds.
 
 - **Phase 1 ✅** — scaffold, config, DB models + order state machine, `BrokerClient`
   ABC + `MockBroker`, risk engine (pure) with FIFO P&L + persistent kill switch +
@@ -91,6 +93,9 @@ fill idempotency.
 ```bash
 uv venv --python 3.11
 uv sync --all-extras --dev
+# Designate this checkout as the runtime installation (once per machine; see
+# "Installation designation" below):
+uv run python -m trading_assistant.installation designate
 ./scripts/setup-local-tls.sh
 uv run python -m trading_assistant.ops.secrets migrate-env \
   --env-file /absolute/path/to/private-migration.env
@@ -129,11 +134,11 @@ uv run python -m trading_assistant.preflight
 # In a separate operator-controlled terminal, and only after preflight passes:
 uv run python -m trading_assistant.daemon.main
 
-# AUTONOMOUS paper trading (opt-in; paper-only). Decides with a deterministic
-# strategy and executes with no human in the loop — the risk engine still runs
-# on every order. Requires autopilot.enabled: true and trading.mode: paper.
-uv run python -m trading_assistant.autopilot          # continuous loop
-uv run python -m trading_assistant.autopilot --once   # a single cycle, then exit
+# The autopilot runs only inside that daemon (autopilot.mode: observe records
+# evidence and places nothing; paper places paper orders only once the
+# readiness gate passes). Operator commands, none of which trade:
+uv run python -m trading_assistant.autopilot readiness  # read-only report
+uv run python -m trading_assistant.autopilot dry-run    # decide once, nothing placed
 
 # Credentialed paper-account drills are not startup steps. Use only the
 # separately reviewed procedure in docs/RUNBOOK.md.
@@ -190,35 +195,50 @@ the outbound manifest, and disabled integrations are still evaluated. Any
 failed structural row stops before broker, provider, or notifier construction.
 
 The checked-in operating profile stays `trading.mode: paper`, with the LLM
-pre-approved-rule path, broker bracket submission OFF, and shadow analysis ON.
-The one autonomous path is the opt-in **autopilot** (`autopilot.enabled: true`),
-a paper-only deterministic loop that both decides and executes without a human —
-see [Autonomous paper trading](#autonomous-paper-trading-autopilot). Do not
-enable execution features from backtest results alone; require the scorecard/paper
-evidence gates in the runbook and a separate manual decision.
+pre-approved-rule path, broker bracket submission OFF, shadow analysis ON, and
+the daemon-hosted autopilot in `observe` mode (it records evidence and places
+no orders). The autopilot can place paper orders only in `mode: paper` *and*
+after its fail-closed readiness gate passes; see
+[Autonomous paper trading](#autonomous-paper-trading-autopilot).
 
 ## Autonomous paper trading (autopilot)
 
-`trading_assistant.autopilot` is the only component that both decides and
-executes with **no human in the loop**. It is deliberately additive and opt-in:
-disabled unless `autopilot.enabled: true`, and it **refuses to run unless
-`trading.mode: paper`**. It does not weaken a single guardrail — every order is
-placed through the same `propose_order` → `approve_order` path as a human
-approval, so the deterministic risk engine (allowlist, per-order/position/portfolio
-caps, price-sanity, market-hours, spread/quote-freshness, and the daily-loss kill
-switch) runs on every order and stays the final authority. A rejected proposal is
-skipped, never force-submitted.
+The autopilot is the only component that can place an order without a per-order
+human approval. Full design: [`docs/autopilot.md`](docs/autopilot.md).
 
-Decisions come from a deterministic strategy (`autopilot.strategy`, default
-`sma_crossover`) computed over the same `MarketFeatures` the analyst reads — no
-LLM in the execution path, so behaviour is reproducible. Each cycle it evaluates
-`autopilot.universe` (defaulting to `risk.ticker_allowlist`), buys a
-`notional_per_trade` position when a name turns long and is not already held, and
-exits the full position when the signal turns flat. A `max_orders_per_day` cap
-and position de-dupe bound activity. It runs as its own process; nothing trades
-until you start it. **Paper trading is a simulation: this does not authorize live
-trading, predict live results, or guarantee profit — an autonomous strategy will
-take losing trades.**
+- **Where it runs.** Only inside the daemon, which the operator starts
+  explicitly. The daemon is the single owner of its scheduling and orders, at
+  most one cycle per market session, and runtime tenure is checked before
+  every order. No launchd job runs it.
+- **What it decides.** A deterministic strategy shared with the backtester
+  (`autopilot.strategy`, default `sma_trend`) on completed, final sessions over
+  the backtest's 320-bar window. No LLM is in the execution path.
+- **Modes.** `off`, `observe` (checked in: decide and record evidence, no
+  orders), or `paper` (Alpaca paper orders only when the readiness gate passes;
+  otherwise the session is recorded as blocked). Live trading is not
+  supported.
+- **Guardrails.**
+  - Every order goes `propose_order` → `approve_order` → risk engine, with an
+    idempotency key derived from the intended action.
+  - A lost broker response is reconciled, never resubmitted.
+  - It exits only what its own fills bought and never touches plan- or
+    human-owned positions.
+  - Incomplete data never produces an exit.
+- **Readiness** (`python -m trading_assistant.autopilot readiness`) requires:
+  - a recent real-data backtest of the exact strategy and decision code;
+  - genuine observation over a minimum number of distinct sessions and
+    calendar days, under the current configuration and code fingerprints;
+  - release-verifier evidence for the running commit;
+  - no blocking safety latch;
+  - operator approval bound to those fingerprints and to the readiness
+    thresholds.
+
+  Any relevant change restarts observation. Loosening a threshold voids the
+  approval.
+
+**Paper trading is a simulation. Neither readiness nor a backtest authorizes
+live trading, predicts live results, or guarantees profit. An autonomous
+strategy will take losing trades.**
 
 ## LLM providers & market data
 
@@ -233,7 +253,35 @@ under configured accounts in macOS Keychain and audited with
 
 Historical equity bars come from the exact pinned Alpaca data origin and are
 cached to parquet. Crypto OHLCV uses the exact pinned CoinGecko origin and has
-no credential query parameter. Query-string credentials are prohibited.
+no credential query parameter. Query-string credentials are prohibited. Live
+feature paths (`/analyze`, `/screen`, shadow analysis, autopilot) decide on
+completed, *final* sessions only:
+
+- The market clock decides completion.
+- A bar counts as final only if fetched after 20:00 New York time on its date.
+- A cache fetched before the latest final bar is refreshed regardless of age.
+
+Backtests keep reusing their cache for reproducibility. The shared policy is
+`signals/sessions.py`; see `docs/autopilot.md`.
+
+## Installation designation
+
+The operator launcher, operator terminal, runtime consolidation, the launchd
+installer and production broker binding act only from the **designated
+installation**. It is recorded per user, outside the repository:
+
+```bash
+uv run python -m trading_assistant.installation status     # read-only
+uv run python -m trading_assistant.installation designate  # changes it
+```
+
+`status` also reports a virtual environment or launchd job left pointing at an
+old path. If the installed jobs ran from a worktree, consolidate that runtime
+into the designated checkout before reinstalling (RUNBOOK, "Installation
+designation and local repair"). The designation guarantees one designated
+checkout per macOS user. It
+does not stop another account, another machine, or a deliberate
+re-designation from running a second runtime against the same paper account.
 
 The abstract read-only external-account protocol and deterministic mock remain for
 portfolio tests. No unofficial Robinhood login library or production factory path
@@ -244,12 +292,14 @@ is shipped.
 1. This safety-foundation runtime is paper-only and rejects live mode at startup.
 2. The LLM only ever produces `PROPOSED` orders. LLM-path execution needs human
    approval; autonomous pre-approved-rule execution is disabled in the release
-   profile. The one autonomous path is the opt-in, paper-only **autopilot**
-   (deterministic, no LLM in the execution path); it is disabled by default and
-   refuses to run outside paper mode.
+   profile. The one autonomous path is the daemon-hosted, paper-only
+   **autopilot** (deterministic, no LLM in the execution path). It is off by
+   default in code, observe-only in the checked-in profile, and places paper
+   orders only after its readiness gate passes.
 3. The risk engine runs on every order — including every autopilot order — and
    cannot be bypassed.
-4. Everything dangerous defaults OFF; the autopilot is opt-in and paper-only.
+4. Everything dangerous defaults OFF in code. The checked-in autopilot mode is
+   `observe` (no orders).
 5. Every production runtime role writes redacted, owner-only, bounded rotating
    logs under `logs/`.
 6. Chat has an exact read-only tool allowlist plus immutable draft constructors.

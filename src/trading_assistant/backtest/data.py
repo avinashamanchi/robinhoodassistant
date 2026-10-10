@@ -11,6 +11,9 @@ future data either.
 
 from __future__ import annotations
 
+import os
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -107,6 +110,51 @@ def cache_path(cache_dir: str | Path, symbol: str, timeframe: str) -> Path:
     return Path(cache_dir) / f"{safe}_{timeframe}.parquet"
 
 
+def cache_is_fresh(
+    path: str | Path,
+    max_age_seconds: float | None,
+    *,
+    clock: Callable[[], float] = time.time,
+    fetched_after: datetime | None = None,
+) -> bool:
+    """Whether a cached frame may be reused instead of re-downloaded.
+
+    ``max_age_seconds=None`` keeps the historical behaviour (a cache file is
+    reused forever), which is what reproducible backtests want. Live callers
+    pass a bound so decisions are never made on bars frozen at download time,
+    and ``fetched_after`` so a frame captured before the latest session's bar
+    became final is refreshed regardless of its age.
+    """
+    candidate = Path(path)
+    if not candidate.exists():
+        return False
+    fetched = candidate.stat().st_mtime
+    if fetched_after is not None and fetched < fetched_after.timestamp():
+        return False
+    if max_age_seconds is None:
+        return True
+    return clock() - fetched <= max_age_seconds
+
+
+def fetched_at(path: str | Path) -> datetime:
+    """When a cached frame was written (its provenance for bar finality)."""
+    return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc)
+
+
+def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
+    """Publish a cache file atomically so a crash never leaves a torn frame."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Unique per call: the app refreshes on concurrent request threads that
+    # share one PID, and each writer must own its staging file.
+    staging = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        frame.to_parquet(staging)
+        os.replace(staging, target)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def download_alpaca_bars(
     symbol: str,
     api_key: str,
@@ -118,19 +166,33 @@ def download_alpaca_bars(
     runtime_role: str = "app",
     client_factory: Callable[[str, str], Any] | None = None,
     attempt_gate: Callable[[Callable[[], Any]], Any] | None = None,
+    max_cache_age_seconds: float | None = None,
+    clock: Callable[[], float] = time.time,
+    refresh_if_fetched_before: datetime | None = None,
 ) -> pd.DataFrame:
     """Download corporate-action-adjusted bars and cache to parquet.
 
     Kept dependency-light and lazy: only imported/exercised when real credentials
     are supplied. CI never calls this — it uses ``backtest.synthetic``.
+
+    ``max_cache_age_seconds`` bounds how long a cached file is reused; ``None``
+    reuses it forever (backtests). Live feature callers must pass a bound.
+    The returned frame carries ``attrs["fetched_at"]`` (cache write time).
     """
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
     path = cache_path(cache_dir, symbol, timeframe)
-    if path.exists():
-        return load_parquet(path)
+    if cache_is_fresh(
+        path,
+        max_cache_age_seconds,
+        clock=clock,
+        fetched_after=refresh_if_fetched_before,
+    ):
+        cached = load_parquet(path)
+        cached.attrs["fetched_at"] = fetched_at(path)
+        return cached
 
     production_client = client_factory is None
     factory = client_factory or StockHistoricalDataClient
@@ -163,6 +225,6 @@ def download_alpaca_bars(
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level="symbol")
     bars = bars.rename_axis("ts")[["open", "high", "low", "close", "volume"]]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    bars.to_parquet(path)
+    write_parquet_atomic(bars, path)
+    bars.attrs["fetched_at"] = fetched_at(path)
     return bars

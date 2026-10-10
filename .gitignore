@@ -21,10 +21,12 @@ htmlcov/
 .cache/
 *.parquet
 
-# Databases
+# Databases (plus ad-hoc copies such as trading_assistant.db.tripped-<ts>,
+# which are plaintext and must never be committed)
 *.db
 *.db-wal
 *.db-shm
+*.db.*
 *.db.*.pre-migration.bak
 *.db.submission.lock*
 *.sqlite

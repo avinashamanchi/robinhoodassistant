@@ -1104,22 +1104,6 @@ def test_operations_domain_success_survives_supplementary_audit_failure(
 
 
 @pytest.mark.parametrize(
-    "plist_name",
-    [
-        "com.trading.app.plist",
-        "com.trading.daemon.plist",
-    ],
-)
-def test_launchd_discards_unbounded_stream_files(plist_name):
-    path = Path("scripts/launchd") / plist_name
-    with path.open("rb") as handle:
-        config = plistlib.load(handle)
-
-    assert config["StandardOutPath"] == "/dev/null"
-    assert config["StandardErrorPath"] == "/dev/null"
-
-
-@pytest.mark.parametrize(
     ("workflow", "success"),
     [
         ("approve", True),

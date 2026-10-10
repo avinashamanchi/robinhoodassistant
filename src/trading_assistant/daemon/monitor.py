@@ -51,8 +51,15 @@ class Monitor:
         provider_budget=None,
         policy_store_maintenance=None,
         runtime_tenure_guard=None,
+        autopilot=None,
+        autopilot_timeout_seconds: float = 120.0,
     ) -> None:
         self.service = service
+        # Daemon-hosted autopilot (autopilot.runner.AutopilotRunner) or None.
+        self.autopilot = autopilot
+        self.autopilot_timeout = autopilot_timeout_seconds
+        self._autopilot_task: Optional[asyncio.Task[Any]] = None
+        self._autopilot_tenure_lost = False
         self.notifier = notifier or NullNotifier()
         # Retained as a compatibility argument only. RuleWorker has no approval
         # or submission dependency, so even a stale true setting cannot trade.
@@ -248,6 +255,44 @@ class Monitor:
                 "code=daily_analysis_failed"
             )
 
+    async def _bounded_autopilot(self) -> None:
+        """One autopilot check, isolated from the safety loop.
+
+        A failure is logged and recorded as evidence by the runner; it does
+        not trip kill switches. A timeout requests cancellation between
+        symbols (a worker thread cannot be killed) and no new cycle starts
+        until it exits. A lost tenure is latched so the main loop stops.
+        """
+        from ..ops.tenure import TenureLost
+
+        task = asyncio.ensure_future(asyncio.to_thread(self.autopilot.run_if_due))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=self.autopilot_timeout)
+        except TenureLost:
+            self._autopilot_tenure_lost = True
+            log.error("autopilot stopped: runtime tenure lost")
+        except TimeoutError:
+            self.autopilot.request_cancel()
+            log.error(
+                "autopilot cycle exceeded %.1fs; cancellation requested",
+                self.autopilot_timeout,
+            )
+            try:
+                await task
+            except TenureLost:
+                self._autopilot_tenure_lost = True
+            except Exception:
+                log.error("autopilot cycle failed after timeout code=autopilot_cycle_failed")
+        except Exception:
+            log.error("autopilot task failed code=autopilot_task_failed")
+
+    def _schedule_autopilot(self) -> None:
+        if self.autopilot is None:
+            return
+        if self._autopilot_task is not None and not self._autopilot_task.done():
+            return
+        self._autopilot_task = asyncio.create_task(self._bounded_autopilot())
+
     def _schedule_daily_tasks(self) -> None:
         if self._daily_task is not None and not self._daily_task.done():
             return
@@ -284,11 +329,16 @@ class Monitor:
             while not (stop_event and stop_event.is_set()):
                 if guard is not None:
                     guard.ensure_owned()
+                if self._autopilot_tenure_lost:
+                    from ..ops.tenure import TenureLost
+
+                    raise TenureLost()
                 try:
                     await self._bounded_core_cycle()
                     self.service.write_heartbeat("daemon")
                     # Daily analysis is isolated from safety heartbeats.
                     self._schedule_daily_tasks()
+                    self._schedule_autopilot()
                     await asyncio.sleep(self.poll_interval)
                 except Exception as exc:
                     if not isinstance(
@@ -309,6 +359,10 @@ class Monitor:
             primary_failure = True
             raise
         finally:
+            if self.autopilot is not None:
+                # Stop between symbols before tenure is released; the worker
+                # then fails its next ownership check instead of trading.
+                self.autopilot.request_cancel()
             if guard is not None:
                 try:
                     released = guard.close()

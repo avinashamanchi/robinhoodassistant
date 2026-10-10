@@ -559,11 +559,113 @@ breaker or changes trading mode. On failure, inspect the role-specific bounded
 runtime log, audit Keychain, validate TLS and database permissions, run
 migration/field verification and preflight manually, then reload only the
 affected plist. Use
-`./scripts/launchd/uninstall.sh` to remove all four agents.
+`./scripts/launchd/uninstall.sh` to remove every agent, including a retired
+`com.trading.autopilot` from earlier versions. No launchd job trades.
 
 The scheduled artifact name ends in
 `whole-database-v1.sqlite3.aesgcm`; no plaintext operational backup is
 retained. Keep FileVault enabled and off-device backups encrypted.
+
+## Installation designation and local repair
+
+Production runtimes, the operator launcher, runtime consolidation and the
+launchd installer act only from the designated installation:
+
+```bash
+uv run python -m trading_assistant.installation status     # read-only
+uv run python -m trading_assistant.installation designate  # changes it
+```
+
+After moving a checkout, everything that recorded the old absolute path is
+stale: the designation, `.venv` (editable install and console-script
+shebangs), installed LaunchAgents, and any git worktree registration. Repair in
+this order, with backups, and verify with `status` at the end:
+
+1. Read `status` first and note which directory each installed job points at.
+   If the jobs ran from a worktree (for example `.worktrees/safety-foundation`),
+   that worktree's `trading_assistant.db` is the runtime database, not the
+   checkout's own.
+2. Stop app, daemon and MCP (`./scripts/launchd/uninstall.sh` removes all jobs,
+   including a retired `com.trading.autopilot`). Copy
+   `~/Library/LaunchAgents/com.trading.*.plist` aside first.
+3. Recreate the venv. Move it aside (`mv .venv .venv.moved-$(date +%Y%m%dT%H%M%S)`)
+   so rollback is a rename, then run `uv sync --frozen --all-extras --dev`.
+4. Repair worktree links with `git worktree repair <path>`. Back up the two
+   one-line link files (`.git/worktrees/<name>/gitdir` and `<path>/.git`) first;
+   never prune a worktree that still exists on disk.
+5. Designate the checkout (`designate`; `--replace` only to replace another
+   valid designation).
+6. If step 1 found a worktree runtime, move it into the designated checkout
+   before installing anything, with every runtime stopped:
+   `uv run python -m trading_assistant.ops.runtime_consolidation --source-root
+   <checkout>/.worktrees/safety-foundation --destination-root <checkout>`.
+   It reads the backup key from Keychain, writes and verifies an encrypted
+   backup of **both** databases, then replaces the checkout's database with the
+   worktree's. The checkout's previous database survives only in that backup.
+   Skipping this step and installing anyway starts the app on a different
+   database from the one that holds its orders, approvals and breakers.
+7. `./scripts/launchd/install.sh`, then `status` again.
+
+None of these steps enables order execution. The autopilot's mode is
+configuration (`autopilot.mode`), and paper orders additionally require its
+readiness gate.
+
+## Autopilot readiness and evidence
+
+See `docs/autopilot.md` for the full design. In short:
+
+- Run the daemon with `autopilot.mode: observe`. Each session's cycle records
+  encrypted evidence (`autopilot.cycle`) and rewrites
+  `.local/autopilot/readiness.json`.
+- Record backtest evidence (real Alpaca data, operator credentials; stop the
+  app and daemon first) with
+  `uv run python -m trading_assistant.autopilot backtest`.
+- Point `autopilot.readiness.release_evidence_path` at a verifier result for
+  the exact running commit. The verifier refuses a checkout with a root `.env`,
+  so run it in a clean clone.
+- Review `uv run python -m trading_assistant.autopilot readiness`. Only when
+  every other requirement passes, set
+  `autopilot.readiness.approved_fingerprint` to the printed approval
+  fingerprint and switch `autopilot.mode` to `paper`. Any change to strategy,
+  universe, sizing, cadence, risk limits or decision code produces new
+  fingerprints: evidence restarts and the approval is void. Changing a
+  readiness threshold voids the approval but keeps the evidence.
+
+### Observation procedure
+
+Observation evidence counts only when it is collected genuinely, one
+session at a time. Nothing offline or simulated substitutes for it.
+
+1. **Preconditions.** Local repair is complete (`installation status` shows the
+   checkout designated, the venv importing it, and no stale jobs).
+   `trading.mode` is `paper` and `autopilot.mode` is `observe`, and preflight
+   passes.
+2. **Backtest evidence** (optional before observation, required for paper):
+   stop the app and daemon, then run `autopilot backtest`. It reads market
+   data, places no orders, and records one `autopilot.backtest` event.
+3. **Start** the daemon explicitly (`uv run python -m
+   trading_assistant.daemon.main`). In `observe` mode it uses broker
+   credentials for reads and order sync and places no orders. Each session it
+   records one `autopilot.cycle` after `run_after_open_minutes`.
+4. **Check daily** with `autopilot readiness`: the session count, failed
+   cycles, degraded sessions and the age of the latest clean evidence. Failed
+   cycles never age out under the current fingerprints. With the default
+   `max_failed_cycles: 0`, one failure blocks readiness until a fingerprint
+   changes (observation restarts) or the threshold is raised (which voids any
+   approval). Investigate every failure.
+5. **Restart rules.** Changing strategy, universe, sizing, cadence, risk limits
+   or decision code changes a fingerprint, and counting starts again from zero.
+   Restarting the daemon keeps the evidence. So does a new commit that leaves
+   the decision code unchanged, although it needs its own release evidence.
+6. **Exit criteria.** All requirements pass on the report: by default 20 clean
+   sessions over at least 28 calendar days, release evidence for the running
+   commit, and no blocking latch. Only then does the approval fingerprint mean
+   anything.
+7. **Stop** by stopping the daemon. Evidence is append-only and stays in the
+   database.
+
+Readiness is not evidence of profitability, and nothing in this release
+authorizes live trading.
 
 ## Analyst version and future evidence gates
 
@@ -630,6 +732,31 @@ The job then:
    timeouts, and any failed focused/full/coverage/static gate;
 3. runs the mock safety drill against a separate copy of the generated database;
 4. scans the complete Git history with a commit-pinned gitleaks action.
+
+**Re-pinning after a new migration or test.** `EXPECTED_MIGRATION_HEAD` and the
+five `*_TEST_MANIFEST` pins in `scripts/verify_loopback_release.py` are
+deliberate tripwires: a new migration or any added, renamed, or removed test
+fails CI (`MIGRATION_HEAD_MISMATCH` / `TEST_MANIFEST_MISMATCH`) until they are
+re-pinned in the same change. `tests/test_release_verifier.py` checks the
+migration head against Alembic, so that drift also fails the normal suite. To
+re-pin a suite, collect its exact node IDs with the same file arguments the
+verifier uses and hash them the way `_test_manifest` does:
+
+```bash
+uv run python -m pytest --collect-only -q -o addopts= -p no:cacheprovider \
+  | grep '::' | sort | uv run python -c \
+  'import hashlib,sys; ids=[l.strip() for l in sys.stdin if l.strip()]; print(len(ids), "sha256:"+hashlib.sha256("".join(i+"\n" for i in ids).encode()).hexdigest())'
+```
+
+Before committing new pins, diff the old and new node-ID lists and confirm
+that every removed ID was removed on purpose. The pin exists to catch tests that
+silently stop running.
+
+The local verifier trusts `git`, `node`, and `uv` only under fixed system or
+Homebrew Cellar roots. A user-level shim earlier on `PATH` (for example a
+version-manager `node`) makes it report `TOOLCHAIN_UNPROVEN` locally, and
+`tests/test_release_verifier.py` fails for the same reason. Put a trusted
+`node` first on `PATH` before running either locally.
 
 The verifier writes private, redacted evidence to
 `.local/verification/release-results.json`. A passing result is evidence only for

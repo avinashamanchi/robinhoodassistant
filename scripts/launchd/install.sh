@@ -2,17 +2,44 @@
 # Install the loopback HTTPS app, watchdog, and backup jobs. The daemon is not
 # installed here; it remains an explicit operator workflow after preflight.
 #
-#   ./scripts/launchd/install.sh          # install + load
-#   ./scripts/launchd/uninstall.sh        # stop + remove
+#   ./scripts/launchd/install.sh                  # install + load
+#   ./scripts/launchd/uninstall.sh                # stop + remove
+#
+# No trading job is installed. The autopilot runs only inside the daemon,
+# which the operator starts explicitly (autopilot.mode in config.yaml).
 set -euo pipefail
 umask 077
 
-PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+for arg in "$@"; do
+  case "$arg" in
+    --with-autopilot)
+      echo "error: --with-autopilot was retired: the daemon hosts the autopilot" >&2
+      echo "       (autopilot.mode observe|paper); no scheduled trading job exists" >&2
+      exit 2
+      ;;
+    *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PY="$PROJ/.venv/bin/python"
 LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
+
+# Before any side effect: every generated job runs from $PROJ, so it must be
+# the operator's designated runtime installation and its venv must import
+# this checkout (a moved checkout's venv still imports the old path). The
+# check is the stdlib-only module run as a file, so it works even when the
+# package cannot be imported.
+if ! "$PY" -I "$PROJ/src/trading_assistant/installation.py" check \
+    --project "$PROJ" --venv-python "$PY"; then
+  echo "error: refusing to install launchd jobs for $PROJ" >&2
+  echo "       inspect: $PY -I $PROJ/src/trading_assistant/installation.py status" >&2
+  exit 1
+fi
+
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/.local/encrypted-backups"
 chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
@@ -109,6 +136,10 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
 emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
+if [ -f "$LA/com.trading.autopilot.plist" ]; then
+  echo "note: a retired com.trading.autopilot job is still installed; it would run"
+  echo "      the removed standalone loop. Remove it with scripts/launchd/uninstall.sh"
+fi
 
 sleep 6
 echo "=== status ==="
