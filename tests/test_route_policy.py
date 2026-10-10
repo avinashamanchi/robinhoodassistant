@@ -1750,10 +1750,13 @@ def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
     make_service,
     monkeypatch,
 ):
+    # The follower arrives after the initial lease would have expired, so only
+    # renewal keeps it out. A 3 s lease renewed every 0.1 s tolerates a process
+    # stall of up to 2.9 s (a 1 s lease failed on a slow CI runner).
     monkeypatch.setattr(
         policy_module,
         "_LEASE_TTL_SECONDS",
-        1,
+        3,
         raising=False,
     )
     monkeypatch.setattr(
@@ -1781,7 +1784,7 @@ def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
             try:
                 if call_number == 1:
                     self.started.set()
-                    assert self.release.wait(timeout=5)
+                    assert self.release.wait(timeout=30)
                 return {"reply": message, "tool_calls": []}
             finally:
                 with self.lock:
@@ -1823,7 +1826,7 @@ def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
             headers=headers,
         )
         assert agent.started.wait(timeout=5)
-        time.sleep(1.2)
+        time.sleep(3.5)
         try:
             follower = follower_client.post(
                 "/chat",
@@ -1832,7 +1835,7 @@ def test_handler_longer_than_initial_lease_is_renewed_without_overlap(
             )
         finally:
             agent.release.set()
-        owner_response = owner.result(timeout=5)
+        owner_response = owner.result(timeout=30)
 
     assert owner_response.status_code == 200
     assert follower.status_code == 409
