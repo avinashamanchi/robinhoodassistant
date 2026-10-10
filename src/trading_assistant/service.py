@@ -44,18 +44,13 @@ from .db.models import (
     Order,
     OrderStateMachine,
     NONTERMINAL_STATES,
-    PLAN_CANCEL_INDETERMINATE,
-    PLAN_CANCEL_REQUESTED,
-    PLAN_CANCEL_SETTLED,
     Proposal,
     RiskEvent,
     Rule,
     RuleGroup,
-    TERMINAL_STATES,
     fill_has_trusted_identity,
     utcnow,
 )
-from .db.lifecycle_proofs import augment_lifecycle_detail_json
 from .dependencies import RequiredDependencyUnavailable
 from .orders.application import (
     ApprovalCommand,
