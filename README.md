@@ -230,9 +230,11 @@ human approval. Full design: [`docs/autopilot.md`](docs/autopilot.md).
     calendar days, under the current configuration and code fingerprints;
   - release-verifier evidence for the running commit;
   - no blocking safety latch;
-  - operator approval bound to those fingerprints.
+  - operator approval bound to those fingerprints and to the readiness
+    thresholds.
 
-  Any relevant change restarts observation.
+  Any relevant change restarts observation. Loosening a threshold voids the
+  approval.
 
 **Paper trading is a simulation. Neither readiness nor a backtest authorizes
 live trading, predicts live results, or guarantees profit. An autonomous
@@ -274,7 +276,10 @@ uv run python -m trading_assistant.installation designate  # changes it
 ```
 
 `status` also reports a virtual environment or launchd job left pointing at an
-old path. The designation guarantees one designated checkout per macOS user. It
+old path. If the installed jobs ran from a worktree, consolidate that runtime
+into the designated checkout before reinstalling (RUNBOOK, "Installation
+designation and local repair"). The designation guarantees one designated
+checkout per macOS user. It
 does not stop another account, another machine, or a deliberate
 re-designation from running a second runtime against the same paper account.
 

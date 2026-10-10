@@ -581,15 +581,30 @@ stale: the designation, `.venv` (editable install and console-script
 shebangs), installed LaunchAgents, and any git worktree registration. Repair in
 this order, with backups, and verify with `status` at the end:
 
-1. Stop app, daemon and MCP (`./scripts/launchd/uninstall.sh` removes all jobs,
+1. Read `status` first and note which directory each installed job points at.
+   If the jobs ran from a worktree (for example `.worktrees/safety-foundation`),
+   that worktree's `trading_assistant.db` is the runtime database, not the
+   checkout's own.
+2. Stop app, daemon and MCP (`./scripts/launchd/uninstall.sh` removes all jobs,
    including a retired `com.trading.autopilot`). Copy
    `~/Library/LaunchAgents/com.trading.*.plist` aside first.
-2. Recreate the venv. Move it aside (`mv .venv .venv.moved-$(date +%Y%m%dT%H%M%S)`)
+3. Recreate the venv. Move it aside (`mv .venv .venv.moved-$(date +%Y%m%dT%H%M%S)`)
    so rollback is a rename, then run `uv sync --frozen --all-extras --dev`.
-3. Repair worktree links with `git worktree repair <path>`. Back up the two
+4. Repair worktree links with `git worktree repair <path>`. Back up the two
    one-line link files (`.git/worktrees/<name>/gitdir` and `<path>/.git`) first;
    never prune a worktree that still exists on disk.
-4. Re-designate (`designate --replace`), then `./scripts/launchd/install.sh`.
+5. Designate the checkout (`designate`; `--replace` only to replace another
+   valid designation).
+6. If step 1 found a worktree runtime, move it into the designated checkout
+   before installing anything, with every runtime stopped:
+   `uv run python -m trading_assistant.ops.runtime_consolidation --source-root
+   <checkout>/.worktrees/safety-foundation --destination-root <checkout>`.
+   It reads the backup key from Keychain, writes and verifies an encrypted
+   backup of **both** databases, then replaces the checkout's database with the
+   worktree's. The checkout's previous database survives only in that backup.
+   Skipping this step and installing anyway starts the app on a different
+   database from the one that holds its orders, approvals and breakers.
+7. `./scripts/launchd/install.sh`, then `status` again.
 
 None of these steps enables order execution. The autopilot's mode is
 configuration (`autopilot.mode`), and paper orders additionally require its
@@ -613,7 +628,41 @@ See `docs/autopilot.md` for the full design. In short:
   `autopilot.readiness.approved_fingerprint` to the printed approval
   fingerprint and switch `autopilot.mode` to `paper`. Any change to strategy,
   universe, sizing, cadence, risk limits or decision code produces new
-  fingerprints: evidence restarts and the approval is void.
+  fingerprints: evidence restarts and the approval is void. Changing a
+  readiness threshold voids the approval but keeps the evidence.
+
+### Observation procedure
+
+Observation evidence counts only when it is collected genuinely, one
+session at a time. Nothing offline or simulated substitutes for it.
+
+1. **Preconditions.** Local repair is complete (`installation status` shows the
+   checkout designated, the venv importing it, and no stale jobs).
+   `trading.mode` is `paper` and `autopilot.mode` is `observe`, and preflight
+   passes.
+2. **Backtest evidence** (optional before observation, required for paper):
+   stop the app and daemon, then run `autopilot backtest`. It reads market
+   data, places no orders, and records one `autopilot.backtest` event.
+3. **Start** the daemon explicitly (`uv run python -m
+   trading_assistant.daemon.main`). In `observe` mode it uses broker
+   credentials for reads and order sync and places no orders. Each session it
+   records one `autopilot.cycle` after `run_after_open_minutes`.
+4. **Check daily** with `autopilot readiness`: the session count, failed
+   cycles, degraded sessions and the age of the latest clean evidence. Failed
+   cycles never age out under the current fingerprints. With the default
+   `max_failed_cycles: 0`, one failure blocks readiness until a fingerprint
+   changes (observation restarts) or the threshold is raised (which voids any
+   approval). Investigate every failure.
+5. **Restart rules.** Changing strategy, universe, sizing, cadence, risk limits
+   or decision code changes a fingerprint, and counting starts again from zero.
+   Restarting the daemon keeps the evidence. So does a new commit that leaves
+   the decision code unchanged, although it needs its own release evidence.
+6. **Exit criteria.** All requirements pass on the report: by default 20 clean
+   sessions over at least 28 calendar days, release evidence for the running
+   commit, and no blocking latch. Only then does the approval fingerprint mean
+   anything.
+7. **Stop** by stopping the daemon. Evidence is append-only and stays in the
+   database.
 
 Readiness is not evidence of profitability, and nothing in this release
 authorizes live trading.

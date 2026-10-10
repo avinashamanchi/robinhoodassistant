@@ -1,5 +1,19 @@
 # Review follow-up — 2026-10-06
 
+> **Superseded in part by
+> [`2026-10-09-completion.md`](2026-10-09-completion.md).** Three points here
+> no longer hold:
+>
+> * **N13 (wrong).** The worktree is **not stale**. It moved with the
+>   repository and holds the runtime database the installed jobs used. `git worktree prune` would have
+>   dropped git's link to a real worktree; the correct operation is
+>   `git worktree repair`.
+> * **N3, C3 (superseded).** "Move the checkout back" is no longer the fix. The hard-coded
+>   root was replaced by a per-user designated installation, so the checkout
+>   can live anywhere once designated.
+> * **N4 (superseded).** The tenure fix below was replaced: the standalone autopilot was
+>   retired and the daemon now hosts it.
+
 This is stage two of [`2026-10-05-project-review.md`](2026-10-05-project-review.md).
 Stage one found and fixed the autopilot's frozen data, strategy-name mismatch,
 and ownership problems, then opened draft PR #3. This stage did four things:
