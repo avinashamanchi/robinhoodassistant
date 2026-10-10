@@ -391,3 +391,28 @@ def make_snapshot():
         )
 
     return _make
+
+
+_VERIFIER_NODEID_LIMIT = 4096  # scripts/verify_loopback_release.py _safe_nodeid
+
+
+def pytest_collection_modifyitems(config, items):
+    """Fail collection on node IDs the release verifier would reject.
+
+    The verifier rebuilds every node ID from JUnit evidence and treats an ID
+    over 4096 characters, or one containing a raw control character, as
+    malformed evidence. That once surfaced only after a 12-minute verifier
+    run; this makes it an immediate, explicit error in every run.
+    """
+    unsafe = [
+        item.nodeid
+        for item in items
+        if len(item.nodeid) > _VERIFIER_NODEID_LIMIT
+        or any(char in item.nodeid for char in ("\n", "\r", "\x00", "\x1b"))
+    ]
+    if unsafe:
+        raise pytest.UsageError(
+            "test node IDs the release verifier rejects (give the "
+            "parametrized case an explicit id): "
+            + "; ".join(nodeid[:120] for nodeid in unsafe)
+        )

@@ -5241,13 +5241,15 @@ def test_release_static_gate_rejects_protected_deletion_in_helper(
 @pytest.mark.parametrize(
     ("relative_path", "source"),
     [
-        (
+        pytest.param(
             "src/trading_assistant/ops/pinned_root.py",
             "ROOT = '/Users/someone/Desktop/checkout'\n",
+            id="python-module",
         ),
-        (
+        pytest.param(
             "scripts/launcher.sh",
             '#!/bin/bash\nPROJECT="/home/someone/checkout"\n',
+            id="shell-launcher",
         ),
     ],
 )

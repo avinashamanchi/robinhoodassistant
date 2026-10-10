@@ -80,13 +80,15 @@ def test_designation_without_trailing_newline_is_accepted(home, checkout):
 @pytest.mark.parametrize(
     "text",
     [
-        "",
-        "\n",
-        "relative/checkout\n",
-        "/a\n/b\n",
-        "/with\0nul\n",
-        b"/bad-utf8-\xff\n",
-        "/" + "x" * 5000 + "\n",
+        pytest.param("", id="empty"),
+        pytest.param("\n", id="newline-only"),
+        pytest.param("relative/checkout\n", id="relative"),
+        pytest.param("/a\n/b\n", id="multi-line"),
+        pytest.param("/with\0nul\n", id="nul-byte"),
+        pytest.param(b"/bad-utf8-\xff\n", id="invalid-utf8"),
+        # Explicit id: the value itself would make a node ID longer than the
+        # release verifier accepts.
+        pytest.param("/" + "x" * 5000 + "\n", id="oversize"),
     ],
 )
 def test_malformed_designations_are_untrusted(home, text):
