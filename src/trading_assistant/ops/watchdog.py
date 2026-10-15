@@ -146,6 +146,18 @@ def read_database_health(
         return {"db_ok": False, "heartbeat_age_seconds": None}
 
 
+def launch_agent_loaded(label: str) -> bool:
+    """True when launchd has this job loaded, so kickstart can restart it."""
+    completed = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=_LAUNCHCTL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
 def restart_launch_agent(label: str) -> None:
     target = f"gui/{os.getuid()}/{label}"
     subprocess.run(
@@ -228,11 +240,26 @@ def main(argv: list[str] | None = None) -> int:
             ),
             stale_seconds=config.daemon.heartbeat_stale_seconds,
         )
+        # Only launchd jobs can be restarted. A daemon the operator runs in a
+        # terminal, or has not started, is not a launchd job: skip it instead
+        # of failing a kickstart every minute.
+        managed = set()
+        for component, label in _RESTART_ORDER:
+            if label not in labels:
+                continue
+            target = args.label if component == "daemon" else label
+            if launch_agent_loaded(target):
+                managed.add(label)
+            else:
+                log.info(
+                    "watchdog_restart component=%s result=not_installed",
+                    component,
+                )
         restart_failures = restart_selected_components(
-            labels,
+            managed,
             daemon_label=args.label,
         )
-        if labels or restart_failures:
+        if managed or restart_failures:
             return 1
         return 0
 
