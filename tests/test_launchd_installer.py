@@ -241,6 +241,60 @@ def test_installer_refuses_the_retired_autopilot_schedule(installer):
     _assert_no_side_effects(installer)
 
 
+@pytest.mark.parametrize("state", ["plist", "loaded"])
+def test_installer_refuses_while_a_daemon_job_is_installed(installer, state):
+    installer.designate()
+    if state == "plist":
+        agents = installer.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "com.trading.daemon.plist").write_bytes(
+            plistlib.dumps({"Label": "com.trading.daemon"})
+        )
+    else:
+        (installer.fake_bin / "launchctl").write_text(
+            '#!/bin/sh\n[ "$1" = list ] && printf -- "-\\t78\\tcom.trading.daemon\\n"\nexit 0\n',
+            encoding="utf-8",
+        )
+
+    completed = installer.run()
+
+    assert completed.returncode == 1
+    assert "com.trading.daemon launchd job is installed" in completed.stderr
+    assert set(installer.plists()) <= {"com.trading.daemon"}
+    assert not (installer.project / "logs").exists()
+    assert not (installer.project / ".local").exists()
+
+
+def test_uninstall_stops_the_watchdog_first_and_removes_every_job(installer):
+    agents = installer.home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    labels = ("app", "daemon", "watchdog", "backup", "autopilot")
+    for label in labels:
+        (agents / f"com.trading.{label}.plist").write_bytes(
+            plistlib.dumps({"Label": f"com.trading.{label}"})
+        )
+    calls = installer.home / "launchctl.calls"
+    (installer.fake_bin / "launchctl").write_text(
+        f'#!/bin/sh\necho "$*" >> "{calls}"\nexit 0\n',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        ["/bin/bash", str(_REPO / "scripts/launchd/uninstall.sh")],
+        cwd=installer.home,
+        env={"HOME": str(installer.home), "PATH": f"{installer.fake_bin}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert installer.plists() == {}
+    booted_out = [line.split("/")[-1] for line in calls.read_text().splitlines()]
+    assert booted_out[0] == "com.trading.watchdog"
+    assert sorted(booted_out) == sorted(f"com.trading.{label}" for label in labels)
+
+
 def test_installer_warns_about_a_leftover_autopilot_job(installer):
     installer.designate()
     agents = installer.home / "Library" / "LaunchAgents"

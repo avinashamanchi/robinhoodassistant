@@ -40,6 +40,19 @@ if ! "$PY" -I "$PROJ/src/trading_assistant/installation.py" check \
   exit 1
 fi
 
+# A daemon job (from an earlier installer) would start the daemon, with broker
+# access and the autopilot's configured mode, at every login, and the watchdog
+# installed below would restart it. The daemon is an explicit operator
+# workflow, so refuse until such a job is removed.
+loaded_jobs="$(launchctl list 2>/dev/null || true)"
+if [ -e "$LA/com.trading.daemon.plist" ] || [ -L "$LA/com.trading.daemon.plist" ] \
+   || printf '%s\n' "$loaded_jobs" | awk '$3 == "com.trading.daemon" { found = 1 } END { exit !found }'; then
+  echo "error: a com.trading.daemon launchd job is installed; it would start the" >&2
+  echo "       daemon at login without an operator. Remove it first:" >&2
+  echo "       $PROJ/scripts/launchd/uninstall.sh" >&2
+  exit 1
+fi
+
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/.local/encrypted-backups"
 chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
