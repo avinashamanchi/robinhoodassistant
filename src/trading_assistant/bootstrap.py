@@ -27,7 +27,11 @@ from .app.limits import (
 )
 from .broker.base import BrokerClient
 from .broker.factory import build_broker, build_clock
-from .installation import InstallationError, require_designated
+from .installation import (
+    InstallationError,
+    require_chosen_database,
+    require_designated,
+)
 from .config import (
     AppConfig,
     BrokerKind,
@@ -81,7 +85,7 @@ from .security.candidates import (
     CandidateQueueService,
     CandidateSigner,
 )
-from .security.secrets import RuntimeSecrets, secret_is_set
+from .security.secrets import RuntimeSecrets, secret_is_set, secret_value
 from .security.outbound import require_configured_role_origins
 from .security.sensitive_fields import bind_sensitive_cipher
 from .service import TradingService
@@ -1064,9 +1068,12 @@ def _finish_container(
     production_broker = broker is None
     if broker is None:
         # One runtime per operator account: a second checkout (with its own
-        # database) must not bind the same real broker account.
+        # database) must not bind the same real broker account, and the
+        # database must be the one the operator explicitly chose, never one
+        # picked by the working directory.
         try:
             require_designated()
+            require_chosen_database(secret_value(secrets.database_url))
         except InstallationError as error:
             raise StartupInstallationBlocked(error.code) from None
         if runtime_tenure_guard is not None:

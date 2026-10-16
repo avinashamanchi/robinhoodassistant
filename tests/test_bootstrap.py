@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -65,6 +66,17 @@ def designated_repository(tmp_path_factory, monkeypatch):
     return home
 
 
+def _choose(database: Path) -> None:
+    """Record ``database`` as the operator's chosen runtime database (test HOME)."""
+    from trading_assistant import installation
+
+    database = database.resolve()
+    os.chmod(database, 0o600)
+    installation._write_database_choice(
+        database, os.lstat(database), sha256="0" * 64
+    )
+
+
 def _migrated_secrets(tmp_path: Path) -> Secrets:
     database_url = f"sqlite:///{tmp_path}/runtime.db"
     engine = create_db_engine(database_url)
@@ -86,6 +98,7 @@ def _migrated_secrets(tmp_path: Path) -> Secrets:
                 "updated_at": now,
             },
         )
+    _choose(tmp_path / "runtime.db")
     return Secrets(
         database_url=database_url,
         app_api_token="operator-secret-for-bootstrap-tests",
@@ -2891,3 +2904,51 @@ def test_production_container_refuses_another_designated_checkout(
             runtime_role="daemon",
         )
     assert blocked.value.stable_code == "installation_root_mismatch"
+
+
+@pytest.mark.parametrize("case", ["not_chosen", "other_file", "replaced"])
+def test_production_container_requires_the_explicitly_chosen_database(
+    tmp_path,
+    app_config,
+    monkeypatch,
+    designated_repository,
+    case,
+):
+    from trading_assistant import bootstrap, installation
+
+    (tmp_path / "chosen").mkdir()
+    (tmp_path / "other").mkdir()
+    chosen = _migrated_secrets(tmp_path / "chosen")
+    other = _migrated_secrets(tmp_path / "other")
+    chosen_path = (tmp_path / "chosen" / "runtime.db").resolve()
+    _choose(chosen_path)
+    secrets = chosen
+    expected = {
+        "not_chosen": "database_not_chosen",
+        "other_file": "database_not_the_chosen_file",
+        "replaced": "database_identity_changed",
+    }[case]
+    if case == "not_chosen":
+        (designated_repository / installation.DATABASE_CHOICE_RELATIVE).unlink()
+    elif case == "other_file":
+        secrets = other
+    else:
+        copy = chosen_path.with_name("runtime.db.copy")
+        copy.write_bytes(chosen_path.read_bytes())
+        os.chmod(copy, 0o600)
+        os.replace(copy, chosen_path)
+
+    def broker_must_not_be_built(*_args, **_kwargs):
+        raise AssertionError("broker constructed against an unchosen database")
+
+    monkeypatch.setattr(bootstrap, "build_broker", broker_must_not_be_built)
+    config = app_config.model_copy(
+        update={
+            "trading": app_config.trading.model_copy(
+                update={"broker": BrokerKind.ALPACA}
+            )
+        }
+    )
+    with pytest.raises(bootstrap.StartupInstallationBlocked) as blocked:
+        bootstrap.build_container(config, secrets, runtime_role="daemon")
+    assert blocked.value.stable_code == expected

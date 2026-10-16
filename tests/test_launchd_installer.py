@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import hashlib
 import plistlib
 import shutil
 import subprocess
@@ -39,6 +40,30 @@ class Installer:
         path.write_text(f"{root or self.project}\n", encoding="utf-8")
         path.chmod(mode)
         return path
+
+    def choose(self) -> Path:
+        """Choose PROJECT/trading_assistant.db with the real CLI (disposable HOME)."""
+        database = self.project / "trading_assistant.db"
+        database.write_bytes(b"runtime database")
+        database.chmod(0o600)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(self.project / "src/trading_assistant/installation.py"),
+                "choose-database",
+                "--path",
+                str(database),
+                "--sha256",
+                hashlib.sha256(b"runtime database").hexdigest(),
+            ],
+            env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return database
 
     def run(self, *args: str, venv: str = "ok", cwd: Path | None = None,
             script: Path | None = None, env: dict[str, str] | None = None):
@@ -146,6 +171,16 @@ def test_installer_refuses_a_checkout_that_is_not_designated(installer):
     _assert_no_side_effects(installer)
 
 
+def test_installer_refuses_without_a_chosen_database(installer):
+    installer.designate()
+
+    completed = installer.run()
+
+    assert completed.returncode == 1
+    assert "database_not_chosen" in completed.stderr
+    _assert_no_side_effects(installer)
+
+
 def test_installer_refuses_a_designation_for_a_moved_checkout(installer, tmp_path):
     installer.designate(tmp_path / "old location that moved")
 
@@ -185,6 +220,7 @@ def test_installer_refuses_a_venv_that_does_not_run_this_checkout(installer, ven
 # ── generated jobs come from the designated installation ─────────────────────
 def test_installer_generates_bounded_jobs_for_the_designated_root(installer):
     installer.designate()
+    installer.choose()
 
     completed = installer.run()
 
@@ -201,6 +237,7 @@ def test_installer_generates_bounded_jobs_for_the_designated_root(installer):
 
 def test_installer_result_does_not_depend_on_the_working_directory(installer, tmp_path):
     installer.designate()
+    installer.choose()
     elsewhere = tmp_path / "some other cwd"
     elsewhere.mkdir()
 
@@ -212,6 +249,7 @@ def test_installer_result_does_not_depend_on_the_working_directory(installer, tm
 
 def test_installer_reached_through_a_symlink_uses_the_physical_root(installer, tmp_path):
     installer.designate()
+    installer.choose()
     alias = tmp_path / "alias to project"
     alias.symlink_to(installer.project, target_is_directory=True)
 
@@ -244,6 +282,7 @@ def test_installer_refuses_the_retired_autopilot_schedule(installer):
 @pytest.mark.parametrize("state", ["plist", "loaded"])
 def test_installer_refuses_while_a_daemon_job_is_installed(installer, state):
     installer.designate()
+    installer.choose()
     if state == "plist":
         agents = installer.home / "Library" / "LaunchAgents"
         agents.mkdir(parents=True)
@@ -297,6 +336,7 @@ def test_uninstall_stops_the_watchdog_first_and_removes_every_job(installer):
 
 def test_installer_warns_about_a_leftover_autopilot_job(installer):
     installer.designate()
+    installer.choose()
     agents = installer.home / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
     (agents / "com.trading.autopilot.plist").write_bytes(

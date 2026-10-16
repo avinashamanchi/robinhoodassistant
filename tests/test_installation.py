@@ -305,3 +305,115 @@ def test_cli_check_passes_only_for_the_designated_checkout(home, monkeypatch, tm
     root = installation.source_root()
     assert installation.main(["check", "--project", str(root)]) == 0
     assert installation.main(["check", "--project", str(tmp_path)]) == 1
+
+
+# ── runtime database choice ──────────────────────────────────────────────────
+import hashlib  # noqa: E402
+
+from trading_assistant.installation import (  # noqa: E402
+    DATABASE_CHOICE_RELATIVE,
+    choose_database,
+    read_database_choice,
+    require_chosen_database,
+)
+
+
+def _database(path: Path, content: bytes = b"sqlite bytes") -> tuple[Path, str]:
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return path.resolve(), hashlib.sha256(content).hexdigest()
+
+
+@pytest.fixture
+def designated(home, checkout) -> Path:
+    designate(checkout, home=home)
+    return checkout
+
+
+def test_choose_database_records_path_and_identity(home, designated):
+    database, digest = _database(designated / "trading_assistant.db")
+
+    chosen, previous = choose_database(database, sha256=digest, root=designated, home=home)
+
+    assert previous is None
+    assert chosen["path"] == database
+    assert chosen["inode"] == database.stat().st_ino
+    record = home / DATABASE_CHOICE_RELATIVE
+    assert record.stat().st_mode & 0o777 == 0o600
+    assert read_database_choice(home)["sha256_at_choice"] == digest
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["outside_checkout", "hash_mismatch", "hash_invalid", "sidecar", "shared_mode"],
+)
+def test_choose_database_refuses_unsafe_choices(home, designated, tmp_path, case):
+    database, digest = _database(designated / "trading_assistant.db")
+    expected = {
+        "outside_checkout": "database_outside_installation",
+        "hash_mismatch": "database_hash_mismatch",
+        "hash_invalid": "database_hash_invalid",
+        "sidecar": "database_in_use",
+        "shared_mode": "database_file_untrusted",
+    }[case]
+    if case == "outside_checkout":
+        database, digest = _database(tmp_path / "trading_assistant.db")
+    elif case == "hash_mismatch":
+        digest = "0" * 64
+    elif case == "hash_invalid":
+        digest = "not-a-hash"
+    elif case == "sidecar":
+        database.with_name(database.name + "-wal").write_bytes(b"")
+    else:
+        database.chmod(0o644)
+
+    assert _code(choose_database, database, sha256=digest, root=designated, home=home) == expected
+    assert not (home / DATABASE_CHOICE_RELATIVE).exists()
+
+
+def test_replacing_a_different_choice_requires_replace(home, designated):
+    database, digest = _database(designated / "trading_assistant.db")
+    choose_database(database, sha256=digest, root=designated, home=home)
+    replacement, new_digest = _database(designated / "replacement.db", b"other bytes")
+    replacement.replace(database)  # same path, new inode
+
+    assert _code(choose_database, database, sha256=new_digest, root=designated, home=home) == (
+        "database_already_chosen"
+    )
+    chosen, previous = choose_database(
+        database, sha256=new_digest, root=designated, home=home, replace=True
+    )
+    assert previous is not None and previous["inode"] != chosen["inode"]
+
+
+def test_require_chosen_database_resolves_relative_urls_against_cwd(home, designated, tmp_path):
+    database, digest = _database(designated / "trading_assistant.db")
+    choose_database(database, sha256=digest, root=designated, home=home)
+
+    assert require_chosen_database("sqlite:///./trading_assistant.db", cwd=designated, home=home) == database
+    assert require_chosen_database(f"sqlite:///{database}", home=home) == database
+    elsewhere = tmp_path / "worktree"
+    elsewhere.mkdir()
+    _database(elsewhere / "trading_assistant.db")
+    assert _code(
+        require_chosen_database, "sqlite:///./trading_assistant.db", cwd=elsewhere, home=home
+    ) == "database_not_the_chosen_file"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["postgresql://db/x", "sqlite://", "sqlite:///", "sqlite:///:memory:", "sqlite:///x.db?mode=ro"],
+)
+def test_require_chosen_database_refuses_unsupported_urls(home, designated, url):
+    database, digest = _database(designated / "trading_assistant.db")
+    choose_database(database, sha256=digest, root=designated, home=home)
+
+    assert _code(require_chosen_database, url, cwd=designated, home=home) == "database_url_unsupported"
+
+
+def test_require_chosen_database_without_a_choice(home, designated):
+    _database(designated / "trading_assistant.db")
+
+    assert _code(
+        require_chosen_database, "sqlite:///./trading_assistant.db", cwd=designated, home=home
+    ) == "database_not_chosen"

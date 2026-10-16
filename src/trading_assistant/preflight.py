@@ -386,6 +386,41 @@ def _structural_preflight_checks(
     ]
 
 
+def _database_choice(secrets: RuntimeSecrets) -> Result:
+    """The configured database must be the file the operator chose."""
+    from .installation import InstallationError, require_chosen_database
+
+    try:
+        path = require_chosen_database(secret_value(secrets.database_url))
+    except InstallationError as error:
+        return Result("explicitly chosen database", FAIL, error.code)
+    except Exception as error:
+        return Result("explicitly chosen database", FAIL, _safe_exception_code(error))
+    return Result("explicitly chosen database", PASS, str(path))
+
+
+def _runtime_summary(config, database: Result) -> list[str]:
+    """What the runtime will use, printed before any result."""
+    from .broker.alpaca import _OFFICIAL_PAPER_TRADING_URL
+    from .installation import InstallationError, read_designation
+
+    try:
+        checkout = str(read_designation())
+    except InstallationError as error:
+        checkout = f"NOT DESIGNATED ({error.code})"
+    return [
+        "RUNTIME SUMMARY",
+        f"  checkout:        {checkout}",
+        f"  database:        {database.detail if database.status == PASS else 'REFUSED (' + database.detail + ')'}",
+        f"  trading:         mode={config.trading.mode.value} broker={config.trading.broker.value}"
+        f" endpoint={_OFFICIAL_PAPER_TRADING_URL}",
+        f"  app bind:        {config.server.bind_host}:{config.server.port}",
+        f"  autopilot:       mode={config.autopilot.mode} strategy={config.autopilot.strategy}",
+        f"  auto-execution:  pre-approved rules="
+        f"{'ON' if config.features.auto_execute_preapproved_rules else 'off'}",
+    ]
+
+
 def _config_parses() -> Result:
     try:
         load_config("config.yaml")
@@ -769,13 +804,20 @@ def _run(
                 *structural[1:],
             ]
         )
+    database = _database_choice(secrets)
+    print("\n" + "\n".join(_runtime_summary(config, database)))
     results = [
         *structural,
         _config_parses(),
         _paper_only(config),
         _dangerous_switches_off(config, secrets),
         _app_secret_quality(secrets),
+        database,
     ]
+    if database.status != PASS:
+        # Never open (and so convert to WAL) or reconcile against a database
+        # the operator has not chosen.
+        return _print_results(results)
     results.extend(_alpaca(secrets))
     results.extend(_db(secrets))
     if (

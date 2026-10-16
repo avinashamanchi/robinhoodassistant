@@ -29,12 +29,14 @@ UID_="$(id -u)"
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
 
 # Before any side effect: every generated job runs from $PROJ, so it must be
-# the operator's designated runtime installation and its venv must import
-# this checkout (a moved checkout's venv still imports the old path). The
+# the operator's designated runtime installation, its venv must import this
+# checkout (a moved checkout's venv still imports the old path), and its
+# trading_assistant.db must be the explicitly chosen runtime database (an app
+# job against an unchosen database would refuse to start and restart forever). The
 # check is the stdlib-only module run as a file, so it works even when the
 # package cannot be imported.
 if ! "$PY" -I "$PROJ/src/trading_assistant/installation.py" check \
-    --project "$PROJ" --venv-python "$PY"; then
+    --project "$PROJ" --venv-python "$PY" --require-database; then
   echo "error: refusing to install launchd jobs for $PROJ" >&2
   echo "       inspect: $PY -I $PROJ/src/trading_assistant/installation.py status" >&2
   exit 1
