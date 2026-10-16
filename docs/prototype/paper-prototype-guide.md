@@ -23,6 +23,23 @@ changes your machine, contacts Alpaca, or writes a database is marked
 | Installer and uninstaller | Installer refuses while a daemon job exists or no database is chosen; uninstaller stops the watchdog first |
 | Watchdog | Restarts only loaded launchd jobs; a daemon you run yourself is skipped, not kickstarted every minute |
 
+## Verification (2026-10-16)
+
+| Check | Commit | Result |
+|---|---|---|
+| Authoritative release check (clean clone, trusted toolchain, no `.env`, credentials or databases) | `f253b23` (final code) | **PASS**, all 8 stages: migration 186, security 660, safety 142, frontend 188, full suite 5072 with the one allowed skip, branch coverage at least 90 %, static gate. Branch coverage took 1569 s of its 1800 s cap on a loaded machine |
+| Linux CI run 38856236602 | `54c9e00` (docs head), synthetic merge `95cb23f` onto `main@b92ec3f` | Verifier **PASS** (all 8 stages); `uv pip check` 84 packages compatible; gitleaks 29 commits, no leaks. **`pip-audit` FAILED**: `mcp` 1.28.1, CVE-2026-59951 (fixed in 1.30.0), published after the clean 2026-10-10 audit. As a result CI skipped its migration and mock-drill steps |
+| Test manifest | `f253b23` | 5017 to 5072 node IDs: 0 removed, 55 added (all new tests of this pass); the four focused manifests are unchanged |
+| Hermetic lifecycle acceptance (`test_paper_lifecycle_e2e.py`) | `f253b23` | Proposal gating, fill, rejection, cancellation, lost response, expiry and unexplained-fill drift: 7 of 7 pass |
+
+**The `mcp` advisory.** In affected versions, a Streamable HTTP MCP server
+never reclaims session state, so a reachable client can exhaust memory. This
+project's MCP server runs over **stdio only** (`run_stdio_async`), so that
+path does not apply, and `mcp` is an optional extra the paper prototype does
+not use. The fix is still to upgrade to 1.30.0, a minor release within the
+existing `mcp>=1.2` constraint. That needs a package download and a lock
+change, so it awaits your approval. The finding is not suppressed.
+
 ## Real versus simulated
 
 | Part | Real | Simulated or absent |
@@ -207,18 +224,21 @@ orders.
 ## Remaining blockers, by impact
 
 1. **Your database decision.** Without it nothing starts.
-2. **Local repair steps 1–4** need your approval. The venv repair may need a
+2. **CI is red on a new dependency advisory** (`mcp` CVE-2026-59951).
+   Upgrading `mcp` to 1.30.0 needs your approval. The verifier passes; the
+   prototype does not use the affected transport.
+3. **Local repair steps 1–4** need your approval. The venv repair may need a
    download.
-3. **No real Alpaca run yet.** Connectivity, startup reconciliation against
+4. **No real Alpaca run yet.** Connectivity, startup reconciliation against
    your actual paper account, and the paper drill are unverified.
-4. **Probable drift on first start.** Each database holds positions the other
+5. **Probable drift on first start.** Each database holds positions the other
    lacks, and the paper account may differ from both.
-5. **No direct human order entry.** Proposals come from the strategy (propose
+6. **No direct human order entry.** Proposals come from the strategy (propose
    mode), rules, plans, or chat drafts. The demo depends on the strategy
    signalling LONG.
-6. **No account-equity history.** Drawdown is realized-only. Unrealized P/L
+7. **No account-equity history.** Drawdown is realized-only. Unrealized P/L
    needs `--mark` prices or the console.
-7. **No restore command** for encrypted backups.
+8. **No restore command** for encrypted backups.
 
 ## What would make its trades good
 
