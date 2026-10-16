@@ -163,6 +163,8 @@ def max_drawdown(curve: list[tuple[datetime, Decimal]]) -> Decimal:
 
 
 def _source(order: Order) -> str:
+    if order.idempotency_key.startswith("optest-"):
+        return "operator_test"
     if order.idempotency_key.startswith("ap-"):
         return "autopilot"
     proposal = order.proposal

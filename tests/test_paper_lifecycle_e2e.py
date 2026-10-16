@@ -67,13 +67,20 @@ class PaperBrokerDouble(MockBroker):
                 filled_at=datetime.now(timezone.utc),
             )
         )
-        self._positions[current.ticker] = Position(
-            ticker=current.ticker,
-            qty=qty,
-            avg_entry_price=price,
-            current_price=price,
-            unrealized_intraday_pnl=Decimal("0"),
-        )
+        side = current.side.value if hasattr(current.side, "value") else str(current.side)
+        held = self._positions.get(current.ticker)
+        held_qty = held.qty if held is not None else Decimal("0")
+        new_qty = held_qty + qty if side == "buy" else held_qty - qty
+        if new_qty == 0:
+            self._positions.pop(current.ticker, None)
+        else:
+            self._positions[current.ticker] = Position(
+                ticker=current.ticker,
+                qty=new_qty,
+                avg_entry_price=held.avg_entry_price if held is not None and side == "sell" else price,
+                current_price=price,
+                unrealized_intraday_pnl=Decimal("0"),
+            )
 
 
 def _service(make_service):

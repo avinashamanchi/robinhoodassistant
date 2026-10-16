@@ -424,6 +424,19 @@ class AutopilotConfig(_Strict):
         return data
 
 
+class OperatorTestConfig(_Strict):
+    """Operator-generated test proposals (paper only); off unless enabled.
+
+    The symbols and the per-order notional cap are the operator's explicit
+    approval of what a test proposal may contain. Every test proposal still
+    needs a human approval and passes the full risk engine.
+    """
+
+    enabled: bool = False
+    symbols: list[str] = Field(default_factory=list)
+    max_notional_per_order: float = Field(default=50.0, gt=0)
+
+
 class AppConfig(_Strict):
     server: ServerConfig = Field(default_factory=ServerConfig)
     provider_origins: ProviderOriginsConfig = Field(
@@ -442,6 +455,7 @@ class AppConfig(_Strict):
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
     autopilot: AutopilotConfig = Field(default_factory=AutopilotConfig)
+    operator_test: OperatorTestConfig = Field(default_factory=OperatorTestConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 

@@ -102,6 +102,14 @@ features:
 #            gate passes (python -m trading_assistant.autopilot readiness)
 # Live trading is not a mode. The daemon itself only runs when the operator
 # starts it. Every order still passes the risk engine below.
+operator_test:
+  # Operator-generated test proposals for demonstrating the order lifecycle on
+  # Alpaca PAPER (submit/cancel, fill, exit). Off until you enable it. Each one
+  # still needs your approval in the console and passes the full risk engine.
+  enabled: false
+  symbols: [AAPL]                         # symbols you approve for test orders
+  max_notional_per_order: 50              # USD cap for a test entry
+
 autopilot:
   mode: observe                           # off | observe (evidence only) | propose (proposals you approve) | paper (autonomous, readiness-gated)
   strategy: sma_trend                     # same rule as the backtester's sma_trend
