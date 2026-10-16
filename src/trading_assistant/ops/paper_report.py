@@ -206,6 +206,12 @@ def _decimal(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'))}"
 
 
+def _quantity(value: Decimal) -> str:
+    """A share quantity without storage padding (1.000000000 -> 1)."""
+    text = format(value.normalize(), "f")
+    return text if text != "-0" else "0"
+
+
 def build_report(
     session: Session,
     *,
@@ -252,7 +258,7 @@ def build_report(
         open_positions.append(
             {
                 "ticker": ticker,
-                "qty": str(qty),
+                "qty": _quantity(qty),
                 "avg_cost": _decimal(cost / qty) if qty else "0.00",
                 "mark": None if mark is None else str(mark),
                 "unrealized": None if unrealized is None else _decimal(unrealized),
@@ -288,7 +294,7 @@ def build_report(
         "trades": [
             {
                 "ticker": trade.ticker,
-                "qty": str(trade.qty),
+                "qty": _quantity(trade.qty),
                 "entry": _decimal(trade.entry_price),
                 "exit": _decimal(trade.exit_price),
                 "pnl": _decimal(trade.pnl),
