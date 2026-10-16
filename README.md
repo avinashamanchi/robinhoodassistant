@@ -134,11 +134,13 @@ uv run python -m trading_assistant.preflight
 # In a separate operator-controlled terminal, and only after preflight passes:
 uv run python -m trading_assistant.daemon.main
 
-# The autopilot runs only inside that daemon (autopilot.mode: observe records
-# evidence and places nothing; paper places paper orders only once the
-# readiness gate passes). Operator commands, none of which trade:
+# The autopilot runs only inside that daemon. autopilot.mode: observe records
+# evidence and places nothing; propose queues proposals that you approve or
+# reject (it never approves); paper places paper orders only once the
+# readiness gate passes. Operator commands, none of which trade:
 uv run python -m trading_assistant.autopilot readiness  # read-only report
 uv run python -m trading_assistant.autopilot dry-run    # decide once, nothing placed
+uv run python -m trading_assistant.ops.paper_report     # read-only evaluation: funnel, P/L, drawdown
 
 # Credentialed paper-account drills are not startup steps. Use only the
 # separately reviewed procedure in docs/RUNBOOK.md.
@@ -276,10 +278,12 @@ uv run python -m trading_assistant.installation designate  # changes it
 ```
 
 `status` also reports a virtual environment or launchd job left pointing at an
-old path. If the installed jobs ran from a worktree, consolidate that runtime
-into the designated checkout before reinstalling (RUNBOOK, "Installation
-designation and local repair"). The designation guarantees one designated
-checkout per macOS user. It
+old path. The runtime database is chosen explicitly too
+(`installation.py choose-database`): production startup, preflight, the
+installer and the evaluation report refuse any other file, so the working
+directory never silently picks a database. See RUNBOOK, "Installation
+designation and local repair", and `docs/prototype/`. The designation
+guarantees one designated checkout per macOS user. It
 does not stop another account, another machine, or a deliberate
 re-designation from running a second runtime against the same paper account.
 

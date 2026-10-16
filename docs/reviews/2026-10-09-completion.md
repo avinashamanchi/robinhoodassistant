@@ -1,5 +1,16 @@
 # Completion pass — 2026-10-09
 
+> **Corrected on 2026-10-15** by
+> [`../prototype/database-decision.md`](../prototype/database-decision.md).
+> N29 and approval A4a assumed the worktree's `trading_assistant.db` was the
+> live runtime database and proposed consolidating it over the checkout's.
+> Read-only inspection showed the two databases are **independent**: no row in
+> common. The worktree database was last written on 2026-07-30; the
+> checkout's database was written by the retired autopilot until 2026-10-05.
+> Consolidation would have silently discarded one whole history, and now
+> refuses to. The runtime database is chosen explicitly
+> (`choose-database`); A4a is replaced by that decision record.
+
 Stage three of the review of PR #3. It follows
 [`2026-10-05-project-review.md`](2026-10-05-project-review.md) and
 [`2026-10-06-review-followup.md`](2026-10-06-review-followup.md). This pass

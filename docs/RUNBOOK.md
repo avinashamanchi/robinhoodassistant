@@ -578,33 +578,51 @@ uv run python -m trading_assistant.installation designate  # changes it
 
 After moving a checkout, everything that recorded the old absolute path is
 stale: the designation, `.venv` (editable install and console-script
-shebangs), installed LaunchAgents, and any git worktree registration. Repair in
-this order, with backups, and verify with `status` at the end:
+shebangs), installed LaunchAgents, and any git worktree registration. The
+runtime database must also be chosen explicitly: production startup, preflight,
+the installer and the evaluation report refuse any database except the file
+recorded by `choose-database` (path and inode), so the working directory never
+silently picks one.
 
-1. Read `status` first and note which directory each installed job points at.
-   If the jobs ran from a worktree (for example `.worktrees/safety-foundation`),
-   that worktree's `trading_assistant.db` is the runtime database, not the
-   checkout's own.
-2. Stop app, daemon and MCP (`./scripts/launchd/uninstall.sh` removes all jobs,
-   including a retired `com.trading.autopilot`). Copy
-   `~/Library/LaunchAgents/com.trading.*.plist` aside first.
-3. Recreate the venv. Move it aside (`mv .venv .venv.moved-$(date +%Y%m%dT%H%M%S)`)
-   so rollback is a rename, then run `uv sync --frozen --all-extras --dev`.
+```bash
+python -I src/trading_assistant/installation.py choose-database \
+  --path "$PWD/trading_assistant.db" --sha256 "$(shasum -a 256 trading_assistant.db | cut -c1-64)"
+```
+
+Repair in this order, with backups. The full transaction, with checkpoints and
+rollbacks, is in `docs/prototype/paper-prototype-guide.md`.
+
+1. Read `status`; note where each job points. Copy
+   `~/Library/LaunchAgents/com.trading.*.plist` aside and record each
+   database's SHA-256.
+2. Remove every job with `./scripts/launchd/uninstall.sh`. It boots out the
+   watchdog first, then app, daemon, backup and a retired autopilot. Do this
+   before anything could recreate an old path, because a stale KeepAlive job
+   restarts the moment its path exists again.
+3. Repair the venv. Copy it aside first, then run `uv sync --frozen
+   --all-extras --dev` (try `--offline` first).
 4. Repair worktree links with `git worktree repair <path>`. Back up the two
-   one-line link files (`.git/worktrees/<name>/gitdir` and `<path>/.git`) first;
-   never prune a worktree that still exists on disk.
+   one-line link files first, and never prune a worktree that still exists.
 5. Designate the checkout (`designate`; `--replace` only to replace another
    valid designation).
-6. If step 1 found a worktree runtime, move it into the designated checkout
-   before installing anything, with every runtime stopped:
-   `uv run python -m trading_assistant.ops.runtime_consolidation --source-root
-   <checkout>/.worktrees/safety-foundation --destination-root <checkout>`.
-   It reads the backup key from Keychain, writes and verifies an encrypted
-   backup of **both** databases, then replaces the checkout's database with the
-   worktree's. The checkout's previous database survives only in that backup.
-   Skipping this step and installing anyway starts the app on a different
-   database from the one that holds its orders, approvals and breakers.
-7. `./scripts/launchd/install.sh`, then `status` again.
+6. Decide which database the runtime uses, and record it with
+   `choose-database`. Two databases can hold **independent histories**. On the
+   reference machine the worktree's and the checkout's databases share no row
+   at all; see `docs/prototype/database-decision.md`.
+   - Runtime consolidation copies a source database over the destination. It
+     refuses when the destination holds history the source lacks, unless you
+     pass `--replace-divergent-destination <destination sha256>`.
+   - It never merges histories.
+   - After consolidating, choose the database again: the file has a new inode.
+7. Run preflight. It prints a runtime summary first: checkout, database,
+   paper endpoint, loopback bind, autopilot mode and auto-execution.
+8. Run `./scripts/launchd/install.sh`. It refuses while a daemon job is
+   installed or loaded, when the venv imports another checkout, or when no
+   database is chosen. Then run `status` again.
+
+The watchdog restarts only components that are loaded launchd jobs. A daemon
+you run in a terminal, or have not started, is logged as `not_installed` and
+left alone.
 
 None of these steps enables order execution. The autopilot's mode is
 configuration (`autopilot.mode`), and paper orders additionally require its

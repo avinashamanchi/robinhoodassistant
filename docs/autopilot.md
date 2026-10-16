@@ -12,6 +12,7 @@ is **not** evidence of profitability. **Live trading is not supported.**
 |---|---|---|
 | `autopilot.mode: off` | Nothing runs | None |
 | `autopilot.mode: observe` (checked-in profile) | Once per session the daemon decides and records evidence | None (simulated) |
+| `autopilot.mode: propose` | Once per session the daemon decides and queues each intended action as a `PROPOSED` order with a written rationale | Only what a human approves; the autopilot never approves. Not counted as readiness observation |
 | `autopilot.mode: paper` and readiness **not** met | Same as observe; the session is recorded as `blocked` | None |
 | `autopilot.mode: paper` and readiness met | Decides and places Alpaca **paper** orders through the risk engine | Paper only |
 | `trading.mode: live` | Rejected at startup by the runtime and by the gate | Never |
