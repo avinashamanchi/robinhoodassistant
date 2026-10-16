@@ -53,8 +53,11 @@ class Monitor:
         runtime_tenure_guard=None,
         autopilot=None,
         autopilot_timeout_seconds: float = 120.0,
+        equity_recorder=None,
     ) -> None:
         self.service = service
+        # ops.equity.EquitySnapshotRecorder or None: periodic, best-effort.
+        self.equity_recorder = equity_recorder
         # Daemon-hosted autopilot (autopilot.runner.AutopilotRunner) or None.
         self.autopilot = autopilot
         self.autopilot_timeout = autopilot_timeout_seconds
@@ -336,6 +339,8 @@ class Monitor:
                 try:
                     await self._bounded_core_cycle()
                     self.service.write_heartbeat("daemon")
+                    if self.equity_recorder is not None:
+                        await asyncio.to_thread(self.equity_recorder.maybe_record)
                     # Daily analysis is isolated from safety heartbeats.
                     self._schedule_daily_tasks()
                     self._schedule_autopilot()

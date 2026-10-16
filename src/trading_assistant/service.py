@@ -430,6 +430,21 @@ class TradingService(OrderCancellationMixin):
                 read_session, [order_req.ticker], ac
             )
             result = self._risk_for(ac).check(order_req, snapshot)
+        # The quote the proposal was judged against, for decision-versus-fill
+        # measurement later (stored encrypted with the proposal's audit event).
+        decision_quote = snapshot.quotes.get(order_req.ticker)
+        decision_detail = (
+            {
+                "decision_quote": {
+                    "bid": str(decision_quote.bid),
+                    "ask": str(decision_quote.ask),
+                    "last": str(decision_quote.last),
+                    "as_of": decision_quote.as_of.isoformat(),
+                }
+            }
+            if decision_quote is not None
+            else {}
+        )
 
         with self.session_factory() as s:
             order = Order(
@@ -506,6 +521,7 @@ class TradingService(OrderCancellationMixin):
                     request_id=request_id,
                     reason=reason,
                     result_code=order.status,
+                    detail_json=json.dumps(decision_detail, sort_keys=True),
             )
 
             s.commit()

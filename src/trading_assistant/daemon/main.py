@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
+from ..ops.equity import EquitySnapshotRecorder
 from ..app.limits import LimitStoreUnavailable
 from ..config import load_config
 from ..notifications.base import build_notifier
@@ -202,6 +203,7 @@ def _finish_monitor(
         runtime_tenure_guard=runtime_tenure_guard,
         autopilot=autopilot,
         autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
+        equity_recorder=EquitySnapshotRecorder(service),
     )
 
 

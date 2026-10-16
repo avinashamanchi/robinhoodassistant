@@ -61,6 +61,7 @@ class FillRecord:
     price: Decimal
     filled_at: datetime
     trusted: bool = True
+    source: str = "unattributed"
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,31 @@ def max_drawdown(curve: list[tuple[datetime, Decimal]]) -> Decimal:
     return worst
 
 
+def _source_for_key(key: str) -> str:
+    if key.startswith("optest-"):
+        return "operator_test"
+    if key.startswith("ap-"):
+        return "autopilot"
+    return "human_rule_or_chat"
+
+
+def _pnl_summary(pnl: PnL) -> dict[str, object]:
+    wins = [trade.pnl for trade in pnl.trades if trade.pnl > 0]
+    losses = [trade.pnl for trade in pnl.trades if trade.pnl < 0]
+    holds = [(trade.closed_at - trade.opened_at).total_seconds() / 3600 for trade in pnl.trades]
+    return {
+        "realized": _decimal(sum((trade.pnl for trade in pnl.trades), _ZERO)),
+        "closed_trades": len(pnl.trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "average_winner": None if not wins else _decimal(sum(wins, _ZERO) / len(wins)),
+        "average_loser": None if not losses else _decimal(sum(losses, _ZERO) / len(losses)),
+        "average_holding_hours": None if not holds else round(sum(holds) / len(holds), 2),
+        "max_holding_hours": None if not holds else round(max(holds), 2),
+        "turnover": _decimal(pnl.turnover),
+    }
+
+
 def _source(order: Order) -> str:
     if order.idempotency_key.startswith("optest-"):
         return "operator_test"
@@ -230,6 +256,7 @@ def build_report(
     fill_query = select(Fill)
     if until is not None:
         fill_query = fill_query.where(Fill.filled_at < until)
+    keys = dict(session.execute(select(Order.id, Order.idempotency_key)).all())
     fills = [
         FillRecord(
             ticker=fill.ticker,
@@ -238,11 +265,20 @@ def build_report(
             price=Decimal(fill.price),
             filled_at=fill.filled_at,
             trusted=fill_has_trusted_identity(fill),
+            source=(
+                _source_for_key(keys[fill.order_id])
+                if fill.order_id in keys
+                else "unattributed"
+            ),
         )
         for fill in session.scalars(fill_query)
     ]
     trusted = [fill for fill in fills if fill.trusted]
     pnl = fifo_pnl(trusted, since=since)
+    by_source = {
+        source: _pnl_summary(fifo_pnl([f for f in trusted if f.source == source], since=since))
+        for source in sorted({f.source for f in trusted})
+    }
     wins = [trade.pnl for trade in pnl.trades if trade.pnl > 0]
     losses = [trade.pnl for trade in pnl.trades if trade.pnl < 0]
     realized = sum((trade.pnl for trade in pnl.trades), _ZERO)
@@ -288,6 +324,7 @@ def build_report(
             "peak_gross_exposure_at_cost": _decimal(pnl.peak_gross_exposure),
             "unrealized": None if unrealized_total is None else _decimal(unrealized_total),
         },
+        "pnl_by_source": by_source,
         "realized_curve": [
             {"at": at.isoformat(), "cumulative_realized": _decimal(value)}
             for at, value in pnl.curve
@@ -307,10 +344,71 @@ def build_report(
         ],
         "caveats": [
             "Alpaca paper fills are simulated; no live execution quality is implied.",
-            "Realized P/L pairs trusted fills first-in, first-out; fees are not modeled.",
-            "Drawdown is on realized P/L only; account equity history is not recorded.",
+            "Realized P/L pairs trusted fills first-in, first-out; fees and borrow costs are not modeled.",
+            "'pnl' mixes every source; 'pnl_by_source' keeps strategy, operator-test and other trades in "
+            "separate FIFO books. Judge the strategy only on its own book.",
+            "'max_drawdown_realized' is on realized P/L. Equity drawdown needs --with-encrypted "
+            "(account snapshots recorded by the daemon, only while it runs).",
+            "Unrealized P/L uses --mark prices supplied by the operator at report time, not a data feed.",
             "A handful of trades cannot distinguish skill from chance.",
         ],
+    }
+
+
+def fill_quality(session_factory) -> dict[str, object]:
+    """Fill price against the quote the proposal was judged on (needs field keys).
+
+    Slippage in basis points is (average fill - decision mid) / mid, signed so
+    that a positive number is worse for the order's side. Delays show how long
+    the human approval and the fill took after the proposal.
+    """
+    from ..db.models import AuditEvent
+    from ..security.sensitive_fields import sensitive_store
+
+    rows = []
+    with session_factory() as session:
+        store = sensitive_store(session, session_factory)
+        quotes: dict[str, dict] = {}
+        for event in session.scalars(select(AuditEvent).where(AuditEvent.action == "order.propose")):
+            try:
+                detail = json.loads(store.read(event, "detail_json"))
+            except Exception:
+                continue
+            if isinstance(detail, dict) and isinstance(detail.get("decision_quote"), dict):
+                quotes[event.target_id] = detail["decision_quote"]
+        for order in session.scalars(select(Order)):
+            fills = list(session.scalars(select(Fill).where(Fill.order_id == order.id)))
+            quote = quotes.get(str(order.id))
+            if not fills or quote is None:
+                continue
+            qty = sum((Decimal(f.qty) for f in fills), _ZERO)
+            average = sum((Decimal(f.qty) * Decimal(f.price) for f in fills), _ZERO) / qty
+            mid = (Decimal(quote["bid"]) + Decimal(quote["ask"])) / 2
+            sign = Decimal(1) if order.side == "buy" else Decimal(-1)
+            first_fill = min(_aware(f.filled_at) for f in fills)
+            rows.append(
+                {
+                    "order_id": order.id,
+                    "source": _source_for_key(order.idempotency_key),
+                    "ticker": order.ticker,
+                    "side": order.side,
+                    "decision_mid": f"{mid:.4f}",
+                    "average_fill": f"{average:.4f}",
+                    "slippage_bps": f"{(average - mid) / mid * 10000 * sign:.1f}" if mid else None,
+                    "approval_minutes": (
+                        None
+                        if order.approved_at is None
+                        else round((_aware(order.approved_at) - _aware(order.created_at)).total_seconds() / 60, 1)
+                    ),
+                    "fill_minutes_after_proposal": round(
+                        (first_fill - _aware(order.created_at)).total_seconds() / 60, 1
+                    ),
+                }
+            )
+    return {
+        "orders": rows,
+        "note": "decision quote = the quote the proposal's risk check used; orders proposed before "
+        "this was recorded have no decision quote and are omitted",
     }
 
 
@@ -378,6 +476,19 @@ def render_text(report: dict[str, object]) -> str:
                 f"    {trade['closed_at'][:10]} {trade['ticker']} {trade['qty']} @"
                 f" {trade['entry']} -> {trade['exit']} pnl {trade['pnl']}"
             )
+    for source, summary in report.get("pnl_by_source", {}).items():
+        lines.append(
+            f"  [{source}] realized {summary['realized']} over {summary['closed_trades']} trades"
+            f" ({summary['wins']} wins, {summary['losses']} losses), average hold"
+            f" {summary['average_holding_hours']} h, turnover {summary['turnover']}"
+        )
+    equity = report.get("equity")
+    if equity is not None:
+        lines += ["", "Account equity (daemon snapshots)", f"  {equity}"]
+    quality = report.get("fill_quality")
+    if quality is not None:
+        lines += ["", "Fill quality (fill vs decision-time mid; positive bps = worse)"]
+        lines += [f"  {row}" for row in quality["orders"]] or ["  no filled orders with a decision quote"]
     autopilot = report.get("autopilot")
     if autopilot is not None:
         lines += [
@@ -411,7 +522,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", type=_day)
     parser.add_argument("--until", type=_day)
     parser.add_argument("--mark", type=_mark, action="append", default=[])
-    parser.add_argument("--autopilot-evidence", action="store_true")
+    parser.add_argument(
+        "--with-encrypted",
+        "--autopilot-evidence",
+        dest="with_encrypted",
+        action="store_true",
+        help="also decrypt autopilot evidence, equity snapshots and decision quotes (field keys)",
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args(argv)
 
@@ -420,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     from ..security.secrets import load_role_secrets, secret_value
 
     config = load_config()
-    role = "validate-analyst" if args.autopilot_evidence else "watchdog"
+    role = "validate-analyst" if args.with_encrypted else "watchdog"
     secrets = load_role_secrets(role, config=config)
     try:
         database = require_chosen_database(secret_value(secrets.database_url))
@@ -428,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"paper report refused: {error.code}", file=sys.stderr)
         return 1
     factory = read_only_session_factory(database)
-    if args.autopilot_evidence:
+    if args.with_encrypted:
         from ..security.crypto import build_sensitive_data_cipher
         from ..security.sensitive_fields import bind_sensitive_cipher
 
@@ -439,11 +556,15 @@ def main(argv: list[str] | None = None) -> int:
         report = build_report(
             session, since=args.since, until=args.until, marks=dict(args.mark)
         )
-    if args.autopilot_evidence:
+    if args.with_encrypted:
         from ..autopilot.evidence import EvidenceStore
+
+        from .equity import equity_statistics, read_snapshots
 
         store = EvidenceStore(factory, actor="paper-report")
         report["autopilot"] = autopilot_summary(store.cycles())
+        report["equity"] = equity_statistics(read_snapshots(factory))
+        report["fill_quality"] = fill_quality(factory)
     print(render_text(report))
     if args.json is not None:
         try:
