@@ -126,6 +126,10 @@ class RiskConfig(_Strict):
     max_daily_total_loss: float = Field(default=500.0, gt=0)
     max_account_drawdown_pct: float = Field(default=10.0, gt=0, le=100)
     require_broker_reconciled: bool = True
+    # Prototype guardrails (None = no limit). They never block a strictly
+    # reduce-only exit, so a cap cannot trap an open position.
+    max_open_positions: Optional[int] = Field(default=None, gt=0)
+    max_orders_per_day: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("ticker_allowlist")
     @classmethod

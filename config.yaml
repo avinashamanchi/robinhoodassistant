@@ -56,6 +56,8 @@ risk:
   max_daily_total_loss: 500
   max_account_drawdown_pct: 10.0
   require_broker_reconciled: true
+  max_open_positions: 3               # prototype: at most 3 names held or pending
+  max_orders_per_day: 5               # prototype: at most 5 submissions per session
 
 # Crypto risk limits — independent allowlist + kill switch (Phase 7).
 # 24/7 market: never rejected for "closed"; daily P&L boundary is UTC midnight.

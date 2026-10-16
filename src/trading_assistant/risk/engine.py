@@ -129,6 +129,13 @@ class RiskEngine:
             rules.check_portfolio_exposure(order, snapshot, self.config),
             rules.check_price_sanity(order, snapshot, self.config),
         ]
+        if not strictly_reduce_only:
+            base_checks.extend(
+                [
+                    rules.check_max_open_positions(order, snapshot, self.config),
+                    rules.check_daily_order_count(snapshot, self.config),
+                ]
+            )
         reasons.extend(reason for reason in base_checks if reason is not None)
 
         if not snapshot.quote_fresh:

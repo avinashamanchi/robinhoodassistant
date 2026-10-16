@@ -66,6 +66,8 @@ def config_fingerprint(config: AppConfig) -> str:
             "price_sanity_pct": risk.price_sanity_pct,
             "max_spread_pct": getattr(risk, "max_spread_pct", None),
             "max_quote_age_seconds": getattr(risk, "max_quote_age_seconds", None),
+            "max_open_positions": risk.max_open_positions,
+            "max_orders_per_day": risk.max_orders_per_day,
         },
     }
     return hashlib.sha256(_canonical(material).encode("utf-8")).hexdigest()
