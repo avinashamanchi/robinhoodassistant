@@ -2089,6 +2089,118 @@ class TradingService(OrderCancellationMixin):
             },
         }
 
+    def recent_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Recent orders with lifecycle detail for the console (read-only)."""
+        working = {
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        with self.session_factory() as s:
+            rows = s.scalars(
+                select(Order).order_by(Order.id.desc()).limit(max(1, min(limit, 200)))
+            ).all()
+            fills: dict[int, list[Fill]] = {}
+            if rows:
+                for fill in s.scalars(
+                    select(Fill).where(Fill.order_id.in_([o.id for o in rows]))
+                ):
+                    fills.setdefault(fill.order_id, []).append(fill)
+            out = []
+            for o in rows:
+                d = self._order_dict(o)
+                done = fills.get(o.id, [])
+                filled = sum((Decimal(f.qty) for f in done), Decimal(0))
+                d.update(
+                    {
+                        "source": (
+                            "operator_test"
+                            if o.idempotency_key.startswith("optest-")
+                            else "autopilot"
+                            if o.idempotency_key.startswith("ap-")
+                            else "human_rule_or_chat"
+                        ),
+                        "approved_at": None if o.approved_at is None else o.approved_at.isoformat(),
+                        "submitted_at": (
+                            None
+                            if o.submission_started_at is None
+                            else o.submission_started_at.isoformat()
+                        ),
+                        "broker_order_id": o.broker_order_id,
+                        "filled_qty": str(filled),
+                        "avg_fill_price": (
+                            None
+                            if not filled
+                            else str(
+                                sum((Decimal(f.qty) * Decimal(f.price) for f in done), Decimal(0))
+                                / filled
+                            )
+                        ),
+                        "last_error_code": o.last_error_code or None,
+                        "acceptance_state": o.acceptance_state,
+                        "cancellable": o.status in working,
+                    }
+                )
+                out.append(d)
+            return out
+
+    def runtime_overview(self) -> dict[str, Any]:
+        """What this runtime is using: checkout, database, broker, limits, modes."""
+        from .installation import (
+            InstallationError,
+            read_database_choice,
+            read_designation,
+        )
+
+        try:
+            checkout: Any = str(read_designation())
+        except InstallationError as error:
+            checkout = {"error": error.code}
+        try:
+            choice = read_database_choice()
+            database: Any = {
+                "path": str(choice["path"]),
+                "chosen_at": choice.get("chosen_at"),
+            }
+        except InstallationError as error:
+            database = {"error": error.code}
+        risk = self.config.risk
+        tests = self.config.operator_test
+        autopilot = self.config.autopilot
+        return {
+            "trading_mode": self.config.trading.mode.value,
+            "broker": self.config.trading.broker.value,
+            "broker_endpoint": (
+                "https://paper-api.alpaca.markets"
+                if self.config.trading.broker.value == "alpaca"
+                else "mock (no network)"
+            ),
+            "live_trading": "unsupported",
+            "checkout": checkout,
+            "database": database,
+            "auto_execute_preapproved_rules": self.config.features.auto_execute_preapproved_rules,
+            "autopilot": {
+                "mode": autopilot.mode,
+                "strategy": autopilot.strategy,
+                "notional_per_trade": str(autopilot.notional_per_trade),
+            },
+            "risk_limits": {
+                "max_notional_per_order": risk.max_notional_per_order,
+                "max_position_per_ticker": risk.max_position_per_ticker,
+                "max_portfolio_exposure": risk.max_portfolio_exposure,
+                "max_open_positions": risk.max_open_positions,
+                "max_orders_per_day": risk.max_orders_per_day,
+                "daily_realized_loss_limit": risk.daily_realized_loss_limit,
+                "max_account_drawdown_pct": risk.max_account_drawdown_pct,
+                "proposal_ttl_minutes": risk.proposal_ttl_minutes,
+                "ticker_allowlist": list(risk.ticker_allowlist),
+            },
+            "operator_test": {
+                "enabled": tests.enabled,
+                "symbols": list(tests.symbols),
+                "max_notional_per_order": tests.max_notional_per_order,
+            },
+        }
+
     def get_positions(self) -> list[dict[str, Any]]:
         try:
             positions = self._read_valid_broker_positions()
