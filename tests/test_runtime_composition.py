@@ -821,6 +821,7 @@ def test_backup_main_reuses_one_secret_and_writes_role_log(
             start_identity="task9-backup-process",
         ),
         process_inspector=OfflineInspector(),
+        database_guard=lambda url: Path(url.removeprefix("sqlite:///")),
     ) == 0
     assert calls["secrets"] == 1
     assert log_path.exists()
@@ -861,10 +862,13 @@ def test_migration_main_loads_one_role_secret_before_engine_construction(
     monkeypatch.setattr(migrate, "_print_result", lambda *_args: None)
     monkeypatch.setattr(migrate, "require_current_schema", lambda _engine: None)
 
-    assert migrate.main(["status"]) == 0
+    assert migrate.main(
+        ["status"],
+        database_guard=lambda url: Path(url.removeprefix("sqlite:///")),
+    ) == 0
     assert observed == [
         ("load", "migration", app_config),
-        ("engine", secrets.database_url),
+        ("engine", secrets.database_url.get_secret_value()),
     ]
 
 

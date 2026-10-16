@@ -338,6 +338,7 @@ def test_operational_backup_cli_prints_only_stable_encrypted_receipt(
         secrets_loader=lambda *_args, **_kwargs: secrets,
         process_identity=BACKUP_IDENTITY,
         process_inspector=_OfflineInspector(),
+        database_guard=lambda url: Path(url.removeprefix("sqlite:///")),
     )
 
     output = capsys.readouterr().out
