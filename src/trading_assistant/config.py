@@ -388,7 +388,7 @@ class AutopilotConfig(_Strict):
     order still passes the deterministic risk engine.
     """
 
-    mode: Literal["off", "observe", "paper"] = "off"
+    mode: Literal["off", "observe", "propose", "paper"] = "off"
     # Names match ``trading_assistant.strategies`` so a backtest of the same
     # name evaluates the exact rule the autopilot trades. ``sma_trend`` is the
     # 20/50 + 200-day-filter rule the autopilot originally shipped with;

@@ -80,6 +80,7 @@ class Autopilot:
         dry_run: bool = False,
         max_feature_age: Optional[timedelta] = timedelta(hours=120),
         tenure_guard=None,
+        propose_only: bool = False,
     ) -> None:
         if not universe:
             raise ValueError("autopilot requires a non-empty universe")
@@ -91,12 +92,17 @@ class Autopilot:
         self.notional_per_trade = Decimal(str(notional_per_trade))
         self.max_orders_per_day = int(max_orders_per_day)
         self.strategy = strategy
+        self._rule = None
         if decide is None:
             rule = STRATEGIES[strategy]()
+            self._rule = rule
             decide = lambda features: strategy_decision(rule, features)  # noqa: E731
         self.decide = decide
         self.now = now
         self.dry_run = dry_run
+        # propose_only: create PROPOSED orders for a human to approve, and
+        # never approve them (autopilot.mode: propose).
+        self.propose_only = propose_only
         self.max_feature_age = max_feature_age
         self.tenure_guard = tenure_guard
         self.actor = f"{ACTOR_PREFIX}{strategy}"
@@ -204,8 +210,13 @@ class Autopilot:
         session: date,
         qty: Optional[Decimal] = None,
         notional: Optional[Decimal] = None,
+        rationale: Optional[str] = None,
     ) -> tuple[Optional[dict], str]:
-        """Place (or resume) the intended order. Returns (result, reason)."""
+        """Place (or resume) the intended order. Returns (result, reason).
+
+        With ``propose_only`` the order is only proposed, for a human to
+        approve or reject; the autopilot never approves it.
+        """
         key = action_key(self.strategy, symbol, side, session)
         if self.dry_run:
             intended = {
@@ -218,7 +229,7 @@ class Autopilot:
             }
             log.info("autopilot DRY-RUN would place %s", intended)
             return intended, "intended"
-        reason = f"autopilot {side} via {self.strategy}"
+        reason = rationale or f"autopilot {side} via {self.strategy}"
         request_id = uuid4().hex
         self._require_tenure()
         proposal = self.service.propose_order(
@@ -245,6 +256,19 @@ class Autopilot:
                 proposal.get("risk_reasons") or status,
             )
             return None, "risk_rejected"
+        if self.propose_only:
+            if replayed:
+                log.info("autopilot proposal %s %s already pending", side, symbol)
+                return None, "intent_already_proposed"
+            result = {
+                "symbol": symbol,
+                "side": side,
+                "order_id": proposal["order_id"],
+                "status": OrderStatus.PROPOSED.value,
+                "awaiting_approval": True,
+            }
+            log.info("autopilot proposed %s (awaiting human approval)", result)
+            return result, "proposed"
         self._require_tenure()
         approved = self.service.approve_order(
             proposal["order_id"],
@@ -272,6 +296,53 @@ class Autopilot:
         if not approved.get("executed") and approved.get("error"):
             return None, f"intent_already_{final_status}"
         return result, ("resumed_intent" if replayed else "submitted")
+
+    def _rationale(
+        self,
+        symbol: str,
+        side: str,
+        features: MarketFeatures,
+        *,
+        session: date,
+        qty: Optional[Decimal] = None,
+    ) -> str:
+        """Why this symbol, why now, why this size, how it exits, which limits apply."""
+        why = (
+            self._rule.on_bar(features).reason
+            if self._rule is not None
+            else "strategy signal"
+        )
+
+        def value(number: Optional[float]) -> str:
+            return "n/a" if number is None else f"{number:.2f}"
+
+        if side == "buy":
+            size = f"${self.notional_per_trade} notional (autopilot.notional_per_trade)"
+            if features.last_close:
+                shares = self.notional_per_trade / Decimal(str(features.last_close))
+                size += f", about {shares:.4f} shares at the last close"
+            exit_rule = (
+                "a later cycle proposes the exit when the rule turns flat (20-day SMA "
+                "at or below the 50-day, or close below the 200-day); no stop-loss or "
+                "profit target is attached"
+            )
+        else:
+            size = f"{qty} shares, the autopilot's own filled quantity"
+            exit_rule = "this order is the exit"
+        risk = self.service.config.risk
+        return (
+            f"{self.strategy} {side.upper()} {symbol} for session {session}: {why}. "
+            f"Data: completed daily bars as of {features.as_of:%Y-%m-%d}; "
+            f"SMA20 {value(features.sma_20)}, SMA50 {value(features.sma_50)}, "
+            f"SMA200 {value(features.sma_200)}, last close {value(features.last_close)}. "
+            f"Size: {size}. Exit: {exit_rule}. "
+            f"Order: market; at approval the risk engine re-checks per-order "
+            f"${risk.max_notional_per_order:g}, per-ticker ${risk.max_position_per_ticker:g}, "
+            f"exposure ${risk.max_portfolio_exposure:g}, open positions "
+            f"{risk.max_open_positions or 'unlimited'}, orders per session "
+            f"{risk.max_orders_per_day or 'unlimited'}, daily loss "
+            f"${risk.daily_realized_loss_limit:g}."
+        )
 
     def _plan(
         self, signal: str, held: Decimal, owned: Decimal
@@ -367,7 +438,8 @@ class Autopilot:
                     for symbol in self.universe
                 ]
                 return []
-            self._heal_transient_breakers(open_cache)
+            if not self.propose_only:
+                self._heal_transient_breakers(open_cache)
         executed: list[dict] = []
         decisions: list[Decision] = []
         placed = self._orders_today()
@@ -431,12 +503,24 @@ class Autopilot:
             order_status: Optional[str] = None
             if action == "buy":
                 result, outcome = self._submit(
-                    symbol, "buy", session=session, notional=self.notional_per_trade
+                    symbol,
+                    "buy",
+                    session=session,
+                    notional=self.notional_per_trade,
+                    rationale=self._rationale(symbol, "buy", features, session=session),
                 )
-                reason = reason if outcome in ("submitted", "intended") else outcome
+                reason = reason if outcome in ("submitted", "intended", "proposed") else outcome
             elif action == "sell":
-                result, outcome = self._submit(symbol, "sell", session=session, qty=sell_qty)
-                reason = reason if outcome in ("submitted", "intended") else outcome
+                result, outcome = self._submit(
+                    symbol,
+                    "sell",
+                    session=session,
+                    qty=sell_qty,
+                    rationale=self._rationale(
+                        symbol, "sell", features, session=session, qty=sell_qty
+                    ),
+                )
+                reason = reason if outcome in ("submitted", "intended", "proposed") else outcome
             if result is not None:
                 order_status = result.get("status")
                 executed.append(result)

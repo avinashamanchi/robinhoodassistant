@@ -36,7 +36,9 @@ from ..security.sensitive_fields import sensitive_store
 
 CYCLE_ACTION = "autopilot.cycle"
 BACKTEST_ACTION = "autopilot.backtest"
-COMPLETED_RESULTS = frozenset({"observed", "executed", "blocked", "degraded"})
+# "proposed" completes a session (no duplicate proposals) but is not clean
+# observation: a human's approvals shape what happens next.
+COMPLETED_RESULTS = frozenset({"observed", "executed", "blocked", "degraded", "proposed"})
 CLEAN_RESULTS = frozenset({"observed", "executed", "blocked"})
 EVIDENCE_SCHEMA = 1
 

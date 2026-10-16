@@ -130,12 +130,16 @@ class AutopilotRunner:
         self._require_tenure()
         report = self._readiness(now)
         execute = mode == "paper" and report.ready
-        self.autopilot.dry_run = not execute
+        # propose: real PROPOSED orders for a human to approve; the human is
+        # the gate, so readiness is not required and nothing is approved here.
+        propose = mode == "propose"
+        self.autopilot.dry_run = not (execute or propose)
+        self.autopilot.propose_only = propose
         base_detail = {
             "session": session.isoformat(),
             "started_at": now.isoformat(),
             "mode": mode,
-            "execution": "paper" if execute else "simulated",
+            "execution": "paper" if execute else ("proposals" if propose else "simulated"),
             "strategy": self.config.autopilot.strategy,
             "config_fingerprint": config_fp,
             "code_fingerprint": code_fp,
@@ -171,6 +175,8 @@ class AutopilotRunner:
             result_code = "degraded"
         elif execute:
             result_code = "executed"
+        elif propose:
+            result_code = "proposed"
         elif mode == "paper":
             result_code = "blocked"
         else:

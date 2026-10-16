@@ -395,6 +395,13 @@ async function refreshPending() {
       orderSummary(order),
       "ledger-entry-data",
     ));
+    if (typeof order.rationale === "string" && order.rationale) {
+      content.appendChild(node(
+        "div",
+        `Why: ${readable(order.rationale)}`,
+        "ledger-entry-data proposal-rationale",
+      ));
+    }
     content.appendChild(node(
       "div",
       `Expires ${readable(order.expires_at)}`,

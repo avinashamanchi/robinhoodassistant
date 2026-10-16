@@ -146,6 +146,49 @@ def test_paper_mode_with_readiness_executes_through_the_risk_engine(app_config, 
     assert record.detail["orders"][0]["symbol"] == "AAPL"
 
 
+def test_propose_mode_queues_proposals_for_a_human_and_never_approves(app_config, make_service, tmp_path):
+    runner, service, clock = _runner(app_config, make_service, tmp_path, mode="propose")
+
+    assert runner.run_if_due() == {"session": "2026-10-06", "result": "proposed"}
+    assert runner.run_if_due() is None                 # one proposal per session
+    assert service.broker.submit_calls == 0             # never approved, never submitted
+
+    (pending,) = service.get_pending()
+    assert (pending["ticker"], pending["side"]) == ("AAPL", "buy")
+    assert Decimal(pending["notional"]) == Decimal("100") and pending["order_type"] == "market"
+    rationale = pending["rationale"]
+    assert rationale.startswith("sma_trend BUY AAPL for session 2026-10-06: 20>50 and close>=200")
+    for part in ("SMA20 105.00", "Size: $100 notional", "Exit: a later cycle proposes the exit",
+                 "per-order $", "open positions"):
+        assert part in rationale, part
+    (record,) = runner.store.cycles()
+    assert record.result_code == "proposed"
+    assert record.detail["execution"] == "proposals"
+    assert record.detail["decisions"][0]["reason"] == "enter_long"
+    assert record.detail["orders"] == [
+        {"symbol": "AAPL", "side": "buy", "order_id": pending["order_id"], "status": "proposed"}
+    ]
+    # Human-approved proposals are not observation evidence for autonomy.
+    assert runner._readiness(clock["now"]).observed_sessions == 0
+
+
+def test_a_human_approves_an_autopilot_proposal_and_it_is_submitted(app_config, make_service, tmp_path):
+    runner, service, _clock = _runner(app_config, make_service, tmp_path, mode="propose")
+    runner.run_if_due()
+    (pending,) = service.get_pending()
+
+    approved = service.approve_order(
+        pending["order_id"],
+        actor="operator:reviewed",
+        reason="rationale and limits reviewed",
+        request_id="approve-proposal-1",
+    )
+
+    assert approved["executed"] is True
+    assert service.broker.submit_calls == 1
+    assert service.get_pending() == []
+
+
 def _ready_report(runner, now):
     from trading_assistant.autopilot.readiness import evaluate_readiness
 

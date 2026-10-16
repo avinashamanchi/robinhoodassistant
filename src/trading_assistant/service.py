@@ -1905,12 +1905,18 @@ class TradingService(OrderCancellationMixin):
                 .scalars()
                 .all()
             )
+            store = sensitive_store(s, self.session_factory)
             out = []
             for o in rows:
                 d = self._order_dict(o)
                 if o.proposal is not None:
                     d["expires_at"] = o.proposal.expires_at.isoformat()
                     d["expired"] = o.proposal.is_expired()
+                    # Why it was proposed, shown before a human approves it.
+                    try:
+                        d["rationale"] = store.read(o.proposal, "reasoning")
+                    except Exception:
+                        d["rationale"] = "(rationale unavailable)"
                 out.append(d)
             return out
 
