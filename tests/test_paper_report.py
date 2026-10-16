@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -226,3 +227,21 @@ def test_autopilot_evidence_decrypts_through_the_read_only_connection(
     summary = autopilot_summary(EvidenceStore(factory, actor="paper-report").cycles())
 
     assert summary["cycles"] == 1 and summary["results"] == {"observed": 1}
+
+
+def test_json_export_is_private_from_creation_and_never_overwrites(tmp_path):
+    target = tmp_path / "report.json"
+    old_umask = os.umask(0)
+    try:
+        paper_report.write_private_json(target, {"pnl": {"realized": "1.00"}})
+    finally:
+        os.umask(old_umask)
+
+    assert target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        paper_report.write_private_json(target, {})
+    link = tmp_path / "link.json"
+    link.symlink_to(tmp_path / "elsewhere.json")
+    with pytest.raises(FileExistsError):
+        paper_report.write_private_json(link, {})
+    assert not (tmp_path / "elsewhere.json").exists()

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -437,9 +438,21 @@ def main(argv: list[str] | None = None) -> int:
         report["autopilot"] = autopilot_summary(store.cycles())
     print(render_text(report))
     if args.json is not None:
-        args.json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        args.json.chmod(0o600)
+        try:
+            write_private_json(args.json, report)
+        except FileExistsError:
+            print(f"paper report: {args.json} exists; not overwritten", file=sys.stderr)
+            return 1
     return 0
+
+
+def write_private_json(path: Path, payload: dict[str, object]) -> None:
+    """Create ``path`` owner-only (0600) from the start; never follow a link or overwrite."""
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":
