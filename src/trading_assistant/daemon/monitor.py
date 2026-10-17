@@ -56,8 +56,11 @@ class Monitor:
         equity_recorder=None,
     ) -> None:
         self.service = service
-        # ops.equity.EquitySnapshotRecorder or None: periodic, best-effort.
+        # ops.equity.EquitySnapshotRecorder or None: periodic, best-effort,
+        # run off the safety loop's critical path with a bounded timeout.
         self.equity_recorder = equity_recorder
+        self.equity_timeout = 20.0
+        self._equity_task: Optional[asyncio.Task[Any]] = None
         # Daemon-hosted autopilot (autopilot.runner.AutopilotRunner) or None.
         self.autopilot = autopilot
         self.autopilot_timeout = autopilot_timeout_seconds
@@ -289,6 +292,25 @@ class Monitor:
         except Exception:
             log.error("autopilot task failed code=autopilot_task_failed")
 
+    async def _bounded_equity_snapshot(self) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self.equity_recorder.maybe_record),
+                timeout=self.equity_timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warning("equity_snapshot_timed_out")
+        except Exception:
+            log.warning("equity_snapshot_failed")
+
+    def _schedule_equity_snapshot(self) -> None:
+        """Start a snapshot in the background; never block or overlap."""
+        if self.equity_recorder is None:
+            return
+        if self._equity_task is not None and not self._equity_task.done():
+            return
+        self._equity_task = asyncio.create_task(self._bounded_equity_snapshot())
+
     def _schedule_autopilot(self) -> None:
         if self.autopilot is None:
             return
@@ -339,8 +361,7 @@ class Monitor:
                 try:
                     await self._bounded_core_cycle()
                     self.service.write_heartbeat("daemon")
-                    if self.equity_recorder is not None:
-                        await asyncio.to_thread(self.equity_recorder.maybe_record)
+                    self._schedule_equity_snapshot()
                     # Daily analysis is isolated from safety heartbeats.
                     self._schedule_daily_tasks()
                     self._schedule_autopilot()

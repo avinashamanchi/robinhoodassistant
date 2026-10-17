@@ -91,3 +91,40 @@ def test_strategy_and_operator_test_trades_are_kept_in_separate_books(make_servi
     assert report["pnl_by_source"]["autopilot"]["realized"] == "10.00"
     assert report["pnl_by_source"]["operator_test"]["realized"] == "-5.00"
     assert report["funnel"]["by_source"] == {"autopilot": 2, "operator_test": 2}
+
+
+def test_a_hung_snapshot_never_blocks_or_overlaps_the_safety_loop(make_service, caplog):
+    import asyncio
+    import logging
+    import threading
+    import time
+
+    from trading_assistant.daemon.monitor import Monitor
+
+    release = threading.Event()
+    calls = []
+
+    class HungRecorder:
+        def maybe_record(self):
+            calls.append(1)
+            release.wait(5)
+            return True
+
+    monitor = Monitor(make_service(), equity_recorder=HungRecorder())
+    monitor.equity_timeout = 0.1
+
+    async def scenario():
+        started = time.monotonic()
+        monitor._schedule_equity_snapshot()
+        monitor._schedule_equity_snapshot()          # still running: no second snapshot
+        scheduling = time.monotonic() - started
+        await monitor._equity_task                   # ends at the timeout, not when the call returns
+        return scheduling, time.monotonic() - started
+
+    with caplog.at_level(logging.WARNING):
+        scheduling, waited = asyncio.run(scenario())
+    release.set()
+
+    assert scheduling < 0.05 and waited < 1.0
+    assert calls == [1]
+    assert "equity_snapshot_timed_out" in caplog.text
