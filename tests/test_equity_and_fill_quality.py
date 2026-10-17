@@ -93,12 +93,13 @@ def test_strategy_and_operator_test_trades_are_kept_in_separate_books(make_servi
     assert report["funnel"]["by_source"] == {"autopilot": 2, "operator_test": 2}
 
 
-def test_a_hung_snapshot_never_blocks_or_overlaps_the_safety_loop(make_service, caplog):
+def test_a_hung_snapshot_never_blocks_or_overlaps_the_safety_loop(make_service, caplog, monkeypatch):
     import asyncio
     import logging
     import threading
     import time
 
+    from trading_assistant.daemon import monitor as monitor_module
     from trading_assistant.daemon.monitor import Monitor
 
     release = threading.Event()
@@ -121,7 +122,9 @@ def test_a_hung_snapshot_never_blocks_or_overlaps_the_safety_loop(make_service, 
         await monitor._equity_task                   # ends at the timeout, not when the call returns
         return scheduling, time.monotonic() - started
 
-    with caplog.at_level(logging.WARNING):
+    # An in-process Alembic run (fileConfig) elsewhere in the suite disables existing loggers.
+    monkeypatch.setattr(monitor_module.log, "disabled", False)
+    with caplog.at_level(logging.WARNING, logger=monitor_module.__name__):
         scheduling, waited = asyncio.run(scenario())
     release.set()
 
