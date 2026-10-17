@@ -141,6 +141,11 @@ uv run python -m trading_assistant.daemon.main
 uv run python -m trading_assistant.autopilot readiness  # read-only report
 uv run python -m trading_assistant.autopilot dry-run    # decide once, nothing placed
 uv run python -m trading_assistant.ops.paper_report     # read-only evaluation: funnel, P/L, drawdown
+uv run python -m trading_assistant.ops.restore verify --artifact A --into NEW_DIR  # isolated restore check
+# Operator test proposals (paper, off by default; operator_test in config.yaml)
+# are created from the console and still need your approval. Setup, launch,
+# shutdown, demonstrations and the approval checklist:
+# docs/prototype/paper-prototype-guide.md
 
 # Credentialed paper-account drills are not startup steps. Use only the
 # separately reviewed procedure in docs/RUNBOOK.md.

@@ -1,269 +1,308 @@
 # Paper prototype guide
 
-How to repair the local installation, start the prototype against Alpaca
-**paper**, run a controlled demo, and judge the results. It complements
-[`current-state-2026-10-15.md`](current-state-2026-10-15.md) (the Phase 0
-facts) and [`database-decision.md`](database-decision.md) (an open decision).
+Everything needed to set up, run, demonstrate and evaluate the Alpaca
+**paper** trading prototype. Live trading is not supported and has no
+activation path.
 
-`$R` is `~/Desktop/project/robinhood/trading-assistant`. Every step that
-changes your machine, contacts Alpaca, or writes a database is marked
-**[approval]**. None has been run.
+`$R` is `~/Desktop/project/robinhood/trading-assistant`. Use
+`.venv/bin/python` rather than `uv run`: `uv run` rebuilds the environment.
 
-## What changed in this pass
+## 1. Acceptance status
 
-| Change | Effect |
-|---|---|
-| Explicit runtime database (`installation.py choose-database`) | Startup, preflight, the installer and the report refuse any database except the recorded file (same path and inode). No more choice by working directory |
-| Preflight runtime summary | Prints checkout, database file, paper endpoint, loopback bind, autopilot mode and auto-execution before any check; stops before opening the database or broker if the database was not chosen |
-| `autopilot.mode: propose` | The deterministic strategy's decisions become `PROPOSED` orders with a full rationale in the pending queue. The autopilot never approves them; you do |
-| Pending list shows the rationale | Console and API show why each proposal exists before you approve |
-| Guardrails `risk.max_open_positions: 3`, `risk.max_orders_per_day: 5` | Enforced by the risk engine on every order; never block a reduce-only exit; an unknown daily count blocks |
-| `python -m trading_assistant.ops.paper_report` | Read-only evaluation: funnel, FIFO P/L, wins and losses, drawdown, turnover, exposure, autopilot evidence |
-| Consolidation guard | Refuses to discard destination history unless given its exact SHA-256 |
-| Installer and uninstaller | Installer refuses while a daemon job exists or no database is chosen; uninstaller stops the watchdog first |
-| Watchdog | Restarts only loaded launchd jobs; a daemon you run yourself is skipped, not kickstarted every minute |
+Status labels:
 
-## Verification (2026-10-16)
+- **IMPLEMENTED**: built; not yet tested at the level below.
+- **AUTOMATED-TEST VERIFIED**: passes automated tests against Alpaca-shaped
+  doubles.
+- **ALPACA-PAPER VERIFIED**: observed against the real paper API. Nothing is
+  at this level yet; it needs approval D2.
+- **BLOCKED**: waiting on an approval.
+- **NOT IMPLEMENTED**: not built.
 
-| Check | Commit | Result |
+| Area | Status | Evidence |
 |---|---|---|
-| Authoritative release check (clean clone, trusted toolchain, no `.env`, credentials or databases) | `f253b23` (final code) | **PASS**, all 8 stages: migration 186, security 660, safety 142, frontend 188, full suite 5072 with the one allowed skip, branch coverage at least 90 %, static gate. Branch coverage took 1569 s of its 1800 s cap on a loaded machine |
-| Linux CI run 38856236602 | `54c9e00` (docs head), synthetic merge `95cb23f` onto `main@b92ec3f` | Verifier **PASS** (all 8 stages); `uv pip check` 84 packages compatible; gitleaks 29 commits, no leaks. **`pip-audit` FAILED**: `mcp` 1.28.1, CVE-2026-59951 (fixed in 1.30.0), published after the clean 2026-10-10 audit. As a result CI skipped its migration and mock-drill steps |
-| Test manifest | `f253b23` | 5017 to 5072 node IDs: 0 removed, 55 added (all new tests of this pass); the four focused manifests are unchanged |
-| Hermetic lifecycle acceptance (`test_paper_lifecycle_e2e.py`) | `f253b23` | Proposal gating, fill, rejection, cancellation, lost response, expiry and unexplained-fill drift: 7 of 7 pass |
+| Installation and startup | IMPLEMENTED + AUTOMATED-TEST VERIFIED; **BLOCKED** locally (approvals L1–L5) | `test_installation.py`, `test_launchd_installer.py`, `test_bootstrap.py`, `test_launch.py` (preflight summary), `test_startup_help.py` |
+| Database selection and recovery | AUTOMATED-TEST VERIFIED; selection **BLOCKED** (decision S1) | `test_installation.py` (choose-database), `test_bootstrap.py` (wrong, unchosen and replaced files refused), `test_restore.py` (restore, activate, backup and migrate guards), `test_runtime_consolidation.py` |
+| Dependency and security checks | **BLOCKED** (download P1). Verifier passes; `pip-audit` fails on `mcp` 1.28.1 (GHSA-84m7-p3x7-pcfv) | CI run 38856236602; advisory verified with the GitHub advisory API and PyPI metadata |
+| Proposal creation | AUTOMATED-TEST VERIFIED | `test_operator_test_proposals.py`, `test_autopilot_daemon.py` (propose mode), `test_paper_lifecycle_e2e.py` |
+| Human approval and rejection | AUTOMATED-TEST VERIFIED | `test_paper_lifecycle_e2e.py`, `test_api.py`, `test_operator_test_proposals.py` (API route) |
+| Broker submission | AUTOMATED-TEST VERIFIED; ALPACA-PAPER **BLOCKED** (D2) | `test_order_submission.py`, `test_alpaca_broker.py`, `test_failure_handling.py` |
+| Fill and partial-fill recording | AUTOMATED-TEST VERIFIED | `test_paper_lifecycle_e2e.py`, `test_order_submission.py` (partial, terminal partial), `test_reconciliation_service.py` |
+| Cancellation | AUTOMATED-TEST VERIFIED; ALPACA-PAPER **BLOCKED** (D3) | `test_paper_lifecycle_e2e.py`, `test_operator_test_proposals.py` (demo A), cancel race tests |
+| Position-reducing exit | AUTOMATED-TEST VERIFIED | `test_operator_test_proposals.py` (demo C; oversell refused), `test_prototype_guardrails.py` |
+| Reconciliation | AUTOMATED-TEST VERIFIED | `test_paper_lifecycle_e2e.py` (unexplained fill reported), `test_reconciliation_service.py` |
+| Restart recovery | AUTOMATED-TEST VERIFIED | `test_failure_handling.py` (open order and position), `test_autopilot_outages.py` |
+| Risk enforcement | AUTOMATED-TEST VERIFIED | `test_risk_engine.py`, `test_prototype_guardrails.py`, approval re-check in `test_order_submission.py` |
+| Performance reporting | AUTOMATED-TEST VERIFIED | `test_paper_report.py`, `test_equity_and_fill_quality.py` |
+| Shutdown | IMPLEMENTED + AUTOMATED-TEST VERIFIED | `test_autopilot_daemon.py` (cancellation on shutdown), `test_launchd_installer.py` (uninstall order), Panic tests in `test_route_policy.py` |
 
-**The `mcp` advisory.** In affected versions, a Streamable HTTP MCP server
-never reclaims session state, so a reachable client can exhaust memory. This
-project's MCP server runs over **stdio only** (`run_stdio_async`), so that
-path does not apply, and `mcp` is an optional extra the paper prototype does
-not use. The fix is still to upgrade to 1.30.0, a minor release within the
-existing `mcp>=1.2` constraint. That needs a package download and a lock
-change, so it awaits your approval. The finding is not suppressed.
+## 2. Approvals you need to give (one checklist)
 
-## Real versus simulated
+Nothing in this list has been done.
 
-| Part | Real | Simulated or absent |
-|---|---|---|
-| Broker | Alpaca **paper** API only (hard-coded; live rejected at startup) | Paper fills are Alpaca's simulation of execution |
-| Market data | Alpaca historical bars and quotes | — |
-| Strategy | `sma_trend` on completed daily bars | No intraday logic, stops or targets |
-| Orders | Submitted to the paper account after your approval | — |
-| Hermetic tests | — | Alpaca-shaped doubles only; they prove logic, not connectivity |
-| Evaluation | From recorded orders and fills | No fees modeled; no account-equity history (drawdown is realized-only) |
+**S. Database selection**
 
-## Repair transaction
+- **S1.** Choose Option A, B or C in [`database-decision.md`](database-decision.md).
+  The evidence suggests C1 (fresh database plus adopted closed history) if
+  the paper account is flat, otherwise A.
 
-Run in order. Each step names its checkpoint and rollback. Use
-`.venv/bin/python`, not `uv run`: `uv run` silently rebuilds the venv.
+**P. Dependency download**
 
-**0. Inventory (read-only).**
+- **P1.** Download `mcp` 1.30.0 (minor upgrade; every other requirement is
+  already satisfied) and update the lock.
+  - Change: `pyproject.toml` `mcp = ["mcp>=1.30.0,<2"]`, then
+    `uv lock --upgrade-package mcp`.
+  - Effect: CI's `pip-audit` passes, so its migration and mock-drill steps
+    run again.
+  - Risk: low. `mcp` is an optional extra used only by the stdio MCP server.
+  - Rollback: `git revert` the commit.
+
+**L. Local repairs**, in this order, with rollbacks from section 4:
+
+- **L1.** Stop and remove all five old launchd jobs.
+- **L2.** Repair the venv: offline first, may download the six pinned
+  upgrades.
+- **L3.** Repair the worktree links (never prune).
+- **L4.** Designate the checkout.
+- **L5.** Install the app, watchdog and backup jobs. Optional; the manual
+  launch below works without them.
+
+**D. Broker access and orders**, each separately:
+
+- **D1.** Read-only: run preflight, which reads the account, positions and
+  open orders, and reconciles.
+- **D2.** Demonstration B: approve one small paper entry intended to fill,
+  using operator-test settings you choose.
+- **D3.** Demonstration A: approve one paper limit order below the bid, then
+  cancel it.
+- **D4.** Demonstration C: approve one exit of that position.
+- **D5.** Optional: start the daemon in `propose` mode for strategy
+  proposals.
+
+## 3. One-time setup (after S1, L1–L4)
+
+1. Choose the database, following the decision record. Check with
+   `.venv/bin/python -I src/trading_assistant/installation.py status`, which
+   shows the designated checkout, venv, database and launchd lines.
+2. Enable test proposals in `config.yaml`, with values you approve:
+   ```yaml
+   operator_test:
+     enabled: true
+     symbols: [AAPL]
+     max_notional_per_order: 50
+   ```
+3. Run preflight (**D1**): `.venv/bin/python -m trading_assistant.preflight`.
+   The `RUNTIME SUMMARY` comes first: checkout, database, `mode=paper
+   endpoint=https://paper-api.alpaca.markets`, `127.0.0.1:8020`,
+   auto-execution off. Stop on any FAIL or NEEDS-ME. A failed start prints
+   `<role> did not start: <code>. Next: <what to do>`.
+
+## 4. Repairs (L1–L5) with rollback
+
+Record first:
 
 ```bash
 mkdir -m 700 ~/trading-repair-$(date +%Y%m%d)
 cp -p ~/Library/LaunchAgents/com.trading.*.plist ~/trading-repair-$(date +%Y%m%d)/
 launchctl list | grep com.trading > ~/trading-repair-$(date +%Y%m%d)/launchctl-before.txt
-shasum -a 256 "$R/trading_assistant.db" "$R/.worktrees/safety-foundation/trading_assistant.db" \
-  > ~/trading-repair-$(date +%Y%m%d)/db-sha256.txt
 ```
 
-**1. Stop and remove all five launchd jobs [approval].** The stale
-KeepAlive `app` and `daemon` jobs start the moment their old path exists
-again. Remove them before anything else.
+- **L1.** `"$R/scripts/launchd/uninstall.sh"` removes all five jobs, watchdog
+  first. Check that `launchctl list | grep com.trading` prints nothing.
+  Rollback: copy the plists back and `launchctl bootstrap gui/$(id -u) <plist>`
+  each.
+- **L2.**
+  ```bash
+  cp -Rp "$R/.venv" "$R/.venv.backup-$(date +%Y%m%dT%H%M%S)"
+  cd "$R" && uv sync --frozen --all-extras --dev --offline
+  ```
+  If offline fails, the same command without `--offline` downloads; that
+  is a separate approval. Rollback: `rm -rf "$R/.venv"` and rename the
+  backup back.
+- **L3.** Back up `$R/.git/worktrees/safety-foundation/gitdir` and
+  `$R/.worktrees/safety-foundation/.git`, then
+  `git -C "$R" worktree repair "$R/.worktrees/safety-foundation"`. Rollback:
+  copy both files back. Never `prune`.
+- **L4.** `"$R/.venv/bin/python" -I "$R/src/trading_assistant/installation.py" designate`.
+  Rollback: delete
+  `~/Library/Application Support/trading-assistant/installation-root`.
+- **L5.** `"$R/scripts/launchd/install.sh"`. It refuses beside a daemon job,
+  with a stale venv, or with no chosen database, and installs exactly app,
+  watchdog and backup. The watchdog never restarts a daemon that is not a
+  launchd job.
+
+## 5. Normal launch and shutdown
+
+**Launch:**
 
 ```bash
-"$R/scripts/launchd/uninstall.sh"     # watchdog first, then app, daemon, backup, autopilot
-launchctl list | grep com.trading     # expect nothing
-ls ~/Library/LaunchAgents/com.trading.* 2>/dev/null   # expect nothing
+cd ~/Desktop/project/robinhood/trading-assistant
+.venv/bin/python -m trading_assistant.preflight      # read the RUNTIME SUMMARY
+./scripts/start.sh                                   # loopback HTTPS console
+open https://localhost:8020                          # log in with your app token
 ```
 
-Rollback: copy the saved plists back and run `launchctl bootstrap gui/$(id -u) <plist>` for each.
+Optionally, for strategy proposals: set `autopilot.mode: propose`, run
+`./scripts/operator.sh`, then 7 Monitoring, 1 Start, and type
+`START PAPER MONITORING`.
 
-**2. Repair the venv (A3) [approval: may download].**
+**Shutdown:**
+
+1. In the operator terminal: 7 Monitoring, 2 Stop (`STOP PAPER MONITORING`),
+   if the daemon is running.
+2. Then `./scripts/stop.sh`.
+
+Stopping does **not** cancel orders at Alpaca or close positions. Check the
+Orders panel first and cancel anything you do not want left working.
+
+## 6. Demonstrations (D2–D4)
+
+All three use the console's **Operator test proposal** form. Each creates
+one labelled proposal (`OPERATOR TEST (not a strategy signal)`); nothing is
+sent until you approve it under **Pending decisions**. The full risk check
+runs again at approval: allowlist, per-order and per-ticker caps, 3 open
+positions, 5 orders per session, market hours, quote freshness and spread.
+
+**B: entry intended to fill.**
+
+1. Scenario B, symbol AAPL, Market, Notional 25, plus a reason.
+2. Approve it.
+3. Orders shows `submitted`, then `filled` with a broker id; Alpaca
+   positions shows the shares.
+4. Then run Operations, 2 Reconcile in the terminal.
+
+The proposal is refused if the market is closed (`market_closed`); it is
+reported, never queued. A fill is likely but not guaranteed. If it does not
+fill, the order stays `submitted` and you can cancel it. Nothing is changed
+to force a fill.
+
+**A: submit, then cancel.**
+
+1. Scenario A, Limit, quantity 0.1, a limit price a little below the bid
+   (the form refuses one at or above the bid), plus a reason.
+2. Approve it, then **Cancel at broker** in Orders. Expect `canceled`.
+
+It is *expected* to stay unfilled, not guaranteed: if the price drops to
+your limit before the cancel, it fills, fully or partly. The lifecycle
+records whichever happened (a partial fill is reported as such), and an exit
+(C) removes any position.
+
+**C: position-reducing exit.**
+
+1. Scenario C, Market, quantity no larger than the shares held. More is
+   refused (`exit_exceeds_position`), so it cannot open a short.
+2. Approve it.
+3. Expect `filled`, the position reduced or gone, and reconciliation clean.
+
+Afterwards: `.venv/bin/python -m trading_assistant.ops.paper_report --with-encrypted`.
+Test trades appear under `operator_test`, separately from strategy trades.
+
+## 7. What the console shows
+
+| Need | Where |
+|---|---|
+| PAPER mode, live unsupported, endpoint, checkout, database | Runtime and limits |
+| Broker connectivity, quote freshness, daemon, reconciliation, breakers | Environment strip and truth panel |
+| Account (equity, buying power, cash, exposure) | Account |
+| Pending proposals: symbol, side, size, rationale, exit logic; approve or reject | Pending decisions, with an approval dialog that shows the resulting exposure |
+| Order status, partial fills, rejections, cancellations, broker ids | Orders (Cancel at broker for working orders) |
+| Positions | Alpaca positions |
+| Risk limits and why an action was blocked | Runtime and limits; risk log; risk reasons on refused proposals |
+| Last successful synchronization | Truth panel (last confirmed broker contact) |
+| Emergency stop | Panic procedure; see "Stopping, explained" |
+
+**Stopping, explained** (also shown in the console):
+
+- **Stop proposal generation:** stop the daemon. Working orders continue.
+- **Prevent submissions:** do not approve. Panic latches the global breaker;
+  reduce-only exits are still allowed.
+- **Cancel working orders:** per order, or Panic for all.
+- **Close positions:** only by approving an exit. Never automatic.
+
+## 8. Restore from an encrypted backup
 
 ```bash
-cp -Rp "$R/.venv" "$R/.venv.backup-$(date +%Y%m%dT%H%M%S)"
-cd "$R" && uv sync --frozen --all-extras --dev --offline || uv sync --frozen --all-extras --dev
-"$R/.venv/bin/python" -I "$R/src/trading_assistant/installation.py" status   # venv import -> $R/src
+.venv/bin/python -m trading_assistant.ops.restore verify \
+  --artifact .local/encrypted-backups/<artifact>.aesgcm --into .local/restore-$(date +%Y%m%d)
 ```
 
-Try `--offline` first; uv's cache already holds the six security upgrades.
-Rollback: `rm -rf "$R/.venv" && mv "$R/.venv.backup-<ts>" "$R/.venv"`.
+`verify` decrypts into a new private directory and validates:
+authentication, SHA-256, integrity, foreign keys, schema compatibility and
+permissions. It never touches the live database.
 
-**3. Repair the worktree links (A2) [approval].** Repair, never prune.
+To use the restore, stop the app and daemon, then:
 
 ```bash
-cp -p "$R/.git/worktrees/safety-foundation/gitdir" ~/trading-repair-$(date +%Y%m%d)/
-cp -p "$R/.worktrees/safety-foundation/.git" ~/trading-repair-$(date +%Y%m%d)/worktree.git
-git -C "$R" worktree repair "$R/.worktrees/safety-foundation"
-git -C "$R" worktree list --porcelain | grep -c prunable   # expect 0
+.venv/bin/python -m trading_assistant.ops.restore activate --restored <restored.sqlite3> \
+  --restored-sha256 <from verify> --current-sha256 "$(shasum -a 256 trading_assistant.db | cut -c1-64)"
 ```
 
-Rollback: copy both files back.
+The current file is kept as `trading_assistant.db.before-restore-<time>`,
+and the restored file is re-chosen. To roll back: stop, rename the preserved
+file back, then `choose-database --replace`.
 
-**4. Designate the checkout (A1) [approval].**
+## 9. Evaluating the strategy honestly
 
-```bash
-"$R/.venv/bin/python" -I "$R/src/trading_assistant/installation.py" designate
-```
+**The rule (`sma_trend`)** uses completed daily bars and a 320-bar window:
 
-Rollback: delete `~/Library/Application Support/trading-assistant/installation-root`.
+- **Long** when the 20-day SMA is above the 50-day *and* the close is at or
+  above the 200-day; the 200-day filter is skipped if it is unavailable.
+- **Flat** when the 20-day is at or below the 50-day, or the close is below
+  the 200-day.
+- **Hold** (no change) when the 20- or 50-day is missing.
+- **Entry size:** `autopilot.notional_per_trade` (config.yaml: $1,000;
+  consider lowering it).
+- **Exit:** sells only the shares the autopilot's own fills bought.
+- **There is no stop-loss or profit target**
+  (`test_there_is_no_stop_loss_a_deep_drawdown_alone_never_exits`).
 
-**5. Choose the database [approval: your decision].** See
-[`database-decision.md`](database-decision.md). Option A is one command.
+**The report** (`ops.paper_report`):
 
-**6. Preflight [approval: contacts Alpaca paper, read-only; switches the
-chosen database to WAL mode].**
+- Sources are kept apart: `autopilot`, `operator_test`,
+  `human_rule_or_chat`.
+- **Realized P/L** is first-in, first-out over trusted fills, without fees.
+- **Unrealized P/L** uses only `--mark` prices you supply, noted as such.
+- **Realized drawdown** is shown separately from **equity drawdown**, which
+  comes from daemon snapshots every 15 minutes, only while the daemon runs;
+  the largest gap is reported.
+- **Benchmark:** SPY over the same span as the snapshots.
+- **Fill quality:** fill price against the decision-time mid in signed
+  basis points, plus approval and fill delays.
+- **Exposure:** peak gross exposure at cost and from snapshots.
+- **Turnover,** holding periods and trade counts.
 
-```bash
-cd "$R" && .venv/bin/python -m trading_assistant.preflight
-```
+**Out of sample.** `python -m trading_assistant.autopilot backtest` (market
+data only; needs approval like D1) records a real-data backtest with a
+chronological holdout. Do not tune parameters on the period you then
+evaluate.
 
-Expect the `RUNTIME SUMMARY` first: checkout `$R`, database
-`$R/trading_assistant.db`, `mode=paper broker=alpaca
-endpoint=https://paper-api.alpaca.markets`, `app bind: 127.0.0.1:8020`,
-auto-execution off. Then all checks. Stop on any FAIL or NEEDS-ME.
+**What not to conclude.** No fixed number of trades or months establishes
+that the strategy is profitable. Paper fills ignore queue position and
+market impact, and a small sample is dominated by chance. Treat paper
+results as evidence that the system behaves as designed and as a rough check
+against the backtest, not as a forecast.
 
-**7. Start the app manually first [approval: startup reconciles against the
-paper account].** Use launchd only after the demo works.
+## 10. Risk register
 
-```bash
-cd "$R" && ./scripts/start.sh            # stop with ./scripts/stop.sh
-curl --cacert .local/tls/rootCA.pem https://localhost:8020/health/live
-```
+| Risk | Control |
+|---|---|
+| Duplicate orders | `client_order_id` equals the intent key. A lost response, 401, 403, 429 or 5xx on submit becomes *acceptance unknown*, never resubmitted and resolved by key (`test_failure_handling.py`). |
+| Wrong database | Path-and-inode choice enforced by startup, preflight, installer, report, backup and migration; re-choose explicitly after a restore |
+| Stale launchd jobs | Uninstall removes all five, watchdog first; install refuses beside a daemon job. Live until L1 runs |
+| Watchdog loops | Restarts only loaded launchd jobs |
+| Reconciliation failure | Fails closed; drift trips a breaker; never cleared automatically |
+| Accidental live trading | Hard-coded paper endpoint, outbound allowlist, live rejected at startup |
+| Data loss | Old databases untouched; consolidation needs exact-hash acknowledgment; restore activation preserves the replaced file |
+| Runaway orders | Every order needs your approval; caps of 3 open positions and 5 orders per session; per-order notional cap; operator-test notional cap |
+| Snapshot hang | Equity snapshots run outside the safety loop with a timeout |
 
-**8. Later: install launchd jobs [approval].**
-`./scripts/launchd/install.sh` installs exactly app, watchdog and backup. Then
-`launchctl list | grep com.trading` shows exactly those three. The installer
-refuses if a daemon job exists, the venv is stale, or no database is chosen.
+## 11. Known limitations
 
-## Demo plan: one human-approved paper trade, end to end
-
-Preconditions: steps 0–7 done; US market open (closed-market orders are
-rejected); small sizing chosen by you in `config.yaml`, for example
-`autopilot.universe: [AAPL]` and `autopilot.notional_per_trade: 50`.
-
-1. **Real smoke test of submission and cancel [approval].**
-   `cd "$R" && .venv/bin/python -m trading_assistant.ops.paper_drill --symbol AAPL --notional 1.25`
-   submits one tiny limit order priced so it cannot fill, then cancels it.
-   - **You should see:** a submitted and then canceled order. The console's
-     log shows both audit events.
-   - **Success:** the order is canceled at the broker and locally, and no
-     reconciliation drift is reported.
-2. **Preview the decision (read-only market data).**
-   `.venv/bin/python -m trading_assistant.autopilot dry-run` shows what the
-   strategy would do now (signal, action, reason, holdings and data date)
-   and places or records nothing.
-3. **Generate a proposal.** Set `autopilot.mode: propose`. Start the daemon
-   from the operator terminal (`./scripts/operator.sh`, then 7 Monitoring,
-   1 Start, type `START PAPER MONITORING`) **[approval: broker reads and order
-   sync every 15 s]**. About 30 minutes after the open, if the signal is LONG
-   and nothing is held, a proposal appears.
-4. **Review.** In the console's Pending decisions (or terminal 6, 1 List) you
-   see:
-   - symbol, side, notional, order type (market, notional-bounded) and expiry
-     (15 minutes);
-   - **Why:** the rule, SMA values, data date, size reasoning, the exit rule,
-     and the limits re-checked at approval.
-5. **Approve [your action].** Use Review approval, confirm, and give a reason.
-   The risk engine re-runs, then the order is submitted with `client_order_id`
-   equal to its intent key. Or reject it; nothing is sent.
-6. **Watch the outcome.** The daemon syncs every 15 seconds, or use terminal
-   8, 1 Synchronize. Status moves to filled, rejected, canceled or expired.
-7. **Reconcile.** Terminal 8, 2 Reconcile positions. Expect no drift.
-8. **Record and evaluate.**
-   `.venv/bin/python -m trading_assistant.ops.paper_report --mark AAPL=<price>`
-   shows the funnel, fills and P/L. Add `--json ~/trading-repair-<date>/report.json`
-   to keep a copy (written owner-only).
-
-**Success means** every step above is observable: the proposal with its
-rationale, your approval, a broker order id, the terminal status, a recorded
-fill with its order id, no drift, and the report. It says nothing about
-profit.
-
-**If reconciliation fails.** Startup or `Reconcile positions` reports drift,
-for example a position the database never recorded, and a `broker_drift`
-breaker blocks new orders. That is the system failing closed:
-
-1. Do not reset the breaker yet.
-2. Read the drift lines (terminal 8, 3 Redacted logs; console log).
-3. Compare with the Alpaca paper dashboard.
-4. Decide whether the position is legacy (from the other database's history)
-   or unexplained.
-5. If you choose to flatten legacy positions, do it deliberately in the Alpaca
-   dashboard, then re-run reconciliation, and reset the breaker only when it
-   reports clean.
-
-**Stop everything.** Terminal 7, 2 Stop (type `STOP PAPER MONITORING`), then
-`./scripts/stop.sh`. If installed: `./scripts/launchd/uninstall.sh`. In an
-emergency, terminal 9, 1 Panic latches the global breaker and cancels open
-orders.
-
-**Inspect without exposing secrets.**
-
-- `logs/*.runtime.log` are redacted, owner-only and rotated.
-- The report is read-only.
-- For raw counts, use only plaintext columns:
-  `sqlite3 "file:$R/trading_assistant.db?mode=ro" "select status, count(*) from orders group by 1"`.
-- Reasons and evidence are encrypted at rest; read them through the console,
-  the terminal or `paper_report --autopilot-evidence`.
-- Never paste `.env` or Keychain values anywhere.
-
-## Risk register
-
-| Risk | Current control | Residual |
-|---|---|---|
-| Duplicate orders | Intent key equals `client_order_id`; unique idempotency key; submission barrier; a lost response becomes `acceptance_unknown`, never resubmitted, and reconciles by key (tested) | A second machine or account using the same paper keys is outside local control |
-| Wrong database | Explicit choice bound to path and inode; startup, preflight, installer and report refuse anything else (tested) | The backup and migration commands follow the Keychain URL and do not check the choice; run them from `$R` |
-| Stale launchd jobs | Uninstaller removes all five, watchdog first; installer refuses beside a daemon job (tested) | Until step 1 runs, recreating the old path would start the old app and daemon |
-| Watchdog restart loops | Restarts only loaded launchd jobs (tested) | A loaded app that keeps failing is still restarted, throttled by launchd at 10 s |
-| Reconciliation failures | Startup reconciliation fails closed; drift trips a breaker; unexplained fills are surfaced, never absorbed (tested) | Both databases may disagree with the current paper account. Expect drift on first start |
-| Accidental live mode | Paper URL hard-coded; outbound allowlist; live rejected at startup and by the gate | None known in code. Never put live keys in the Keychain |
-| Data loss | Both databases untouched; consolidation needs an exact-hash acknowledgment and makes verified encrypted backups | No restore command exists; a backup restore is a manual, untested procedure |
-| Runaway trading | Approval required (propose mode); 3 open positions; 5 submissions per session; $2,000 per order; daily loss and drawdown breakers | Autonomous `paper` mode stays blocked by the readiness gate |
-
-## Remaining blockers, by impact
-
-1. **Your database decision.** Without it nothing starts.
-2. **CI is red on a new dependency advisory** (`mcp` CVE-2026-59951).
-   Upgrading `mcp` to 1.30.0 needs your approval. The verifier passes; the
-   prototype does not use the affected transport.
-3. **Local repair steps 1–4** need your approval. The venv repair may need a
-   download.
-4. **No real Alpaca run yet.** Connectivity, startup reconciliation against
-   your actual paper account, and the paper drill are unverified.
-5. **Probable drift on first start.** Each database holds positions the other
-   lacks, and the paper account may differ from both.
-6. **No direct human order entry.** Proposals come from the strategy (propose
-   mode), rules, plans, or chat drafts. The demo depends on the strategy
-   signalling LONG.
-7. **No account-equity history.** Drawdown is realized-only. Unrealized P/L
-   needs `--mark` prices or the console.
-8. **No restore command** for encrypted backups.
-
-## What would make its trades good
-
-- **Evidence needed.** A forward record, collected after the fact and not
-  backfilled, of every proposal and why, which you approved or rejected, fill
-  prices against the decision-time price (slippage), exits, and P/L per
-  closed trade. Compare it with a do-nothing or buy-and-hold baseline over the
-  same period, and with a backtest of the same rule over the same window
-  (`autopilot backtest` records one).
-- **Metrics that matter.** Expectancy per trade (average winner × win rate
-  minus average loser × loss rate). Max drawdown relative to exposure.
-  Turnover and slippage. How often the rule is in the market. Behavior in down
-  and sideways regimes. Win rate alone misleads.
-- **Minimum sample.** `sma_trend` trades rarely, roughly a handful of
-  round trips per symbol per year. Even 20 sessions of observation yields few
-  trades. Expect to need at least about 30 closed trades, or several months
-  across a few symbols, before P/L means much. Use the backtest (2+ years with
-  a holdout) for statistical weight and paper trading to check that live
-  behavior matches the backtest.
-- **Do not conclude from a few paper trades** that the strategy is
-  profitable, safe at a larger size, or likely to fill the same way live.
-  Paper fills ignore queue position and market impact, and a few outcomes are
-  dominated by chance.
-- **Honest assessment of the strategy.** `sma_trend` is a slow, long-only,
-  daily trend filter with no stops. It is evaluable: deterministic, explained
-  and backtestable. It is not tuned, has no risk-based exits, and will lag
-  turns. That is acceptable for a prototype whose goal is controlled,
-  observable execution, not returns.
+- Nothing has run against Alpaca paper yet. Every ALPACA-PAPER item is
+  blocked on D1–D4.
+- Proposals expire after 15 minutes; approve promptly.
+- Autopilot orders are notional market orders; operator tests may use
+  limits.
+- Equity snapshots and drawdown cover only daemon uptime.
+- The `mcp` advisory blocks CI's audit, migration and mock-drill steps until
+  P1.
