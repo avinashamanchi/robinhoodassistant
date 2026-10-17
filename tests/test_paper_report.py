@@ -245,3 +245,19 @@ def test_json_export_is_private_from_creation_and_never_overwrites(tmp_path):
     with pytest.raises(FileExistsError):
         paper_report.write_private_json(link, {})
     assert not (tmp_path / "elsewhere.json").exists()
+
+
+def test_an_explicit_database_is_reported_read_only_without_secrets(session_factory, tmp_path, monkeypatch, capsys):
+    from trading_assistant.security import secrets as secrets_module
+
+    _seed(session_factory)
+    monkeypatch.setattr(
+        secrets_module, "load_role_secrets",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no secrets needed")),
+    )
+    before = (tmp_path / "test.db").stat().st_mtime_ns
+
+    assert paper_report.main(["--database", str(tmp_path / "test.db")]) == 0
+
+    assert "PAPER EVALUATION REPORT" in capsys.readouterr().out
+    assert (tmp_path / "test.db").stat().st_mtime_ns == before

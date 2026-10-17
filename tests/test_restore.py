@@ -182,7 +182,9 @@ def test_migration_refuses_an_unchosen_database_but_accepts_an_explicit_file(
     assert observed == []
 
     assert migrate.main(["--database", str(database), "status"]) == 0
-    assert observed == [f"sqlite:///{database.resolve()}"]
+    fresh = tmp_path / "fresh.db"
+    assert migrate.main(["--database", str(fresh), "status"]) == 0  # a new file is allowed
+    assert observed == [f"sqlite:///{database.resolve()}", f"sqlite:///{tmp_path.resolve() / 'fresh.db'}"]
 
 
 def test_backup_refuses_an_unchosen_database(app_config, monkeypatch, tmp_path, capsys):

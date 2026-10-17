@@ -530,6 +530,11 @@ def main(argv: list[str] | None = None) -> int:
         help="also decrypt autopilot evidence, equity snapshots and decision quotes (field keys)",
     )
     parser.add_argument("--json", type=Path)
+    parser.add_argument(
+        "--database",
+        type=Path,
+        help="report on this SQLite file instead of the chosen database (still opened read-only)",
+    )
     args = parser.parse_args(argv)
 
     from ..config import load_config
@@ -537,13 +542,18 @@ def main(argv: list[str] | None = None) -> int:
     from ..security.secrets import load_role_secrets, secret_value
 
     config = load_config()
-    role = "validate-analyst" if args.with_encrypted else "watchdog"
-    secrets = load_role_secrets(role, config=config)
-    try:
-        database = require_chosen_database(secret_value(secrets.database_url))
-    except InstallationError as error:
-        print(f"paper report refused: {error.code}", file=sys.stderr)
-        return 1
+    secrets = None
+    if args.with_encrypted or args.database is None:
+        role = "validate-analyst" if args.with_encrypted else "watchdog"
+        secrets = load_role_secrets(role, config=config)
+    if args.database is not None:
+        database = args.database.resolve(strict=True)
+    else:
+        try:
+            database = require_chosen_database(secret_value(secrets.database_url))
+        except InstallationError as error:
+            print(f"paper report refused: {error.code}", file=sys.stderr)
+            return 1
     factory = read_only_session_factory(database)
     if args.with_encrypted:
         from ..security.crypto import build_sensitive_data_cipher

@@ -241,7 +241,9 @@ def main(
             config=config,
         )
     if args.database is not None:
-        target_url = f"sqlite:///{Path(args.database).resolve(strict=True)}"
+        # The file may not exist yet (a fresh database); its directory must.
+        explicit = Path(args.database).expanduser()
+        target_url = f"sqlite:///{explicit.parent.resolve(strict=True) / explicit.name}"
     elif args.development_environment_secrets:
         target_url = runtime_secrets.database_url
     else:
