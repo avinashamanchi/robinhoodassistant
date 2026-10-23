@@ -4957,23 +4957,27 @@ def _runtime_consolidation_static_fixture() -> str:
         "from trading_assistant.db.schema import require_current_schema\n"
         "from trading_assistant.ops.backup import backup_database\n"
         "from trading_assistant.ops.control import prove_app_absent\n"
-        "from trading_assistant.ops.tenure import RuntimeTenureService\n\n"
-        "PRODUCTION_SOURCE = Path("
-        "'/Users/avi/Desktop/robinhood/trading-assistant/.worktrees/"
-        "safety-foundation')\n"
-        "PRODUCTION_DESTINATION = Path("
-        "'/Users/avi/Desktop/robinhood/trading-assistant')\n"
+        "from trading_assistant.ops.tenure import RuntimeTenureService\n"
+        "from trading_assistant.installation import require_designated\n\n"
         "MIGRATION_UNCERTAIN = 'migration_uncertain'\n\n"
+        "def _production_roots():\n"
+        "    destination = require_designated()\n"
+        "    return (\n"
+        "        destination / '.worktrees' / 'safety-foundation',\n"
+        "        destination,\n"
+        "    )\n\n"
         "def logical_summary(connection):\n"
         "    return connection.execute("
         "'SELECT COUNT(*) FROM probe').fetchone()\n\n"
         "def consolidate_runtime(source_root, destination_root, *, "
         "backup_key, backup_key_id, process_identity, process_inspector):\n"
+        "    production_source, production_destination = "
+        "_production_roots()\n"
         "    source_root = source_root.resolve(strict=True)\n"
         "    destination_root = destination_root.resolve(strict=True)\n"
-        "    assert source_root == PRODUCTION_SOURCE.resolve(strict=True)\n"
+        "    assert source_root == production_source.resolve(strict=True)\n"
         "    assert destination_root == "
-        "PRODUCTION_DESTINATION.resolve(strict=True)\n"
+        "production_destination.resolve(strict=True)\n"
         "    assert source_root.name == 'safety-foundation'\n"
         "    assert source_root.parent.name == '.worktrees'\n"
         "    source = source_root / 'trading_assistant.db'\n"
@@ -5066,10 +5070,12 @@ def test_release_static_gate_authorizes_only_verified_runtime_consolidation(
 @pytest.mark.parametrize(
     ("needle", "replacement"),
     [
+        ("destination = require_designated()", "destination = Path('/srv/x')"),
+        ("destination / '.worktrees' / 'safety-foundation'", "destination"),
         (
-            "/Users/avi/Desktop/robinhood/trading-assistant/.worktrees/"
-            "safety-foundation",
-            "/tmp/safety-foundation",
+            "MIGRATION_UNCERTAIN = 'migration_uncertain'",
+            "MIGRATION_UNCERTAIN = 'migration_uncertain'\n"
+            "LEGACY = '/' + 'x'\nPINNED = '/Users/someone/checkout/x'",
         ),
         ("source_root.parent.name == '.worktrees'", "True"),
         ("os.O_NOFOLLOW", "os.O_RDONLY"),
@@ -5230,3 +5236,41 @@ def test_release_static_gate_rejects_protected_deletion_in_helper(
 
     assert completed.returncode == 1
     assert "PLAINTEXT_RUNTIME_TRANSFER_UNPROVEN" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        pytest.param(
+            "src/trading_assistant/ops/pinned_root.py",
+            "ROOT = '/Users/someone/Desktop/checkout'\n",
+            id="python-module",
+        ),
+        pytest.param(
+            "scripts/launcher.sh",
+            '#!/bin/bash\nPROJECT="/home/someone/checkout"\n',
+            id="shell-launcher",
+        ),
+    ],
+)
+def test_release_static_gate_rejects_hardcoded_checkout_paths(
+    tmp_path,
+    relative_path,
+    source,
+):
+    """A literal checkout path broke every entry point when the repo moved."""
+    root = _static_fixture(tmp_path)
+    _write_fixture_file(root, relative_path, source)
+
+    completed = _run_trust_gate(root)
+
+    assert completed.returncode != 0
+    assert f"HARDCODED_CHECKOUT_PATH {relative_path}" in completed.stderr
+
+
+def test_release_static_gate_accepts_the_repository_without_checkout_paths():
+    findings = __import__(
+        "scripts.check_release_safety", fromlist=["x"]
+    )._scan_hardcoded_checkout_paths(Path(".").resolve())
+
+    assert findings == []

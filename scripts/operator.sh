@@ -1,5 +1,9 @@
 #!/bin/bash -p
-# Launch the fixed-root terminal only after the loopback HTTPS app is proven.
+# Launch the terminal for the designated runtime installation, only after the
+# loopback HTTPS app is proven. The project root is derived from this script's
+# physical location and must equal the operator's designation in
+# "$HOME/Library/Application Support/trading-assistant/installation-root"
+# (see `python -m trading_assistant.installation`).
 set -euo pipefail
 umask 077
 
@@ -29,24 +33,13 @@ unset \
   PYTHONUSERBASE \
   PYTHONWARNINGS
 
-CANONICAL_PROJECT="/Users/avi/Desktop/robinhood/trading-assistant"
+DESIGNATION_RELATIVE="Library/Application Support/trading-assistant/installation-root"
 CURL="/usr/bin/curl"
 LIVENESS_URL="https://localhost:8020/health/live"
 
 if (( $# != 0 )); then
   echo "operator launcher accepts no arguments" >&2
   exit 2
-fi
-
-if [[ "${PWD:-}" != "$CANONICAL_PROJECT" ]]; then
-  echo "run ./scripts/operator.sh from $CANONICAL_PROJECT" >&2
-  exit 1
-fi
-
-PROJECT="$(builtin pwd -P)"
-if [[ "$PROJECT" != "$CANONICAL_PROJECT" || -L "$CANONICAL_PROJECT" ]]; then
-  echo "canonical project root validation failed" >&2
-  exit 1
 fi
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -58,8 +51,58 @@ SCRIPT_DIRECTORY="$(
   builtin cd -P -- "${SCRIPT_PATH%/*}" \
     && builtin pwd -P
 )"
-if [[ "$SCRIPT_DIRECTORY" != "$PROJECT/scripts" ]]; then
-  echo "operator launcher is outside the canonical project root" >&2
+if [[ "$SCRIPT_DIRECTORY" != /*/scripts ]]; then
+  echo "operator launcher is outside a project scripts directory" >&2
+  exit 1
+fi
+LAUNCHER_PROJECT="${SCRIPT_DIRECTORY%/scripts}"
+
+PROJECT="$(builtin pwd -P)"
+if [[ "${PWD:-}" != "$PROJECT" \
+  || "$PROJECT" != "$LAUNCHER_PROJECT" \
+  || -L "$PROJECT" ]]; then
+  echo "run ./scripts/operator.sh from its project root: $LAUNCHER_PROJECT" >&2
+  exit 1
+fi
+
+CURRENT_UID="$(/usr/bin/id -u)"
+if [[ ! "$CURRENT_UID" =~ ^[0-9]+$ ]]; then
+  echo "current user identity is unavailable" >&2
+  exit 1
+fi
+
+if [[ -z "${HOME:-}" || "$HOME" != /* || -L "$HOME" || ! -d "$HOME" ]]; then
+  echo "account home directory is unavailable" >&2
+  exit 1
+fi
+DESIGNATION="$HOME/$DESIGNATION_RELATIVE"
+if [[ ! -f "$DESIGNATION" || -L "$DESIGNATION" ]]; then
+  echo "no designated runtime installation; to designate this checkout run" >&2
+  echo "  .venv/bin/python -m trading_assistant.installation designate" >&2
+  echo "from $PROJECT" >&2
+  exit 1
+fi
+if ! DESIGNATION_METADATA="$(
+  /usr/bin/stat -f '%u:%p:%l' -- "$DESIGNATION"
+)"; then
+  echo "runtime installation designation metadata is unavailable" >&2
+  exit 1
+fi
+IFS=: read -r DESIGNATION_OWNER DESIGNATION_MODE DESIGNATION_LINKS \
+  <<< "$DESIGNATION_METADATA"
+if [[ "$DESIGNATION_OWNER" != "$CURRENT_UID" ]] \
+  || [[ ! "$DESIGNATION_MODE" =~ ^[0-7]+$ ]] \
+  || [[ "$DESIGNATION_LINKS" != "1" ]] \
+  || (( (8#$DESIGNATION_MODE & 0170000) != 0100000 )) \
+  || (( (8#$DESIGNATION_MODE & 0077) != 0 )); then
+  echo "runtime installation designation is not private" >&2
+  exit 1
+fi
+DESIGNATED_PROJECT="$(< "$DESIGNATION")"
+if [[ "$DESIGNATED_PROJECT" != "$PROJECT" ]]; then
+  echo "this checkout is not the designated runtime installation" >&2
+  echo "  this checkout: $PROJECT" >&2
+  echo "  designated:    $DESIGNATED_PROJECT" >&2
   exit 1
 fi
 
@@ -79,12 +122,6 @@ for trusted_directory in \
     exit 1
   fi
 done
-
-CURRENT_UID="$(/usr/bin/id -u)"
-if [[ ! "$CURRENT_UID" =~ ^[0-9]+$ ]]; then
-  echo "current user identity is unavailable" >&2
-  exit 1
-fi
 
 if [[ ! -L "$PY" || ! -x "$PY" ]]; then
   echo "venv python link not found at $PY (run 'uv sync' first)" >&2
@@ -163,6 +200,12 @@ fi
 
 if [[ ! -x "$CURL" ]]; then
   echo "absolute curl dependency is unavailable" >&2
+  exit 1
+fi
+
+if ! "$PY" -I -m trading_assistant.installation check --project "$PROJECT"; then
+  echo "the virtual environment does not run this checkout (stale after a move?)" >&2
+  echo "repair it from $PROJECT with: uv sync --all-extras --dev" >&2
   exit 1
 fi
 

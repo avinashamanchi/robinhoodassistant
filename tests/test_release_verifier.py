@@ -250,8 +250,9 @@ def clean_repository(
     root = tmp_path / "repository"
     versions = root / "migrations" / "versions"
     versions.mkdir(parents=True)
-    (versions / "20260729_0017_release.py").write_text(
-        'revision = "20260729_0017"\n'
+    head = verifier_module.EXPECTED_MIGRATION_HEAD
+    (versions / f"{head}_release.py").write_text(
+        f'revision = "{head}"\n'
         "down_revision = None\n",
         encoding="utf-8",
     )
@@ -1944,3 +1945,13 @@ def test_failed_command_still_rechecks_candidate_tree_before_reporting_failure(
 
     assert result.passed is False
     assert result.detail_code == "DIRTY_TREE"
+
+
+def test_expected_migration_head_tracks_the_repository_head():
+    """A new migration without a verifier re-pin turned CI red for weeks."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+
+    assert verifier_module.EXPECTED_MIGRATION_HEAD == script.get_current_head()

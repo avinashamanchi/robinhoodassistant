@@ -44,18 +44,13 @@ from .db.models import (
     Order,
     OrderStateMachine,
     NONTERMINAL_STATES,
-    PLAN_CANCEL_INDETERMINATE,
-    PLAN_CANCEL_REQUESTED,
-    PLAN_CANCEL_SETTLED,
     Proposal,
     RiskEvent,
     Rule,
     RuleGroup,
-    TERMINAL_STATES,
     fill_has_trusted_identity,
     utcnow,
 )
-from .db.lifecycle_proofs import augment_lifecycle_detail_json
 from .dependencies import RequiredDependencyUnavailable
 from .orders.application import (
     ApprovalCommand,
@@ -69,6 +64,7 @@ from .orders.safety_state import (
     unknown_persisted_safety_truth,
 )
 from .orders.submission import OrderSubmissionService, order_to_request
+from .orders.cancellation import OrderCancellationMixin
 from .orders.startup import (
     StartupReconciliationFailed,
     StartupReconciliationGate,
@@ -82,6 +78,7 @@ from .risk.submission_barrier import (
     serialized_writer,
 )
 from .security.sensitive_fields import persist_sensitive, sensitive_store
+from .service_support import _persist_audit, _require_mutation_context
 
 # Every nonterminal state must remain visible to operators and MCP callers,
 # especially indeterminate outbox states that require reconciliation.
@@ -102,60 +99,6 @@ _RESUMABLE_RULE_GROUP_STATES = ("pending", "active")
 log = logging.getLogger(__name__)
 
 
-def _require_mutation_context(
-    actor: str,
-    reason: str,
-    request_id: str,
-) -> tuple[str, str, str]:
-    actor = actor.strip()
-    reason = reason.strip()
-    request_id = request_id.strip()
-    if not actor or not reason or not request_id:
-        raise ValueError(
-            "mutation actor, reason, and request_id must be non-empty"
-        )
-    return actor, reason, request_id
-
-
-def _persist_audit(
-    session: Session,
-    *,
-    actor: str,
-    action: str,
-    target_type: str,
-    target_id: str,
-    request_id: str,
-    reason: str,
-    result_code: str,
-    idempotency_key: str = "",
-    detail_json: str = "{}",
-    created_at=None,
-    lifecycle_proof: bool = True,
-) -> AuditEvent:
-    if lifecycle_proof:
-        detail_json = augment_lifecycle_detail_json(
-            session,
-            target_type=target_type,
-            target_id=target_id,
-            detail_json=detail_json,
-        )
-    event = AuditEvent(
-        actor=actor,
-        action=action,
-        target_type=target_type,
-        target_id=target_id,
-        request_id=request_id,
-        idempotency_key=idempotency_key,
-        result_code=result_code,
-        created_at=created_at or utcnow(),
-    )
-    persist_sensitive(
-        session,
-        event,
-        {"reason": reason, "detail_json": detail_json},
-    )
-    return event
-
 
 def _persist_risk(
     session: Session,
@@ -169,7 +112,7 @@ def _persist_risk(
     return event
 
 
-class TradingService:
+class TradingService(OrderCancellationMixin):
     def __init__(
         self,
         broker: BrokerClient,
@@ -301,6 +244,10 @@ class TradingService:
         """Return the configured broker clock state for a symbol's asset class."""
         ac = self._asset_class(ticker)
         return self._clock_for(ac).is_open()
+
+    def market_clock(self, asset_class: AssetClass) -> MarketClock:
+        """The configured session clock for an asset class (read-only use)."""
+        return self._clock_for(asset_class)
 
     # ── snapshot assembly (A1) ─────────────────────────────────
     def _realized_pnl_today(
@@ -483,6 +430,21 @@ class TradingService:
                 read_session, [order_req.ticker], ac
             )
             result = self._risk_for(ac).check(order_req, snapshot)
+        # The quote the proposal was judged against, for decision-versus-fill
+        # measurement later (stored encrypted with the proposal's audit event).
+        decision_quote = snapshot.quotes.get(order_req.ticker)
+        decision_detail = (
+            {
+                "decision_quote": {
+                    "bid": str(decision_quote.bid),
+                    "ask": str(decision_quote.ask),
+                    "last": str(decision_quote.last),
+                    "as_of": decision_quote.as_of.isoformat(),
+                }
+            }
+            if decision_quote is not None
+            else {}
+        )
 
         with self.session_factory() as s:
             order = Order(
@@ -559,6 +521,7 @@ class TradingService:
                     request_id=request_id,
                     reason=reason,
                     result_code=order.status,
+                    detail_json=json.dumps(decision_detail, sort_keys=True),
             )
 
             s.commit()
@@ -1814,605 +1777,6 @@ class TradingService:
         )
         return False
 
-    def cancel_live_order(
-        self,
-        order_id: int,
-        *,
-        actor: str,
-        reason: str,
-        request_id: str,
-    ) -> dict[str, Any]:
-        """Cancel a live (SUBMITTED / PARTIALLY_FILLED) order at the broker + DB."""
-        actor, reason, request_id = _require_mutation_context(
-            actor,
-            reason,
-            request_id,
-        )
-        with self.submission_barrier.hold_writer():
-            result = self._cancel_live_order_under_writer(
-                order_id,
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-            )
-            with self.session_factory() as session:
-                _persist_audit(
-                        session,
-                        actor=actor,
-                        action="order.cancel",
-                        target_type="order",
-                        target_id=str(order_id),
-                        request_id=request_id,
-                        reason=reason,
-                        result_code=(
-                            "canceled"
-                            if "error" not in result
-                            else "cancel_failed"
-                        ),
-                        detail_json=json.dumps(
-                            {
-                                "status": result.get("status"),
-                                "has_error": "error" in result,
-                            },
-                            sort_keys=True,
-                        ),
-                )
-                session.commit()
-            return result
-
-    @staticmethod
-    def _record_plan_cancel_state(
-        session: Session,
-        order: Order,
-        state: str,
-        *,
-        actor: str,
-        reason: str,
-        request_id: str,
-        now,
-    ) -> None:
-        if state not in {
-            PLAN_CANCEL_REQUESTED,
-            PLAN_CANCEL_INDETERMINATE,
-            PLAN_CANCEL_SETTLED,
-        }:
-            raise ValueError("invalid durable plan cancellation state")
-        if order.plan_cancel_state == state:
-            return
-        order.plan_cancel_state = state
-        order.updated_at = now
-        order.version += 1
-        _persist_audit(
-                session,
-                actor=actor,
-                action="order.plan_cancel_intent",
-                target_type="order",
-                target_id=str(order.id),
-                request_id=request_id,
-                reason=reason,
-                result_code=state,
-                created_at=now,
-        )
-
-    @serialized_writer
-    def quiesce_trade_plan_orders(
-        self,
-        plan_id: int,
-        *,
-        entry_only: bool = False,
-        actor: str,
-        reason: str,
-        request_id: str,
-    ) -> dict[str, int]:
-        """Make every plan-linked order terminal before rule cancellation."""
-        actor, reason, request_id = _require_mutation_context(
-            actor,
-            reason,
-            request_id,
-        )
-        canceled = 0
-        failed = 0
-        order_ids = (
-            self.rule_repository.plan_entry_nonterminal_order_ids(
-                plan_id
-            )
-            if entry_only
-            else self.rule_repository.plan_nonterminal_order_ids(
-                plan_id
-            )
-        )
-        for order_id in order_ids:
-            with self.session_factory() as session:
-                order = session.get(Order, order_id)
-                if order is None:
-                    failed += 1
-                    continue
-                current = OrderStatus(order.status)
-                if current in {
-                    OrderStatus.PROPOSED,
-                    OrderStatus.APPROVAL_RECORDED,
-                }:
-                    target = (
-                        OrderStatus.CANCELED
-                        if current is OrderStatus.PROPOSED
-                        else OrderStatus.REJECTED
-                    )
-                    OrderStateMachine.transition(order, target)
-                    order.last_error_code = "plan_cancel"
-                    self._record_plan_cancel_state(
-                        session,
-                        order,
-                        PLAN_CANCEL_SETTLED,
-                        actor=actor,
-                        reason=reason,
-                        request_id=request_id,
-                        now=utcnow(),
-                    )
-                    _persist_audit(
-                            session,
-                            actor=actor,
-                            action="order.plan_cancel",
-                            target_type="order",
-                            target_id=str(order_id),
-                            request_id=request_id,
-                            reason=reason,
-                            result_code=target.value,
-                    )
-                    session.commit()
-                    canceled += 1
-                    continue
-                if current not in {
-                    OrderStatus.SUBMITTED,
-                    OrderStatus.PARTIALLY_FILLED,
-                }:
-                    if order.plan_cancel_state not in {
-                        PLAN_CANCEL_REQUESTED,
-                        PLAN_CANCEL_INDETERMINATE,
-                    }:
-                        self._record_plan_cancel_state(
-                            session,
-                            order,
-                            PLAN_CANCEL_REQUESTED,
-                            actor=actor,
-                            reason=reason,
-                            request_id=request_id,
-                            now=utcnow(),
-                        )
-                    trip_in_session(
-                        session,
-                        BreakerScope.broker_drift(),
-                        (
-                            f"plan {plan_id} cancellation found "
-                            f"indeterminate order {order_id} in "
-                            f"state {current.value}"
-                        ),
-                        actor,
-                        request_id=request_id,
-                        audit_reason=reason,
-                    )
-                    session.commit()
-                    failed += 1
-                    continue
-                order.last_error_code = "plan_cancel"
-                if order.plan_cancel_state not in {
-                    PLAN_CANCEL_REQUESTED,
-                    PLAN_CANCEL_INDETERMINATE,
-                }:
-                    self._record_plan_cancel_state(
-                        session,
-                        order,
-                        PLAN_CANCEL_REQUESTED,
-                        actor=actor,
-                        reason=reason,
-                        request_id=request_id,
-                        now=utcnow(),
-                    )
-                _persist_audit(
-                        session,
-                        actor=actor,
-                        action="order.plan_broker_cancel",
-                        target_type="order",
-                        target_id=str(order_id),
-                        request_id=request_id,
-                        reason=reason,
-                        result_code="requested",
-                )
-                session.commit()
-            outcome = self._cancel_live_order_under_writer(
-                order_id,
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-                settle_plan_lifecycle=False,
-            )
-            if "error" in outcome:
-                self.breakers.trip(
-                    BreakerScope.broker_drift(),
-                    (
-                        f"plan {plan_id} cancellation remains "
-                        f"unresolved for order {order_id}"
-                    ),
-                    actor,
-                    request_id=request_id,
-                    audit_reason=reason,
-                )
-                failed += 1
-            else:
-                canceled += 1
-        remaining = len(
-            (
-                self.rule_repository.plan_entry_nonterminal_order_ids(
-                    plan_id
-                )
-                if entry_only
-                else self.rule_repository.plan_nonterminal_order_ids(
-                    plan_id
-                )
-            )
-        )
-        return {
-            "canceled": canceled,
-            # Every still-live row has already contributed to ``failed`` when
-            # its local or broker cancellation could not be confirmed. Keep
-            # the count cardinal rather than double-counting those rows.
-            "failed": max(failed, remaining),
-            "remaining": remaining,
-        }
-
-    @serialized_writer
-    def _cancel_plan_orders_after_exit_fill(
-        self,
-        *,
-        actor: str,
-        reason: str,
-        request_id: str,
-    ) -> dict[str, int]:
-        """Cancel broker-live entries/siblings before a filled exit closes a plan."""
-        canceled = 0
-        failed = 0
-        seen: set[int] = set()
-        while True:
-            candidates = [
-                order_id
-                for order_id in sorted(
-                    set(
-                        self.rule_repository
-                        .plan_order_ids_requiring_broker_cancel()
-                    )
-                    | set(
-                        self.rule_repository
-                        .plan_cancellation_intent_order_ids()
-                    )
-                )
-                if order_id not in seen
-            ]
-            if not candidates:
-                break
-            for order_id in candidates:
-                seen.add(order_id)
-                with self.session_factory() as session:
-                    order = session.get(Order, order_id)
-                    if order is None:
-                        failed += 1
-                        continue
-                    current = OrderStatus(order.status)
-                    if (
-                        current in TERMINAL_STATES
-                        and order.acceptance_state
-                        != FILL_RECONCILIATION_REQUIRED
-                    ):
-                        self._record_plan_cancel_state(
-                            session,
-                            order,
-                            PLAN_CANCEL_SETTLED,
-                            actor=actor,
-                            reason=reason,
-                            request_id=request_id,
-                            now=utcnow(),
-                        )
-                        session.commit()
-                        canceled += 1
-                        continue
-                    if current not in {
-                        OrderStatus.SUBMITTED,
-                        OrderStatus.PARTIALLY_FILLED,
-                    }:
-                        if order.plan_cancel_state not in {
-                            PLAN_CANCEL_REQUESTED,
-                            PLAN_CANCEL_INDETERMINATE,
-                        }:
-                            self._record_plan_cancel_state(
-                                session,
-                                order,
-                                PLAN_CANCEL_REQUESTED,
-                                actor=actor,
-                                reason=reason,
-                                request_id=request_id,
-                                now=utcnow(),
-                            )
-                        trip_in_session(
-                            session,
-                            BreakerScope.broker_drift(),
-                            (
-                                "plan exit requires cancellation of "
-                                f"indeterminate order {order_id} in "
-                                f"state {current.value}"
-                            ),
-                            actor,
-                            request_id=request_id,
-                            audit_reason=reason,
-                        )
-                        session.commit()
-                        failed += 1
-                        continue
-                    if order.last_error_code not in {
-                        "plan_cancel",
-                        "plan_exit_entry_cancel",
-                    }:
-                        order.last_error_code = (
-                            "plan_exit_entry_cancel"
-                        )
-                    if order.plan_cancel_state not in {
-                        PLAN_CANCEL_REQUESTED,
-                        PLAN_CANCEL_INDETERMINATE,
-                    }:
-                        self._record_plan_cancel_state(
-                            session,
-                            order,
-                            PLAN_CANCEL_REQUESTED,
-                            actor=actor,
-                            reason=reason,
-                            request_id=request_id,
-                            now=utcnow(),
-                        )
-                    _persist_audit(
-                            session,
-                            actor=actor,
-                            action="order.plan_broker_cancel",
-                            target_type="order",
-                            target_id=str(order_id),
-                            request_id=request_id,
-                            reason=reason,
-                            result_code="requested",
-                    )
-                    session.commit()
-                outcome = self._cancel_live_order_under_writer(
-                    order_id,
-                    actor=actor,
-                    reason=reason,
-                    request_id=request_id,
-                    settle_plan_lifecycle=False,
-                )
-                if "error" in outcome:
-                    self.breakers.trip(
-                        BreakerScope.broker_drift(),
-                        (
-                            "plan exit cancellation remains "
-                            f"unresolved for order {order_id}"
-                        ),
-                        actor,
-                        request_id=request_id,
-                        audit_reason=reason,
-                    )
-                    failed += 1
-                else:
-                    canceled += 1
-        return {"canceled": canceled, "failed": failed}
-
-    def _cancel_live_order_under_writer(
-        self,
-        order_id: int,
-        *,
-        actor: str,
-        reason: str,
-        request_id: str,
-        settle_plan_lifecycle: bool = True,
-    ) -> dict[str, Any]:
-        with self.session_factory() as s:
-            order = s.get(Order, order_id)
-            if order is None:
-                return {"error": "not found"}
-            if OrderStatus(order.status) not in (
-                OrderStatus.SUBMITTED,
-                OrderStatus.PARTIALLY_FILLED,
-            ):
-                return {"order_id": order_id, "status": order.status,
-                        "error": "order not cancelable in this state"}
-            broker_order_id = order.broker_order_id
-            local_status = order.status
-            if not broker_order_id:
-                return {
-                    "order_id": order_id,
-                    "status": order.status,
-                    "error": "live order has no broker order id",
-                }
-
-        # The process writer is already held, but this read session is closed
-        # before broker I/O. Reconciliation later opens its own short write
-        # transactions and commits exact fill/latch truth before writer release.
-        try:
-            broker_result = self.broker.cancel_order(broker_order_id)
-        except Exception:
-            try:
-                broker_result = self.broker.get_order_status(broker_order_id)
-            except Exception:
-                fault_reason = (
-                    "indeterminate broker cancellation for order "
-                    f"{order_id}"
-                )
-                now = utcnow()
-                # Fail closed first in an independent durable transaction. A
-                # later latch/audit failure must not reopen submissions.
-                self.breakers.trip(
-                    BreakerScope.broker_drift(),
-                    fault_reason,
-                    actor,
-                    now=now,
-                    request_id=request_id,
-                    audit_reason=reason,
-                )
-
-                # The latch and its exact provenance are one transaction. If
-                # either write fails, neither may be visible.
-                with self.session_factory() as session:
-                    order = session.get(Order, order_id)
-                    if order is None:
-                        raise RuntimeError(
-                            "order disappeared during cancellation latch"
-                        )
-                    order.acceptance_state = (
-                        FILL_RECONCILIATION_REQUIRED
-                    )
-                    order.last_error_code = "indeterminate_cancel"
-                    if order.plan_cancel_state in {
-                        PLAN_CANCEL_REQUESTED,
-                        PLAN_CANCEL_INDETERMINATE,
-                    }:
-                        self._record_plan_cancel_state(
-                            session,
-                            order,
-                            PLAN_CANCEL_INDETERMINATE,
-                            actor=actor,
-                            reason=reason,
-                            request_id=request_id,
-                            now=now,
-                        )
-                    else:
-                        order.updated_at = now
-                        order.version += 1
-                    _persist_audit(
-                            session,
-                            actor=actor,
-                            action="order.cancel_latch",
-                            target_type="order",
-                            target_id=str(order_id),
-                            request_id=request_id,
-                            reason=reason,
-                            result_code="indeterminate_cancel",
-                            detail_json=json.dumps(
-                                {
-                                    "acceptance_state": (
-                                        FILL_RECONCILIATION_REQUIRED
-                                    ),
-                                    "error_code": "indeterminate_cancel",
-                                },
-                                sort_keys=True,
-                            ),
-                            created_at=now,
-                    )
-                    session.commit()
-                return {
-                    "order_id": order_id,
-                    "status": local_status,
-                    "error": "broker cancellation could not be confirmed",
-                }
-        broker_status = broker_result.status
-        if settle_plan_lifecycle:
-            sync = self.sync_open_orders(
-                actor=actor,
-                reason=reason,
-                request_id=request_id,
-            )
-        else:
-            sync = self.serialize_reconciliation_report(
-                self.reconciliation.reconcile(
-                    actor=actor,
-                    reason=reason,
-                    request_id=request_id,
-                )
-            )
-        current = self.get_order_status(order_id)
-        with self.session_factory() as session:
-            current_row = session.get(Order, order_id)
-            exact_fill_truth_confirmed = bool(
-                current_row is not None
-                and current_row.acceptance_state
-                != FILL_RECONCILIATION_REQUIRED
-            )
-            terminal_exact = bool(
-                current_row is not None
-                and OrderStatus(current_row.status)
-                in TERMINAL_STATES
-                and exact_fill_truth_confirmed
-            )
-            plan_cancel_settled = bool(
-                terminal_exact
-                and current_row is not None
-                and current_row.plan_cancel_state
-                in {
-                    PLAN_CANCEL_REQUESTED,
-                    PLAN_CANCEL_INDETERMINATE,
-                }
-            )
-            if plan_cancel_settled:
-                self._record_plan_cancel_state(
-                    session,
-                    current_row,
-                    PLAN_CANCEL_SETTLED,
-                    actor=actor,
-                    reason=reason,
-                    request_id=request_id,
-                    now=utcnow(),
-                )
-                session.commit()
-        if (
-            broker_status is OrderStatus.CANCELED
-            and current is not None
-            and current["status"] == OrderStatus.CANCELED.value
-            and exact_fill_truth_confirmed
-        ):
-            return {"order_id": order_id, "status": current["status"]}
-        if (
-            plan_cancel_settled
-            and not settle_plan_lifecycle
-            and current is not None
-        ):
-            return {"order_id": order_id, "status": current["status"]}
-        return {
-            "order_id": order_id,
-            "status": current["status"] if current else None,
-            "error": (
-                "broker cancellation lacks exact fill confirmation"
-                if not exact_fill_truth_confirmed
-                else (
-                    "broker order was not canceled; reported "
-                    f"{broker_status.value}"
-                )
-            ),
-            "sync": sync,
-        }
-
-    def replace_order(
-        self,
-        order_id: int,
-        *,
-        actor: str,
-        reason: str,
-        request_id: str,
-        **new_order,
-    ) -> dict[str, Any]:
-        """Cancel/replace: cancel the live order, then propose a replacement."""
-        actor, reason, request_id = _require_mutation_context(
-            actor,
-            reason,
-            request_id,
-        )
-        cancel = self.cancel_live_order(
-            order_id,
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
-        if "error" in cancel:
-            return {"canceled": cancel, "replacement": None}
-        replacement = self.propose_order(
-            **new_order,
-            actor=actor,
-            reason=reason,
-            request_id=request_id,
-        )
-        return {"canceled": cancel, "replacement": replacement}
-
     def reconcile_positions(
         self,
         *,
@@ -2557,12 +1921,18 @@ class TradingService:
                 .scalars()
                 .all()
             )
+            store = sensitive_store(s, self.session_factory)
             out = []
             for o in rows:
                 d = self._order_dict(o)
                 if o.proposal is not None:
                     d["expires_at"] = o.proposal.expires_at.isoformat()
                     d["expired"] = o.proposal.is_expired()
+                    # Why it was proposed, shown before a human approves it.
+                    try:
+                        d["rationale"] = store.read(o.proposal, "reasoning")
+                    except Exception:
+                        d["rationale"] = "(rationale unavailable)"
                 out.append(d)
             return out
 
@@ -2732,6 +2102,185 @@ class TradingService:
                     else str(order_estimated_notional)
                 ),
                 "quote_observed_at": quote_observed_at,
+            },
+        }
+
+    def recent_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Recent orders with lifecycle detail for the console (read-only)."""
+        working = {
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        with self.session_factory() as s:
+            rows = s.scalars(
+                select(Order).order_by(Order.id.desc()).limit(max(1, min(limit, 200)))
+            ).all()
+            fills: dict[int, list[Fill]] = {}
+            if rows:
+                for fill in s.scalars(
+                    select(Fill).where(Fill.order_id.in_([o.id for o in rows]))
+                ):
+                    fills.setdefault(fill.order_id, []).append(fill)
+            out = []
+            for o in rows:
+                d = self._order_dict(o)
+                done = fills.get(o.id, [])
+                filled = sum((Decimal(f.qty) for f in done), Decimal(0))
+                d.update(
+                    {
+                        "source": (
+                            "operator_test"
+                            if o.idempotency_key.startswith("optest-")
+                            else "autopilot"
+                            if o.idempotency_key.startswith("ap-")
+                            else "human_rule_or_chat"
+                        ),
+                        "approved_at": None if o.approved_at is None else o.approved_at.isoformat(),
+                        "submitted_at": (
+                            None
+                            if o.submission_started_at is None
+                            else o.submission_started_at.isoformat()
+                        ),
+                        "broker_order_id": o.broker_order_id,
+                        "filled_qty": str(filled),
+                        "avg_fill_price": (
+                            None
+                            if not filled
+                            else str(
+                                sum((Decimal(f.qty) * Decimal(f.price) for f in done), Decimal(0))
+                                / filled
+                            )
+                        ),
+                        "last_error_code": o.last_error_code or None,
+                        "acceptance_state": o.acceptance_state,
+                        "cancellable": o.status in working,
+                    }
+                )
+                out.append(d)
+            return out
+
+    def autopilot_overview(self, *, sessions: int = 10) -> dict[str, Any]:
+        """The autopilot's settings, its readiness report and its latest sessions.
+
+        Read-only: evidence comes from the audit log the daemon writes, and the
+        readiness report from the file the daemon refreshes every cycle.
+        """
+        import json as _json
+
+        from .autopilot.decisions import exit_policy, resolve_universe
+        from .autopilot.evidence import EvidenceStore
+        from .autopilot.readiness import REPORT_RELATIVE
+        from .installation import source_root
+
+        autopilot = self.config.autopilot
+        readiness: Any = None
+        try:
+            report = _json.loads((source_root() / REPORT_RELATIVE).read_text(encoding="utf-8"))
+            readiness = {
+                "ready": bool(report.get("ready")),
+                "generated_at": report.get("generated_at"),
+                "observed_sessions": report.get("observed_sessions"),
+                "unmet": [
+                    {"name": r.get("name"), "detail": r.get("detail")}
+                    for r in report.get("requirements", [])
+                    if not r.get("passed")
+                ],
+            }
+        except FileNotFoundError:
+            readiness = {"error": "no readiness report yet (written by the daemon)"}
+        except Exception:
+            readiness = {"error": "readiness report unreadable"}
+        store = EvidenceStore(self.session_factory, actor=f"autopilot:{autopilot.strategy}")
+        records = sorted(store.cycles(), key=lambda r: r.created_at)[-sessions:]
+        history = []
+        for record in reversed(records):
+            detail = record.detail
+            history.append(
+                {
+                    "session": detail.get("session"),
+                    "result": record.result_code,
+                    "execution": detail.get("execution"),
+                    "strategy": detail.get("strategy"),
+                    "decisions": [
+                        {
+                            "symbol": d.get("symbol"),
+                            "signal": d.get("signal"),
+                            "action": d.get("action"),
+                            "reason": d.get("reason"),
+                        }
+                        for d in detail.get("decisions", [])
+                    ],
+                    "orders": detail.get("orders", []),
+                    "intended_actions": detail.get("intended_actions", []),
+                }
+            )
+        return {
+            "mode": autopilot.mode,
+            "strategy": autopilot.strategy,
+            "universe": resolve_universe(self.config),
+            "notional_per_trade": str(autopilot.notional_per_trade),
+            "max_orders_per_day": autopilot.max_orders_per_day,
+            "exit_policy": exit_policy(self.config).describe(),
+            "retry_after_rejection_days": autopilot.retry_after_rejection_days,
+            "readiness": readiness,
+            "sessions": history,
+        }
+
+    def runtime_overview(self) -> dict[str, Any]:
+        """What this runtime is using: checkout, database, broker, limits, modes."""
+        from .installation import (
+            InstallationError,
+            read_database_choice,
+            read_designation,
+        )
+
+        try:
+            checkout: Any = str(read_designation())
+        except InstallationError as error:
+            checkout = {"error": error.code}
+        try:
+            choice = read_database_choice()
+            database: Any = {
+                "path": str(choice["path"]),
+                "chosen_at": choice.get("chosen_at"),
+            }
+        except InstallationError as error:
+            database = {"error": error.code}
+        risk = self.config.risk
+        tests = self.config.operator_test
+        autopilot = self.config.autopilot
+        return {
+            "trading_mode": self.config.trading.mode.value,
+            "broker": self.config.trading.broker.value,
+            "broker_endpoint": (
+                "https://paper-api.alpaca.markets"
+                if self.config.trading.broker.value == "alpaca"
+                else "mock (no network)"
+            ),
+            "live_trading": "unsupported",
+            "checkout": checkout,
+            "database": database,
+            "auto_execute_preapproved_rules": self.config.features.auto_execute_preapproved_rules,
+            "autopilot": {
+                "mode": autopilot.mode,
+                "strategy": autopilot.strategy,
+                "notional_per_trade": str(autopilot.notional_per_trade),
+            },
+            "risk_limits": {
+                "max_notional_per_order": risk.max_notional_per_order,
+                "max_position_per_ticker": risk.max_position_per_ticker,
+                "max_portfolio_exposure": risk.max_portfolio_exposure,
+                "max_open_positions": risk.max_open_positions,
+                "max_orders_per_day": risk.max_orders_per_day,
+                "daily_realized_loss_limit": risk.daily_realized_loss_limit,
+                "max_account_drawdown_pct": risk.max_account_drawdown_pct,
+                "proposal_ttl_minutes": risk.proposal_ttl_minutes,
+                "ticker_allowlist": list(risk.ticker_allowlist),
+            },
+            "operator_test": {
+                "enabled": tests.enabled,
+                "symbols": list(tests.symbols),
+                "max_notional_per_order": tests.max_notional_per_order,
             },
         }
 

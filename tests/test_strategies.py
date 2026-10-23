@@ -17,6 +17,7 @@ from trading_assistant.strategies.breakout import Breakout
 from trading_assistant.strategies.buy_and_hold import BuyAndHold
 from trading_assistant.strategies.rsi_reversion import RsiReversion
 from trading_assistant.strategies.sma_crossover import SmaCrossover
+from trading_assistant.strategies.sma_trend import SmaTrend
 
 TS = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
@@ -38,6 +39,28 @@ def test_sma_crossover():
     assert s.on_bar(_feat(sma_50=110, sma_200=100)).action is SignalAction.BUY
     assert s.on_bar(_feat(sma_50=90, sma_200=100)).action is SignalAction.SELL
     assert s.on_bar(_feat()).action is SignalAction.HOLD  # no SMAs yet
+
+
+def test_sma_trend():
+    s = SmaTrend()
+    assert s.on_bar(_feat(sma_20=105, sma_50=100, sma_200=90)).action is SignalAction.BUY
+    assert s.on_bar(_feat(sma_20=95, sma_50=100)).action is SignalAction.SELL
+    # Short-term lead but price below the long-term trend -> flat.
+    assert (
+        s.on_bar(_feat(sma_20=105, sma_50=100, sma_200=120)).action
+        is SignalAction.SELL
+    )
+    # Without a 200-day average the trend filter is skipped, not failed.
+    assert s.on_bar(_feat(sma_20=105, sma_50=100)).action is SignalAction.BUY
+    # Incomplete inputs must never produce an exit.
+    assert s.on_bar(_feat()).action is SignalAction.HOLD
+    assert s.on_bar(_feat(sma_20=95)).action is SignalAction.HOLD
+
+
+def test_backtest_runner_evaluates_the_autopilot_strategy():
+    from trading_assistant.backtest.runner import STRATEGIES
+
+    assert "sma_trend" in {factory().name for factory in STRATEGIES}
 
 
 def test_rsi_reversion():

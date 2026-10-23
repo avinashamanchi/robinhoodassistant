@@ -283,6 +283,9 @@ ROUTE_POLICIES = (
         broker_read=True,
     ),
     RoutePolicy("GET", "/log", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/orders", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/runtime", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/autopilot", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
         "POST",
         "/killswitch/reset",
@@ -402,6 +405,16 @@ ROUTE_POLICIES = (
         "analysis",
         provider_category="analysis",
         broker_read=True,
+    ),
+    RoutePolicy(
+        "POST",
+        "/proposals/test",
+        AuthLevel.CSRF,
+        "mutation",
+        requires_idempotency=True,
+        audit_mutation=True,
+        broker_read=True,
+        mutation_operation="proposal_batch",
     ),
     RoutePolicy(
         "POST",

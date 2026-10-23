@@ -24,8 +24,21 @@ uv run python -m trading_assistant.preflight
 ```
 
 Idempotent — re-run it after pulling code changes to reload with the new binary.
-It regenerates both plists from the repo's current path, so it works on any
-machine where the repo is checked out and `.venv` exists (`uv sync`). Do not
+It generates every plist from this checkout's physical path, and refuses
+(before creating or loading anything) unless this checkout is the
+**designated installation** and `.venv` imports this checkout:
+
+```bash
+uv run python -m trading_assistant.installation status     # read-only check
+uv run python -m trading_assistant.installation designate  # first time / after a move
+```
+
+launchd keeps the absolute paths it was given, so a job whose
+`WorkingDirectory` no longer exists fails on every run (`launchctl list` shows
+exit `78`). After moving the checkout, repair `.venv` (`uv sync --all-extras
+--dev`, or recreate it), re-designate with `designate --replace`, then re-run
+`uninstall.sh` and this installer. `status` lists every installed job whose
+path is stale. Do not
 install unless `KEYCHAIN`, `LOCAL_TLS`, `FIELD_ENCRYPTION`,
 `OUTBOUND_ORIGINS`, and `INTEGRATIONS_DISABLED` all pass. The five rows execute
 independently even after a Keychain construction/load
@@ -44,6 +57,14 @@ For rotation, keep every writer stopped, configure and prompt for the reviewed
 retained key ID, run the field rotation, complete the coordinated
 active/retained config transition, then audit Keychain and verify all envelopes
 before reinstalling or restarting jobs.
+
+### No trading jobs
+
+No launchd job trades. The autopilot runs only inside the daemon, which the
+operator starts explicitly (`autopilot.mode` in `config.yaml`; see
+`docs/autopilot.md`). `install.sh --with-autopilot` is refused. A
+`com.trading.autopilot` job left by an earlier version would run a retired
+standalone loop. `install.sh` warns about it, and `uninstall.sh` removes it.
 
 ## Remove
 
@@ -94,6 +115,6 @@ launchctl bootout  gui/$(id -u)/com.trading.app
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trading.app.plist
 ```
 
-The checked-in `com.trading.app.plist` / `com.trading.daemon.plist` are reference
-snapshots with absolute paths for this machine; `install.sh` is the source of
-truth and rewrites them on install.
+`install.sh` is the only source of installed plists. The repository no longer
+ships machine-specific reference snapshots: they hard-coded one checkout path
+and went stale when the checkout moved.

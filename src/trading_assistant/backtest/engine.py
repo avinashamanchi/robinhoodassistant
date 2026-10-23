@@ -25,15 +25,19 @@ from ..broker.models import (
 from ..config import BacktestConfig, RiskConfig
 from ..risk.engine import RiskEngine
 from ..signals.features import build_features
+from ..signals.sessions import FEATURE_LOOKBACK, session_date
 from ..strategies.base import SignalAction, Strategy
+from ..strategies.exit_policy import ExitPolicy
 from .data import DataSource
 from .sim_broker import SimBroker, SimFill
 
 TARGET_PCT = 0.95  # fraction of equity a full-size long deploys
-# Feature indicators are causal and need at most ~252 bars (52-week window); a
-# bounded lookback yields identical values while keeping the run O(n·window),
-# not O(n^2). Still strictly <= t, so the no-lookahead guarantee is untouched.
-FEATURE_LOOKBACK = 320
+# Features use a bounded trailing window (shared with live consumers through
+# ``signals.sessions`` so both see the same bars): it keeps the run
+# O(n·window), not O(n^2), and stays strictly <= t, so the no-lookahead
+# guarantee is untouched. Simple averages are window-independent once warm;
+# exponential ones (EMA, MACD, ADX) are not, which is why live decisions must
+# use this exact window too.
 
 
 def permissive_risk_config(symbols: list[str], capital: float = 1e9) -> RiskConfig:
@@ -90,10 +94,14 @@ def run_backtest(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     cancel_check: Callable[[], None] | None = None,
+    exit_policy: Optional[ExitPolicy] = None,
 ) -> BacktestResult:
     """Replay ``symbol``. If ``start``/``end`` are given, only bars in that window
     are traded and scored, but feature views still see all prior history (so a
-    sub-period run gets fair warmup — no cold-start bias)."""
+    sub-period run gets fair warmup — no cold-start bias).
+
+    ``exit_policy`` applies the autopilot's stop-loss and re-entry cooldown
+    (``strategies.exit_policy``) on top of the strategy's signal."""
     symbol = symbol.upper()
     ac = AssetClass.for_symbol(symbol)
     risk_config = risk_config or permissive_risk_config([symbol])
@@ -141,7 +149,12 @@ def run_backtest(
             if cancel_check is not None:
                 cancel_check()
             signal = strategy.on_bar(features)
-            _act(engine_risk, broker, symbol, ac, signal.action, signal.size_hint)
+            action = signal.action
+            if exit_policy is not None:
+                action = _apply_exit_policy(
+                    exit_policy, broker, symbol, ac, action, features.last_close, t
+                )
+            _act(engine_risk, broker, symbol, ac, action, signal.size_hint)
 
         result.equity_curve.append((t, broker.equity()))
         result.regimes.append(regime)
@@ -154,6 +167,35 @@ def run_backtest(
 def _current_qty(broker: SimBroker, symbol: str) -> float:
     pos = broker._pos.get(symbol.upper())
     return pos.qty if pos else 0.0
+
+
+def _last_exit_session(broker: SimBroker, symbol: str, ac: AssetClass):
+    for fill in reversed(broker.fills):
+        if fill.symbol.upper() == symbol and fill.side == OrderSide.SELL.value:
+            return session_date(fill.ts, ac)
+    return None
+
+
+def _apply_exit_policy(
+    policy: ExitPolicy,
+    broker: SimBroker,
+    symbol: str,
+    ac: AssetClass,
+    action: SignalAction,
+    last_close: Optional[float],
+    t: datetime,
+) -> SignalAction:
+    """The same stop-loss and cooldown the autopilot applies (see exit_policy)."""
+    position = broker._pos.get(symbol)
+    if position is not None and position.qty > 0:
+        if policy.stop_triggered(position.avg, last_close):
+            return SignalAction.SELL
+        return action
+    if action is SignalAction.BUY and policy.cooling_down(
+        _last_exit_session(broker, symbol, ac), session_date(t, ac)
+    ):
+        return SignalAction.HOLD
+    return action
 
 
 def _act(

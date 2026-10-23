@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
+from ..ops.equity import EquitySnapshotRecorder
 from ..app.limits import LimitStoreUnavailable
 from ..config import load_config
 from ..notifications.base import build_notifier
@@ -91,7 +92,11 @@ def _finish_monitor(
         from decimal import Decimal
 
         from ..analyst.analyst import Analyst
-        from ..analyst.live_features import build_live_feature_provider, build_screen_source
+        from ..analyst.live_features import (
+            RefreshingScreenSource,
+            build_live_feature_provider,
+            build_screen_source,
+        )
         from ..analyst.planning import PlanningService
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
@@ -131,12 +136,14 @@ def _finish_monitor(
             secrets,
         )
         universe = config.screener.universe or config.risk.ticker_allowlist
-        screen_source = build_screen_source(
-            [s.upper() for s in universe],
-            secrets,
-            config=config,
-            runtime_role="daemon",
-            **historical_kwargs,
+        screen_source = RefreshingScreenSource(
+            lambda: build_screen_source(
+                [s.upper() for s in universe],
+                secrets,
+                config=config,
+                runtime_role="daemon",
+                **historical_kwargs,
+            )
         )
 
         def _price(sym: str):
@@ -165,6 +172,15 @@ def _finish_monitor(
 
         shadow = ShadowRunner(service, planning, screen_source, _price, top_n=3)
 
+    autopilot = _build_autopilot_runner(
+        config,
+        secrets,
+        container=container,
+        runtime_tenure_guard=runtime_tenure_guard,
+        historical_alpaca_client_factory=historical_alpaca_client_factory,
+        historical_cache_dir=historical_cache_dir,
+    )
+
     return Monitor(
         service,
         notifier,
@@ -185,6 +201,72 @@ def _finish_monitor(
             None,
         ),
         runtime_tenure_guard=runtime_tenure_guard,
+        autopilot=autopilot,
+        autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
+        equity_recorder=EquitySnapshotRecorder(service),
+    )
+
+
+def _build_autopilot_runner(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    container,
+    runtime_tenure_guard,
+    historical_alpaca_client_factory,
+    historical_cache_dir,
+):
+    """The daemon is the single owner of autopilot scheduling and orders."""
+    if config.autopilot.mode == "off":
+        return None
+    from datetime import timedelta
+
+    from ..analyst.live_features import build_live_feature_provider
+    from ..autopilot import Autopilot, AutopilotDisabled, autopilot_config_problems
+    from ..autopilot.decisions import exit_policy, require_paper, resolve_universe
+    from ..autopilot.evidence import EvidenceStore
+    from ..autopilot.runner import AutopilotRunner
+    from ..installation import source_root
+
+    require_paper(config)
+    problems = autopilot_config_problems(config)
+    if problems:
+        raise AutopilotDisabled(
+            "autopilot configuration cannot trade: " + "; ".join(problems)
+        )
+    service = container.service
+    autopilot = Autopilot(
+        service,
+        build_live_feature_provider(
+            config,
+            secrets,
+            scheduled_service=service,
+            rate_limiter=container.rate_limiter,
+            alpaca_client_factory=historical_alpaca_client_factory,
+            cache_dir=historical_cache_dir,
+            runtime_role="daemon",
+            require_market_clock=True,
+        ),
+        universe=resolve_universe(config),
+        notional_per_trade=config.autopilot.notional_per_trade,
+        max_orders_per_day=config.autopilot.max_orders_per_day,
+        strategy=config.autopilot.strategy,
+        dry_run=True,
+        max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        exit_policy=exit_policy(config),
+        retry_after_rejection_days=config.autopilot.retry_after_rejection_days,
+        tenure_guard=runtime_tenure_guard,
+    )
+    return AutopilotRunner(
+        config=config,
+        service=service,
+        autopilot=autopilot,
+        store=EvidenceStore(
+            container.session_factory,
+            actor=f"autopilot:{config.autopilot.strategy}",
+        ),
+        root=source_root(),
+        tenure_guard=runtime_tenure_guard,
     )
 
 

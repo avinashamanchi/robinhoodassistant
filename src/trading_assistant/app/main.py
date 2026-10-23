@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, timedelta
+from decimal import Decimal
 import json
 from pathlib import Path
 import re
@@ -262,6 +263,23 @@ class AnalyzeIn(BaseModel):
 
 class ProposeIn(BaseModel):
     n: int = 3
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value.strip()
+
+
+class OperatorTestProposalIn(BaseModel):
+    scenario: Literal["non_marketable", "entry", "exit"]
+    symbol: str
+    order_type: Literal["limit", "market"]
+    qty: Optional[Decimal] = None
+    notional: Optional[Decimal] = None
+    limit_price: Optional[Decimal] = None
     reason: str
 
     @field_validator("reason")
@@ -566,6 +584,7 @@ def _create_app(
                 build_live_feature_provider(
                     service.config,
                     runtime_secrets,
+                    market_clock=service.market_clock,
                 ),
                 runtime_secrets,
             )
@@ -866,11 +885,70 @@ def _create_app(
     ):
         return {"pending": service.get_pending()}
 
+    @app.get("/orders")
+    def list_orders(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return {"orders": service.recent_orders()}
+
+    @app.get("/autopilot")
+    def autopilot_overview(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return service.autopilot_overview()
+
+    @app.get("/runtime")
+    def runtime(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return service.runtime_overview()
+
     @app.get("/rules")
     def list_rules(
         principal: SessionPrincipal = Depends(current_principal),
     ):
         return {"rules": service.list_rules()}
+
+    @app.post("/proposals/test")
+    def propose_operator_test_order(
+        body: OperatorTestProposalIn,
+        request: Request,
+        principal: SessionPrincipal = Depends(csrf_protected),
+    ):
+        """Create one labelled operator test proposal (paper only). Never submits."""
+        from ..orders.operator_test import (
+            OperatorTestRefused,
+            OperatorTestRequest,
+            propose_operator_test,
+        )
+
+        context = _mutation(
+            request,
+            principal,
+            body.reason,
+            "http.operator_test_proposal",
+            "order",
+            body.symbol.upper(),
+        )
+        try:
+            return propose_operator_test(
+                service,
+                OperatorTestRequest(
+                    scenario=body.scenario,
+                    symbol=body.symbol,
+                    order_type=body.order_type,
+                    qty=body.qty,
+                    notional=body.notional,
+                    limit_price=body.limit_price,
+                ),
+                actor=context.actor,
+                reason=context.reason,
+                request_id=context.request_id,
+            )
+        except OperatorTestRefused as refused:
+            raise ApiError(refused.code, 409, refused.message) from None
+        except RequiredDependencyUnavailable:
+            raise _dependency_unavailable() from None
 
     @app.get("/pending/{order_id}/confirmation")
     def pending_confirmation(
@@ -1344,12 +1422,18 @@ def _create_app(
             sec = _secrets_holder.get("s")
             if sec is None:
                 raise _dependency_unavailable()
-            from ..analyst.live_features import build_screen_source
+            from ..analyst.live_features import (
+                RefreshingScreenSource,
+                build_screen_source,
+            )
 
             try:
-                screen_source = build_screen_source(
-                    [s.upper() for s in universe],
-                    sec,
+                screen_source = RefreshingScreenSource(
+                    lambda: build_screen_source(
+                        [s.upper() for s in universe],
+                        sec,
+                        market_clock=service.market_clock,
+                    )
                 )
             except RequiredDependencyUnavailable:
                 raise _dependency_unavailable() from None

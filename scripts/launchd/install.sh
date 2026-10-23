@@ -1,18 +1,69 @@
 #!/usr/bin/env bash
-# Install the loopback HTTPS app, watchdog, and backup jobs. The daemon is not
-# installed here; it remains an explicit operator workflow after preflight.
+# Install the loopback HTTPS app, watchdog, and backup jobs. By default the
+# daemon is not installed; it remains an explicit operator workflow after
+# preflight.
 #
-#   ./scripts/launchd/install.sh          # install + load
-#   ./scripts/launchd/uninstall.sh        # stop + remove
+#   ./scripts/launchd/install.sh                  # install + load
+#   ./scripts/launchd/install.sh --with-daemon    # also run the daemon as a job
+#   ./scripts/launchd/uninstall.sh                # stop + remove
+#
+# --with-daemon is the operator's explicit choice to keep the daemon (and so
+# the autopilot, in whatever autopilot.mode config.yaml and config.local.yaml
+# set) running at login, restarted after a crash at most every 5 minutes and
+# by the watchdog when its heartbeat goes stale. The daemon still refuses to
+# start unless it is paper-only, on the chosen database, with a current
+# schema and a clean startup reconciliation.
 set -euo pipefail
 umask 077
 
-PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WITH_DAEMON=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-daemon) WITH_DAEMON=1 ;;
+    --with-autopilot)
+      echo "error: --with-autopilot was retired: the daemon hosts the autopilot" >&2
+      echo "       (autopilot.mode observe|paper); no scheduled trading job exists" >&2
+      exit 2
+      ;;
+    *) echo "error: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PY="$PROJ/.venv/bin/python"
 LA="$HOME/Library/LaunchAgents"
 UID_="$(id -u)"
 
 [ -x "$PY" ] || { echo "error: venv python not found at $PY (run 'uv sync' first)"; exit 1; }
+
+# Before any side effect: every generated job runs from $PROJ, so it must be
+# the operator's designated runtime installation, its venv must import this
+# checkout (a moved checkout's venv still imports the old path), and its
+# trading_assistant.db must be the explicitly chosen runtime database (an app
+# job against an unchosen database would refuse to start and restart forever). The
+# check is the stdlib-only module run as a file, so it works even when the
+# package cannot be imported.
+if ! "$PY" -I "$PROJ/src/trading_assistant/installation.py" check \
+    --project "$PROJ" --venv-python "$PY" --require-database; then
+  echo "error: refusing to install launchd jobs for $PROJ" >&2
+  echo "       inspect: $PY -I $PROJ/src/trading_assistant/installation.py status" >&2
+  exit 1
+fi
+
+# A daemon job (from an earlier installer) would start the daemon, with broker
+# access and the autopilot's configured mode, at every login, and the watchdog
+# installed below would restart it. The daemon is an explicit operator
+# workflow, so refuse until such a job is removed.
+loaded_jobs="$(launchctl list 2>/dev/null || true)"
+if [ "$WITH_DAEMON" = 0 ] && { [ -e "$LA/com.trading.daemon.plist" ] || [ -L "$LA/com.trading.daemon.plist" ] \
+   || printf '%s\n' "$loaded_jobs" | awk '$3 == "com.trading.daemon" { found = 1 } END { exit !found }'; }; then
+  echo "error: a com.trading.daemon launchd job is installed; it would start the" >&2
+  echo "       daemon at login without an operator. Remove it first:" >&2
+  echo "       $PROJ/scripts/launchd/uninstall.sh" >&2
+  echo "       (or reinstall it deliberately with --with-daemon)" >&2
+  exit 1
+fi
+
 mkdir -p "$LA" "$PROJ/logs" "$PROJ/.local/encrypted-backups"
 chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 [ ! -f "$PROJ/.env" ] || chmod 600 "$PROJ/.env"
@@ -106,9 +157,41 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
   echo "loaded $label"
 }
 
+emit_daemon () {  # restart only after an unsuccessful exit, at most every 5 minutes
+  local label="com.trading.daemon"
+  local plist="$LA/$label.plist"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$label"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>ProgramArguments</key>\n  <array>\n'
+    printf '    <string>%s</string>\n' "$PY" "-m" "trading_assistant.daemon.main"
+    printf '  </array>\n'
+    printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    printf '  <key>Umask</key><integer>63</integer>\n'
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n'
+    printf '  <key>ThrottleInterval</key><integer>300</integer>\n'
+    printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+    printf '  <key>StandardErrorPath</key><string>/dev/null</string>\n'
+    printf '</dict></plist>\n'
+  } > "$plist"
+  reload_plist "$label" "$plist"
+  echo "loaded $label"
+}
+
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
+if [ "$WITH_DAEMON" = 1 ]; then
+  emit_daemon
+fi
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
 emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
+if [ -f "$LA/com.trading.autopilot.plist" ]; then
+  echo "note: a retired com.trading.autopilot job is still installed; it would run"
+  echo "      the removed standalone loop. Remove it with scripts/launchd/uninstall.sh"
+fi
 
 sleep 6
 echo "=== status ==="

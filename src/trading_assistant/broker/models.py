@@ -413,6 +413,10 @@ class PortfolioSnapshot:
     # opposite sides are deliberately never netted.
     pending_signed_notional: dict[str, Decimal] = field(default_factory=dict)
     pending_exposure_complete: bool = True
+    # Orders of this asset class whose broker submission started in the
+    # current session. None means unknown, which blocks new orders when a
+    # daily order limit is configured.
+    orders_submitted_today: int | None = None
 
     def _marked_position_value(self, ticker: str) -> Decimal | None:
         symbol = ticker.upper()
