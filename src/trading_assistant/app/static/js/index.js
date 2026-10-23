@@ -1809,6 +1809,63 @@ function describeLocation(value) {
   return readable(value);
 }
 
+function describeSession(entry) {
+  const acted = (entry.decisions || []).filter((d) => d.action && d.action !== "none");
+  const skipped = (entry.decisions || []).filter((d) => !d.action || d.action === "none");
+  const parts = [`${readable(entry.result)} (${readable(entry.execution)})`];
+  if (acted.length) {
+    parts.push(acted.map((d) => `${d.action} ${d.symbol}: ${readable(d.reason)}`).join(", "));
+  }
+  const reasons = {};
+  for (const d of skipped) {
+    reasons[d.reason] = (reasons[d.reason] || 0) + 1;
+  }
+  const summary = Object.entries(reasons).map(([reason, count]) => `${readable(reason)} ×${count}`).join(", ");
+  if (summary) {
+    parts.push(`no action: ${summary}`);
+  }
+  return parts.join(" · ");
+}
+
+async function refreshAutopilot() {
+  const target = byId("autopilot-overview");
+  if (!target) {
+    return;
+  }
+  let overview;
+  try {
+    overview = await api("/autopilot");
+  } catch (error) {
+    clear(target);
+    target.appendChild(node("p", "Autopilot details are unavailable.", "empty-state"));
+    throw error;
+  }
+  clear(target);
+  const readiness = overview.readiness || {};
+  let readinessText;
+  if (readiness.error) {
+    readinessText = readiness.error;
+  } else if (readiness.ready) {
+    readinessText = `READY · ${readable(readiness.observed_sessions)} observed sessions`;
+  } else {
+    readinessText = "NOT READY · " + (readiness.unmet || []).map((r) => `${r.name}: ${r.detail}`).join("; ");
+  }
+  target.append(
+    labelled("Mode", `${readable(overview.mode)} · ${readable(overview.strategy)} · $${readable(overview.notional_per_trade)} per entry · at most ${readable(overview.max_orders_per_day)} orders per session`),
+    labelled("Universe", listText(overview.universe)),
+    labelled("Exits", `${readable(overview.exit_policy)} · a refused order is not retried for ${readable(overview.retry_after_rejection_days)} days`),
+    labelled("Readiness", readinessText),
+  );
+  const sessions = overview.sessions || [];
+  if (!sessions.length) {
+    target.appendChild(node("p", "No autopilot session recorded yet. The daemon runs one cycle per market session.", "empty-state"));
+    return;
+  }
+  for (const entry of sessions) {
+    target.appendChild(labelled(`Session ${readable(entry.session)}`, describeSession(entry)));
+  }
+}
+
 async function refreshRuntime() {
   const target = byId("runtime-overview");
   if (!target) {
@@ -1967,6 +2024,7 @@ async function refreshAll() {
     refreshHoldings(),
     refreshRiskLog(),
     refreshRuntime(),
+    refreshAutopilot(),
     refreshOrders(),
   ];
   const results = await Promise.allSettled(jobs);

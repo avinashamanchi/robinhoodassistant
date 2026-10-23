@@ -2159,6 +2159,73 @@ class TradingService(OrderCancellationMixin):
                 out.append(d)
             return out
 
+    def autopilot_overview(self, *, sessions: int = 10) -> dict[str, Any]:
+        """The autopilot's settings, its readiness report and its latest sessions.
+
+        Read-only: evidence comes from the audit log the daemon writes, and the
+        readiness report from the file the daemon refreshes every cycle.
+        """
+        import json as _json
+
+        from .autopilot.decisions import exit_policy, resolve_universe
+        from .autopilot.evidence import EvidenceStore
+        from .autopilot.readiness import REPORT_RELATIVE
+        from .installation import source_root
+
+        autopilot = self.config.autopilot
+        readiness: Any = None
+        try:
+            report = _json.loads((source_root() / REPORT_RELATIVE).read_text(encoding="utf-8"))
+            readiness = {
+                "ready": bool(report.get("ready")),
+                "generated_at": report.get("generated_at"),
+                "observed_sessions": report.get("observed_sessions"),
+                "unmet": [
+                    {"name": r.get("name"), "detail": r.get("detail")}
+                    for r in report.get("requirements", [])
+                    if not r.get("passed")
+                ],
+            }
+        except FileNotFoundError:
+            readiness = {"error": "no readiness report yet (written by the daemon)"}
+        except Exception:
+            readiness = {"error": "readiness report unreadable"}
+        store = EvidenceStore(self.session_factory, actor=f"autopilot:{autopilot.strategy}")
+        records = sorted(store.cycles(), key=lambda r: r.created_at)[-sessions:]
+        history = []
+        for record in reversed(records):
+            detail = record.detail
+            history.append(
+                {
+                    "session": detail.get("session"),
+                    "result": record.result_code,
+                    "execution": detail.get("execution"),
+                    "strategy": detail.get("strategy"),
+                    "decisions": [
+                        {
+                            "symbol": d.get("symbol"),
+                            "signal": d.get("signal"),
+                            "action": d.get("action"),
+                            "reason": d.get("reason"),
+                        }
+                        for d in detail.get("decisions", [])
+                    ],
+                    "orders": detail.get("orders", []),
+                    "intended_actions": detail.get("intended_actions", []),
+                }
+            )
+        return {
+            "mode": autopilot.mode,
+            "strategy": autopilot.strategy,
+            "universe": resolve_universe(self.config),
+            "notional_per_trade": str(autopilot.notional_per_trade),
+            "max_orders_per_day": autopilot.max_orders_per_day,
+            "exit_policy": exit_policy(self.config).describe(),
+            "retry_after_rejection_days": autopilot.retry_after_rejection_days,
+            "readiness": readiness,
+            "sessions": history,
+        }
+
     def runtime_overview(self) -> dict[str, Any]:
         """What this runtime is using: checkout, database, broker, limits, modes."""
         from .installation import (

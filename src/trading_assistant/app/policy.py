@@ -285,6 +285,7 @@ ROUTE_POLICIES = (
     RoutePolicy("GET", "/log", AuthLevel.SESSION, "session_read"),
     RoutePolicy("GET", "/orders", AuthLevel.SESSION, "session_read"),
     RoutePolicy("GET", "/runtime", AuthLevel.SESSION, "session_read"),
+    RoutePolicy("GET", "/autopilot", AuthLevel.SESSION, "session_read"),
     RoutePolicy(
         "POST",
         "/killswitch/reset",

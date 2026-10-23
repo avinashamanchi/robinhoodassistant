@@ -891,6 +891,12 @@ def _create_app(
     ):
         return {"orders": service.recent_orders()}
 
+    @app.get("/autopilot")
+    def autopilot_overview(
+        principal: SessionPrincipal = Depends(current_principal),
+    ):
+        return service.autopilot_overview()
+
     @app.get("/runtime")
     def runtime(
         principal: SessionPrincipal = Depends(current_principal),
