@@ -100,7 +100,7 @@ def run(argv=None) -> int:
     p.add_argument("--yes", action="store_true", help="skip the >$5 confirmation")
     args = p.parse_args(argv)
 
-    config = load_config("config.yaml")
+    config = load_config()
     secrets = load_role_secrets(
         "validate-analyst",
         config=config,

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import re
 
-from .config import BrokerKind, TradingMode, load_config
+from .config import BrokerKind, TradingMode, config_sources, load_config
 from .db.schema import SchemaOutOfDate
 from .security.secrets import (
     MacOSKeychainSecretProvider,
@@ -401,6 +401,7 @@ def _database_choice(secrets: RuntimeSecrets) -> Result:
 
 def _runtime_summary(config, database: Result) -> list[str]:
     """What the runtime will use, printed before any result."""
+    from .autopilot.decisions import exit_policy
     from .broker.alpaca import _OFFICIAL_PAPER_TRADING_URL
     from .installation import InstallationError, read_designation
 
@@ -415,7 +416,10 @@ def _runtime_summary(config, database: Result) -> list[str]:
         f"  trading:         mode={config.trading.mode.value} broker={config.trading.broker.value}"
         f" endpoint={_OFFICIAL_PAPER_TRADING_URL}",
         f"  app bind:        {config.server.bind_host}:{config.server.port}",
-        f"  autopilot:       mode={config.autopilot.mode} strategy={config.autopilot.strategy}",
+        f"  config:          {' + '.join(source.name for source in config_sources())}",
+        f"  autopilot:       mode={config.autopilot.mode} strategy={config.autopilot.strategy}"
+        f" notional=${config.autopilot.notional_per_trade}",
+        f"  autopilot exits: {exit_policy(config).describe()}",
         f"  auto-execution:  pre-approved rules="
         f"{'ON' if config.features.auto_execute_preapproved_rules else 'off'}",
     ]
@@ -423,7 +427,7 @@ def _runtime_summary(config, database: Result) -> list[str]:
 
 def _config_parses() -> Result:
     try:
-        load_config("config.yaml")
+        load_config()
         return Result("config.yaml parses (extra=forbid)", PASS)
     except Exception as e:
         return Result("config.yaml parses", FAIL, _safe_exception_code(e))
@@ -741,7 +745,7 @@ def run(
 ) -> int:
     from .logging import runtime_startup
 
-    config = load_config("config.yaml")
+    config = load_config()
     selected_provider: SecretProvider | None = provider
     if selected_provider is None:
         factory = provider_factory or MacOSKeychainSecretProvider

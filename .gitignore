@@ -1,5 +1,7 @@
 # Secrets — never commit
 .env
+# Machine-specific overrides merged over config.yaml (see config.load_config)
+config.local.yaml
 .local/
 
 # Python
