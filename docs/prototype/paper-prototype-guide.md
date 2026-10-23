@@ -21,9 +21,9 @@ Status labels:
 
 | Area | Status | Evidence |
 |---|---|---|
-| Installation and startup | IMPLEMENTED + AUTOMATED-TEST VERIFIED; **BLOCKED** locally (approvals L1–L5) | `test_installation.py`, `test_launchd_installer.py`, `test_bootstrap.py`, `test_launch.py` (preflight summary), `test_startup_help.py` |
-| Database selection and recovery | AUTOMATED-TEST VERIFIED; selection **BLOCKED** (decision S1) | `test_installation.py` (choose-database), `test_bootstrap.py` (wrong, unchosen and replaced files refused), `test_restore.py` (restore, activate, backup and migrate guards), `test_runtime_consolidation.py` |
-| Dependency and security checks | **BLOCKED** (download P1). Verifier passes; `pip-audit` fails on `mcp` 1.28.1 (GHSA-84m7-p3x7-pcfv) | CI run 38856236602; advisory verified with the GitHub advisory API and PyPI metadata |
+| Installation and startup | AUTOMATED-TEST VERIFIED; repairs L1–L4 done on 2026-10-22; optional `--with-daemon` job added | `test_installation.py`, `test_launchd_installer.py`, `test_bootstrap.py`, `test_launch.py` (preflight summary), `test_startup_help.py` |
+| Database selection and recovery | AUTOMATED-TEST VERIFIED; Option C chosen and executed 2026-10-22 (fresh database); a real encrypted backup restored and validated in isolation | `test_installation.py` (choose-database), `test_bootstrap.py` (wrong, unchosen and replaced files refused), `test_restore.py` (restore, activate, backup and migrate guards), `test_runtime_consolidation.py` |
+| Dependency and security checks | IMPLEMENTED: `mcp` 1.30.0 (GHSA-84m7-p3x7-pcfv fixed); CI result pending the next push | `uv.lock`; earlier CI runs 38856236602 and 38951855379 failed only on that advisory |
 | Proposal creation | AUTOMATED-TEST VERIFIED | `test_operator_test_proposals.py`, `test_autopilot_daemon.py` (propose mode), `test_paper_lifecycle_e2e.py` |
 | Human approval and rejection | AUTOMATED-TEST VERIFIED | `test_paper_lifecycle_e2e.py`, `test_api.py`, `test_operator_test_proposals.py` (API route) |
 | Broker submission | AUTOMATED-TEST VERIFIED; ALPACA-PAPER **BLOCKED** (D2) | `test_order_submission.py`, `test_alpaca_broker.py`, `test_failure_handling.py` |
@@ -243,7 +243,39 @@ file back, then `choose-database --replace`.
 
 ## 9. Evaluating the strategy honestly
 
-**The rule (`sma_trend`)** uses completed daily bars and a 320-bar window:
+**Exit policy (both strategies).** `autopilot.stop_loss_pct` sells the
+autopilot's own shares once a completed daily close is at or below the
+average entry price less that percentage; `autopilot.reentry_cooldown_days`
+blocks re-buying a name for that many calendar days after selling it. Both
+are applied identically by the backtester (`strategies/exit_policy.py`). A
+gap down fills below the stop price. After the risk engine refuses an
+autopilot order, the same symbol and side is not proposed again for
+`retry_after_rejection_days`, and nothing is proposed while a broker-drift,
+global, loss or drawdown latch is tripped.
+
+**Development-window results (2026-10-23).** Seven allowlisted names, daily
+Alpaca bars, 2017-08 to 2025-10 in two halves; the last 12 months were not
+used. Mean per-symbol total return, mean max drawdown, round trips:
+
+| Rule | First half | Second half |
+|---|---|---|
+| Buy and hold | 349%, −40%, 0 | 165%, −53%, 0 |
+| `sma_trend` | 103%, −32%, 94 | 88%, −31%, 101 |
+| `sma_crossover` (50/200) | 267%, −39%, 16 | 130%, −35%, 19 |
+| `sma_crossover`, 20% stop, 30-day cooldown | 264%, −39%, 16 | 130%, −35%, 20 |
+
+What this does and does not say:
+
+- The crossover beat `sma_trend` in both halves with about a fifth of the
+  trades, so it was chosen for this Mac (`config.local.yaml`).
+- Stops on daily closes barely changed results; the 20% stop is a disaster
+  backstop, not a source of return.
+- **Buy and hold beat every rule.** These names were picked knowing they
+  went up, so every result here is flattered by hindsight.
+- The holdout year is evaluated once, when readiness evidence is recorded.
+
+**The original rule (`sma_trend`)** uses completed daily bars and a 320-bar
+window:
 
 - **Long** when the 20-day SMA is above the 50-day *and* the close is at or
   above the 200-day; the 200-day filter is skipped if it is unavailable.
@@ -253,8 +285,9 @@ file back, then `choose-database --replace`.
 - **Entry size:** `autopilot.notional_per_trade` (config.yaml: $1,000;
   consider lowering it).
 - **Exit:** sells only the shares the autopilot's own fills bought.
-- **There is no stop-loss or profit target**
-  (`test_there_is_no_stop_loss_a_deep_drawdown_alone_never_exits`).
+- **The rule itself has no stop-loss or profit target**
+  (`test_there_is_no_stop_loss_a_deep_drawdown_alone_never_exits`); the
+  exit policy above adds one.
 
 **The report** (`ops.paper_report`):
 
@@ -293,7 +326,8 @@ against the backtest, not as a forecast.
 | Reconciliation failure | Fails closed; drift trips a breaker; never cleared automatically |
 | Accidental live trading | Hard-coded paper endpoint, outbound allowlist, live rejected at startup |
 | Data loss | Old databases untouched; consolidation needs exact-hash acknowledgment; restore activation preserves the replaced file |
-| Runaway orders | Every order needs your approval; caps of 3 open positions and 5 orders per session; per-order notional cap; operator-test notional cap |
+| Runaway orders | Autonomous orders only after the readiness gate and your fingerprint approval; caps on open positions and orders per session; per-order notional cap; no repeat of a refused order for 3 days; nothing proposed while a safety latch is tripped |
+| Repeated trades in one name | 30-day re-entry cooldown after an exit; at most one intent per symbol, side and session |
 | Snapshot hang | Equity snapshots run outside the safety loop with a timeout |
 
 ## 11. Known limitations
@@ -306,3 +340,29 @@ against the backtest, not as a forecast.
 - Equity snapshots and drawdown cover only daemon uptime.
 - The `mcp` advisory blocks CI's audit, migration and mock-drill steps until
   P1.
+
+## 12. Autonomous paper trading on this Mac
+
+Machine-specific settings live in the git-ignored `config.local.yaml`, merged
+over `config.yaml` (preflight prints `config: config.yaml + config.local.yaml`).
+The checked-in default stays `autopilot.mode: observe`.
+
+1. **The paper account must reconcile.** A fresh database plus positions it
+   never recorded is drift, and drift blocks every order. Close the positions
+   in the Alpaca paper dashboard, then adopt the closed history:
+   `.venv/bin/python -m trading_assistant.ops.paper_history --help`.
+2. **Record backtest evidence** (one-shot holdout):
+   `.venv/bin/python -m trading_assistant.autopilot backtest --years 10`.
+3. **Release evidence** for the running commit at
+   `.local/verification/release-results.json` (from
+   `scripts/verify_loopback_release.py`).
+4. **Start the daemon** and keep it running:
+   `./scripts/launchd/install.sh --with-daemon`. It restarts after a crash at
+   most every 5 minutes, and the watchdog restarts it on a stale heartbeat.
+5. **Approve.** After the first session, run
+   `.venv/bin/python -m trading_assistant.autopilot readiness`, review it, and
+   set `autopilot.readiness.approved_fingerprint` in `config.local.yaml`.
+   Any change to the rule, universe, sizing, limits or thresholds voids it.
+6. **Watch** the console's Autopilot panel: each session's decisions, orders
+   and the readiness report. Stop with `./scripts/launchd/uninstall.sh` or
+   `autopilot.mode: observe`; neither cancels orders or closes positions.

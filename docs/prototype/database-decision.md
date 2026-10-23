@@ -1,7 +1,7 @@
 # Decision record: which database the runtime uses
 
-**Status: OPEN — your decision. Nothing below has been executed. Both files
-are untouched.**
+**Status: DECIDED — Option C, executed 2026-10-22.** Both old files are
+preserved (see *Decision* below).
 
 `$R` is `~/Desktop/project/robinhood/trading-assistant`; `$W` is
 `$R/.worktrees/safety-foundation`.
@@ -100,14 +100,21 @@ cd ~/Desktop/project/robinhood/trading-assistant
 
 **Option C:**
 
-1. Keep the old file under a dated name.
-2. Migrate a new, empty file.
+1. Keep the old file under a dated name, **with any `-wal`/`-shm` sidecars**:
+   left behind, they sit next to the new file and SQLite may replay them
+   into it.
+2. Migrate a new, empty file and initialise sensitive-field encryption.
 3. Optionally, if the account is flat, adopt closed history (C1).
 4. Choose the new file.
 
 ```bash
-mv trading_assistant.db trading_assistant.db.archived-autopilot-era-$(date +%Y%m%d)
+A=trading_assistant.db.archived-autopilot-era-$(date +%Y%m%d)
+for f in trading_assistant.db trading_assistant.db-wal trading_assistant.db-shm; do
+  [ -e "$f" ] && mv -n "$f" "${f/trading_assistant.db/$A}"
+done
 .venv/bin/python -m trading_assistant.db.migrate --database "$PWD/trading_assistant.db" upgrade
+.venv/bin/python -m trading_assistant.ops.encrypt_sensitive migrate
+.venv/bin/python -m trading_assistant.ops.encrypt_sensitive verify
 .venv/bin/python -m trading_assistant.ops.paper_history --help
 .venv/bin/python -I src/trading_assistant/installation.py choose-database \
   --path "$PWD/trading_assistant.db" --sha256 "$(shasum -a 256 trading_assistant.db | cut -c1-64)"
@@ -120,6 +127,16 @@ choose the new file with `--replace`.
 
 ## Decision
 
-- Chosen option: _______
-- Date: _______
-- File and SHA-256 at choice: _______
+- Chosen option: **C** (fresh database). C1 waits until the paper account
+  is flat: on 2026-10-22 it still held AAPL and META from the earlier eras.
+- Date: 2026-10-22.
+- Preserved: `trading_assistant.db.archived-autopilot-era-20261022`
+  (SHA-256 prefix `41d55322f5022219`, plus an encrypted backup in
+  `.local/encrypted-backups/option-c-20261022`, restored and validated in
+  isolation) and the untouched worktree file (`63d4a238dd8747a1`, plus a
+  private copy in `.local/archive-20261022`; the backup tool refuses its
+  `0017` schema).
+- Lesson: the main file's `-wal`/`-shm` sidecars were left behind by the
+  move. The new database was compared with a pristine migration and is
+  identical apart from constraint order; the archived file lacks only the
+  lock rows the backup run wrote, which the encrypted backup holds.
