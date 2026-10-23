@@ -30,7 +30,9 @@ from trading_assistant.risk.clock import FakeClock
 from trading_assistant.signals.models import MarketFeatures
 
 NY = ZoneInfo("America/New_York")
-OPEN = datetime(2026, 10, 6, 9, 30, tzinfo=NY)
+# Relative to today: the risk snapshot refuses a session boundary older than
+# 15 days against the real clock, so a fixed date would expire.
+OPEN = (datetime.now(NY) - timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
 
 
 def _features():
@@ -145,7 +147,9 @@ def test_ambiguous_submission_failure_is_uncertain_and_never_blindly_retried(mak
 
     again = _autopilot(service)
     again.run_once(session=OPEN.date())
-    assert _reasons(again) == ["order_in_flight"]
+    # The uncertain submission latches broker drift, so the next cycle proposes
+    # nothing at all (it would otherwise stop at the in-flight order).
+    assert _reasons(again) == ["safety_latch"]
     assert broker.submit_calls == 1
 
 

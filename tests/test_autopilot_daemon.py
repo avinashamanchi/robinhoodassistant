@@ -26,7 +26,9 @@ from trading_assistant.risk.clock import FakeClock
 from trading_assistant.signals.models import MarketFeatures
 
 NY = ZoneInfo("America/New_York")
-OPEN = datetime(2026, 10, 6, 9, 30, tzinfo=NY)
+# Relative to today: the risk snapshot refuses a session boundary older than
+# 15 days against the real clock, so a fixed date would expire.
+OPEN = (datetime.now(NY) - timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
 
 
 def _features(sma20=105):
@@ -103,7 +105,7 @@ def test_cycle_is_not_due_before_the_open_offset_or_when_closed(app_config, make
 def test_observe_runs_once_per_session_and_records_evidence(app_config, make_service, tmp_path):
     runner, service, clock = _runner(app_config, make_service, tmp_path)
 
-    assert runner.run_if_due() == {"session": "2026-10-06", "result": "observed"}
+    assert runner.run_if_due() == {"session": OPEN.date().isoformat(), "result": "observed"}
     assert runner.run_if_due() is None              # already recorded
     assert service.broker.submit_calls == 0
 
@@ -119,10 +121,10 @@ def test_observe_runs_once_per_session_and_records_evidence(app_config, make_ser
     report = tmp_path / REPORT_RELATIVE
     assert report.stat().st_mode & 0o777 == 0o600
 
-    next_open = datetime(2026, 10, 7, 9, 30, tzinfo=NY)
+    next_open = OPEN + timedelta(days=1)
     service._clocks[AssetClass.EQUITY] = FakeClock(is_open=True, most_recent_open=next_open.astimezone(timezone.utc))
     clock["now"] = (next_open + timedelta(minutes=45)).astimezone(timezone.utc)
-    assert runner.run_if_due() == {"session": "2026-10-07", "result": "observed"}
+    assert runner.run_if_due() == {"session": (OPEN + timedelta(days=1)).date().isoformat(), "result": "observed"}
 
 
 def test_paper_mode_without_readiness_is_blocked_and_places_nothing(app_config, make_service, tmp_path):
@@ -149,7 +151,7 @@ def test_paper_mode_with_readiness_executes_through_the_risk_engine(app_config, 
 def test_propose_mode_queues_proposals_for_a_human_and_never_approves(app_config, make_service, tmp_path):
     runner, service, clock = _runner(app_config, make_service, tmp_path, mode="propose")
 
-    assert runner.run_if_due() == {"session": "2026-10-06", "result": "proposed"}
+    assert runner.run_if_due() == {"session": OPEN.date().isoformat(), "result": "proposed"}
     assert runner.run_if_due() is None                 # one proposal per session
     assert service.broker.submit_calls == 0             # never approved, never submitted
 
@@ -157,8 +159,8 @@ def test_propose_mode_queues_proposals_for_a_human_and_never_approves(app_config
     assert (pending["ticker"], pending["side"]) == ("AAPL", "buy")
     assert Decimal(pending["notional"]) == Decimal("100") and pending["order_type"] == "market"
     rationale = pending["rationale"]
-    assert rationale.startswith("sma_trend BUY AAPL for session 2026-10-06: 20>50 and close>=200")
-    for part in ("SMA20 105.00", "Size: $100 notional", "Exit: a later cycle proposes the exit",
+    assert rationale.startswith(f"sma_trend BUY AAPL for session {OPEN.date()}: 20>50 and close>=200")
+    for part in ("SMA20 105.00", "Size: $100 notional", "Exit: a later cycle exits when the rule turns flat", "no stop-loss",
                  "per-order $", "open positions"):
         assert part in rationale, part
     (record,) = runner.store.cycles()

@@ -218,6 +218,9 @@ def test_partially_filled_order_blocks_and_counts_only_filled_quantity(make_serv
         s.commit()
 
     ap = _autopilot(service)
+    # The mock broker has never seen this fixture order, so reconciliation
+    # latches broker drift; look beneath the latch at ownership and in-flight.
+    ap._blocking_latch = lambda: None
     ap.run_once(session=SESSION)
     (decision,) = ap.last_decisions
     assert decision.reason == "order_in_flight"

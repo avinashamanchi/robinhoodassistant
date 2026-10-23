@@ -405,6 +405,13 @@ class AutopilotConfig(_Strict):
     # The daemon runs one cycle per session, this long after the open.
     run_after_open_minutes: int = Field(default=30, ge=0, le=360)
     cycle_timeout_seconds: int = Field(default=120, gt=0, le=1800)
+    # Exits and re-entry spacing on top of the strategy, applied identically
+    # by the backtester (``strategies.exit_policy``). None disables the stop.
+    stop_loss_pct: Optional[float] = Field(default=None, gt=0, lt=100)
+    reentry_cooldown_days: int = Field(default=0, ge=0, le=365)
+    # After the risk engine refuses an autopilot order for a symbol and side,
+    # do not propose that same action again for this many calendar days.
+    retry_after_rejection_days: int = Field(default=3, ge=0, le=60)
     readiness: AutopilotReadinessConfig = Field(
         default_factory=AutopilotReadinessConfig
     )
@@ -485,10 +492,44 @@ class AppConfig(_Strict):
 Secrets = RuntimeSecrets
 
 
-def load_config(path: str | Path = "config.yaml") -> AppConfig:
-    """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8)."""
-    text = Path(path).read_text(encoding="utf-8")
-    raw = yaml.safe_load(text) or {}
+LOCAL_CONFIG = "config.local.yaml"
+
+
+def _merge_override(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_override(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def config_sources(path: str | Path | None = None) -> list[Path]:
+    """The files ``load_config(path)`` reads, in merge order."""
+    if path is not None:
+        return [Path(path)]
+    main = Path("config.yaml")
+    local = main.with_name(LOCAL_CONFIG)
+    return [main, local] if local.is_file() else [main]
+
+
+def load_config(path: str | Path | None = None) -> AppConfig:
+    """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8).
+
+    With no explicit path, an optional, git-ignored ``config.local.yaml``
+    beside it is merged over it: mappings merge key by key, and any other
+    value (a list included) replaces the checked-in one. This is where an
+    operator turns on machine-specific settings, such as autonomous paper
+    mode, without changing the repository's defaults. The merged result is
+    validated exactly like the checked-in file.
+    """
+    raw: dict = {}
+    for source in config_sources(path):
+        loaded = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{source.name} must contain a mapping")
+        raw = _merge_override(raw, loaded)
     return AppConfig.model_validate(raw)
 
 

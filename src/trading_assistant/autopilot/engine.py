@@ -16,7 +16,18 @@ Before acting on a symbol it requires:
 * no order for that symbol already in flight, including an uncertain
   submission still awaiting reconciliation;
 * ownership: it exits only the quantity its own fills bought, and never buys
-  into or sells out of a position another workflow holds.
+  into or sells out of a position another workflow holds;
+* no blocking safety latch (broker drift, operator global, loss, drawdown):
+  while one is tripped nothing is proposed, because every proposal would be
+  refused and recorded as another rejected order.
+
+On top of the strategy's long/flat signal it applies the configured
+``ExitPolicy`` (``strategies.exit_policy``), exactly as the backtester does:
+a stop-loss below the average entry price of its own fills, and a re-entry
+cooldown after an exit. After the risk engine refuses one of its orders it
+does not propose the same symbol and side again for
+``retry_after_rejection_days``, so a persistent refusal is reported once
+instead of being retried every session.
 
 Duplicate safety: every order's idempotency key is derived from the intended
 action (strategy, symbol, side, session; see ``identity.action_key``) and is
@@ -44,12 +55,14 @@ from ..broker.models import OrderSide, OrderStatus
 from ..db.models import Fill, Order, fill_has_trusted_identity
 from ..dependencies import RequiredDependencyUnavailable
 from ..signals.models import MarketFeatures
+from ..strategies.exit_policy import ExitPolicy
 from .decisions import (
     ACTOR_PREFIX,
     FLAT,
     IN_FLIGHT_STATUSES,
     LONG,
     STRATEGIES,
+    STRATEGY_EXITS,
     Decision,
     require_paper,
     strategy_decision,
@@ -81,6 +94,8 @@ class Autopilot:
         max_feature_age: Optional[timedelta] = timedelta(hours=120),
         tenure_guard=None,
         propose_only: bool = False,
+        exit_policy: Optional[ExitPolicy] = None,
+        retry_after_rejection_days: int = 0,
     ) -> None:
         if not universe:
             raise ValueError("autopilot requires a non-empty universe")
@@ -104,6 +119,8 @@ class Autopilot:
         # never approve them (autopilot.mode: propose).
         self.propose_only = propose_only
         self.max_feature_age = max_feature_age
+        self.exit_policy = exit_policy or ExitPolicy()
+        self.retry_after_rejection_days = int(retry_after_rejection_days)
         self.tenure_guard = tenure_guard
         self.actor = f"{ACTOR_PREFIX}{strategy}"
         self.last_decisions: list[Decision] = []
@@ -175,6 +192,92 @@ class Autopilot:
             elif fill.side == OrderSide.SELL.value:
                 net -= fill.qty
         return max(net, Decimal(0))
+
+    def _position_history(
+        self, session, symbol: str
+    ) -> tuple[Optional[Decimal], Optional[date]]:
+        """Average entry price of the autopilot's open lots, and its last exit.
+
+        Average-cost accounting over its own trusted fills in time order: a
+        sell reduces quantity at the running average, and the average resets
+        once the position is flat. The exit date is the New York session of
+        the latest autopilot sell fill.
+        """
+        fills = session.execute(
+            select(Fill)
+            .join(Order, Fill.order_id == Order.id)
+            .where(
+                Order.ticker == symbol,
+                Order.approval_actor.like(f"{ACTOR_PREFIX}%"),
+            )
+            .order_by(Fill.filled_at, Fill.id)
+        ).scalars().all()
+        qty = Decimal(0)
+        cost = Decimal(0)
+        last_exit: Optional[date] = None
+        for fill in fills:
+            if not fill_has_trusted_identity(fill):
+                continue
+            if fill.side == OrderSide.BUY.value:
+                qty += fill.qty
+                cost += fill.qty * fill.price
+            elif fill.side == OrderSide.SELL.value and qty > 0:
+                sold = min(fill.qty, qty)
+                cost -= cost * sold / qty
+                qty -= sold
+                if qty == 0:
+                    cost = Decimal(0)
+            if fill.side == OrderSide.SELL.value and fill.filled_at is not None:
+                filled_at = fill.filled_at
+                if filled_at.tzinfo is None:
+                    filled_at = filled_at.replace(tzinfo=timezone.utc)
+                last_exit = filled_at.astimezone(_NEW_YORK).date()
+        average = cost / qty if qty > 0 else None
+        return average, last_exit
+
+    def _recently_rejected(self, session, symbol: str, side: str) -> bool:
+        """The risk engine refused this autopilot action within the back-off."""
+        if self.retry_after_rejection_days <= 0:
+            return False
+        since = self.now().astimezone(timezone.utc) - timedelta(
+            days=self.retry_after_rejection_days
+        )
+        return (
+            session.execute(
+                select(Order.id)
+                .where(
+                    Order.ticker == symbol,
+                    Order.side == side,
+                    Order.status == OrderStatus.REJECTED.value,
+                    Order.idempotency_key.like("ap-%"),
+                    Order.created_at >= since,
+                )
+                .limit(1)
+            ).first()
+            is not None
+        )
+
+    def _blocking_latch(self) -> Optional[str]:
+        """A tripped latch that refuses every new order, or None."""
+        from ..assets import AssetClass
+        from ..risk.breakers import BreakerScope
+
+        breakers = getattr(self.service, "breakers", None)
+        if breakers is None:
+            return None
+        for scope in (
+            BreakerScope.broker_drift(),
+            BreakerScope.operator_global(),
+            BreakerScope.loss(AssetClass.EQUITY),
+            BreakerScope.drawdown(AssetClass.EQUITY),
+        ):
+            try:
+                state = breakers.get(scope)
+            except Exception:
+                return "breaker_state_unavailable"
+            if state is not None and state.tripped:
+                return scope.key
+        return None
 
     def _feature_age_hours(self, features: MarketFeatures) -> float:
         as_of = features.as_of
@@ -322,9 +425,9 @@ class Autopilot:
                 shares = self.notional_per_trade / Decimal(str(features.last_close))
                 size += f", about {shares:.4f} shares at the last close"
             exit_rule = (
-                "a later cycle proposes the exit when the rule turns flat (20-day SMA "
-                "at or below the 50-day, or close below the 200-day); no stop-loss or "
-                "profit target is attached"
+                "a later cycle exits when "
+                f"{STRATEGY_EXITS.get(self.strategy, 'the rule turns flat')}; "
+                f"{self.exit_policy.describe()}; no profit target"
             )
         else:
             size = f"{qty} shares, the autopilot's own filled quantity"
@@ -442,6 +545,13 @@ class Autopilot:
                 self._heal_transient_breakers(open_cache)
         executed: list[dict] = []
         decisions: list[Decision] = []
+        latch = self._blocking_latch()
+        if latch is not None:
+            log.warning("autopilot proposes nothing while %s is tripped", latch)
+            self.last_decisions = [
+                Decision(symbol, "n/a", "none", "safety_latch") for symbol in self.universe
+            ]
+            return []
         placed = self._orders_today()
         positions: Optional[dict[str, Decimal]] = None
         for index, symbol in enumerate(self.universe):
@@ -476,7 +586,7 @@ class Autopilot:
                 )
                 continue
             signal = self.decide(features)
-            if signal not in (LONG, FLAT):
+            if signal not in (LONG, FLAT) and self.exit_policy.stop_loss_pct is None:
                 decisions.append(
                     Decision(symbol, signal, "none", "signal_hold", as_of=as_of, feature_age_hours=age)
                 )
@@ -493,12 +603,28 @@ class Autopilot:
             with self.service.session_factory() as s:
                 in_flight = self._has_in_flight_order(s, symbol)
                 owned = self._owned_qty(s, symbol)
+                entry_price, last_exit = self._position_history(s, symbol)
             if in_flight:
                 decisions.append(
                     Decision(symbol, signal, "none", "order_in_flight", held, owned, as_of, age)
                 )
                 continue
             action, sell_qty, reason = self._plan(signal, held, owned)
+            if (
+                owned > 0
+                and held > 0
+                and self.exit_policy.stop_triggered(
+                    float(entry_price) if entry_price is not None else None,
+                    features.last_close,
+                )
+            ):
+                action, sell_qty, reason = "sell", min(owned, held), "stop_loss"
+            elif action == "buy" and self.exit_policy.cooling_down(last_exit, session):
+                action, reason = "none", "reentry_cooldown"
+            if action in ("buy", "sell"):
+                with self.service.session_factory() as s:
+                    if self._recently_rejected(s, symbol, action):
+                        action, reason = "none", "recent_rejection_backoff"
             result: Optional[dict] = None
             order_status: Optional[str] = None
             if action == "buy":

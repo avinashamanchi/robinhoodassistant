@@ -25,6 +25,7 @@ from typing import Callable
 from .decisions import (
     AutopilotDisabled,
     autopilot_config_problems,
+    exit_policy,
     require_paper,
     resolve_universe,
 )
@@ -137,6 +138,8 @@ def _dry_run(config) -> int:
             strategy=config.autopilot.strategy,
             dry_run=True,
             max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        exit_policy=exit_policy(config),
+        retry_after_rejection_days=config.autopilot.retry_after_rejection_days,
             tenure_guard=getattr(container, "runtime_tenure_guard", None),
         )
         intended = autopilot.run_once()

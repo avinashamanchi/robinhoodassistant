@@ -17,6 +17,7 @@ from ..db.models import NONTERMINAL_STATES
 from ..broker.models import OrderStatus
 from ..signals.models import MarketFeatures
 from ..strategies.base import SignalAction, Strategy
+from ..strategies.exit_policy import ExitPolicy
 from ..strategies.sma_crossover import SmaCrossover
 from ..strategies.sma_trend import SmaTrend
 
@@ -53,6 +54,25 @@ DEGRADED_REASONS = frozenset(
 
 class AutopilotDisabled(RuntimeError):
     """The autopilot must not run in this configuration."""
+
+
+# How each strategy's own signal exits a long position (order rationale).
+STRATEGY_EXITS: dict[str, str] = {
+    "sma_trend": (
+        "the rule turns flat (20-day SMA at or below the 50-day, or close below "
+        "the 200-day)"
+    ),
+    "sma_crossover": "the rule turns flat (50-day SMA at or below the 200-day)",
+}
+
+
+def exit_policy(config: AppConfig) -> ExitPolicy:
+    """The stop-loss and re-entry cooldown configured for the autopilot."""
+    autopilot = config.autopilot
+    return ExitPolicy(
+        stop_loss_pct=autopilot.stop_loss_pct,
+        reentry_cooldown_days=autopilot.reentry_cooldown_days,
+    )
 
 
 def require_paper(config: AppConfig) -> None:

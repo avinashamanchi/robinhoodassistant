@@ -54,6 +54,9 @@ def config_fingerprint(config: AppConfig) -> str:
             "max_orders_per_day": autopilot.max_orders_per_day,
             "max_feature_age_hours": autopilot.max_feature_age_hours,
             "run_after_open_minutes": autopilot.run_after_open_minutes,
+            "stop_loss_pct": autopilot.stop_loss_pct,
+            "reentry_cooldown_days": autopilot.reentry_cooldown_days,
+            "retry_after_rejection_days": autopilot.retry_after_rejection_days,
         },
         "risk": {
             "ticker_allowlist": sorted(s.upper() for s in risk.ticker_allowlist),
@@ -76,12 +79,13 @@ def config_fingerprint(config: AppConfig) -> str:
 def _decision_sources(strategy: str) -> list[Path]:
     """Source files whose behavior determines what the autopilot decides."""
     from ..signals import events, features, indicators, regime, sessions, structure
-    from ..strategies import base
+    from ..strategies import base, exit_policy
     from . import decisions, engine
 
     modules = [
         inspect.getmodule(STRATEGIES[strategy]),
         base,
+        exit_policy,
         features,
         indicators,
         regime,

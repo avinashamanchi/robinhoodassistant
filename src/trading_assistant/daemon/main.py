@@ -223,7 +223,7 @@ def _build_autopilot_runner(
 
     from ..analyst.live_features import build_live_feature_provider
     from ..autopilot import Autopilot, AutopilotDisabled, autopilot_config_problems
-    from ..autopilot.decisions import require_paper, resolve_universe
+    from ..autopilot.decisions import exit_policy, require_paper, resolve_universe
     from ..autopilot.evidence import EvidenceStore
     from ..autopilot.runner import AutopilotRunner
     from ..installation import source_root
@@ -253,6 +253,8 @@ def _build_autopilot_runner(
         strategy=config.autopilot.strategy,
         dry_run=True,
         max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        exit_policy=exit_policy(config),
+        retry_after_rejection_days=config.autopilot.retry_after_rejection_days,
         tenure_guard=runtime_tenure_guard,
     )
     return AutopilotRunner(

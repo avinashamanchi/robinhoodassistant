@@ -25,7 +25,7 @@ from ..backtest.data import DataSource
 from ..backtest.evaluate import walk_forward
 from ..config import AppConfig
 from ..signals.sessions import completed_bars, final_through
-from .decisions import STRATEGIES, resolve_universe
+from .decisions import STRATEGIES, exit_policy, resolve_universe
 from .evidence import EvidenceStore
 from .identity import code_identity, config_fingerprint, decision_code_fingerprint
 
@@ -61,6 +61,7 @@ def record_backtest_evidence(
         holdout_months=backtest.holdout_months if backtest is not None else 12,
         spy_symbol="SPY",
         label=f"autopilot readiness evidence: {strategy}",
+        exit_policy=exit_policy(config),
     )
     timeline = source.timeline(universe)
     if not timeline:
@@ -79,6 +80,7 @@ def record_backtest_evidence(
         "code_fingerprint": decision_code_fingerprint(strategy),
         "code_identity": code_identity(root),
         "cost_model": backtest.model_dump(mode="json") if backtest is not None else None,
+        "exit_policy": exit_policy(config).describe(),
         "recorded_at": now.isoformat(),
         "disclaimer": report.disclaimer,
         "rows": [row.to_dict() for row in report.rows],

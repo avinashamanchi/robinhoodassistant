@@ -25,6 +25,7 @@ from ..db.models import (
 from ..strategies.base import Strategy
 from ..security.sensitive_fields import persist_sensitive
 from ..strategies.buy_and_hold import BuyAndHold
+from ..strategies.exit_policy import ExitPolicy
 from .data import DataSource
 from .engine import BacktestResult, run_backtest
 from .holdout import HoldoutGuard
@@ -100,6 +101,7 @@ def _run_window(
     backtest_config: BacktestConfig,
     spy_symbol: Optional[str],
     cancel_check: Callable[[], None] | None,
+    exit_policy: Optional[ExitPolicy] = None,
 ) -> tuple[Metrics, BacktestResult]:
     if cancel_check is not None:
         cancel_check()
@@ -112,6 +114,7 @@ def _run_window(
         start=bounds[0],
         end=bounds[1],
         cancel_check=cancel_check,
+        exit_policy=exit_policy,
     )
     return compute_metrics(result), result
 
@@ -128,6 +131,7 @@ def walk_forward(
     cancel_check: Callable[[], None] | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    exit_policy: Optional[ExitPolicy] = None,
 ) -> tuple[EvaluationReport, HoldoutGuard]:
     backtest_config = backtest_config or BacktestConfig()
     if cancel_check is not None:
@@ -171,6 +175,7 @@ def walk_forward(
                     backtest_config,
                     spy_symbol,
                     cancel_check,
+                    exit_policy,
                 )
                 if cancel_check is not None:
                     cancel_check()
