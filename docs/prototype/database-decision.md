@@ -127,8 +127,11 @@ choose the new file with `--replace`.
 
 ## Decision
 
-- Chosen option: **C** (fresh database). C1 waits until the paper account
-  is flat: on 2026-10-22 it still held AAPL and META from the earlier eras.
+- Chosen option: **C** (fresh database). C1 cannot work for this account:
+  `ops.paper_history` needs one legacy database holding exactly the broker's
+  fills, and these span two databases plus notional orders. Once the account
+  is flat (it still held AAPL and META on 2026-10-22), `ops.paper_baseline`
+  records a baseline instead (C2 with a reconciliation cursor).
 - Date: 2026-10-22.
 - Preserved: `trading_assistant.db.archived-autopilot-era-20261022`
   (SHA-256 prefix `41d55322f5022219`, plus an encrypted backup in

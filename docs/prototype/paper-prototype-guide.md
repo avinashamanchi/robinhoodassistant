@@ -349,8 +349,12 @@ The checked-in default stays `autopilot.mode: observe`.
 
 1. **The paper account must reconcile.** A fresh database plus positions it
    never recorded is drift, and drift blocks every order. Close the positions
-   in the Alpaca paper dashboard, then adopt the closed history:
-   `.venv/bin/python -m trading_assistant.ops.paper_history --help`.
+   in the Alpaca paper dashboard. This account's history spans two databases
+   and notional orders, so `ops.paper_history` cannot import it exactly;
+   instead record a baseline, review its receipt, then reset the
+   `broker_drift` breaker in the console or operator terminal:
+   `.venv/bin/python -m trading_assistant.ops.paper_baseline`. Earlier P/L
+   stays in the archived databases and the Alpaca dashboard.
 2. **Record backtest evidence** (one-shot holdout):
    `.venv/bin/python -m trading_assistant.autopilot backtest --years 10`.
 3. **Release evidence** for the running commit at
