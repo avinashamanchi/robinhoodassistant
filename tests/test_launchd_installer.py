@@ -348,3 +348,46 @@ def test_installer_warns_about_a_leftover_autopilot_job(installer):
     assert completed.returncode == 0, completed.stderr
     assert "retired com.trading.autopilot job is still installed" in completed.stdout
     assert "com.trading.autopilot" in installer.plists()  # left for uninstall.sh
+
+
+# ── the daemon job is an explicit opt-in ──────────────────────────────────────
+def test_with_daemon_installs_a_throttled_daemon_job(installer):
+    installer.designate()
+    installer.choose()
+
+    completed = installer.run("--with-daemon")
+
+    assert completed.returncode == 0, completed.stderr
+    plists = installer.plists()
+    assert set(plists) == {"com.trading.app", "com.trading.watchdog", "com.trading.backup", "com.trading.daemon"}
+    daemon = plists["com.trading.daemon"]
+    assert daemon["ProgramArguments"] == [
+        str(installer.project / ".venv/bin/python"), "-m", "trading_assistant.daemon.main",
+    ]
+    assert daemon["WorkingDirectory"] == str(installer.project)
+    # Restarted only after an unsuccessful exit, never more than every 5 minutes.
+    assert daemon["KeepAlive"] == {"SuccessfulExit": False}
+    assert daemon["ThrottleInterval"] == 300
+    assert daemon["Umask"] == 0o77
+
+
+def test_with_daemon_still_refuses_an_unchosen_database(installer):
+    installer.designate()
+
+    completed = installer.run("--with-daemon")
+
+    assert completed.returncode == 1
+    _assert_no_side_effects(installer)
+
+
+def test_with_daemon_replaces_an_existing_daemon_job(installer):
+    installer.designate()
+    installer.choose()
+    agents = installer.home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    (agents / "com.trading.daemon.plist").write_bytes(plistlib.dumps({"Label": "com.trading.daemon"}))
+
+    completed = installer.run("--with-daemon")
+
+    assert completed.returncode == 0, completed.stderr
+    assert installer.plists()["com.trading.daemon"]["ThrottleInterval"] == 300
