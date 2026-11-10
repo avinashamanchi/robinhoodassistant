@@ -1838,7 +1838,8 @@ class ReleaseVerifier:
                     "--cov-branch",
                     "--cov-fail-under=90",
                 ),
-                timeout_seconds=1800.0,
+                # Instrumenting the full suite can take over 30 minutes on CI.
+                timeout_seconds=2700.0,
                 expects_tests=True,
                 test_manifest=_FULL_TEST_MANIFEST,
             ),
