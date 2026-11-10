@@ -4780,7 +4780,7 @@ def test_ci_matches_offline_release_gate_without_runtime_authority():
     assert verification.get("continue-on-error") is None
     assert verification.get("needs") is None
     assert verification.get("runs-on") == "ubuntu-24.04"
-    assert verification.get("timeout-minutes") == "60"
+    assert verification.get("timeout-minutes") == "90"
     expected_order = (
         "Install locked test dependencies without project code",
         "Run the deterministic release verifier",
