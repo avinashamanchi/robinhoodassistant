@@ -2037,7 +2037,10 @@ def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
         try:
             if call_number == 1:
                 started.set()
-                assert release_worker.wait(timeout=5)
+                # The worker must outlive the entire exercise, including the
+                # deliberate lease expiry and slower audited writes under
+                # coverage. Only the exercise should release its side effect.
+                assert release_worker.wait(timeout=60)
             with lock:
                 side_effects += 1
             return {"status": "submitted", "executed": True}
@@ -2126,7 +2129,9 @@ def test_cancelled_request_awaits_real_sync_worker_and_keeps_interlock(
             release_worker.set()
             loop.set_exception_handler(previous_handler)
 
-    follower, still_latched, leaked = asyncio.run(exercise())
+    follower, still_latched, leaked = asyncio.run(
+        asyncio.wait_for(exercise(), timeout=30)
+    )
 
     for response in (follower, still_latched):
         assert response.status_code == 409
