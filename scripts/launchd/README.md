@@ -87,14 +87,16 @@ a production source. Inherited stdout and stderr go to `/dev/null`;
 each process writes redacted, owner-only, bounded rotating output to its own
 `logs/<role>.runtime.log`.
 
-The backup job acquires exclusive database maintenance tenure and publishes
-only mode-`0600`
+The backup job pauses the installed app, daemon and watchdog, acquires exclusive
+database maintenance tenure, and publishes only mode-`0600`
 `.local/encrypted-backups/<timestamp>-whole-database-v1.sqlite3.aesgcm`
 artifacts inside a mode-`0700` directory. It uses the dedicated configured
 backup key, verifies a streamed decryption and SQLite `quick_check`, then
 removes every plaintext snapshot and verification temporary file. The job
 fails closed while any app, daemon, MCP, or validation writer tenure is active;
-it never leaves an operational plaintext database copy.
+it never leaves an operational plaintext database copy. It restores exactly
+the jobs that were loaded before the backup, including after a backup failure.
+The watchdog starts last so it can observe the restarted runtimes.
 
 The installer does not start the daemon. After preflight passes, launch it as a
 separate operator-controlled process:

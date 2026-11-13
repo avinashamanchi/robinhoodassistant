@@ -118,6 +118,11 @@ snapshot hash, and SQLite `quick_check` before success. The destination is mode
 plaintext snapshot/verification temporary is removed on success or failure.
 Do not create an operational plaintext database copy for retention or analysis.
 
+The macOS launchd installer uses `trading_assistant.ops.scheduled_backup` to
+pause the managed app, daemon and watchdog for this exclusive operation. It
+restores the previously loaded jobs on completion or failure. The direct
+`ops.backup` command above requires runtime writers to be stopped first.
+
 The watchdog probes anonymous app liveness at
 `https://localhost:8020/health/live`. It reads the persisted daemon heartbeat
 directly from the local database; app liveness is never treated as proof that

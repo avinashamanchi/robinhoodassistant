@@ -110,6 +110,9 @@ class AutopilotRunner:
         from ..ops.tenure import TenureLost
 
         now = self.now()
+        self._require_tenure()
+        # Approval, breaker and release state can change between daily cycles.
+        self._write_report(now)
         try:
             session = self.due_session(now)
         except Exception:

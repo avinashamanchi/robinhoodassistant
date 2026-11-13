@@ -100,6 +100,7 @@ def test_cycle_is_not_due_before_the_open_offset_or_when_closed(app_config, make
     clock["now"] = (OPEN + timedelta(hours=8)).astimezone(timezone.utc)
     assert runner.run_if_due() is None
     assert runner.store.cycles() == []
+    assert (tmp_path / REPORT_RELATIVE).exists()
 
 
 def test_observe_runs_once_per_session_and_records_evidence(app_config, make_service, tmp_path):
@@ -120,6 +121,10 @@ def test_observe_runs_once_per_session_and_records_evidence(app_config, make_ser
     assert detail["orders"] == []
     report = tmp_path / REPORT_RELATIVE
     assert report.stat().st_mode & 0o777 == 0o600
+    clock["now"] += timedelta(minutes=5)
+    assert runner.run_if_due() is None
+    import json
+    assert json.loads(report.read_text())["generated_at"] == clock["now"].isoformat()
 
     next_open = OPEN + timedelta(days=1)
     service._clocks[AssetClass.EQUITY] = FakeClock(is_open=True, most_recent_open=next_open.astimezone(timezone.utc))

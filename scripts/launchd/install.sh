@@ -186,8 +186,10 @@ emit com.trading.app "$PY" -m trading_assistant.ops.serve
 if [ "$WITH_DAEMON" = 1 ]; then
   emit_daemon
 fi
+# Give fresh runtimes time to acquire tenure before watchdog startup checks.
+sleep 10
 emit_periodic com.trading.watchdog 60 "$PY" -m trading_assistant.ops.watchdog
-emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
+emit_daily com.trading.backup 2 0 "$PY" -m trading_assistant.ops.scheduled_backup --destination "$PROJ/.local/encrypted-backups" --retention-days 14
 if [ -f "$LA/com.trading.autopilot.plist" ]; then
   echo "note: a retired com.trading.autopilot job is still installed; it would run"
   echo "      the removed standalone loop. Remove it with scripts/launchd/uninstall.sh"

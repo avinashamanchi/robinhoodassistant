@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=5148,
+    count=5161,
     digest=(
-        "sha256:69bba10b788eea7dbfcfbed12924089a"
-        "716bb5b520a7b9a3e8371790f8dd2851"
+        "sha256:e9d5ed65522fb1008195c6ec24fcd4566"
+        "406dbc4329f727c55108b0e72a091bd"
     ),
 )
 
