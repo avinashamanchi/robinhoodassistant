@@ -363,7 +363,11 @@ def test_scheduled_backup_and_operator_docs_have_no_plaintext_entrypoint():
     runbook = Path("docs/RUNBOOK.md").read_text(encoding="utf-8")
     ops_readme = Path("docs/ops/README.md").read_text(encoding="utf-8")
 
-    assert "trading_assistant.ops.backup" in install
+    assert "trading_assistant.ops.scheduled_backup" in install
+    scheduled = Path("src/trading_assistant/ops/scheduled_backup.py").read_text(
+        encoding="utf-8"
+    )
+    assert "backup.main(" in scheduled
     assert '"$PROJ/backups"' not in install
     assert ".local/encrypted-backups" in install
     for document in (launchd_readme, runbook, ops_readme):
