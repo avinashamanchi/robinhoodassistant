@@ -102,4 +102,3 @@ def test_overlapping_scheduled_backups_cannot_stop_each_others_jobs(jobs):
         with pytest.raises(RuntimeError, match="scheduled_backup_already_running"):
             with paused_runtime(root, agents=agents, runner=run, sleep=lambda _: None):
                 pytest.fail("second backup should not run")
-
