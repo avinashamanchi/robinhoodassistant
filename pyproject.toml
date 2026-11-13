@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.13,<2",
-    "cryptography>=48.0.1,<49",
+    "cryptography>=50.0.0,<51",
     "keyring>=25,<27",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
@@ -22,7 +22,7 @@ trading-operator = "trading_assistant.ops.operator_terminal:main"
 # Broker / server / app deps land in later phases; kept optional so Phase 1
 # installs and tests with zero network-capable packages.
 broker = ["alpaca-py>=0.21"]
-mcp = ["mcp>=1.2"]
+mcp = ["mcp>=1.30.0,<2"]
 app = ["fastapi>=0.110", "uvicorn>=0.29", "anthropic>=0.39"]
 notify = ["python-telegram-bot>=21"]
 # Alternative LLM providers. Exactly one is selected at startup.

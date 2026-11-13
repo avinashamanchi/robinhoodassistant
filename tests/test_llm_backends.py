@@ -229,6 +229,47 @@ def test_gemini_accepts_request_id_without_sending_it_to_sdk():
     )
 
     assert "request_id" not in client.models.last
+    assert client.models.last["config"].automatic_function_calling.disable is True
+
+
+def test_gemini_distinguishes_completed_error_responses_from_transport_failures():
+    from google.genai.errors import ServerError
+    from trading_assistant.llm.base import ProviderRequestRejected
+
+    class Models:
+        error = ServerError(503, {"error": {"code": 503, "message": "provider-sensitive-detail"}})
+
+        def generate_content(self, **kwargs):
+            raise self.error
+
+    models = Models()
+    backend = GeminiBackend("key", "model", client=SimpleNamespace(models=models))
+    payload = dict(system="s", messages=[{"role": "user", "content": "hi"}], tools=[])
+    with pytest.raises(ProviderRequestRejected, match="^gemini_request_rejected$"):
+        backend.create(**payload)
+    models.error = TimeoutError("response missing")
+    with pytest.raises(TimeoutError):
+        backend.create(**payload)
+
+
+def test_gemini_usage_includes_billable_thinking_tokens():
+    response = from_gemini(SimpleNamespace(
+        candidates=[],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10, candidates_token_count=5,
+            thoughts_token_count=13,
+        ),
+    ))
+    assert response.usage.input_tokens == 10
+    assert response.usage.output_tokens == 18
+    response = from_gemini(SimpleNamespace(
+        candidates=[],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10, candidates_token_count=None,
+            thoughts_token_count=64, total_token_count=74,
+        ),
+    ))
+    assert response.usage.output_tokens == 64
 
 
 def test_anthropic_accepts_request_id_without_sending_it_to_sdk(monkeypatch):

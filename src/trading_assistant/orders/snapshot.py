@@ -617,6 +617,7 @@ class PortfolioSnapshotService:
             and high_water_mark > 0
         )
 
+        orders_submitted_today: int | None = None
         try:
             pending_query = select(Order).where(
                 Order.status.in_(_PENDING_STATUSES)
@@ -626,6 +627,20 @@ class PortfolioSnapshotService:
                     Order.id != exclude_order_id
                 )
             pending_orders = session.scalars(pending_query).all()
+            if boundary is not None:
+                submitted_query = select(Order.ticker).where(
+                    Order.submission_started_at.is_not(None),
+                    Order.submission_started_at >= boundary,
+                )
+                if exclude_order_id is not None:
+                    submitted_query = submitted_query.where(
+                        Order.id != exclude_order_id
+                    )
+                orders_submitted_today = sum(
+                    1
+                    for ticker in session.scalars(submitted_query)
+                    if AssetClass.for_symbol(ticker) is asset_class
+                )
             all_fills = session.scalars(select(Fill)).all()
             fills = [
                 fill
@@ -789,6 +804,7 @@ class PortfolioSnapshotService:
             daily_pnl_complete = False
             broker_reconciled = False
             realized = Decimal(0)
+            orders_submitted_today = None
 
         return PortfolioSnapshot(
             positions=pos_map,
@@ -813,4 +829,5 @@ class PortfolioSnapshotService:
             external_positions=external,
             pending_signed_notional=dict(pending_buy_notional),
             pending_exposure_complete=pending_exposure_complete,
+            orders_submitted_today=orders_submitted_today,
         )

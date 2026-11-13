@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import logging
+import sys
 import os
 import re
 from logging.handlers import RotatingFileHandler
@@ -237,8 +238,28 @@ def runtime_startup(
     configure_runtime_logging(runtime_role, secrets)
     try:
         yield
-    except BaseException:
+    except BaseException as error:
         logger = logging.getLogger("trading_assistant.startup")
         logger.disabled = False
         logger.error("startup_failed role=%s", runtime_role)
+        _explain_startup_failure(runtime_role, error)
         raise
+
+
+def _explain_startup_failure(runtime_role: str, error: BaseException) -> None:
+    """Log a stable reason code and tell the operator what to do next."""
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return
+    from .startup_help import failure_code, remedy
+
+    code = failure_code(error)
+    reason = logging.getLogger("trading_assistant.startup.reason")
+    reason.disabled = False
+    reason.error("startup_refused role=%s code=%s", runtime_role, code)
+    try:
+        print(
+            f"{runtime_role} did not start: {code}. Next: {remedy(code)}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass

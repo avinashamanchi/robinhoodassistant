@@ -2763,13 +2763,14 @@ def test_main_constructs_only_the_fixed_root_client_and_injected_menu(
     monkeypatch.setattr(operator_terminal, "OperatorMenu", Menu)
     monkeypatch.setattr(operator_terminal, "DaemonSupervisor", Supervisor)
 
+    designated = Path("/designated/installation")
+    monkeypatch.setattr(
+        operator_terminal, "require_designated", lambda: designated
+    )
+
     assert operator_terminal.main([]) == 0
-    assert seen["project_root"] == Path(
-        "/Users/avi/Desktop/robinhood/trading-assistant"
-    )
-    assert seen["daemon_project_root"] == Path(
-        "/Users/avi/Desktop/robinhood/trading-assistant"
-    )
+    assert seen["project_root"] == designated
+    assert seen["daemon_project_root"] == designated
     assert seen["api"].__class__ is Client
     assert seen["daemon"].__class__ is Supervisor
 
@@ -2791,3 +2792,24 @@ def test_main_rejects_all_arguments_without_echoing_them(
     output = capsys.readouterr().out
     assert output.strip() == "operator_arguments_not_supported"
     assert "secret.test" not in output
+
+
+def test_main_refuses_an_undesignated_checkout_before_any_client(
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant.installation import InstallationError
+
+    def not_designated():
+        raise InstallationError("installation_not_designated", "/home/x")
+
+    def forbidden_client(_project_root):
+        raise AssertionError("client must not be constructed")
+
+    monkeypatch.setattr(operator_terminal, "require_designated", not_designated)
+    monkeypatch.setattr(operator_terminal, "OperatorApiClient", forbidden_client)
+
+    assert operator_terminal.main([]) == 1
+    assert capsys.readouterr().out.strip() == (
+        "operator_installation_invalid installation_not_designated"
+    )

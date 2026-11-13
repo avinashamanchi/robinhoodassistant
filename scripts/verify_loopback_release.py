@@ -30,7 +30,7 @@ DEFAULT_OUTPUT_RELATIVE = Path(".local/verification")
 NETWORK_GUARD_PATH = Path(__file__).resolve().with_name(
     "verifier_network_guard.py"
 )
-EXPECTED_MIGRATION_HEAD = "20260729_0017"
+EXPECTED_MIGRATION_HEAD = "20260730_0018"
 TRUSTED_ANCESTRY_ANCHOR = "4807cc0dc9dd20f21cf174e81034fea656162e3d"
 CI_VERIFIER_BIN = Path("/opt/trading-assistant-verifier/bin")
 _MAX_CAPTURE_CHARS = 32_768
@@ -158,10 +158,10 @@ class TestManifest:
 
 
 _MIGRATION_TEST_MANIFEST = TestManifest(
-    count=182,
+    count=186,
     digest=(
-        "sha256:8b7fc05ee92e1ad2a257e8967cdba00f"
-        "5948795a5ea98ac61aeeed3a9b09e8ce"
+        "sha256:8a6d2f8130bf2dbc7677972a30668603"
+        "64f23e388a104056fde74a60035c46ff"
     ),
 )
 _SECURITY_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=4253,
+    count=5161,
     digest=(
-        "sha256:b438bc6183eb6c7c3a7f208d5c992a82"
-        "6549fcf0cafd0c06d8526281e294992d"
+        "sha256:e9d5ed65522fb1008195c6ec24fcd4566"
+        "406dbc4329f727c55108b0e72a091bd"
     ),
 )
 
@@ -1838,7 +1838,8 @@ class ReleaseVerifier:
                     "--cov-branch",
                     "--cov-fail-under=90",
                 ),
-                timeout_seconds=1800.0,
+                # Instrumenting the full suite can take over 30 minutes on CI.
+                timeout_seconds=2700.0,
                 expects_tests=True,
                 test_manifest=_FULL_TEST_MANIFEST,
             ),

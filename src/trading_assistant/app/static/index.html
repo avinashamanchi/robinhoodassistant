@@ -293,6 +293,100 @@
 
       <div class="primary-workspace">
         <div class="data-grid">
+          <section class="panel" aria-labelledby="runtime-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">What this runtime uses</p>
+                <h2 id="runtime-title">Runtime and limits</h2>
+              </div>
+            </div>
+            <div class="section-body" id="runtime-overview">
+              <p class="empty-state">Loading runtime…</p>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="autopilot-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Autonomous paper trading</p>
+                <h2 id="autopilot-title">Autopilot</h2>
+              </div>
+            </div>
+            <div class="section-body" id="autopilot-overview">
+              <p class="empty-state">Loading autopilot…</p>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="orders-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Submitted and recent orders</p>
+                <h2 id="orders-title">Orders</h2>
+              </div>
+            </div>
+            <div class="section-body" id="orders">
+              <p class="empty-state">Loading orders…</p>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="test-proposal-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Paper only · operator generated</p>
+                <h2 id="test-proposal-title">Operator test proposal</h2>
+              </div>
+            </div>
+            <div class="section-body">
+              <p>Creates a labelled test proposal (not a strategy signal). Nothing is sent until you approve it under Pending decisions, and the full risk check runs again at approval.</p>
+              <form id="test-proposal-form">
+                <label for="test-scenario">Scenario</label>
+                <select id="test-scenario">
+                  <option value="non_marketable">A · submit then cancel (buy limit below the bid)</option>
+                  <option value="entry">B · entry intended to fill (buy)</option>
+                  <option value="exit">C · reduce a held position (sell)</option>
+                </select>
+                <label for="test-symbol">Symbol</label>
+                <input id="test-symbol" required maxlength="10" autocomplete="off">
+                <label for="test-order-type">Order type</label>
+                <select id="test-order-type">
+                  <option value="limit">Limit</option>
+                  <option value="market">Market</option>
+                </select>
+                <label for="test-qty">Quantity (shares)</label>
+                <input id="test-qty" inputmode="decimal" autocomplete="off">
+                <label for="test-notional">Notional USD (market buy instead of quantity)</label>
+                <input id="test-notional" inputmode="decimal" autocomplete="off">
+                <label for="test-limit">Limit price</label>
+                <input id="test-limit" inputmode="decimal" autocomplete="off">
+                <label for="test-reason">Reason</label>
+                <input id="test-reason" required maxlength="500" autocomplete="off">
+                <button type="submit" id="test-proposal-submit">Create test proposal</button>
+              </form>
+              <p id="test-proposal-status" role="status"></p>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="stops-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Four different things</p>
+                <h2 id="stops-title">Stopping, explained</h2>
+              </div>
+            </div>
+            <div class="section-body">
+              <dl>
+                <dt>Stop proposal generation</dt>
+                <dd>Stop the daemon (operator terminal, Monitoring, Stop) or set autopilot.mode: off. Orders already at the broker keep working.</dd>
+                <dt>Prevent new order submissions</dt>
+                <dd>Nothing is submitted without your approval; leave proposals unapproved or reject them. Panic additionally latches the global breaker: new entries are refused until you reset it, while a strictly position-reducing exit is still allowed.</dd>
+                <dt>Cancel working orders</dt>
+                <dd>Cancel one order in the Orders panel, or use Panic to cancel every open order. Stopping the app or daemon does not cancel orders at Alpaca.</dd>
+                <dt>Close positions</dt>
+                <dd>Never automatic. Create and approve a position-reducing exit (scenario C, or a strategy exit). Panic does not liquidate positions.</dd>
+              </dl>
+            </div>
+          </section>
+
           <section class="panel" aria-labelledby="positions-title">
             <div class="section-heading">
               <div>

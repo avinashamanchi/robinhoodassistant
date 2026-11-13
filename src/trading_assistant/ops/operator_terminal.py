@@ -7,19 +7,16 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import getpass
 import json
-from pathlib import Path
 import re
 import sys
 import unicodedata
 from typing import Any, Callable
 
+from ..installation import InstallationError, require_designated
 from .operator_api import OperatorApiClient, OperatorApiError
 from .operator_daemon import DaemonSupervisor
 
 
-CANONICAL_PROJECT_ROOT = Path(
-    "/Users/avi/Desktop/robinhood/trading-assistant"
-)
 PAPER_BANNER = (
     "ALPACA PAPER OPERATOR\n"
     "No action is automatic. Every order requires fresh human approval."
@@ -1927,14 +1924,24 @@ class OperatorMenu:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Start the fixed-root terminal without URL or TLS override arguments."""
+    """Start the terminal for the designated installation.
+
+    No URL, TLS, or root override arguments exist. The root is this checkout
+    and must be the operator's designated runtime installation
+    (``trading_assistant.installation``).
+    """
     arguments = sys.argv[1:] if argv is None else list(argv)
     if arguments:
         print("operator_arguments_not_supported")
         return 2
     try:
-        api = OperatorApiClient(CANONICAL_PROJECT_ROOT)
-        daemon = DaemonSupervisor(CANONICAL_PROJECT_ROOT)
+        project_root = require_designated()
+    except InstallationError as error:
+        print(f"operator_installation_invalid {error.code}")
+        return 1
+    try:
+        api = OperatorApiClient(project_root)
+        daemon = DaemonSupervisor(project_root)
         return OperatorMenu(api, daemon).run()
     except (KeyboardInterrupt, EOFError):
         return 0

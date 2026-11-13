@@ -207,8 +207,16 @@ def main(
     *,
     process_identity: ProcessIdentity | None = None,
     process_inspector: ProcessInspector | None = None,
+    database_guard=None,
 ) -> int:
     parser = argparse.ArgumentParser(description="Manage the trading assistant schema.")
+    parser.add_argument(
+        "--database",
+        help=(
+            "operate on this SQLite file explicitly; default: the chosen "
+            "runtime database (development secrets use their own URL)"
+        ),
+    )
     parser.add_argument(
         "--development-environment-secrets",
         action="store_true",
@@ -232,7 +240,33 @@ def main(
             "migration",
             config=config,
         )
-    engine = create_db_engine(runtime_secrets.database_url)
+    if args.database is not None:
+        # The file may not exist yet (a fresh database); its directory must.
+        explicit = Path(args.database).expanduser()
+        target_url = f"sqlite:///{explicit.parent.resolve(strict=True) / explicit.name}"
+    elif args.development_environment_secrets:
+        target_url = runtime_secrets.database_url
+    else:
+        from trading_assistant.installation import (
+            InstallationError,
+            require_chosen_database,
+        )
+        from trading_assistant.security.secrets import secret_value
+        from trading_assistant.startup_help import remedy
+
+        try:
+            chosen = (database_guard or require_chosen_database)(
+                secret_value(runtime_secrets.database_url)
+            )
+        except InstallationError as error:
+            print(
+                f"migration refused: {error.code}. Next: {remedy(error.code)} "
+                "(or name a file with --database)",
+                file=sys.stderr,
+            )
+            return 1
+        target_url = f"sqlite:///{chosen}"
+    engine = create_db_engine(target_url)
     backup_buffer: bytearray | None = None
     inspector = process_inspector or LocalProcessInspector()
     identity = process_identity

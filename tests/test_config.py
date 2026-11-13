@@ -453,3 +453,41 @@ def test_live_trading_is_never_enabled_by_parsed_legacy_fields(
         )
         is False
     )
+
+
+# ── machine-local override (config.local.yaml) ────────────────────────────────
+def test_a_local_override_merges_over_the_checked_in_file(tmp_path, monkeypatch):
+    from trading_assistant.config import config_sources
+
+    _write(tmp_path, VALID)
+    (tmp_path / "config.local.yaml").write_text(
+        "autopilot:\n  mode: paper\n  stop_loss_pct: 8\nrisk:\n  ticker_allowlist: [NVDA]\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    merged = load_config()
+
+    assert merged.autopilot.mode == "paper" and merged.autopilot.stop_loss_pct == 8
+    assert merged.risk.ticker_allowlist == ["NVDA"]          # lists replace
+    assert merged.risk.max_notional_per_order == 500          # siblings survive
+    assert [p.name for p in config_sources()] == ["config.yaml", "config.local.yaml"]
+
+
+def test_an_explicit_path_ignores_the_local_override(tmp_path, monkeypatch):
+    path = _write(tmp_path, VALID)
+    (tmp_path / "config.local.yaml").write_text("autopilot:\n  mode: paper\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert load_config(path).autopilot.mode != "paper"
+
+
+def test_a_local_override_is_validated_like_the_checked_in_file(tmp_path, monkeypatch):
+    _write(tmp_path, VALID)
+    (tmp_path / "config.local.yaml").write_text("autopilot:\n  surprise: true\n")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValidationError):
+        load_config()
+    (tmp_path / "config.local.yaml").write_text("- not a mapping\n")
+    with pytest.raises(ValueError):
+        load_config()

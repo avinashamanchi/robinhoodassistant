@@ -34,6 +34,7 @@ from ..security.secrets import (
 )
 from .backup import EncryptedBackupReceipt, backup_database
 from .control import prove_app_absent
+from ..installation import InstallationError, require_designated
 from .tenure import (
     LocalProcessInspector,
     ProcessIdentity,
@@ -46,12 +47,22 @@ from .tenure import (
 )
 
 
-_PRODUCTION_DESTINATION = Path(
-    "/Users/avi/Desktop/robinhood/trading-assistant"
-)
-_PRODUCTION_SOURCE = (
-    _PRODUCTION_DESTINATION / ".worktrees" / "safety-foundation"
-)
+def _production_roots() -> "ConsolidationRoots":
+    """Exact production roots: the designated installation and its worktree.
+
+    The destination is the operator's designated runtime installation
+    (``trading_assistant.installation``), never a hard-coded path; the source
+    is that installation's ``.worktrees/safety-foundation`` checkout.
+    """
+    try:
+        destination = require_designated()
+    except InstallationError:
+        raise ConsolidationError("root_mismatch") from None
+    return ConsolidationRoots(
+        source_root=destination / ".worktrees" / "safety-foundation",
+        destination_root=destination,
+    )
+
 _DATABASE_NAME = "trading_assistant.db"
 _BACKUP_DIRECTORY = Path(".local/encrypted-backups")
 _UNCERTAINTY_MARKER = Path(
@@ -1055,6 +1066,86 @@ def _ensure_private_directory(path: Path) -> Path:
     return canonical
 
 
+# Tables that record history, with the plaintext columns that identify a row
+# and never change after it is written.
+_HISTORY_IDENTITY: dict[str, tuple[str, ...]] = {
+    "audit_events": (
+        "id",
+        "created_at",
+        "actor",
+        "action",
+        "target_type",
+        "target_id",
+        "request_id",
+    ),
+    "orders": ("id", "idempotency_key", "created_at"),
+    "proposals": ("id", "order_id", "created_at"),
+    "fills": ("id", "ticker", "side", "filled_at"),
+    "risk_events": ("id", "event_type", "created_at"),
+    "trade_plans": ("id", "created_at"),
+    "rule_groups": ("id", "group_key", "created_at"),
+    "rules": ("id", "created_at"),
+}
+
+
+def _history_identities(path: Path) -> dict[str, set[tuple[object, ...]]]:
+    engine = _read_only_engine(path)
+    try:
+        with engine.connect() as connection:
+            present = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_schema WHERE type='table'"
+                )
+            }
+            metadata = MetaData()
+            identities: dict[str, set[tuple[object, ...]]] = {}
+            for table_name, columns in _HISTORY_IDENTITY.items():
+                if table_name not in present:
+                    continue
+                table = Table(table_name, metadata, autoload_with=connection)
+                identities[table_name] = {
+                    tuple(row)
+                    for row in connection.execute(
+                        select(*(table.c[column] for column in columns))
+                    )
+                }
+            return identities
+    except Exception:
+        raise ConsolidationError("history_comparison_failed") from None
+    finally:
+        engine.dispose()
+
+
+def _require_destination_history_in_source(
+    source_database: _ValidatedDatabase,
+    destination_database: _ValidatedDatabase,
+    *,
+    replace_destination_sha256: str | None,
+) -> None:
+    """Refuse to discard destination history the source does not contain.
+
+    Installing the source replaces the destination. That loses nothing only
+    when every history row in the destination is already in the source, as
+    when the source runtime grew from a copy of the destination. Otherwise
+    the operator must name the destination's exact SHA-256 to accept that its
+    extra rows will survive only in its encrypted backup.
+    """
+    source = _history_identities(source_database.path)
+    destination = _history_identities(destination_database.path)
+    if not any(
+        rows - source.get(table, set())
+        for table, rows in destination.items()
+    ):
+        return
+    if replace_destination_sha256 is None:
+        raise ConsolidationError("destination_history_not_in_source")
+    if replace_destination_sha256 != _hash_descriptor(
+        destination_database.descriptor
+    ):
+        raise ConsolidationError("destination_acknowledgment_mismatch")
+
+
 def _valid_hash(value: object) -> bool:
     return bool(
         isinstance(value, str)
@@ -1341,14 +1432,12 @@ def _validate_inputs(
     _ValidatedDatabase,
     _ValidatedDatabase | None,
 ]:
-    expected = roots or ConsolidationRoots(
-        source_root=_PRODUCTION_SOURCE,
-        destination_root=_PRODUCTION_DESTINATION,
-    )
+    expected = roots or _production_roots()
+    source_root = Path(source_root)
     if roots is None:
         if (
-            Path(source_root).name != "safety-foundation"
-            or Path(source_root).parent.name != ".worktrees"
+            source_root.name != "safety-foundation"
+            or source_root.parent.name != ".worktrees"
         ):
             raise ConsolidationError("root_mismatch")
     if (
@@ -1371,9 +1460,7 @@ def _validate_inputs(
             expected.destination_root,
         )
         if roots is None and destination.path != (
-            Path(
-                "/Users/avi/Desktop/robinhood/trading-assistant"
-            ).resolve(strict=True)
+            expected.destination_root.resolve(strict=True)
         ):
             raise ConsolidationError("root_mismatch")
         source_database = _validate_database(
@@ -1422,8 +1509,13 @@ def consolidate_runtime(
     process_identity: ProcessIdentity,
     process_inspector: ProcessInspector,
     roots: ConsolidationRoots | None = None,
+    replace_destination_sha256: str | None = None,
 ) -> ConsolidationReceipt:
-    """Install a verified source snapshot under durable dual maintenance."""
+    """Install a verified source snapshot under durable dual maintenance.
+
+    A destination holding history the source lacks is refused unless
+    ``replace_destination_sha256`` names that destination's exact contents.
+    """
 
     if (
         not isinstance(backup_key, bytes)
@@ -1432,6 +1524,10 @@ def consolidate_runtime(
         or not backup_key_id
     ):
         raise ConsolidationError("backup_configuration_invalid")
+    if replace_destination_sha256 is not None and not _valid_hash(
+        replace_destination_sha256
+    ):
+        raise ConsolidationError("destination_acknowledgment_invalid")
     try:
         process_identity.validate()
     except ValueError:
@@ -1492,6 +1588,12 @@ def consolidate_runtime(
                 destination_database.path
             )
         source_anchor = _open_read_anchor(source_database.path)
+        if destination_database is not None:
+            _require_destination_history_in_source(
+                source_database,
+                destination_database,
+                replace_destination_sha256=replace_destination_sha256,
+            )
 
         _prime_maintenance_slot(
             source_database.path,
@@ -1940,6 +2042,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _ValueFreeParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--destination-root", type=Path, required=True)
+    parser.add_argument("--replace-divergent-destination", metavar="SHA256")
     try:
         args = parser.parse_args(argv)
         config = load_config()
@@ -1958,6 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
                 backup_key_id=config.encryption.backup_key_id,
                 process_identity=identity,
                 process_inspector=inspector,
+                replace_destination_sha256=args.replace_divergent_destination,
             )
         finally:
             for index in range(len(key_buffer)):

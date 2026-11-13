@@ -14,7 +14,7 @@ from ..security.outbound import (
     new_httpx_client,
     require_origin,
 )
-from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
+from .base import LLMResponse, ProviderRequestRejected, TextBlock, ToolUseBlock, Usage
 from .payloads import (
     build_gemini_payload,
     sanitize_gemini_schema,
@@ -52,6 +52,22 @@ def from_gemini(resp: Any) -> LLMResponse:
         try:
             input_tokens = getattr(meta, "prompt_token_count")
             output_tokens = getattr(meta, "candidates_token_count")
+            thinking_tokens = getattr(meta, "thoughts_token_count", None)
+            if thinking_tokens is None:
+                thinking_tokens = 0
+            total_tokens = getattr(meta, "total_token_count", None)
+            # With thinking-only output Gemini can omit the candidate count.
+            # Infer it only when the provider's total proves the full usage.
+            if (
+                output_tokens is None
+                and type(input_tokens) is int
+                and type(thinking_tokens) is int
+                and type(total_tokens) is int
+                and input_tokens >= 0
+                and thinking_tokens >= 0
+                and total_tokens >= input_tokens + thinking_tokens
+            ):
+                output_tokens = total_tokens - input_tokens - thinking_tokens
         except AttributeError:
             pass
         else:
@@ -60,10 +76,12 @@ def from_gemini(resp: Any) -> LLMResponse:
                 and input_tokens >= 0
                 and type(output_tokens) is int
                 and output_tokens >= 0
+                and type(thinking_tokens) is int
+                and thinking_tokens >= 0
             ):
                 usage = Usage(
                     input_tokens=input_tokens,
-                    output_tokens=output_tokens,
+                    output_tokens=output_tokens + thinking_tokens,
                 )
     return LLMResponse(
         content=blocks,
@@ -153,6 +171,9 @@ class GeminiBackend:
             system_instruction=payload["system_instruction"],
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         )
         # Preserve the validated explicit mode. "any" forces a function call
         # so a 200 always carries structured output.
@@ -166,9 +187,18 @@ class GeminiBackend:
                 )
             )
         config = types.GenerateContentConfig(**cfg_kwargs)
-        resp = self._get_client().models.generate_content(
-            model=self.model, contents=gem_contents, config=config
-        )
+        from google.genai.errors import APIError
+
+        try:
+            resp = self._get_client().models.generate_content(
+                model=self.model, contents=gem_contents, config=config
+            )
+        except APIError as error:
+            # Google documents failed 4xx/5xx GenerateContent requests as
+            # unbilled. Transport failures still have ambiguous acceptance.
+            if type(error.code) is int and 400 <= error.code < 600:
+                raise ProviderRequestRejected("gemini_request_rejected") from None
+            raise
         return from_gemini(resp)
 
     @staticmethod

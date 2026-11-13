@@ -14,7 +14,9 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _LAUNCHER = _ROOT / "scripts/operator.sh"
-_CANONICAL_ROOT = "/Users/avi/Desktop/robinhood/trading-assistant"
+_DESIGNATION_RELATIVE = Path(
+    "Library/Application Support/trading-assistant/installation-root"
+)
 _CURL = "/usr/bin/curl"
 _STAT = "/usr/bin/stat"
 _LIVENESS_URL = "https://localhost:8020/health/live"
@@ -30,6 +32,8 @@ def _write_executable(path: Path, source: str) -> None:
 @dataclass(frozen=True)
 class LauncherHarness:
     project: Path
+    home: Path
+    designation: Path
     launcher: Path
     python: Path
     python_target: Path
@@ -58,6 +62,7 @@ class LauncherHarness:
         directory = self.project if cwd is None else cwd
         cd_mode = "-L" if logical_cwd else "-P"
         environment = {
+            "HOME": str(self.home),
             "HARNESS_CONTROL": control,
             "HARNESS_LIVENESS": liveness,
             "HARNESS_LOG": str(self.log),
@@ -108,7 +113,10 @@ class LauncherHarness:
 
 @pytest.fixture
 def launcher_harness(tmp_path: Path) -> LauncherHarness:
-    project = tmp_path / "canonical-project"
+    # Spaces in both paths: every launcher test exercises quoting.
+    project = tmp_path / "operator project"
+    home = tmp_path / "home dir"
+    designation = home / _DESIGNATION_RELATIVE
     launcher = project / "scripts/operator.sh"
     python = project / ".venv/bin/python"
     ca = project / ".local/tls/rootCA.pem"
@@ -120,6 +128,10 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
     start_script = project / "scripts/start.sh"
 
     project.mkdir()
+    designation.parent.mkdir(parents=True)
+    designation.parent.chmod(0o700)
+    designation.write_text(f"{project}\n", encoding="utf-8")
+    designation.chmod(0o600)
     ca.parent.mkdir(parents=True)
     (project / ".local").chmod(0o700)
     ca.parent.chmod(0o700)
@@ -207,6 +219,17 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
                     else 1
                 )
             raise SystemExit(97)
+
+        if owned_arguments[:3] == [
+            "-m",
+            "trading_assistant.installation",
+            "check",
+        ]:
+            record("installation", **common)
+            if os.environ.get("HARNESS_INSTALLATION", "ok") != "ok":
+                sys.stderr.write("installation check failed: stale\\n")
+                raise SystemExit(1)
+            raise SystemExit(0)
 
         if owned_arguments == [
             "-m",
@@ -327,46 +350,56 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
     )
     _write_executable(fake_curl, fake_curl_source)
 
+    # Emulates the BSD ``stat -f`` forms the launcher uses (``%u`` owner,
+    # ``%p`` octal st_mode including type bits, ``%l`` link count) with
+    # os.stat, so launcher behavior is tested identically on macOS and on the
+    # Linux CI runner, whose GNU stat has no BSD ``-f`` format option.
     fake_stat_source = textwrap.dedent(
         f"""\
         #!{sys.executable} -I
         import os
-        import subprocess
         import sys
 
         arguments = sys.argv[1:]
-        completed = subprocess.run(
-            [{_STAT!r}, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        output = completed.stdout
+        follow = "-L" in arguments
+        try:
+            fmt = arguments[arguments.index("-f") + 1]
+            separator = arguments.index("--")
+            (path,) = arguments[separator + 1:]
+        except (ValueError, IndexError):
+            sys.stderr.write("fake stat: unsupported arguments\\n")
+            raise SystemExit(2)
+        try:
+            result = os.stat(path) if follow else os.lstat(path)
+        except OSError as error:
+            sys.stderr.write(f"stat: {{path}}: {{error.strerror}}\\n")
+            raise SystemExit(1)
+        fields = {{
+            "%u": str(result.st_uid),
+            "%p": format(result.st_mode, "o"),
+            "%l": str(result.st_nlink),
+        }}
+        if fmt not in {{"%u:%p:%l", "%u:%p"}}:
+            sys.stderr.write("fake stat: unsupported format\\n")
+            raise SystemExit(2)
+        output = ":".join(fields[part] for part in fmt.split(":")) + "\\n"
         if (
-            completed.returncode == 0
-            and os.environ.get("HARNESS_FOREIGN_START_OWNER") == "1"
-            and arguments[-1:] == [
-                os.environ["HARNESS_START_SCRIPT"]
-            ]
-            and "%u:%p:%l" in arguments
+            os.environ.get("HARNESS_FOREIGN_START_OWNER") == "1"
+            and path == os.environ["HARNESS_START_SCRIPT"]
+            and fmt == "%u:%p:%l"
         ):
             owner, mode, links = output.strip().split(":")
             output = f"{{int(owner) + 1}}:{{mode}}:{{links}}\\n"
         sys.stdout.write(output)
-        sys.stderr.write(completed.stderr)
-        raise SystemExit(completed.returncode)
+        raise SystemExit(0)
         """
     )
     _write_executable(fake_stat, fake_stat_source)
 
     production_source = _LAUNCHER.read_text(encoding="utf-8")
-    assert _CANONICAL_ROOT in production_source
     assert _CURL in production_source
     assert _STAT in production_source
     injected_source = production_source.replace(
-        _CANONICAL_ROOT,
-        str(project),
-    ).replace(
         _CURL,
         str(fake_curl),
     ).replace(
@@ -377,6 +410,8 @@ def launcher_harness(tmp_path: Path) -> LauncherHarness:
 
     return LauncherHarness(
         project=project,
+        home=home,
+        designation=designation,
         launcher=launcher,
         python=python,
         python_target=python_target,
@@ -404,7 +439,7 @@ def _python_events(
     return [
         event
         for event in harness.events()
-        if event["event"] in {"control", "python-c", "terminal"}
+        if event["event"] in {"control", "installation", "python-c", "terminal"}
     ]
 
 
@@ -417,7 +452,11 @@ def _replace_with_symlink(path: Path, target: Path) -> None:
 def test_operator_launcher_is_canonical_and_does_not_start_daemon():
     source = _LAUNCHER.read_text(encoding="utf-8")
 
-    assert _CANONICAL_ROOT in source
+    # The runtime root is derived and must match the operator's designation;
+    # no checkout location is hard-coded.
+    assert "/Users/" not in source
+    assert str(_DESIGNATION_RELATIVE) in source
+    assert "trading_assistant.installation check" in source
     assert "scripts/start.sh" in source
     assert "trading_assistant.ops.operator_terminal" in source
     assert "set -euo pipefail" in source
@@ -957,12 +996,12 @@ def test_operator_launcher_stops_on_wrong_process_control_without_starting(
 def test_operator_launcher_reuses_verified_running_app_and_execs_menu(
     launcher_harness: LauncherHarness,
 ):
-    home = launcher_harness.parent / "home"
-    home.mkdir()
-    (home / ".curlrc").write_text("--insecure\n", encoding="utf-8")
+    # A hostile ~/.curlrc in the (designated) account home must be ignored.
+    (launcher_harness.home / ".curlrc").write_text(
+        "--insecure\n", encoding="utf-8"
+    )
     completed = launcher_harness.run(
         environment_overrides={
-            "HOME": str(home),
             "HTTPS_PROXY": "http://127.0.0.1:9",
         },
     )
@@ -1050,3 +1089,106 @@ def test_operator_launcher_stops_when_post_start_liveness_is_not_verified(
     assert completed.returncode != 0
     assert _event_names(launcher_harness).count("start") == 1
     _assert_menu_was_not_launched(launcher_harness)
+
+
+# ── designated runtime installation ─────────────────────────────────────────
+def test_operator_launcher_runs_from_a_designated_root_with_spaces(
+    launcher_harness: LauncherHarness,
+):
+    assert " " in str(launcher_harness.project)
+    completed = launcher_harness.run()
+
+    assert completed.returncode == 0, completed.stderr
+    names = _event_names(launcher_harness)
+    assert names.index("installation") < names.index("terminal")
+
+
+def test_operator_launcher_requires_a_designation_before_any_python(
+    launcher_harness: LauncherHarness,
+):
+    launcher_harness.designation.unlink()
+
+    completed = launcher_harness.run()
+
+    assert completed.returncode != 0
+    assert "trading_assistant.installation designate" in completed.stderr
+    assert launcher_harness.events() == []
+
+
+def test_operator_launcher_rejects_a_checkout_that_is_not_designated(
+    launcher_harness: LauncherHarness,
+):
+    other = launcher_harness.parent / "other checkout"
+    other.mkdir()
+    launcher_harness.designation.write_text(f"{other}\n", encoding="utf-8")
+
+    completed = launcher_harness.run()
+
+    assert completed.returncode != 0
+    assert "not the designated runtime installation" in completed.stderr
+    assert launcher_harness.events() == []
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o620])
+def test_operator_launcher_rejects_a_shared_designation(
+    launcher_harness: LauncherHarness,
+    mode: int,
+):
+    launcher_harness.designation.chmod(mode)
+
+    completed = launcher_harness.run()
+
+    assert completed.returncode != 0
+    assert "designation is not private" in completed.stderr
+    assert launcher_harness.events() == []
+
+
+def test_operator_launcher_rejects_a_symlinked_designation(
+    launcher_harness: LauncherHarness,
+):
+    real = launcher_harness.parent / "real-designation"
+    real.write_text(f"{launcher_harness.project}\n", encoding="utf-8")
+    real.chmod(0o600)
+    launcher_harness.designation.unlink()
+    launcher_harness.designation.symlink_to(real)
+
+    completed = launcher_harness.run()
+
+    assert completed.returncode != 0
+    assert launcher_harness.events() == []
+
+
+@pytest.mark.parametrize("home", ["", "relative/home", "/nonexistent/home"])
+def test_operator_launcher_rejects_an_unusable_home(
+    launcher_harness: LauncherHarness,
+    home: str,
+):
+    completed = launcher_harness.run(environment_overrides={"HOME": home})
+
+    assert completed.returncode != 0
+    assert launcher_harness.events() == []
+
+
+def test_operator_launcher_stops_when_the_venv_runs_another_checkout(
+    launcher_harness: LauncherHarness,
+):
+    completed = launcher_harness.run(
+        environment_overrides={"HARNESS_INSTALLATION": "stale"},
+    )
+
+    assert completed.returncode != 0
+    assert "uv sync --all-extras --dev" in completed.stderr
+    assert _event_names(launcher_harness) == ["installation"]
+
+
+def test_operator_launcher_rejects_being_run_from_another_directory(
+    launcher_harness: LauncherHarness,
+):
+    completed = launcher_harness.run(
+        cwd=launcher_harness.project / "scripts",
+        launcher="./operator.sh",
+    )
+
+    assert completed.returncode != 0
+    assert "run ./scripts/operator.sh from its project root" in completed.stderr
+    assert launcher_harness.events() == []

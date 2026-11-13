@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import sys
 import os
 import re
 import sqlite3
@@ -1857,15 +1858,40 @@ def main(
     secrets_loader=load_role_secrets,
     process_identity: ProcessIdentity | None = None,
     process_inspector: ProcessInspector | None = None,
+    database_guard=None,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination")
     parser.add_argument("--retention-days", type=int, default=14)
+    parser.add_argument(
+        "--database",
+        help=(
+            "back up this SQLite file explicitly (for example a database you "
+            "have not chosen yet); default: the chosen runtime database"
+        ),
+    )
     args = parser.parse_args(argv)
+    from ..installation import InstallationError, require_chosen_database
     from ..logging import runtime_startup
+    from ..security.secrets import secret_value
+    from ..startup_help import remedy
 
     config = config_loader()
     secrets = secrets_loader("backup", config=config)
+    if args.database is not None:
+        source = Path(args.database).resolve(strict=True)
+    else:
+        try:
+            source = (database_guard or require_chosen_database)(
+                secret_value(secrets.database_url)
+            )
+        except InstallationError as error:
+            print(
+                f"backup refused: {error.code}. Next: {remedy(error.code)} "
+                "(or name a file with --database)",
+                file=sys.stderr,
+            )
+            return 1
     inspector = process_inspector or LocalProcessInspector()
     identity = process_identity or inspector.current()
     key_buffer = validate_base64_key(
@@ -1875,7 +1901,7 @@ def main(
     try:
         with runtime_startup("backup", secrets):
             receipt = backup_database(
-                database_path(secrets.database_url),
+                source,
                 (
                     args.destination
                     if args.destination is not None
