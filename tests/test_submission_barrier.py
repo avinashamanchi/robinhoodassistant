@@ -1053,7 +1053,10 @@ def _counted_submission_process(
                 snapshot_evaluated.set()
                 if (
                     pause_after_first_evaluation
-                    and not release_evaluation.wait(timeout=10)
+                    # The parent permits four separate ten-second setup
+                    # phases before releasing this worker. Its lifetime must
+                    # outlast that budget, including slower spawned imports.
+                    and not release_evaluation.wait(timeout=60)
                 ):
                     raise TimeoutError("test did not release risk evaluation")
             return RiskResult(approved=True)
@@ -1075,7 +1078,7 @@ def _counted_submission_process(
     )
     try:
         process_ready.set()
-        if not begin_submission.wait(timeout=10):
+        if not begin_submission.wait(timeout=60):
             raise TimeoutError("test did not start counted submission")
         result = _submit(service, order_id)
         outcome.put(("ok", result.status.value, risk.calls))
