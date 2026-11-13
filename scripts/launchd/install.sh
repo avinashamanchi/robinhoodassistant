@@ -71,7 +71,15 @@ chmod 700 "$PROJ/logs" "$PROJ/.local" "$PROJ/.local/encrypted-backups"
 reload_plist () {  # launchd can briefly return EIO immediately after bootout
   local label="$1"
   local plist="$2"
-  launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
+  if launchctl bootout "gui/$UID_/$label" 2>/dev/null; then
+    case "$label" in
+      com.trading.app|com.trading.daemon)
+        # A terminated process can leave a valid 30-second fencing lease.
+        # Let that lease expire before asking launchd to start a successor.
+        sleep 35
+        ;;
+    esac
+  fi
   for attempt in 1 2 3; do
     if launchctl bootstrap "gui/$UID_" "$plist"; then
       return 0
